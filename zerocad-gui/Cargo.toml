@@ -1,0 +1,16 @@
+[package]
+name = "zerocad-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zerocad-core = { path = "../zerocad-core" }
+egui.workspace = true
+# eframe's "wgpu" feature pulls in wgpu/winit/egui-wgpu transitively — the GUI
+# never touches those crates directly, so they are not listed here.
+eframe = { workspace = true, features = ["wgpu"] }
+# serde / serde_json are kept for the in-progress Save / Export feature.
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true

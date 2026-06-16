@@ -1,0 +1,15 @@
+[package]
+name = "zerocad-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+petgraph.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+truck-modeling.workspace = true
+truck-meshalgo.workspace = true
+truck-polymesh.workspace = true
+truck-topology.workspace = true
+truck-shapeops.workspace = true

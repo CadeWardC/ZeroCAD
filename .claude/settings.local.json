@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cargo search truck-modeling truck-meshalgo truck-polymesh truck-shapeops truck-stepio truck-topology --limit 20)"
+    ]
+  }
+}
