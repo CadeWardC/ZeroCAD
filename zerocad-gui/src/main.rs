@@ -258,6 +258,41 @@ impl SettingsTab {
     }
 }
 
+/// File format choices offered in the save dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveFormat {
+    /// Full `.zcad` with embedded mesh cache for instant open.
+    ZcadFull,
+    /// Lightweight `.zcad` — recipe only, geometry regenerated on open.
+    ZcadLightweight,
+}
+
+impl SaveFormat {
+    fn label(self) -> &'static str {
+        match self {
+            SaveFormat::ZcadFull => "ZeroCAD Full (.zcadh)",
+            SaveFormat::ZcadLightweight => "ZeroCAD (.zcad)",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            SaveFormat::ZcadFull => "zcadh",
+            SaveFormat::ZcadLightweight => "zcad",
+        }
+    }
+}
+
+/// State for the in-app save dialog modal.
+struct SaveDialogState {
+    /// User-editable project title (becomes the file stem).
+    project_title: String,
+    /// Which format to save in.
+    save_format: SaveFormat,
+    /// Target directory.
+    save_dir: PathBuf,
+}
+
 struct ZeroCadApp {
     graph: ParametricGraph,
     selected_node_id: Option<String>,
@@ -437,6 +472,8 @@ struct ZeroCadApp {
     capturing_shortcut: Option<ShortcutAction>,
     /// Whether the onboarding screen is shown on startup.
     show_onboarding: bool,
+    /// The in-app save dialog, if currently open.
+    save_dialog: Option<SaveDialogState>,
     /// Dark theme toggle.
     dark_mode: bool,
     /// Last theme actually pushed to egui (`Some(dark_mode)`). The full
@@ -551,6 +588,7 @@ impl ZeroCadApp {
             keymap: Keymap::load(),
             capturing_shortcut: None,
             show_onboarding: prefs.show_onboarding,
+            save_dialog: None,
             dark_mode: prefs.dark_mode,
             theme_applied: None,
             renaming_node: None,
@@ -1845,27 +1883,49 @@ impl ZeroCadApp {
         self.status_msg = "New blank design created.".to_string();
     }
 
-    /// Prompt for a path and write the document as a `.zcad` file, embedding the
-    /// evaluated geometry as a fast-open / fallback cache. The recipe stays the
-    /// source of truth.
-    pub(crate) fn save_design(&mut self) {
-        self.save_design_inner(true);
+    /// Open the in-app save dialog. The dialog presents a project title, format
+    /// dropdown, recent folders, and a browse button.
+    pub(crate) fn open_save_dialog(&mut self) {
+        // Default directory: parent of last saved/opened project, else the
+        // user's home / documents folder.
+        let default_dir = self
+            .recent_files
+            .entries
+            .first()
+            .and_then(|e| e.path.parent().map(|p| p.to_path_buf()))
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Default title: the stem of the most-recent project, or "Untitled".
+        let default_title = self
+            .recent_files
+            .entries
+            .first()
+            .and_then(|e| e.path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "Untitled".to_string());
+
+        self.save_dialog = Some(SaveDialogState {
+            project_title: default_title,
+            save_format: SaveFormat::ZcadLightweight,
+            save_dir: default_dir,
+        });
     }
 
-    /// As [`save_design`], but omit the embedded mesh cache for a smaller file
-    /// (geometry is regenerated from the recipe on open).
-    pub(crate) fn save_design_lightweight(&mut self) {
-        self.save_design_inner(false);
-    }
-
-    fn save_design_inner(&mut self, embed_mesh: bool) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Save ZeroCAD Design")
-            .add_filter("ZeroCAD Design", &["zcad"])
-            .save_file()
-        else {
-            return;
+    /// Execute the save using the current save-dialog parameters.
+    fn do_save(&mut self) {
+        let state = match self.save_dialog.take() {
+            Some(s) => s,
+            None => return,
         };
+
+        let ext = state.save_format.extension();
+        let file_name = format!("{}.{ext}", state.project_title);
+        let path = state.save_dir.join(&file_name);
+        let embed_mesh = state.save_format == SaveFormat::ZcadFull;
 
         // A PNG preview rendered from the current bodies, embedded so the file
         // carries its own thumbnail (portable across machines).
@@ -1876,17 +1936,26 @@ impl ZeroCadApp {
             thumbnail::encode_png(w, h, &rgba)
         };
 
+        // For the mesh cache, exclude hidden bodies so they stay hidden on open.
+        let visible_bodies: Vec<(String, MockMesh)> = self
+            .body_meshes
+            .iter()
+            .filter(|(id, _)| !self.hidden_nodes.contains(id))
+            .cloned()
+            .collect();
+
         let doc = zerocad_core::ZcadDocument {
             graph: &self.graph,
             thumbnail_png,
             mesh_cache: if embed_mesh {
-                Some(&self.body_meshes)
+                Some(&visible_bodies)
             } else {
                 None
             },
             units: self.current_unit,
             bbox: Self::bodies_bbox(&self.body_meshes),
             created_unix: self.doc_created_unix,
+            hidden_nodes: self.hidden_nodes.clone(),
         };
 
         let bytes = match zerocad_core::write_zcad(&doc) {
@@ -1904,6 +1973,141 @@ impl ZeroCadApp {
                 self.remember_project(&path);
             }
             Err(e) => self.status_msg = format!("Save failed: {e}"),
+        }
+    }
+
+    /// Render the in-app save dialog as a centered modal overlay.
+    fn show_save_dialog(&mut self, ctx: &egui::Context) {
+        let is_open = self.save_dialog.is_some();
+        if !is_open {
+            return;
+        }
+
+        // Semi-transparent backdrop.
+        egui::Area::new(egui::Id::new("save_dialog_backdrop"))
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_black_alpha(120),
+                );
+                // Consume clicks on the backdrop so they don't fall through.
+                ui.allocate_rect(screen, egui::Sense::click());
+            });
+
+        let mut close = false;
+        let mut do_save = false;
+
+        egui::Window::new("Save Design")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .min_width(420.0)
+            .show(ctx, |ui| {
+                let state = self.save_dialog.as_mut().unwrap();
+
+                ui.add_space(4.0);
+
+                // --- Project Title ---
+                ui.horizontal(|ui| {
+                    ui.label("Project Title:");
+                    ui.text_edit_singleline(&mut state.project_title);
+                });
+
+                ui.add_space(6.0);
+
+                // --- File Format ---
+                ui.horizontal(|ui| {
+                    ui.label("File Format:");
+                    egui::ComboBox::from_id_source("save_format")
+                        .selected_text(state.save_format.label())
+                        .show_ui(ui, |ui: &mut egui::Ui| {
+                            ui.selectable_value(
+                                &mut state.save_format,
+                                SaveFormat::ZcadLightweight,
+                                SaveFormat::ZcadLightweight.label(),
+                            );
+                            ui.selectable_value(
+                                &mut state.save_format,
+                                SaveFormat::ZcadFull,
+                                SaveFormat::ZcadFull.label(),
+                            );
+                        });
+                });
+
+                ui.add_space(6.0);
+
+                // --- Save Location ---
+                ui.horizontal(|ui| {
+                    ui.label("Save to:");
+                    let display = state.save_dir.display().to_string();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut display.clone())
+                            .desired_width(260.0)
+                            .interactive(false),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Choose save folder")
+                            .set_directory(&state.save_dir)
+                            .pick_folder()
+                        {
+                            state.save_dir = dir;
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                // --- Recent Folders ---
+                let folders = self.recent_files.recent_folders();
+                if !folders.is_empty() {
+                    ui.label("Recent Folders:");
+                    let state = self.save_dialog.as_mut().unwrap();
+                    egui::ScrollArea::vertical()
+                        .max_height(100.0)
+                        .show(ui, |ui| {
+                            for folder in &folders {
+                                let label = folder.display().to_string();
+                                let selected = *folder == state.save_dir;
+                                if ui
+                                    .selectable_label(selected, &label)
+                                    .clicked()
+                                {
+                                    state.save_dir = folder.clone();
+                                }
+                            }
+                        });
+                    ui.add_space(6.0);
+                }
+
+                // --- Full path preview ---
+                let state = self.save_dialog.as_ref().unwrap();
+                let full_path = state.save_dir.join(format!("{}.{}", state.project_title, state.save_format.extension()));
+                ui.horizontal(|ui| {
+                    ui.label("File:");
+                    ui.monospace(full_path.display().to_string());
+                });
+
+                ui.add_space(8.0);
+
+                // --- Buttons ---
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if do_save {
+            self.do_save();
+        } else if close {
+            self.save_dialog = None;
         }
     }
 
@@ -2232,7 +2436,7 @@ impl ZeroCadApp {
     pub(crate) fn open_design(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open ZeroCAD Design")
-            .add_filter("ZeroCAD Design", &["zcad"])
+            .add_filter("ZeroCAD Design", &["zcad", "zcadh"])
             .pick_file()
         else {
             return;
@@ -2273,7 +2477,7 @@ impl ZeroCadApp {
         self.selected_faces.clear();
         self.selected_edges.clear();
         self.selected_body.clear();
-        self.hidden_nodes.clear();
+        self.hidden_nodes = loaded.hidden_nodes;
         self.extrude_op = None;
         self.edge_mod_op = None;
 
@@ -2358,7 +2562,7 @@ impl ZeroCadApp {
         match action {
             ShortcutAction::NewDesign => self.new_design(),
             ShortcutAction::OpenDesign => self.open_design(),
-            ShortcutAction::SaveDesign => self.save_design(),
+            ShortcutAction::SaveDesign => self.open_save_dialog(),
             ShortcutAction::ExportStl => self.export_stl(),
             ShortcutAction::Undo => self.undo(),
             ShortcutAction::Redo => self.redo(),
@@ -2495,6 +2699,9 @@ impl eframe::App for ZeroCadApp {
                 ctx.request_repaint(); // Smooth animation repaint request
             }
         }
+
+        // SAVE DIALOG (modal overlay, drawn before the Settings window).
+        self.show_save_dialog(ctx);
 
         // SETTINGS WINDOW (floating, modal-style; tab rail left, content right)
         if self.show_preferences {
@@ -2726,19 +2933,7 @@ impl eframe::App for ZeroCadApp {
                             .clicked()
                         {
                             ui.memory_mut(|mem| mem.close_popup());
-                            self.save_design();
-                        }
-
-                        if icons::Icon::Save
-                            .menu_button(ui, "Save Design (lightweight)")
-                            .on_hover_text(
-                                "Smaller file: stores only the recipe, regenerating \
-                                 geometry on open.",
-                            )
-                            .clicked()
-                        {
-                            ui.memory_mut(|mem| mem.close_popup());
-                            self.save_design_lightweight();
+                            self.open_save_dialog();
                         }
 
                         if icons::Icon::Download

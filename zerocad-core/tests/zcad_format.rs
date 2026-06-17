@@ -2,6 +2,7 @@
 //! format, corruption is detected (never a panic), old plain-JSON files still
 //! load, and unknown sections/fields are tolerated for forward compatibility.
 
+use std::collections::HashSet;
 use zerocad_core::zcad_format::{read_zcad, write_zcad, ZcadDocument, ZcadError, MAGIC};
 use zerocad_core::{FeatureNode, FeatureType, ParametricGraph, Unit};
 
@@ -33,6 +34,7 @@ fn doc_for(graph: &ParametricGraph) -> ZcadDocument<'_> {
         units: Unit::Millimeter,
         bbox: [0.0; 6],
         created_unix: None,
+        hidden_nodes: HashSet::new(),
     }
 }
 
@@ -66,6 +68,7 @@ fn round_trip_with_thumbnail_and_mesh_cache() {
         units: Unit::Inch,
         bbox: [-1.0, -2.0, -3.0, 4.0, 5.0, 6.0],
         created_unix: Some(1_700_000_000),
+        hidden_nodes: HashSet::new(),
     };
     let bytes = write_zcad(&doc).expect("write");
     let loaded = read_zcad(&bytes).expect("read");

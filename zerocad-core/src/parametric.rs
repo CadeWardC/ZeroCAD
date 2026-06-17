@@ -1053,7 +1053,8 @@ fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> bool {
             });
             keeps_bulk && within
         }
-        _ => true,
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1542,6 +1543,27 @@ mod extrude_mode_tests {
             1,
             "join into overlapping body should stay one body (got {})",
             bodies.len()
+        );
+    }
+
+    #[test]
+    fn edge_mod_oversized_leaves_body_unchanged_and_warns() {
+        // A fillet of 30mm on a 10mm box is oversized and should be rejected,
+        // leaving the original body intact.
+        let g = box_with_edge_mod(30.0, crate::sketch::CornerKind::Fillet);
+        let (bodies, warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(bodies.len(), 1, "body must not disappear");
+        assert!(
+            !warnings.is_empty(),
+            "an oversized fillet should warn"
+        );
+        let mesh = &bodies[0].1;
+        let plain = MockMesh::make_box(10.0, 10.0, 10.0);
+        assert_eq!(
+            mesh.indices.len(), plain.indices.len(),
+            "oversized fillet must leave the body unchanged"
         );
     }
 }

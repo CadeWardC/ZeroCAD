@@ -37,6 +37,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mock_kernel::MockMesh;
@@ -58,6 +59,7 @@ const SEC_METADATA: u16 = 1;
 const SEC_GRAPH: u16 = 2;
 const SEC_THUMBNAIL: u16 = 3;
 const SEC_MESH_CACHE: u16 = 4;
+const SEC_HIDDEN_NODES: u16 = 5;
 
 // Codecs.
 const CODEC_STORE: u8 = 0;
@@ -102,6 +104,9 @@ pub struct ZcadDocument<'a> {
     pub bbox: [f32; 6],
     /// Creation timestamp to preserve across re-saves. `None` stamps "now".
     pub created_unix: Option<u64>,
+    /// Node ids the user has hidden in the feature tree. Persisted so visibility
+    /// state survives save/open.
+    pub hidden_nodes: HashSet<String>,
 }
 
 /// What [`read_zcad`] returns. `graph` is authoritative; everything else is
@@ -116,6 +121,8 @@ pub struct LoadedZcad {
     pub mesh_cache: Option<Vec<(String, MockMesh)>>,
     /// True when the file was an old plain-JSON `.zcad` loaded via the legacy path.
     pub was_legacy_json: bool,
+    /// Node ids that were hidden when the file was saved.
+    pub hidden_nodes: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -292,6 +299,19 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
         });
     }
 
+    // --- HIDDEN_NODES (optional, zstd) ---
+    if !doc.hidden_nodes.is_empty() {
+        let cbor = cbor_to_vec(&doc.hidden_nodes)?;
+        let uncompressed_len = cbor.len();
+        let stored = zstd_compress(&cbor, GRAPH_LEVEL)?;
+        sections.push(StagedSection {
+            id: SEC_HIDDEN_NODES,
+            codec: CODEC_ZSTD,
+            uncompressed_len,
+            stored,
+        });
+    }
+
     // --- Lay out the file ---
     let section_count = sections.len();
     let table_len = section_count * TABLE_ENTRY_LEN;
@@ -351,6 +371,7 @@ pub fn read_zcad(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
                 thumbnail_png: None,
                 mesh_cache: None,
                 was_legacy_json: true,
+                hidden_nodes: HashSet::new(),
             });
         }
     }
@@ -431,6 +452,7 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
     let mut graph_bytes: Option<Vec<u8>> = None;
     let mut thumbnail_png: Option<Vec<u8>> = None;
     let mut mesh_payload: Option<MeshCachePayload> = None;
+    let mut hidden_nodes: HashSet<String> = HashSet::new();
 
     for s in &sections {
         match s.id {
@@ -450,6 +472,10 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
                 let raw = decode_section(s)?;
                 mesh_payload = Some(cbor_from_slice(&raw)?);
             }
+            SEC_HIDDEN_NODES => {
+                let raw = decode_section(s)?;
+                hidden_nodes = cbor_from_slice(&raw)?;
+            }
             _ => { /* unknown section — skip for forward compatibility */ }
         }
     }
@@ -468,6 +494,7 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
         thumbnail_png,
         mesh_cache,
         was_legacy_json: false,
+        hidden_nodes,
     })
 }
 

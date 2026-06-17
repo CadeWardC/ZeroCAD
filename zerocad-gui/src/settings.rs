@@ -157,6 +157,22 @@ impl RecentFiles {
             Err(e) => log::warn!("Could not serialize recent list: {e}"),
         }
     }
+
+    /// De-duplicated parent directories from the recent entries list (newest
+    /// first), for populating the save dialog's "Recent Folders" section.
+    pub fn recent_folders(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        let mut folders = Vec::new();
+        for entry in &self.entries {
+            if let Some(parent) = entry.path.parent() {
+                let p = parent.to_path_buf();
+                if seen.insert(p.clone()) {
+                    folders.push(p);
+                }
+            }
+        }
+        folders
+    }
 }
 
 // ---------------------------------------------------------------------------
