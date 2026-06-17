@@ -2761,11 +2761,6 @@ impl eframe::App for ZeroCadApp {
 
                         ui.separator();
 
-                        if icons::Icon::New.menu_button(ui, "Welcome").clicked() {
-                            ui.memory_mut(|mem| mem.close_popup());
-                            self.onboarding_visible = true;
-                        }
-
                         if icons::Icon::Settings
                             .menu_button_hint(ui, "Settings", &hint(self, ShortcutAction::OpenSettings))
                             .clicked()

@@ -741,11 +741,10 @@ impl ZeroCadApp {
         // which egui renders sequentially). One painter.add per frame instead of
         // one per triangle eliminates the per-triangle vertex-buffer overhead.
         // PlaneSheets flush the current batch to maintain their painter's position
-        // in the depth-sorted sequence. Hairline seam strokes (flat faces only)
-        // are collected and emitted after the mesh so they draw on top of all
-        // opaque geometry without interrupting the batch.
+        // in the depth-sorted sequence. Real model edges are drawn in section F;
+        // drawing per-triangle seam outlines here exposes boolean tessellation
+        // diagonals as stray construction-like lines after Join/Cut operations.
         let mut batched_mesh = egui::Mesh::default();
-        let mut seam_strokes: Vec<egui::Shape> = Vec::new();
 
         let flush_batch = |mesh: &mut egui::Mesh, painter: &egui::Painter| {
             if !mesh.vertices.is_empty() {
@@ -764,19 +763,6 @@ impl ZeroCadApp {
                         batched_mesh.colored_vertex(*p, *c);
                     }
                     batched_mesh.add_triangle(base, base + 1, base + 2);
-
-                    // Hairline seam stroke for flat-shaded facets only (see the
-                    // longer comment in the single-triangle version above). Skipped
-                    // while the camera is moving — it's one closed_line (3 strokes)
-                    // per flat triangle, the heaviest per-triangle cost, and its
-                    // absence is imperceptible mid-orbit.
-                    let flat = colors[0] == colors[1] && colors[1] == colors[2];
-                    if !interacting && flat && colors[0].a() == 255 {
-                        seam_strokes.push(egui::Shape::closed_line(
-                            points.to_vec(),
-                            egui::Stroke::new(1.0, colors[0]),
-                        ));
-                    }
                 }
                 RenderItemContent::PlaneSheet {
                     points,
@@ -811,9 +797,8 @@ impl ZeroCadApp {
                 }
             }
         }
-        // Flush any remaining triangles, then draw seam strokes on top.
+        // Flush any remaining triangles.
         flush_batch(&mut batched_mesh, &painter);
-        painter.extend(seam_strokes);
 
         // F. Wireframe edges, drawn ON TOP of the solids with depth-buffer
         // hidden-line removal. Each edge is walked in screen space and only the
