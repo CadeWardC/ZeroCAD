@@ -2,6 +2,9 @@
 name = "zerocad-core"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Pure geometry and parametric-history engine for ZeroCAD (no UI, no GPU)."
+repository = "https://github.com/CadeWardC/ZeroCAD"
 
 [dependencies]
 petgraph.workspace = true

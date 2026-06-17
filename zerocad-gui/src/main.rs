@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use zerocad_core::{
@@ -13,12 +14,16 @@ mod extrude;
 mod geom2d;
 mod icons;
 mod render;
+mod settings;
+mod shortcuts;
 mod sketch_ui;
 mod theme;
+mod thumbnail;
 use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
 use geom2d::{circumcircle, dist_point_to_segment, is_point_in_quad, project_point_on_segment};
+use shortcuts::{Keymap, ShortcutAction};
 use sketch_ui::{dim_fields_for, DimInput};
 use theme::{apply_premium_dark_theme, apply_premium_light_theme, Palette};
 
@@ -238,15 +243,17 @@ enum RowAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
+    Shortcuts,
 }
 
 impl SettingsTab {
     /// Tabs shown in the left rail, in display order.
-    const ALL: &'static [SettingsTab] = &[SettingsTab::General];
+    const ALL: &'static [SettingsTab] = &[SettingsTab::General, SettingsTab::Shortcuts];
 
     fn label(self) -> &'static str {
         match self {
             SettingsTab::General => "General",
+            SettingsTab::Shortcuts => "Shortcuts",
         }
     }
 }
@@ -359,6 +366,12 @@ struct ZeroCadApp {
     /// only when the depth/targets change, not on every repaint (e.g. mouse moves
     /// over the viewport while the dialog is open).
     extrude_preview_mesh_cache: Option<(u64, MockMesh)>,
+    /// True while the user is actively push/pull dragging the extrude depth in
+    /// the viewport. During the drag we render only the cheap ghost tool volume
+    /// (`cached_preview_mesh`) following the cursor live, and SKIP the expensive
+    /// truck boolean (`cached_preview_extrude_bodies`). The real booleaned result
+    /// is computed once on release, when this flag clears.
+    extrude_depth_dragging: bool,
     /// Screen anchor for the inline extrude distance box (preview centroid).
     extrude_dim_pos: Option<egui::Pos2>,
     /// Active (uncommitted) 3D edge fillet/chamfer with its live preview, if any.
@@ -380,6 +393,13 @@ struct ZeroCadApp {
     /// Node ids (sketches or bodies) the user has hidden in the browser.
     hidden_nodes: HashSet<String>,
 
+    /// Snapshot stack for Undo (Ctrl+Z). Each entry is a serialized
+    /// `ParametricGraph`; capped at 50 entries to bound memory.
+    undo_stack: Vec<String>,
+    /// Snapshot stack for Redo (Ctrl+Y / Ctrl+Shift+Z). Cleared whenever a new
+    /// destructive change is committed.
+    redo_stack: Vec<String>,
+
     /// Active shape-dimension dialog (after the first click of a shape).
     dim_input: Option<DimInput>,
     /// Screen anchor (last cursor position) for placing the dimension dialog.
@@ -399,6 +419,12 @@ struct ZeroCadApp {
     show_preferences: bool,
     /// Which tab is selected in the Settings window.
     settings_tab: SettingsTab,
+    /// User-configurable keyboard shortcuts (loaded from disk on startup).
+    keymap: Keymap,
+    /// The action whose binding the Shortcuts tab is currently capturing a new
+    /// key for, if any. While `Some`, the next key press is recorded as its new
+    /// binding and the normal shortcut dispatcher is suspended.
+    capturing_shortcut: Option<ShortcutAction>,
     /// Whether the onboarding screen is shown on startup.
     show_onboarding: bool,
     /// Dark theme toggle.
@@ -420,11 +446,28 @@ struct ZeroCadApp {
     /// The single live variable-name autocomplete popup shared by every
     /// dimension field (sketch + extrude). `None` when no popup is open.
     autocomplete: Option<Autocomplete>,
+
+    /// Recently saved/opened `.zcad` projects (newest first), shown on the
+    /// onboarding screen. Loaded from disk on startup; missing files pruned.
+    recent_files: settings::RecentFiles,
+    /// Whether the onboarding (Welcome) card is showing **right now**. Seeded
+    /// from the persisted `show_onboarding` preference at startup, but distinct
+    /// from it: dismissing the card for this session doesn't change the
+    /// "pop up on startup" preference.
+    onboarding_visible: bool,
+    /// Lazily-uploaded GPU textures for Recent thumbnails, keyed by project path,
+    /// so the onboarding screen uploads each `.thumb` to egui only once.
+    onboarding_textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Last preference snapshot persisted to `settings.json`. Compared at the end
+    /// of every frame so any change to the unit / dark mode / onboarding toggle
+    /// is saved without threading a save call through each edit site.
+    settings_baseline: settings::AppSettings,
 }
 
 impl ZeroCadApp {
     fn new() -> Self {
         let graph = ParametricGraph::new();
+        let prefs = settings::AppSettings::load();
 
         Self {
             graph,
@@ -475,6 +518,7 @@ impl ZeroCadApp {
             extrude_op: None,
             extrude_preview_cache: None,
             extrude_preview_mesh_cache: None,
+            extrude_depth_dragging: false,
             extrude_dim_pos: None,
             edge_mod_op: None,
             edge_mod_dim_pos: None,
@@ -482,21 +526,29 @@ impl ZeroCadApp {
             corner_dim_pos: None,
             corner_handle: None,
             hidden_nodes: HashSet::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             dim_input: None,
             dim_anchor: None,
             last_cursor: None,
             dim_screen_positions: Vec::new(),
             id_counter: 1,
-            current_unit: Unit::Millimeter,
+            current_unit: prefs.unit,
             show_preferences: false,
             settings_tab: SettingsTab::General,
-            show_onboarding: true,
-            dark_mode: false,
+            keymap: Keymap::load(),
+            capturing_shortcut: None,
+            show_onboarding: prefs.show_onboarding,
+            dark_mode: prefs.dark_mode,
             theme_applied: None,
             renaming_node: None,
             rename_buffer: String::new(),
             rename_focus_pending: false,
             autocomplete: None,
+            recent_files: settings::RecentFiles::load(),
+            onboarding_visible: prefs.show_onboarding,
+            onboarding_textures: HashMap::new(),
+            settings_baseline: prefs,
         }
     }
 
@@ -1708,6 +1760,554 @@ impl ZeroCadApp {
 
     /// Recalculates the geometry after a parametric history change (skipping
     /// hidden bodies).
+    /// Snapshot the current `ParametricGraph` onto the undo stack (capped at 50)
+    /// and clear the redo stack. Call before any destructive graph mutation.
+    pub(crate) fn push_undo(&mut self) {
+        if let Ok(snap) = serde_json::to_string(&self.graph) {
+            if self.undo_stack.len() >= 50 {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(snap);
+            self.redo_stack.clear();
+        }
+    }
+
+    /// Restore the previous graph snapshot (Ctrl+Z).
+    pub(crate) fn undo(&mut self) {
+        if let Some(snap) = self.undo_stack.pop() {
+            if let Ok(current) = serde_json::to_string(&self.graph) {
+                self.redo_stack.push(current);
+            }
+            if let Ok(graph) = serde_json::from_str::<zerocad_core::ParametricGraph>(&snap) {
+                self.graph = graph;
+                self.selected_node_id = None;
+                self.selected_faces.clear();
+                self.selected_body.clear();
+                self.extrude_op = None;
+                self.edge_mod_op = None;
+                self.reevaluate_geometry();
+                self.status_msg = "Undo.".to_string();
+            }
+        } else {
+            self.status_msg = "Nothing to undo.".to_string();
+        }
+    }
+
+    /// Reapply the previously undone change (Ctrl+Y / Ctrl+Shift+Z).
+    pub(crate) fn redo(&mut self) {
+        if let Some(snap) = self.redo_stack.pop() {
+            if let Ok(current) = serde_json::to_string(&self.graph) {
+                if self.undo_stack.len() >= 50 {
+                    self.undo_stack.remove(0);
+                }
+                self.undo_stack.push(current);
+            }
+            if let Ok(graph) = serde_json::from_str::<zerocad_core::ParametricGraph>(&snap) {
+                self.graph = graph;
+                self.selected_node_id = None;
+                self.selected_faces.clear();
+                self.selected_body.clear();
+                self.extrude_op = None;
+                self.edge_mod_op = None;
+                self.reevaluate_geometry();
+                self.status_msg = "Redo.".to_string();
+            }
+        } else {
+            self.status_msg = "Nothing to redo.".to_string();
+        }
+    }
+
+    /// Replace the model with a fresh empty design (undoable).
+    pub(crate) fn new_design(&mut self) {
+        log::info!("Creating new empty model.");
+        self.push_undo();
+        self.graph = ParametricGraph::new();
+        self.body_meshes = Vec::new();
+        self.mesh_stats = (0, 0);
+        self.selected_node_id = None;
+        self.reset_sketch_state();
+        self.selected_faces.clear();
+        self.selected_edges.clear();
+        self.selected_body.clear();
+        self.status_msg = "New blank design created.".to_string();
+    }
+
+    /// Prompt for a path and serialize the parametric graph to a `.zcad` file.
+    pub(crate) fn save_design(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save ZeroCAD Design")
+            .add_filter("ZeroCAD Design", &["zcad"])
+            .save_file()
+        else {
+            return;
+        };
+        match serde_json::to_string_pretty(&self.graph) {
+            Ok(json) => match std::fs::write(&path, json) {
+                Ok(()) => {
+                    log::info!("Design saved to {:?}", path);
+                    self.status_msg = format!("Design saved to {}", path.display());
+                    self.remember_project(&path);
+                }
+                Err(e) => self.status_msg = format!("Save failed: {e}"),
+            },
+            Err(e) => self.status_msg = format!("Serialization failed: {e}"),
+        }
+    }
+
+    /// Record `path` in the recent-projects list and (re)bake a thumbnail of the
+    /// currently-evaluated bodies for the onboarding screen. Called after a
+    /// successful save/open, when `body_meshes` reflects `path`'s model.
+    fn remember_project(&mut self, path: &Path) {
+        self.recent_files.record(path);
+        if !self.body_meshes.is_empty() {
+            let (w, h, rgba) = thumbnail::render_thumbnail(&self.body_meshes, 256);
+            settings::save_thumb(path, w, h, &rgba);
+        }
+        // Drop any stale cached texture so the next onboarding render reloads it.
+        self.onboarding_textures.remove(path);
+    }
+
+    /// Fetch (uploading once, then caching) the egui texture for a project's
+    /// cached thumbnail, or `None` if there's no `.thumb` for it yet.
+    fn thumb_texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.onboarding_textures.get(path) {
+            return Some(t.clone());
+        }
+        let (w, h, rgba) = settings::load_thumb(path)?;
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+        let tex = ctx.load_texture(
+            format!("thumb_{}", path.display()),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.onboarding_textures.insert(path.to_path_buf(), tex.clone());
+        Some(tex)
+    }
+
+    /// The centered Welcome modal: New / Open / Recent. Drawn over a dimmed,
+    /// click-swallowing backdrop so the workspace beneath is inert. A no-op
+    /// unless `onboarding_visible`. Esc, the Close button, or choosing any action
+    /// dismisses it (without touching the persisted "show on startup" preference,
+    /// which the footer checkbox edits separately).
+    fn draw_onboarding(&mut self, ctx: &egui::Context) {
+        if !self.onboarding_visible {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.onboarding_visible = false;
+            return;
+        }
+
+        let pal = self.pal();
+
+        // Dim + swallow input to the workspace behind the card (Middle sits above
+        // the Background panels but below the Foreground card).
+        egui::Area::new(egui::Id::new("onboarding_dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+            });
+
+        // Top 5 recents, snapshotted (path + display name) so the draw closure
+        // borrows locals, not `self.recent_files`. Textures are pre-loaded for
+        // the same reason (uploading mutably borrows `self`).
+        let recents: Vec<(PathBuf, String)> = self
+            .recent_files
+            .entries
+            .iter()
+            .take(5)
+            .map(|e| {
+                let name = e
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| e.path.to_string_lossy().into_owned());
+                (e.path.clone(), name)
+            })
+            .collect();
+        let textures: Vec<Option<egui::TextureHandle>> = recents
+            .iter()
+            .map(|(p, _)| self.thumb_texture(ctx, p))
+            .collect();
+
+        let mut do_new = false;
+        let mut do_open = false;
+        let mut open_recent: Option<PathBuf> = None;
+        let mut close = false;
+
+        // The window defaults to Order::Middle and is registered after the dim
+        // Area (also Middle), so it draws on top of the dim — and both sit above
+        // the Background-order workspace panels.
+        egui::Window::new("onboarding_window")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(egui::vec2(560.0, 430.0))
+            .frame(egui::Frame::window(&ctx.style()).inner_margin(egui::Margin::same(22.0)))
+            .show(ctx, |ui| {
+                // Brand title.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 1.0;
+                    ui.label(
+                        egui::RichText::new("Welcome to ")
+                            .size(22.0)
+                            .color(pal.text_strong),
+                    );
+                    ui.label(
+                        egui::RichText::new("Zero")
+                            .strong()
+                            .size(22.0)
+                            .color(pal.text_strong),
+                    );
+                    ui.label(
+                        egui::RichText::new("CAD")
+                            .strong()
+                            .size(22.0)
+                            .color(egui::Color32::from_rgb(37, 99, 235)),
+                    );
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Start a new project, open one, or pick up where you left off.")
+                        .size(13.0)
+                        .color(pal.text_muted),
+                );
+                ui.add_space(16.0);
+
+                // New / Open.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if icons::Icon::New
+                        .labeled_button(
+                            ui,
+                            "New Project",
+                            egui::Color32::from_rgb(37, 99, 235),
+                            egui::Color32::from_rgb(29, 78, 216),
+                            egui::Color32::WHITE,
+                            egui::Stroke::NONE,
+                        )
+                        .clicked()
+                    {
+                        do_new = true;
+                    }
+                    if icons::Icon::Folder
+                        .labeled_button(
+                            ui,
+                            "Open Project",
+                            egui::Color32::from_rgb(241, 245, 249),
+                            egui::Color32::from_rgb(226, 232, 240),
+                            pal.text_body,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                        )
+                        .clicked()
+                    {
+                        do_open = true;
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Recent")
+                        .strong()
+                        .size(14.0)
+                        .color(pal.text_strong),
+                );
+                ui.add_space(8.0);
+
+                if recents.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("No recent projects yet.")
+                                .size(13.0)
+                                .color(pal.text_muted),
+                        );
+                        ui.label(
+                            egui::RichText::new("Saved and opened projects will appear here.")
+                                .size(12.0)
+                                .color(pal.text_muted),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        for ((path, name), tex) in recents.iter().zip(textures.iter()) {
+                            if Self::recent_card(ui, &pal, name, tex.as_ref())
+                                .on_hover_text(path.to_string_lossy())
+                                .clicked()
+                            {
+                                open_recent = Some(path.clone());
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.show_onboarding, "Show on startup");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("Close").min_size(egui::vec2(80.0, 28.0)))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        // Apply deferred actions (outside the borrow of the draw closure).
+        if do_new {
+            self.new_design();
+            self.onboarding_visible = false;
+        } else if do_open {
+            self.open_design();
+            self.onboarding_visible = false;
+        } else if let Some(path) = open_recent {
+            self.load_design_from(path);
+            self.onboarding_visible = false;
+        } else if close {
+            self.onboarding_visible = false;
+        }
+    }
+
+    /// One clickable Recent card: thumbnail (or placeholder) above the project
+    /// name, with a hover highlight. Returns its click response.
+    fn recent_card(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        name: &str,
+        tex: Option<&egui::TextureHandle>,
+    ) -> egui::Response {
+        const CARD: egui::Vec2 = egui::vec2(96.0, 120.0);
+        const IMG: f32 = 84.0;
+        let (rect, resp) = ui.allocate_exact_size(CARD, egui::Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return resp;
+        }
+        let painter = ui.painter();
+        let hovered = resp.hovered();
+        painter.rect(
+            rect,
+            6.0,
+            if hovered {
+                egui::Color32::from_rgb(226, 232, 240)
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+            if hovered {
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(37, 99, 235))
+            } else {
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225))
+            },
+        );
+        let img_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - IMG * 0.5, rect.top() + 6.0),
+            egui::vec2(IMG, IMG),
+        );
+        match tex {
+            Some(t) => {
+                painter.image(
+                    t.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                painter.rect_filled(img_rect, 4.0, egui::Color32::from_rgb(238, 241, 245));
+                let icon = egui::Rect::from_center_size(img_rect.center(), egui::vec2(28.0, 28.0));
+                icons::Icon::Sketch.draw(painter, icon, pal.text_muted);
+            }
+        }
+        // Project name, truncated to fit.
+        let label: String = if name.chars().count() > 13 {
+            format!("{}…", name.chars().take(12).collect::<String>())
+        } else {
+            name.to_string()
+        };
+        painter.text(
+            egui::pos2(rect.center().x, img_rect.bottom() + 8.0),
+            egui::Align2::CENTER_TOP,
+            label,
+            egui::FontId::proportional(12.0),
+            pal.text_body,
+        );
+        resp
+    }
+
+    /// Prompt for a `.zcad` file and load it, replacing the current model.
+    pub(crate) fn open_design(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open ZeroCAD Design")
+            .add_filter("ZeroCAD Design", &["zcad"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.load_design_from(path);
+    }
+
+    /// Load the `.zcad` file at `path`, replacing the current model (undoable).
+    /// Selection / preview state is reset to match the new graph. Shared by the
+    /// Open dialog and the onboarding Recent list.
+    pub(crate) fn load_design_from(&mut self, path: PathBuf) {
+        let json = match std::fs::read_to_string(&path) {
+            Ok(j) => j,
+            Err(e) => {
+                self.status_msg = format!("Could not read file: {e}");
+                return;
+            }
+        };
+        match serde_json::from_str::<zerocad_core::ParametricGraph>(&json) {
+            Ok(graph) => {
+                self.push_undo();
+                self.graph = graph;
+                self.selected_node_id = None;
+                self.selected_faces.clear();
+                self.selected_edges.clear();
+                self.selected_body.clear();
+                self.hidden_nodes.clear();
+                self.extrude_op = None;
+                self.edge_mod_op = None;
+                self.reevaluate_geometry();
+                self.status_msg = format!("Design loaded from {}", path.display());
+                self.remember_project(&path);
+            }
+            Err(e) => self.status_msg = format!("Load failed: {e}"),
+        }
+    }
+
+    /// Prompt for a path and write all current bodies as one binary STL mesh.
+    /// STL is a triangle soup (no history/units), so this is export-only — the
+    /// editable document stays the `.zcad` JSON.
+    pub(crate) fn export_stl(&mut self) {
+        if self.body_meshes.is_empty() {
+            self.status_msg = "Nothing to export — the model has no solid bodies.".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export STL")
+            .add_filter("STL mesh", &["stl"])
+            .save_file()
+        else {
+            return;
+        };
+        let bytes = zerocad_core::meshes_to_binary_stl(self.body_meshes.iter().map(|(_, m)| m));
+        let tris = bytes.len().saturating_sub(84) / 50;
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                log::info!("Exported STL to {:?} ({tris} triangles)", path);
+                self.status_msg = format!("Exported {tris} triangles to {}", path.display());
+            }
+            Err(e) => self.status_msg = format!("STL export failed: {e}"),
+        }
+    }
+
+    /// Delete the currently selected browser node (sketch/body/variable set), if
+    /// any (undoable). Mirrors the per-row delete button in the document browser.
+    pub(crate) fn delete_selected_node(&mut self) {
+        let Some(del_id) = self.selected_node_id.clone() else {
+            self.status_msg = "Nothing selected to delete.".to_string();
+            return;
+        };
+        let target = self
+            .graph
+            .graph
+            .node_indices()
+            .find(|idx| self.graph.graph[*idx].id == del_id);
+        if let Some(idx) = target {
+            self.push_undo();
+            self.graph.graph.remove_node(idx);
+            self.selected_node_id = None;
+            self.selected_faces.retain(|(sid, _)| sid != &del_id);
+            self.selected_edges.retain(|(sid, _)| sid != &del_id);
+            self.selected_body.retain(|(nid, _)| nid != &del_id);
+            self.hidden_nodes.remove(&del_id);
+            self.reevaluate_geometry();
+            self.status_msg = "Deleted selection.".to_string();
+        }
+    }
+
+    /// Run a keyboard-shortcut action. Single dispatch point shared by the global
+    /// hotkey handler and (where relevant) menu items.
+    fn run_shortcut(&mut self, action: ShortcutAction) {
+        match action {
+            ShortcutAction::NewDesign => self.new_design(),
+            ShortcutAction::OpenDesign => self.open_design(),
+            ShortcutAction::SaveDesign => self.save_design(),
+            ShortcutAction::ExportStl => self.export_stl(),
+            ShortcutAction::Undo => self.undo(),
+            ShortcutAction::Redo => self.redo(),
+            ShortcutAction::DeleteSelection => self.delete_selected_node(),
+            ShortcutAction::ToggleTheme => self.dark_mode = !self.dark_mode,
+            ShortcutAction::OpenSettings => self.show_preferences = true,
+        }
+    }
+
+    /// Process global keyboard shortcuts, or capture a new binding when the
+    /// Shortcuts settings tab is waiting for one. Called first thing each frame,
+    /// before any UI, so bindings fire regardless of which panel is hovered.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Rebinding capture mode: the Shortcuts tab is waiting for a key combo.
+        if let Some(action) = self.capturing_shortcut {
+            // Escape cancels the capture, leaving the existing binding intact.
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.capturing_shortcut = None;
+                return;
+            }
+            let captured = ctx.input(|i| {
+                i.events.iter().find_map(|ev| match ev {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+            });
+            if let Some((key, mods)) = captured {
+                self.keymap.set(action, shortcuts::Hotkey::from_event(key, mods));
+                self.keymap.save();
+                self.capturing_shortcut = None;
+            }
+            // Suppress normal dispatch while capturing so the captured combo does
+            // not also trigger an action on this frame.
+            return;
+        }
+
+        // Normal dispatch. Skip entirely while a widget holds keyboard focus, so
+        // typing in a text field (dimensions, variable names, …) never fires a
+        // command. At most one action runs per frame.
+        if ctx.memory(|m| m.focus().is_some()) {
+            return;
+        }
+        let mut fire = None;
+        for &action in ShortcutAction::ALL {
+            if let Some(hk) = self.keymap.get(action) {
+                if hk.pressed(ctx) {
+                    fire = Some(action);
+                    break;
+                }
+            }
+        }
+        if let Some(action) = fire {
+            self.run_shortcut(action);
+        }
+    }
+
     fn reevaluate_geometry(&mut self) {
         match self.graph.evaluate_bodies_with_warnings(&self.hidden_nodes) {
             Ok((bodies, warnings)) => {
@@ -1737,6 +2337,12 @@ impl ZeroCadApp {
 
 impl eframe::App for ZeroCadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // While the Welcome modal is up the workspace is inert, so its hotkeys
+        // are suppressed (the modal reads Esc itself).
+        if !self.onboarding_visible {
+            self.handle_shortcuts(ctx);
+        }
+
         // Apply the active theme aesthetics (light by default, optional dark).
         // Rebuilding the egui Visuals + Style is costly, so only do it when the
         // theme actually changed rather than on every frame.
@@ -1748,6 +2354,9 @@ impl eframe::App for ZeroCadApp {
             }
             self.theme_applied = Some(self.dark_mode);
         }
+
+        // Welcome modal (drawn as a Foreground layer over everything below).
+        self.draw_onboarding(ctx);
 
         // Handle camera animation interpolation if active
         if self.camera_anim_active {
@@ -1797,12 +2406,12 @@ impl eframe::App for ZeroCadApp {
                     // Fixed-height row so the vertical separator below doesn't
                     // stretch to fill the whole (auto-sized) window.
                     ui.allocate_ui_with_layout(
-                        egui::vec2(444.0, 200.0),
+                        egui::vec2(444.0, 270.0),
                         egui::Layout::left_to_right(egui::Align::Min),
                         |ui| {
                         // Left rail: tab list.
                         ui.allocate_ui_with_layout(
-                            egui::vec2(110.0, 200.0),
+                            egui::vec2(110.0, 270.0),
                             egui::Layout::top_down_justified(egui::Align::Min),
                             |ui| {
                                 for &tab in SettingsTab::ALL {
@@ -1840,6 +2449,87 @@ impl eframe::App for ZeroCadApp {
 
                                     // --- Onboarding ---
                                     ui.checkbox(&mut self.show_onboarding, "Onboarding Screen");
+                                }
+                                SettingsTab::Shortcuts => {
+                                    ui.label(
+                                        egui::RichText::new("Keyboard shortcuts").strong(),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.weak(
+                                        "Click a shortcut, then press the new combo. Esc cancels.",
+                                    );
+                                    ui.add_space(8.0);
+
+                                    // Deferred mutations so the keymap isn't borrowed
+                                    // mutably while the rows read it.
+                                    let mut toggle_capture: Option<ShortcutAction> = None;
+                                    let mut clear_action: Option<ShortcutAction> = None;
+
+                                    egui::ScrollArea::vertical()
+                                        .max_height(190.0)
+                                        .show(ui, |ui| {
+                                            for &action in ShortcutAction::ALL {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_sized(
+                                                        [150.0, 24.0],
+                                                        egui::Label::new(action.label()),
+                                                    );
+                                                    let capturing =
+                                                        self.capturing_shortcut == Some(action);
+                                                    let text = if capturing {
+                                                        "Press a key…".to_string()
+                                                    } else {
+                                                        self.keymap
+                                                            .get(action)
+                                                            .map(|h| h.label())
+                                                            .unwrap_or_else(|| "Unbound".to_string())
+                                                    };
+                                                    let mut btn = egui::Button::new(text)
+                                                        .min_size(egui::vec2(120.0, 24.0));
+                                                    if capturing {
+                                                        btn = btn.fill(egui::Color32::from_rgb(
+                                                            0, 120, 215,
+                                                        ));
+                                                    }
+                                                    if ui.add(btn).clicked() {
+                                                        toggle_capture = Some(action);
+                                                    }
+                                                    if ui
+                                                        .small_button("✕")
+                                                        .on_hover_text("Unbind")
+                                                        .clicked()
+                                                    {
+                                                        clear_action = Some(action);
+                                                    }
+                                                });
+                                                ui.add_space(2.0);
+                                            }
+                                        });
+
+                                    ui.add_space(10.0);
+                                    if ui.button("Reset to defaults").clicked() {
+                                        self.keymap.reset_to_defaults();
+                                        self.keymap.save();
+                                        self.capturing_shortcut = None;
+                                    }
+
+                                    // Apply the deferred row actions.
+                                    if let Some(action) = toggle_capture {
+                                        // Clicking the row already capturing cancels it.
+                                        self.capturing_shortcut =
+                                            if self.capturing_shortcut == Some(action) {
+                                                None
+                                            } else {
+                                                Some(action)
+                                            };
+                                    }
+                                    if let Some(action) = clear_action {
+                                        self.keymap.unbind(action);
+                                        self.keymap.save();
+                                        if self.capturing_shortcut == Some(action) {
+                                            self.capturing_shortcut = None;
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -1899,38 +2589,62 @@ impl eframe::App for ZeroCadApp {
                     file_btn_id,
                     &file_btn,
                     |ui| {
-                        ui.set_min_width(140.0);
+                        ui.set_min_width(180.0);
                         ui.style_mut().spacing.button_padding = egui::vec2(16.0, 6.0);
 
-                        if icons::Icon::New.menu_button(ui, "New Design").clicked() {
+                        // Shortcut hint for a menu action, taken from the live keymap.
+                        let hint = |app: &ZeroCadApp, action: ShortcutAction| {
+                            app.keymap
+                                .get(action)
+                                .map(|h| h.label())
+                                .unwrap_or_default()
+                        };
+
+                        if icons::Icon::New
+                            .menu_button_hint(ui, "New Design", &hint(self, ShortcutAction::NewDesign))
+                            .clicked()
+                        {
                             ui.memory_mut(|mem| mem.close_popup());
-                            log::info!("Creating new empty model.");
-                            self.graph = ParametricGraph::new();
-                            self.body_meshes = Vec::new();
-                            self.mesh_stats = (0, 0);
-                            self.selected_node_id = None;
-                            self.reset_sketch_state();
-                            self.selected_faces.clear();
-                            self.selected_edges.clear();
-                            self.selected_body.clear();
-                            self.status_msg = "New blank design created.".to_string();
+                            self.new_design();
                         }
 
-                        if icons::Icon::Save.menu_button(ui, "Save Design").clicked() {
+                        if icons::Icon::Save
+                            .menu_button_hint(ui, "Save Design", &hint(self, ShortcutAction::SaveDesign))
+                            .clicked()
+                        {
                             ui.memory_mut(|mem| mem.close_popup());
-                            log::info!("Saving design.");
-                            self.status_msg = "Design saved successfully.".to_string();
+                            self.save_design();
                         }
 
-                        if icons::Icon::Download.menu_button(ui, "Export Design").clicked() {
+                        if icons::Icon::Download
+                            .menu_button_hint(ui, "Open Design", &hint(self, ShortcutAction::OpenDesign))
+                            .clicked()
+                        {
                             ui.memory_mut(|mem| mem.close_popup());
-                            log::info!("Exporting design.");
-                            self.status_msg = "Mesh exported successfully.".to_string();
+                            self.open_design();
                         }
 
                         ui.separator();
 
-                        if icons::Icon::Settings.menu_button(ui, "Settings").clicked() {
+                        if icons::Icon::Download
+                            .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
+                            .clicked()
+                        {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.export_stl();
+                        }
+
+                        ui.separator();
+
+                        if icons::Icon::New.menu_button(ui, "Welcome").clicked() {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.onboarding_visible = true;
+                        }
+
+                        if icons::Icon::Settings
+                            .menu_button_hint(ui, "Settings", &hint(self, ShortcutAction::OpenSettings))
+                            .clicked()
+                        {
                             ui.memory_mut(|mem| mem.close_popup());
                             log::info!("Opening Settings window.");
                             self.show_preferences = true;
@@ -1988,6 +2702,7 @@ impl eframe::App for ZeroCadApp {
                                 },
                             };
 
+                            self.push_undo();
                             self.graph.add_feature(sketch_node);
                             self.selected_node_id = Some(sketch_id);
                             self.reset_sketch_state();
@@ -2605,11 +3320,11 @@ impl eframe::App for ZeroCadApp {
                             }
                         }
                         if let Some(idx) = target {
+                            self.push_undo();
                             self.graph.graph.remove_node(idx);
                             if self.selected_node_id.as_deref() == Some(del_id.as_str()) {
                                 self.selected_node_id = None;
                             }
-                            // Drop any selected faces/edges belonging to the deleted sketch.
                             self.selected_faces.retain(|(sid, _)| sid != &del_id);
                             self.selected_edges.retain(|(sid, _)| sid != &del_id);
                             self.selected_body.retain(|(nid, _)| nid != &del_id);
@@ -3386,6 +4101,10 @@ impl eframe::App for ZeroCadApp {
                                     op.depth = (op.depth + delta).clamp(-300.0, 300.0);
                                     // Mirror the dragged value into the inline box.
                                     op.depth_text = format!("{:.2}", op.depth);
+                                    // Live ghost mode: while pushing/pulling we show
+                                    // only the cheap tool volume, deferring the truck
+                                    // boolean until the button is released.
+                                    self.extrude_depth_dragging = true;
                                 }
                             }
                         }
@@ -3401,6 +4120,13 @@ impl eframe::App for ZeroCadApp {
                                 .clamp(-std::f32::consts::FRAC_PI_2 + 0.05, std::f32::consts::FRAC_PI_2 - 0.05);
                         }
                     }
+                }
+
+                // End of a push/pull: once the primary button is released, drop
+                // the live-ghost flag so this frame's draw_viewport (below) runs
+                // the deferred truck boolean once and shows the real result.
+                if self.extrude_depth_dragging && !ctx.input(|i| i.pointer.primary_down()) {
+                    self.extrude_depth_dragging = false;
                 }
 
                 // Zoom: Mouse scroll
@@ -3859,6 +4585,20 @@ impl eframe::App for ZeroCadApp {
                     "Tool deselected — select faces, edges, or points.".to_string();
                 log::info!("Escape: switched to Select mode");
             }
+        }
+
+        // Persist preferences whenever the unit, theme, or onboarding toggle
+        // changed this frame. One diff against the last-saved snapshot covers
+        // every edit site (Settings window, Ctrl+D theme toggle, the Welcome
+        // footer checkbox) without threading a save into each.
+        let current = settings::AppSettings {
+            show_onboarding: self.show_onboarding,
+            dark_mode: self.dark_mode,
+            unit: self.current_unit,
+        };
+        if current != self.settings_baseline {
+            current.save();
+            self.settings_baseline = current;
         }
     }
 }

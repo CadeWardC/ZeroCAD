@@ -162,6 +162,52 @@ impl Icon {
         }
         resp
     }
+
+    /// Like [`menu_button`](Self::menu_button) but with a right-aligned, dimmed
+    /// keyboard-shortcut hint (e.g. "Ctrl+S"). An empty `hint` renders the same
+    /// as a plain menu button.
+    pub fn menu_button_hint(&self, ui: &mut egui::Ui, label: &str, hint: &str) -> egui::Response {
+        let h = 24.0f32;
+        let w = ui.available_width().max(140.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let is_hovered = resp.hovered();
+            let fill = if is_hovered {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            ui.painter().rect(rect, 4.0, fill, egui::Stroke::NONE);
+
+            let icon_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 6.0, rect.center().y - 8.0),
+                egui::vec2(16.0, 16.0),
+            );
+            let text_color = if is_hovered {
+                ui.visuals().widgets.hovered.fg_stroke.color
+            } else {
+                ui.visuals().widgets.inactive.fg_stroke.color
+            };
+            self.draw(ui.painter(), icon_rect, text_color);
+            ui.painter().text(
+                egui::pos2(icon_rect.right() + 8.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                text_color,
+            );
+            if !hint.is_empty() {
+                ui.painter().text(
+                    egui::pos2(rect.right() - 8.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    hint,
+                    egui::FontId::proportional(11.0),
+                    text_color.gamma_multiply(0.65),
+                );
+            }
+        }
+        resp
+    }
 }
 
 /// How finely cubic Béziers are sampled. 10 segments is smooth at icon scale.

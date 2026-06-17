@@ -78,6 +78,13 @@ impl MockMesh {
         // Shift incoming face ids past ours so the two meshes' faces stay distinct.
         let f_offset = self.max_face_id().map_or(0, |m| m + 1);
 
+        self.vertices.reserve(other.vertices.len());
+        self.indices.reserve(other.indices.len());
+        self.edge_vertices.reserve(other.edge_vertices.len());
+        self.edge_indices.reserve(other.edge_indices.len());
+        self.edge_face_normals.reserve(other.edge_face_normals.len());
+        self.face_ids.reserve(other.face_ids.len());
+
         self.vertices.extend(other.vertices);
         for idx in other.indices {
             self.indices.push(idx + v_offset);
@@ -86,7 +93,6 @@ impl MockMesh {
         for idx in other.edge_indices {
             self.edge_indices.push(idx + e_offset);
         }
-        // Per-edge data, parallel to edge pairs — no index rebasing needed.
         self.edge_face_normals.extend(other.edge_face_normals);
         for fid in other.face_ids {
             self.face_ids.push(fid + f_offset);

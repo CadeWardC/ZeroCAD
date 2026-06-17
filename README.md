@@ -33,7 +33,10 @@ ZeroCAD/
 `zerocad-core` knows nothing about the GUI. The GUI mutates a
 `ParametricGraph`, calls `evaluate_bodies*`, and renders the resulting meshes.
 Everything in core is `Serialize`/`Deserialize`, so the whole document is one
-JSON blob (the foundation for save/load and undo/redo, neither wired up yet).
+JSON blob — the foundation for **Save/Load** (`.zcad` files) and the snapshot
+**Undo/Redo** stack, both wired up in the GUI. The same tessellated meshes feed
+**binary STL export** (`zerocad_core::stl`) for handing models to slicers and
+mesh tools.
 
 ## Running
 
@@ -41,6 +44,13 @@ JSON blob (the foundation for save/load and undo/redo, neither wired up yet).
 cargo run --release      # release strongly recommended — the truck solver is CPU-heavy
 cargo test --workspace
 ```
+
+## Keyboard shortcuts
+
+Common actions are bound to keys and **rebindable** under *Settings → Shortcuts*
+(persisted to the OS config dir). Defaults: New `Ctrl+N`, Open `Ctrl+O`, Save
+`Ctrl+S`, Export STL `Ctrl+E`, Undo `Ctrl+Z`, Redo `Ctrl+Y`, Delete `Delete`,
+Toggle Dark Mode `Ctrl+D`, Settings `Ctrl+,`.
 
 ---
 
@@ -389,6 +399,20 @@ lever and a near-total rewrite of this file.
   geometry actually changed (e.g. a cut adds hole-wall triangles), not just
   counts. This is the executable spec; add to it when you add a feature.
 - `tests/bool_matrix.rs`, `tests/cylinder_tests.rs`, `tests/parametric_tests.rs`.
+- `tests/serialization.rs` — `.zcad` JSON round-trip and graceful handling of a
+  corrupt document. `stl::tests` covers binary STL export.
 
-Gaps worth filling: serialization round-trips, performance benchmarks, and
-property-based tests over random profiles.
+Gaps worth filling: performance benchmarks and property-based tests over random
+profiles.
+
+---
+
+## Contributing & license
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/style conventions and the
+"adding a feature" checklist. CI (GitHub Actions) builds and tests the workspace
+on Windows and the core engine on Linux on every push and PR.
+
+ZeroCAD is licensed under either of [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE) at your option. Unless you state otherwise, any
+contribution you submit is dual-licensed under the same terms.

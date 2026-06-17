@@ -152,6 +152,15 @@ impl ZeroCadApp {
             }
             self.id_counter.hash(&mut h);
             self.hidden_nodes.len().hash(&mut h);
+            // Include variable values so that editing a dimension variable while
+            // the extrude dialog is open invalidates the cached boolean result.
+            let vars = self.graph.variable_map();
+            let mut var_keys: Vec<&String> = vars.keys().collect();
+            var_keys.sort();
+            for k in var_keys {
+                k.hash(&mut h);
+                ((vars[k] * 1000.0) as i64).hash(&mut h);
+            }
             h.finish()
         };
         if let Some((cached_key, bodies)) = self.extrude_preview_cache.as_ref() {
@@ -521,6 +530,7 @@ impl ZeroCadApp {
         let Some(op) = self.extrude_op.take() else {
             return;
         };
+        self.push_undo();
         self.extrude_depth = op.depth; // remember for next time
         self.extrude_mode = op.mode; // remember the mode too
 

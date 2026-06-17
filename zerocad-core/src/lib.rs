@@ -3,6 +3,7 @@ pub mod geometry;
 pub mod mock_kernel;
 pub mod parametric;
 pub mod sketch;
+pub mod stl;
 pub mod units;
 
 /// How many segments a full circle is discretized into. This is the single
@@ -20,4 +21,5 @@ pub use sketch::{
     build_sketch_curves, detect_regions, effective_curves, Circle, CornerKind, CornerMod,
     Dimension, LineSegment, Region, SketchCurves, SketchShape,
 };
+pub use stl::{meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};

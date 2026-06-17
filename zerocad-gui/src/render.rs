@@ -413,6 +413,12 @@ impl ZeroCadApp {
         let preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
         let preview_bodies = if edge_mod_active {
             self.preview_edge_mod_bodies()
+        } else if self.extrude_depth_dragging {
+            // Live ghost drag: skip the (expensive) truck boolean entirely. We
+            // render the un-booleaned model plus the cheap ghost tool volume
+            // (added below) so the preview tracks the cursor at full frame rate.
+            // The real merged/cut result is computed once on release.
+            None
         } else {
             match preview_mode {
                 // Memoized: the full-model re-evaluation (truck booleans) only
@@ -484,9 +490,24 @@ impl ZeroCadApp {
                     });
                 }
             }
-            // Join previews already show the merged result (the added material is
-            // part of the body), so no separate tool volume is drawn.
-            Some(ExtrudeMode::Join) => {}
+            // Join: a settled preview already shows the merged result (the added
+            // material is part of the booleaned body), so no separate tool volume
+            // is needed. But while push/pull dragging, that boolean is deferred —
+            // so float the warm additive ghost over the live body for instant,
+            // full-rate feedback. On release the merge runs and replaces it.
+            Some(ExtrudeMode::Join) => {
+                if self.extrude_depth_dragging {
+                    if let Some(pm) = preview_mesh.as_ref() {
+                        meshes.push(Drawable {
+                            mesh: pm,
+                            base: (255.0, 178.0, 96.0),
+                            alpha: 255,
+                            cull_back: true,
+                            draw_edges: true,
+                        });
+                    }
+                }
+            }
             // New Body: the warm additive tool volume floats over the live model.
             Some(ExtrudeMode::NewBody) | None => {
                 if let Some(pm) = preview_mesh.as_ref() {
@@ -706,34 +727,42 @@ impl ZeroCadApp {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // E. Draw Sorted Items
+        // E. Draw Sorted Items — triangles are accumulated into one batched
+        // egui::Mesh (depth-sorted order is preserved by vertex insertion order,
+        // which egui renders sequentially). One painter.add per frame instead of
+        // one per triangle eliminates the per-triangle vertex-buffer overhead.
+        // PlaneSheets flush the current batch to maintain their painter's position
+        // in the depth-sorted sequence. Hairline seam strokes (flat faces only)
+        // are collected and emitted after the mesh so they draw on top of all
+        // opaque geometry without interrupting the batch.
+        let mut batched_mesh = egui::Mesh::default();
+        let mut seam_strokes: Vec<egui::Shape> = Vec::new();
+
+        let flush_batch = |mesh: &mut egui::Mesh, painter: &egui::Painter| {
+            if !mesh.vertices.is_empty() {
+                painter.add(egui::Shape::mesh(std::mem::take(mesh)));
+            }
+        };
+
         for item in render_items {
             match item.content {
                 RenderItemContent::Triangle { points, colors } => {
-                    // Gouraud-shaded triangle: a small egui::Mesh with one color
-                    // per vertex, which egui interpolates across the face. A
-                    // same-color hairline stroke (using the average shade) closes
-                    // the feathered AA seams between adjacent triangles so the
-                    // surface reads continuous — except for a translucent fill
-                    // (Cut preview), where a stroke would double-blend into a
-                    // spurious wire mesh over the ghosted body.
-                    let mut mesh = egui::Mesh::default();
+                    // Append this triangle into the running batch. The base index
+                    // advances by 3 per triangle so each triangle's local [0,1,2]
+                    // offsets map to the correct absolute vertex slot.
+                    let base = batched_mesh.vertices.len() as u32;
                     for (p, c) in points.iter().zip(colors.iter()) {
-                        mesh.colored_vertex(*p, *c);
+                        batched_mesh.colored_vertex(*p, *c);
                     }
-                    mesh.add_triangle(0, 1, 2);
-                    painter.add(egui::Shape::mesh(mesh));
+                    batched_mesh.add_triangle(base, base + 1, base + 2);
 
-                    if colors[0].a() == 255 {
-                        let avg = egui::Color32::from_rgba_unmultiplied(
-                            ((colors[0].r() as u16 + colors[1].r() as u16 + colors[2].r() as u16) / 3) as u8,
-                            ((colors[0].g() as u16 + colors[1].g() as u16 + colors[2].g() as u16) / 3) as u8,
-                            ((colors[0].b() as u16 + colors[1].b() as u16 + colors[2].b() as u16) / 3) as u8,
-                            255,
-                        );
-                        painter.add(egui::Shape::closed_line(
+                    // Hairline seam stroke for flat-shaded facets only (see the
+                    // longer comment in the single-triangle version above).
+                    let flat = colors[0] == colors[1] && colors[1] == colors[2];
+                    if flat && colors[0].a() == 255 {
+                        seam_strokes.push(egui::Shape::closed_line(
                             points.to_vec(),
-                            egui::Stroke::new(1.0, avg),
+                            egui::Stroke::new(1.0, colors[0]),
                         ));
                     }
                 }
@@ -744,13 +773,14 @@ impl ZeroCadApp {
                     label,
                     plane,
                 } => {
-                    // Draw face sheet
+                    // Flush accumulated triangles before the sheet so their
+                    // painter's-algorithm position in the sorted list is respected.
+                    flush_batch(&mut batched_mesh, &painter);
                     painter.add(egui::Shape::convex_polygon(
                         points.to_vec(),
                         fill_color,
                         egui::Stroke::new(1.8, border_color),
                     ));
-                    // Draw label in 3D center
                     if !label.is_empty() {
                         let cx = (points[0].x + points[1].x + points[2].x + points[3].x) / 4.0;
                         let cy = (points[0].y + points[1].y + points[2].y + points[3].y) / 4.0;
@@ -769,6 +799,9 @@ impl ZeroCadApp {
                 }
             }
         }
+        // Flush any remaining triangles, then draw seam strokes on top.
+        flush_batch(&mut batched_mesh, &painter);
+        painter.extend(seam_strokes);
 
         // F. Wireframe edges, drawn ON TOP of the solids with depth-buffer
         // hidden-line removal. Each edge is walked in screen space and only the

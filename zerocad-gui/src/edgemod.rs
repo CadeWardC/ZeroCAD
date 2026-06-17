@@ -97,6 +97,7 @@ impl ZeroCadApp {
         let Some(op) = self.edge_mod_op.take() else {
             return;
         };
+        self.push_undo();
         let dist_expr = if zerocad_core::expr::references_variable(&op.dist_text) {
             Some(op.dist_text.trim().to_string())
         } else {
