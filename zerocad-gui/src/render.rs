@@ -99,6 +99,13 @@ impl ZeroCadApp {
         let center_y = rect.center().y + self.camera_pan.y;
         let view_scale = rect.width().min(rect.height()) / (self.camera_zoom * 5.0);
 
+        // Level-of-detail while the camera is in motion (orbit/pan drag or an
+        // animated view transition). During motion the eye can't resolve fine
+        // detail, so we drop the cosmetic per-triangle seam strokes and march the
+        // hidden-line wireframe in coarser steps — this is what keeps orbiting a
+        // big model smooth. When motion stops, the next repaint draws full detail.
+        let interacting = self.orbiting || self.camera_anim_active;
+
         // Compute Orthographic or Perspective Projection matrices
         let cos_p = self.camera_pitch.cos();
         let sin_p = self.camera_pitch.sin();
@@ -412,7 +419,9 @@ impl ZeroCadApp {
         };
         let preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
         let preview_bodies = if edge_mod_active {
-            self.preview_edge_mod_bodies()
+            // Memoized: the full-model re-evaluation (truck boolean) only reruns
+            // when the fillet/chamfer size/kind/target change, not every frame.
+            self.cached_preview_edge_mod_bodies()
         } else if self.extrude_depth_dragging {
             // Live ghost drag: skip the (expensive) truck boolean entirely. We
             // render the un-booleaned model plus the cheap ghost tool volume
@@ -757,9 +766,12 @@ impl ZeroCadApp {
                     batched_mesh.add_triangle(base, base + 1, base + 2);
 
                     // Hairline seam stroke for flat-shaded facets only (see the
-                    // longer comment in the single-triangle version above).
+                    // longer comment in the single-triangle version above). Skipped
+                    // while the camera is moving — it's one closed_line (3 strokes)
+                    // per flat triangle, the heaviest per-triangle cost, and its
+                    // absence is imperceptible mid-orbit.
                     let flat = colors[0] == colors[1] && colors[1] == colors[2];
-                    if flat && colors[0].a() == 255 {
+                    if !interacting && flat && colors[0].a() == 255 {
                         seam_strokes.push(egui::Shape::closed_line(
                             points.to_vec(),
                             egui::Stroke::new(1.0, colors[0]),
@@ -864,9 +876,13 @@ impl ZeroCadApp {
                     mesh.edge_vertices[i1 + 2],
                 );
 
-                // Walk the edge in ~2px steps, stroking the contiguous visible runs.
+                // Walk the edge in screen space, stroking the contiguous visible
+                // runs. ~2px steps when still (crisp hidden-line cuts); coarser
+                // ~6px steps while orbiting, where the extra precision can't be
+                // seen but the per-step occlusion lookups dominate edge-heavy models.
                 let len = (p1.0 - p0.0).hypot(p1.1 - p0.1);
-                let steps = (len / 2.0).ceil().max(1.0) as usize;
+                let step_px = if interacting { 6.0 } else { 2.0 };
+                let steps = (len / step_px).ceil().max(1.0) as usize;
                 let mut run_start: Option<egui::Pos2> = None;
                 let mut last_vis = egui::pos2(p0.0, p0.1);
                 for s in 0..=steps {

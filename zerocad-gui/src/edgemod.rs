@@ -91,6 +91,44 @@ impl ZeroCadApp {
         graph.evaluate_bodies(&self.hidden_nodes).ok()
     }
 
+    /// Memoized [`preview_edge_mod_bodies`]. egui repaints continuously while the
+    /// inline size box is focused or the handle is dragged, and each call clones
+    /// the whole graph and re-runs every truck boolean — so without caching the
+    /// fillet preview re-solves the model every frame. This recomputes only when
+    /// the size (quantized to a sub-visible step), kind, or target change, making
+    /// idle frames and slow drags nearly free (mirrors `cached_preview_extrude_bodies`).
+    pub(crate) fn cached_preview_edge_mod_bodies(&mut self) -> Option<Vec<(String, MockMesh)>> {
+        use std::hash::{Hash, Hasher};
+        let Some(op) = self.edge_mod_op.as_ref() else {
+            self.edge_mod_preview_cache = None;
+            return None;
+        };
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            // Quantize size to 0.05mm: idle frames and slow drags reuse the cache,
+            // and a sub-0.05mm preview lag is invisible (commit uses the exact size).
+            ((op.dist / 0.05).round() as i64).hash(&mut h);
+            (op.kind as u8).hash(&mut h);
+            op.target.hash(&mut h);
+            // The edge itself — two edges of the same body share `target`, so
+            // without this a fillet on edge B could reuse edge A's cached result.
+            for c in op.edge.p0.iter().chain(op.edge.p1.iter()) {
+                ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+            }
+            self.id_counter.hash(&mut h);
+            self.hidden_nodes.len().hash(&mut h);
+            h.finish()
+        };
+        if let Some((cached_key, bodies)) = self.edge_mod_preview_cache.as_ref() {
+            if *cached_key == key {
+                return Some(bodies.clone());
+            }
+        }
+        let bodies = self.preview_edge_mod_bodies();
+        self.edge_mod_preview_cache = bodies.as_ref().map(|b| (key, b.clone()));
+        bodies
+    }
+
     /// Commit the live edge mod into history as a real `EdgeMod` feature, binding
     /// the size to a variable expression when the text references one.
     pub(crate) fn commit_edge_mod(&mut self) {

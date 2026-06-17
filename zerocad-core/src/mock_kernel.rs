@@ -478,10 +478,20 @@ fn offset_polygon_outward(pts: &[(f32, f32)], grow: f32) -> Vec<(f32, f32)> {
         let t = ((p2.0 - p1.0) * d2.1 - (p2.1 - p1.1) * d2.0) / denom;
         Some((p1.0 + t * d1.0, p1.1 + t * d1.1))
     };
+    // Sanity bound: when two consecutive edges are *nearly* (but not exactly)
+    // parallel, `denom` is tiny-but-finite, so `t` blows up and the miter vertex
+    // shoots astronomically far away — a spike that corrupts the cutter and
+    // leaves stray vertices (and lines) in the boolean result. Only such
+    // degenerate (or non-finite) intersections are rejected; every legitimate
+    // miter, even on a sharp corner, stays far inside this bound and is untouched.
+    const SPIKE_LIMIT: f32 = 1.0e4; // mm
     (0..n)
         .map(|i| {
             let prev = (i + n - 1) % n;
-            intersect(off_pt[prev], dir[prev], off_pt[i], dir[i]).unwrap_or(off_pt[i])
+            match intersect(off_pt[prev], dir[prev], off_pt[i], dir[i]) {
+                Some(p) if p.0.is_finite() && p.1.is_finite() && p.0.abs() < SPIKE_LIMIT && p.1.abs() < SPIKE_LIMIT => p,
+                _ => off_pt[i],
+            }
         })
         .collect()
 }
@@ -1093,6 +1103,15 @@ fn build_extrusion_wireframe(
                 efn.extend_from_slice(&[a.x, a.y, a.z, b.x, b.y, b.z]);
             };
 
+            // A vertical strut is a real silhouette edge only at a *true* corner.
+            // Along a smooth run — a tessellated fillet arc (~24 pts) or a
+            // sketched circle (`CIRCLE_SEGS` pts) — consecutive walls differ by
+            // only a few degrees; strutting every such vertex draws a dense fan of
+            // near-parallel lines down the curve (the "spray" artifact). Emit a
+            // strut only where the two adjacent walls meet past the crease angle,
+            // matching `mesh_feature_edges`' crease filter and the cylinder
+            // wireframe, so a rounded edge reads as one smooth surface.
+            const STRUT_CREASE_COS: f32 = 0.95; // cos(~18°)
             for i in 0..n {
                 // Bottom-loop edge: borders the bottom cap and side wall i.
                 ei.push(bot_idx[i]);
@@ -1104,10 +1123,15 @@ fn build_extrusion_wireframe(
                 ei.push(top_idx[(i + 1) % n]);
                 push_n(efn, cap_top, wall[i]);
 
-                // Vertical strut at vertex i: borders walls (i-1) and i.
-                ei.push(bot_idx[i]);
-                ei.push(top_idx[i]);
-                push_n(efn, wall[(i + n - 1) % n], wall[i]);
+                // Vertical strut at vertex i: borders walls (i-1) and i. Skip it on
+                // a smooth run where those walls nearly agree.
+                let prev = wall[(i + n - 1) % n];
+                let cur = wall[i];
+                if prev.dot(cur).clamp(-1.0, 1.0) <= STRUT_CREASE_COS {
+                    ei.push(bot_idx[i]);
+                    ei.push(top_idx[i]);
+                    push_n(efn, prev, cur);
+                }
             }
         };
 
@@ -1229,7 +1253,13 @@ fn mesh_feature_edges(
         let b = idx * 6;
         [vertices[b], vertices[b + 1], vertices[b + 2]]
     };
-    // A planar face's vertices share one normal, so the first vertex's is fine.
+    // The crease test deliberately uses the *smoothed* per-vertex normal
+    // (`solid_to_flat_mesh` runs `smooth_vertex_normals`, which blends normals
+    // across shallow creases). That makes adjacent facets of a curved/boolean'd
+    // surface look nearly identical, so their seams are suppressed and the round
+    // reads as one face — while a genuine sharp edge (≥30°, beyond the smoothing
+    // cap) keeps each face's distinct normal and still draws. A planar face's
+    // vertices share one normal, so the first vertex's is fine.
     let nrm = |idx: usize| -> [f32; 3] {
         let b = idx * 6;
         [vertices[b + 3], vertices[b + 4], vertices[b + 5]]
@@ -1267,10 +1297,14 @@ fn mesh_feature_edges(
     let mut edge_indices: Vec<u32> = Vec::new();
     let mut edge_face_normals: Vec<f32> = Vec::new();
     for rec in edges.values() {
-        // Skip internal diagonals: two triangles of the SAME face (one distinct
-        // face id but two triangles). Keep creases (≥2 faces) and true mesh
-        // boundary edges (a single triangle).
-        if rec.faces.len() < 2 && rec.tris >= 2 {
+        // Keep only a crease between two *distinct* B-rep faces. This drops both
+        // internal triangulation diagonals (two triangles of the SAME face) and
+        // lone boundary edges (a single triangle owns the edge). Every ZeroCAD
+        // body is a closed solid, so a watertight tessellation has no genuine
+        // boundary edge — a single-triangle edge is a crack/sliver left by a
+        // fragile boolean, and drawing it is exactly the "stray spray". Real
+        // design edges are always shared by ≥2 faces, so they're untouched.
+        if rec.faces.len() < 2 {
             continue;
         }
         // Suppress the *facet-boundary* lines of a curved surface: a crease whose
@@ -1289,6 +1323,14 @@ fn mesh_feature_edges(
                 continue;
             }
         }
+        // Drop a degenerate zero-length edge (collapsed by a sliver triangle): it
+        // would render as a stray dot/spike and never as a real line.
+        let d2 = (rec.pa[0] - rec.pb[0]).powi(2)
+            + (rec.pa[1] - rec.pb[1]).powi(2)
+            + (rec.pa[2] - rec.pb[2]).powi(2);
+        if d2 < 1.0e-12 {
+            continue;
+        }
         let a = (edge_vertices.len() / 3) as u32;
         edge_vertices.extend_from_slice(&rec.pa);
         edge_vertices.extend_from_slice(&rec.pb);
@@ -1302,4 +1344,96 @@ fn mesh_feature_edges(
     }
 
     (edge_vertices, edge_indices, edge_face_normals)
+}
+
+#[cfg(test)]
+mod wireframe_tests {
+    use super::*;
+    use crate::geometry::CoordinateSystem;
+
+    /// Count edges that run parallel to the sweep axis (i.e. vertical struts):
+    /// their endpoints share x/y and differ by `|depth|` along z (CS::XY here).
+    fn count_struts(ev: &[f32], ei: &[u32], depth: f32) -> usize {
+        ei.chunks_exact(2)
+            .filter(|p| {
+                let (a, b) = (p[0] as usize * 3, p[1] as usize * 3);
+                let dz = (ev[a + 2] - ev[b + 2]).abs();
+                let dxy = ((ev[a] - ev[b]).powi(2) + (ev[a + 1] - ev[b + 1]).powi(2)).sqrt();
+                (dz - depth.abs()).abs() < 1e-3 && dxy < 1e-3
+            })
+            .count()
+    }
+
+    #[test]
+    fn sharp_polygon_struts_every_true_corner() {
+        // A square has four genuine 90° corners → exactly four vertical struts.
+        let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let (ev, ei, _) = build_extrusion_wireframe(&square, &[], 5.0, &CoordinateSystem::XY);
+        assert_eq!(count_struts(&ev, &ei, 5.0), 4);
+    }
+
+    #[test]
+    fn smooth_circle_extrude_has_no_strut_fan() {
+        // A sketched circle is a many-sided polygon whose consecutive walls differ
+        // by only a few degrees. Pre-fix this drew one strut per segment (a dense
+        // fan); now the smooth wall must produce ZERO struts.
+        let n = crate::CIRCLE_SEGS;
+        let circle: Vec<(f32, f32)> = (0..n)
+            .map(|i| {
+                let a = (i as f32 / n as f32) * std::f32::consts::TAU;
+                (5.0 * a.cos(), 5.0 * a.sin())
+            })
+            .collect();
+        let (ev, ei, _) = build_extrusion_wireframe(&circle, &[], 8.0, &CoordinateSystem::XY);
+        assert_eq!(count_struts(&ev, &ei, 8.0), 0);
+    }
+
+    #[test]
+    fn lone_boundary_edges_are_dropped() {
+        // Two coplanar triangles meeting along a diagonal, the four outer edges
+        // owned by a single triangle each. On a closed solid such lone edges are
+        // tessellation cracks, not design edges — they must be dropped. The
+        // shared diagonal is coplanar (same stored normal) so it's suppressed too,
+        // leaving no wireframe at all.
+        let v = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+            0.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let face_ids = vec![0, 1];
+        let (_ev, ei, _) = mesh_feature_edges(&v, &indices, &face_ids);
+        assert_eq!(ei.len() / 2, 0, "lone boundary/crack edges must be dropped");
+    }
+
+    #[test]
+    fn genuine_perpendicular_crease_is_kept() {
+        // Two triangles sharing the x-axis edge but lying in perpendicular planes
+        // (z=0 and y=0). That 90° crease is a real design edge and must survive.
+        let v = vec![
+            // Triangle A (face 0) in z=0, normal +Z
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            0.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+            // Triangle B (face 1) in y=0, normal +Y
+            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, 1.0, 0.0, //
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let face_ids = vec![0, 1];
+        let (ev, ei, _) = mesh_feature_edges(&v, &indices, &face_ids);
+
+        assert_eq!(ei.len() / 2, 1, "the 90° crease should be the one kept edge");
+        let (a, b) = (ei[0] as usize * 3, ei[1] as usize * 3);
+        let on = |k: usize, p: (f32, f32, f32)| {
+            (ev[k] - p.0).abs() < 1e-4 && (ev[k + 1] - p.1).abs() < 1e-4 && (ev[k + 2] - p.2).abs() < 1e-4
+        };
+        let shared = (on(a, (0.0, 0.0, 0.0)) && on(b, (1.0, 0.0, 0.0)))
+            || (on(a, (1.0, 0.0, 0.0)) && on(b, (0.0, 0.0, 0.0)));
+        assert!(shared, "kept edge should be the shared x-axis crease");
+    }
 }

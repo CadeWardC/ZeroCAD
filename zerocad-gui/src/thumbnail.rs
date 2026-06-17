@@ -113,6 +113,37 @@ pub fn render_thumbnail(meshes: &[(String, MockMesh)], size: usize) -> (usize, u
     (size, size, rgba)
 }
 
+/// PNG-encode a `w`×`h` RGBA buffer for embedding inside a `.zcad` file.
+/// Returns `None` if encoding fails (so the caller can save without a preview).
+pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || rgba.len() != w * h * 4 {
+        return None;
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// Decode an RGBA8 PNG (as produced by [`encode_png`]) back into
+/// `(width, height, rgba)`. Returns `None` on any malformed/unsupported input.
+pub fn decode_png(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    Some((info.width as usize, info.height as usize, buf))
+}
+
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if l < 1e-6 {

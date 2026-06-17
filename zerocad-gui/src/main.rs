@@ -270,6 +270,10 @@ struct ZeroCadApp {
     mesh_stats: (usize, usize),
     error_msg: Option<String>,
     status_msg: String,
+    /// Creation timestamp (Unix seconds) of the document currently open, carried
+    /// from the loaded `.zcad` so re-saving preserves "created" rather than
+    /// stamping it anew. `None` for a fresh/never-saved or legacy document.
+    doc_created_unix: Option<u64>,
 
     // Camera parameters for the 3D Viewport
     camera_pitch: f32,      // Pitch (up/down rotation) in radians
@@ -366,6 +370,12 @@ struct ZeroCadApp {
     /// only when the depth/targets change, not on every repaint (e.g. mouse moves
     /// over the viewport while the dialog is open).
     extrude_preview_mesh_cache: Option<(u64, MockMesh)>,
+    /// Memoized live edge fillet/chamfer preview: `(input hash, bodies)`. Like
+    /// `extrude_preview_cache`, the underlying `preview_edge_mod_bodies` clones the
+    /// graph and re-runs every truck boolean — far too slow to redo on every
+    /// repaint while the size box is open or the handle is dragged. Recomputed only
+    /// when the size/kind/target actually change. Cleared when the op ends.
+    edge_mod_preview_cache: Option<(u64, Vec<(String, MockMesh)>)>,
     /// True while the user is actively push/pull dragging the extrude depth in
     /// the viewport. During the drag we render only the cheap ghost tool volume
     /// (`cached_preview_mesh`) following the cursor live, and SKIP the expensive
@@ -476,6 +486,7 @@ impl ZeroCadApp {
             mesh_stats: (0, 0),
             error_msg: None,
             status_msg: "Welcome to ZeroCAD. Ready for modeling.".to_string(),
+            doc_created_unix: None,
             // Positive pitch starts the camera above the XZ ground plane,
             // looking down at it (negative would start underneath).
             camera_pitch: 0.7,
@@ -518,6 +529,7 @@ impl ZeroCadApp {
             extrude_op: None,
             extrude_preview_cache: None,
             extrude_preview_mesh_cache: None,
+            edge_mod_preview_cache: None,
             extrude_depth_dragging: false,
             extrude_dim_pos: None,
             edge_mod_op: None,
@@ -1822,6 +1834,7 @@ impl ZeroCadApp {
         log::info!("Creating new empty model.");
         self.push_undo();
         self.graph = ParametricGraph::new();
+        self.doc_created_unix = None;
         self.body_meshes = Vec::new();
         self.mesh_stats = (0, 0);
         self.selected_node_id = None;
@@ -1832,8 +1845,20 @@ impl ZeroCadApp {
         self.status_msg = "New blank design created.".to_string();
     }
 
-    /// Prompt for a path and serialize the parametric graph to a `.zcad` file.
+    /// Prompt for a path and write the document as a `.zcad` file, embedding the
+    /// evaluated geometry as a fast-open / fallback cache. The recipe stays the
+    /// source of truth.
     pub(crate) fn save_design(&mut self) {
+        self.save_design_inner(true);
+    }
+
+    /// As [`save_design`], but omit the embedded mesh cache for a smaller file
+    /// (geometry is regenerated from the recipe on open).
+    pub(crate) fn save_design_lightweight(&mut self) {
+        self.save_design_inner(false);
+    }
+
+    fn save_design_inner(&mut self, embed_mesh: bool) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Save ZeroCAD Design")
             .add_filter("ZeroCAD Design", &["zcad"])
@@ -1841,17 +1866,67 @@ impl ZeroCadApp {
         else {
             return;
         };
-        match serde_json::to_string_pretty(&self.graph) {
-            Ok(json) => match std::fs::write(&path, json) {
-                Ok(()) => {
-                    log::info!("Design saved to {:?}", path);
-                    self.status_msg = format!("Design saved to {}", path.display());
-                    self.remember_project(&path);
-                }
-                Err(e) => self.status_msg = format!("Save failed: {e}"),
+
+        // A PNG preview rendered from the current bodies, embedded so the file
+        // carries its own thumbnail (portable across machines).
+        let thumbnail_png = if self.body_meshes.is_empty() {
+            None
+        } else {
+            let (w, h, rgba) = thumbnail::render_thumbnail(&self.body_meshes, 256);
+            thumbnail::encode_png(w, h, &rgba)
+        };
+
+        let doc = zerocad_core::ZcadDocument {
+            graph: &self.graph,
+            thumbnail_png,
+            mesh_cache: if embed_mesh {
+                Some(&self.body_meshes)
+            } else {
+                None
             },
-            Err(e) => self.status_msg = format!("Serialization failed: {e}"),
+            units: self.current_unit,
+            bbox: Self::bodies_bbox(&self.body_meshes),
+            created_unix: self.doc_created_unix,
+        };
+
+        let bytes = match zerocad_core::write_zcad(&doc) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_msg = format!("Save failed: {e}");
+                return;
+            }
+        };
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                log::info!("Design saved to {:?}", path);
+                let how = if embed_mesh { "" } else { " (lightweight)" };
+                self.status_msg = format!("Design saved to {}{how}", path.display());
+                self.remember_project(&path);
+            }
+            Err(e) => self.status_msg = format!("Save failed: {e}"),
         }
+    }
+
+    /// Axis-aligned bounding box `[min_x, min_y, min_z, max_x, max_y, max_z]` of
+    /// every body's vertices (interleaved `[x,y,z,nx,ny,nz]`), or all-zero when
+    /// there is no geometry.
+    fn bodies_bbox(bodies: &[(String, MockMesh)]) -> [f32; 6] {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        let mut any = false;
+        for (_, m) in bodies {
+            for v in m.vertices.chunks_exact(6) {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v[k]);
+                    hi[k] = hi[k].max(v[k]);
+                }
+                any = true;
+            }
+        }
+        if !any {
+            return [0.0; 6];
+        }
+        [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]
     }
 
     /// Record `path` in the recent-projects list and (re)bake a thumbnail of the
@@ -1901,16 +1976,21 @@ impl ZeroCadApp {
         let pal = self.pal();
 
         // Dim + swallow input to the workspace behind the card (Middle sits above
-        // the Background panels but below the Foreground card).
-        egui::Area::new(egui::Id::new("onboarding_dim"))
+        // the Background panels but below the Foreground card). Clicking the
+        // backdrop — anywhere outside the card, since the card sits on top and
+        // consumes clicks over its own rect — dismisses onboarding so the user
+        // drops straight into the (blank) workspace and can start modeling.
+        let backdrop_clicked = egui::Area::new(egui::Id::new("onboarding_dim"))
             .order(egui::Order::Middle)
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
-                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                let resp = ui.allocate_rect(screen, egui::Sense::click_and_drag());
                 ui.painter()
                     .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
-            });
+                resp.clicked()
+            })
+            .inner;
 
         // Top 5 recents, snapshotted (path + display name) so the draw closure
         // borrows locals, not `self.recent_files`. Textures are pre-loaded for
@@ -2076,7 +2156,9 @@ impl ZeroCadApp {
         } else if let Some(path) = open_recent {
             self.load_design_from(path);
             self.onboarding_visible = false;
-        } else if close {
+        } else if close || backdrop_clicked {
+            // Close button, or a click anywhere off the card: dismiss and let the
+            // user model in the current (blank-on-startup) workspace.
             self.onboarding_visible = false;
         }
     }
@@ -2162,30 +2244,61 @@ impl ZeroCadApp {
     /// Selection / preview state is reset to match the new graph. Shared by the
     /// Open dialog and the onboarding Recent list.
     pub(crate) fn load_design_from(&mut self, path: PathBuf) {
-        let json = match std::fs::read_to_string(&path) {
-            Ok(j) => j,
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
             Err(e) => {
                 self.status_msg = format!("Could not read file: {e}");
                 return;
             }
         };
-        match serde_json::from_str::<zerocad_core::ParametricGraph>(&json) {
-            Ok(graph) => {
-                self.push_undo();
-                self.graph = graph;
-                self.selected_node_id = None;
-                self.selected_faces.clear();
-                self.selected_edges.clear();
-                self.selected_body.clear();
-                self.hidden_nodes.clear();
-                self.extrude_op = None;
-                self.edge_mod_op = None;
-                self.reevaluate_geometry();
-                self.status_msg = format!("Design loaded from {}", path.display());
-                self.remember_project(&path);
+        let loaded = match zerocad_core::read_zcad(&bytes) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status_msg = format!("Load failed: {e}");
+                return;
             }
-            Err(e) => self.status_msg = format!("Load failed: {e}"),
+        };
+
+        self.push_undo();
+        self.graph = loaded.graph;
+        // Preserve the original creation time for legacy/unknown files we stamp anew.
+        self.doc_created_unix = (!loaded.was_legacy_json && loaded.metadata.created_unix != 0)
+            .then_some(loaded.metadata.created_unix);
+        // Restore the document's display unit (binary files only; legacy JSON has
+        // no metadata, so we keep the user's current preference).
+        if !loaded.was_legacy_json {
+            self.current_unit = loaded.metadata.units;
         }
+        self.selected_node_id = None;
+        self.selected_faces.clear();
+        self.selected_edges.clear();
+        self.selected_body.clear();
+        self.hidden_nodes.clear();
+        self.extrude_op = None;
+        self.edge_mod_op = None;
+
+        // Show the embedded geometry cache immediately (instant open). It's only
+        // present when fresh (its hash matched the loaded graph), so it's safe to
+        // display; `reevaluate_geometry` then swaps in freshly-computed bodies.
+        if let Some(cache) = loaded.mesh_cache {
+            self.body_meshes = cache;
+            self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+        }
+        // Seed the onboarding thumbnail cache from the file's embedded preview so
+        // a `.zcad` from another machine shows its real thumbnail even if it has
+        // no geometry to re-render (e.g. evaluation fails).
+        if let Some(png) = &loaded.thumbnail_png {
+            if let Some((w, h, rgba)) = thumbnail::decode_png(png) {
+                settings::save_thumb(&path, w, h, &rgba);
+                self.onboarding_textures.remove(path.as_path());
+            }
+        }
+
+        // Regenerate from the recipe (authoritative). On failure, the cached
+        // bodies above remain on screen so the model is never lost.
+        self.reevaluate_geometry();
+        self.status_msg = format!("Design loaded from {}", path.display());
+        self.remember_project(&path);
     }
 
     /// Prompt for a path and write all current bodies as one binary STL mesh.
@@ -2614,6 +2727,18 @@ impl eframe::App for ZeroCadApp {
                         {
                             ui.memory_mut(|mem| mem.close_popup());
                             self.save_design();
+                        }
+
+                        if icons::Icon::Save
+                            .menu_button(ui, "Save Design (lightweight)")
+                            .on_hover_text(
+                                "Smaller file: stores only the recipe, regenerating \
+                                 geometry on open.",
+                            )
+                            .clicked()
+                        {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.save_design_lightweight();
                         }
 
                         if icons::Icon::Download

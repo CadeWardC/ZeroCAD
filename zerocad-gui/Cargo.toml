@@ -18,3 +18,5 @@ serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
 rfd.workspace = true
+# Encodes/decodes the preview thumbnail embedded inside a `.zcad` file.
+png.workspace = true

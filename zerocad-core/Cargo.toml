@@ -16,3 +16,6 @@ truck-meshalgo.workspace = true
 truck-polymesh.workspace = true
 truck-topology.workspace = true
 truck-shapeops.workspace = true
+ciborium.workspace = true
+zstd.workspace = true
+crc32fast.workspace = true

@@ -5,6 +5,7 @@ pub mod parametric;
 pub mod sketch;
 pub mod stl;
 pub mod units;
+pub mod zcad_format;
 
 /// How many segments a full circle is discretized into. This is the single
 /// source of truth shared by sketch arrangement, ellipse faceting, cylinder
@@ -23,3 +24,4 @@ pub use sketch::{
 };
 pub use stl::{meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};
+pub use zcad_format::{read_zcad, write_zcad, LoadedZcad, ZcadDocument, ZcadError, ZcadMetadata};
