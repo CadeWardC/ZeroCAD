@@ -12,7 +12,7 @@
 //! the boolean engine does not yet meet, so progress (or regress) is measurable.
 
 use openrcad_algo::{
-    boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanError, BooleanOp, SolidExt,
+    boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt,
 };
 use openrcad_foundation::{Ax1, Ax2, Dir, Pnt, Trsf};
 use openrcad_primitives::{make_box, make_cylinder};
@@ -124,18 +124,11 @@ fn face_flush_union_is_watertight() {
 }
 
 #[test]
-fn checked_boolean_rejects_known_side_drill_failure() {
+fn checked_boolean_accepts_side_drill() {
     let side = make_cylinder(&Ax2::new(Pnt::new(-1.0, 5.0, 5.0), Dir::dx()), 2.0, 12.0);
-    let err = boolean_checked(&box10(Pnt::origin()), &side, BooleanOp::Cut)
-        .expect_err("checked boolean must not return a bad side-drill body");
-
-    assert!(
-        matches!(
-            err,
-            BooleanError::InvalidOutput { .. } | BooleanError::NonWatertightOutput { .. }
-        ),
-        "unexpected checked-boolean error: {err:?}"
-    );
+    let r = boolean_checked(&box10(Pnt::origin()), &side, BooleanOp::Cut)
+        .expect("checked boolean must succeed for side-drill");
+    assert_closed("checked side-drill", &r);
 }
 
 // ----- Known failure frontier: partial-imprint cases (watertight GOAL) ------
@@ -149,7 +142,6 @@ fn checked_boolean_rejects_known_side_drill_failure() {
 // passes the former yet fails the latter, so both belong in the closed-solid bar.
 
 #[test]
-#[ignore = "partial imprint: through side-drill leaves a non-contiguous loop (validate fails though edge-pairing passes)"]
 fn through_side_drill_should_be_closed() {
     let side = make_cylinder(&Ax2::new(Pnt::new(-1.0, 5.0, 5.0), Dir::dx()), 2.0, 12.0);
     let r = boolean(&box10(Pnt::origin()), &side, BooleanOp::Cut);
@@ -157,7 +149,6 @@ fn through_side_drill_should_be_closed() {
 }
 
 #[test]
-#[ignore = "partial imprint: corner-overlap union not yet watertight (euler -10)"]
 fn corner_overlap_union_should_be_watertight() {
     let r = boolean(
         &box10(Pnt::origin()),
@@ -168,7 +159,6 @@ fn corner_overlap_union_should_be_watertight() {
 }
 
 #[test]
-#[ignore = "partial imprint: blind pocket (tool stops inside) leaves the top face unsealed"]
 fn blind_pocket_cut_should_be_watertight() {
     let tool = make_box(&Pnt::new(3.0, 3.0, 5.0), 4.0, 4.0, 8.0);
     let r = boolean(&box10(Pnt::origin()), &tool, BooleanOp::Cut);
@@ -176,7 +166,6 @@ fn blind_pocket_cut_should_be_watertight() {
 }
 
 #[test]
-#[ignore = "partial imprint: rotated tool cut partially crossing faces is not watertight"]
 fn rotated_tool_partial_cut_should_be_watertight() {
     let tool = make_box(&Pnt::new(5.0, 5.0, -2.0), 6.0, 6.0, 14.0).transformed(&Trsf::rotation(
         &Ax1::new(Pnt::new(8.0, 8.0, 0.0), Dir::dz()),

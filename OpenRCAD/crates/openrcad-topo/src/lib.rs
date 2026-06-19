@@ -24,6 +24,7 @@
 
 pub mod arena;
 pub mod builder;
+pub mod containment;
 pub mod edge;
 pub mod face;
 pub mod orientation;

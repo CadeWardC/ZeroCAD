@@ -4,6 +4,12 @@ members = [
     "zerocad-core",
     "zerocad-gui",
 ]
+# OpenRCAD is its own cargo workspace living inside this tree; exclude it so this
+# workspace doesn't try to absorb its member crates. It is consumed only through
+# the `openrcad` facade path dependency below.
+exclude = [
+    "OpenRCAD",
+]
 
 # Release profile tuned for a lean, fast binary.
 # NOTE: `panic` is deliberately left at the default "unwind" — `guarded_boolean`
@@ -31,11 +37,7 @@ egui = "0.26"
 egui-wgpu = "0.26"
 eframe = { version = "0.26", features = ["wgpu"] }
 bytemuck = { version = "1.14", features = ["derive"] }
-truck-modeling = "0.6"
-truck-meshalgo = "0.4"
-truck-polymesh = "0.6"
-truck-topology = "0.6"
-truck-shapeops = { version = "0.4", default-features = false }
+openrcad = { path = "./OpenRCAD" }
 rfd = "0.14"
 ciborium = "0.2"
 zstd = "0.13"

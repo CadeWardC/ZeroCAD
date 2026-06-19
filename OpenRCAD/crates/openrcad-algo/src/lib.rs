@@ -8,6 +8,7 @@ pub mod blend;
 pub mod bvh;
 pub mod euler;
 pub mod facade;
+pub mod imprint;
 pub mod intersect;
 
 pub use blend::BlendError;
@@ -60,6 +61,8 @@ pub fn boolean_checked(object: &Solid, tool: &Solid, op: BooleanOp) -> Result<So
 pub mod chamfer;
 pub mod fillet;
 pub mod offset;
+pub mod prism;
+pub mod rolling_ball;
 
 /// Roll a constant-`radius` fillet along every edge of `solid`
 /// (OCCT `BRepFilletAPI_MakeFillet`).
@@ -111,6 +114,11 @@ pub fn shell_solid(
 }
 
 pub mod sew;
+pub use prism::{prism, sweep_prism, SweepError};
+pub use rolling_ball::{
+    fillet_edges, fillet_planar_edge, rolling_ball_between_planar_faces, rolling_ball_fillet_edge,
+    RollingBallBlend, RollingBallError,
+};
 
 /// Sew a collection of faces into a single shell, joining edges within `tol`
 /// (OCCT `BRepBuilderAPI_Sewing`).

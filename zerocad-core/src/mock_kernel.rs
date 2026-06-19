@@ -1,34 +1,38 @@
-//! Geometry kernel — backed by the `truck` B-Rep CAD kernel.
+//! Geometry kernel — backed by the `openrcad` pure-Rust B-Rep CAD kernel.
 //!
-//! The `MockMesh` name and field layout are preserved for now so existing
-//! parametric and rendering code keeps working unchanged. Internally each
-//! constructor now builds a real `truck_modeling::Solid`, tessellates it via
-//! `truck_meshalgo`, and flattens the result into the same interleaved
-//! position+normal vertex buffer the egui painter expects.
+//! The `MockMesh` name and field layout are preserved so existing parametric
+//! and rendering code keeps working unchanged. Internally each constructor
+//! builds a real `openrcad::topo::Solid`, tessellates it via `openrcad::mesh`,
+//! and flattens the result into the same interleaved position+normal vertex
+//! buffer the egui painter expects.
 //!
 //! Wireframe edges are still produced analytically (matching the previous
 //! procedural output) — extracting them from the B-Rep topology is deferred
 //! to the GPU-viewport phase.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use truck_meshalgo::tessellation::MeshableShape;
-use truck_modeling::{builder, Point3, Vector3, Vertex, Wire};
-use truck_polymesh::PolygonMesh;
-use truck_topology::Solid;
+use openrcad::algo::{boolean_checked, fillet_edges, prism, BooleanOp};
+use openrcad::foundation::{Ax2, Dir, Pnt, Vec as GeomVec};
+use openrcad::geom::{Curve, GeomSurface, Plane};
+use openrcad::mesh::tessellate;
+use openrcad::primitives::{make_box, make_cylinder};
+use openrcad::topo::{Edge, Face, Orientation, Solid, Wire};
 
-/// The kernel's solid type (a `truck` B-Rep solid). Re-exported so the
+use crate::geometry::Vec3;
+
+/// The kernel's solid type (an `openrcad` B-Rep solid). Re-exported so the
 /// parametric evaluator can hold solids between features and combine them with
 /// boolean operations (join/cut) before tessellating to a `MockMesh`.
-pub type KernelSolid = truck_modeling::Solid;
+pub type KernelSolid = Solid;
 
-/// Tessellation tolerance (in model units / mm). 0.05mm produces a smooth
-/// cylinder without explosive triangle counts. Will become a user-facing
+/// Tessellation chordal tolerance (in model units / mm). 0.05mm produces a
+/// smooth cylinder without explosive triangle counts. Will become a user-facing
 /// setting in a later phase.
 const TESS_TOL: f64 = 0.05;
 
-/// Tolerance handed to the boolean solver.
-const BOOL_TOL: f64 = 0.05;
+/// Tessellation angular tolerance (radians) handed to `openrcad::mesh::tessellate`.
+const TESS_ANGLE: f64 = 0.5;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MockMesh {
@@ -103,7 +107,7 @@ impl MockMesh {
     pub fn make_box(w: f32, h: f32, d: f32) -> Self {
         let solid = box_solid(w, h, d);
 
-        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid);
+        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, false);
 
         let (edge_vertices, edge_indices, edge_face_normals) = build_box_wireframe(w, h, d);
 
@@ -125,7 +129,7 @@ impl MockMesh {
             None => return Self::empty(),
         };
 
-        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid);
+        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, false);
         let (edge_vertices, edge_indices, edge_face_normals) =
             build_cylinder_wireframe(r, h, segments.max(4));
 
@@ -173,7 +177,7 @@ impl MockMesh {
             None => return Self::empty(),
         };
 
-        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid);
+        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, true);
 
         let (edge_vertices, edge_indices, edge_face_normals) = match circle {
             Some((cu, cv, r)) => build_oriented_cylinder_wireframe(cs, cu, cv, r, depth),
@@ -195,7 +199,7 @@ impl MockMesh {
     /// extracted from the solid's B-Rep edges, and hidden-line normals are left
     /// empty (the renderer then shows every edge).
     pub fn from_solid(solid: &KernelSolid) -> Self {
-        let (vertices, indices, face_ids) = solid_to_flat_mesh(solid);
+        let (vertices, indices, face_ids) = solid_to_flat_mesh(solid, true, false);
         // Derive the wireframe from the tessellation's *feature* edges (borders
         // between two distinct faces), not the raw B-Rep edge list. This gives
         // every edge its two adjacent face normals — so the renderer's
@@ -203,8 +207,17 @@ impl MockMesh {
         // primitives, instead of x-raying every edge — and it silently drops the
         // degenerate zero-area "fin" edges a boolean can leave in the B-Rep
         // (they produce no triangle, so no feature edge, so no stray spike).
-        let (edge_vertices, edge_indices, edge_face_normals) =
+        let (mut edge_vertices, mut edge_indices, mut edge_face_normals) =
             mesh_feature_edges(&vertices, &indices, &face_ids);
+        add_missing_straight_brep_edges(
+            solid,
+            &vertices,
+            &indices,
+            &face_ids,
+            &mut edge_vertices,
+            &mut edge_indices,
+            &mut edge_face_normals,
+        );
         Self {
             vertices,
             indices,
@@ -218,16 +231,13 @@ impl MockMesh {
 
 // ---------------------------------------------------------------------------
 // Public solid builders + boolean operations (used by the parametric evaluator
-// to compose join/cut features). Each returns a `truck` solid so several
+// to compose join/cut features). Each returns an `openrcad` solid so several
 // features can be combined before a single tessellation pass.
 // ---------------------------------------------------------------------------
 
 /// Axis-aligned box solid, one corner at the origin, opposite at (w, h, d).
 pub fn box_solid(w: f32, h: f32, d: f32) -> KernelSolid {
-    let v0 = builder::vertex(Point3::new(0.0, 0.0, 0.0));
-    let edge_x = builder::tsweep(&v0, Vector3::new(w as f64, 0.0, 0.0));
-    let face_xy = builder::tsweep(&edge_x, Vector3::new(0.0, h as f64, 0.0));
-    builder::tsweep(&face_xy, Vector3::new(0.0, 0.0, d as f64))
+    make_box(&Pnt::origin(), w as f64, h as f64, d as f64)
 }
 
 /// Boolean-ready solid for a cylinder primitive: a polygonal prism along +Y,
@@ -439,142 +449,6 @@ pub fn edge_corner_cutter(
     extruded_region_solid(&loop_pts, &[], len + 2.0 * end_overshoot, &cs)
 }
 
-/// Build the fillet cutter with a **true circular arc** instead of the faceted
-/// chord polygon [`edge_corner_cutter`] uses. The cross-section is the corner
-/// sliver `corner → T1 → (arc) → T2`, where the `T1→T2` arc is one
-/// `circle_arc` edge; swept the length of the edge it yields **one analytic
-/// cylindrical face** for the round, **one arc edge** where it meets each end
-/// face, and leaves the neighbour faces genuinely flat and tangent.
-///
-/// This is the geometrically-correct fillet, but truck's boolean solver is
-/// fragile on cylindrical cutters (it can reject or panic). Callers therefore
-/// try this cutter first and fall back to the faceted [`edge_corner_cutter`] if
-/// the boolean can't take it — so the worst case is the old faceted result, never
-/// a missing fillet.
-///
-/// `grow` lifts the section's tangent points radially off the body faces (a
-/// concentric scale about the arc centre, which keeps the arc a valid circle) to
-/// dodge the coplanar-face boolean failure, mirroring the faceted cutter's
-/// fallback. `end_overshoot` extends the prism past both edge ends so its caps
-/// clear the body's perpendicular faces. Returns `None` for a degenerate edge,
-/// the same cases [`edge_corner_cutter`] rejects.
-pub fn edge_fillet_cutter_arc(
-    p0: [f32; 3],
-    p1: [f32; 3],
-    n1: [f32; 3],
-    n2: [f32; 3],
-    dist: f32,
-    grow: f32,
-    end_overshoot: f32,
-) -> Option<KernelSolid> {
-    use crate::geometry::Vec3;
-
-    if dist <= 1.0e-4 {
-        return None;
-    }
-    let p0 = Vec3::new(p0[0], p0[1], p0[2]);
-    let p1 = Vec3::new(p1[0], p1[1], p1[2]);
-    let n1 = Vec3::new(n1[0], n1[1], n1[2]).normalize();
-    let n2 = Vec3::new(n2[0], n2[1], n2[2]).normalize();
-
-    let edge = p1.sub(p0);
-    let len = edge.length();
-    if len < 1.0e-4 {
-        return None;
-    }
-    let t = edge.mul(1.0 / len);
-
-    if n1.cross(n2).length() < 1.0e-3 {
-        return None;
-    }
-
-    // Into-body directions along each face (see `edge_corner_cutter`). Both are
-    // ⊥ the edge, so the corner/T1/T2/arc all lie in one cross-section plane.
-    let f1 = n2.mul(-1.0).sub(n1.mul(n2.mul(-1.0).dot(n1))).normalize();
-    let f2 = n1.mul(-1.0).sub(n2.mul(n1.mul(-1.0).dot(n2))).normalize();
-    if f1.length() < 0.5 || f2.length() < 0.5 {
-        return None;
-    }
-
-    let u_axis = n1.sub(t.mul(n1.dot(t))).normalize();
-    let v_axis = t.cross(u_axis).normalize();
-    let proj = |pt: Vec3| -> (f32, f32) {
-        let d = pt.sub(p0);
-        (d.dot(u_axis), d.dot(v_axis))
-    };
-
-    let t1 = p0.add(f1.mul(dist)); // tangent point on face 1
-    let t2 = p0.add(f2.mul(dist)); // tangent point on face 2
-    // Arc centre sits one `dist` off each face (exact for a right-angle corner);
-    // the round is the circle through T1/T2 about it, bulging toward the corner.
-    let center = p0.add(f1.mul(dist)).add(f2.mul(dist));
-    let r = t1.sub(center).length();
-    if r < 1.0e-4 {
-        return None;
-    }
-    // Transit point: the arc's apex toward the corner (the circle point in the
-    // corner's direction from the centre). `circle_arc` sweeps T1→T2 through it,
-    // so this picks the short arc that hugs the corner.
-    let to_corner = p0.sub(center);
-    if to_corner.length() < 1.0e-4 {
-        return None;
-    }
-    let transit = center.add(to_corner.normalize().mul(r));
-
-    // Robust fallback: concentric scale about the centre lifts T1/T2 (and the
-    // transit) radially outward — off the body faces (T1−centre = +n1·dist, an
-    // outward face normal) — so the legs aren't coplanar with the body and the
-    // boolean cuts through transversally. A concentric scale keeps the arc a
-    // valid circle (radius r→r+grow), unlike an off-centre offset.
-    let (corner_p, t1_p, t2_p, transit_p) = if grow > 1.0e-6 {
-        let s = (r + grow) / r;
-        let scale = |pt: Vec3| center.add(pt.sub(center).mul(s));
-        (scale(p0), scale(t1), scale(t2), scale(transit))
-    } else {
-        (p0, t1, t2, transit)
-    };
-
-    // Wind CCW as seen from +t so `tsweep` along +t yields an outward solid the
-    // boolean accepts (matches `build_cylinder_solid`'s convention).
-    let (a0, a1, a2) = (proj(corner_p), proj(t1_p), proj(t2_p));
-    let area = (a0.0 * a1.1 - a1.0 * a0.1)
-        + (a1.0 * a2.1 - a2.0 * a1.1)
-        + (a2.0 * a0.1 - a0.0 * a2.1);
-    let ccw = area >= 0.0;
-
-    // Start the cross-section one overshoot behind p0; sweep the full edge plus
-    // both overshoots along +t.
-    let back = t.mul(-end_overshoot);
-    let pt3 = |p: Vec3| Point3::new(p.x as f64, p.y as f64, p.z as f64);
-    let v_corner = builder::vertex(pt3(corner_p.add(back)));
-    let v_t1 = builder::vertex(pt3(t1_p.add(back)));
-    let v_t2 = builder::vertex(pt3(t2_p.add(back)));
-    let transit3 = pt3(transit_p.add(back));
-
-    // CCW order is corner → T1 → (arc) → T2 → corner; reverse to corner → T2 →
-    // (arc) → T1 → corner when the projected winding came out CW.
-    let wire: Wire = if ccw {
-        vec![
-            builder::line(&v_corner, &v_t1),
-            builder::circle_arc(&v_t1, &v_t2, transit3),
-            builder::line(&v_t2, &v_corner),
-        ]
-    } else {
-        vec![
-            builder::line(&v_corner, &v_t2),
-            builder::circle_arc(&v_t2, &v_t1, transit3),
-            builder::line(&v_t1, &v_corner),
-        ]
-    }
-    .into_iter()
-    .collect();
-
-    let face = builder::try_attach_plane(&[wire]).ok()?;
-    let depth = (len + 2.0 * end_overshoot) as f64;
-    let sweep = Vector3::new(t.x as f64 * depth, t.y as f64 * depth, t.z as f64 * depth);
-    Some(builder::tsweep(&face, sweep))
-}
-
 /// Offset a simple **CCW** polygon outward by `grow`, the robust way: slide every
 /// edge out along its outward normal, then place each new vertex at the
 /// intersection of the two consecutive offset edges. Unlike a radial scale about
@@ -666,8 +540,8 @@ fn circle_profile(points: &[(f32, f32)]) -> Option<(f32, f32, f32)> {
 }
 
 /// A real cylinder: a circular face of radius `r` centred at `(cu, cv)` on the
-/// sketch plane, swept `depth` along the plane normal. Built from four quarter
-/// arcs so the side is a single smooth cylindrical B-Rep face (not a prism).
+/// sketch plane, swept `depth` along the plane normal. Uses the native cylinder
+/// primitive so the side is a smooth analytic cylindrical surface (not a prism).
 fn oriented_cylinder_solid(
     cs: &crate::geometry::CoordinateSystem,
     cu: f32,
@@ -675,87 +549,179 @@ fn oriented_cylinder_solid(
     r: f32,
     depth: f32,
 ) -> Option<KernelSolid> {
-    use std::f64::consts::PI;
+    if r <= 0.0 || depth.abs() < f32::EPSILON {
+        return None;
+    }
     let center = cs.unproject(cu, cv);
-    // A point on the rim at angle `ang`, expressed in 3D via the plane axes.
-    let rim = |ang: f64| -> Point3 {
-        let (c, s) = (ang.cos() as f32, ang.sin() as f32);
-        let p = center.add(cs.u.mul(r * c)).add(cs.v.mul(r * s));
-        Point3::new(p.x as f64, p.y as f64, p.z as f64)
+    // `make_cylinder` builds the wall along +axis from the base; for a negative
+    // sweep, base the cylinder at the far (lower) rim and use the positive height.
+    let base = if depth >= 0.0 {
+        center
+    } else {
+        center.add(cs.n.mul(depth))
     };
-
-    let v0 = builder::vertex(rim(0.0));
-    let v1 = builder::vertex(rim(PI * 0.5));
-    let v2 = builder::vertex(rim(PI));
-    let v3 = builder::vertex(rim(PI * 1.5));
-    let a1 = builder::circle_arc(&v0, &v1, rim(PI * 0.25));
-    let a2 = builder::circle_arc(&v1, &v2, rim(PI * 0.75));
-    let a3 = builder::circle_arc(&v2, &v3, rim(PI * 1.25));
-    let a4 = builder::circle_arc(&v3, &v0, rim(PI * 1.75));
-
-    let wire: Wire = vec![a1, a2, a3, a4].into_iter().collect();
-    let face = builder::try_attach_plane(&[wire]).ok()?;
-    let sweep = Vector3::new(
-        cs.n.x as f64 * depth as f64,
-        cs.n.y as f64 * depth as f64,
-        cs.n.z as f64 * depth as f64,
+    let axis = Ax2::new(
+        Pnt::new(base.x as f64, base.y as f64, base.z as f64),
+        Dir::new(cs.n.x as f64, cs.n.y as f64, cs.n.z as f64),
     );
-    Some(builder::tsweep(&face, sweep))
+    Some(make_cylinder(&axis, r as f64, depth.abs() as f64))
 }
 
-/// Run a kernel boolean, swallowing both a `None` result and any panic from
-/// inside `truck` (its solver can panic outright on curved geometry — e.g. a
-/// cylinder meeting a box). The panic hook is silenced for the duration so a
-/// degenerate boolean doesn't spam the log on every drag frame. Either way the
-/// caller just sees `None` and degrades gracefully instead of crashing the app.
-fn guarded_boolean(op: impl FnOnce() -> Option<KernelSolid>) -> Option<KernelSolid> {
+/// Run `f` with the panic hook silenced, restoring it afterward. `boolean_checked`
+/// already catches the kernel's panics, but the *default* hook still prints the
+/// panic (and any diagnostic dump) to stderr — which would spam the console on
+/// every degraded boolean (e.g. a drag frame). Silencing it keeps recoverable
+/// boolean failures quiet; the caller still just sees `None`.
+fn quiet_panic<R>(f: impl FnOnce() -> R) -> R {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op))
-        .ok()
-        .flatten();
+    let r = f();
     std::panic::set_hook(prev);
-    result
+    r
 }
 
-/// Boolean union (`a ∪ b`). Returns `None` if the solver can't resolve (or
-/// panics on) the configuration — callers decide how to degrade.
+/// Boolean union (`a ∪ b`). Returns `None` if the kernel can't resolve the
+/// configuration, panics, or produces a non-watertight result — callers decide
+/// how to degrade. `boolean_checked` catches panics and rejects leaky output.
 pub fn union(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
-    guarded_boolean(|| truck_shapeops::or(a, b, BOOL_TOL))
+    quiet_panic(|| boolean_checked(a, b, BooleanOp::Fuse).ok())
 }
 
-/// Boolean difference (`a − b`): subtract `b`'s volume from `a`. Implemented as
-/// `a ∩ complement(b)` by inverting `b`. Returns `None` on solver failure.
+/// Boolean difference (`a − b`): subtract `b`'s volume from `a`. Returns `None`
+/// on kernel failure or non-watertight output.
 pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
-    let mut inv = b.clone();
-    inv.not();
-    guarded_boolean(|| truck_shapeops::and(a, &inv, BOOL_TOL))
+    quiet_panic(|| boolean_checked(a, b, BooleanOp::Cut).ok())
+}
+
+/// Fallback for the common "rectangular pocket clean through an axis-aligned
+/// block" case when the general boolean engine cannot resolve the coplanar
+/// split. The result is rebuilt as one extruded face with a rectangular hole.
+pub fn axis_aligned_through_cut(part: &KernelSolid, tool: &KernelSolid) -> Option<KernelSolid> {
+    let (plo, phi) = solid_aabb(part)?;
+    let (tlo, thi) = solid_aabb(tool)?;
+    const EPS: f32 = 0.25;
+
+    for axis in 0..3 {
+        if tlo[axis] > plo[axis] + EPS || thi[axis] < phi[axis] - EPS {
+            continue;
+        }
+
+        let axes: Vec<usize> = (0..3).filter(|&k| k != axis).collect();
+        let a = axes[0];
+        let b = axes[1];
+        let ha0 = tlo[a].max(plo[a]);
+        let ha1 = thi[a].min(phi[a]);
+        let hb0 = tlo[b].max(plo[b]);
+        let hb1 = thi[b].min(phi[b]);
+
+        if ha0 <= plo[a] + EPS
+            || ha1 >= phi[a] - EPS
+            || hb0 <= plo[b] + EPS
+            || hb1 >= phi[b] - EPS
+            || ha1 <= ha0 + EPS
+            || hb1 <= hb0 + EPS
+        {
+            continue;
+        }
+
+        let outer = vec![
+            (0.0, 0.0),
+            (phi[a] - plo[a], 0.0),
+            (phi[a] - plo[a], phi[b] - plo[b]),
+            (0.0, phi[b] - plo[b]),
+        ];
+        let hole = vec![
+            (ha0 - plo[a], hb0 - plo[b]),
+            (ha1 - plo[a], hb0 - plo[b]),
+            (ha1 - plo[a], hb1 - plo[b]),
+            (ha0 - plo[a], hb1 - plo[b]),
+        ];
+
+        let origin = Vec3::new(plo[0], plo[1], plo[2]);
+        let cs = match axis {
+            0 => crate::geometry::CoordinateSystem::new(origin, Vec3::Y, Vec3::Z),
+            1 => crate::geometry::CoordinateSystem::new(origin, Vec3::X, Vec3::Z),
+            _ => crate::geometry::CoordinateSystem::new(origin, Vec3::X, Vec3::Y),
+        };
+
+        return build_extrusion_solid(&outer, &[hole], (phi[axis] - plo[axis]) as f64, &cs);
+    }
+
+    None
+}
+
+/// Fallback for an axis-aligned cut when the exact boolean fails. It approximates
+/// the removed volume by the tool AABB and decomposes `part - tool` into up to
+/// six non-overlapping boxes, all kept as parts of the same ZeroCAD body.
+pub fn axis_aligned_cut_parts(part: &KernelSolid, tool: &KernelSolid) -> Option<Vec<KernelSolid>> {
+    let (plo, phi) = solid_aabb(part)?;
+    let (tlo, thi) = solid_aabb(tool)?;
+    const EPS: f32 = 0.01;
+
+    let rlo = [
+        tlo[0].max(plo[0]),
+        tlo[1].max(plo[1]),
+        tlo[2].max(plo[2]),
+    ];
+    let rhi = [
+        thi[0].min(phi[0]),
+        thi[1].min(phi[1]),
+        thi[2].min(phi[2]),
+    ];
+    if (0..3).any(|k| rhi[k] <= rlo[k] + EPS) {
+        return None;
+    }
+
+    let mut pieces = Vec::new();
+    let mut push_box = |lo: [f32; 3], hi: [f32; 3]| {
+        let d = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+        if d.iter().all(|&v| v > EPS) {
+            pieces.push(make_box(
+                &Pnt::new(lo[0] as f64, lo[1] as f64, lo[2] as f64),
+                d[0] as f64,
+                d[1] as f64,
+                d[2] as f64,
+            ));
+        }
+    };
+
+    push_box(plo, [rlo[0], phi[1], phi[2]]);
+    push_box([rhi[0], plo[1], plo[2]], phi);
+
+    let xlo = rlo[0];
+    let xhi = rhi[0];
+    push_box([xlo, plo[1], plo[2]], [xhi, rlo[1], phi[2]]);
+    push_box([xlo, rhi[1], plo[2]], [xhi, phi[1], phi[2]]);
+
+    let ylo = rlo[1];
+    let yhi = rhi[1];
+    push_box([xlo, ylo, plo[2]], [xhi, yhi, rlo[2]]);
+    push_box([xlo, ylo, rhi[2]], [xhi, yhi, phi[2]]);
+
+    (!pieces.is_empty()).then_some(pieces)
+}
+
+/// Round the edge running from `p0` to `p1` of `solid` by `radius`, using the
+/// native rolling-ball blend (no booleans). The edge is located in the solid's
+/// topology by matching its endpoints, so `p0`/`p1` are the world-space edge
+/// endpoints captured in an [`crate::parametric::EdgeRef`]. Returns `None` when
+/// the edge isn't found, isn't a blendable convex corner, or the blend fails.
+pub fn fillet_edge(solid: &KernelSolid, p0: [f32; 3], p1: [f32; 3], radius: f32) -> Option<KernelSolid> {
+    let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
+    let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
+    let e = Edge::between_points(a, b);
+    fillet_edges(solid, std::slice::from_ref(&e), radius as f64).ok()
 }
 
 /// Axis-aligned bounding box of a solid from its B-Rep vertices, as
 /// `(min, max)`. Exact for polygonal solids; a conservative-enough estimate for
 /// curved ones (used only for cheap overlap pre-tests). `None` if vertexless.
 pub fn solid_aabb(solid: &KernelSolid) -> Option<([f32; 3], [f32; 3])> {
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    let mut any = false;
-    for shell in solid.boundaries() {
-        for face in shell.face_iter() {
-            for wire in face.boundaries() {
-                for edge in wire.edge_iter() {
-                    for p in [edge.front().point(), edge.back().point()] {
-                        any = true;
-                        let c = [p.x as f32, p.y as f32, p.z as f32];
-                        for k in 0..3 {
-                            min[k] = min[k].min(c[k]);
-                            max[k] = max[k].max(c[k]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    any.then_some((min, max))
+    let (lo, hi) = solid.bounding_box().corners()?;
+    Some((
+        [lo.x() as f32, lo.y() as f32, lo.z() as f32],
+        [hi.x() as f32, hi.y() as f32, hi.z() as f32],
+    ))
 }
 
 /// Whether two AABBs overlap (or touch within `eps`). Used to skip boolean
@@ -774,26 +740,16 @@ pub fn aabb_contains(outer: &([f32; 3], [f32; 3]), inner: &([f32; 3], [f32; 3]),
 
 
 // ---------------------------------------------------------------------------
-// truck Solid builders
+// openrcad Solid builders
 // ---------------------------------------------------------------------------
 
-fn build_cylinder_solid(r: f64, h: f64) -> Option<truck_modeling::Solid> {
-    // Four quarter-arcs forming a circle in the XZ plane (perpendicular to Y).
-    let half = std::f64::consts::FRAC_1_SQRT_2 * r;
-
-    let v_px = builder::vertex(Point3::new(r, 0.0, 0.0));
-    let v_pz = builder::vertex(Point3::new(0.0, 0.0, r));
-    let v_nx = builder::vertex(Point3::new(-r, 0.0, 0.0));
-    let v_nz = builder::vertex(Point3::new(0.0, 0.0, -r));
-
-    let a1 = builder::circle_arc(&v_px, &v_pz, Point3::new(half, 0.0, half));
-    let a2 = builder::circle_arc(&v_pz, &v_nx, Point3::new(-half, 0.0, half));
-    let a3 = builder::circle_arc(&v_nx, &v_nz, Point3::new(-half, 0.0, -half));
-    let a4 = builder::circle_arc(&v_nz, &v_px, Point3::new(half, 0.0, -half));
-
-    let wire: Wire = vec![a1, a2, a3, a4].into_iter().collect();
-    let face = builder::try_attach_plane(&[wire]).ok()?;
-    Some(builder::tsweep(&face, Vector3::new(0.0, h, 0.0)))
+fn build_cylinder_solid(r: f64, h: f64) -> Option<KernelSolid> {
+    if r <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    // Base centered at the origin, swept along +Y — the axis the primitive
+    // display path (`MockMesh::make_cylinder`) and its wireframe expect.
+    Some(make_cylinder(&Ax2::new(Pnt::origin(), Dir::dy()), r, h))
 }
 
 fn build_extrusion_solid(
@@ -801,100 +757,114 @@ fn build_extrusion_solid(
     holes: &[Vec<(f32, f32)>],
     depth: f64,
     cs: &crate::geometry::CoordinateSystem,
-) -> Option<truck_modeling::Solid> {
-    // truck's `tsweep` only yields an *outward-facing* solid — the orientation
-    // its boolean solver needs — when the swept profile is wound CCW as seen
-    // from the +normal side AND the sweep runs along that +normal, which holds
-    // for a right-handed frame swept a positive depth.
-    //
-    // Two things flip the orientation, each independently turning the prism
-    // inside-out:
-    //   • a LEFT-handed frame (u × v = −n): the XZ/YZ origin-plane consts are
-    //     left-handed, so a CCW profile there faces −n.
-    //   • a NEGATIVE depth: the sweep runs opposite the plane normal.
-    // Either alone inverts the solid; both together cancel out. Display always
-    // survives (`enforce_outward_normals` re-signs render normals), but the
-    // boolean solver consumes the raw solid: an inside-out tool makes `union`
-    // (join) *subtract* the body and `difference` (cut) *add* the tool. XOR the
-    // two conditions so the winding is reversed exactly when needed, leaving an
-    // outward solid for any frame and either sweep direction.
-    let left_handed = cs.u.cross(cs.v).dot(cs.n) < 0.0;
-    let reverse_winding = left_handed ^ (depth < 0.0);
-
-    let make_wire = |loop_pts: &[(f32, f32)], reverse: bool| -> Wire {
-        let mut ordered: Vec<(f32, f32)> = loop_pts.to_vec();
-        if reverse {
-            ordered.reverse();
-        }
-        let verts: Vec<Vertex> = ordered
-            .iter()
-            .map(|(u, v)| {
-                let p3 = cs.unproject(*u, *v);
-                builder::vertex(Point3::new(p3.x as f64, p3.y as f64, p3.z as f64))
-            })
-            .collect();
-        let n = verts.len();
-        let edges: Vec<_> = (0..n)
-            .map(|i| builder::line(&verts[i], &verts[(i + 1) % n]))
-            .collect();
-        edges.into_iter().collect()
-    };
-
-    // Outer boundary first; holes follow, wound opposite so they cut a pocket.
-    // `reverse_winding` flips both together so the solid stays outward-facing
-    // for any frame handedness and either sweep direction.
-    let mut wires: Vec<Wire> = vec![make_wire(points, reverse_winding)];
-    for hole in holes {
-        if hole.len() < 3 {
-            continue;
-        }
-        wires.push(make_wire(hole, !reverse_winding));
+) -> Option<KernelSolid> {
+    if points.len() < 3 || depth.abs() < f64::EPSILON {
+        return None;
     }
 
-    let face = builder::try_attach_plane(&wires).ok()?;
-    let sweep = Vector3::new(
+    let to_pnt = |u: f32, v: f32| -> Pnt {
+        let p = cs.unproject(u, v);
+        Pnt::new(p.x as f64, p.y as f64, p.z as f64)
+    };
+    let make_wire = |loop_pts: &[(f32, f32)]| -> Option<Wire> {
+        if loop_pts.len() < 3 {
+            return None;
+        }
+        let pts: Vec<Pnt> = loop_pts.iter().map(|(u, v)| to_pnt(*u, *v)).collect();
+        let n = pts.len();
+        let edges: Vec<Edge> = (0..n)
+            .map(|i| Edge::between_points(pts[i], pts[(i + 1) % n]))
+            .collect();
+        Some(Wire::from_edges(edges))
+    };
+
+    // A planar face on the sketch frame: outer boundary plus holes as inner
+    // wires. `prism` orients its caps from the face's declared plane normal vs.
+    // the sweep direction, so that normal must agree with the outer loop's actual
+    // winding — otherwise the shell comes out with mixed (some inward) face
+    // normals. ZeroCAD's XZ/YZ sketch frames are left-handed (u × v = −n), so a
+    // CCW-in-(u,v) loop there faces −cs.n, not +cs.n. Derive the plane normal
+    // straight from the 3D winding (Newell's method) so it is always consistent,
+    // for any frame handedness; the sweep still runs along cs.n·depth, and
+    // `prism` reconciles the sign.
+    let outer = make_wire(points)?;
+    let inners: Vec<Wire> = holes.iter().filter_map(|h| make_wire(h)).collect();
+    let pts3: Vec<Pnt> = points.iter().map(|(u, v)| to_pnt(*u, *v)).collect();
+    let normal = newell_normal(&pts3)?;
+    let plane = GeomSurface::plane(Plane::from_point_normal(pts3[0], normal));
+    let face = if inners.is_empty() {
+        Face::new(Some(plane), outer)
+    } else {
+        Face::with_wires(Some(plane), Some(outer), inners, Orientation::Forward)
+    };
+    let sweep = GeomVec::new(
         cs.n.x as f64 * depth,
         cs.n.y as f64 * depth,
         cs.n.z as f64 * depth,
     );
-    Some(builder::tsweep(&face, sweep))
+    prism(&face, sweep).ok()
+}
+
+/// Unit normal of a planar 3D loop via Newell's method — robust to the loop's
+/// winding and to which axis it spans. `None` for a degenerate (collinear or
+/// zero-area) loop.
+fn newell_normal(pts: &[Pnt]) -> Option<Dir> {
+    let n = pts.len();
+    let (mut nx, mut ny, mut nz) = (0.0f64, 0.0, 0.0);
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        nx += (a.y() - b.y()) * (a.z() + b.z());
+        ny += (a.z() - b.z()) * (a.x() + b.x());
+        nz += (a.x() - b.x()) * (a.y() + b.y());
+    }
+    let len = (nx * nx + ny * ny + nz * nz).sqrt();
+    (len > 1e-12).then(|| Dir::new(nx / len, ny / len, nz / len))
 }
 
 // ---------------------------------------------------------------------------
 // Tessellation → flat interleaved vertex buffer
 // ---------------------------------------------------------------------------
 
-fn solid_to_flat_mesh(solid: &truck_modeling::Solid) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
-    let meshed: Solid<Point3, _, Option<PolygonMesh>> = solid.triangulation(TESS_TOL);
+fn solid_to_flat_mesh(
+    solid: &KernelSolid,
+    correct_boolean_bevels: bool,
+    correct_mixed_triangle_normals: bool,
+) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+    // `gpu_mesh` unwelds each triangle into three vertices carrying that
+    // triangle's flat face normal, plus a per-triangle source-face id — exactly
+    // the interleaved layout (minus the f32 normal smoothing) we want. Each
+    // vertex copy belongs to a single triangle, so the per-vertex→face mapping
+    // `smooth_vertex_normals` relies on holds.
+    let mesh = tessellate(solid, TESS_TOL, TESS_ANGLE);
+    let gpu = mesh.gpu_mesh();
 
-    let mut vertices: Vec<f32> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    let mut face_ids: Vec<u32> = Vec::new();
-    // One id per truck B-rep face, so all triangles of a face share an id.
-    let mut next_face_id: u32 = 0;
-
-    for shell in meshed.boundaries() {
-        for face in shell.face_iter() {
-            // Account for face orientation: tsweep can produce inverted shells.
-            let flip = !face.orientation();
-            if let Some(pm) = face.surface().as_ref() {
-                let before = indices.len() / 3;
-                append_polymesh(pm, flip, &mut vertices, &mut indices);
-                let added = indices.len() / 3 - before;
-                if added > 0 {
-                    face_ids.extend(std::iter::repeat(next_face_id).take(added));
-                    next_face_id += 1;
-                }
-            }
-        }
+    let vcount = gpu.positions.len() / 3;
+    let mut vertices: Vec<f32> = Vec::with_capacity(vcount * 6);
+    for i in 0..vcount {
+        let p = i * 3;
+        vertices.extend_from_slice(&[
+            gpu.positions[p],
+            gpu.positions[p + 1],
+            gpu.positions[p + 2],
+            gpu.normals[p],
+            gpu.normals[p + 1],
+            gpu.normals[p + 2],
+        ]);
     }
+    let indices = gpu.indices;
+    let face_ids = gpu.face_ids;
 
-    // Normalize the whole shell to outward-facing normals. truck builds some
-    // solids inside-out (e.g. extrusions on the left-handed XZ/YZ sketch
-    // frames), which would otherwise make the renderer's back-face culling and
-    // hidden-line removal disagree. A closed shell's normals are uniformly
-    // oriented, so one centroid test decides the sign for the whole mesh.
-    enforce_outward_normals(&mut vertices, &indices);
+    // Normalize the shell to outward-facing normals. `tessellate` usually
+    // honours face orientation, but direct sketch prisms can arrive with one cap
+    // sign inverted while the rest of the shell is correct, so that path opts
+    // into a per-triangle repair. More complex boolean/fillet solids keep the
+    // older whole-shell guard because a centroid test is too blunt for their
+    // curved or non-convex local faces.
+    enforce_outward_normals(&mut vertices, &indices, correct_mixed_triangle_normals);
+    if correct_boolean_bevels {
+        correct_inverted_planar_bevel_normals(&mut vertices, &indices, &face_ids);
+    }
 
     // Smooth the normals across shallow creases so a curved surface — an
     // analytic fillet cylinder, or a boolean'd / many-sided extruded cylinder
@@ -1027,10 +997,9 @@ fn smooth_vertex_normals(
     }
 }
 
-/// Flip every normal in `vertices` (interleaved pos+normal) if the shell's
-/// normals point inward, judged by summing each triangle's normal against the
-/// direction from the mesh centroid to that triangle.
-fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32]) {
+/// Flip triangle normals in `vertices` (interleaved pos+normal) when they point
+/// inward, judged against the direction from the mesh centroid to that triangle.
+fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32], per_triangle: bool) {
     let vcount = vertices.len() / 6;
     if vcount == 0 || indices.is_empty() {
         return;
@@ -1045,6 +1014,15 @@ fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32]) {
     let inv = 1.0 / vcount as f32;
     let (cx, cy, cz) = (cx * inv, cy * inv, cz * inv);
 
+    let flip_triangle = |vertices: &mut [f32], tri: &[u32]| {
+        for &vi in tri {
+            let b = vi as usize * 6;
+            vertices[b + 3] = -vertices[b + 3];
+            vertices[b + 4] = -vertices[b + 4];
+            vertices[b + 5] = -vertices[b + 5];
+        }
+    };
+
     let mut orient = 0.0f32;
     for tri in indices.chunks_exact(3) {
         let i0 = tri[0] as usize * 6;
@@ -1053,10 +1031,17 @@ fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32]) {
         let tcx = (vertices[i0] + vertices[i1] + vertices[i2]) / 3.0 - cx;
         let tcy = (vertices[i0 + 1] + vertices[i1 + 1] + vertices[i2 + 1]) / 3.0 - cy;
         let tcz = (vertices[i0 + 2] + vertices[i1 + 2] + vertices[i2 + 2]) / 3.0 - cz;
-        orient += vertices[i0 + 3] * tcx + vertices[i0 + 4] * tcy + vertices[i0 + 5] * tcz;
+        let dot = vertices[i0 + 3] * tcx + vertices[i0 + 4] * tcy + vertices[i0 + 5] * tcz;
+        if per_triangle {
+            if dot < 0.0 {
+                flip_triangle(vertices, tri);
+            }
+        } else {
+            orient += dot;
+        }
     }
 
-    if orient < 0.0 {
+    if !per_triangle && orient < 0.0 {
         for v in 0..vcount {
             vertices[v * 6 + 3] = -vertices[v * 6 + 3];
             vertices[v * 6 + 4] = -vertices[v * 6 + 4];
@@ -1065,46 +1050,267 @@ fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32]) {
     }
 }
 
-fn append_polymesh(pm: &PolygonMesh, flip: bool, vertices: &mut Vec<f32>, indices: &mut Vec<u32>) {
-    let positions = pm.positions();
-    let normals = pm.normals();
-    let tri_faces = pm.tri_faces();
-
-    if positions.is_empty() || tri_faces.is_empty() {
+/// Boolean cuts can occasionally sew one new planar cutter face with its normal
+/// opposite the two flat faces it bridges. That is the signature of a chamfer
+/// bevel: a flat face with at least two flat neighbours whose outward normals
+/// strongly agree with each other only after the candidate is flipped.
+fn correct_inverted_planar_bevel_normals(
+    vertices: &mut [f32],
+    indices: &[u32],
+    face_ids: &[u32],
+) {
+    if indices.is_empty() || face_ids.is_empty() {
         return;
     }
 
-    // Dedupe per (pos, normal) within this face. Reusing across faces would be
-    // nice but seam normals differ — keeping faces independent is correct.
-    let mut cache: HashMap<(usize, Option<usize>), u32> = HashMap::new();
+    let nrm = |vertices: &[f32], i: usize| -> [f32; 3] {
+        let b = i * 6;
+        [vertices[b + 3], vertices[b + 4], vertices[b + 5]]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| -> f32 { a[0] * b[0] + a[1] * b[1] + a[2] * b[2] };
+    let norm = |v: [f32; 3]| -> Option<[f32; 3]> {
+        let len = dot(v, v).sqrt();
+        (len > 1.0e-6).then(|| [v[0] / len, v[1] / len, v[2] / len])
+    };
+    let key = |idx: usize| -> (i64, i64, i64) {
+        let b = idx * 6;
+        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (q(vertices[b]), q(vertices[b + 1]), q(vertices[b + 2]))
+    };
 
-    for tri in tri_faces {
-        let mut local = [0u32; 3];
-        for (slot, v) in tri.iter().enumerate() {
-            let key = (v.pos, v.nor);
-            let idx = *cache.entry(key).or_insert_with(|| {
-                let p = &positions[v.pos];
-                let n = match v.nor.and_then(|i| normals.get(i)) {
-                    Some(n) => {
-                        if flip {
-                            [-n.x as f32, -n.y as f32, -n.z as f32]
-                        } else {
-                            [n.x as f32, n.y as f32, n.z as f32]
-                        }
-                    }
-                    None => [0.0, 0.0, 1.0],
-                };
-                vertices.extend_from_slice(&[p.x as f32, p.y as f32, p.z as f32, n[0], n[1], n[2]]);
-                (vertices.len() / 6) as u32 - 1
-            });
-            local[slot] = idx;
-        }
-        if flip {
-            indices.extend_from_slice(&[local[0], local[2], local[1]]);
-        } else {
-            indices.extend_from_slice(&[local[0], local[1], local[2]]);
+    let mut face_tris: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut face_sum: HashMap<u32, [f32; 3]> = HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        face_tris.entry(fid).or_default().push(t);
+        let n = nrm(vertices, tri[0] as usize);
+        let sum = face_sum.entry(fid).or_insert([0.0, 0.0, 0.0]);
+        sum[0] += n[0];
+        sum[1] += n[1];
+        sum[2] += n[2];
+    }
+
+    let mut face_normal: HashMap<u32, [f32; 3]> = HashMap::new();
+    let mut face_flat: HashMap<u32, bool> = HashMap::new();
+    for (&fid, tris) in &face_tris {
+        let Some(avg) = face_sum.get(&fid).and_then(|&n| norm(n)) else {
+            continue;
+        };
+        let flat = tris.iter().all(|&t| {
+            indices[t * 3..t * 3 + 3]
+                .iter()
+                .all(|&vi| dot(avg, nrm(vertices, vi as usize)) > 0.999)
+        });
+        face_normal.insert(fid, avg);
+        face_flat.insert(fid, flat);
+    }
+
+    let mut edge_faces: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<u32>> = HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        for &(i, j) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+            let (ka, kb) = (key(tri[i] as usize), key(tri[j] as usize));
+            let k = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            let faces = edge_faces.entry(k).or_default();
+            if !faces.contains(&fid) {
+                faces.push(fid);
+            }
         }
     }
+
+    let mut neighbours: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for faces in edge_faces.values() {
+        for &a in faces {
+            for &b in faces {
+                if a != b {
+                    neighbours.entry(a).or_default().insert(b);
+                }
+            }
+        }
+    }
+
+    let mut flip_faces = HashSet::new();
+    for (&fid, tris) in &face_tris {
+        if tris.is_empty() || !face_flat.get(&fid).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(&n) = face_normal.get(&fid) else {
+            continue;
+        };
+
+        let mut opposing = [0.0f32, 0.0, 0.0];
+        let mut opposing_count = 0;
+        for neighbour in neighbours.get(&fid).into_iter().flatten() {
+            if !face_flat.get(neighbour).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(&nn) = face_normal.get(neighbour) else {
+                continue;
+            };
+            if dot(n, nn) < -0.2 {
+                opposing[0] += nn[0];
+                opposing[1] += nn[1];
+                opposing[2] += nn[2];
+                opposing_count += 1;
+            }
+        }
+
+        if opposing_count >= 2
+            && norm(opposing)
+                .map(|avg| dot(n, avg) < -0.75)
+                .unwrap_or(false)
+        {
+            flip_faces.insert(fid);
+        }
+    }
+
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        if !flip_faces.contains(&fid) {
+            continue;
+        }
+        for &vi in tri {
+            let b = vi as usize * 6;
+            vertices[b + 3] = -vertices[b + 3];
+            vertices[b + 4] = -vertices[b + 4];
+            vertices[b + 5] = -vertices[b + 5];
+        }
+    }
+}
+
+fn add_missing_straight_brep_edges(
+    solid: &KernelSolid,
+    vertices: &[f32],
+    indices: &[u32],
+    face_ids: &[u32],
+    edge_vertices: &mut Vec<f32>,
+    edge_indices: &mut Vec<u32>,
+    edge_face_normals: &mut Vec<f32>,
+) {
+    let edge_key_from_points = |a: [f32; 3], b: [f32; 3]| {
+        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        let ka = (q(a[0]), q(a[1]), q(a[2]));
+        let kb = (q(b[0]), q(b[1]), q(b[2]));
+        if ka <= kb { (ka, kb) } else { (kb, ka) }
+    };
+
+    let mut existing = HashSet::new();
+    for pair in edge_indices.chunks_exact(2) {
+        let ia = pair[0] as usize * 3;
+        let ib = pair[1] as usize * 3;
+        let a = [
+            edge_vertices[ia],
+            edge_vertices[ia + 1],
+            edge_vertices[ia + 2],
+        ];
+        let b = [
+            edge_vertices[ib],
+            edge_vertices[ib + 1],
+            edge_vertices[ib + 2],
+        ];
+        existing.insert(edge_key_from_points(a, b));
+    }
+
+    let mut face_normal: HashMap<u32, [f32; 3]> = HashMap::new();
+    let mut face_count: HashMap<u32, u32> = HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        let b = tri[0] as usize * 6;
+        let n = [vertices[b + 3], vertices[b + 4], vertices[b + 5]];
+        let sum = face_normal.entry(fid).or_insert([0.0, 0.0, 0.0]);
+        sum[0] += n[0];
+        sum[1] += n[1];
+        sum[2] += n[2];
+        *face_count.entry(fid).or_insert(0) += 1;
+    }
+    for (fid, n) in &mut face_normal {
+        let count = face_count.get(fid).copied().unwrap_or(1) as f32;
+        n[0] /= count;
+        n[1] /= count;
+        n[2] /= count;
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if len > 1.0e-6 {
+            n[0] /= len;
+            n[1] /= len;
+            n[2] /= len;
+        }
+    }
+
+    let mut topo_edges: HashMap<
+        ((i64, i64, i64), (i64, i64, i64)),
+        ([f32; 3], [f32; 3], Vec<u32>),
+    > = HashMap::new();
+    for (fid, face) in solid.shell().faces().iter().enumerate() {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                let a = edge.start().point();
+                let b = edge.end().point();
+                let pa = [a.x() as f32, a.y() as f32, a.z() as f32];
+                let pb = [b.x() as f32, b.y() as f32, b.z() as f32];
+                let d2 = (pa[0] - pb[0]).powi(2)
+                    + (pa[1] - pb[1]).powi(2)
+                    + (pa[2] - pb[2]).powi(2);
+                if d2 < 1.0e-8 || !edge_is_straight(&edge) {
+                    continue;
+                }
+                let rec = topo_edges
+                    .entry(edge_key_from_points(pa, pb))
+                    .or_insert_with(|| (pa, pb, Vec::new()));
+                if !rec.2.contains(&(fid as u32)) {
+                    rec.2.push(fid as u32);
+                }
+            }
+        }
+    }
+
+    for (key, (pa, pb, faces)) in topo_edges {
+        if existing.contains(&key) || faces.len() < 2 {
+            continue;
+        }
+        let d2 = (pa[0] - pb[0]).powi(2)
+            + (pa[1] - pb[1]).powi(2)
+            + (pa[2] - pb[2]).powi(2);
+        if d2 < 1.0e-6 {
+            continue;
+        }
+        let a = (edge_vertices.len() / 3) as u32;
+        edge_vertices.extend_from_slice(&pa);
+        edge_vertices.extend_from_slice(&pb);
+        edge_indices.push(a);
+        edge_indices.push(a + 1);
+
+        let n0 = faces
+            .get(0)
+            .and_then(|fid| face_normal.get(fid).copied())
+            .unwrap_or([0.0, 0.0, 1.0]);
+        let n1 = faces
+            .get(1)
+            .and_then(|fid| face_normal.get(fid).copied())
+            .unwrap_or(n0);
+        edge_face_normals.extend_from_slice(&n0);
+        edge_face_normals.extend_from_slice(&n1);
+    }
+}
+
+fn edge_is_straight(edge: &Edge) -> bool {
+    let Some(curve) = edge.curve() else {
+        return true;
+    };
+    let first = edge.first();
+    let last = edge.last();
+    let mid = 0.5 * (first + last);
+    let p0 = curve.point(first);
+    let p1 = curve.point(last);
+    let pm = curve.point(mid);
+    let chord = p1 - p0;
+    let len = chord.magnitude();
+    if len <= 1.0e-9 {
+        return false;
+    }
+    let along = chord / len;
+    let d = pm - p0;
+    let closest = p0 + along * d.dot(&along);
+    pm.distance(&closest) < 1.0e-4
 }
 
 // ---------------------------------------------------------------------------

@@ -1,10 +1,9 @@
 //! Parameter-space adaptive subdivision intersection solvers with Newton-Raphson refinement.
 //! Respects local tolerances and handles curve-curve, curve-surface, and surface-surface cases.
 
-use openrcad_foundation::predicates::orient2d;
-use openrcad_foundation::{Ax3, Dir, Pnt, Pnt2d, Vec as GeomVec};
+use openrcad_foundation::{Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{BSplineCurve, Circle, Curve, GeomCurve, GeomSurface, Surface};
-use openrcad_topo::{Face, Orientation};
+use openrcad_topo::{containment::point_in_polygon_2d, Face, Orientation};
 
 use core::f64::consts::PI;
 
@@ -1368,43 +1367,6 @@ fn search_nearest_parameter_newton(s: &GeomSurface, p: &Pnt, hint: (f64, f64)) -
     (u, v)
 }
 
-/// Robust Jordan curve theorem point-in-polygon containment test for 2D.
-///
-/// Crossing-number ray test, but each "is the +x ray crossing this edge?"
-/// decision is made with the exact [`orient2d`] predicate rather than the
-/// classic floating-point slope comparison `q.x < (…)/(pj.y - pi.y)`. That
-/// division is ill-conditioned for near-horizontal edges (and the usual
-/// `+ 1e-15` guard silently biases the result); `orient2d` is division-free and
-/// promotes to exact arithmetic exactly when the sign is in doubt, so a point
-/// near a sliver edge is classified consistently with the same edge seen from an
-/// adjacent face. Operates in surface `(u, v)` parameter space, where an
-/// orientation test is still a valid 2D predicate.
-fn point_in_polygon_2d(q: (f64, f64), poly: &[(f64, f64)]) -> bool {
-    let n = poly.len();
-    if n < 3 {
-        return false;
-    }
-    let qp = Pnt2d::new(q.0, q.1);
-    let mut inside = false;
-    let mut j = n - 1;
-    for i in 0..n {
-        let (a, b) = (poly[j], poly[i]); // directed edge a -> b
-                                         // Does the edge straddle the horizontal line through q?
-        if (a.1 > q.1) != (b.1 > q.1) {
-            // The +x ray from q crosses edge a->b iff q lies on the side of the
-            // directed edge that faces the crossing: for an upward edge that is
-            // the left side (orient2d > 0), for a downward edge the right side.
-            let side = orient2d(Pnt2d::new(a.0, a.1), Pnt2d::new(b.0, b.1), qp);
-            let upward = b.1 > a.1;
-            if upward == (side > 0.0) {
-                inside = !inside;
-            }
-        }
-        j = i;
-    }
-    inside
-}
-
 /// Sample the boundary `wire` of a face carried by `surface` into a polygon in
 /// the surface's `(u, v)` parameter space. Each edge is sampled in its oriented
 /// traversal direction; the angular coordinate is unwrapped so the polygon does
@@ -1483,7 +1445,8 @@ pub fn is_inside_trimming_loops(u: f64, v: f64, face: &Face) -> bool {
     for hole in face.inner_wires() {
         let hole_poly = loop_uv_polygon(surface, &hole);
         let hu = if periodic { align_u(u, &hole_poly) } else { u };
-        if point_in_polygon_2d((hu, v), &hole_poly) {
+        let res = point_in_polygon_2d((hu, v), &hole_poly);
+        if res {
             return false;
         }
     }
@@ -1532,6 +1495,147 @@ pub fn ray_face(ray_origin: &Pnt, ray_dir: &GeomVec, face: &Face, tol: f64) -> O
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         })
 }
+
+/// Find trimmed intersection curves between two faces.
+///
+/// Intersects the host surfaces and trims the resulting curves to the boundaries of both faces.
+pub fn surface_surface_curves(
+    face1: &Face,
+    face2: &Face,
+    tol: f64,
+) -> Vec<(GeomCurve, f64, f64)> {
+    let s1 = match face1.surface() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let s2 = match face2.surface() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let raw_curves = surface_surface(s1, s2, tol);
+    let mut trimmed_curves = Vec::new();
+
+    for curve in raw_curves {
+        let (c_min, c_max) = curve.bounds();
+        let c_min = if c_min.is_infinite() || c_min.is_nan() { -100.0 } else { c_min };
+        let c_max = if c_max.is_infinite() || c_max.is_nan() { 100.0 } else { c_max };
+
+        let mut split_params = vec![c_min, c_max];
+
+        // Find intersections between the intersection curve and the boundary edges of both faces
+        let mut add_intersections = |face: &Face| {
+            for wire in face.wires() {
+                for edge in wire.edges() {
+                    if let Some(edge_curve) = edge.curve() {
+                        let pts = curve_curve(edge_curve, &curve, tol);
+                        for pt in pts {
+                            let t = crate::boolean::project_point_on_curve(&pt, &curve, c_min, c_max);
+                            if t > c_min + tol && t < c_max - tol {
+                                split_params.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        add_intersections(face1);
+        add_intersections(face2);
+
+        // Sort and deduplicate split parameters
+        split_params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut unique_params: Vec<f64> = Vec::new();
+        for &t in &split_params {
+            if unique_params.iter().all(|&u| (u - t).abs() > 1e-5) {
+                unique_params.push(t);
+            }
+        }
+
+        // For each segment, check if its midpoint lies inside both faces
+        for i in 0..unique_params.len() - 1 {
+            let t1 = unique_params[i];
+            let t2 = unique_params[i + 1];
+            if (t2 - t1).abs() < tol {
+                continue;
+            }
+            let t_mid = 0.5 * (t1 + t2);
+            let p_mid = curve.point(t_mid);
+            let (u1, v1) = uv_of(s1, &p_mid);
+            let (u2, v2) = uv_of(s2, &p_mid);
+
+            if is_inside_trimming_loops(u1, v1, face1) && is_inside_trimming_loops(u2, v2, face2) {
+                trimmed_curves.push((curve.clone(), t1, t2));
+            }
+        }
+    }
+
+    trimmed_curves
+}
+
+/// Trim a curve segment to the interior of a face.
+///
+/// Intersects the curve segment with the face's boundary edges and returns
+/// all parameter intervals on the curve that lie inside the face.
+pub fn trim_curve_to_face(
+    curve: &GeomCurve,
+    first: f64,
+    last: f64,
+    face: &Face,
+    tol: f64,
+) -> Vec<(f64, f64)> {
+    let surface = match face.surface() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let first = if first.is_infinite() || first.is_nan() { -100.0 } else { first };
+    let last = if last.is_infinite() || last.is_nan() { 100.0 } else { last };
+
+    let mut split_params = vec![first, last];
+
+    for wire in face.wires() {
+        for edge in wire.edges() {
+            if let Some(edge_curve) = edge.curve() {
+                let pts = curve_curve(edge_curve, curve, tol);
+                for pt in pts {
+                    let t = crate::boolean::project_point_on_curve(&pt, curve, first, last);
+                    if t > first + tol && t < last - tol {
+                        split_params.push(t);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort and deduplicate
+    split_params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut unique_params: Vec<f64> = Vec::new();
+    for &t in &split_params {
+        if unique_params.iter().all(|&u| (u - t).abs() > 1e-5) {
+            unique_params.push(t);
+        }
+    }
+
+    let mut intervals = Vec::new();
+    for i in 0..unique_params.len() - 1 {
+        let t1 = unique_params[i];
+        let t2 = unique_params[i + 1];
+        if (t2 - t1).abs() < tol {
+            continue;
+        }
+        let t_mid = 0.5 * (t1 + t2);
+        let p_mid = curve.point(t_mid);
+        let (u, v) = uv_of(surface, &p_mid);
+
+        if is_inside_trimming_loops(u, v, face) {
+            intervals.push((t1, t2));
+        }
+    }
+
+    intervals
+}
+
 
 #[cfg(test)]
 mod tests {

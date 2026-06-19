@@ -882,6 +882,13 @@ fn apply_join(
                             break 'bodies;
                         }
                     }
+                    if let Some(fallback) = tool.exact.as_ref().or(tool.dipped.as_ref()).cloned()
+                    {
+                        body.parts.push(fallback);
+                        body.pristine = None;
+                        merged = true;
+                        break 'bodies;
+                    }
                 }
             }
         }
@@ -943,19 +950,43 @@ fn apply_cut(
                 }
                 // Exact first (precise pocket), then the expanded fallback that
                 // breaks wall-coplanarity. Both None → keep the part intact.
-                let cut = tool
+                let cut_parts = tool
                     .exact
                     .as_ref()
                     .and_then(|t| crate::mock_kernel::difference(&part, t))
+                    .map(|d| vec![d])
                     .or_else(|| {
                         tool.expanded
                             .as_ref()
                             .and_then(|t| crate::mock_kernel::difference(&part, t))
+                            .map(|d| vec![d])
+                    })
+                    .or_else(|| {
+                        tool.exact
+                            .as_ref()
+                            .and_then(|t| crate::mock_kernel::axis_aligned_through_cut(&part, t))
+                            .map(|d| vec![d])
+                    })
+                    .or_else(|| {
+                        tool.expanded
+                            .as_ref()
+                            .and_then(|t| crate::mock_kernel::axis_aligned_through_cut(&part, t))
+                            .map(|d| vec![d])
+                    })
+                    .or_else(|| {
+                        tool.exact
+                            .as_ref()
+                            .and_then(|t| crate::mock_kernel::axis_aligned_cut_parts(&part, t))
+                    })
+                    .or_else(|| {
+                        tool.expanded
+                            .as_ref()
+                            .and_then(|t| crate::mock_kernel::axis_aligned_cut_parts(&part, t))
                     });
-                match cut {
-                    Some(d) => {
+                match cut_parts {
+                    Some(parts) => {
                         changed = true;
-                        next.push(d);
+                        next.extend(parts);
                     }
                     // Solver failure or fully consumed. Keep the original part so
                     // a failed boolean doesn't delete material.
@@ -994,79 +1025,34 @@ const EDGE_FILLET_SEGS: usize = 24;
 /// fallback path, the price of a boolean that resolves at all.
 const EDGE_MOD_GROW: f32 = 0.2;
 
-/// Outward inflation (mm) for the **analytic-arc** fillet cutter. Smaller than
-/// [`EDGE_MOD_GROW`] because the visible loss of tangency at the fillet's blend
-/// line scales with this offset — the round meets its neighbour faces with a step
-/// of about this size — so it's kept as tight as the boolean allows while still
-/// clearing `BOOL_TOL` (0.05mm) by a 2× margin so the arc's tangent line reads as
-/// off-face rather than tangent (which truck rejects). Halving 0.2→0.1 visibly
-/// tightens the blend. A perfectly tangent blend needs no boolean at all (direct
-/// construction), but truck rejects a cutter that touches the faces tangentially.
-const ARC_FILLET_GROW: f32 = 0.1;
-
-/// Apply a 3D fillet/chamfer: subtract the edge cutter from the target body's
-/// parts. Mirrors [`apply_cut`]'s guarded, body-preserving strategy — a cutter
-/// the solver can't subtract leaves the part intact and raises a warning rather
-/// than dropping a valid body. The corner-push and end-overshoot offsets baked
-/// into the cutter dodge the coplanar-face failures (see
-/// [`crate::mock_kernel::edge_corner_cutter`]); the cutter is built once per
-/// part-attempt so the precise corner is tried before the pushed-out fallback.
+/// Apply a 3D fillet or chamfer to the target body.
+///
+/// **Fillet** uses OpenRCAD's native rolling-ball blend
+/// ([`crate::mock_kernel::fillet_edge`]): the captured edge is located in each
+/// part's B-Rep by its endpoints and replaced by a true cylindrical fillet face
+/// — no booleans, no draft/commit split. An oversized radius (≥ half the part's
+/// smallest dimension, the same bar OpenRCAD's all-edge `fillet` uses) is
+/// rejected so the body is left intact rather than self-intersecting.
+///
+/// **Chamfer** still subtracts a faceted edge cutter
+/// ([`crate::mock_kernel::edge_corner_cutter`]) via a guarded boolean, since the
+/// kernel has no native single-edge chamfer yet. As with [`apply_cut`], a
+/// boolean the kernel can't resolve leaves the part intact and warns rather than
+/// dropping a valid body.
+///
+/// `draft` is retained for API compatibility but no longer changes the result:
+/// the native fillet is exact in a single pass, so the live preview and the
+/// committed model are identical.
 fn apply_edge_mod(
     mod_id: &str,
     target: &str,
     edge: &EdgeRef,
     dist: f32,
     kind: crate::sketch::CornerKind,
-    draft: bool,
+    _draft: bool,
     live: &mut [LiveBody],
     warnings: &mut Vec<String>,
 ) {
-    let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
-
-    // Cutters are tried in quality order; the first whose boolean the solver
-    // accepts wins. For a *committed* fillet the analytic-arc cutter leads — it
-    // makes the round ONE cylindrical face with ONE arc edge and leaves the
-    // neighbour faces genuinely flat — with the faceted cutter following as a
-    // guaranteed fallback (truck's boolean is fragile on cylinders). In `draft`
-    // mode (a live drag preview) the arc cutter is skipped entirely: its boolean
-    // is ~50× slower, so re-solving it per frame freezes the UI — the preview
-    // uses the fast faceted cutter and the smooth arc result lands on commit.
-    // (A chamfer's bevel is already one planar face, so it never uses the arc.)
-    //
-    // Within each kind: `exact` keeps the corner on the body edge (perfect
-    // geometry if the solver takes it); `robust` lifts it just outside the body
-    // so the leg faces aren't coplanar with the body faces — the configuration
-    // truck's solver rejects. Both overshoot the edge ends. The arc cutter only
-    // ships its `robust` form: its `exact` (coplanar-leg) boolean reliably fails
-    // *and* costs a full ~250ms solve, so trying it is pure wasted latency.
-    let mut cutters: Vec<crate::mock_kernel::KernelSolid> = Vec::with_capacity(3);
-    if fillet && !draft {
-        cutters.extend(crate::mock_kernel::edge_fillet_cutter_arc(
-            edge.p0, edge.p1, edge.n1, edge.n2, dist, ARC_FILLET_GROW, CUT_OVERSHOOT,
-        ));
-    }
-    cutters.extend(crate::mock_kernel::edge_corner_cutter(
-        edge.p0, edge.p1, edge.n1, edge.n2, dist, fillet, EDGE_FILLET_SEGS, 0.0, CUT_OVERSHOOT,
-    ));
-    cutters.extend(crate::mock_kernel::edge_corner_cutter(
-        edge.p0,
-        edge.p1,
-        edge.n1,
-        edge.n2,
-        dist,
-        fillet,
-        EDGE_FILLET_SEGS,
-        EDGE_MOD_GROW,
-        CUT_OVERSHOOT,
-    ));
-    if cutters.is_empty() {
-        warnings.push(format!(
-            "Fillet/Chamfer '{mod_id}': the edge couldn't be turned into a cutter \
-             (degenerate edge or size), so the body was left unchanged."
-        ));
-        return;
-    }
-
     let Some(body) = live.iter_mut().find(|b| b.id == target) else {
         warnings.push(format!(
             "Fillet/Chamfer '{mod_id}': its target body no longer exists, so it \
@@ -1075,20 +1061,93 @@ fn apply_edge_mod(
         return;
     };
 
+    match kind {
+        crate::sketch::CornerKind::Fillet => apply_fillet(mod_id, edge, dist, body, warnings),
+        crate::sketch::CornerKind::Chamfer => apply_chamfer(mod_id, edge, dist, body, warnings),
+    }
+}
+
+/// Largest `dist` allowed before a fillet/chamfer would over-run the part: half
+/// its smallest AABB dimension (a blend rolling in from both faces meets in the
+/// middle there). Mirrors OpenRCAD's `ParameterTooLarge` bound.
+fn edge_mod_fits(part: &KernelSolid, dist: f32) -> bool {
+    match crate::mock_kernel::solid_aabb(part) {
+        Some((lo, hi)) => {
+            let min_dim = (0..3)
+                .map(|k| hi[k] - lo[k])
+                .fold(f32::INFINITY, f32::min);
+            dist < min_dim * 0.5
+        }
+        None => true,
+    }
+}
+
+/// Native rolling-ball fillet of the captured edge on every part of `body`.
+fn apply_fillet(
+    mod_id: &str,
+    edge: &EdgeRef,
+    dist: f32,
+    body: &mut LiveBody,
+    warnings: &mut Vec<String>,
+) {
     let mut applied = false;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
     for part in body.parts.drain(..) {
-        // Try each cutter (best geometry first); take the first difference the
-        // solver returns that still keeps the body's bulk.
+        let rounded = edge_mod_fits(&part, dist)
+            .then(|| crate::mock_kernel::fillet_edge(&part, edge.p0, edge.p1, dist))
+            .flatten();
+        match rounded {
+            Some(f) => {
+                applied = true;
+                next.push(f);
+            }
+            None => next.push(part),
+        }
+    }
+    body.parts = next;
+    if applied {
+        body.pristine = None;
+    } else {
+        warnings.push(format!(
+            "Fillet '{mod_id}': the edge couldn't be rounded (it may not be a \
+             clean convex corner, the radius may be too large, or the edge is no \
+             longer on the body), so the body was left unchanged."
+        ));
+    }
+}
+
+/// Faceted cutter-subtraction chamfer (no native single-edge chamfer yet).
+fn apply_chamfer(
+    mod_id: &str,
+    edge: &EdgeRef,
+    dist: f32,
+    body: &mut LiveBody,
+    warnings: &mut Vec<String>,
+) {
+    // exact = corner on the body edge (best geometry when the boolean takes it);
+    // robust = legs lifted just outside the body so they aren't coplanar with its
+    // faces. Both overshoot the edge ends.
+    let mut cutters: Vec<KernelSolid> = Vec::with_capacity(2);
+    cutters.extend(crate::mock_kernel::edge_corner_cutter(
+        edge.p0, edge.p1, edge.n1, edge.n2, dist, false, EDGE_FILLET_SEGS, 0.0, CUT_OVERSHOOT,
+    ));
+    cutters.extend(crate::mock_kernel::edge_corner_cutter(
+        edge.p0, edge.p1, edge.n1, edge.n2, dist, false, EDGE_FILLET_SEGS, EDGE_MOD_GROW, CUT_OVERSHOOT,
+    ));
+    if cutters.is_empty() {
+        warnings.push(format!(
+            "Chamfer '{mod_id}': the edge couldn't be turned into a cutter \
+             (degenerate edge or size), so the body was left unchanged."
+        ));
+        return;
+    }
+
+    let mut applied = false;
+    let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
+    for part in body.parts.drain(..) {
         let cut = cutters.iter().find_map(|tool| {
-            crate::mock_kernel::difference(&part, tool)
-                .filter(|d| edge_mod_keeps_body(&part, d))
+            crate::mock_kernel::difference(&part, tool).filter(|d| edge_mod_keeps_body(&part, d))
         });
-        // A fillet/chamfer must never delete the body: `a − cutter` is a subset
-        // of `a`, but truck can hand back a degenerate solid whose bounds
-        // collapse — `edge_mod_keeps_body` (applied in the `find_map` above)
-        // rejects anything that lost most of the part's box, so any `cut` here
-        // is a sound result.
         match cut {
             Some(d) => {
                 applied = true;
@@ -1102,9 +1161,8 @@ fn apply_edge_mod(
         body.pristine = None;
     } else {
         warnings.push(format!(
-            "Fillet/Chamfer '{mod_id}': the solver couldn't apply it to the body \
-             (the edge may not be a clean convex corner), so the body was left \
-             unchanged."
+            "Chamfer '{mod_id}': the solver couldn't apply it to the body (the \
+             edge may not be a clean convex corner), so the body was left unchanged."
         ));
     }
 }
@@ -1480,9 +1538,9 @@ mod extrude_mode_tests {
             warnings.is_empty(),
             "a clean box-edge chamfer should not warn, got {warnings:?}"
         );
+        let mesh = &bodies[0].1;
         // The bevel introduces a face whose outward normal points at ~45° between
         // the two original faces (-Y and -Z): n ≈ (0, -0.707, -0.707).
-        let mesh = &bodies[0].1;
         let has_bevel = mesh.vertices.chunks(6).any(|v| {
             v[3].abs() < 0.2 && (v[4] + 0.707).abs() < 0.15 && (v[5] + 0.707).abs() < 0.15
         });
@@ -1616,13 +1674,6 @@ mod extrude_mode_tests {
 
     #[test]
     fn fillet_tangent_boundary_edges_are_drawn() {
-        // The round meets each neighbour face along a tangent line — the visible
-        // top/bottom edge of the fillet. Those must be drawn (a fillet without them
-        // looks like a smeared blob), even though the surfaces are tangent there.
-        // On the y=0,z=0 edge of the 10-box the tangent lines run along +X: one on
-        // the front face (z≈0, at some y inside the round) and one on the bottom
-        // (y≈0, at some z inside the round). truck splits each into many short
-        // collinear segments, so we sum their +X extent rather than expect one span.
         let g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
         let (bodies, _) = g
             .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
@@ -1630,9 +1681,6 @@ mod extrude_mode_tests {
         let mesh = &bodies[0].1;
 
         let nedges = mesh.edge_indices.len() / 2;
-        // Total +X length of tangent-line segments lying on a flat face (`on0`≈0)
-        // at an interior offset (`off` strictly inside the round, 0.3..2.5) on the
-        // other axis. `pick` selects (front: z≈0,y=off) or (bottom: y≈0,z=off).
         let tangent_len = |front: bool| -> f32 {
             (0..nedges)
                 .filter_map(|e| {
@@ -1653,16 +1701,19 @@ mod extrude_mode_tests {
                 })
                 .sum()
         };
+
+        let t_true = tangent_len(true);
+        let t_false = tangent_len(false);
         // The round is ~10 long; require most of the tangent line to be present.
         assert!(
-            tangent_len(true) > 5.0,
+            t_true > 5.0,
             "the fillet's tangent edge on the front (z=0) face must be drawn (got {})",
-            tangent_len(true)
+            t_true
         );
         assert!(
-            tangent_len(false) > 5.0,
+            t_false > 5.0,
             "the fillet's tangent edge on the bottom (y=0) face must be drawn (got {})",
-            tangent_len(false)
+            t_false
         );
     }
 

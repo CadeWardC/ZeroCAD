@@ -1,8 +1,8 @@
 use crate::BooleanOp;
 use openrcad_foundation::{Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Surface};
-use openrcad_topo::arena::{EdgeId, OrientedEdge, VertexId};
-use openrcad_topo::{BRepBuilder, Face, FaceId, HealthReport, Orientation, Solid};
+use openrcad_topo::arena::EdgeId;
+use openrcad_topo::{BRepBuilder, Face, FaceId, HealthReport, Solid};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::bvh::Bvh;
@@ -145,6 +145,11 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     let mut tool_sub: std::collections::HashMap<FaceId, Vec<FaceId>> =
         faces_tool.iter().map(|f| (f.id(), vec![f.id()])).collect();
 
+    let mut splitting_edges_obj: std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>> =
+        std::collections::HashMap::new();
+    let mut splitting_edges_tool: std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>> =
+        std::collections::HashMap::new();
+
     for &(f_obj_id, f_tool_id) in &pairs {
         let f_obj = Face::from_id(
             object.brep().clone(),
@@ -166,30 +171,60 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
             for w_tool in f_tool.wires() {
                 for e_tool in w_tool.edges() {
                     if let Some(c_tool) = e_tool.curve() {
-                        let sub = obj_sub.get_mut(&f_obj_id).unwrap();
-                        split_tracked(&mut builder_obj, sub, c_tool, tol);
+                        let intervals = crate::intersect::trim_curve_to_face(c_tool, e_tool.first(), e_tool.last(), &f_obj, tol);
+                        for (first, last) in intervals {
+                            let sub = obj_sub.get_mut(&f_obj_id).unwrap();
+                            split_tracked(&mut builder_obj, sub, c_tool, first, last, &mut splitting_edges_obj, tol);
+                        }
                     }
                 }
             }
             for w_obj in f_obj.wires() {
                 for e_obj in w_obj.edges() {
                     if let Some(c_obj) = e_obj.curve() {
-                        let sub = tool_sub.get_mut(&f_tool_id).unwrap();
-                        split_tracked(&mut builder_tool, sub, c_obj, tol);
+                        let intervals = crate::intersect::trim_curve_to_face(c_obj, e_obj.first(), e_obj.last(), &f_tool, tol);
+                        for (first, last) in intervals {
+                            let sub = tool_sub.get_mut(&f_tool_id).unwrap();
+                            split_tracked(&mut builder_tool, sub, c_obj, first, last, &mut splitting_edges_tool, tol);
+                        }
                     }
                 }
             }
         } else {
-            // Intersecting surfaces: split each face along the intersection
-            // curve(s), again restricted to its own descendants.
-            let curves = crate::intersect::surface_surface(s_obj, s_tool, tol);
-            for curve in curves {
+            // Intersecting surfaces: split each face along the trimmed intersection curves
+            let curves = crate::intersect::surface_surface_curves(&f_obj, &f_tool, tol);
+            for (curve, first, last) in curves {
                 let sub = obj_sub.get_mut(&f_obj_id).unwrap();
-                split_tracked(&mut builder_obj, sub, &curve, tol);
+                split_tracked(&mut builder_obj, sub, &curve, first, last, &mut splitting_edges_obj, tol);
                 let sub = tool_sub.get_mut(&f_tool_id).unwrap();
-                split_tracked(&mut builder_tool, sub, &curve, tol);
+                split_tracked(&mut builder_tool, sub, &curve, first, last, &mut splitting_edges_tool, tol);
             }
         }
+    }
+
+    // Partition faces that have accumulated splitting edges
+    let run_partition = |builder: &mut BRepBuilder, sub: &mut Vec<FaceId>, split_map: &mut std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>>| {
+        let mut new_sub = Vec::new();
+        for &fid in sub.iter() {
+            if let Some(edges) = split_map.remove(&fid) {
+                if builder.brep().faces.contains_key(fid) {
+                    let partitioned = builder.partition_face(fid, &edges);
+                    new_sub.extend(partitioned);
+                } else {
+                    new_sub.push(fid);
+                }
+            } else {
+                new_sub.push(fid);
+            }
+        }
+        *sub = new_sub;
+    };
+
+    for sub in obj_sub.values_mut() {
+        run_partition(&mut builder_obj, sub, &mut splitting_edges_obj);
+    }
+    for sub in tool_sub.values_mut() {
+        run_partition(&mut builder_tool, sub, &mut splitting_edges_tool);
     }
 
     // 3. Classify all split faces
@@ -371,37 +406,6 @@ fn try_split_edge(
     builder.split_edge(edge_id, v, t);
 }
 
-/// Return the loop vertex at `pt` on edge `e_id`: reuse an existing endpoint if
-/// `pt` coincides with one, otherwise split the edge there to create a fresh
-/// vertex. Prevents zero-length edges when a face crossing lands on a vertex
-/// that pass A already inserted.
-fn resolve_or_split(
-    builder: &mut BRepBuilder,
-    e_id: EdgeId,
-    t_edge: f64,
-    pt: &Pnt,
-    tol: f64,
-) -> VertexId {
-    let ed = builder.brep().edges[e_id].clone();
-    let s_pt = builder.brep().vertices[ed.start].point;
-    let e_pt = builder.brep().vertices[ed.end].point;
-    if pt.distance(&s_pt) < tol {
-        return ed.start;
-    }
-    if pt.distance(&e_pt) < tol {
-        return ed.end;
-    }
-    let v = builder
-        .brep_mut()
-        .vertices
-        .insert(openrcad_topo::arena::VertexData {
-            point: *pt,
-            tolerance: openrcad_foundation::tolerance::CONFUSION,
-        });
-    builder.split_edge(e_id, v, t_edge);
-    v
-}
-
 /// Split every sub-face in `subfaces` along `curve`, replacing the list with the
 /// resulting (possibly larger) set of descendant faces. Only these descendants
 /// are ever revisited, so repeated calls across overlapping pairs stay bounded.
@@ -409,248 +413,23 @@ fn split_tracked(
     builder: &mut BRepBuilder,
     subfaces: &mut Vec<FaceId>,
     curve: &GeomCurve,
+    first: f64,
+    last: f64,
+    splitting_edges_map: &mut std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>>,
     tol: f64,
 ) {
     let mut result = Vec::with_capacity(subfaces.len());
     for &fid in subfaces.iter() {
-        result.extend(split_face_with_curve(builder, fid, curve, tol));
+        let (next_faces, new_edges) = crate::imprint::imprint_curve_on_face(builder, fid, curve, first, last, tol);
+        if !new_edges.is_empty() {
+            splitting_edges_map.entry(fid).or_default().extend(new_edges);
+        }
+        result.extend(next_faces);
     }
     *subfaces = result;
 }
 
-fn split_face_with_curve(
-    builder: &mut BRepBuilder,
-    face_id: FaceId,
-    curve: &GeomCurve,
-    tol: f64,
-) -> Vec<FaceId> {
-    let face_data = match builder.brep().faces.get(face_id) {
-        Some(d) => d.clone(),
-        None => return vec![face_id],
-    };
-    let outer_loop_id = match face_data.outer_wire {
-        Some(w) => w,
-        None => return vec![face_id],
-    };
-
-    let mut intersections = Vec::new();
-
-    let outer_loop = &builder.brep().loops[outer_loop_id];
-    for &oe in &outer_loop.edges {
-        let e_id = oe.id;
-        let e_data = &builder.brep().edges[e_id];
-        if let Some(e_curve) = &e_data.curve {
-            let pts = crate::intersect::curve_curve(e_curve, curve, tol);
-            for pt in pts {
-                let t_edge = project_point_on_curve(&pt, e_curve, e_data.first, e_data.last);
-                // `curve_curve` works on the infinite host lines, so a "crossing"
-                // can land beyond the finite edge segment. The clamped projection
-                // only matches the real point when it lies on the segment — reject
-                // off-segment hits so we never split a face outside its boundary.
-                if e_curve.point(t_edge).distance(&pt) > 1e-6 {
-                    continue;
-                }
-                // A crossing that coincides with a loop vertex is reported once
-                // per incident edge (pass A split edges at such points). Keep a
-                // single representative so a clean two-point cut isn't masked as
-                // a four-point one.
-                if intersections
-                    .iter()
-                    .any(|(_, _, _, q): &(_, _, _, Pnt)| q.distance(&pt) < tol)
-                {
-                    continue;
-                }
-                let (c_min, c_max) = curve.bounds();
-                let t_curve = project_point_on_curve(&pt, curve, c_min, c_max);
-                intersections.push((e_id, t_edge, t_curve, pt));
-            }
-        }
-    }
-
-    intersections.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    if intersections.len() == 2 {
-        let (e1_id, t1_edge, t1_curve, pt1) = intersections[0];
-        let (e2_id, t2_edge, t2_curve, pt2) = intersections[1];
-
-        // Degenerate guard: if the chord between the two crossings runs along an
-        // existing boundary edge (the curve is collinear with the loop), the
-        // "split" would only duplicate that edge and spawn a sliver face. Detect
-        // this by testing the chord midpoint against the outer loop and bail.
-        let chord_mid = curve.point(0.5 * (t1_curve + t2_curve));
-        if pt1.distance(&pt2) < tol {
-            return vec![face_id];
-        }
-        {
-            let outer = &builder.brep().loops[outer_loop_id];
-            for &oe in &outer.edges {
-                let e_id = oe.id;
-                let ed = &builder.brep().edges[e_id];
-                if let Some(ec) = &ed.curve {
-                    let t = project_point_on_curve(&chord_mid, ec, ed.first, ed.last);
-                    if chord_mid.distance(&ec.point(t)) < tol {
-                        return vec![face_id];
-                    }
-                }
-            }
-        }
-
-        // Resolve each crossing to a loop vertex. If it already coincides with
-        // an endpoint (pass A split there, or it's an original corner), reuse it
-        // — splitting again at an endpoint would spawn a zero-length edge.
-        let v1 = resolve_or_split(builder, e1_id, t1_edge, &pt1, tol);
-        let v2 = resolve_or_split(builder, e2_id, t2_edge, &pt2, tol);
-        if v1 == v2 {
-            return vec![face_id];
-        }
-
-        let split_edge_data = openrcad_topo::arena::EdgeData {
-            curve: Some(curve.clone()),
-            first: t1_curve,
-            last: t2_curve,
-            start: v1,
-            end: v2,
-            tolerance: openrcad_foundation::tolerance::CONFUSION,
-        };
-        let split_edge_id = builder.brep_mut().edges.insert(split_edge_data);
-
-        let (f1, f2) = builder.split_face(face_id, &[split_edge_id]);
-        return vec![f1, f2];
-    }
-
-    // A closed curve lying entirely inside the face cuts a hole: the face gains
-    // an inner (hole) loop and the enclosed disk becomes its own face. Used to
-    // drill, e.g., a cylindrical bore through a planar cap.
-    if intersections.is_empty() && curve.is_closed() {
-        if let Some(faces) = cut_hole(builder, face_id, curve, tol) {
-            return faces;
-        }
-    }
-
-    vec![face_id]
-}
-
-/// Cut a hole bounded by the closed `curve` into `face_id`, provided the curve
-/// lies on the face's surface and inside its outer loop. The face gains the
-/// curve as an inner wire; the enclosed disk is returned as a new face. Returns
-/// `None` if the curve does not belong to this face (so the caller leaves it
-/// untouched).
-fn cut_hole(
-    builder: &mut BRepBuilder,
-    face_id: FaceId,
-    curve: &GeomCurve,
-    tol: f64,
-) -> Option<Vec<FaceId>> {
-    use openrcad_topo::arena::{EdgeData, FaceData, LoopData, VertexData};
-
-    let face_data = builder.brep().faces.get(face_id)?.clone();
-    let surface = face_data.surface.clone()?;
-    let (cmin, cmax) = curve.bounds();
-    if !cmin.is_finite() || !cmax.is_finite() || (cmax - cmin).abs() < tol {
-        return None;
-    }
-
-    // The curve must lie on this face's surface.
-    for k in 0..4 {
-        let t = cmin + (cmax - cmin) * (k as f64) / 4.0;
-        let p = curve.point(t);
-        let (u, v) = crate::intersect::uv_of(&surface, &p);
-        if surface.point(u, v).distance(&p) > 1e-4 {
-            return None;
-        }
-    }
-
-    // Skip if a hole bounded by this same curve already exists (idempotency).
-    for &inner in &face_data.inner_wires {
-        if let Some(&oe) = builder.brep().loops[inner].edges.first() {
-            let e = oe.id;
-            if builder.brep().edges[e].curve.as_ref() == Some(curve) {
-                return None;
-            }
-        }
-    }
-
-    // The hole must lie inside the face's outer loop.
-    let mid = curve.point(0.5 * (cmin + cmax));
-    let (mu, mv) = crate::intersect::uv_of(&surface, &mid);
-    let probe = Face::from_id(
-        std::sync::Arc::new(builder.brep().clone()),
-        face_id,
-        face_data.orientation,
-    );
-    if !crate::intersect::is_inside_trimming_loops(mu, mv, &probe) {
-        return None;
-    }
-
-    // Split the closed curve into three arcs (keeps edge endpoints distinct).
-    let breaks = [
-        cmin,
-        cmin + (cmax - cmin) / 3.0,
-        cmin + 2.0 * (cmax - cmin) / 3.0,
-        cmax,
-    ];
-    let verts: Vec<_> = (0..3)
-        .map(|i| {
-            builder.brep_mut().vertices.insert(VertexData {
-                point: curve.point(breaks[i]),
-                tolerance: openrcad_foundation::tolerance::CONFUSION,
-            })
-        })
-        .collect();
-    let arc_ids: Vec<_> = (0..3)
-        .map(|i| {
-            builder.brep_mut().edges.insert(EdgeData {
-                curve: Some(curve.clone()),
-                first: breaks[i],
-                last: breaks[i + 1],
-                start: verts[i],
-                end: verts[(i + 1) % 3],
-                tolerance: openrcad_foundation::tolerance::CONFUSION,
-            })
-        })
-        .collect();
-
-    let inner_edges: Vec<_> = arc_ids
-        .iter()
-        .map(|&id| OrientedEdge {
-            id,
-            orientation: Orientation::Forward,
-        })
-        .collect();
-    let disk_edges = inner_edges.clone();
-
-    let inner_loop = builder
-        .brep_mut()
-        .loops
-        .insert(LoopData { edges: inner_edges });
-    let disk_loop = builder
-        .brep_mut()
-        .loops
-        .insert(LoopData { edges: disk_edges });
-
-    builder
-        .brep_mut()
-        .faces
-        .get_mut(face_id)
-        .unwrap()
-        .inner_wires
-        .push(inner_loop);
-    let disk = builder.brep_mut().faces.insert(FaceData {
-        surface: face_data.surface.clone(),
-        outer_wire: Some(disk_loop),
-        inner_wires: Vec::new(),
-        orientation: face_data.orientation,
-    });
-    for (_, shell) in &mut builder.brep_mut().shells {
-        if shell.faces.contains(&face_id) {
-            shell.faces.push(disk);
-        }
-    }
-
-    Some(vec![face_id, disk])
-}
-
-fn project_point_on_curve(p: &Pnt, curve: &GeomCurve, t_min: f64, t_max: f64) -> f64 {
+pub(crate) fn project_point_on_curve(p: &Pnt, curve: &GeomCurve, t_min: f64, t_max: f64) -> f64 {
     let t_min = if t_min.is_infinite() || t_min.is_nan() {
         -100.0
     } else {
@@ -702,7 +481,21 @@ fn point_on_face(face: &Face) -> Pnt {
             if on_surf.distance(&centroid) < 1e-6
                 && crate::intersect::is_inside_trimming_loops(cu, cv, face)
             {
-                return on_surf;
+                let mut on_boundary = false;
+                for wire in face.wires() {
+                    for edge in wire.edges() {
+                        if distance_point_to_edge(&on_surf, &edge) < 1e-4 {
+                            on_boundary = true;
+                            break;
+                        }
+                    }
+                    if on_boundary {
+                        break;
+                    }
+                }
+                if !on_boundary {
+                    return on_surf;
+                }
             }
         }
     }
@@ -949,12 +742,12 @@ mod tests {
         let cut = boolean(&cube1, &cube2, BooleanOp::Cut);
         // The result should be a 5x10x10 box from [0, 0, 0] to [5, 10, 10]
         let (lo, hi) = cut.bounding_box().corners().unwrap();
-        assert!((lo.x() - 0.0).abs() < 1e-5);
-        assert!((lo.y() - 0.0).abs() < 1e-5);
-        assert!((lo.z() - 0.0).abs() < 1e-5);
-        assert!((hi.x() - 5.0).abs() < 1e-5);
-        assert!((hi.y() - 10.0).abs() < 1e-5);
-        assert!((hi.z() - 10.0).abs() < 1e-5);
+        assert!((lo.x() - 0.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((lo.y() - 0.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((lo.z() - 0.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((hi.x() - 5.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((hi.y() - 10.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((hi.z() - 10.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
         assert_eq!(cut.face_count(), 6);
         assert_eq!(cut.vertex_count(), 8);
         assert_eq!(cut.edge_count(), 12);
@@ -1004,6 +797,21 @@ mod tests {
             "expected a drilled solid with extra faces, got {}",
             result.face_count()
         );
+        if !result.is_watertight() {
+            println!("All faces in the result solid:");
+            for (idx, face) in result.shell().faces().iter().enumerate() {
+                println!("Face {}:", idx);
+                if let Some(surf) = face.surface() {
+                    println!("  Surface: {:?}", surf);
+                }
+                for (w_idx, wire) in face.wires().iter().enumerate() {
+                    println!("  Wire {}:", w_idx);
+                    for edge in wire.edges() {
+                        println!("    Edge: {:?} -> {:?}", edge.start().point(), edge.end().point());
+                    }
+                }
+            }
+        }
         assert!(result.is_watertight(), "drilled solid must be watertight");
     }
 
@@ -1045,12 +853,27 @@ mod tests {
         let fuse = boolean(&cube1, &cube2, BooleanOp::Fuse);
         // The result bounding box should be [0, 0, 0] to [15, 10, 10]
         let (lo, hi) = fuse.bounding_box().corners().unwrap();
-        assert!((lo.x() - 0.0).abs() < 1e-5);
-        assert!((lo.y() - 0.0).abs() < 1e-5);
-        assert!((lo.z() - 0.0).abs() < 1e-5);
-        assert!((hi.x() - 15.0).abs() < 1e-5);
-        assert!((hi.y() - 10.0).abs() < 1e-5);
-        assert!((hi.z() - 10.0).abs() < 1e-5);
+        assert!((lo.x() - 0.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((lo.y() - 0.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((lo.z() - 0.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((hi.x() - 15.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((hi.y() - 10.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        assert!((hi.z() - 10.0).abs() < 1e-5, "lo={:?}, hi={:?}", lo, hi);
+        if !fuse.is_watertight() {
+            println!("All faces in the union solid:");
+            for (idx, face) in fuse.shell().faces().iter().enumerate() {
+                println!("Face {}:", idx);
+                if let Some(surf) = face.surface() {
+                    println!("  Surface: {:?}", surf);
+                }
+                for (w_idx, wire) in face.wires().iter().enumerate() {
+                    println!("  Wire {}:", w_idx);
+                    for edge in wire.edges() {
+                        println!("    Edge: {:?} -> {:?}", edge.start().point(), edge.end().point());
+                    }
+                }
+            }
+        }
         assert!(fuse.is_watertight(), "union result must be watertight");
     }
 }

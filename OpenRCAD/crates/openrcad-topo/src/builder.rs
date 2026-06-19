@@ -4,9 +4,72 @@
 //! on a mutable BRep state, which can then be sealed into an immutable Arc<BRep>.
 
 use crate::arena::{BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, VertexId};
+use crate::containment::point_in_polygon_2d;
 use crate::orientation::Orientation;
-use openrcad_geom::GeomSurface;
+use openrcad_geom::{Curve, GeomSurface, Surface};
 use std::sync::Arc;
+
+/// Locate the `(u, v)` parameters of the point on `surface` nearest to `pt`.
+///
+/// Used to project 3D points into a general (non-planar) surface's parameter
+/// space for 2D containment tests. A coarse parameter sweep seeds a short
+/// bounded Gauss-Newton refinement using the surface's first derivatives.
+fn search_nearest_parameter(surface: &GeomSurface, pt: openrcad_foundation::Pnt) -> (f64, f64) {
+    let (mut u0, mut u1, mut v0, mut v1) = surface.bounds();
+    // Clamp unbounded directions to a finite working window (cf. `to_bspline`).
+    if !u0.is_finite() {
+        u0 = -100.0;
+    }
+    if !u1.is_finite() {
+        u1 = 100.0;
+    }
+    if !v0.is_finite() {
+        v0 = -100.0;
+    }
+    if !v1.is_finite() {
+        v1 = 100.0;
+    }
+
+    // Coarse sweep for a good initial guess.
+    let n = 16;
+    let mut best = (u0, v0);
+    let mut best_d2 = f64::INFINITY;
+    for i in 0..=n {
+        let u = u0 + (u1 - u0) * (i as f64) / (n as f64);
+        for j in 0..=n {
+            let v = v0 + (v1 - v0) * (j as f64) / (n as f64);
+            let d2 = surface.point(u, v).distance_squared(&pt);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = (u, v);
+            }
+        }
+    }
+
+    // Gauss-Newton refinement: minimize ½‖S(u,v) − pt‖² using d1.
+    let (mut u, mut v) = best;
+    for _ in 0..16 {
+        let (s, du, dv) = surface.d1(u, v);
+        let r = s - pt;
+        let guu = du.dot(&du);
+        let gvv = dv.dot(&dv);
+        let guv = du.dot(&dv);
+        let bu = r.dot(&du);
+        let bv = r.dot(&dv);
+        let det = guu * gvv - guv * guv;
+        if det.abs() <= 1e-14 {
+            break;
+        }
+        let step_u = (bu * gvv - bv * guv) / det;
+        let step_v = (guu * bv - guv * bu) / det;
+        u = (u - step_u).clamp(u0, u1);
+        v = (v - step_v).clamp(v0, v1);
+        if step_u.abs() + step_v.abs() <= 1e-12 {
+            break;
+        }
+    }
+    (u, v)
+}
 
 /// A mutable staging B-Rep builder.
 #[derive(Clone, Debug, Default)]
@@ -320,27 +383,393 @@ impl BRepBuilder {
 
         (face1_id, face2_id)
     }
-}
 
-/// Robust Jordan curve theorem point-in-polygon containment test for 2D.
-fn point_in_polygon_2d(q: (f64, f64), poly: &[(f64, f64)]) -> bool {
-    let mut inside = false;
-    let n = poly.len();
-    if n < 3 {
-        return false;
-    }
-    let mut j = n - 1;
-    for i in 0..n {
-        let pi = poly[i];
-        let pj = poly[j];
-        if ((pi.1 > q.1) != (pj.1 > q.1))
-            && (q.0 < (pj.0 - pi.0) * (q.1 - pi.1) / (pj.1 - pi.1 + 1e-15) + pi.0)
-        {
-            inside = !inside;
+    /// Partition a face into N faces along a network of splitting edges.
+    ///
+    /// The splitting edges can form arbitrary networks of edges (e.g. sharing internal vertices),
+    /// partitioning the face into multiple regions.
+    /// Distributes any inner loops (holes) of the original face to the correct new face.
+    pub fn partition_face(
+        &mut self,
+        face_id: FaceId,
+        splitting_edges: &[EdgeId],
+    ) -> Vec<FaceId> {
+        let face_data = self
+            .brep
+            .faces
+            .get(face_id)
+            .expect("partition_face: face not found")
+            .clone();
+        let outer_loop_id = face_data
+            .outer_wire
+            .expect("partition_face: face has no outer wire");
+        let outer_loop = self
+            .brep
+            .loops
+            .get(outer_loop_id)
+            .expect("partition_face: loop not found")
+            .clone();
+        let surface = face_data
+            .surface
+            .as_ref()
+            .expect("partition_face: face has no surface");
+
+        let get_edge_endpoints = |brep: &BRep, oe: OrientedEdge| {
+            let e = &brep.edges[oe.id];
+            match oe.orientation {
+                Orientation::Reversed => (e.end, e.start),
+                _ => (e.start, e.end),
+            }
+        };
+
+        // 1. Gather all edges (outer boundary + splitting edges) and build both Forward and Reversed half-edges
+        // so that the graph is symmetric and every edge is traversed in both directions (avoiding dead ends / bijections breaking).
+        let mut edges_pool = Vec::new();
+        edges_pool.extend(outer_loop.edges.iter().map(|oe| oe.id));
+        edges_pool.extend(splitting_edges.iter().copied());
+
+        let mut half_edges = Vec::new();
+        for e_id in edges_pool {
+            half_edges.push(OrientedEdge {
+                id: e_id,
+                orientation: Orientation::Forward,
+            });
+            half_edges.push(OrientedEdge {
+                id: e_id,
+                orientation: Orientation::Reversed,
+            });
         }
-        j = i;
+
+        // 2. Build adjacency mapping of outgoing half-edges from each vertex.
+        let mut adjacency: std::collections::HashMap<VertexId, Vec<OrientedEdge>> =
+            std::collections::HashMap::new();
+        for &oe in &half_edges {
+            let (start, _) = get_edge_endpoints(&self.brep, oe);
+            adjacency.entry(start).or_default().push(oe);
+        }
+
+        // Helper to project 3D point to 2D parametric UV coordinates
+        let project_point_on_surface = |pt: openrcad_foundation::Pnt, s: &openrcad_geom::GeomSurface| -> (f64, f64) {
+            match s {
+                openrcad_geom::GeomSurface::Plane(plane) => {
+                    let diff = pt - plane.location();
+                    let u = diff.dot(&openrcad_foundation::Vec::from_dir(plane.position().x_direction()));
+                    let v = diff.dot(&openrcad_foundation::Vec::from_dir(plane.position().y_direction()));
+                    (u, v)
+                }
+                other => {
+                    // General surfaces: locate the nearest (u, v) by a bounded
+                    // Gauss-Newton search seeded from a coarse parameter sweep.
+                    search_nearest_parameter(other, pt)
+                }
+            }
+        };
+
+        // Helper to get polar angle of outgoing tangent direction of oriented edge at its start vertex
+        let get_tangent_angle = |brep: &BRep, oe: OrientedEdge, surf: &openrcad_geom::GeomSurface| -> f64 {
+            let e = &brep.edges[oe.id];
+            let curve = e.curve.as_ref().expect("partition_face: edge has no curve");
+            let (first, last) = (e.first, e.last);
+            let (t_start, _) = match oe.orientation {
+                Orientation::Reversed => (last, first),
+                _ => (first, last),
+            };
+            let dt = 1e-4 * (last - first);
+            let t_step = if oe.orientation == Orientation::Reversed {
+                t_start - dt
+            } else {
+                t_start + dt
+            };
+            let p0 = curve.point(t_start);
+            let p1 = curve.point(t_step);
+            let uv0 = project_point_on_surface(p0, surf);
+            let uv1 = project_point_on_surface(p1, surf);
+            (uv1.1 - uv0.1).atan2(uv1.0 - uv0.0)
+        };
+
+        // Sort outgoing half-edges counter-clockwise by polar angle of outgoing tangent direction
+        for list in adjacency.values_mut() {
+            let self_brep = &self.brep;
+            list.sort_by(|&a, &b| {
+                let angle_a = get_tangent_angle(self_brep, a, surface);
+                let angle_b = get_tangent_angle(self_brep, b, surface);
+                angle_a.partial_cmp(&angle_b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        // 3. Trace closed loops (faces) using the rotation system
+        let mut new_loop_edges_list = Vec::new();
+        let mut visited_edges = std::collections::HashSet::new();
+
+        for &start_he in &half_edges {
+            if visited_edges.contains(&start_he) {
+                continue;
+            }
+
+            let mut loop_edges = Vec::new();
+            let mut curr_he = start_he;
+
+            loop {
+                visited_edges.insert(curr_he);
+                loop_edges.push(curr_he);
+
+                let (_, end_v) = get_edge_endpoints(&self.brep, curr_he);
+                let list = match adjacency.get(&end_v) {
+                    Some(l) => l,
+                    None => break, // dead end
+                };
+                let k = list.len();
+                if k == 0 {
+                    break;
+                }
+
+                // Find the opposite of the current half-edge (starts at end_v)
+                let opp = OrientedEdge {
+                    id: curr_he.id,
+                    orientation: curr_he.orientation.reversed(),
+                };
+
+                // Find the index of opp in the sorted outgoing list at end_v.
+                // Fallback: if not found, pick the first.
+                let j = list.iter().position(|&oe| oe == opp).unwrap_or_default();
+
+                // The successor of curr_he is the next outgoing edge clockwise from opp
+                // which is index (j - 1) mod k in the counter-clockwise sorted list
+                let next_idx = if j == 0 { k - 1 } else { j - 1 };
+                let next_he = list[next_idx];
+
+                if next_he == start_he {
+                    break;
+                }
+                curr_he = next_he;
+            }
+
+            if !loop_edges.is_empty() {
+                new_loop_edges_list.push(loop_edges);
+            }
+        }
+
+        let mut orig_poly = Vec::new();
+        for &oe in &outer_loop.edges {
+            let (v_start, _) = get_edge_endpoints(&self.brep, oe);
+            let p = self.brep.vertices[v_start].point;
+            orig_poly.push(project_point_on_surface(p, surface));
+        }
+        let mut orig_area = 0.0;
+        if orig_poly.len() >= 3 {
+            for i in 0..orig_poly.len() {
+                let (x1, y1) = orig_poly[i];
+                let (x2, y2) = orig_poly[(i + 1) % orig_poly.len()];
+                orig_area += x1 * y2 - x2 * y1;
+            }
+        }
+        let orig_sign = orig_area.signum();
+
+        let mut inner_loop_edges_list = Vec::new();
+        for loop_edges in new_loop_edges_list {
+            let mut has_outer_edges = false;
+            let mut loop_is_reversed = false;
+            for &oe in &loop_edges {
+                if let Some(orig_oe) = outer_loop.edges.iter().find(|o| o.id == oe.id) {
+                    has_outer_edges = true;
+                    if oe.orientation == orig_oe.orientation.reversed() {
+                        loop_is_reversed = true;
+                        break;
+                    }
+                }
+            }
+            let is_exterior = if has_outer_edges {
+                loop_is_reversed == (orig_sign > 0.0)
+            } else {
+                false
+            };
+            if !is_exterior {
+                // Calculate area to check for degeneracy
+                let mut poly = Vec::new();
+                for &oe in &loop_edges {
+                    let (v_start, _) = get_edge_endpoints(&self.brep, oe);
+                    let p = self.brep.vertices[v_start].point;
+                    poly.push(project_point_on_surface(p, surface));
+                }
+                let mut area = 0.0;
+                if poly.len() >= 3 {
+                    for i in 0..poly.len() {
+                        let (x1, y1) = poly[i];
+                        let (x2, y2) = poly[(i + 1) % poly.len()];
+                        area += x1 * y2 - x2 * y1;
+                    }
+                }
+                area *= 0.5;
+                if area.abs() >= 1e-5 {
+                    inner_loop_edges_list.push(loop_edges);
+                }
+            }
+        }
+
+        let mut loop_polys = Vec::new();
+        let mut new_loop_ids = Vec::new();
+
+        for new_edges in &inner_loop_edges_list {
+            let l_id = self.brep.loops.insert(LoopData {
+                edges: new_edges.clone(),
+            });
+            new_loop_ids.push(l_id);
+
+            // Reconstruct outer boundary polygon in UV space
+            let mut poly = Vec::new();
+            for &oe in new_edges {
+                let (v_start, _) = get_edge_endpoints(&self.brep, oe);
+                let p = self.brep.vertices[v_start].point;
+                poly.push(project_point_on_surface(p, surface));
+            }
+            loop_polys.push(poly);
+        }
+
+        // Initialize classification arrays
+        let n_loops = new_loop_ids.len();
+        let mut loop_areas = Vec::new();
+        for poly in &loop_polys {
+            let mut area = 0.0;
+            if poly.len() >= 3 {
+                for i in 0..poly.len() {
+                    let (x1, y1) = poly[i];
+                    let (x2, y2) = poly[(i + 1) % poly.len()];
+                    area += x1 * y2 - x2 * y1;
+                }
+            }
+            loop_areas.push(0.5 * area);
+        }
+
+        // Find containers for each loop
+        let mut containers = vec![Vec::new(); n_loops];
+        for i in 0..n_loops {
+            let set_i: std::collections::HashSet<_> = inner_loop_edges_list[i].iter().map(|oe| oe.id).collect();
+            for j in 0..n_loops {
+                if i != j {
+                    let set_j: std::collections::HashSet<_> = inner_loop_edges_list[j].iter().map(|oe| oe.id).collect();
+                    if set_i == set_j {
+                        continue;
+                    }
+                    // Check if loop i is inside loop j
+                    let oe = inner_loop_edges_list[i][0];
+                    let e = &self.brep.edges[oe.id];
+                    let mid_t = 0.5 * (e.first + e.last);
+                    let mid_p = e.curve.as_ref().unwrap().point(mid_t);
+                    let (_, tangent) = e.curve.as_ref().unwrap().d1(mid_t);
+                    let tangent = if oe.orientation == Orientation::Reversed { -tangent } else { tangent };
+                    
+                    let normal = match surface {
+                        openrcad_geom::GeomSurface::Plane(plane) => plane.normal(),
+                        _ => {
+                            if let openrcad_geom::GeomSurface::Cylinder(cyl) = surface {
+                                let axis_pt = cyl.position().axis().location();
+                                let axis_dir = openrcad_foundation::Vec::from_dir(cyl.position().axis().direction());
+                                let diff = mid_p - axis_pt;
+                                let proj = axis_pt + axis_dir * diff.dot(&axis_dir);
+                                (mid_p - proj).normalized().unwrap_or(openrcad_foundation::Dir::dz())
+                            } else {
+                                openrcad_foundation::Dir::dz()
+                            }
+                        }
+                    };
+                    let left_dir = tangent.cross(&openrcad_foundation::Vec::from_dir(normal)).normalized().unwrap();
+                    let left_vec = openrcad_foundation::Vec::from_dir(left_dir);
+                    let probe_p = mid_p + left_vec * 1e-3;
+                    let uv = project_point_on_surface(probe_p, surface);
+
+                    if point_in_polygon_2d(uv, &loop_polys[j]) {
+                        containers[i].push(j);
+                    }
+                }
+            }
+        }
+
+        let mut is_face = vec![true; n_loops];
+        let mut hole_to_face = std::collections::HashMap::new();
+
+        for i in 0..n_loops {
+            if !containers[i].is_empty() {
+                // Find the direct container (parent), which is the container with the largest number of containers
+                let &parent_idx = containers[i]
+                    .iter()
+                    .max_by_key(|&&c_idx| containers[c_idx].len())
+                    .unwrap();
+
+                // If the loop's sign is opposite to the parent's sign, it's a hole of the parent
+                let parent_area = loop_areas[parent_idx];
+                let current_area = loop_areas[i];
+                if parent_area.signum() != current_area.signum() {
+                    is_face[i] = false;
+                    hole_to_face.insert(i, parent_idx);
+                }
+            }
+        }
+
+        // Initialize inner wires arrays for each loop
+        let mut distributed_inners = vec![Vec::new(); n_loops];
+
+        // Distribute original face's inner wires to the new faces
+        for &inner_loop_id in &face_data.inner_wires {
+            let inner_loop = &self.brep.loops[inner_loop_id];
+            if let Some(&first_edge) = inner_loop.edges.first() {
+                let (start_v, _) = get_edge_endpoints(&self.brep, first_edge);
+                let p = self.brep.vertices[start_v].point;
+                let uv = project_point_on_surface(p, surface);
+
+                // Find which face loop contains this hole
+                for idx in 0..n_loops {
+                    if is_face[idx] && point_in_polygon_2d(uv, &loop_polys[idx]) {
+                        distributed_inners[idx].push(inner_loop_id);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Distribute the new hole loops to their containing faces
+        for i in 0..n_loops {
+            if !is_face[i] {
+                if let Some(&face_idx) = hole_to_face.get(&i) {
+                    distributed_inners[face_idx].push(new_loop_ids[i]);
+                }
+            }
+        }
+
+        // 5. Create new faces (only for loops classified as faces)
+        let mut new_face_ids = Vec::new();
+        for idx in 0..n_loops {
+            if is_face[idx] {
+                let loop_id = new_loop_ids[idx];
+                let face_data = FaceData {
+                    surface: face_data.surface.clone(),
+                    outer_wire: Some(loop_id),
+                    inner_wires: distributed_inners[idx].clone(),
+                    orientation: face_data.orientation,
+                };
+                let f_id = self.brep.faces.insert(face_data);
+                new_face_ids.push(f_id);
+            }
+        }
+
+        // 6. Remove original face and outer loop
+        self.brep.loops.remove(outer_loop_id);
+        self.brep.faces.remove(face_id);
+
+        // 7. Update shells
+        for (_, shell_data) in &mut self.brep.shells {
+            let mut updated_faces = Vec::with_capacity(shell_data.faces.len() + new_face_ids.len());
+            for &fid in &shell_data.faces {
+                if fid == face_id {
+                    updated_faces.extend(new_face_ids.iter().copied());
+                } else {
+                    updated_faces.push(fid);
+                }
+            }
+            shell_data.faces = updated_faces;
+        }
+
+        new_face_ids
     }
-    inside
 }
 
 #[cfg(test)]
@@ -551,5 +980,216 @@ mod tests {
         let w2_id = builder.brep.faces[f2].outer_wire.unwrap();
         assert_eq!(builder.brep.loops[w1_id].edges.len(), 4);
         assert_eq!(builder.brep.loops[w2_id].edges.len(), 4);
+    }
+
+    #[test]
+    fn test_partition_face_3_anchor() {
+        let p0 = Pnt::new(0.0, 0.0, 0.0);
+        let p1 = Pnt::new(10.0, 0.0, 0.0);
+        let p2 = Pnt::new(10.0, 10.0, 0.0);
+        let p3 = Pnt::new(0.0, 10.0, 0.0);
+
+        let w = Wire::from_edges([
+            Edge::between_points(p0, p1),
+            Edge::between_points(p1, p2),
+            Edge::between_points(p2, p3),
+            Edge::between_points(p3, p0),
+        ]);
+
+        let plane = GeomSurface::plane(Plane::from_point_normal(
+            Pnt::origin(),
+            openrcad_foundation::Dir::dz(),
+        ));
+        let face = Face::new(Some(plane), w);
+
+        let mut builder = BRepBuilder::from_brep((*face.brep).clone());
+        let face_id = builder.brep.faces.keys().next().unwrap();
+
+        // Find the top edge (from (10,10) to (0,10)) and split it at (5, 10)
+        let top_edge_id = builder
+            .brep
+            .edges
+            .iter()
+            .find(|(_, data)| {
+                let p = builder.brep.vertices[data.start].point;
+                (p.x() - p2.x()).abs() < 1e-5 && (p.y() - p2.y()).abs() < 1e-5
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+
+        let v_top_split = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(5.0, 10.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+
+        builder.split_edge(top_edge_id, v_top_split, 5.0);
+
+        // Get the corner vertex ids
+        let v0 = builder.brep.vertices.iter().find(|(_, d)| d.point.distance(&p0) < 1e-5).map(|(k,_)| k).unwrap();
+        let v1 = builder.brep.vertices.iter().find(|(_, d)| d.point.distance(&p1) < 1e-5).map(|(k,_)| k).unwrap();
+
+        // Create the center vertex
+        let v_center = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(5.0, 5.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+
+        // Add 3 splitting edges connecting center to v0, v1, and v_top_split
+        let e_c0 = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), p0);
+        let e_c1 = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), p1);
+        let e_ct = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), Pnt::new(5.0, 10.0, 0.0));
+
+        let map_c0 = builder.brep.merge(&e_c0.brep);
+        let map_c1 = builder.brep.merge(&e_c1.brep);
+        let map_ct = builder.brep.merge(&e_ct.brep);
+
+        let e_c0_id = map_c0.edges[&e_c0.id];
+        let e_c1_id = map_c1.edges[&e_c1.id];
+        let e_ct_id = map_ct.edges[&e_ct.id];
+
+        // We must update the newly merged edge vertices to be the exact same shared vertices
+        builder.brep.edges.get_mut(e_c0_id).unwrap().start = v_center;
+        builder.brep.edges.get_mut(e_c0_id).unwrap().end = v0;
+
+        builder.brep.edges.get_mut(e_c1_id).unwrap().start = v_center;
+        builder.brep.edges.get_mut(e_c1_id).unwrap().end = v1;
+
+        builder.brep.edges.get_mut(e_ct_id).unwrap().start = v_center;
+        builder.brep.edges.get_mut(e_ct_id).unwrap().end = v_top_split;
+
+        let splitting_edges = vec![e_c0_id, e_c1_id, e_ct_id];
+
+        // Partition!
+        let new_faces = builder.partition_face(face_id, &splitting_edges);
+
+        // Verify we got exactly 3 faces
+        assert_eq!(new_faces.len(), 3);
+        for &fid in &new_faces {
+            assert!(builder.brep.faces.contains_key(fid));
+        }
+    }
+
+    #[test]
+    fn test_partition_face_4_anchor() {
+        let p0 = Pnt::new(0.0, 0.0, 0.0);
+        let p1 = Pnt::new(10.0, 0.0, 0.0);
+        let p2 = Pnt::new(10.0, 10.0, 0.0);
+        let p3 = Pnt::new(0.0, 10.0, 0.0);
+
+        let w = Wire::from_edges([
+            Edge::between_points(p0, p1),
+            Edge::between_points(p1, p2),
+            Edge::between_points(p2, p3),
+            Edge::between_points(p3, p0),
+        ]);
+
+        let plane = GeomSurface::plane(Plane::from_point_normal(
+            Pnt::origin(),
+            openrcad_foundation::Dir::dz(),
+        ));
+        let face = Face::new(Some(plane), w);
+
+        let mut builder = BRepBuilder::from_brep((*face.brep).clone());
+        let face_id = builder.brep.faces.keys().next().unwrap();
+
+        // Find and split all 4 boundary edges at their midpoints
+        let bottom_edge_id = builder
+            .brep
+            .edges
+            .iter()
+            .find(|(_, data)| {
+                let p = builder.brep.vertices[data.start].point;
+                (p.x() - p0.x()).abs() < 1e-5 && (p.y() - p0.y()).abs() < 1e-5
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+
+        let right_edge_id = builder
+            .brep
+            .edges
+            .iter()
+            .find(|(_, data)| {
+                let p = builder.brep.vertices[data.start].point;
+                (p.x() - p1.x()).abs() < 1e-5 && (p.y() - p1.y()).abs() < 1e-5
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+
+        let top_edge_id = builder
+            .brep
+            .edges
+            .iter()
+            .find(|(_, data)| {
+                let p = builder.brep.vertices[data.start].point;
+                (p.x() - p2.x()).abs() < 1e-5 && (p.y() - p2.y()).abs() < 1e-5
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+
+        let left_edge_id = builder
+            .brep
+            .edges
+            .iter()
+            .find(|(_, data)| {
+                let p = builder.brep.vertices[data.start].point;
+                (p.x() - p3.x()).abs() < 1e-5 && (p.y() - p3.y()).abs() < 1e-5
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+
+        let v_bottom_split = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(5.0, 0.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+        let v_right_split = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(10.0, 5.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+        let v_top_split = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(5.0, 10.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+        let v_left_split = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(0.0, 5.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+
+        builder.split_edge(bottom_edge_id, v_bottom_split, 5.0);
+        builder.split_edge(right_edge_id, v_right_split, 5.0);
+        builder.split_edge(top_edge_id, v_top_split, 5.0);
+        builder.split_edge(left_edge_id, v_left_split, 5.0);
+
+        // Create the center vertex
+        let _v_center = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(5.0, 5.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+
+        // Add 4 splitting edges from center to midpoints
+        let e_b = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), Pnt::new(5.0, 0.0, 0.0));
+        let e_r = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), Pnt::new(10.0, 5.0, 0.0));
+        let e_t = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), Pnt::new(5.0, 10.0, 0.0));
+        let e_l = Edge::between_points(Pnt::new(5.0, 5.0, 0.0), Pnt::new(0.0, 5.0, 0.0));
+
+        let map_b = builder.brep.merge(&e_b.brep);
+        let map_r = builder.brep.merge(&e_r.brep);
+        let map_t = builder.brep.merge(&e_t.brep);
+        let map_l = builder.brep.merge(&e_l.brep);
+
+        let splitting_edges = vec![
+            map_b.edges[&e_b.id],
+            map_r.edges[&e_r.id],
+            map_t.edges[&e_t.id],
+            map_l.edges[&e_l.id],
+        ];
+
+        // Partition!
+        let new_faces = builder.partition_face(face_id, &splitting_edges);
+
+        // Verify we got exactly 4 faces
+        assert_eq!(new_faces.len(), 4);
+        for &fid in &new_faces {
+            assert!(builder.brep.faces.contains_key(fid));
+        }
     }
 }

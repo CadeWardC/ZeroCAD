@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::TriangleMesh;
 use openrcad_foundation::{tolerance::CONFUSION, Pnt, Pnt2d, Vec as GeomVec};
@@ -10,6 +10,12 @@ pub struct Tri {
     pub a: usize,
     pub b: usize,
     pub c: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BoundarySample {
+    uv: Pnt2d,
+    point: Pnt,
 }
 
 /// Robust 2D orientation test from predicates (CCW turn > 0, CW turn < 0, collinear == 0).
@@ -145,26 +151,164 @@ pub fn delaunay_triangulate(points: &[Pnt2d]) -> Vec<Tri> {
     triangles
 }
 
-/// Ray-casting point-in-polygon containment test.
-pub fn is_point_in_polygon(p: Pnt2d, loop_pts: &[Pnt2d]) -> bool {
-    let mut inside = false;
-    let n = loop_pts.len();
-    if n < 3 {
+fn edge_key(a: usize, b: usize) -> (usize, usize) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn tri_has_edge(t: Tri, a: usize, b: usize) -> bool {
+    (t.a == a && t.b == b)
+        || (t.a == b && t.b == a)
+        || (t.b == a && t.c == b)
+        || (t.b == b && t.c == a)
+        || (t.c == a && t.a == b)
+        || (t.c == b && t.a == a)
+}
+
+fn mesh_has_edge(tris: &[Tri], a: usize, b: usize) -> bool {
+    tris.iter().any(|&t| tri_has_edge(t, a, b))
+}
+
+fn third_vertex(t: Tri, a: usize, b: usize) -> Option<usize> {
+    if (t.a == a || t.a == b) && (t.b == a || t.b == b) {
+        Some(t.c)
+    } else if (t.b == a || t.b == b) && (t.c == a || t.c == b) {
+        Some(t.a)
+    } else if (t.c == a || t.c == b) && (t.a == a || t.a == b) {
+        Some(t.b)
+    } else {
+        None
+    }
+}
+
+fn make_ccw(a: usize, b: usize, c: usize, points: &[Pnt2d]) -> Option<Tri> {
+    let area = ccw(points[a], points[b], points[c]);
+    if area > 1e-14 {
+        Some(Tri { a, b, c })
+    } else if area < -1e-14 {
+        Some(Tri { a, b: c, c: b })
+    } else {
+        None
+    }
+}
+
+fn segments_intersect_strict(a: Pnt2d, b: Pnt2d, c: Pnt2d, d: Pnt2d) -> bool {
+    let ab_c = ccw(a, b, c);
+    let ab_d = ccw(a, b, d);
+    let cd_a = ccw(c, d, a);
+    let cd_b = ccw(c, d, b);
+
+    ab_c * ab_d < -1e-14 && cd_a * cd_b < -1e-14
+}
+
+fn build_edge_map(tris: &[Tri]) -> HashMap<(usize, usize), Vec<usize>> {
+    let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (idx, t) in tris.iter().enumerate() {
+        for (a, b) in [(t.a, t.b), (t.b, t.c), (t.c, t.a)] {
+            edge_map.entry(edge_key(a, b)).or_default().push(idx);
+        }
+    }
+    edge_map
+}
+
+fn find_crossing_edge(
+    tris: &[Tri],
+    points: &[Pnt2d],
+    a: usize,
+    b: usize,
+    locked_edges: &HashSet<(usize, usize)>,
+) -> Option<(usize, usize, usize, usize)> {
+    let edge_map = build_edge_map(tris);
+    for (&(c, d), adj) in &edge_map {
+        if c == a || c == b || d == a || d == b || locked_edges.contains(&edge_key(c, d)) {
+            continue;
+        }
+
+        if adj.len() == 2 && segments_intersect_strict(points[a], points[b], points[c], points[d]) {
+            return Some((c, d, adj[0], adj[1]));
+        }
+    }
+
+    None
+}
+
+fn flip_edge(tris: &mut [Tri], points: &[Pnt2d], edge: (usize, usize, usize, usize)) -> bool {
+    let (a, b, tri_idx_a, tri_idx_b) = edge;
+    let Some(c) = third_vertex(tris[tri_idx_a], a, b) else {
+        return false;
+    };
+    let Some(d) = third_vertex(tris[tri_idx_b], a, b) else {
+        return false;
+    };
+
+    if c == d || mesh_has_edge(tris, c, d) {
         return false;
     }
-    let mut j = n - 1;
-    for i in 0..n {
-        let pi = loop_pts[i];
-        let pj = loop_pts[j];
 
-        let intersect = ((pi.y() > p.y()) != (pj.y() > p.y()))
-            && (p.x() < (pj.x() - pi.x()) * (p.y() - pi.y()) / (pj.y() - pi.y()) + pi.x());
-        if intersect {
-            inside = !inside;
-        }
-        j = i;
+    let old_sides = ccw(points[a], points[b], points[c]) * ccw(points[a], points[b], points[d]);
+    let new_sides = ccw(points[c], points[d], points[a]) * ccw(points[c], points[d], points[b]);
+    if old_sides >= -1e-14 || new_sides >= -1e-14 {
+        return false;
     }
-    inside
+
+    let Some(t1) = make_ccw(c, d, a, points) else {
+        return false;
+    };
+    let Some(t2) = make_ccw(d, c, b, points) else {
+        return false;
+    };
+
+    tris[tri_idx_a] = t1;
+    tris[tri_idx_b] = t2;
+    true
+}
+
+fn recover_constrained_edges(
+    mut tris: Vec<Tri>,
+    points: &[Pnt2d],
+    constraints: &[(usize, usize)],
+) -> Vec<Tri> {
+    let mut locked_edges = HashSet::new();
+    let max_flips = constraints.len().max(1) * tris.len().max(1) * tris.len().max(1);
+    let mut flips = 0;
+
+    for &(a, b) in constraints {
+        if a == b {
+            continue;
+        }
+
+        while !mesh_has_edge(&tris, a, b) {
+            if flips >= max_flips {
+                break;
+            }
+
+            let Some(crossing) = find_crossing_edge(&tris, points, a, b, &locked_edges) else {
+                break;
+            };
+
+            if !flip_edge(&mut tris, points, crossing) {
+                break;
+            }
+
+            flips += 1;
+        }
+
+        if mesh_has_edge(&tris, a, b) {
+            locked_edges.insert(edge_key(a, b));
+        }
+    }
+
+    tris
+}
+
+/// Ray-casting point-in-polygon containment test.
+pub fn is_point_in_polygon(p: Pnt2d, loop_pts: &[Pnt2d]) -> bool {
+    let q = (p.x(), p.y());
+    let poly: Vec<_> = loop_pts.iter().map(|pt| (pt.x(), pt.y())).collect();
+    openrcad_topo::containment::point_in_polygon_2d(q, &poly)
 }
 
 /// Project a 3D point onto the surface to find its (u, v) coordinates.
@@ -442,7 +586,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
 
     let face_wires = face.wires();
     for wire in &face_wires {
-        let mut loop_pts_2d = Vec::new();
+        let mut loop_samples = Vec::new();
         let edges = wire.edges();
         let mut prev_hint = None;
 
@@ -474,12 +618,15 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                     let frac = i as f64 / (n_points - 1) as f64;
                     let u = u_start + frac * (u_next - u_start);
                     let v = v_pole;
-                    loop_pts_2d.push(Pnt2d::new(u, v));
+                    loop_samples.push(BoundarySample {
+                        uv: Pnt2d::new(u, v),
+                        point: p_start,
+                    });
                     prev_hint = Some((u, v));
                 }
 
-                if loop_pts_2d.len() > 1 {
-                    loop_pts_2d.pop();
+                if loop_samples.len() > 1 {
+                    loop_samples.pop();
                 }
                 continue;
             }
@@ -498,7 +645,10 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                             v = unwrap_coordinate(v, pv, 2.0 * std::f64::consts::PI);
                         }
                     }
-                    loop_pts_2d.push(Pnt2d::new(u, v));
+                    loop_samples.push(BoundarySample {
+                        uv: Pnt2d::new(u, v),
+                        point: p3d,
+                    });
                     prev_hint = Some((u, v));
                     continue;
                 }
@@ -528,36 +678,39 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                 }
 
                 let p2d = Pnt2d::new(u, v);
-                loop_pts_2d.push(p2d);
+                loop_samples.push(BoundarySample {
+                    uv: p2d,
+                    point: p3d,
+                });
                 prev_hint = Some((u, v));
             }
 
             // Remove duplicated adjacent endpoint when moving to next edge
-            if loop_pts_2d.len() > 1 {
-                loop_pts_2d.pop();
+            if loop_samples.len() > 1 {
+                loop_samples.pop();
             }
         }
 
         // Close the loop if not closed
-        if loop_pts_2d.len() > 2 {
-            let first = loop_pts_2d[0];
-            let last = *loop_pts_2d.last().unwrap();
+        if loop_samples.len() > 2 {
+            let first = loop_samples[0].uv;
+            let last = loop_samples.last().unwrap().uv;
             if first.distance(&last) > 1e-6 {
                 // Keep it
             } else {
-                loop_pts_2d.pop();
+                loop_samples.pop();
             }
         }
 
         // Add loop points to master coordinates
         let mut loop_indices = Vec::new();
-        for &p2d in &loop_pts_2d {
+        for sample in &loop_samples {
+            let p2d = sample.uv;
             let key = ((p2d.x() * 1e8) as i64, (p2d.y() * 1e8) as i64);
             let idx = *point_map.entry(key).or_insert_with(|| {
                 let id = all_points_2d.len();
                 all_points_2d.push(p2d);
-                // Evaluate 3D coordinate corresponding to this 2D coordinate on surface
-                all_points_3d.push(surface.point(p2d.x(), p2d.y()));
+                all_points_3d.push(sample.point);
                 id
             });
             loop_indices.push(idx);
@@ -622,8 +775,23 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         });
     }
 
-    // 3. Delaunay Triangulation in 2D
-    let tris = delaunay_triangulate(&all_points_2d);
+    // 3. Delaunay Triangulation in 2D, with trimming-loop edges recovered.
+    let mut constraints = Vec::new();
+    for loop_indices in &loops_2d {
+        for i in 0..loop_indices.len() {
+            let a = loop_indices[i];
+            let b = loop_indices[(i + 1) % loop_indices.len()];
+            if a != b {
+                constraints.push((a, b));
+            }
+        }
+    }
+
+    let tris = recover_constrained_edges(
+        delaunay_triangulate(&all_points_2d),
+        &all_points_2d,
+        &constraints,
+    );
 
     // 4. Centroid trimming and construction of output TriangleMesh
     let mut triangles = Vec::new();
@@ -647,11 +815,12 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                 }
             }
             if !inside_hole {
-                // Respect face orientation (reverse CCW if face is Reversed)
-                if face.orientation() == Orientation::Reversed {
-                    triangles.push([t.a as u32, t.c as u32, t.b as u32]);
-                } else {
+                let tri_ccw = ccw(pa, pb, pc) > 0.0;
+                let wants_ccw = face.orientation() != Orientation::Reversed;
+                if tri_ccw == wants_ccw {
                     triangles.push([t.a as u32, t.b as u32, t.c as u32]);
+                } else {
+                    triangles.push([t.a as u32, t.c as u32, t.b as u32]);
                 }
             }
         }
@@ -761,4 +930,77 @@ fn find_prev_non_collapsed_u(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openrcad_foundation::{Dir, Pnt};
+    use openrcad_geom::{GeomSurface, Plane};
+    use openrcad_topo::{Edge, Face, Orientation, Wire};
+
+    fn square_face(z: f64, orientation: Orientation) -> Face {
+        let wire = Wire::from_edges([
+            Edge::between_points(Pnt::new(0.0, 0.0, z), Pnt::new(1.0, 0.0, z)),
+            Edge::between_points(Pnt::new(1.0, 0.0, z), Pnt::new(1.0, 1.0, z)),
+            Edge::between_points(Pnt::new(1.0, 1.0, z), Pnt::new(0.0, 1.0, z)),
+            Edge::between_points(Pnt::new(0.0, 1.0, z), Pnt::new(0.0, 0.0, z)),
+        ]);
+        Face::with_wires(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                Dir::dz(),
+            ))),
+            Some(wire),
+            Vec::new(),
+            orientation,
+        )
+    }
+
+    fn normal_z(mesh: &TriangleMesh, tri: [u32; 3]) -> f64 {
+        let a = mesh.vertices[tri[0] as usize];
+        let b = mesh.vertices[tri[1] as usize];
+        let c = mesh.vertices[tri[2] as usize];
+        (b - a).cross(&(c - a)).z()
+    }
+
+    #[test]
+    fn recovers_missing_constrained_edge_by_flipping() {
+        let points = vec![
+            Pnt2d::new(0.0, 0.0),
+            Pnt2d::new(1.0, 0.0),
+            Pnt2d::new(1.0, 1.0),
+            Pnt2d::new(0.0, 1.0),
+        ];
+        let tris = vec![Tri { a: 0, b: 1, c: 2 }, Tri { a: 0, b: 2, c: 3 }];
+
+        let recovered = recover_constrained_edges(tris, &points, &[(1, 3)]);
+
+        assert!(mesh_has_edge(&recovered, 1, 3));
+    }
+
+    #[test]
+    fn tessellated_winding_follows_face_orientation() {
+        let forward = tessellate_face_local(&square_face(0.0, Orientation::Forward), 0.01, 0);
+        let reversed = tessellate_face_local(&square_face(0.0, Orientation::Reversed), 0.01, 0);
+
+        assert!(!forward.triangles.is_empty());
+        assert!(!reversed.triangles.is_empty());
+        assert!(forward
+            .triangles
+            .iter()
+            .all(|&tri| normal_z(&forward, tri) > 0.0));
+        assert!(reversed
+            .triangles
+            .iter()
+            .all(|&tri| normal_z(&reversed, tri) < 0.0));
+    }
+
+    #[test]
+    fn boundary_vertices_keep_exact_edge_curve_positions() {
+        let mesh = tessellate_face_local(&square_face(0.25, Orientation::Forward), 0.01, 0);
+
+        assert!(!mesh.vertices.is_empty());
+        assert!(mesh.vertices.iter().all(|p| (p.z() - 0.25).abs() < 1e-12));
+    }
 }

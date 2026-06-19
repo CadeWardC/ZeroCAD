@@ -62,8 +62,9 @@ fn test_parametric_graph_box() {
     let mesh = mesh_res.unwrap();
     // Six planar faces, each tessellated to two triangles → 36 indices.
     assert_eq!(mesh.indices.len(), 36);
-    // Each face produces its own 4 corner vertices (independent normals), so 24 total.
-    assert_eq!(mesh.vertices.len() / 6, 24);
+    // OpenRCAD's flat-shaded `gpu_mesh` is unwelded: every triangle emits three
+    // independent vertices carrying its face normal, so 12 triangles × 3 = 36.
+    assert_eq!(mesh.vertices.len() / 6, 36);
     // Wireframe is built analytically from 8 deduped cube corners with 12 edges.
     assert_eq!(mesh.edge_vertices.len() / 3, 8);
     assert_eq!(mesh.edge_indices.len() / 2, 12);

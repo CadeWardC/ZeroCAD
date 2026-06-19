@@ -68,6 +68,14 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
         root
     }
 
+    fn find_no_compress(i: usize, parent: &[usize]) -> usize {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        root
+    }
+
     fn union(i: usize, j: usize, parent: &mut [usize]) {
         let root_i = find(i, parent);
         let root_j = find(j, parent);
@@ -232,8 +240,8 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
                 };
 
                 if curves_match {
-                    let root_i = find(i, &mut e_parent);
-                    let root_j = find(j, &mut e_parent);
+                    let root_i = find_no_compress(i, &e_parent);
+                    let root_j = find_no_compress(j, &e_parent);
                     if root_i != root_j {
                         e_parent[root_i] = root_j;
                         if endpoints_match_opp {
@@ -249,7 +257,7 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
     let mut e_map = HashMap::with_capacity(n_edges);
     let mut edge_reversals = HashMap::new();
     for i in 0..n_edges {
-        let root = find(i, &mut e_parent);
+        let root = find_no_compress(i, &e_parent);
         let e_id = edge_keys[i];
         let rep_id = edge_keys[root];
         e_map.insert(e_id, rep_id);
@@ -446,7 +454,16 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
         }
     }
 
-    // 8. Create the final Shell in the BRep.
+    // 8. Garbage-collect orphan entities. `BRep::merge` copies *every* entity of
+    // each source arena, so faces assembled from edges borrowed from another
+    // face's arena (prism/sweep laterals do exactly this) drag that whole face
+    // in as an orphan. Pruning to the faces the shell actually references keeps
+    // the arena consistent with the shell — without it, a later partition that
+    // removes a loop shared with an orphan leaves a dangling reference that
+    // panics every full-arena traversal (BVH build, validation).
+    brep.retain_faces(&face_ids);
+
+    // 9. Create the final Shell in the BRep.
     let shell_id = brep.shells.insert(ShellData { faces: face_ids });
 
     Shell::from_id(Arc::new(brep), shell_id)

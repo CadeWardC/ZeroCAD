@@ -229,6 +229,64 @@ impl BRep {
         map
     }
 
+    /// Discard every face not in `keep`, plus every loop, edge, and vertex no
+    /// longer reachable from a kept face. Any shell that references a dropped
+    /// face — and any solid that references a dropped shell — is removed too, so
+    /// the arena never keeps a dangling reference. Callers that prune faces are
+    /// expected to (re)build the shell they want afterwards.
+    ///
+    /// This is the garbage collector for [`BRep::merge`]: `merge` copies *all*
+    /// entities of a source arena, so assembling a face from edges that live in
+    /// another face's arena (as prism/sweep do) drags that whole face — and its
+    /// shell — in as an orphan. Sewing then leaves the arena holding faces the
+    /// shell never references — and worse, orphan faces can share a loop with a
+    /// real face, so a later `partition_face` that removes that loop leaves the
+    /// orphan dangling and any full-arena traversal (BVH build, validation,
+    /// `merge`) panics. Pruning to the reachable set keeps the arena in
+    /// lock-step with the shell.
+    pub fn retain_faces(&mut self, keep: &[FaceId]) {
+        use std::collections::HashSet;
+        let keep_faces: HashSet<FaceId> = keep.iter().copied().collect();
+
+        let mut keep_loops: HashSet<LoopId> = HashSet::new();
+        for &f in &keep_faces {
+            if let Some(fd) = self.faces.get(f) {
+                if let Some(o) = fd.outer_wire {
+                    keep_loops.insert(o);
+                }
+                keep_loops.extend(fd.inner_wires.iter().copied());
+            }
+        }
+
+        let mut keep_edges: HashSet<EdgeId> = HashSet::new();
+        for &l in &keep_loops {
+            if let Some(ld) = self.loops.get(l) {
+                keep_edges.extend(ld.edges.iter().map(|oe| oe.id));
+            }
+        }
+
+        let mut keep_verts: HashSet<VertexId> = HashSet::new();
+        for &e in &keep_edges {
+            if let Some(ed) = self.edges.get(e) {
+                keep_verts.insert(ed.start);
+                keep_verts.insert(ed.end);
+            }
+        }
+
+        self.faces.retain(|id, _| keep_faces.contains(&id));
+        self.loops.retain(|id, _| keep_loops.contains(&id));
+        self.edges.retain(|id, _| keep_edges.contains(&id));
+        self.vertices.retain(|id, _| keep_verts.contains(&id));
+
+        // Drop shells that referenced any dropped face, and solids that
+        // referenced a dropped shell, so no dangling reference survives.
+        self.shells
+            .retain(|_, s| s.faces.iter().all(|f| keep_faces.contains(f)));
+        let keep_shells: HashSet<ShellId> = self.shells.keys().collect();
+        self.solids
+            .retain(|_, so| so.shells.iter().all(|s| keep_shells.contains(s)));
+    }
+
     /// Returns a transformed copy of this B-Rep, transforming all vertices, curves, and surfaces.
     pub fn transformed(&self, t: &openrcad_foundation::Trsf) -> Self {
         let mut cloned = self.clone();
