@@ -1,0 +1,105 @@
+# OpenRCAD — a pure-Rust CAD kernel.
+#
+# This manifest is BOTH the `openrcad` facade package (the crate users depend
+# on) AND the workspace root. The sub-crates live under `crates/` and are the
+# real implementation; `openrcad` re-exports them so the whole kernel is one
+# dependency. Crate-local tests cover the stack.
+[package]
+name = "openrcad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "A pure-Rust CAD kernel — a refactor of OpenCASCADE's architecture, informed by truck."
+categories = ["mathematics", "graphics", "science"]
+keywords = ["cad", "geometry", "occt", "opencascade", "brep", "kernel"]
+readme = "README.md"
+exclude = [
+    "OpenCASCADE Source Code/**",
+    "truck Source Code/**",
+    "source-code/OCCT/**",
+    "target/**",
+    "memory/**",
+    "memory.md",
+    "CLAUDE.md",
+]
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/openrcad-foundation",
+    "crates/openrcad-geom2d",
+    "crates/openrcad-geom",
+    "crates/openrcad-topo",
+    "crates/openrcad-sketch",
+    "crates/openrcad-primitives",
+    "crates/openrcad-algo",
+    "crates/openrcad-document",
+    "crates/openrcad-mesh",
+    "crates/openrcad-exchange",
+    "crates/openrcad-render",
+    "crates/openrcad-truck-compat",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/CadeWardC/OpenRCAD"
+homepage = "https://github.com/CadeWardC/OpenRCAD"
+rust-version = "1.74"
+authors = ["Cade Ward"]
+
+# Internal crates are published in lock-step, so every crate shares one version
+# and depends on its siblings at that version over a `path`.
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+openrcad-foundation = { version = "0.1.0", path = "crates/openrcad-foundation" }
+openrcad-geom2d = { version = "0.1.0", path = "crates/openrcad-geom2d" }
+openrcad-geom = { version = "0.1.0", path = "crates/openrcad-geom" }
+openrcad-topo = { version = "0.1.0", path = "crates/openrcad-topo" }
+openrcad-sketch = { version = "0.1.0", path = "crates/openrcad-sketch" }
+openrcad-primitives = { version = "0.1.0", path = "crates/openrcad-primitives" }
+openrcad-algo = { version = "0.1.0", path = "crates/openrcad-algo" }
+openrcad-document = { version = "0.1.0", path = "crates/openrcad-document" }
+# `default-features = false` here (the canonical spot — overriding it in a member
+# is silently ignored) makes the `parallel`/rayon switch opt-in for every
+# inheritor; each consumer re-enables it through its own default-on `parallel`
+# feature, so native builds stay parallel while `--no-default-features` is fully
+# rayon-free (the wasm path).
+openrcad-mesh = { version = "0.1.0", path = "crates/openrcad-mesh", default-features = false }
+openrcad-exchange = { version = "0.1.0", path = "crates/openrcad-exchange", default-features = false }
+
+[features]
+# Parallel tessellation, forwarded to `openrcad-mesh`. On by default; a build
+# for `wasm32` or any single-threaded host can opt out with
+# `default-features = false`, which drops the `rayon` dependency entirely.
+default = ["parallel"]
+parallel = ["openrcad-mesh/parallel", "openrcad-exchange/parallel"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom2d.workspace = true
+openrcad-geom.workspace = true
+openrcad-topo.workspace = true
+openrcad-sketch.workspace = true
+openrcad-primitives.workspace = true
+openrcad-algo.workspace = true
+openrcad-document.workspace = true
+openrcad-mesh.workspace = true
+openrcad-exchange.workspace = true
+serde.workspace = true
+
+# A lean, fast release binary. `panic` stays at the default "unwind": future
+# algorithmic layers (booleans, fillets) will lean on catch_unwind for graceful
+# degradation, exactly as ZeroCAD does around truck today.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

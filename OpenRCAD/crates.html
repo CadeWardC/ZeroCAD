@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crates — OpenRCAD</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<header class="nav"><div class="inner">
+  <a class="brand" href="index.html">Open<span>RCAD</span></a>
+  <a href="index.html">Overview</a>
+  <a href="getting-started.html">Getting started</a>
+  <a href="architecture.html">Architecture</a>
+  <a href="crates.html" class="active">Crates</a>
+  <a href="status.html">Status</a>
+  <a href="INTEGRATION.md">Integration guide</a>
+</div></header>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>Crates</h1>
+    <p class="lead">Eight kernel crates behind one facade — each mapping to an OpenCASCADE toolkit, each depending only on the layers beneath it — plus a viewer, 2D sketches, a parametric document layer, and truck interop.</p>
+  </section>
+
+  <table>
+    <thead><tr><th>Crate</th><th>OCCT analogue</th><th>What's inside</th><th>State</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>openrcad-foundation</code></td>
+        <td><code>TKMath</code>, <code>gp</code>, <code>Precision</code>, <code>Bnd</code></td>
+        <td><code>Pnt</code> / <code>Vec</code> / <code>Dir</code> / <code>Ax1</code>/<code>Ax2</code>/<code>Ax3</code>, <code>Trsf</code>, bounding boxes, tolerances, interval arithmetic, exact predicates.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-geom2d</code></td>
+        <td><code>TKG2d</code></td>
+        <td>2D lines, conics (circle, ellipse, parabola, hyperbola), and NURBS curves via de Boor.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-geom</code></td>
+        <td><code>TKG3d</code>, <code>TKGeomBase</code></td>
+        <td>3D curves + surfaces: plane, cylinder, cone, sphere, <strong>torus</strong>, B-spline/NURBS, Bézier/Gregory, offset, ruled. The <code>GeomCurve</code> / <code>GeomSurface</code> owned enums.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-topo</code></td>
+        <td><code>TKBRep</code></td>
+        <td>Arena-based B-Rep: <code>Vertex</code>, <code>Edge</code>, <code>Wire</code>, <code>Face</code>, <code>Shell</code>, <code>Solid</code> on generational <code>slotmap</code> arenas. Per-entity tolerance; <code>validate</code> / <code>is_watertight</code> / <code>manifold_report</code> checks.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-sketch</code></td>
+        <td>(2D sketch layer)</td>
+        <td>2D sketch entities — rectangles, circles, lines — resolved into closed <code>Profile</code>s on a <code>SketchPlane</code>. Stores intent for the parametric layer.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-primitives</code></td>
+        <td><code>TKPrim</code></td>
+        <td><code>make_box</code>, <code>make_cylinder</code>, <code>make_cone</code>, <code>make_sphere</code>, <code>make_wedge</code> — built from the geometry up through Euler operators.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-algo</code></td>
+        <td><code>TKBool</code>, <code>TKGeomAlgo</code>, <code>TKFillet</code></td>
+        <td>SAH BVH, curve/curve/surface intersection (closed-form line/circle fast paths), Euler operators, booleans (<code>fuse</code>/<code>cut</code>/<code>common</code>) with BVH-pruned classification, sewing, and <code>fillet</code>/<code>chamfer</code>/<code>shell_solid</code>.</td>
+        <td><span class="pill done">intersection · BVH · booleans tested</span> · <span class="pill wip">box/cylinder blends</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-mesh</code></td>
+        <td><code>TKMesh</code></td>
+        <td>Adaptive face tessellation (chordal + angular) to a <code>TriangleMesh</code>; parallel across faces via <code>rayon</code>.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-exchange</code></td>
+        <td><code>TKSTEP</code>, <code>TKSTL</code></td>
+        <td>STEP AP242 reader/writer (incl. <code>TOROIDAL_SURFACE</code>); ASCII + binary STL writers.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-document</code></td>
+        <td>(parametric history)</td>
+        <td>Document of sketches + features with insertion-order recompute, and the <code>.zcad</code> serde document format (with cached meshes). The Fusion/FreeCAD-style modeling spine.</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-render</code></td>
+        <td><code>TKV3d</code>, <code>TKOpenGl</code></td>
+        <td>Interactive <code>wgpu</code>/<code>winit</code> viewer: orbit/pan/zoom camera, 4× MSAA, topological-edge wireframe overlay, and CPU ray-cast click-to-select with a shader highlight. <strong>Not</strong> re-exported by the facade — GPU deps stay out of the kernel.</td>
+        <td><span class="pill wip">viewer milestone</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad-truck-compat</code></td>
+        <td>(interop)</td>
+        <td>Bidirectional <code>truck_topology</code> ↔ <code>openrcad-topo</code> conversion contexts that preserve vertex/edge/face sharing. A separate crate so <code>truck</code> never enters the core graph.</td>
+        <td><span class="pill wip">conversion</span></td>
+      </tr>
+      <tr>
+        <td><code>openrcad</code></td>
+        <td>(facade)</td>
+        <td>Re-exports the kernel as submodules: <code>foundation</code>, <code>geom2d</code>, <code>geom</code>, <code>topo</code>, <code>sketch</code>, <code>primitives</code>, <code>algo</code>, <code>document</code>, <code>mesh</code>, <code>exchange</code>, plus a <code>prelude</code>. (The <code>render</code> and <code>truck-compat</code> crates are intentionally <em>not</em> re-exported.)</td>
+        <td><span class="pill done">tested</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Picking a dependency</h2>
+  <p>Most applications depend on the <code>openrcad</code> facade and reach in through its submodules. If you want a thinner build — say, only math and topology for a server-side validator — depend on the individual crates directly; the layering guarantees you pull in only what you use.</p>
+
+  <div class="note"><p>Every public type is <code>Clone</code> + <code>Serialize</code> + <code>Deserialize</code>. A <code>Solid</code> (and any sub-entity) round-trips through <code>serde_json</code>, <code>bincode</code>, or any serde format — the basis for storing a whole model as one document.</p></div>
+
+  <h2>Key public types</h2>
+  <table>
+    <thead><tr><th>Type</th><th>Crate</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><code>Pnt</code>, <code>Vec</code>, <code>Dir</code>, <code>Trsf</code></td><td>foundation</td><td>The <code>gp</code> math layer — points, vectors, directions, rigid transforms.</td></tr>
+      <tr><td><code>GeomCurve</code>, <code>GeomSurface</code></td><td>geom</td><td>Owned curve/surface sum types stored by value in topology.</td></tr>
+      <tr><td><code>Solid</code>, <code>Shell</code>, <code>Face</code>, <code>Edge</code>, <code>Vertex</code></td><td>topo</td><td>The B-Rep entities and their traversal API.</td></tr>
+      <tr><td><code>BooleanOp</code>, <code>BlendError</code></td><td>algo</td><td>Boolean selector; the error type returned by blend builders.</td></tr>
+      <tr><td><code>TriangleMesh</code>, <code>GpuMesh</code></td><td>mesh</td><td>Tessellation output; <code>GpuMesh</code> adds flat-shaded GPU buffers + per-triangle face ids.</td></tr>
+      <tr><td><code>HealthReport</code>, <code>ManifoldReport</code></td><td>topo</td><td>Self-validation: <code>Solid::is_watertight</code>, <code>validate</code>, <code>manifold_report</code>, <code>health_report</code>.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<footer class="foot">OpenRCAD · pure-Rust CAD kernel · MIT / Apache-2.0</footer>
+</body>
+</html>

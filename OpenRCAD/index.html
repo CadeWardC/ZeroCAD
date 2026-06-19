@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenRCAD — a pure-Rust CAD kernel</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<header class="nav"><div class="inner">
+  <a class="brand" href="index.html">Open<span>RCAD</span></a>
+  <a href="index.html" class="active">Overview</a>
+  <a href="getting-started.html">Getting started</a>
+  <a href="architecture.html">Architecture</a>
+  <a href="crates.html">Crates</a>
+  <a href="status.html">Status</a>
+  <a href="INTEGRATION.md">Integration guide</a>
+</div></header>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>OpenRCAD</h1>
+    <p class="lead">A lightweight, dependency-light geometric modeling kernel in pure, <code>#![forbid(unsafe_code)]</code> Rust — a refactor of OpenCASCADE's architecture, informed by truck.</p>
+    <div class="badges">
+      <span class="badge">pure Rust</span>
+      <span class="badge">no <code>unsafe</code></span>
+      <span class="badge">serde-serializable</span>
+      <span class="badge">native + WASM</span>
+      <span class="badge ok">clippy-clean</span>
+    </div>
+  </section>
+
+  <h2>What it gives you</h2>
+  <p>OpenRCAD provides the foundation a CAD <em>application</em> needs — points, vectors, curves, surfaces, boundary-representation (B-Rep) topology, primitive builders, booleans, blends, tessellation, and STEP/STL exchange — without depending on any C++ kernel. Everything is owned, <code>Clone</code>, and <code>Serialize</code>, so a whole model round-trips to a single document blob.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Build geometry</h3>
+      <p>Boxes and cylinders out of the box; lines, conics, and full NURBS curves/surfaces underneath, evaluated with de Boor and Boehm.</p>
+    </div>
+    <div class="card">
+      <h3>Combine it</h3>
+      <p>Boolean union / intersection / difference over a BVH-accelerated intersection engine with robust, tolerant classification.</p>
+    </div>
+    <div class="card">
+      <h3>Blend &amp; hollow</h3>
+      <p>Fillet, chamfer, and shell a box or cylinder at any orientation — rolling-ball tori, frustum chamfers, offset-surface cavities.</p>
+    </div>
+    <div class="card">
+      <h3>Mesh &amp; exchange</h3>
+      <p>Adaptive parallel tessellation to triangle meshes; read/write STEP (AP242) and STL for interop with other tools.</p>
+    </div>
+    <div class="card">
+      <h3>View &amp; pick</h3>
+      <p>An interactive <code>wgpu</code> viewer: orbit / pan / zoom, 4× MSAA, a topological-edge wireframe, and click-to-select faces.</p>
+    </div>
+    <div class="card">
+      <h3>Sketch &amp; document</h3>
+      <p>2D profiles and a parametric document history (the <code>.zcad</code> format) — a Fusion/FreeCAD-style modeling spine on the kernel.</p>
+    </div>
+  </div>
+
+  <h2>30-second taste</h2>
+  <pre><code><span class="tok-kw">use</span> openrcad::foundation::{Pnt, Dir, Ax2};
+<span class="tok-kw">use</span> openrcad::primitives::make_cylinder;
+<span class="tok-kw">use</span> openrcad::algo::fillet;
+
+<span class="tok-kw">let</span> cyl = <span class="tok-fn">make_cylinder</span>(&Ax2::new(Pnt::origin(), Dir::dz()), <span class="tok-str">2.0</span>, <span class="tok-str">6.0</span>);
+<span class="tok-kw">let</span> rounded = <span class="tok-fn">fillet</span>(&cyl, <span class="tok-str">0.5</span>)?;  <span class="tok-com">// rims become torus fillets</span>
+<span class="tok-kw">assert_eq!</span>(rounded.<span class="tok-fn">face_count</span>(), <span class="tok-str">11</span>);</code></pre>
+  <p class="dim">Blend builders return <code>Result&lt;Solid, BlendError&gt;</code>; see the <a href="INTEGRATION.md">integration guide</a> for the full pattern.</p>
+
+  <h2>Why another kernel?</h2>
+  <p><a href="https://github.com/ricosjp/truck">truck</a> proved a pure-Rust kernel is possible, but its boolean solver panics on some configurations, it has no fillet/chamfer builder, and smooth faces break its boolean path. OpenRCAD adopts <a href="https://dev.opencascade.org/">OpenCASCADE</a>'s battle-tested module architecture and re-implements each layer in safe Rust — a kernel whose entire stack you own and can fix. It contains <strong>no OCCT or truck source</strong>; both are design references only.</p>
+
+  <div class="note"><p><strong>Status: pre-alpha.</strong> The foundation, geometry, topology, primitives, intersection engine + BVH, booleans, tessellation, sewing, and STEP/STL layers are real and tested — plus an interactive viewer and a parametric document layer. Booleans are watertight on a wide range of inputs (with a documented partial-imprint frontier); fillet / chamfer / shell handle a box or cylinder at any orientation. See <a href="status.html">Status</a> for the full picture.</p></div>
+
+  <h2>Where to next</h2>
+  <ul class="clean">
+    <li><a href="getting-started.html">Getting started</a> — install, build, and run your first model.</li>
+    <li><a href="INTEGRATION.md">Integration guide</a> — add OpenRCAD to a project and call every layer.</li>
+    <li><a href="status.html">Status</a> — what's verified, what's limited, and the roadmap.</li>
+    <li><a href="architecture.html">Architecture</a> — the design decisions that make it robust.</li>
+    <li><a href="crates.html">Crates</a> — the per-crate map of the workspace.</li>
+  </ul>
+</div>
+
+<footer class="foot">OpenRCAD · pure-Rust CAD kernel · MIT / Apache-2.0</footer>
+</body>
+</html>

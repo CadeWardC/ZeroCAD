@@ -1,0 +1,16 @@
+[package]
+name = "openrcad-sketch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Lightweight 2D sketches and profiles for OpenRCAD parametric documents."
+categories = ["mathematics", "graphics", "science"]
+keywords = ["cad", "sketch", "profile", "parametric"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+serde.workspace = true

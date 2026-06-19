@@ -1,0 +1,28 @@
+[package]
+name = "openrcad-exchange"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Data exchange for OpenRCAD — STEP and STL read/write (the OCCT TKSTEP / TKSTL layer)."
+categories = ["mathematics", "graphics", "parser-implementations"]
+keywords = ["cad", "step", "stl", "occt"]
+
+[features]
+# Forwards parallel tessellation to `openrcad-mesh`. On by default; drops rayon
+# when disabled (see the workspace `openrcad-mesh` dependency note).
+default = ["parallel"]
+parallel = ["openrcad-mesh/parallel"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom.workspace = true
+openrcad-topo.workspace = true
+openrcad-mesh.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+openrcad-primitives.workspace = true

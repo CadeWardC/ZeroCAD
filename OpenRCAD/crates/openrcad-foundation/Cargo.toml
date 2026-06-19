@@ -1,0 +1,15 @@
+[package]
+name = "openrcad-foundation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Foundation classes for OpenRCAD — geometric primitives, axes, transforms, and tolerance (the OCCT gp / TKernel / TKMath layer)."
+categories = ["mathematics", "graphics", "science"]
+keywords = ["cad", "geometry", "occt", "gp", "kernel"]
+
+[dependencies]
+serde.workspace = true

@@ -1,0 +1,39 @@
+[package]
+name = "openrcad-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Real-time wgpu viewer for OpenRCAD meshes. Not part of the core kernel."
+
+# This crate is deliberately NOT re-exported by the `openrcad` facade: GPU/windowing
+# dependencies (wgpu, winit) must never enter a core kernel crate. It depends only on
+# the pure mesh/topology output and turns it into pixels.
+
+[features]
+# The desktop viewer tessellates on a rayon pool by default; forwarded so a
+# build can opt out alongside the rest of the workspace.
+default = ["parallel", "native-backends"]
+parallel = ["openrcad-mesh/parallel"]
+# Keep browser WebGPU support opt-in so the desktop viewer's default dependency
+# surface stays smaller. Vulkan/OpenGL are selected by wgpu's target-specific
+# dependencies; these explicit features cover shader parsing and native platform
+# backends that are feature-gated.
+native-backends = ["wgpu/wgsl", "wgpu/dx12", "wgpu/metal"]
+webgpu = ["wgpu/wgsl", "wgpu/webgpu"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-topo.workspace = true
+openrcad-mesh.workspace = true
+
+wgpu = { version = "22", default-features = false }
+winit = "0.30"
+bytemuck = "1"
+pollster = "0.3"
+
+[dev-dependencies]
+openrcad-primitives.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "openrcad-truck-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Interop between OpenRCAD topology and the `truck` CAD kernel — bidirectional Vertex/Edge/Wire/Face/Shell/Solid conversion preserving topological sharing."
+categories = ["mathematics", "graphics"]
+keywords = ["cad", "brep", "truck", "interop"]
+
+# This adapter lives in its own crate (not behind an `openrcad-topo` feature) so
+# the core topology crate keeps a strictly minimal dependency set — only the
+# users who need `truck` interop pull `truck-topology` into their graph, and the
+# `openrcad` facade deliberately does NOT re-export this crate.
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom.workspace = true
+openrcad-topo.workspace = true
+truck-topology = "0.6.0"

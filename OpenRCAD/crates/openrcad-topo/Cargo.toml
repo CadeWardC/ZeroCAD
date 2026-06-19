@@ -1,0 +1,19 @@
+[package]
+name = "openrcad-topo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Boundary-representation topology for OpenRCAD — Vertex, Edge, Wire, Face, Shell, Solid (the OCCT TKBRep layer)."
+categories = ["mathematics", "graphics"]
+keywords = ["cad", "brep", "topology", "occt"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom.workspace = true
+openrcad-geom2d.workspace = true
+serde.workspace = true
+slotmap = { version = "1.0", features = ["serde"] }

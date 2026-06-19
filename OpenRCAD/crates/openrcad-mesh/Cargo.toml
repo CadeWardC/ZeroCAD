@@ -1,0 +1,27 @@
+[package]
+name = "openrcad-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Tessellation for OpenRCAD — B-Rep to triangle mesh with chord/sag tolerance (the OCCT TKMesh layer)."
+categories = ["mathematics", "graphics", "algorithms"]
+keywords = ["cad", "mesh", "tessellation", "occt"]
+
+[features]
+# Parallel face tessellation via `rayon`. On by default; disable
+# (`default-features = false`) for single-threaded or `wasm32` targets where a
+# thread pool is unavailable — the sequential fallback produces identical meshes.
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom.workspace = true
+openrcad-geom2d.workspace = true
+openrcad-topo.workspace = true
+serde.workspace = true
+rayon = { version = "1.8", optional = true }

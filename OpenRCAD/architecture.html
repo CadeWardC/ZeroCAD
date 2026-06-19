@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — OpenRCAD</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<header class="nav"><div class="inner">
+  <a class="brand" href="index.html">Open<span>RCAD</span></a>
+  <a href="index.html">Overview</a>
+  <a href="getting-started.html">Getting started</a>
+  <a href="architecture.html" class="active">Architecture</a>
+  <a href="crates.html">Crates</a>
+  <a href="status.html">Status</a>
+  <a href="INTEGRATION.md">Integration guide</a>
+</div></header>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>Architecture</h1>
+    <p class="lead">The design decisions that separate OpenRCAD from legacy kernels — and the few that look unusual until you see the bug they prevent.</p>
+  </section>
+
+  <h2>Hard rules</h2>
+  <ul class="clean">
+    <li><strong><code>#![forbid(unsafe_code)]</code> everywhere.</strong> Every crate. No exceptions. All data structures and algorithms are safe Rust.</li>
+    <li><strong>Geometry is owned enums, not <code>Box&lt;dyn Trait&gt;</code>.</strong> <code>GeomCurve</code> and <code>GeomSurface</code> are sum types stored <em>by value</em> inside topology — so topology is <code>Clone</code>, <code>Serialize</code>, and lifetime-free.</li>
+    <li><strong>Minimal dependencies.</strong> Only <code>serde</code> for core crates; <code>slotmap</code> in topology and <code>rayon</code> in meshing. No C/C++ anywhere.</li>
+  </ul>
+
+  <h2>1 · Arena-based B-Rep</h2>
+  <p>B-Rep graphs are inherently cyclic (Face → Loop → Edge → Vertex → …). Safe Rust cannot represent pointer cycles without <code>Rc</code>/<code>Arc</code> + locks, which destroy cache locality. OpenRCAD stores every entity in flat <strong>generational arenas</strong> (<code>slotmap</code>) and references them by <code>Copy</code>-able index handles (<code>VertexId</code>, <code>EdgeId</code>, …). Adjacency is arrays of indices, giving O(1) access, contiguous layout, and lock-free concurrent reads via <code>rayon</code>.</p>
+
+  <h2>2 · BVH spatial acceleration</h2>
+  <p>Every geometric query (intersection, closest point, containment) is accelerated by a <strong>bounding-volume hierarchy</strong> of axis-aligned boxes, built with the Surface-Area Heuristic and rebuilt lazily on topology change. This takes intersection and boolean complexity from O(n²) toward O(n log n).</p>
+
+  <h2>3 · Robust numerics</h2>
+  <p>Floating-point error is the #1 cause of boolean and fillet failures in legacy kernels. OpenRCAD uses <strong>Shewchuk-style adaptive exact predicates</strong> (fast floating-point, promoted to exact only when the sign is ambiguous) for orientation tests, and <strong>adaptive subdivision with interval bounding</strong> so intersection curves are proven topologically correct before they enter the B-Rep.</p>
+
+  <h2>4 · Tolerant modeling</h2>
+  <p>Imported CAD data has small gaps. A single global tolerance is too rigid, so each <code>Vertex</code> and <code>Edge</code> stores its own local tolerance — the radius of its uncertainty sphere/tube — and every adjacency and sewing check respects it. This is what lets the kernel process "dirty" STEP/IGES geometry.</p>
+
+  <h2>5 · NURBS done right</h2>
+  <p>Curves and surfaces evaluate with <strong>de Boor's algorithm</strong> (local support, O(k²)), refine with <strong>Boehm knot insertion</strong>, and take derivatives directly from de Boor — never naive basis summation or finite differences. The new <code>ToroidalSurface</code> joins planes, cylinders, cones, spheres, Bézier/Gregory, offset, and ruled surfaces as first-class analytic variants.</p>
+
+  <h2>6 · Local Euler operators</h2>
+  <p>Local edits (fillets, chamfers, face deletions) use atomic <strong>Euler operators</strong> (<code>MEV</code>, <code>MEF</code>, <code>KEV</code>, <code>KEF</code>, …) that surgically modify the B-Rep graph and preserve the Euler–Poincaré invariant <code>V − E + F = 2(S − G) + H</code> — rather than a global boolean sweep.</p>
+
+  <h2>7 · Blending &amp; offset</h2>
+  <p>The blend system targets the cases that crash other kernels: rolling-ball edge fillets (constant + variable radius), N-sided Gregory-patch corner blends for n-valent vertices, distance/angle chamfers, and offset-surface shelling with self-intersection resolution. Today's builders handle a single box or cylinder primitive at <em>any orientation</em> (the frame is recovered from geometry), each finishing watertight; the general solver on arbitrary edges — and watertight booleans on partial-imprint cases — is the active frontier (see <a href="status.html">Status</a>).</p>
+
+  <h2>8 · Sewing &amp; healing</h2>
+  <p>Robust import/export needs repair: identify free edges on open shells, match and merge them within per-entity tolerance, and validate the result for manifoldness, orientation consistency, and watertightness. Every blend builder finishes by sewing its faces into one watertight shell.</p>
+
+  <h2>The layered dependency graph</h2>
+  <p>The workspace is strictly layered and points one way — no cycles between crates.</p>
+  <pre><code>            openrcad  <span class="tok-com">(facade, re-exports the kernel)</span>
+                │
+   ┌────────────┼───────────────┬───────────────┐
+ primitives   exchange        mesh            algo
+   │            │               │               │
+   └────────► topo ◄────────────┴───────────────┘
+                │   ◄── geom, geom2d
+                │
+          foundation   <span class="tok-com">(no internal deps — the gp layer)</span>
+
+ document ──► algo + sketch     <span class="tok-com">(parametric history, .zcad)</span>
+ render   ──► mesh + topo       <span class="tok-com">(wgpu viewer — outside the facade)</span></code></pre>
+
+  <p class="dim">The viewer (<code>render</code>) and <code>truck-compat</code> sit <em>outside</em> the facade so GPU and interop dependencies never reach a core kernel crate. For the canonical, source-of-truth description of these principles, see <code>CLAUDE.md</code> in the repository root.</p>
+</div>
+
+<footer class="foot">OpenRCAD · pure-Rust CAD kernel · MIT / Apache-2.0</footer>
+</body>
+</html>

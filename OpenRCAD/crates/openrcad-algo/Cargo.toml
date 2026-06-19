@@ -1,0 +1,21 @@
+[package]
+name = "openrcad-algo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Modeling algorithms for OpenRCAD — booleans, fillets, offsets (the OCCT TKBool / TKGeomAlgo / TKFillet layer)."
+categories = ["mathematics", "graphics", "algorithms"]
+keywords = ["cad", "boolean", "fillet", "occt"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom.workspace = true
+openrcad-topo.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+openrcad-primitives = { path = "../openrcad-primitives" }

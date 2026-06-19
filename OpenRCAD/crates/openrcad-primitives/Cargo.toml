@@ -1,0 +1,23 @@
+[package]
+name = "openrcad-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Primitive solid builders for OpenRCAD — Box, Sphere, Cylinder, Cone (the OCCT TKPrim layer)."
+categories = ["mathematics", "graphics"]
+keywords = ["cad", "primitives", "box", "occt"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+openrcad-geom.workspace = true
+openrcad-topo.workspace = true
+serde.workspace = true
+
+# Test-only: a concrete serde format to exercise serialize/deserialize round-trips.
+# Not a runtime dependency of the kernel.
+[dev-dependencies]
+serde_json = "1"

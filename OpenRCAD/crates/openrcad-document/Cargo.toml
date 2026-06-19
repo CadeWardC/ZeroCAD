@@ -1,0 +1,21 @@
+[package]
+name = "openrcad-document"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Parametric document history for OpenRCAD sketches and solid features."
+categories = ["mathematics", "graphics", "science"]
+keywords = ["cad", "document", "history", "parametric"]
+
+[dependencies]
+openrcad-algo.workspace = true
+openrcad-foundation.workspace = true
+openrcad-primitives.workspace = true
+openrcad-sketch.workspace = true
+openrcad-topo.workspace = true
+serde.workspace = true
+serde_json.workspace = true

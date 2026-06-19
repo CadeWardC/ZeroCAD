@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status — OpenRCAD</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<header class="nav"><div class="inner">
+  <a class="brand" href="index.html">Open<span>RCAD</span></a>
+  <a href="index.html">Overview</a>
+  <a href="getting-started.html">Getting started</a>
+  <a href="architecture.html">Architecture</a>
+  <a href="crates.html">Crates</a>
+  <a href="status.html" class="active">Status</a>
+  <a href="INTEGRATION.md">Integration guide</a>
+</div></header>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>Status</h1>
+    <p class="lead">Honest, current state of the kernel — what's real, what's special-cased, and what's next.</p>
+    <div class="badges">
+      <span class="badge ok">workspace builds, 0 warnings</span>
+      <span class="badge ok">clippy-clean</span>
+      <span class="badge ok">full test suite green</span>
+    </div>
+  </section>
+
+  <h2>The five-phase roadmap</h2>
+  <table>
+    <thead><tr><th>Phase</th><th>Deliverable</th><th>State</th></tr></thead>
+    <tbody>
+      <tr><td>1 · Geometry &amp; parallel topology</td><td>All conics, NURBS curves/surfaces, arena B-Rep.</td><td><span class="pill done">complete</span></td></tr>
+      <tr><td>2 · Intersection engine &amp; BVH</td><td>Curve/curve, curve/surface, surface/surface via adaptive subdivision with closed-form line/circle fast paths; SAH BVH with dual-tree overlap.</td><td><span class="pill done">complete</span></td></tr>
+      <tr><td>3 · Booleans, Euler ops &amp; primitives</td><td><code>MEV/MEF/KEV/KEF</code>; fuse/cut/common with BVH-pruned classification; box, cylinder, cone, sphere, wedge.</td><td><span class="pill done">complete (for scope)</span></td></tr>
+      <tr><td>4 · Tessellation, sewing &amp; exchange</td><td>Parallel meshing, free-edge sewing/healing, STEP + STL I/O; interactive wgpu viewer.</td><td><span class="pill done">complete</span></td></tr>
+      <tr><td>5 · Advanced blending &amp; offset</td><td>Rolling-ball fillets, Gregory corner blends, chamfers, shelling.</td><td><span class="pill wip">in progress</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Blending &amp; offset — what works today</h2>
+  <p>Phase 5 geometry is in place, and the blend builders work end-to-end on the two primitive families the detectors recognize. Each returns a watertight solid (sewn) or a typed error.</p>
+
+  <table>
+    <thead><tr><th>Operation</th><th>Box</th><th>Cylinder</th><th>Construction</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>fillet</code></td>
+        <td><span class="pill done">yes</span></td>
+        <td><span class="pill done">yes</span></td>
+        <td>Box: cylindrical edge faces + spherical octant corners. Cylinder: <strong>torus</strong> rolling-ball faces on both rims.</td>
+      </tr>
+      <tr>
+        <td><code>chamfer</code></td>
+        <td><span class="pill done">yes</span></td>
+        <td><span class="pill done">yes</span></td>
+        <td>Box: ruled bevel faces + triangular corners. Cylinder: 45° conical frustum on both rims.</td>
+      </tr>
+      <tr>
+        <td><code>shell_solid</code></td>
+        <td><span class="pill done">yes</span></td>
+        <td><span class="pill done">yes</span></td>
+        <td>Offset-surface inner cavity + planar rim faces around the removed open faces.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="warn"><p><strong>Scope limit, stated plainly.</strong> The blend builders detect a single box or cylinder primitive — at <em>any position/orientation</em> (the frame is recovered from geometry, verified watertight on rotated inputs) — and construct the result directly. For any other solid, including a boolean result, they return <code>BlendError::UnsupportedShape</code> (they never silently hand back the input). The general rolling-ball sweep on arbitrary edges, N-valent Gregory corner blends, face overflow, and concave-offset self-intersection resolution are not yet implemented.</p></div>
+
+  <h2>Booleans — robustness frontier (measured)</h2>
+  <p>Booleans run over the BVH-accelerated intersection engine and finish watertight on a wide range of configurations. The split between solid and broken is sharp and tracked by <code>crates/openrcad-algo/tests/robustness.rs</code> against the <code>is_watertight</code> + <code>validate</code> oracles.</p>
+  <table>
+    <thead><tr><th>Watertight + valid today</th><th>Open frontier (partial imprint)</th></tr></thead>
+    <tbody>
+      <tr><td>through-cuts; face-flush unions</td><td>corner-overlap <strong>unions</strong></td></tr>
+      <tr><td>enclosed voids; corner-overlap <strong>intersections</strong></td><td><strong>blind pockets</strong> (tool stops inside)</td></tr>
+      <tr><td>all rotated placements</td><td>partial rotated cuts; through side-drill (non-contiguous loop)</td></tr>
+    </tbody>
+  </table>
+  <p class="dim">Root cause of the frontier: the split pass does not yet imprint an intersection curve that only <em>partially</em> crosses a face. The failing cases are encoded as <code>#[ignore]</code>d goal-tests (run with <code>cargo test --ignored</code>) so progress is measurable.</p>
+
+  <h2>New since the last cut</h2>
+  <ul class="clean">
+    <li><strong>~10× faster booleans</strong> — a closed-form <code>curve_curve</code> fast path for line/circle pairs (lines have infinite bounds, so the old subdivision bisected a clamped ±100 domain) dropped box∩box from ~13.8 ms to ~1.3 ms; the classification scan is now BVH-pruned.</li>
+    <li><strong>Watertight / manifold validation</strong> — <code>Solid::is_watertight</code>, <code>manifold_report</code>, <code>is_manifold</code>, and <code>health_report</code>, with a regression suite that asserts closure on every verified-good boolean and blend (and pins the failure frontier).</li>
+    <li><strong>Interactive viewer</strong> (<code>openrcad-render</code>) — orbit / pan / zoom, 4× MSAA, a topological-edge wireframe overlay, and click-to-select with a shader face highlight.</li>
+    <li><strong>Orientation-general blends</strong> — fillet / chamfer / shell verified watertight on rotated boxes and cylinders, not just axis-aligned.</li>
+    <li><strong>Parametric layer</strong> — <code>openrcad-sketch</code> (2D profiles) and <code>openrcad-document</code> (feature recompute + the <code>.zcad</code> document format).</li>
+    <li><strong><code>ToroidalSurface</code></strong> — a first-class analytic surface wired through the geometry enum, the BVH, intersection <code>uv_of</code>, tessellation, and STEP read/write (<code>TOROIDAL_SURFACE</code>).</li>
+    <li><strong>Clippy-clean workspace</strong> — every lint addressed; numeric kernels keep index loops by explicit, justified allow.</li>
+  </ul>
+
+  <h2>Verification</h2>
+  <pre><code>cargo build --workspace                  <span class="tok-com"># 0 compiler warnings</span>
+cargo clippy --workspace --all-targets   <span class="tok-com"># 0 lint warnings</span>
+cargo test --workspace                   <span class="tok-com"># full suite green</span></code></pre>
+  <p class="dim"><code>is_watertight</code> + <code>validate</code> and Euler-characteristic checks guard every primitive and blend; booleans assert watertightness and valid face counts; primitives round-trip through serde. The canonical design rationale for these checks lives in <code>CLAUDE.md</code> at the repository root.</p>
+</div>
+
+<footer class="foot">OpenRCAD · pure-Rust CAD kernel · MIT / Apache-2.0</footer>
+</body>
+</html>

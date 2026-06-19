@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started — OpenRCAD</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<header class="nav"><div class="inner">
+  <a class="brand" href="index.html">Open<span>RCAD</span></a>
+  <a href="index.html">Overview</a>
+  <a href="getting-started.html" class="active">Getting started</a>
+  <a href="architecture.html">Architecture</a>
+  <a href="crates.html">Crates</a>
+  <a href="status.html">Status</a>
+  <a href="INTEGRATION.md">Integration guide</a>
+</div></header>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>Getting started</h1>
+    <p class="lead">Build the workspace, run the tests, and create your first solid.</p>
+  </section>
+
+  <h2>Prerequisites</h2>
+  <p>A recent stable Rust toolchain via <a href="https://rustup.rs">rustup</a>. No C/C++ toolchain, no system libraries — the kernel is pure Rust and compiles natively and to WebAssembly.</p>
+
+  <h2>Build &amp; test</h2>
+  <pre><code><span class="tok-com"># clone, then from the workspace root:</span>
+cargo build --workspace        <span class="tok-com"># build every crate</span>
+cargo test  --workspace        <span class="tok-com"># unit + integration suite</span>
+cargo clippy --workspace --all-targets   <span class="tok-com"># lint (a CI gate; kept clean)</span></code></pre>
+  <p>Handy aliases live in <code>.cargo/config.toml</code>:</p>
+  <pre><code>cargo t     <span class="tok-com"># == cargo test --workspace</span>
+cargo ck    <span class="tok-com"># == cargo clippy --workspace --all-targets</span></code></pre>
+
+  <h2>Add it to your project</h2>
+  <p>Depend on the <code>openrcad</code> facade crate — it re-exports every kernel layer as a submodule (<code>foundation</code>, <code>geom2d</code>, <code>geom</code>, <code>topo</code>, <code>sketch</code>, <code>primitives</code>, <code>algo</code>, <code>document</code>, <code>mesh</code>, <code>exchange</code>) plus a <code>prelude</code>. The interactive viewer (<code>openrcad-render</code>) is a separate dependency.</p>
+  <pre><code><span class="tok-com"># Cargo.toml</span>
+[dependencies]
+openrcad = { version = <span class="tok-str">"0.1"</span> }</code></pre>
+  <p class="dim">Prefer thinner builds? Depend on the individual crates (e.g. <code>openrcad-foundation</code>, <code>openrcad-topo</code>) directly. See the <a href="crates.html">crates map</a>.</p>
+
+  <h2>Your first solid</h2>
+  <pre><code><span class="tok-kw">use</span> openrcad::foundation::{Pnt, Dir, Ax1, Trsf};
+<span class="tok-kw">use</span> openrcad::primitives::make_box;
+
+<span class="tok-com">// A 10×20×30 box sitting on the origin.</span>
+<span class="tok-kw">let</span> solid = <span class="tok-fn">make_box</span>(&Pnt::new(<span class="tok-str">0.0</span>, <span class="tok-str">0.0</span>, <span class="tok-str">0.0</span>), <span class="tok-str">10.0</span>, <span class="tok-str">20.0</span>, <span class="tok-str">30.0</span>);
+<span class="tok-kw">assert_eq!</span>(solid.<span class="tok-fn">shell</span>().<span class="tok-fn">faces</span>().len(), <span class="tok-str">6</span>);
+<span class="tok-kw">assert_eq!</span>(solid.<span class="tok-fn">vertex_count</span>(), <span class="tok-str">8</span>);
+
+<span class="tok-com">// Rotate 90° about Z and read the moved AABB.</span>
+<span class="tok-kw">let</span> rot = Trsf::<span class="tok-fn">rotation</span>(&Ax1::new(Pnt::origin(), Dir::dz()), std::f64::consts::FRAC_PI_2);
+<span class="tok-kw">let</span> moved = solid.<span class="tok-fn">transformed</span>(&rot);
+<span class="tok-kw">let</span> (min, max) = moved.<span class="tok-fn">bounding_box</span>().<span class="tok-fn">corners</span>().unwrap();</code></pre>
+
+  <h2>A complete pipeline</h2>
+  <p>Primitive → blend → mesh → file, the way an application uses it:</p>
+  <pre><code><span class="tok-kw">use</span> openrcad::foundation::{Pnt, Dir, Ax2};
+<span class="tok-kw">use</span> openrcad::primitives::make_cylinder;
+<span class="tok-kw">use</span> openrcad::algo::chamfer;
+<span class="tok-kw">use</span> openrcad::mesh::tessellate;
+<span class="tok-kw">use</span> openrcad::exchange::write_step;
+
+<span class="tok-kw">let</span> cyl  = <span class="tok-fn">make_cylinder</span>(&Ax2::new(Pnt::origin(), Dir::dz()), <span class="tok-str">5.0</span>, <span class="tok-str">12.0</span>);
+<span class="tok-kw">let</span> part = <span class="tok-fn">chamfer</span>(&cyl, <span class="tok-str">0.8</span>)?;            <span class="tok-com">// 45° frustum chamfers on both rims</span>
+<span class="tok-kw">let</span> mesh = <span class="tok-fn">tessellate</span>(&part, <span class="tok-str">0.05</span>, <span class="tok-str">0.5</span>);  <span class="tok-com">// chordal + angular tolerance</span>
+<span class="tok-fn">write_step</span>(&part, <span class="tok-str">"part.step"</span>)?;
+<span class="tok-kw">println!</span>(<span class="tok-str">"{} triangles"</span>, mesh.<span class="tok-fn">triangle_count</span>());</code></pre>
+
+  <div class="note"><p>Blend builders (<code>fillet</code>, <code>chamfer</code>, <code>shell_solid</code>) return <code>Result&lt;Solid, BlendError&gt;</code>. Handle <code>BlendError::UnsupportedShape</code> (not a box/cylinder primitive) and <code>BlendError::ParameterTooLarge { max, .. }</code>. The full pattern is in the <a href="INTEGRATION.md">integration guide</a>.</p></div>
+
+  <h2>See it in a window</h2>
+  <p>The <code>openrcad-render</code> crate (a separate dependency, not part of the facade) opens an interactive <code>wgpu</code> viewer — orbit / pan / zoom, 4× MSAA, an edge wireframe, and click-to-select:</p>
+  <pre><code><span class="tok-com">// Cargo.toml: openrcad-render = { version = "0.1" }</span>
+openrcad_render::<span class="tok-fn">run_solid</span>(&part, <span class="tok-str">0.02</span>);  <span class="tok-com">// (solid, chord error) — blocks until closed</span></code></pre>
+
+  <h2>Verify a result</h2>
+  <p>Every modeling result should be a closed, two-manifold solid. Check it directly:</p>
+  <pre><code><span class="tok-kw">assert!</span>(part.<span class="tok-fn">is_watertight</span>());      <span class="tok-com">// every edge shared by exactly two faces</span>
+<span class="tok-kw">assert!</span>(part.<span class="tok-fn">validate</span>().is_ok()); <span class="tok-com">// every boundary loop closed + contiguous</span></code></pre>
+
+  <h2>Next</h2>
+  <ul class="clean">
+    <li><a href="INTEGRATION.md">Integration guide</a> — every layer with copy-paste examples.</li>
+    <li><a href="architecture.html">Architecture</a> — why the kernel is shaped the way it is.</li>
+    <li><a href="status.html">Status</a> — what's verified, what's limited, and the roadmap.</li>
+    <li>Run <code>cargo doc --workspace --open</code> for the full Rust API reference.</li>
+  </ul>
+</div>
+
+<footer class="foot">OpenRCAD · pure-Rust CAD kernel · MIT / Apache-2.0</footer>
+</body>
+</html>

@@ -1,0 +1,16 @@
+[package]
+name = "openrcad-geom2d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "2D geometry for OpenRCAD — curves on the plane (the OCCT TKG2d / Geom2d layer)."
+categories = ["mathematics", "graphics"]
+keywords = ["cad", "geometry", "geom2d", "occt"]
+
+[dependencies]
+openrcad-foundation.workspace = true
+serde.workspace = true
