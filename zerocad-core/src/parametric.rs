@@ -296,6 +296,59 @@ impl ParametricGraph {
         &self,
         hidden: &std::collections::HashSet<String>,
     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+        self.evaluate_bodies_inner(hidden, false)
+    }
+
+    /// **Draft** evaluation for live previews (a fillet drag, an extrude
+    /// preview): identical to [`evaluate_bodies_with_warnings`] except every 3D
+    /// fillet uses the fast **faceted** cutter instead of the analytic-arc one.
+    /// The arc cutter's boolean is ~50× slower (truck's curve–surface
+    /// intersection), so re-solving it on every drag frame freezes the UI. The
+    /// committed model still rebuilds with the arc cutter via the non-draft path,
+    /// which runs only once per edit — so the user drags a fast faceted preview
+    /// and lands on the smooth single-face result.
+    pub fn evaluate_bodies_draft(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, MockMesh)>, String> {
+        self.evaluate_bodies_inner(hidden, true)
+            .map(|(bodies, _warnings)| bodies)
+    }
+
+    /// [`evaluate_bodies_draft`] but also returning warnings — the draft variant
+    /// the GUI uses for an instant on-screen rebuild before refining to the slow
+    /// arc-fillet result in the background.
+    pub fn evaluate_bodies_with_warnings_draft(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+    ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+        self.evaluate_bodies_inner(hidden, true)
+    }
+
+    /// Whether the (non-hidden) model contains a 3D fillet whose committed,
+    /// arc-cutter geometry differs from its fast faceted draft. The GUI uses this
+    /// to decide if a background refine pass is worth spawning: with no such
+    /// fillet the draft result *is* the final result, so it skips the extra
+    /// (and otherwise redundant) async evaluation. Chamfers are excluded — their
+    /// bevel is a single planar face either way, so draft and final agree.
+    pub fn has_arc_fillet(&self, hidden: &std::collections::HashSet<String>) -> bool {
+        self.graph.node_weights().any(|n| {
+            !hidden.contains(&n.id)
+                && matches!(
+                    &n.feature,
+                    FeatureType::EdgeMod {
+                        kind: crate::sketch::CornerKind::Fillet,
+                        ..
+                    }
+                )
+        })
+    }
+
+    fn evaluate_bodies_inner(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        draft: bool,
+    ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
         // Surface circular dependencies (toposort result is otherwise unused,
         // but a cycle should still fail the whole evaluation).
         toposort(&self.graph, None)
@@ -393,6 +446,7 @@ impl ParametricGraph {
                         edge,
                         eff_dist,
                         *kind,
+                        draft,
                         &mut live,
                         &mut warnings,
                     );
@@ -940,6 +994,16 @@ const EDGE_FILLET_SEGS: usize = 24;
 /// fallback path, the price of a boolean that resolves at all.
 const EDGE_MOD_GROW: f32 = 0.2;
 
+/// Outward inflation (mm) for the **analytic-arc** fillet cutter. Smaller than
+/// [`EDGE_MOD_GROW`] because the visible loss of tangency at the fillet's blend
+/// line scales with this offset — the round meets its neighbour faces with a step
+/// of about this size — so it's kept as tight as the boolean allows while still
+/// clearing `BOOL_TOL` (0.05mm) by a 2× margin so the arc's tangent line reads as
+/// off-face rather than tangent (which truck rejects). Halving 0.2→0.1 visibly
+/// tightens the blend. A perfectly tangent blend needs no boolean at all (direct
+/// construction), but truck rejects a cutter that touches the faces tangentially.
+const ARC_FILLET_GROW: f32 = 0.1;
+
 /// Apply a 3D fillet/chamfer: subtract the edge cutter from the target body's
 /// parts. Mirrors [`apply_cut`]'s guarded, body-preserving strategy — a cutter
 /// the solver can't subtract leaves the part intact and raises a warning rather
@@ -953,18 +1017,38 @@ fn apply_edge_mod(
     edge: &EdgeRef,
     dist: f32,
     kind: crate::sketch::CornerKind,
+    draft: bool,
     live: &mut [LiveBody],
     warnings: &mut Vec<String>,
 ) {
     let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
 
-    // exact: corner kept on the body edge (perfect geometry if the solver takes
-    // it). robust: corner pushed just outside the body so the leg faces aren't
-    // coplanar with the body faces. Both overshoot the edge ends.
-    let exact = crate::mock_kernel::edge_corner_cutter(
+    // Cutters are tried in quality order; the first whose boolean the solver
+    // accepts wins. For a *committed* fillet the analytic-arc cutter leads — it
+    // makes the round ONE cylindrical face with ONE arc edge and leaves the
+    // neighbour faces genuinely flat — with the faceted cutter following as a
+    // guaranteed fallback (truck's boolean is fragile on cylinders). In `draft`
+    // mode (a live drag preview) the arc cutter is skipped entirely: its boolean
+    // is ~50× slower, so re-solving it per frame freezes the UI — the preview
+    // uses the fast faceted cutter and the smooth arc result lands on commit.
+    // (A chamfer's bevel is already one planar face, so it never uses the arc.)
+    //
+    // Within each kind: `exact` keeps the corner on the body edge (perfect
+    // geometry if the solver takes it); `robust` lifts it just outside the body
+    // so the leg faces aren't coplanar with the body faces — the configuration
+    // truck's solver rejects. Both overshoot the edge ends. The arc cutter only
+    // ships its `robust` form: its `exact` (coplanar-leg) boolean reliably fails
+    // *and* costs a full ~250ms solve, so trying it is pure wasted latency.
+    let mut cutters: Vec<crate::mock_kernel::KernelSolid> = Vec::with_capacity(3);
+    if fillet && !draft {
+        cutters.extend(crate::mock_kernel::edge_fillet_cutter_arc(
+            edge.p0, edge.p1, edge.n1, edge.n2, dist, ARC_FILLET_GROW, CUT_OVERSHOOT,
+        ));
+    }
+    cutters.extend(crate::mock_kernel::edge_corner_cutter(
         edge.p0, edge.p1, edge.n1, edge.n2, dist, fillet, EDGE_FILLET_SEGS, 0.0, CUT_OVERSHOOT,
-    );
-    let robust = crate::mock_kernel::edge_corner_cutter(
+    ));
+    cutters.extend(crate::mock_kernel::edge_corner_cutter(
         edge.p0,
         edge.p1,
         edge.n1,
@@ -974,8 +1058,8 @@ fn apply_edge_mod(
         EDGE_FILLET_SEGS,
         EDGE_MOD_GROW,
         CUT_OVERSHOOT,
-    );
-    if exact.is_none() && robust.is_none() {
+    ));
+    if cutters.is_empty() {
         warnings.push(format!(
             "Fillet/Chamfer '{mod_id}': the edge couldn't be turned into a cutter \
              (degenerate edge or size), so the body was left unchanged."
@@ -994,23 +1078,23 @@ fn apply_edge_mod(
     let mut applied = false;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
     for part in body.parts.drain(..) {
-        let cut = exact
-            .as_ref()
-            .and_then(|t| crate::mock_kernel::difference(&part, t))
-            .or_else(|| {
-                robust
-                    .as_ref()
-                    .and_then(|t| crate::mock_kernel::difference(&part, t))
-            });
+        // Try each cutter (best geometry first); take the first difference the
+        // solver returns that still keeps the body's bulk.
+        let cut = cutters.iter().find_map(|tool| {
+            crate::mock_kernel::difference(&part, tool)
+                .filter(|d| edge_mod_keeps_body(&part, d))
+        });
+        // A fillet/chamfer must never delete the body: `a − cutter` is a subset
+        // of `a`, but truck can hand back a degenerate solid whose bounds
+        // collapse — `edge_mod_keeps_body` (applied in the `find_map` above)
+        // rejects anything that lost most of the part's box, so any `cut` here
+        // is a sound result.
         match cut {
-            // A fillet/chamfer must never delete the body: `a − cutter` is a
-            // subset of `a`, but truck can hand back a degenerate solid whose
-            // bounds collapse. Reject anything that lost most of the part's box.
-            Some(d) if edge_mod_keeps_body(&part, &d) => {
+            Some(d) => {
                 applied = true;
                 next.push(d);
             }
-            _ => next.push(part),
+            None => next.push(part),
         }
     }
     body.parts = next;
@@ -1426,6 +1510,26 @@ mod extrude_mode_tests {
     }
 
     #[test]
+    fn fillet_round_is_a_single_brep_face() {
+        // The analytic-arc cutter must turn the round into ONE cylindrical B-rep
+        // face — not the ~24 flat facets of the faceted fallback. Rounding one
+        // edge of a 6-faced box leaves the 6 box faces (two trimmed) plus the one
+        // fillet face: a handful, nowhere near 6 + 24. This guards against a
+        // change silently regressing the fillet to the faceted path.
+        let g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+        let (bodies, _) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        let mesh = &bodies[0].1;
+        let distinct: std::collections::HashSet<u32> = mesh.face_ids.iter().copied().collect();
+        assert!(
+            distinct.len() <= 12,
+            "fillet should be one cylindrical face (got {} B-rep faces — faceted fallback?)",
+            distinct.len()
+        );
+    }
+
+    #[test]
     fn fillet_rounds_a_box_edge() {
         let g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
         let (bodies, warnings) = g
@@ -1507,6 +1611,101 @@ mod extrude_mode_tests {
         assert!(
             mesh.edge_indices.len() / 2 >= 8,
             "real box edges must still be drawn after crease filtering"
+        );
+    }
+
+    #[test]
+    fn fillet_tangent_boundary_edges_are_drawn() {
+        // The round meets each neighbour face along a tangent line — the visible
+        // top/bottom edge of the fillet. Those must be drawn (a fillet without them
+        // looks like a smeared blob), even though the surfaces are tangent there.
+        // On the y=0,z=0 edge of the 10-box the tangent lines run along +X: one on
+        // the front face (z≈0, at some y inside the round) and one on the bottom
+        // (y≈0, at some z inside the round). truck splits each into many short
+        // collinear segments, so we sum their +X extent rather than expect one span.
+        let g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+        let (bodies, _) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        let mesh = &bodies[0].1;
+
+        let nedges = mesh.edge_indices.len() / 2;
+        // Total +X length of tangent-line segments lying on a flat face (`on0`≈0)
+        // at an interior offset (`off` strictly inside the round, 0.3..2.5) on the
+        // other axis. `pick` selects (front: z≈0,y=off) or (bottom: y≈0,z=off).
+        let tangent_len = |front: bool| -> f32 {
+            (0..nedges)
+                .filter_map(|e| {
+                    let ia = mesh.edge_indices[e * 2] as usize * 3;
+                    let ib = mesh.edge_indices[e * 2 + 1] as usize * 3;
+                    let g = |i: usize| {
+                        [
+                            mesh.edge_vertices[i],
+                            mesh.edge_vertices[i + 1],
+                            mesh.edge_vertices[i + 2],
+                        ]
+                    };
+                    let (a, b) = (g(ia), g(ib));
+                    let along_x = (b[1] - a[1]).abs() < 0.05 && (b[2] - a[2]).abs() < 0.05;
+                    let (on0, off) = if front { (a[2], a[1]) } else { (a[1], a[2]) };
+                    let on_face = on0.abs() < 0.05 && (0.3..2.5).contains(&off);
+                    (along_x && on_face).then(|| (b[0] - a[0]).abs())
+                })
+                .sum()
+        };
+        // The round is ~10 long; require most of the tangent line to be present.
+        assert!(
+            tangent_len(true) > 5.0,
+            "the fillet's tangent edge on the front (z=0) face must be drawn (got {})",
+            tangent_len(true)
+        );
+        assert!(
+            tangent_len(false) > 5.0,
+            "the fillet's tangent edge on the bottom (y=0) face must be drawn (got {})",
+            tangent_len(false)
+        );
+    }
+
+    #[test]
+    fn fillet_keeps_adjacent_faces_flat() {
+        // A fillet is tangent to its neighbour faces, so the round's first facet
+        // sits just a few degrees off them. Plain crease-angle smoothing used to
+        // drag those flat faces' edge normals toward the round, making the flat
+        // faces render as a slope. The face-aware smoothing must anchor the flat
+        // faces so a flat normal survives right up to the tangent line.
+        let g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+        let (bodies, _) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        let mesh = &bodies[0].1;
+
+        // The two faces adjacent to the rounded y=0,z=0 edge are z=0 (normal
+        // (0,0,-1)) and y=0 (normal (0,-1,0)); each meets the round at a tangent
+        // line ~`dist`=2 in from the old edge. At that tangent line the flat face
+        // must still carry its exact axis-aligned normal — no tilt toward the
+        // round. (Interior flat-face vertices were never co-located with the round
+        // and so were never affected; the tangent line is where the bleed showed.)
+        let on_z0_tangent = mesh.vertices.chunks(6).any(|v| {
+            v[2].abs() < 0.02
+                && (1.0..3.0).contains(&v[1])
+                && v[3].abs() < 1.0e-3
+                && v[4].abs() < 1.0e-3
+                && v[5] < -0.999
+        });
+        assert!(
+            on_z0_tangent,
+            "the z=0 flat face must stay flat (normal (0,0,-1)) at the fillet tangent line"
+        );
+        let on_y0_tangent = mesh.vertices.chunks(6).any(|v| {
+            v[1].abs() < 0.02
+                && (1.0..3.0).contains(&v[2])
+                && v[3].abs() < 1.0e-3
+                && v[5].abs() < 1.0e-3
+                && v[4] < -0.999
+        });
+        assert!(
+            on_y0_tangent,
+            "the y=0 flat face must stay flat (normal (0,-1,0)) at the fillet tangent line"
         );
     }
 

@@ -11,6 +11,12 @@ use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, MockMesh};
 
 use crate::ZeroCadApp;
 
+/// How long a fillet size must hold steady before its slow analytic-arc geometry
+/// is precomputed on a worker thread (see [`ZeroCadApp::tick_speculative_edge_mod`]).
+/// Short enough to be ready by the time the user reaches for OK, long enough that
+/// a fast drag through many sizes doesn't spawn a job per step.
+const EDGE_MOD_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// A live, uncommitted 3D edge fillet/chamfer. Holds the captured edge geometry
 /// and the editable size; the viewport shows the resulting body in real time.
 #[derive(Debug, Clone)]
@@ -64,8 +70,146 @@ impl ZeroCadApp {
             dist_text: text,
             focus_request: true,
         });
+        // Start each edit with a clean speculative-arc slate so a stale precompute
+        // from a previous fillet can't be mistaken for this one.
+        self.clear_edge_mod_speculation();
         self.status_msg =
             "Set the size, then Enter / OK to apply (Esc cancels).".to_string();
+    }
+
+    /// Reset all speculative arc-fillet precompute state (cache, in-flight job,
+    /// debounce). Any worker thread still running harmlessly sends into a dropped
+    /// channel. Called when an edit begins, commits, or is cancelled.
+    pub(crate) fn clear_edge_mod_speculation(&mut self) {
+        self.edge_mod_arc_cache = None;
+        self.edge_mod_arc_inflight = None;
+        self.edge_mod_arc_rx = None;
+        self.edge_mod_settle = None;
+    }
+
+    /// Hash of everything that determines a fillet's committed arc geometry — the
+    /// size (quantized to 0.01mm, finer than the faceted preview's 0.05mm so the
+    /// precompute matches the exact committed size), kind, target body, edge, and
+    /// the hidden set. [`commit_edge_mod`](Self::commit_edge_mod) recomputes this
+    /// to decide whether the speculative result applies, and
+    /// [`tick_speculative_edge_mod`](Self::tick_speculative_edge_mod) uses it both
+    /// to debounce and to tag the job.
+    fn edge_mod_arc_key(op: &EdgeModOp, hidden_len: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ((op.dist.max(0.2) / 0.01).round() as i64).hash(&mut h);
+        (op.kind as u8).hash(&mut h);
+        op.target.hash(&mut h);
+        for c in op.edge.p0.iter().chain(op.edge.p1.iter()) {
+            ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+        }
+        hidden_len.hash(&mut h);
+        h.finish()
+    }
+
+    /// Build the graph the speculative precompute evaluates: the current model
+    /// plus the live fillet as a real `EdgeMod` node, using the same `dist.max(0.2)`
+    /// the commit will. Evaluated **non-draft** (arc cutter) on a worker thread, it
+    /// yields exactly the bodies a commit at this size would — the round becomes one
+    /// cylindrical B-rep face. Bodies key by `target`, not the node id, so this
+    /// matches the committed result despite the throwaway node name.
+    fn build_edge_mod_arc_graph(&self) -> Option<zerocad_core::ParametricGraph> {
+        let op = self.edge_mod_op.as_ref()?;
+        let mut graph = self.graph.clone();
+        let id = format!("edgemod_spec_{}", self.id_counter);
+        graph.add_feature(FeatureNode {
+            id: id.clone(),
+            name: "Spec Edge Mod".to_string(),
+            feature: FeatureType::EdgeMod {
+                target: op.target.clone(),
+                edge: op.edge.clone(),
+                dist: op.dist.max(0.2),
+                dist_expr: None,
+                kind: op.kind,
+            },
+        });
+        graph.add_dependency(&op.target, &id);
+        Some(graph)
+    }
+
+    /// Drive the speculative arc-fillet precompute. Called once per frame. While a
+    /// fillet is being edited, the moment its size has held steady for
+    /// [`EDGE_MOD_SETTLE`] this spawns the slow analytic-arc evaluation for that
+    /// size on a worker thread and caches the result, so committing at that size
+    /// applies the smooth one-face geometry instantly instead of showing the
+    /// faceted draft and swapping the arc in ~1s later. At most one job runs at a
+    /// time; chamfers (already one planar face) and the no-edit case do nothing.
+    pub(crate) fn tick_speculative_edge_mod(&mut self, ctx: &egui::Context) {
+        // Drain a finished job into the cache first.
+        if let Some(rx) = self.edge_mod_arc_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((key, result)) => {
+                    self.edge_mod_arc_rx = None;
+                    self.edge_mod_arc_inflight = None;
+                    if let Ok((bodies, warnings)) = result {
+                        self.edge_mod_arc_cache = Some((key, bodies, warnings));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.edge_mod_arc_rx = None;
+                    self.edge_mod_arc_inflight = None;
+                }
+            }
+        }
+
+        let Some(op) = self.edge_mod_op.as_ref() else {
+            return;
+        };
+        // A chamfer's bevel is a single planar face in draft already — nothing
+        // slower to precompute.
+        if !matches!(op.kind, CornerKind::Fillet) {
+            return;
+        }
+        let key = Self::edge_mod_arc_key(op, self.hidden_nodes.len());
+
+        // Already computed (or computing) the arc for this exact size.
+        if matches!(&self.edge_mod_arc_cache, Some((k, _, _)) if *k == key) {
+            return;
+        }
+        if self.edge_mod_arc_inflight == Some(key) {
+            return;
+        }
+
+        // Debounce: wait until this size has been stable for EDGE_MOD_SETTLE before
+        // spending a ~1s solve on it.
+        let settled_at = match self.edge_mod_settle {
+            Some((k, t)) if k == key => t,
+            _ => {
+                self.edge_mod_settle = Some((key, std::time::Instant::now()));
+                ctx.request_repaint_after(EDGE_MOD_SETTLE);
+                return;
+            }
+        };
+        let waited = settled_at.elapsed();
+        if waited < EDGE_MOD_SETTLE {
+            ctx.request_repaint_after(EDGE_MOD_SETTLE - waited);
+            return;
+        }
+        // Only one speculative job at a time; if one's busy on an older size, let
+        // it finish — the next tick will spawn this size once the slot frees.
+        if self.edge_mod_arc_inflight.is_some() {
+            return;
+        }
+
+        let Some(graph) = self.build_edge_mod_arc_graph() else {
+            return;
+        };
+        let hidden = self.hidden_nodes.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.edge_mod_arc_rx = Some(rx);
+        self.edge_mod_arc_inflight = Some(key);
+        std::thread::spawn(move || {
+            let result = graph.evaluate_bodies_with_warnings(&hidden);
+            let _ = tx.send((key, result));
+            ctx.request_repaint();
+        });
     }
 
     /// Evaluate the model as if the live edge mod had been committed, so the
@@ -88,7 +232,11 @@ impl ZeroCadApp {
             },
         });
         graph.add_dependency(&op.target, &id);
-        graph.evaluate_bodies(&self.hidden_nodes).ok()
+        // Draft eval: the live drag re-solves every frame, so every fillet in the
+        // model uses the fast faceted cutter, not the ~50× slower analytic-arc
+        // one. The smooth single-face round lands when the edit is committed and
+        // the model rebuilds via the non-draft path.
+        graph.evaluate_bodies_draft(&self.hidden_nodes).ok()
     }
 
     /// Memoized [`preview_edge_mod_bodies`]. egui repaints continuously while the
@@ -103,6 +251,16 @@ impl ZeroCadApp {
             self.edge_mod_preview_cache = None;
             return None;
         };
+        // Prefer the speculative smooth arc result if it's ready for this exact
+        // size: showing the final one-face round *in the preview* means committing
+        // changes nothing on screen — the round refines gently while the user is
+        // still adjusting, instead of the body popping faceted→arc after commit.
+        let arc_key = Self::edge_mod_arc_key(op, self.hidden_nodes.len());
+        if let Some((k, bodies, _)) = self.edge_mod_arc_cache.as_ref() {
+            if *k == arc_key {
+                return Some(bodies.clone());
+            }
+        }
         let key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             // Quantize size to 0.05mm: idle frames and slow drags reuse the cache,
@@ -135,6 +293,8 @@ impl ZeroCadApp {
         let Some(op) = self.edge_mod_op.take() else {
             return;
         };
+        // Key the speculative precompute before `op`'s fields are moved below.
+        let arc_key = Self::edge_mod_arc_key(&op, self.hidden_nodes.len());
         self.push_undo();
         let dist_expr = if zerocad_core::expr::references_variable(&op.dist_text) {
             Some(op.dist_text.trim().to_string())
@@ -159,7 +319,24 @@ impl ZeroCadApp {
         self.edge_mod_dist_text = op.dist_text;
         self.selected_body.clear();
         self.selected_edges.clear();
-        self.reevaluate_geometry();
+        // If the smooth one-face arc geometry for this exact size was already
+        // computed while the user was adjusting it, apply it instantly — no
+        // faceted-then-arc "pop" a second later. Otherwise fall back to the normal
+        // path (instant faceted draft + background arc refine).
+        let precomputed = match self.edge_mod_arc_cache.take() {
+            Some((k, bodies, warnings)) if k == arc_key => Some((bodies, warnings)),
+            _ => None,
+        };
+        if let Some((bodies, warnings)) = precomputed {
+            // Supersede any in-flight refine so its late result can't clobber this.
+            self.eval_gen += 1;
+            self.eval_rx = None;
+            self.eval_pending = false;
+            self.apply_eval_result(bodies, warnings);
+        } else {
+            self.reevaluate_geometry();
+        }
+        self.clear_edge_mod_speculation();
         let noun = match op.kind {
             CornerKind::Fillet => "Fillet",
             CornerKind::Chamfer => "Chamfer",
@@ -176,6 +353,7 @@ impl ZeroCadApp {
         if self.edge_mod_op.take().is_some() {
             self.status_msg = "Fillet/Chamfer cancelled.".to_string();
         }
+        self.clear_edge_mod_speculation();
     }
 
     /// The Fusion-style floating size box for the live edge mod: an editable

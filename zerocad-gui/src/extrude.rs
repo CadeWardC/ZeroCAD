@@ -118,7 +118,10 @@ impl ZeroCadApp {
             graph.add_dependency(&target.sketch_id, &extrude_id);
         }
 
-        graph.evaluate_bodies(&self.hidden_nodes).ok()
+        // Draft eval: this re-solves the whole model every preview frame, so any
+        // already-committed fillet uses its fast faceted cutter rather than the
+        // ~50× slower analytic-arc one (which would freeze the extrude preview).
+        graph.evaluate_bodies_draft(&self.hidden_nodes).ok()
     }
 
     /// Memoized [`preview_extrude_bodies`]. The underlying call clones the whole

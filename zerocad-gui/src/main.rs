@@ -293,6 +293,13 @@ struct SaveDialogState {
     save_dir: PathBuf,
 }
 
+/// Result delivered by a background refine evaluation: its generation tag (to
+/// discard superseded jobs) and the evaluated bodies + warnings (or an error).
+type EvalResult = (
+    u64,
+    Result<(Vec<(String, MockMesh)>, Vec<String>), String>,
+);
+
 struct ZeroCadApp {
     graph: ParametricGraph,
     selected_node_id: Option<String>,
@@ -303,6 +310,19 @@ struct ZeroCadApp {
     /// only when the meshes change so the status bar doesn't re-sum every
     /// vertex/index of the whole model on every frame.
     mesh_stats: (usize, usize),
+    /// Background "refine" evaluation for slow arc fillets. `reevaluate_geometry`
+    /// shows the fast faceted draft instantly, then — when the model has a fillet
+    /// — spawns the arc-cutter evaluation on a worker thread and swaps the result
+    /// in here, so committing a fillet never stalls the UI (the arc boolean is
+    /// ~1s; see `ParametricGraph::has_arc_fillet`). Stale jobs are ignored by
+    /// generation.
+    eval_gen: u64,
+    eval_rx: Option<std::sync::mpsc::Receiver<EvalResult>>,
+    /// True while a background refine is in flight (drives a "Refining…" hint).
+    eval_pending: bool,
+    /// A clone of the egui context, captured each frame, so a worker thread can
+    /// wake the UI (`request_repaint`) the instant its result is ready.
+    egui_ctx: Option<egui::Context>,
     error_msg: Option<String>,
     status_msg: String,
     /// Creation timestamp (Unix seconds) of the document currently open, carried
@@ -411,6 +431,23 @@ struct ZeroCadApp {
     /// repaint while the size box is open or the handle is dragged. Recomputed only
     /// when the size/kind/target actually change. Cleared when the op ends.
     edge_mod_preview_cache: Option<(u64, Vec<(String, MockMesh)>)>,
+    /// **Speculative** arc-fillet precompute for the live edge mod. While the user
+    /// is still adjusting a fillet, the moment its size settles (stops changing for
+    /// `EDGE_MOD_SETTLE`) the slow analytic-arc geometry for that size is computed
+    /// on a worker thread and cached here, keyed by the same hash `commit_edge_mod`
+    /// recomputes. If the user then commits at that size, the one-face result is
+    /// already done and is applied instantly — no faceted→arc "pop" a second later.
+    /// Holds `(key, bodies, warnings)`; cleared when the op ends.
+    edge_mod_arc_cache: Option<(u64, Vec<(String, MockMesh)>, Vec<String>)>,
+    /// In-flight speculative arc job: its key (so a finished result can be matched
+    /// to the size it was computed for) and the channel it reports on. At most one
+    /// runs at a time — while it's busy, size changes don't spawn more.
+    edge_mod_arc_inflight: Option<u64>,
+    edge_mod_arc_rx: Option<std::sync::mpsc::Receiver<(u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>)>>,
+    /// Debounce tracker for the speculative precompute: the current size key and
+    /// when it was first observed. The arc job is spawned only once a key has been
+    /// stable for `EDGE_MOD_SETTLE`, so a fast drag doesn't kick off a job per step.
+    edge_mod_settle: Option<(u64, std::time::Instant)>,
     /// True while the user is actively push/pull dragging the extrude depth in
     /// the viewport. During the drag we render only the cheap ghost tool volume
     /// (`cached_preview_mesh`) following the cursor live, and SKIP the expensive
@@ -521,6 +558,10 @@ impl ZeroCadApp {
             selected_node_id: None,
             body_meshes: Vec::new(),
             mesh_stats: (0, 0),
+            eval_gen: 0,
+            eval_rx: None,
+            eval_pending: false,
+            egui_ctx: None,
             error_msg: None,
             status_msg: "Welcome to ZeroCAD. Ready for modeling.".to_string(),
             doc_created_unix: None,
@@ -567,6 +608,10 @@ impl ZeroCadApp {
             extrude_preview_cache: None,
             extrude_preview_mesh_cache: None,
             edge_mod_preview_cache: None,
+            edge_mod_arc_cache: None,
+            edge_mod_arc_inflight: None,
+            edge_mod_arc_rx: None,
+            edge_mod_settle: None,
             extrude_depth_dragging: false,
             extrude_dim_pos: None,
             edge_mod_op: None,
@@ -1922,6 +1967,13 @@ impl ZeroCadApp {
             None => return,
         };
 
+        // If an arc-fillet refine is still in flight, finish it synchronously so
+        // the embedded thumbnail and mesh cache persist the final geometry, not
+        // the faceted draft.
+        if self.eval_pending {
+            self.reevaluate_geometry_blocking();
+        }
+
         let ext = state.save_format.extension();
         let file_name = format!("{}.{ext}", state.project_title);
         let path = state.save_dir.join(&file_name);
@@ -2513,6 +2565,10 @@ impl ZeroCadApp {
             self.status_msg = "Nothing to export — the model has no solid bodies.".to_string();
             return;
         }
+        // Export the final arc geometry, not a faceted draft mid-refine.
+        if self.eval_pending {
+            self.reevaluate_geometry_blocking();
+        }
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export STL")
             .add_filter("STL mesh", &["stl"])
@@ -2625,25 +2681,113 @@ impl ZeroCadApp {
         }
     }
 
+    /// Rebuild the model. The **fast faceted draft** is computed synchronously and
+    /// shown immediately, so committing a fillet (or any edit) never stalls the
+    /// UI. If the model has a 3D fillet — whose true arc geometry needs the ~1s
+    /// boolean — the arc result is computed on a **background thread** and swapped
+    /// in when ready (see [`reevaluate_geometry_blocking`] for the rare callers
+    /// that must have the final geometry before continuing).
     fn reevaluate_geometry(&mut self) {
-        match self.graph.evaluate_bodies_with_warnings(&self.hidden_nodes) {
-            Ok((bodies, warnings)) => {
-                self.body_meshes = bodies;
-                self.mesh_stats = Self::mesh_totals(&self.body_meshes);
-                if warnings.is_empty() {
-                    self.error_msg = None;
-                    self.status_msg = "Model evaluated successfully.".to_string();
-                } else {
-                    // Non-fatal: the model evaluated, but a boolean didn't do
-                    // what the user asked. Surface it instead of letting the
-                    // geometry come out wrong silently.
-                    self.status_msg = format!(
-                        "Model evaluated with {} warning(s).",
-                        warnings.len()
-                    );
-                    self.error_msg = Some(warnings.join("\n"));
+        // Instant draft: faceted fillets + the (fast, planar) cut/join booleans.
+        match self.graph.evaluate_bodies_with_warnings_draft(&self.hidden_nodes) {
+            Ok((bodies, warnings)) => self.apply_eval_result(bodies, warnings),
+            Err(err) => {
+                self.error_msg = Some(err);
+                self.status_msg = "Error: Model evaluation failed.".to_string();
+                return;
+            }
+        }
+        // Refine to the smooth single-face arc fillet off the UI thread. Skipped
+        // when there's no fillet, since then the draft already *is* the final.
+        if self.graph.has_arc_fillet(&self.hidden_nodes) {
+            self.spawn_refine_eval();
+            self.status_msg = "Smoothing fillet…".to_string();
+        } else {
+            self.eval_pending = false;
+            self.eval_rx = None;
+        }
+    }
+
+    /// Apply an evaluation result to the displayed model + status line.
+    fn apply_eval_result(&mut self, bodies: Vec<(String, MockMesh)>, warnings: Vec<String>) {
+        self.body_meshes = bodies;
+        self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+        if warnings.is_empty() {
+            self.error_msg = None;
+            self.status_msg = "Model evaluated successfully.".to_string();
+        } else {
+            // Non-fatal: the model evaluated, but a boolean didn't do what the
+            // user asked. Surface it instead of letting the geometry come out
+            // wrong silently.
+            self.status_msg = format!("Model evaluated with {} warning(s).", warnings.len());
+            self.error_msg = Some(warnings.join("\n"));
+        }
+    }
+
+    /// Spawn the background arc-fillet evaluation. Tagged with a generation so a
+    /// later edit's job supersedes this one (stale results are dropped on
+    /// arrival). The worker wakes the UI via `request_repaint` the moment it's
+    /// done so the refined geometry appears without waiting for the next input.
+    fn spawn_refine_eval(&mut self) {
+        self.eval_gen += 1;
+        let gen = self.eval_gen;
+        let graph = self.graph.clone();
+        let hidden = self.hidden_nodes.clone();
+        let ctx = self.egui_ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.eval_rx = Some(rx);
+        self.eval_pending = true;
+        std::thread::spawn(move || {
+            let result = graph.evaluate_bodies_with_warnings(&hidden);
+            let _ = tx.send((gen, result));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Poll the background refine channel; apply the result if it's the current
+    /// generation. Called once per frame.
+    fn poll_refine_eval(&mut self) {
+        let Some(rx) = self.eval_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((gen, result)) => {
+                self.eval_rx = None;
+                self.eval_pending = false;
+                // Drop a superseded job's result; a newer one is (or will be) in
+                // flight and owns the display.
+                if gen != self.eval_gen {
+                    return;
+                }
+                match result {
+                    Ok((bodies, warnings)) => self.apply_eval_result(bodies, warnings),
+                    // A failed refine leaves the faceted draft on screen — still a
+                    // valid model — rather than blanking it.
+                    Err(err) => log::warn!("Background refine failed: {err}"),
                 }
             }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.eval_rx = None;
+                self.eval_pending = false;
+            }
+        }
+    }
+
+    /// Synchronous rebuild that waits for the **final** arc geometry. Use only
+    /// where the result must be current before the next line runs (export, save
+    /// thumbnail); interactive edits use [`reevaluate_geometry`] so they don't
+    /// stall.
+    fn reevaluate_geometry_blocking(&mut self) {
+        // A pending background job is now obsolete — bump the generation so its
+        // late result is discarded in favour of this authoritative one.
+        self.eval_gen += 1;
+        self.eval_rx = None;
+        self.eval_pending = false;
+        match self.graph.evaluate_bodies_with_warnings(&self.hidden_nodes) {
+            Ok((bodies, warnings)) => self.apply_eval_result(bodies, warnings),
             Err(err) => {
                 self.error_msg = Some(err);
                 self.status_msg = "Error: Model evaluation failed.".to_string();
@@ -2654,6 +2798,16 @@ impl ZeroCadApp {
 
 impl eframe::App for ZeroCadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keep a context handle so a background refine worker can wake the UI.
+        if self.egui_ctx.is_none() {
+            self.egui_ctx = Some(ctx.clone());
+        }
+        // Swap in any finished background arc-fillet refine.
+        self.poll_refine_eval();
+        // Speculatively precompute the smooth arc geometry for a settling fillet so
+        // committing it is instant rather than popping in ~1s later.
+        self.tick_speculative_edge_mod(ctx);
+
         // While the Welcome modal is up the workspace is inert, so its hotkeys
         // are suppressed (the modal reads Esc itself).
         if !self.onboarding_visible {

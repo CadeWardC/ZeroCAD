@@ -439,6 +439,142 @@ pub fn edge_corner_cutter(
     extruded_region_solid(&loop_pts, &[], len + 2.0 * end_overshoot, &cs)
 }
 
+/// Build the fillet cutter with a **true circular arc** instead of the faceted
+/// chord polygon [`edge_corner_cutter`] uses. The cross-section is the corner
+/// sliver `corner → T1 → (arc) → T2`, where the `T1→T2` arc is one
+/// `circle_arc` edge; swept the length of the edge it yields **one analytic
+/// cylindrical face** for the round, **one arc edge** where it meets each end
+/// face, and leaves the neighbour faces genuinely flat and tangent.
+///
+/// This is the geometrically-correct fillet, but truck's boolean solver is
+/// fragile on cylindrical cutters (it can reject or panic). Callers therefore
+/// try this cutter first and fall back to the faceted [`edge_corner_cutter`] if
+/// the boolean can't take it — so the worst case is the old faceted result, never
+/// a missing fillet.
+///
+/// `grow` lifts the section's tangent points radially off the body faces (a
+/// concentric scale about the arc centre, which keeps the arc a valid circle) to
+/// dodge the coplanar-face boolean failure, mirroring the faceted cutter's
+/// fallback. `end_overshoot` extends the prism past both edge ends so its caps
+/// clear the body's perpendicular faces. Returns `None` for a degenerate edge,
+/// the same cases [`edge_corner_cutter`] rejects.
+pub fn edge_fillet_cutter_arc(
+    p0: [f32; 3],
+    p1: [f32; 3],
+    n1: [f32; 3],
+    n2: [f32; 3],
+    dist: f32,
+    grow: f32,
+    end_overshoot: f32,
+) -> Option<KernelSolid> {
+    use crate::geometry::Vec3;
+
+    if dist <= 1.0e-4 {
+        return None;
+    }
+    let p0 = Vec3::new(p0[0], p0[1], p0[2]);
+    let p1 = Vec3::new(p1[0], p1[1], p1[2]);
+    let n1 = Vec3::new(n1[0], n1[1], n1[2]).normalize();
+    let n2 = Vec3::new(n2[0], n2[1], n2[2]).normalize();
+
+    let edge = p1.sub(p0);
+    let len = edge.length();
+    if len < 1.0e-4 {
+        return None;
+    }
+    let t = edge.mul(1.0 / len);
+
+    if n1.cross(n2).length() < 1.0e-3 {
+        return None;
+    }
+
+    // Into-body directions along each face (see `edge_corner_cutter`). Both are
+    // ⊥ the edge, so the corner/T1/T2/arc all lie in one cross-section plane.
+    let f1 = n2.mul(-1.0).sub(n1.mul(n2.mul(-1.0).dot(n1))).normalize();
+    let f2 = n1.mul(-1.0).sub(n2.mul(n1.mul(-1.0).dot(n2))).normalize();
+    if f1.length() < 0.5 || f2.length() < 0.5 {
+        return None;
+    }
+
+    let u_axis = n1.sub(t.mul(n1.dot(t))).normalize();
+    let v_axis = t.cross(u_axis).normalize();
+    let proj = |pt: Vec3| -> (f32, f32) {
+        let d = pt.sub(p0);
+        (d.dot(u_axis), d.dot(v_axis))
+    };
+
+    let t1 = p0.add(f1.mul(dist)); // tangent point on face 1
+    let t2 = p0.add(f2.mul(dist)); // tangent point on face 2
+    // Arc centre sits one `dist` off each face (exact for a right-angle corner);
+    // the round is the circle through T1/T2 about it, bulging toward the corner.
+    let center = p0.add(f1.mul(dist)).add(f2.mul(dist));
+    let r = t1.sub(center).length();
+    if r < 1.0e-4 {
+        return None;
+    }
+    // Transit point: the arc's apex toward the corner (the circle point in the
+    // corner's direction from the centre). `circle_arc` sweeps T1→T2 through it,
+    // so this picks the short arc that hugs the corner.
+    let to_corner = p0.sub(center);
+    if to_corner.length() < 1.0e-4 {
+        return None;
+    }
+    let transit = center.add(to_corner.normalize().mul(r));
+
+    // Robust fallback: concentric scale about the centre lifts T1/T2 (and the
+    // transit) radially outward — off the body faces (T1−centre = +n1·dist, an
+    // outward face normal) — so the legs aren't coplanar with the body and the
+    // boolean cuts through transversally. A concentric scale keeps the arc a
+    // valid circle (radius r→r+grow), unlike an off-centre offset.
+    let (corner_p, t1_p, t2_p, transit_p) = if grow > 1.0e-6 {
+        let s = (r + grow) / r;
+        let scale = |pt: Vec3| center.add(pt.sub(center).mul(s));
+        (scale(p0), scale(t1), scale(t2), scale(transit))
+    } else {
+        (p0, t1, t2, transit)
+    };
+
+    // Wind CCW as seen from +t so `tsweep` along +t yields an outward solid the
+    // boolean accepts (matches `build_cylinder_solid`'s convention).
+    let (a0, a1, a2) = (proj(corner_p), proj(t1_p), proj(t2_p));
+    let area = (a0.0 * a1.1 - a1.0 * a0.1)
+        + (a1.0 * a2.1 - a2.0 * a1.1)
+        + (a2.0 * a0.1 - a0.0 * a2.1);
+    let ccw = area >= 0.0;
+
+    // Start the cross-section one overshoot behind p0; sweep the full edge plus
+    // both overshoots along +t.
+    let back = t.mul(-end_overshoot);
+    let pt3 = |p: Vec3| Point3::new(p.x as f64, p.y as f64, p.z as f64);
+    let v_corner = builder::vertex(pt3(corner_p.add(back)));
+    let v_t1 = builder::vertex(pt3(t1_p.add(back)));
+    let v_t2 = builder::vertex(pt3(t2_p.add(back)));
+    let transit3 = pt3(transit_p.add(back));
+
+    // CCW order is corner → T1 → (arc) → T2 → corner; reverse to corner → T2 →
+    // (arc) → T1 → corner when the projected winding came out CW.
+    let wire: Wire = if ccw {
+        vec![
+            builder::line(&v_corner, &v_t1),
+            builder::circle_arc(&v_t1, &v_t2, transit3),
+            builder::line(&v_t2, &v_corner),
+        ]
+    } else {
+        vec![
+            builder::line(&v_corner, &v_t2),
+            builder::circle_arc(&v_t2, &v_t1, transit3),
+            builder::line(&v_t1, &v_corner),
+        ]
+    }
+    .into_iter()
+    .collect();
+
+    let face = builder::try_attach_plane(&[wire]).ok()?;
+    let depth = (len + 2.0 * end_overshoot) as f64;
+    let sweep = Vector3::new(t.x as f64 * depth, t.y as f64 * depth, t.z as f64 * depth);
+    Some(builder::tsweep(&face, sweep))
+}
+
 /// Offset a simple **CCW** polygon outward by `grow`, the robust way: slide every
 /// edge out along its outward normal, then place each new vertex at the
 /// intersection of the two consecutive offset edges. Unlike a radial scale about
@@ -760,14 +896,18 @@ fn solid_to_flat_mesh(solid: &truck_modeling::Solid) -> (Vec<f32>, Vec<u32>, Vec
     // oriented, so one centroid test decides the sign for the whole mesh.
     enforce_outward_normals(&mut vertices, &indices);
 
-    // Smooth the normals across shallow creases so a faceted curved surface — a
-    // fillet, or a boolean'd / many-sided extruded cylinder wall — shades as ONE
-    // smooth face. Sharp features (90° box corners, 45° chamfers) meet past the
-    // crease angle and keep distinct normals, so they stay crisp. Pristine flat
-    // faces are unaffected (their normals already agree). Pairs with the
-    // renderer's Gouraud (per-vertex) shading and `mesh_feature_edges`' matching
-    // crease filter, which hides the facet-boundary lines.
-    smooth_vertex_normals(&mut vertices, SHADE_CREASE_COS);
+    // Smooth the normals across shallow creases so a curved surface — an
+    // analytic fillet cylinder, or a boolean'd / many-sided extruded cylinder
+    // wall — shades as ONE smooth face. Sharp features (90° box corners, 45°
+    // chamfers) meet past the crease angle and keep distinct normals, so they
+    // stay crisp. Crucially this is *face-aware*: a genuinely flat B-rep face is
+    // anchored, so its normal survives unbent right up to a tangent fillet line
+    // (a fillet is tangent to its neighbours, so plain crease smoothing would
+    // otherwise drag the flat face's edge normals into the round and shade the
+    // flat face as a slope). Pairs with the renderer's Gouraud (per-vertex)
+    // shading and `mesh_feature_edges`' matching crease filter, which hides the
+    // facet-boundary lines.
+    smooth_vertex_normals(&mut vertices, &indices, &face_ids, SHADE_CREASE_COS);
 
     (vertices, indices, face_ids)
 }
@@ -777,14 +917,29 @@ fn solid_to_flat_mesh(solid: &truck_modeling::Solid) -> (Vec<f32>, Vec<u32>, Vec
 /// 90°) the crease is a real edge and the faces keep independent normals.
 const SHADE_CREASE_COS: f32 = 0.866;
 
-/// Replace each vertex normal with the average of the normals of all vertices
-/// sharing its position whose normal lies within the crease angle (`crease_cos`).
-/// This is per-vertex normal smoothing with a crease threshold: a fillet's facet
-/// normals (a few degrees apart) blend into a smooth gradient, while a sharp edge
-/// — whose two faces' normals diverge past the threshold — keeps each face's own
-/// normal, so it still reads as an edge. Operates on the interleaved
-/// `[x,y,z,nx,ny,nz]` buffer in place.
-fn smooth_vertex_normals(vertices: &mut [f32], crease_cos: f32) {
+/// Replace each *curved-face* vertex normal with the average of the normals of
+/// all vertices sharing its position whose normal lies within the crease angle
+/// (`crease_cos`). This is per-vertex normal smoothing with a crease threshold:
+/// a fillet cylinder's tessellation normals (a few degrees apart) blend into a
+/// smooth gradient, while a sharp edge — whose two faces' normals diverge past
+/// the threshold — keeps each face's own normal, so it still reads as an edge.
+///
+/// It is **face-aware**: a genuinely flat B-rep face (all its triangles share
+/// one normal) is *anchored* — its vertices keep their exact face normal even
+/// where they sit on a tangent fillet line. Without this anchor, a fillet (which
+/// is tangent to its neighbour faces) would bleed its curving normals into the
+/// flat face along that line and shade the flat face as a slope. The round's own
+/// vertices are still free to average toward the flat normal there, so the
+/// junction stays smooth from the fillet side while the flat face stays flat.
+///
+/// Operates on the interleaved `[x,y,z,nx,ny,nz]` buffer in place; `face_ids`
+/// gives the B-rep face of each triangle in `indices`.
+fn smooth_vertex_normals(
+    vertices: &mut [f32],
+    indices: &[u32],
+    face_ids: &[u32],
+    crease_cos: f32,
+) {
     let vcount = vertices.len() / 6;
     if vcount == 0 {
         return;
@@ -799,6 +954,38 @@ fn smooth_vertex_normals(vertices: &mut [f32], crease_cos: f32) {
         let b = i * 6;
         [vertices[b + 3], vertices[b + 4], vertices[b + 5]]
     };
+
+    // Map each vertex to its B-rep face (a vertex copy is only referenced by
+    // triangles of the one face that appended it — see `solid_to_flat_mesh`),
+    // then collect each face's vertices.
+    let mut vert_face: Vec<Option<u32>> = vec![None; vcount];
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        for &vi in tri {
+            vert_face[vi as usize] = Some(fid);
+        }
+    }
+    let mut face_verts: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, f) in vert_face.iter().enumerate() {
+        if let Some(f) = f {
+            face_verts.entry(*f).or_default().push(i);
+        }
+    }
+    // A face is flat when all its vertices' normals agree (within the crease
+    // angle of the face's first normal). Such faces are anchored: a flat design
+    // face stays flat; a faceted-fallback fillet's individual flat facets also
+    // anchor (so that path keeps its old per-facet look), while a true analytic
+    // fillet cylinder — whose normals genuinely vary — is left smoothable.
+    let mut flat_face: HashMap<u32, bool> = HashMap::new();
+    for (f, verts) in &face_verts {
+        let n0 = nrm(verts[0]);
+        let flat = verts.iter().all(|&i| {
+            let n = nrm(i);
+            (n0[0] * n[0] + n0[1] * n[1] + n0[2] * n[2]) >= crease_cos
+        });
+        flat_face.insert(*f, flat);
+    }
+
     let mut groups: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     for i in 0..vcount {
         groups.entry(key(i)).or_default().push(i);
@@ -807,6 +994,14 @@ fn smooth_vertex_normals(vertices: &mut [f32], crease_cos: f32) {
     for members in groups.values() {
         for &i in members {
             let ni = nrm(i);
+            // Anchor: a vertex on a flat face keeps its exact normal.
+            let anchored = vert_face[i]
+                .and_then(|f| flat_face.get(&f).copied())
+                .unwrap_or(false);
+            if anchored {
+                smoothed[i] = ni;
+                continue;
+            }
             let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);
             for &j in members {
                 let nj = nrm(j);
@@ -1293,6 +1488,28 @@ fn mesh_feature_edges(
         }
     }
 
+    // Classify each B-rep face as flat or curved by whether its triangles' stored
+    // (smoothed) normals vary. A fillet/cylinder face is curved; box and cap faces
+    // are flat. Used below so a fillet's *tangent boundary* — where its curved face
+    // meets a flat one with nearly-equal normals — is kept as a real edge (the
+    // top/bottom line of the round), while a faceted fallback's flat-facet seams
+    // (also shallow) stay suppressed.
+    let mut face_ref_n: HashMap<u32, [f32; 3]> = HashMap::new();
+    let mut face_curved: HashMap<u32, bool> = HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        let r = *face_ref_n.entry(fid).or_insert_with(|| nrm(tri[0] as usize));
+        for &v in tri {
+            let n = nrm(v as usize);
+            // ~2.5°: a flat B-rep face's vertices share one (anchored) normal, so
+            // it never trips this; a curved face's normals fan out and do.
+            const CURVE_COS: f32 = 0.999;
+            if r[0] * n[0] + r[1] * n[1] + r[2] * n[2] < CURVE_COS {
+                face_curved.insert(fid, true);
+            }
+        }
+    }
+
     let mut edge_vertices: Vec<f32> = Vec::new();
     let mut edge_indices: Vec<u32> = Vec::new();
     let mut edge_face_normals: Vec<f32> = Vec::new();
@@ -1319,7 +1536,16 @@ fn mesh_feature_edges(
             let n1 = rec.faces[1].1;
             let dot = (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).clamp(-1.0, 1.0);
             const CREASE_COS: f32 = 0.95; // cos(~18°)
-            if dot > CREASE_COS {
+            // A curved face (fillet/cylinder) meets its neighbour along a *tangent*
+            // edge whose normals nearly agree — yet it's a real design edge (the
+            // top/bottom of a fillet, a cylinder's rim), so any shallow crease that
+            // touches a curved face is kept. Only a shallow crease between two
+            // genuinely flat faces is a faceted tessellation seam to hide.
+            let touches_curved = rec
+                .faces
+                .iter()
+                .any(|(fid, _)| face_curved.get(fid).copied().unwrap_or(false));
+            if dot > CREASE_COS && !touches_curved {
                 continue;
             }
         }
