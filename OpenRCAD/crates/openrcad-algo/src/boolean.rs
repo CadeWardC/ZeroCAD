@@ -1,8 +1,9 @@
 use crate::BooleanOp;
+use core::f64::consts::TAU;
 use openrcad_foundation::{Dir, Pnt, Vec as GeomVec};
-use openrcad_geom::{Curve, GeomCurve, GeomSurface, Surface};
+use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Surface};
 use openrcad_topo::arena::EdgeId;
-use openrcad_topo::{BRepBuilder, Face, FaceId, HealthReport, Solid};
+use openrcad_topo::{BRepBuilder, Face, FaceId, HealthReport, Solid, Wire};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::bvh::Bvh;
@@ -71,6 +72,45 @@ pub fn boolean_checked(object: &Solid, tool: &Solid, op: BooleanOp) -> Result<So
     let result = catch_unwind(AssertUnwindSafe(|| boolean(object, tool, op)))
         .map_err(|_| BooleanError::Panicked)?;
     validate_output(result)
+}
+
+/// Apply `op`, then split a result that severed the body into one solid per
+/// connected component.
+///
+/// A cut that slices a body in two (or a fuse of two bodies that don't actually
+/// touch) is returned by [`boolean`] as a single shell holding several disjoint
+/// pieces — topologically valid, but really multiple bodies. This is the
+/// multi-body entry point: it returns each connected component separately via
+/// [`Solid::split_disconnected`]. For the common case where the result is one
+/// connected body, the returned vector has a single element.
+pub fn boolean_bodies(object: &Solid, tool: &Solid, op: BooleanOp) -> Vec<Solid> {
+    boolean(object, tool, op).split_disconnected()
+}
+
+/// Checked multi-body boolean: like [`boolean_checked`], but splits a severed
+/// result into separate bodies and validates **each** one. Fails if any body is
+/// unhealthy or non-watertight, so a half-formed sliver can't slip through.
+pub fn boolean_checked_bodies(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+) -> Result<Vec<Solid>, BooleanError> {
+    validate_operand(BooleanInput::Object, object)?;
+    validate_operand(BooleanInput::Tool, tool)?;
+
+    let result = catch_unwind(AssertUnwindSafe(|| boolean(object, tool, op)))
+        .map_err(|_| BooleanError::Panicked)?;
+    let bodies = result.split_disconnected();
+    for body in &bodies {
+        let report = body.health_report();
+        if !report.is_healthy() {
+            return Err(BooleanError::InvalidOutput { report });
+        }
+        if !body.is_watertight() {
+            return Err(BooleanError::NonWatertightOutput { report });
+        }
+    }
+    Ok(bodies)
 }
 
 /// Apply `op` between `object` and `tool`.
@@ -169,6 +209,18 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
             // Coplanar faces: split f_obj along f_tool's boundary edges, and
             // vice versa — restricted to each face's own descendants.
             for w_tool in f_tool.wires() {
+                // A coplanar circular cap (cylinder rim) sitting fully inside
+                // f_obj — the cylinder-boss case. Imprint the *whole* circle once
+                // so the imprint engine bores a clean hole (its closed-curve path),
+                // instead of three arcs it can't close into a hole.
+                if let Some(circle) = wire_full_circle(&w_tool, tol) {
+                    if circle_inside_face(&circle, &f_obj) {
+                        let c = GeomCurve::Circle(circle);
+                        let sub = obj_sub.get_mut(&f_obj_id).unwrap();
+                        split_tracked(&mut builder_obj, sub, &c, 0.0, TAU, &mut splitting_edges_obj, tol);
+                        continue;
+                    }
+                }
                 for e_tool in w_tool.edges() {
                     if let Some(c_tool) = e_tool.curve() {
                         let intervals = crate::intersect::trim_curve_to_face(c_tool, e_tool.first(), e_tool.last(), &f_obj, tol);
@@ -180,6 +232,14 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
                 }
             }
             for w_obj in f_obj.wires() {
+                if let Some(circle) = wire_full_circle(&w_obj, tol) {
+                    if circle_inside_face(&circle, &f_tool) {
+                        let c = GeomCurve::Circle(circle);
+                        let sub = tool_sub.get_mut(&f_tool_id).unwrap();
+                        split_tracked(&mut builder_tool, sub, &c, 0.0, TAU, &mut splitting_edges_tool, tol);
+                        continue;
+                    }
+                }
                 for e_obj in w_obj.edges() {
                     if let Some(c_obj) = e_obj.curve() {
                         let intervals = crate::intersect::trim_curve_to_face(c_obj, e_obj.first(), e_obj.last(), &f_tool, tol);
@@ -348,7 +408,12 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
 
     // 4. Sew kept faces together
     let shell = sew(&kept_faces, tol);
-    Solid::new(shell)
+    let solid = Solid::new(shell);
+
+    // 5. Merge coplanar faces split by the imprint (e.g. a union of two boxes
+    //    keeps the shared face as several coplanar strips). This is a no-op
+    //    fallback unless it produces a watertight, healthy, smaller solid.
+    crate::merge::merge_coplanar_faces(&solid)
 }
 
 fn validate_operand(input: BooleanInput, solid: &Solid) -> Result<(), BooleanError> {
@@ -668,6 +733,54 @@ fn distance_point_to_edge(p: &Pnt, edge: &openrcad_topo::Edge) -> f64 {
     }
 }
 
+/// If `wire` is a closed loop whose every edge is an arc of one common circle
+/// (a cylinder cap rim), return that full circle. Used to imprint the whole
+/// circle as a hole instead of three un-closable arcs.
+fn wire_full_circle(wire: &Wire, tol: f64) -> Option<Circle> {
+    let edges = wire.edges();
+    if edges.len() < 2 {
+        return None;
+    }
+    let mut circ: Option<Circle> = None;
+    for e in &edges {
+        match e.curve() {
+            Some(GeomCurve::Circle(c)) => match &circ {
+                Some(prev) => {
+                    if prev.center().distance(&c.center()) > tol
+                        || (prev.radius() - c.radius()).abs() > tol
+                        || !prev.axis().is_parallel(&c.axis(), 1e-6)
+                    {
+                        return None;
+                    }
+                }
+                None => circ = Some(*c),
+            },
+            _ => return None,
+        }
+    }
+    circ
+}
+
+/// Whether `circle` lies on `face`'s surface and strictly inside its trimming
+/// loops (sampled around the rim) — i.e. the cap sits fully within `face`.
+fn circle_inside_face(circle: &Circle, face: &Face) -> bool {
+    let Some(surf) = face.surface() else {
+        return false;
+    };
+    for i in 0..8 {
+        let u = TAU * (i as f64) / 8.0;
+        let p = circle.point(u);
+        let (uu, vv) = crate::intersect::search_nearest_parameter(surf, &p, (0.0, 0.0));
+        if surf.point(uu, vv).distance(&p) > 1e-6 {
+            return false;
+        }
+        if !crate::intersect::is_inside_trimming_loops(uu, vv, face) {
+            return false;
+        }
+    }
+    true
+}
+
 fn surfaces_are_coplanar(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> bool {
     match (s1, s2) {
         (GeomSurface::Plane(p1), GeomSurface::Plane(p2)) => {
@@ -691,6 +804,7 @@ mod tests {
     use super::*;
     use openrcad_foundation::Pnt;
     use openrcad_primitives::make_box;
+    use openrcad_topo::Shell;
 
     #[test]
     fn primitives_pass_structural_validation() {
@@ -842,6 +956,62 @@ mod tests {
             "expected drilling to add faces, got {}",
             result.face_count()
         );
+    }
+
+    /// Two disjoint boxes packed into one shell split back into two solids,
+    /// independent of the boolean engine. Locks in `split_disconnected`.
+    #[test]
+    fn split_disconnected_separates_two_packed_boxes() {
+        let a = make_box(&Pnt::origin(), 5.0, 5.0, 5.0);
+        let b = make_box(&Pnt::new(20.0, 0.0, 0.0), 5.0, 5.0, 5.0);
+        let mut faces = a.shell().faces();
+        faces.extend(b.shell().faces());
+        let combined = Solid::new(Shell::from_faces(faces));
+        // Combined shell: two euler-2 boxes → V−E+F = 16−24+12 = 4.
+        assert_eq!(combined.euler_characteristic(), 4);
+
+        let bodies = combined.split_disconnected();
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            assert_eq!(body.face_count(), 6);
+            assert_eq!(body.euler_characteristic(), 2);
+            assert!(body.is_watertight());
+        }
+    }
+
+    /// A bar cut clean through the middle is severed into two separate bodies.
+    /// `boolean` returns them as one shell (Euler=4); `boolean_bodies` splits it.
+    #[test]
+    fn cut_severing_a_bar_yields_two_bodies() {
+        // A 30×10×10 bar along X, sliced by a tool that fully spans Y and Z and
+        // removes x∈[10,20], leaving x∈[0,10] and x∈[20,30].
+        let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);
+        let knife = make_box(&Pnt::new(10.0, -1.0, -1.0), 10.0, 12.0, 12.0);
+
+        let merged = boolean(&bar, &knife, BooleanOp::Cut);
+        assert!(merged.is_watertight(), "severed cut should be watertight");
+
+        let bodies = boolean_bodies(&bar, &knife, BooleanOp::Cut);
+        assert_eq!(bodies.len(), 2, "a through-cut must produce two bodies");
+
+        for body in &bodies {
+            assert!(body.is_watertight(), "each severed body must be watertight");
+            assert_eq!(body.euler_characteristic(), 2);
+            let (lo, hi) = body.bounding_box().corners().unwrap();
+            // Each piece is a 10×10×10 cube; only its X span differs.
+            assert!((hi.x() - lo.x() - 10.0).abs() < 1e-4, "x span {}", hi.x() - lo.x());
+            assert!((hi.y() - lo.y() - 10.0).abs() < 1e-4);
+            assert!((hi.z() - lo.z() - 10.0).abs() < 1e-4);
+        }
+
+        // The two pieces sit at opposite ends of the original bar.
+        let mut x_los: Vec<f64> = bodies
+            .iter()
+            .map(|b| b.bounding_box().corners().unwrap().0.x())
+            .collect();
+        x_los.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((x_los[0] - 0.0).abs() < 1e-4, "near piece at x≈0, got {}", x_los[0]);
+        assert!((x_los[1] - 20.0).abs() < 1e-4, "far piece at x≈20, got {}", x_los[1]);
     }
 
     #[test]

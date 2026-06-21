@@ -8,11 +8,12 @@
 
 use openrcad_foundation::{BndBox, Trsf};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::arena::{BRep, SolidData, SolidId};
 use crate::edge::Edge;
+use crate::face::Face;
 use crate::shell::Shell;
 use crate::vertex::Vertex;
 
@@ -130,6 +131,78 @@ impl Solid {
         b
     }
 
+    /// Split a solid whose boundary is several disconnected pieces into one
+    /// [`Solid`] per connected component.
+    ///
+    /// A boolean cut that *severs* a body (e.g. slicing a bar in two) yields a
+    /// single shell holding two disjoint, individually-watertight boxes — a
+    /// valid B-Rep, but really two bodies. This groups faces into connected
+    /// components (two faces are connected when they share a boundary edge,
+    /// matched by quantized endpoint position like [`edges`](Solid::edges) and
+    /// [`manifold_report`](Solid::manifold_report)) and rebuilds one solid per
+    /// component.
+    ///
+    /// Returns a single-element vector (a clone of `self`) when the boundary is
+    /// already one connected piece — so callers can treat the result uniformly.
+    pub fn split_disconnected(&self) -> Vec<Solid> {
+        let faces = self.shell().faces();
+        let n = faces.len();
+        if n <= 1 {
+            return vec![self.clone()];
+        }
+
+        // Union-find over face indices, joined wherever two faces share an edge.
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        let mut parent: Vec<usize> = (0..n).collect();
+        let mut edge_owner: HashMap<[(i64, i64, i64); 2], usize> = HashMap::new();
+        for (fi, face) in faces.iter().enumerate() {
+            for wire in face.wires() {
+                for edge in wire.edges() {
+                    match edge_owner.get(&edge_key(&edge)) {
+                        Some(&other) => {
+                            let ra = find(&mut parent, fi);
+                            let rb = find(&mut parent, other);
+                            if ra != rb {
+                                parent[ra] = rb;
+                            }
+                        }
+                        None => {
+                            edge_owner.insert(edge_key(&edge), fi);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Group faces by component root, in first-seen order so the output is
+        // deterministic (a stated kernel invariant).
+        let mut group_of: HashMap<usize, usize> = HashMap::new();
+        let mut groups: Vec<Vec<Face>> = Vec::new();
+        for (fi, face) in faces.iter().enumerate() {
+            let root = find(&mut parent, fi);
+            let gi = *group_of.entry(root).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[gi].push(face.clone());
+        }
+
+        if groups.len() <= 1 {
+            return vec![self.clone()];
+        }
+        groups
+            .into_iter()
+            .map(|component| Solid::new(Shell::from_faces(component)))
+            .collect()
+    }
+
     /// Apply `t` to the whole boundary shell.
     pub fn transformed(&self, t: &Trsf) -> Self {
         let transformed_brep = self.brep.transformed(t);
@@ -226,5 +299,38 @@ mod tests {
         let (lo, hi) = s.bounding_box().corners().unwrap();
         assert_eq!(lo, Pnt::origin());
         assert_eq!(hi, Pnt::new(1.0, 1.0, 0.0));
+    }
+
+    fn square_face(x0: f64) -> Face {
+        let wire = Wire::from_edges([
+            Edge::between_points(Pnt::new(x0, 0.0, 0.0), Pnt::new(x0 + 1.0, 0.0, 0.0)),
+            Edge::between_points(Pnt::new(x0 + 1.0, 0.0, 0.0), Pnt::new(x0 + 1.0, 1.0, 0.0)),
+            Edge::between_points(Pnt::new(x0 + 1.0, 1.0, 0.0), Pnt::new(x0, 1.0, 0.0)),
+            Edge::between_points(Pnt::new(x0, 1.0, 0.0), Pnt::new(x0, 0.0, 0.0)),
+        ]);
+        Face::new(None, wire)
+    }
+
+    #[test]
+    fn connected_boundary_stays_one_body() {
+        // A single face is trivially one component.
+        let s = Solid::new(Shell::from_faces([square_face(0.0)]));
+        assert_eq!(s.split_disconnected().len(), 1);
+    }
+
+    #[test]
+    fn disjoint_faces_split_into_separate_bodies() {
+        // Two squares 10 units apart share no edges → two independent components.
+        let s = Solid::new(Shell::from_faces([square_face(0.0), square_face(10.0)]));
+        let bodies = s.split_disconnected();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies.iter().all(|b| b.face_count() == 1));
+    }
+
+    #[test]
+    fn edge_sharing_faces_stay_one_body() {
+        // Two coincident squares share all four edges → still one component.
+        let s = Solid::new(Shell::from_faces([square_face(0.0), square_face(0.0)]));
+        assert_eq!(s.split_disconnected().len(), 1);
     }
 }

@@ -67,22 +67,23 @@
     </tbody>
   </table>
 
-  <div class="warn"><p><strong>Scope limit, stated plainly.</strong> The blend builders detect a single box or cylinder primitive — at <em>any position/orientation</em> (the frame is recovered from geometry, verified watertight on rotated inputs) — and construct the result directly. For any other solid, including a boolean result, they return <code>BlendError::UnsupportedShape</code> (they never silently hand back the input). The general rolling-ball sweep on arbitrary edges, N-valent Gregory corner blends, face overflow, and concave-offset self-intersection resolution are not yet implemented.</p></div>
+  <div class="warn"><p><strong>Scope limit, stated plainly.</strong> The <em>whole-solid</em> blend builders (<code>fillet</code>/<code>chamfer</code>/<code>shell_solid</code>) detect a single box or cylinder primitive — at <em>any position/orientation</em> (the frame is recovered from geometry, verified watertight on rotated inputs) — and construct the result directly; for any other whole solid they return <code>BlendError::UnsupportedShape</code> (they never silently hand back the input). The <em>per-edge</em> rolling-ball fillet (<code>fillet_edges</code>) does handle arbitrary planar/analytic edges, including boolean results, and rejects an over-large radius instead of emitting a degenerate solid. N-valent Gregory corner blends, face overflow, and concave-offset self-intersection resolution are not yet implemented.</p></div>
 
-  <h2>Booleans — robustness frontier (measured)</h2>
-  <p>Booleans run over the BVH-accelerated intersection engine and finish watertight on a wide range of configurations. The split between solid and broken is sharp and tracked by <code>crates/openrcad-algo/tests/robustness.rs</code> against the <code>is_watertight</code> + <code>validate</code> oracles.</p>
+  <h2>Booleans — watertight + health-validated</h2>
+  <p>Booleans run over the BVH-accelerated intersection engine and finish <strong>watertight and healthy</strong> (<code>is_healthy</code> — contiguous loops, no degenerate edges, manifold) across the everyday cases, tracked by <code>crates/openrcad-algo/tests/robustness.rs</code> and the <code>repro_*</code> suites. Coplanar adjacent faces are merged back to clean topology (a two-box union is a 6-face box). No boolean goal-tests remain <code>#[ignore]</code>d.</p>
   <table>
-    <thead><tr><th>Watertight + valid today</th><th>Open frontier (partial imprint)</th></tr></thead>
+    <thead><tr><th>Watertight + valid today</th><th>Open</th></tr></thead>
     <tbody>
-      <tr><td>through-cuts; face-flush unions</td><td>corner-overlap <strong>unions</strong></td></tr>
-      <tr><td>enclosed voids; corner-overlap <strong>intersections</strong></td><td><strong>blind pockets</strong> (tool stops inside)</td></tr>
-      <tr><td>all rotated placements</td><td>partial rotated cuts; through side-drill (non-contiguous loop)</td></tr>
+      <tr><td>through-cuts; face-flush &amp; corner-overlap unions</td><td rowspan="3">a cut that <strong>severs</strong> a body is returned as one solid (Euler=4) rather than split into separate bodies</td></tr>
+      <tr><td>blind pockets; enclosed voids; corner-overlap intersections</td></tr>
+      <tr><td>partial &amp; rotated cuts; through side-drill; thin plates; off-axis bodies; cylinder cuts &amp; bosses</td></tr>
     </tbody>
   </table>
-  <p class="dim">Root cause of the frontier: the split pass does not yet imprint an intersection curve that only <em>partially</em> crosses a face. The failing cases are encoded as <code>#[ignore]</code>d goal-tests (run with <code>cargo test --ignored</code>) so progress is measurable.</p>
+  <p class="dim">The split pass imprints partial and coplanar intersection curves (a coplanar circular cap is bored as a hole, closing cylinder bosses), and <code>sew</code> re-threads every loop into a contiguous co-edge chain so results pass <code>validate()</code>/<code>is_healthy()</code>, not just <code>is_watertight()</code>.</p>
 
   <h2>New since the last cut</h2>
   <ul class="clean">
+    <li><strong>Boolean robustness &amp; clean topology</strong> — loop re-threading in <code>sew</code> makes results pass <code>is_healthy()</code> (so <code>boolean_checked</code> accepts ordinary joins on thin/off-axis/coplanar geometry); coplanar + collinear merge collapses a two-box union to a clean 6-face box; a coplanar circular-hole imprint closes cylinder boss unions. The per-edge fillet now works on boolean results and errors on an over-large radius.</li>
     <li><strong>~10× faster booleans</strong> — a closed-form <code>curve_curve</code> fast path for line/circle pairs (lines have infinite bounds, so the old subdivision bisected a clamped ±100 domain) dropped box∩box from ~13.8 ms to ~1.3 ms; the classification scan is now BVH-pruned.</li>
     <li><strong>Watertight / manifold validation</strong> — <code>Solid::is_watertight</code>, <code>manifold_report</code>, <code>is_manifold</code>, and <code>health_report</code>, with a regression suite that asserts closure on every verified-good boolean and blend (and pins the failure frontier).</li>
     <li><strong>Interactive viewer</strong> (<code>openrcad-render</code>) — orbit / pan / zoom, 4× MSAA, a topological-edge wireframe overlay, and click-to-select with a shader face highlight.</li>

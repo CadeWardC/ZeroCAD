@@ -1,10 +1,271 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use openrcad_foundation::Pnt;
-use openrcad_geom::Curve;
-use openrcad_topo::arena::ShellData;
+use openrcad_foundation::{tolerance, Pnt, Vec as FVec};
+use openrcad_geom::{Curve, GeomSurface, Plane};
+use openrcad_topo::arena::{LoopId, OrientedEdge, ShellData};
 use openrcad_topo::{BRep, EdgeId, Face, FaceId, Orientation, Shell, VertexId};
+
+/// A point quantized to a fine integer grid (see [`quantize`]).
+type QPoint = (i64, i64, i64);
+
+/// Quantize a point to a fine integer grid so coincident endpoints from
+/// independently-built edges compare equal (matches `manifold_report`'s grid).
+fn quantize(p: &Pnt) -> QPoint {
+    const GRID: f64 = 1.0e6;
+    (
+        (p.x() * GRID).round() as i64,
+        (p.y() * GRID).round() as i64,
+        (p.z() * GRID).round() as i64,
+    )
+}
+
+/// Re-order and re-orient a loop's co-edges into a single contiguous chain, so
+/// each co-edge's traversal-end meets the next's traversal-start — the defining
+/// invariant of a B-Rep loop.
+///
+/// The split/partition/imprint passes can emit a loop whose edges are all present
+/// and form a closed cycle but with one co-edge's orientation flipped, leaving the
+/// loop non-contiguous (`LoopNotContiguous`) even though it is geometrically
+/// closed. This greedily threads the edges by quantized endpoint position to
+/// restore the chain.
+///
+/// Returns `None` (caller leaves the loop untouched) when the loop is **already
+/// contiguous** — so correct loops keep their exact winding — or when the edges
+/// cannot be threaded into one closed cycle (a genuine gap or a pinch point),
+/// so nothing is silently corrupted. Preserves the first co-edge's orientation,
+/// and therefore the loop's winding sense.
+fn rethread_loop(brep: &BRep, edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge>> {
+    let n = edges.len();
+    if n < 3 {
+        return None;
+    }
+    // Natural endpoint positions (start, end) of an edge.
+    let endpoints = |oe: &OrientedEdge| -> Option<(QPoint, QPoint)> {
+        let e = brep.edges.get(oe.id)?;
+        let ps = brep.vertices.get(e.start)?.point;
+        let pe = brep.vertices.get(e.end)?.point;
+        Some((quantize(&ps), quantize(&pe)))
+    };
+    // Oriented (traversal start, traversal end) of a co-edge.
+    let oriented = |oe: &OrientedEdge| -> Option<(QPoint, QPoint)> {
+        let (s, e) = endpoints(oe)?;
+        Some(match oe.orientation {
+            Orientation::Reversed => (e, s),
+            _ => (s, e),
+        })
+    };
+
+    // Fast path: already a contiguous chain → leave untouched (exact winding).
+    let mut contiguous = true;
+    for i in 0..n {
+        let (_, cur_end) = oriented(&edges[i])?;
+        let (next_start, _) = oriented(&edges[(i + 1) % n])?;
+        if cur_end != next_start {
+            contiguous = false;
+            break;
+        }
+    }
+    if contiguous {
+        return None;
+    }
+
+    // Thread the edges, keeping the first co-edge as the anchor.
+    let mut remaining: Vec<OrientedEdge> = edges.to_vec();
+    let first = remaining.remove(0);
+    let (start_key, mut cur_end) = oriented(&first)?;
+    let mut result: Vec<OrientedEdge> = Vec::with_capacity(n);
+    result.push(first);
+
+    while !remaining.is_empty() {
+        let mut picked = None;
+        for (i, oe) in remaining.iter().enumerate() {
+            let (es, ee) = match endpoints(oe) {
+                Some(v) => v,
+                None => continue,
+            };
+            if es == cur_end {
+                picked = Some((i, OrientedEdge { id: oe.id, orientation: Orientation::Forward }, ee));
+                break;
+            } else if ee == cur_end {
+                picked = Some((i, OrientedEdge { id: oe.id, orientation: Orientation::Reversed }, es));
+                break;
+            }
+        }
+        let (i, oe, next_end) = picked?;
+        remaining.remove(i);
+        result.push(oe);
+        cur_end = next_end;
+    }
+
+    // The chain must close back onto the first co-edge's start.
+    (cur_end == start_key).then_some(result)
+}
+
+/// The traversal-start points of a loop's co-edges, in loop order — the polygon
+/// that defines the loop's winding (each co-edge contributes the vertex it leaves
+/// from, honouring its orientation flag).
+fn loop_traversal_points(brep: &BRep, loop_id: LoopId) -> Vec<Pnt> {
+    let mut pts = Vec::new();
+    let Some(l) = brep.loops.get(loop_id) else {
+        return pts;
+    };
+    for oe in &l.edges {
+        let Some(e) = brep.edges.get(oe.id) else {
+            continue;
+        };
+        let v = match oe.orientation {
+            Orientation::Reversed => e.end,
+            _ => e.start,
+        };
+        if let Some(vd) = brep.vertices.get(v) {
+            pts.push(vd.point);
+        }
+    }
+    pts
+}
+
+/// Newell area-weighted normal of an ordered point polygon, or `None` if the
+/// polygon is degenerate (fewer than 3 points or near-zero area).
+fn newell_normal(points: &[Pnt]) -> Option<FVec> {
+    if points.len() < 3 {
+        return None;
+    }
+    let (mut nx, mut ny, mut nz) = (0.0, 0.0, 0.0);
+    for i in 0..points.len() {
+        let p = points[i];
+        let q = points[(i + 1) % points.len()];
+        nx += (p.y() - q.y()) * (p.z() + q.z());
+        ny += (p.z() - q.z()) * (p.x() + q.x());
+        nz += (p.x() - q.x()) * (p.y() + q.y());
+    }
+    let n = FVec::new(nx, ny, nz);
+    (n.magnitude() > tolerance::CONFUSION).then_some(n)
+}
+
+/// True if every undirected boundary edge (matched by quantized endpoint
+/// position) is used by exactly two face loops — the watertight 2-manifold
+/// condition. Open intermediate shells return `false`.
+fn shell_is_closed(brep: &BRep, face_ids: &[FaceId]) -> bool {
+    let mut counts: HashMap<(QPoint, QPoint), usize> = HashMap::new();
+    for &f_id in face_ids {
+        let Some(f) = brep.faces.get(f_id) else {
+            continue;
+        };
+        let mut wires = Vec::new();
+        if let Some(w) = f.outer_wire {
+            wires.push(w);
+        }
+        wires.extend(&f.inner_wires);
+        for w_id in wires {
+            let Some(l) = brep.loops.get(w_id) else {
+                continue;
+            };
+            for oe in &l.edges {
+                let Some(e) = brep.edges.get(oe.id) else {
+                    continue;
+                };
+                let (Some(a), Some(b)) =
+                    (brep.vertices.get(e.start), brep.vertices.get(e.end))
+                else {
+                    continue;
+                };
+                let (qa, qb) = (quantize(&a.point), quantize(&b.point));
+                let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
+                *counts.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    !counts.is_empty() && counts.values().all(|&c| c == 2)
+}
+
+/// Signed volume of the shell via the divergence theorem: sum of the signed
+/// tetrahedra `(origin, p0, pi, pi+1)` over a fan triangulation of each face's
+/// outer loop (in its effective, flag-adjusted winding). Positive when the shell
+/// faces outward. Only the sign is used, so the coarse boundary-loop fan (which
+/// approximates curved faces by their corner polygon) is sufficient.
+fn signed_volume(brep: &BRep, face_ids: &[FaceId]) -> f64 {
+    let mut v6 = 0.0;
+    for &f_id in face_ids {
+        let Some(f) = brep.faces.get(f_id) else {
+            continue;
+        };
+        let Some(outer) = f.outer_wire else {
+            continue;
+        };
+        let mut pts = loop_traversal_points(brep, outer);
+        if f.orientation == Orientation::Reversed {
+            pts.reverse();
+        }
+        if pts.len() < 3 {
+            continue;
+        }
+        let a = pts[0];
+        for i in 1..pts.len() - 1 {
+            let b = pts[i];
+            let c = pts[i + 1];
+            v6 += a.x() * (b.y() * c.z() - b.z() * c.y())
+                - a.y() * (b.x() * c.z() - b.z() * c.x())
+                + a.z() * (b.x() * c.y() - b.y() * c.x());
+        }
+    }
+    v6 / 6.0
+}
+
+/// Canonicalize the sewn shell's orientation so every face's effective normal is
+/// reliable and (for a closed shell) points outward.
+///
+/// Step 7's BFS makes the flag-adjusted loop *windings* mutually consistent, but
+/// never reconciles them with each face's stored surface normal, and never
+/// orients the shell as a whole — so a watertight result can still carry faces
+/// whose effective normal (`orientation × surface.normal()`) disagrees with the
+/// winding, or whose shell faces inward. This pass closes both gaps:
+///
+/// 1. **Per-face normal/winding agreement.** For each planar face, re-point the
+///    stored plane normal to agree with its loop winding's Newell normal. A plane
+///    normal is independent of the winding and can be flipped without changing the
+///    face's geometry, so this only touches the *stored normal*, never the
+///    orientation flag — leaving step 7's winding consistency intact. (Curved
+///    surfaces carry an intrinsic normal sense and are handled by step 2 alone.)
+/// 2. **Global outward pass.** If the shell is closed and its signed volume is
+///    negative, flip every face's orientation flag so the shell faces outward.
+///    Flipping all flags together preserves both the per-face agreement and the
+///    cross-edge winding consistency.
+fn canonicalize_shell_orientation(brep: &mut BRep, face_ids: &[FaceId]) {
+    // 1. Align each planar face's stored normal with its loop winding.
+    for &f_id in face_ids {
+        let Some(outer) = brep.faces.get(f_id).and_then(|f| f.outer_wire) else {
+            continue;
+        };
+        let pts = loop_traversal_points(brep, outer);
+        let Some(w) = newell_normal(&pts) else {
+            continue;
+        };
+        let plane = match &brep.faces[f_id].surface {
+            Some(GeomSurface::Plane(p)) => *p,
+            _ => continue,
+        };
+        let n = plane.normal();
+        let dot = n.x() * w.x() + n.y() * w.y() + n.z() * w.z();
+        if dot < 0.0 {
+            let flipped = Plane::from_point_normal(plane.location(), n.reversed());
+            brep.faces[f_id].surface = Some(GeomSurface::plane(flipped));
+        }
+    }
+
+    // 2. Orient the whole shell outward — only when it is closed (an open
+    //    intermediate shell has no well-defined inside).
+    if !shell_is_closed(brep, face_ids) {
+        return;
+    }
+    if signed_volume(brep, face_ids) < 0.0 {
+        for &f_id in face_ids {
+            if let Some(f) = brep.faces.get_mut(f_id) {
+                f.orientation = f.orientation.reversed();
+            }
+        }
+    }
+}
 
 /// Sew a collection of faces into a single shell, joining edges within `tol`.
 ///
@@ -330,6 +591,25 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
         }
     }
 
+    // 6.5 Re-thread every loop into a contiguous, consistently-oriented chain.
+    // The coplanar imprint/partition passes can leave a closed loop with one
+    // co-edge's orientation flipped, which fails the `LoopNotContiguous` validator
+    // even though the loop is geometrically closed. Restore the loop invariant by
+    // threading the edges by endpoint position; this is a no-op on loops that are
+    // already contiguous (their winding is preserved exactly).
+    let loop_ids: Vec<_> = brep.loops.keys().collect();
+    for l_id in loop_ids {
+        let edges = match brep.loops.get(l_id) {
+            Some(l) => l.edges.clone(),
+            None => continue,
+        };
+        if let Some(threaded) = rethread_loop(&brep, &edges) {
+            if let Some(l) = brep.loops.get_mut(l_id) {
+                l.edges = threaded;
+            }
+        }
+    }
+
     // 7. Perform normal orientation propagation across faces using BFS.
     let mut face_adj: HashMap<FaceId, Vec<(FaceId, EdgeId)>> = HashMap::new();
     for (f_id, f_data) in &brep.faces {
@@ -453,6 +733,12 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
             }
         }
     }
+
+    // 7.5 Canonicalize orientation: make every face's stored normal agree with
+    // its winding and (for a closed shell) orient the whole shell outward. Step 7
+    // only makes windings mutually consistent; this reconciles them with the
+    // stored surface normals and fixes a globally-inward shell.
+    canonicalize_shell_orientation(&mut brep, &face_ids);
 
     // 8. Garbage-collect orphan entities. `BRep::merge` copies *every* entity of
     // each source arena, so faces assembled from edges borrowed from another
@@ -608,6 +894,88 @@ mod tests {
         // Since they are opposite, they are consistent if and only if both faces have the same orientation value.
         // Let's verify they both have the same orientation!
         assert_eq!(f1_sewn.orientation(), f2_sewn.orientation());
+    }
+
+    /// Effective outward normal of a planar face, or `None` if non-planar.
+    fn effective_planar_normal(face: &Face) -> Option<openrcad_foundation::Dir> {
+        let n = match face.surface()? {
+            GeomSurface::Plane(p) => p.normal(),
+            _ => return None,
+        };
+        Some(if face.orientation() == Orientation::Reversed {
+            n.reversed()
+        } else {
+            n
+        })
+    }
+
+    /// For a convex solid, every planar face's effective normal must point away
+    /// from the solid centroid (i.e. outward).
+    fn assert_planar_normals_outward(solid: &Solid) {
+        let verts = solid.vertices();
+        let n = verts.len() as f64;
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        let mut cz = 0.0;
+        for v in &verts {
+            cx += v.point().x();
+            cy += v.point().y();
+            cz += v.point().z();
+        }
+        let centroid = Pnt::new(cx / n, cy / n, cz / n);
+
+        let mut checked = 0;
+        for face in solid.shell().faces() {
+            let Some(en) = effective_planar_normal(&face) else {
+                continue;
+            };
+            let pts: Vec<Pnt> = face
+                .outer_wire()
+                .unwrap()
+                .edges()
+                .iter()
+                .map(|e| e.start().point())
+                .collect();
+            let m = pts.len() as f64;
+            let fc = Pnt::new(
+                pts.iter().map(|p| p.x()).sum::<f64>() / m,
+                pts.iter().map(|p| p.y()).sum::<f64>() / m,
+                pts.iter().map(|p| p.z()).sum::<f64>() / m,
+            );
+            let out = fc - centroid;
+            let dot = out.x() * en.x() + out.y() * en.y() + out.z() * en.z();
+            assert!(
+                dot > 0.0,
+                "face effective normal points inward (dot = {dot})"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "expected at least one planar face to check");
+    }
+
+    #[test]
+    fn sew_keeps_outward_box_outward() {
+        // A clean primitive box is already outward — canonicalization is a no-op.
+        let solid = openrcad_primitives::make_box(&Pnt::origin(), 2.0, 3.0, 4.0);
+        let faces = solid.shell().faces();
+        let shell = sew(&faces, openrcad_foundation::tolerance::CONFUSION * 10.0);
+        let resewn = Solid::new(shell);
+        assert!(resewn.is_watertight());
+        assert!(resewn.health_report().is_healthy());
+        assert_planar_normals_outward(&resewn);
+    }
+
+    #[test]
+    fn sew_reorients_inverted_box_outward() {
+        // Reverse every face so the shell faces *inward*; sew's global outward
+        // pass (Fix #1, step 2) must flip it back so all normals point outward.
+        let solid = openrcad_primitives::make_box(&Pnt::origin(), 2.0, 3.0, 4.0);
+        let inverted: Vec<Face> = solid.shell().faces().iter().map(|f| f.reversed()).collect();
+        let shell = sew(&inverted, openrcad_foundation::tolerance::CONFUSION * 10.0);
+        let fixed = Solid::new(shell);
+        assert!(fixed.is_watertight());
+        assert!(fixed.health_report().is_healthy());
+        assert_planar_normals_outward(&fixed);
     }
 
     #[test]

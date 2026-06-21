@@ -369,7 +369,15 @@ pub fn fillet_planar_edge(
     }
     faces.push(blend.blend_face);
 
-    Ok(Solid::new(sew(&faces, radius * 0.1)))
+    // Reject a blend that didn't close: a radius too large for the local geometry
+    // (e.g. larger than half the part thickness) collapses trim edges and leaves a
+    // non-watertight / degenerate shell. Surface that as an error rather than
+    // returning a broken solid the application would cache.
+    let result = Solid::new(sew(&faces, radius * 0.1));
+    if !result.is_watertight() || !result.health_report().is_healthy() {
+        return Err(RollingBallError::InvalidRadius { radius });
+    }
+    Ok(result)
 }
 
 /// Apply a constant-`radius` rolling-ball fillet to several selected `edges`.
@@ -420,7 +428,12 @@ pub fn rolling_ball_fillet_edge(
         && matches!(adjacent[1].surface(), Some(GeomSurface::Plane(_)));
 
     if both_planar {
-        rolling_ball_between_planar_faces(edge, &adjacent[0], &adjacent[1], radius)
+        // `sew` canonicalizes every sewn shell so each planar face's stored normal
+        // agrees with its winding and the shell faces outward, so the face's stored
+        // orientation is trustworthy here (no solid-interior re-derivation needed).
+        let n_a = planar_outward_normal(&adjacent[0])?;
+        let n_b = planar_outward_normal(&adjacent[1])?;
+        planar_blend(edge, &adjacent[0], &adjacent[1], n_a, n_b, radius)
     } else {
         rolling_ball_between_curved_faces(edge, &adjacent[0], &adjacent[1], radius)
     }
@@ -730,6 +743,24 @@ pub fn rolling_ball_between_planar_faces(
     face_b: &Face,
     radius: f64,
 ) -> Result<RollingBallBlend, RollingBallError> {
+    let n_a = planar_outward_normal(face_a)?;
+    let n_b = planar_outward_normal(face_b)?;
+    planar_blend(edge, face_a, face_b, n_a, n_b, radius)
+}
+
+/// Core rolling-ball planar blend with explicit, already-outward face normals.
+/// Factored out of [`rolling_ball_between_planar_faces`] so
+/// [`rolling_ball_fillet_edge`] can substitute solid-aware outward normals for a
+/// face whose *stored* orientation is inward (a sewn prism cap), which
+/// `planar_outward_normal` alone would misread.
+fn planar_blend(
+    edge: &Edge,
+    face_a: &Face,
+    face_b: &Face,
+    n_a: Dir,
+    n_b: Dir,
+    radius: f64,
+) -> Result<RollingBallBlend, RollingBallError> {
     if !radius.is_finite() || radius <= tolerance::CONFUSION {
         return Err(RollingBallError::InvalidRadius { radius });
     }
@@ -741,8 +772,6 @@ pub fn rolling_ball_between_planar_faces(
         .normalized()
         .ok_or(RollingBallError::DegenerateSpine)?;
 
-    let n_a = planar_outward_normal(face_a)?;
-    let n_b = planar_outward_normal(face_b)?;
     let inward_a = -GeomVec::from_dir(n_a);
     let inward_b = -GeomVec::from_dir(n_b);
     let bisector = inward_a + inward_b;

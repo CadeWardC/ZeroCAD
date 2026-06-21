@@ -10,6 +10,7 @@ pub mod euler;
 pub mod facade;
 pub mod imprint;
 pub mod intersect;
+pub mod merge;
 
 pub use blend::BlendError;
 pub use facade::SolidExt;
@@ -56,6 +57,22 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
 /// body that downstream features might cache.
 pub fn boolean_checked(object: &Solid, tool: &Solid, op: BooleanOp) -> Result<Solid, BooleanError> {
     boolean::boolean_checked(object, tool, op)
+}
+
+/// Apply `op`, then split a severed result into one solid per connected body
+/// (see [`Solid::split_disconnected`]). Use this when a cut may slice a body in
+/// two; the common single-body case returns a one-element vector.
+pub fn boolean_bodies(object: &Solid, tool: &Solid, op: BooleanOp) -> Vec<Solid> {
+    boolean::boolean_bodies(object, tool, op)
+}
+
+/// Checked multi-body boolean: splits a severed result and validates each body.
+pub fn boolean_checked_bodies(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+) -> Result<Vec<Solid>, BooleanError> {
+    boolean::boolean_checked_bodies(object, tool, op)
 }
 
 pub mod chamfer;

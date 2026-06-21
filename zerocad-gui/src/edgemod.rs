@@ -232,19 +232,22 @@ impl ZeroCadApp {
             },
         });
         graph.add_dependency(&op.target, &id);
-        // Draft eval: the live drag re-solves every frame, so every fillet in the
-        // model uses the fast faceted cutter, not the ~50× slower analytic-arc
-        // one. The smooth single-face round lands when the edit is committed and
-        // the model rebuilds via the non-draft path.
+        // The preview fillet is appended as a trailing node, so the parametric
+        // graph's per-node geometry cache (carried by the clone above) reuses the
+        // committed prefix — the upstream booleans (e.g. a box∪boss union) are NOT
+        // re-solved each frame; only this one edge-mod runs. The native rolling-ball
+        // fillet is exact, so draft and commit already match (the `draft` flag is a
+        // no-op); it is kept only for API symmetry with the extrude preview.
         graph.evaluate_bodies_draft(&self.hidden_nodes).ok()
     }
 
     /// Memoized [`preview_edge_mod_bodies`]. egui repaints continuously while the
-    /// inline size box is focused or the handle is dragged, and each call clones
-    /// the whole graph and re-runs every truck boolean — so without caching the
-    /// fillet preview re-solves the model every frame. This recomputes only when
-    /// the size (quantized to a sub-visible step), kind, or target change, making
-    /// idle frames and slow drags nearly free (mirrors `cached_preview_extrude_bodies`).
+    /// inline size box is focused or the handle is dragged. This GUI-level cache
+    /// recomputes only when the size (quantized to a sub-visible step), kind, or
+    /// target change, so idle frames and the still points of a slow drag are free;
+    /// the parametric graph's per-node cache then keeps the recompute cheap on the
+    /// frames that *do* change (the upstream booleans are reused, only the fillet
+    /// re-runs). Mirrors `cached_preview_extrude_bodies`.
     pub(crate) fn cached_preview_edge_mod_bodies(&mut self) -> Option<Vec<(String, MockMesh)>> {
         use std::hash::{Hash, Hasher};
         let Some(op) = self.edge_mod_op.as_ref() else {

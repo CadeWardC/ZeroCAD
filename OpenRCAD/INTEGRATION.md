@@ -9,10 +9,12 @@ exchange. It is written to be copy-paste practical; for the conceptual *why*, se
 > primitives, intersection engine + BVH, booleans, tessellation, sewing, and
 > STEP/STL layers are real and tested, plus an interactive viewer
 > (`openrcad-render`) and a parametric document layer (`openrcad-document`). The
-> fillet/chamfer/shell builders handle a single **box** or **cylinder** primitive
-> at **any orientation** and return a typed error for anything else. Booleans are
-> watertight on many configurations but not yet on "partial imprint" cases. See
-> [Limitations](#limitations).
+> whole-solid fillet/chamfer/shell builders handle a single **box** or
+> **cylinder** primitive at **any orientation** and return a typed error for
+> anything else; the per-edge rolling-ball fillet (`fillet_edges`) works on
+> arbitrary edges including boolean results. Booleans are watertight **and**
+> health-validated across the everyday cases (partial-imprint, coplanar joins,
+> cylinder cuts and bosses). See [Limitations](#limitations).
 
 ---
 
@@ -133,9 +135,10 @@ let m = cut.manifold_report();         // { total_edges, free_edges, nonmanifold
 
 `is_watertight` (edge pairing) and `validate` (loop contiguity) are
 complementary; together they are the cheapest catch for a malformed solid.
-Booleans are watertight on through-cuts, face-flush unions, enclosed voids,
-corner-overlap intersections, and all rotated placements; they are not yet
-watertight on partial-imprint cases (see [Limitations](#limitations)).
+Booleans are watertight **and** healthy on through-cuts, face-flush and
+corner-overlap unions, blind pockets, enclosed voids, partial and rotated cuts,
+and cylinder cuts and bosses; coplanar adjacent faces are merged to clean
+topology (see [Limitations](#limitations)).
 
 ---
 
@@ -265,18 +268,22 @@ the result back as a serde blob with zero pointer fix-ups.
 
 Know these before you wire OpenRCAD into a production path:
 
-- **Blends are box/cylinder-only.** `fillet`, `chamfer`, and `shell_solid` detect
-  a single box or cylinder primitive (at **any position/orientation** — the frame
-  is recovered from geometry) and construct the result directly; any other solid,
-  including a boolean result, yields `BlendError::UnsupportedShape`. The general
-  rolling-ball sweep, N-valent Gregory corner blends, face overflow, and
-  concave-offset self-intersection resolution are not implemented yet.
-- **Booleans: partial-imprint frontier.** Watertight on through-cuts, face-flush
-  unions, enclosed voids, corner-overlap intersections, and rotated inputs; **not
-  yet** watertight on corner-overlap *unions*, *blind pockets* (tool stops
-  inside), or partial rotated cuts, where an intersection curve only partly
-  crosses a face. These are tracked as `#[ignore]`d goal-tests in
-  `crates/openrcad-algo/tests/robustness.rs`.
+- **Whole-solid blends are box/cylinder-only.** `fillet`, `chamfer`, and
+  `shell_solid` detect a single box or cylinder primitive (at **any
+  position/orientation** — the frame is recovered from geometry) and construct the
+  result directly; any other *whole solid* yields `BlendError::UnsupportedShape`.
+  The **per-edge** `fillet_edges` (rolling ball) does handle arbitrary
+  planar/analytic edges, including boolean results — and rejects an over-large
+  radius rather than emitting a degenerate solid. N-valent Gregory corner blends,
+  face overflow, and concave-offset self-intersection resolution are not
+  implemented yet.
+- **Booleans: severed cuts stay one body.** Watertight and health-validated on
+  through-cuts, face-flush and corner-overlap unions, blind pockets, enclosed
+  voids, partial and rotated cuts, and cylinder cuts and bosses (the former
+  partial-imprint goal-tests now pass and are un-`#[ignore]`d in
+  `crates/openrcad-algo/tests/robustness.rs`). The remaining edge case: a cut that
+  *severs* a body is returned as a single solid (Euler=4) rather than split into
+  separate bodies.
 - **Intersection subdivision** can be deep on tangential NURBS configurations;
   prefer analytic primitives (line/circle pairs take a closed-form fast path).
 - **STL is write-only**; STEP is read + write.

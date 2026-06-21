@@ -593,6 +593,26 @@ pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
     quiet_panic(|| boolean_checked(a, b, BooleanOp::Cut).ok())
 }
 
+/// Boolean difference (`a − b`) that returns **one solid per connected
+/// component** instead of a single shell.
+///
+/// A cut that *severs* `a` — e.g. a slot sliced clean through a bar, leaving two
+/// separate lumps — comes back from the kernel as one watertight shell holding
+/// both disjoint pieces (a valid B-Rep, but really two bodies). `difference`
+/// hands that back as a single `KernelSolid`; the parametric evaluator instead
+/// wants each lump as its own selectable body part. This runs the same guarded
+/// cut, then splits the result into its connected components via
+/// [`Solid::split_disconnected`].
+///
+/// Returns `None` on kernel failure or non-watertight output (the caller keeps
+/// the part intact rather than dropping material). On success the vector always
+/// has at least one element — an un-severed cut yields a single body.
+pub fn difference_bodies(a: &KernelSolid, b: &KernelSolid) -> Option<Vec<KernelSolid>> {
+    let result = difference(a, b)?;
+    let parts = result.split_disconnected();
+    Some(if parts.is_empty() { vec![result] } else { parts })
+}
+
 /// Fallback for the common "rectangular pocket clean through an axis-aligned
 /// block" case when the general boolean engine cannot resolve the coplanar
 /// split. The result is rebuilt as one extruded face with a rectangular hole.
@@ -852,18 +872,23 @@ fn solid_to_flat_mesh(
             gpu.normals[p + 2],
         ]);
     }
-    let indices = gpu.indices;
+    let mut indices = gpu.indices;
     let face_ids = gpu.face_ids;
 
-    // Normalize the shell to outward-facing normals. `tessellate` usually
-    // honours face orientation, but direct sketch prisms can arrive with one cap
-    // sign inverted while the rest of the shell is correct, so that path opts
-    // into a per-triangle repair. More complex boolean/fillet solids keep the
-    // older whole-shell guard because a centroid test is too blunt for their
-    // curved or non-convex local faces.
-    enforce_outward_normals(&mut vertices, &indices, correct_mixed_triangle_normals);
+    // Normalize the shell to outward-facing normals.
     if correct_boolean_bevels {
-        correct_inverted_planar_bevel_normals(&mut vertices, &indices, &face_ids);
+        // Boolean / fillet results: `sew` aligns the loop *winding* across faces
+        // but the stored plane normals can still diverge, so the shell arrives
+        // with a MIX of inward/outward faces (a union drops a face, a cut's hole
+        // walls turn invisible). A whole-shell or centroid test can't fix a mix —
+        // and a centroid test is plain wrong for a hole wall (which legitimately
+        // faces the centroid). Orient robustly by triangle adjacency + signed
+        // volume instead, then recompute flat normals from the corrected winding.
+        orient_mesh_outward(&mut vertices, &mut indices);
+    } else {
+        // Analytic primitives / sketch prisms: a per-triangle centroid repair
+        // (the inverted cap is local and the geometry is convex enough).
+        enforce_outward_normals(&mut vertices, &indices, correct_mixed_triangle_normals);
     }
 
     // Smooth the normals across shallow creases so a curved surface — an
@@ -999,6 +1024,126 @@ fn smooth_vertex_normals(
 
 /// Flip triangle normals in `vertices` (interleaved pos+normal) when they point
 /// inward, judged against the direction from the mesh centroid to that triangle.
+/// Robustly orient a tessellated **closed** mesh so every triangle winds (and is
+/// normalled) outward — correct even for non-convex / holed solids where a
+/// centroid test fails. Boolean results arrive orientation-inconsistent (`sew`
+/// aligns winding but stored plane normals diverge), which a whole-shell flip
+/// can't repair: it leaves a union missing a face and a cut's hole walls
+/// back-facing (so the hole — and the whole cut — looks like it never happened).
+///
+/// Two passes: (1) flood-fill the triangles, flipping any neighbour that
+/// traverses a shared edge the *same* way (a consistently-oriented manifold
+/// traverses every shared edge in opposite directions); (2) flip the entire
+/// shell if its signed volume came out negative (inside-out). Finally each
+/// triangle's flat normal is recomputed from its corrected winding so normal and
+/// winding always agree. `gpu_mesh` unwelds every triangle (3 private vertices),
+/// so flipping one never disturbs a neighbour.
+fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
+    let tris = indices.len() / 3;
+    if tris == 0 {
+        return;
+    }
+    let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+    let vkey = |vi: u32| -> (i64, i64, i64) {
+        let b = vi as usize * 6;
+        (q(vertices[b]), q(vertices[b + 1]), q(vertices[b + 2]))
+    };
+    // Per-triangle vertex keys in stored winding order.
+    let tkeys: Vec<[(i64, i64, i64); 3]> = (0..tris)
+        .map(|t| [vkey(indices[t * 3]), vkey(indices[t * 3 + 1]), vkey(indices[t * 3 + 2])])
+        .collect();
+    // Undirected edge -> incident triangles.
+    let mut edge_tris: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+    for (t, k) in tkeys.iter().enumerate() {
+        for ei in 0..3 {
+            let (a, b) = (k[ei], k[(ei + 1) % 3]);
+            edge_tris.entry(if a <= b { (a, b) } else { (b, a) }).or_default().push(t);
+        }
+    }
+    // The three directed edges of a triangle given its current flip state.
+    let directed = |t: usize, flip: bool| -> [((i64, i64, i64), (i64, i64, i64)); 3] {
+        let k = &tkeys[t];
+        let o = if flip { [0usize, 2, 1] } else { [0, 1, 2] };
+        let v = [k[o[0]], k[o[1]], k[o[2]]];
+        [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])]
+    };
+    let mut flipped = vec![false; tris];
+    let mut visited = vec![false; tris];
+    for seed in 0..tris {
+        if visited[seed] {
+            continue;
+        }
+        visited[seed] = true;
+        let mut queue = std::collections::VecDeque::from([seed]);
+        while let Some(t) = queue.pop_front() {
+            for &(ta, tb) in &directed(t, flipped[t]) {
+                let u = if ta <= tb { (ta, tb) } else { (tb, ta) };
+                let Some(adj) = edge_tris.get(&u) else { continue };
+                for &t2 in adj {
+                    if t2 == t || visited[t2] {
+                        continue;
+                    }
+                    // Consistent ⇔ t2 traverses this edge OPPOSITE to t. If t2
+                    // (unflipped) traverses it the SAME way (ta→tb), flip it.
+                    flipped[t2] = directed(t2, false).contains(&(ta, tb));
+                    visited[t2] = true;
+                    queue.push_back(t2);
+                }
+            }
+        }
+    }
+    // Signed volume (×6) with flips applied; negative ⇒ the shell is inside-out.
+    let pos = |vi: u32| -> [f64; 3] {
+        let b = vi as usize * 6;
+        [vertices[b] as f64, vertices[b + 1] as f64, vertices[b + 2] as f64]
+    };
+    let mut vol6 = 0.0f64;
+    for t in 0..tris {
+        let (i0, i1, i2) = if flipped[t] {
+            (indices[t * 3], indices[t * 3 + 2], indices[t * 3 + 1])
+        } else {
+            (indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2])
+        };
+        let (a, b, c) = (pos(i0), pos(i1), pos(i2));
+        vol6 += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0]);
+    }
+    let global_flip = vol6 < 0.0;
+    // Apply winding flips, then recompute each triangle's flat normal so the
+    // normal agrees with the corrected winding (discarding any inconsistent
+    // stored normal). Smoothing later blends genuinely-curved faces.
+    for t in 0..tris {
+        if flipped[t] ^ global_flip {
+            indices.swap(t * 3 + 1, t * 3 + 2);
+        }
+        let (i0, i1, i2) = (
+            indices[t * 3] as usize,
+            indices[t * 3 + 1] as usize,
+            indices[t * 3 + 2] as usize,
+        );
+        let p = |i: usize| [vertices[i * 6], vertices[i * 6 + 1], vertices[i * 6 + 2]];
+        let (a, b, c) = (p(i0), p(i1), p(i2));
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let nn = if len > 1.0e-12 {
+            [n[0] / len, n[1] / len, n[2] / len]
+        } else {
+            [vertices[i0 * 6 + 3], vertices[i0 * 6 + 4], vertices[i0 * 6 + 5]]
+        };
+        for &vi in &[i0, i1, i2] {
+            vertices[vi * 6 + 3] = nn[0];
+            vertices[vi * 6 + 4] = nn[1];
+            vertices[vi * 6 + 5] = nn[2];
+        }
+    }
+}
+
 fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32], per_triangle: bool) {
     let vcount = vertices.len() / 6;
     if vcount == 0 || indices.is_empty() {
@@ -1046,134 +1191,6 @@ fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32], per_triangle: 
             vertices[v * 6 + 3] = -vertices[v * 6 + 3];
             vertices[v * 6 + 4] = -vertices[v * 6 + 4];
             vertices[v * 6 + 5] = -vertices[v * 6 + 5];
-        }
-    }
-}
-
-/// Boolean cuts can occasionally sew one new planar cutter face with its normal
-/// opposite the two flat faces it bridges. That is the signature of a chamfer
-/// bevel: a flat face with at least two flat neighbours whose outward normals
-/// strongly agree with each other only after the candidate is flipped.
-fn correct_inverted_planar_bevel_normals(
-    vertices: &mut [f32],
-    indices: &[u32],
-    face_ids: &[u32],
-) {
-    if indices.is_empty() || face_ids.is_empty() {
-        return;
-    }
-
-    let nrm = |vertices: &[f32], i: usize| -> [f32; 3] {
-        let b = i * 6;
-        [vertices[b + 3], vertices[b + 4], vertices[b + 5]]
-    };
-    let dot = |a: [f32; 3], b: [f32; 3]| -> f32 { a[0] * b[0] + a[1] * b[1] + a[2] * b[2] };
-    let norm = |v: [f32; 3]| -> Option<[f32; 3]> {
-        let len = dot(v, v).sqrt();
-        (len > 1.0e-6).then(|| [v[0] / len, v[1] / len, v[2] / len])
-    };
-    let key = |idx: usize| -> (i64, i64, i64) {
-        let b = idx * 6;
-        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
-        (q(vertices[b]), q(vertices[b + 1]), q(vertices[b + 2]))
-    };
-
-    let mut face_tris: HashMap<u32, Vec<usize>> = HashMap::new();
-    let mut face_sum: HashMap<u32, [f32; 3]> = HashMap::new();
-    for (t, tri) in indices.chunks_exact(3).enumerate() {
-        let fid = face_ids.get(t).copied().unwrap_or(0);
-        face_tris.entry(fid).or_default().push(t);
-        let n = nrm(vertices, tri[0] as usize);
-        let sum = face_sum.entry(fid).or_insert([0.0, 0.0, 0.0]);
-        sum[0] += n[0];
-        sum[1] += n[1];
-        sum[2] += n[2];
-    }
-
-    let mut face_normal: HashMap<u32, [f32; 3]> = HashMap::new();
-    let mut face_flat: HashMap<u32, bool> = HashMap::new();
-    for (&fid, tris) in &face_tris {
-        let Some(avg) = face_sum.get(&fid).and_then(|&n| norm(n)) else {
-            continue;
-        };
-        let flat = tris.iter().all(|&t| {
-            indices[t * 3..t * 3 + 3]
-                .iter()
-                .all(|&vi| dot(avg, nrm(vertices, vi as usize)) > 0.999)
-        });
-        face_normal.insert(fid, avg);
-        face_flat.insert(fid, flat);
-    }
-
-    let mut edge_faces: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<u32>> = HashMap::new();
-    for (t, tri) in indices.chunks_exact(3).enumerate() {
-        let fid = face_ids.get(t).copied().unwrap_or(0);
-        for &(i, j) in &[(0usize, 1usize), (1, 2), (2, 0)] {
-            let (ka, kb) = (key(tri[i] as usize), key(tri[j] as usize));
-            let k = if ka <= kb { (ka, kb) } else { (kb, ka) };
-            let faces = edge_faces.entry(k).or_default();
-            if !faces.contains(&fid) {
-                faces.push(fid);
-            }
-        }
-    }
-
-    let mut neighbours: HashMap<u32, HashSet<u32>> = HashMap::new();
-    for faces in edge_faces.values() {
-        for &a in faces {
-            for &b in faces {
-                if a != b {
-                    neighbours.entry(a).or_default().insert(b);
-                }
-            }
-        }
-    }
-
-    let mut flip_faces = HashSet::new();
-    for (&fid, tris) in &face_tris {
-        if tris.is_empty() || !face_flat.get(&fid).copied().unwrap_or(false) {
-            continue;
-        }
-        let Some(&n) = face_normal.get(&fid) else {
-            continue;
-        };
-
-        let mut opposing = [0.0f32, 0.0, 0.0];
-        let mut opposing_count = 0;
-        for neighbour in neighbours.get(&fid).into_iter().flatten() {
-            if !face_flat.get(neighbour).copied().unwrap_or(false) {
-                continue;
-            }
-            let Some(&nn) = face_normal.get(neighbour) else {
-                continue;
-            };
-            if dot(n, nn) < -0.2 {
-                opposing[0] += nn[0];
-                opposing[1] += nn[1];
-                opposing[2] += nn[2];
-                opposing_count += 1;
-            }
-        }
-
-        if opposing_count >= 2
-            && norm(opposing)
-                .map(|avg| dot(n, avg) < -0.75)
-                .unwrap_or(false)
-        {
-            flip_faces.insert(fid);
-        }
-    }
-
-    for (t, tri) in indices.chunks_exact(3).enumerate() {
-        let fid = face_ids.get(t).copied().unwrap_or(0);
-        if !flip_faces.contains(&fid) {
-            continue;
-        }
-        for &vi in tri {
-            let b = vi as usize * 6;
-            vertices[b + 3] = -vertices[b + 3];
-            vertices[b + 4] = -vertices[b + 4];
-            vertices[b + 5] = -vertices[b + 5];
         }
     }
 }

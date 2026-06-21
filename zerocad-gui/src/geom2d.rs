@@ -236,8 +236,22 @@ fn triangulate_simple(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
         idx.reverse();
     }
 
+    // Holes are spliced in with a zero-width bridge (see `merge_holes`), which
+    // leaves *coincident* vertices (the two ends of each bridge share a position
+    // but have distinct indices). Index-only skipping would let such a duplicate,
+    // sitting exactly on a candidate ear's corner, falsely fail the (inclusive)
+    // containment test and block every ear — stalling onto the force-clip path,
+    // which emits overlapping giant triangles (the "bright corner-to-corner
+    // sliver"). So skip vertices coincident with the ear's corners, and clip
+    // zero-area (collinear / slit-tip) corners for free instead of leaving them
+    // to jam the search.
+    const COINCIDE: f32 = 1e-4;
+    let coincident = |p: egui::Pos2, q: egui::Pos2| {
+        (p.x - q.x).abs() < COINCIDE && (p.y - q.y).abs() < COINCIDE
+    };
+
     let mut guard = 0;
-    while idx.len() > 3 && guard < 20000 {
+    while idx.len() > 3 && guard < 40000 {
         guard += 1;
         let m = idx.len();
         let mut clipped = false;
@@ -248,8 +262,17 @@ fn triangulate_simple(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
             let ic = idx[(i + 1) % m];
             let (a, b, c) = (pts[ia], pts[ib], pts[ic]);
             let cr = poly_cross(a, b, c);
-            if cr <= 0.0 {
-                continue; // reflex/collinear
+            // A (near) zero-area corner is a redundant collinear vertex or a
+            // zero-width slit tip: drop it so the in/out bridge edges merge. It
+            // bounds no area, so removing it can't leave a gap or overlap, and it
+            // unblocks the genuine ears next to it.
+            if cr.abs() <= COINCIDE {
+                idx.remove(i);
+                clipped = true;
+                break;
+            }
+            if cr < 0.0 {
+                continue; // reflex
             }
             // Track the sharpest convex corner as a fallback.
             if best_convex.map_or(true, |(_, bc)| cr > bc) {
@@ -260,7 +283,13 @@ fn triangulate_simple(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
                 if j == ia || j == ib || j == ic {
                     continue;
                 }
-                if point_in_tri(pts[j], a, b, c) {
+                let pj = pts[j];
+                // A vertex sharing a corner's position is part of the boundary
+                // (a bridge duplicate), not interior — don't let it block the ear.
+                if coincident(pj, a) || coincident(pj, b) || coincident(pj, c) {
+                    continue;
+                }
+                if point_in_tri(pj, a, b, c) {
                     contains = true;
                     break;
                 }
@@ -440,6 +469,52 @@ mod tests {
     #[test]
     fn circumcircle_collinear_is_none() {
         assert!(circumcircle((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn fill_square_with_circular_hole_tiles_without_overlap() {
+        use super::{merge_holes, triangulate_simple};
+        use eframe::egui;
+        // A 100×100 square with a centered Ø40 circular hole (48-gon) — the
+        // "circle inside a square" the screenshot flagged. The fill triangles must
+        // tile the annulus exactly: their total area == square − hole, with no
+        // double-covered (bright) slivers (which would push the sum over).
+        let outer = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+            egui::pos2(100.0, 100.0),
+            egui::pos2(0.0, 100.0),
+        ];
+        let hole: Vec<egui::Pos2> = (0..48)
+            .map(|i| {
+                let a = (i as f32 / 48.0) * std::f32::consts::TAU;
+                egui::pos2(50.0 + 20.0 * a.cos(), 50.0 + 20.0 * a.sin())
+            })
+            .collect();
+        let poly = merge_holes(&outer, &[hole.clone()]);
+        let tris = triangulate_simple(&poly);
+        let area = |t: &[egui::Pos2; 3]| {
+            ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                * 0.5
+        };
+        let sum: f32 = tris.iter().map(area).sum();
+        // Hole polygon area (48-gon inscribing-ish): compute exactly from the loop.
+        let hole_area = {
+            let n = hole.len();
+            let mut a = 0.0;
+            for i in 0..n {
+                let p = hole[i];
+                let q = hole[(i + 1) % n];
+                a += p.x * q.y - q.x * p.y;
+            }
+            (a * 0.5).abs()
+        };
+        let expected = 100.0 * 100.0 - hole_area;
+        assert!(
+            (sum - expected).abs() < expected * 0.02,
+            "fill triangles must tile the annulus (sum={sum:.1}, expected={expected:.1}) — \
+             excess area = overlapping bright slivers"
+        );
     }
 }
 

@@ -2,4 +2,5 @@ target/*
 target/debug/*
 /target/debug/deps/*
 /target
+/OpenRCAD/target/*
 *.pdb

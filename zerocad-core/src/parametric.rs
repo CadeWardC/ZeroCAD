@@ -174,6 +174,32 @@ pub struct ParametricGraph {
     /// starts warm); it is a transparent accelerator, never persisted state.
     #[serde(skip)]
     region_cache: RefCell<HashMap<u64, Vec<Region>>>,
+    /// Per-node geometry checkpoints from the previous evaluation, used to skip
+    /// re-solving the unchanged prefix of the feature tree. Each entry holds the
+    /// assembled bodies *after* one node, keyed by a cumulative content hash of
+    /// every input that node's geometry depends on (see [`evaluate_bodies_inner`]).
+    /// When an edit changes only a trailing node — e.g. dragging a fillet/chamfer
+    /// radius — the prefix hashes still match, so the expensive upstream booleans
+    /// are restored from here instead of recomputed every frame. Skipped by serde
+    /// and a transparent accelerator (dropping it only costs a one-time rebuild).
+    #[serde(skip)]
+    eval_cache: RefCell<EvalCache>,
+}
+
+/// Checkpoints of [`evaluate_bodies_inner`], one per processed body node, in
+/// creation order. A pure accelerator — see [`ParametricGraph::eval_cache`].
+#[derive(Debug, Clone, Default)]
+struct EvalCache {
+    checkpoints: Vec<EvalCheckpoint>,
+}
+
+/// The assembled bodies and accumulated warnings immediately after one node was
+/// applied, tagged with the cumulative hash of all geometry inputs up to it.
+#[derive(Debug, Clone)]
+struct EvalCheckpoint {
+    key: u64,
+    live: Vec<LiveBody>,
+    warnings: Vec<String>,
 }
 
 impl ParametricGraph {
@@ -182,6 +208,7 @@ impl ParametricGraph {
             graph: DiGraph::new(),
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
+            eval_cache: RefCell::new(EvalCache::default()),
         };
         pg.bootstrap_origin();
         pg
@@ -358,14 +385,38 @@ impl ParametricGraph {
         // depth and sketch dimensions alike) sees the current variable values.
         let vars = self.variable_map();
         let sketch_cache = self.sketch_region_cache(&vars);
-        let mut live: Vec<LiveBody> = Vec::new();
-        let mut warnings: Vec<String> = Vec::new();
 
-        for idx in self.body_nodes_in_creation_order() {
-            let node = &self.graph[idx];
-            if hidden.contains(&node.id) {
+        // Body-eval nodes in creation order, with a cumulative content hash after
+        // each one (see [`eval_prefix_keys`]). An edit that touches only a trailing
+        // node — dragging a fillet/chamfer radius, say — leaves every earlier key
+        // identical, so the matching prefix (and its expensive booleans) is
+        // restored from the previous evaluation instead of recomputed.
+        let nodes: Vec<NodeIndex> = self.body_nodes_in_creation_order();
+        let keys = self.eval_prefix_keys(&nodes, hidden, &vars);
+
+        let (mut live, mut warnings, reuse, mut checkpoints) = {
+            let cache = self.eval_cache.borrow();
+            let cps = &cache.checkpoints;
+            let mut m = 0;
+            while m < keys.len() && m < cps.len() && keys[m] == cps[m].key {
+                m += 1;
+            }
+            if m > 0 {
+                let cp = &cps[m - 1];
+                (cp.live.clone(), cp.warnings.clone(), m, cps[..m].to_vec())
+            } else {
+                (Vec::new(), Vec::new(), 0usize, Vec::new())
+            }
+        };
+
+        for (i, &idx) in nodes.iter().enumerate() {
+            // Reused prefix: its checkpoints (and so its `live`/`warnings`) were
+            // restored above; skip recomputing it.
+            if i < reuse {
                 continue;
             }
+            let node = &self.graph[idx];
+            if !hidden.contains(&node.id) {
             match &node.feature {
                 FeatureType::Box { w, h, d } => {
                     live.push(LiveBody {
@@ -453,9 +504,69 @@ impl ParametricGraph {
                 }
                 _ => {}
             }
+            }
+            // Snapshot the assembled bodies after this node so a later evaluation
+            // that shares this prefix can resume from here.
+            checkpoints.push(EvalCheckpoint {
+                key: keys[i],
+                live: live.clone(),
+                warnings: warnings.clone(),
+            });
         }
 
+        *self.eval_cache.borrow_mut() = EvalCache { checkpoints };
+
         Ok((tessellate_bodies(live), warnings))
+    }
+
+    /// Cumulative content hash of the geometry inputs for each node in `nodes`,
+    /// in order — `keys[i]` covers nodes `0..=i`. Folds `vars` (the seed, so any
+    /// variable change invalidates everything), then per node its id, hidden
+    /// state, feature, and its inputs' features (e.g. an extrude's parent sketch).
+    /// Two evaluations agree on a prefix exactly when the geometry of that prefix
+    /// is identical, which is what makes reusing a cached checkpoint sound.
+    /// Hashing only — no geometry is built here.
+    ///
+    /// NOTE: the `draft` flag is deliberately NOT folded in — it is currently a
+    /// no-op (`apply_edge_mod` ignores it), so draft previews and committed
+    /// rebuilds produce identical geometry and should share cached checkpoints. If
+    /// `draft` is ever made to change geometry again (e.g. a faceted draft fillet),
+    /// it MUST be folded into the seed here, or a draft preview would serve a
+    /// committed body's cached result (and vice versa).
+    fn eval_prefix_keys(
+        &self,
+        nodes: &[NodeIndex],
+        hidden: &std::collections::HashSet<String>,
+        vars: &HashMap<String, f64>,
+    ) -> Vec<u64> {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut kv: Vec<(&String, &f64)> = vars.iter().collect();
+        kv.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in kv {
+            h.write(k.as_bytes());
+            h.write_u8(0xff);
+            h.write_u64(v.to_bits());
+        }
+
+        let mut keys = Vec::with_capacity(nodes.len());
+        for &idx in nodes {
+            let node = &self.graph[idx];
+            h.write(node.id.as_bytes());
+            h.write_u8(hidden.contains(&node.id) as u8);
+            fold_feature(&mut h, &node.feature);
+            // An input node's geometry feeds this one (an extrude reads its parent
+            // sketch's plane + curves), so a change there must invalidate from here.
+            for p in self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+            {
+                let pn = &self.graph[p];
+                h.write(pn.id.as_bytes());
+                fold_feature(&mut h, &pn.feature);
+            }
+            keys.push(h.finish());
+        }
+        keys
     }
 
     /// Detect (or fetch from the region cache) the planar regions of every
@@ -673,6 +784,7 @@ fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> {
 /// holds the analytic mesh while the body is untouched by any boolean, so plain
 /// bodies keep their nice hidden-line wireframes. A boolean clears it, forcing a
 /// fresh tessellation from `parts`.
+#[derive(Debug, Clone)]
 struct LiveBody {
     id: String,
     parts: Vec<KernelSolid>,
@@ -704,6 +816,19 @@ fn hash_curves(c: &SketchCurves) -> u64 {
         }
     }
     h.finish()
+}
+
+/// Fold a feature into the running [`eval_prefix_keys`] hash via its serde form.
+/// JSON of a given value is deterministic across frames (identical floats format
+/// identically), so two bit-identical features hash equal — exactly when they
+/// build identical geometry. A trailing separator keeps adjacent fields from
+/// running together. Serialization can't realistically fail here; if it ever did,
+/// skipping the bytes only risks a missed invalidation, never a crash.
+fn fold_feature(h: &mut impl Hasher, f: &FeatureType) {
+    if let Ok(bytes) = serde_json::to_vec(f) {
+        h.write(&bytes);
+    }
+    h.write_u8(0xfe);
 }
 
 /// How far a tool overshoots the sketch plane to break coplanarity, in mm.
@@ -949,17 +1074,18 @@ fn apply_cut(
                     continue;
                 }
                 // Exact first (precise pocket), then the expanded fallback that
-                // breaks wall-coplanarity. Both None → keep the part intact.
+                // breaks wall-coplanarity. Both use the body-splitting difference,
+                // so a cut that severs the part (slices it in two) yields separate
+                // parts instead of one shell holding both lumps. Both None → keep
+                // the part intact.
                 let cut_parts = tool
                     .exact
                     .as_ref()
-                    .and_then(|t| crate::mock_kernel::difference(&part, t))
-                    .map(|d| vec![d])
+                    .and_then(|t| crate::mock_kernel::difference_bodies(&part, t))
                     .or_else(|| {
                         tool.expanded
                             .as_ref()
-                            .and_then(|t| crate::mock_kernel::difference(&part, t))
-                            .map(|d| vec![d])
+                            .and_then(|t| crate::mock_kernel::difference_bodies(&part, t))
                     })
                     .or_else(|| {
                         tool.exact
@@ -1067,21 +1193,6 @@ fn apply_edge_mod(
     }
 }
 
-/// Largest `dist` allowed before a fillet/chamfer would over-run the part: half
-/// its smallest AABB dimension (a blend rolling in from both faces meets in the
-/// middle there). Mirrors OpenRCAD's `ParameterTooLarge` bound.
-fn edge_mod_fits(part: &KernelSolid, dist: f32) -> bool {
-    match crate::mock_kernel::solid_aabb(part) {
-        Some((lo, hi)) => {
-            let min_dim = (0..3)
-                .map(|k| hi[k] - lo[k])
-                .fold(f32::INFINITY, f32::min);
-            dist < min_dim * 0.5
-        }
-        None => true,
-    }
-}
-
 /// Native rolling-ball fillet of the captured edge on every part of `body`.
 fn apply_fillet(
     mod_id: &str,
@@ -1093,9 +1204,14 @@ fn apply_fillet(
     let mut applied = false;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
     for part in body.parts.drain(..) {
-        let rounded = edge_mod_fits(&part, dist)
-            .then(|| crate::mock_kernel::fillet_edge(&part, edge.p0, edge.p1, dist))
-            .flatten();
+        // No pre-size gate: the kernel's rolling-ball blend rejects a radius too
+        // large for the local geometry (a non-watertight result → `None`), which
+        // is the correct, geometry-aware bound. The old global-AABB heuristic was
+        // both wrong (it measured the part's *thinnest* axis, not the filleted
+        // edge's adjacent-face extents, so it blocked radii the kernel handles)
+        // and asymmetric — chamfer never had it, which is why a radius would
+        // chamfer but refuse to fillet.
+        let rounded = crate::mock_kernel::fillet_edge(&part, edge.p0, edge.p1, dist);
         match rounded {
             Some(f) => {
                 applied = true;
@@ -1493,6 +1609,89 @@ mod extrude_mode_tests {
         assert_eq!(first.len(), 1, "a rectangle is exactly one region");
     }
 
+    /// Overwrite an edge-mod node's distance in place — mimics a fillet/chamfer
+    /// radius drag, which changes only that trailing node.
+    fn set_edge_mod_dist(g: &mut ParametricGraph, id: &str, new_dist: f32) {
+        let idx = g.node_map[id];
+        if let FeatureType::EdgeMod { dist, .. } = &mut g.graph[idx].feature {
+            *dist = new_dist;
+        }
+    }
+
+    /// A flat (id, vertex bytes, index) summary for exact mesh comparison.
+    fn mesh_digest(bodies: &[(String, MockMesh)]) -> Vec<(String, Vec<u32>, Vec<u32>)> {
+        bodies
+            .iter()
+            .map(|(id, m)| {
+                (
+                    id.clone(),
+                    m.vertices.iter().map(|f| f.to_bits()).collect(),
+                    m.indices.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn eval_cache_matches_cold_eval_after_radius_drag() {
+        // The prefix cache is a pure accelerator: re-evaluating after changing only
+        // a trailing edge-mod (a radius drag) must yield byte-identical geometry to
+        // a freshly built graph at the same final state — never a stale prefix.
+        let empty = std::collections::HashSet::new();
+
+        let mut warm = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+        // Warm the cache at radius 2.0, then "drag" to 3.0 and re-evaluate (the box
+        // prefix is reused from the checkpoint; only the fillet re-runs).
+        let _ = warm.evaluate_bodies_with_warnings(&empty).unwrap();
+        set_edge_mod_dist(&mut warm, "edgemod_2", 3.0);
+        let (warm_bodies, warm_warn) = warm.evaluate_bodies_with_warnings(&empty).unwrap();
+
+        // Cold: an identical graph at radius 3.0 with an empty cache.
+        let cold = box_with_edge_mod(3.0, crate::sketch::CornerKind::Fillet);
+        let (cold_bodies, cold_warn) = cold.evaluate_bodies_with_warnings(&empty).unwrap();
+
+        assert_eq!(
+            mesh_digest(&warm_bodies),
+            mesh_digest(&cold_bodies),
+            "cached re-eval after a radius drag must match a cold rebuild exactly"
+        );
+        assert_eq!(warm_warn, cold_warn, "warnings must match the cold rebuild too");
+    }
+
+    #[test]
+    fn eval_cache_is_invalidated_when_an_upstream_node_changes() {
+        // Changing an *upstream* dimension (the box size) must not serve a stale
+        // cached body — the prefix key changes, forcing a rebuild that matches cold.
+        let empty = std::collections::HashSet::new();
+        let mut g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+        let _ = g.evaluate_bodies_with_warnings(&empty).unwrap();
+
+        // Grow the box: this is the very first node, so nothing downstream can be
+        // reused.
+        let box_idx = g.node_map["box_1"];
+        if let FeatureType::Box { w, h, d } = &mut g.graph[box_idx].feature {
+            *w = 20.0;
+            *h = 20.0;
+            *d = 20.0;
+        }
+        let (warm_bodies, _) = g.evaluate_bodies_with_warnings(&empty).unwrap();
+
+        let mut cold = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+        let cold_idx = cold.node_map["box_1"];
+        if let FeatureType::Box { w, h, d } = &mut cold.graph[cold_idx].feature {
+            *w = 20.0;
+            *h = 20.0;
+            *d = 20.0;
+        }
+        let (cold_bodies, _) = cold.evaluate_bodies_with_warnings(&empty).unwrap();
+
+        assert_eq!(
+            mesh_digest(&warm_bodies),
+            mesh_digest(&cold_bodies),
+            "an upstream change must invalidate the cache, not serve stale geometry"
+        );
+    }
+
     fn box_with_edge_mod(dist: f32, kind: crate::sketch::CornerKind) -> ParametricGraph {
         let mut g = ParametricGraph::new();
         // A 10×10×10 block, one corner at the origin.
@@ -1525,6 +1724,258 @@ mod extrude_mode_tests {
         });
         g.add_dependency("box_1", "edgemod_2");
         g
+    }
+
+    fn add_sketch_cs(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: SketchCurves) {
+        g.add_feature(FeatureNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            feature: FeatureType::Sketch {
+                cs,
+                curves,
+                shapes: vec![],
+                corner_mods: vec![],
+                on_face: false,
+            },
+        });
+    }
+
+    #[test]
+    fn rect_with_circular_hole_newbody_renders() {
+        // The "plate with a hole vanishes on commit" case: a rectangle with a circle
+        // inside, extruded as a New Body. detect_regions yields 2 regions — the
+        // annulus (rect ⊖ circle) and the inner disk. take_all, region 0, and
+        // region 1 must each produce a visible (non-empty) body.
+        let mut g = ParametricGraph::new();
+        let mut curves = SketchCurves::new();
+        curves.add_rectangle((0.0, 0.0), (40.0, 30.0));
+        curves.add_circle((20.0, 15.0), 8.0);
+        assert_eq!(g.cached_regions(&curves).len(), 2, "rect+circle = annulus + disk");
+
+        add_sketch(&mut g, "sketch_1", curves);
+        add_extrude(&mut g, "extrude_2", "sketch_1", 11.62, ExtrudeMode::NewBody);
+        let (bodies, _) = g
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .map(|b| (b, ()))
+            .unwrap();
+        assert!(!bodies.is_empty(), "rect+hole New Body must not vanish");
+        assert!(bodies.iter().all(|(_, m)| !m.indices.is_empty()));
+
+        // Each individual region selection must also render a body.
+        for sel in [vec![0usize], vec![1]] {
+            let mut g2 = ParametricGraph::new();
+            let mut c2 = SketchCurves::new();
+            c2.add_rectangle((0.0, 0.0), (40.0, 30.0));
+            c2.add_circle((20.0, 15.0), 8.0);
+            add_sketch(&mut g2, "s", c2);
+            g2.add_feature(FeatureNode {
+                id: "e".to_string(),
+                name: "e".to_string(),
+                feature: FeatureType::Extrude {
+                    depth: 11.62,
+                    region_indices: sel.clone(),
+                    mode: ExtrudeMode::NewBody,
+                    depth_expr: None,
+                },
+            });
+            g2.add_dependency("s", "e");
+            let b2 = g2.evaluate_bodies(&std::collections::HashSet::new()).unwrap();
+            let tris: usize = b2.iter().map(|(_, m)| m.indices.len() / 3).sum();
+            assert!(tris > 0, "region selection {sel:?} must render a body, got {tris} tris");
+        }
+    }
+
+    #[test]
+    fn edge_mod_on_sketched_prism_applies() {
+        // The screenshots' box is a sketch→extrude prism (build_extrusion_solid),
+        // not a make_box. Both chamfer AND fillet must apply to a top edge of such a
+        // prism (pre-fix the fillet failed because the sewn top cap stored an inward
+        // normal).
+        for kind in [crate::sketch::CornerKind::Chamfer, crate::sketch::CornerKind::Fillet] {
+            let mut g = ParametricGraph::new();
+            add_sketch(&mut g, "s", rect_sketch((0.0, 0.0), (40.0, 30.0)));
+            add_extrude(&mut g, "e", "s", 20.0, ExtrudeMode::NewBody);
+            // Top-front edge of the prism: from (0,0,20) to (40,0,20); adjacent
+            // faces are +Z (top) and -Y (front).
+            g.add_feature(FeatureNode {
+                id: "em".to_string(),
+                name: "Edge Mod".to_string(),
+                feature: FeatureType::EdgeMod {
+                    target: "e".to_string(),
+                    edge: EdgeRef {
+                        p0: [0.0, 0.0, 20.0],
+                        p1: [40.0, 0.0, 20.0],
+                        n1: [0.0, 0.0, 1.0],
+                        n2: [0.0, -1.0, 0.0],
+                    },
+                    dist: 2.11,
+                    dist_expr: None,
+                    kind,
+                },
+            });
+            g.add_dependency("e", "em");
+            let mut hidden = std::collections::HashSet::new();
+            hidden.insert("s".to_string());
+            let (bodies, warnings) = g.evaluate_bodies_with_warnings(&hidden).unwrap();
+            assert_eq!(bodies.len(), 1, "{kind:?} on a prism must stay one body");
+            assert!(warnings.is_empty(), "{kind:?} on a clean prism edge should not warn, got {warnings:?}");
+            // The top-front sharp edge (y=0, z=20) must be gone — the edge-mod applied.
+            let m = &bodies[0].1;
+            let sharp = m.vertices.chunks(6).any(|v| v[1].abs() < 0.02 && (v[2] - 20.0).abs() < 0.02);
+            assert!(!sharp, "{kind:?} should have removed the prism's top-front edge");
+        }
+    }
+
+    #[test]
+    fn prism_box_cut_and_join_a_cylinder_through_top() {
+        use crate::geometry::Vec3;
+        // Full parametric repro of the screenshots: a sketch→extrude PRISM box,
+        // then a circle on its top face (a) Cut downward through it and (b) Joined
+        // upward as a boss. The cut must actually bore a hole (many more tris than
+        // the plain box) and the join must add the boss (reaches z≈23), each one
+        // body with no warning.
+        let make_base = || {
+            let mut g = ParametricGraph::new();
+            add_sketch(&mut g, "s_base", rect_sketch((0.0, 0.0), (40.0, 20.0)));
+            add_extrude(&mut g, "e_base", "s_base", 15.0, ExtrudeMode::NewBody);
+            g
+        };
+        let plain_tris = make_base()
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap()[0]
+            .1
+            .indices
+            .len()
+            / 3;
+        let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, 15.0), Vec3::X, Vec3::Y);
+
+        // CUT through the top.
+        let mut gc = make_base();
+        let mut cc = SketchCurves::new();
+        cc.add_circle((20.0, 10.0), 4.0);
+        add_sketch_cs(&mut gc, "s_cut", top, cc);
+        add_extrude(&mut gc, "e_cut", "s_cut", -16.62, ExtrudeMode::Cut);
+        gc.add_dependency("e_base", "e_cut");
+        let (cb, cw) = gc.evaluate_bodies_with_warnings(&std::collections::HashSet::new()).unwrap();
+        assert_eq!(cb.len(), 1, "cut stays one body");
+        assert!(cw.is_empty(), "a clean drill-through should not warn, got {cw:?}");
+        assert!(
+            cb[0].1.indices.len() / 3 > plain_tris + 6,
+            "cut must bore a hole (more tris than the plain box={plain_tris})"
+        );
+
+        // JOIN a boss on top.
+        let mut gj = make_base();
+        let mut jc = SketchCurves::new();
+        jc.add_circle((20.0, 10.0), 4.0);
+        add_sketch_cs(&mut gj, "s_join", top, jc);
+        add_extrude(&mut gj, "e_join", "s_join", 8.0, ExtrudeMode::Join);
+        gj.add_dependency("e_base", "e_join");
+        let (jb, jw) = gj.evaluate_bodies_with_warnings(&std::collections::HashSet::new()).unwrap();
+        assert_eq!(jb.len(), 1, "join stays one body");
+        assert!(jw.is_empty(), "a clean boss join should not warn, got {jw:?}");
+        let max_z = jb.iter().flat_map(|(_, m)| m.vertices.chunks(6)).map(|v| v[2]).fold(f32::MIN, f32::max);
+        assert!(max_z >= 22.9, "join must add the boss (top z≈23), got {max_z}");
+    }
+
+    #[test]
+    fn join_circle_boss_on_top_survives() {
+        use crate::geometry::Vec3;
+        // A 10×10×10 box, then a Ø6 circular boss sketched on its top face (z=10)
+        // and joined upward 5mm — the "boss on a face" case from the screenshots,
+        // where the boss base is coplanar with the box top and the boss is now a
+        // smooth analytic cylinder. The boss must survive: one body, top near z=15.
+        let mut g = ParametricGraph::new();
+        g.add_feature(FeatureNode {
+            id: "box_1".to_string(),
+            name: "Box".to_string(),
+            feature: FeatureType::Box { w: 10.0, h: 10.0, d: 10.0 },
+        });
+        let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, 10.0), Vec3::X, Vec3::Y);
+        let mut circ = SketchCurves::new();
+        circ.add_circle((5.0, 5.0), 3.0);
+        add_sketch_cs(&mut g, "sketch_2", top, circ);
+        add_extrude(&mut g, "extrude_3", "sketch_2", 5.0, ExtrudeMode::Join);
+        g.add_dependency("box_1", "extrude_3");
+
+        let (bodies, warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(bodies.len(), 1, "boss-join must stay one body, got {}", bodies.len());
+        assert!(warnings.is_empty(), "a coplanar boss join should not warn, got {warnings:?}");
+        let max_z = bodies[0].1.vertices.chunks(6).map(|v| v[2]).fold(f32::MIN, f32::max);
+        assert!(max_z >= 14.9, "joined boss must reach z≈15 (top of boss), got {max_z}");
+    }
+
+    fn box_with_boss_then_edge_mod(dist: f32, kind: crate::sketch::CornerKind) -> ParametricGraph {
+        use crate::geometry::Vec3;
+        // 10³ box + a Ø6 boss joined on top (z=10..15), then a fillet/chamfer on a
+        // *bottom* box edge (well clear of the boss). Exercises an edge-mod on a
+        // boolean-union body whose top is now a smooth analytic cylinder.
+        let mut g = ParametricGraph::new();
+        g.add_feature(FeatureNode {
+            id: "box_1".to_string(),
+            name: "Box".to_string(),
+            feature: FeatureType::Box { w: 10.0, h: 10.0, d: 10.0 },
+        });
+        let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, 10.0), Vec3::X, Vec3::Y);
+        let mut circ = SketchCurves::new();
+        circ.add_circle((5.0, 5.0), 3.0);
+        add_sketch_cs(&mut g, "sketch_2", top, circ);
+        add_extrude(&mut g, "extrude_3", "sketch_2", 5.0, ExtrudeMode::Join);
+        g.add_dependency("box_1", "extrude_3");
+        g.add_feature(FeatureNode {
+            id: "edgemod_4".to_string(),
+            name: "Edge Mod".to_string(),
+            feature: FeatureType::EdgeMod {
+                target: "box_1".to_string(),
+                edge: EdgeRef {
+                    p0: [0.0, 0.0, 0.0],
+                    p1: [10.0, 0.0, 0.0],
+                    n1: [0.0, 0.0, -1.0],
+                    n2: [0.0, -1.0, 0.0],
+                },
+                dist,
+                dist_expr: None,
+                kind,
+            },
+        });
+        g.add_dependency("extrude_3", "edgemod_4");
+        g
+    }
+
+    #[test]
+    fn edge_mod_on_boss_union_body_keeps_boss() {
+        for kind in [crate::sketch::CornerKind::Chamfer, crate::sketch::CornerKind::Fillet] {
+            let g = box_with_boss_then_edge_mod(2.0, kind);
+            let (bodies, _warnings) = g
+                .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+                .unwrap();
+            assert_eq!(bodies.len(), 1, "{kind:?} on union body must stay one body");
+            let m = &bodies[0].1;
+            let max_z = m.vertices.chunks(6).map(|v| v[2]).fold(f32::MIN, f32::max);
+            assert!(max_z >= 14.9, "{kind:?} must preserve the boss (top z≈15), got {max_z}");
+            // The modified bottom-front corner must not still be sharp.
+            let sharp = m.vertices.chunks(6).any(|v| v[1].abs() < 0.01 && v[2].abs() < 0.01);
+            assert!(!sharp, "{kind:?} should have removed the y=0,z=0 corner");
+        }
+    }
+
+    #[test]
+    fn chamfer_large_radius_stays_in_bounds() {
+        // A 6.48mm chamfer on a 10mm box edge (the screenshot's value). Big, but
+        // valid — must bevel the corner, not produce a runaway wedge.
+        let g = box_with_edge_mod(6.48, crate::sketch::CornerKind::Chamfer);
+        let (bodies, _warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        let mesh = &bodies[0].1;
+        let inside = mesh.vertices.chunks(6).all(|v| {
+            (-0.5..=10.5).contains(&v[0])
+                && (-0.5..=10.5).contains(&v[1])
+                && (-0.5..=10.5).contains(&v[2])
+        });
+        assert!(inside, "large chamfer flew vertices outside the 10³ block (runaway wedge)");
     }
 
     #[test]
