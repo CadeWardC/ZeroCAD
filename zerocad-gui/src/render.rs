@@ -811,13 +811,28 @@ impl ZeroCadApp {
         // Self-occlusion guard: an edge lies ON its own faces, so only a face
         // nearer by more than this hides it. Scaled to the model's depth span.
         let occ_bias = ((depth_max - depth_min) * 0.01).max(0.02);
+        // Does this one cell hold a face nearer than the edge point?
+        let cell_occludes = |cx: i32, cy: i32, sd: f32| -> bool {
+            if cx < 0 || cy < 0 || cx as usize >= occ_w || cy as usize >= occ_h {
+                return false; // off-buffer ⇒ background ⇒ not occluding
+            }
+            zbuf[cy as usize * occ_w + cx as usize] > sd + occ_bias
+        };
+        // A point is hidden only if its cell AND its four orthogonal neighbours are
+        // all covered by a nearer face. A ~2px occlusion cell straddling a curved
+        // silhouette captures the surface's near bulge just inside the outline, so a
+        // single-cell test reads the *visible* silhouette as "occluded" and dashes
+        // it (the reported dotted cylinder outline). Requiring the neighbourhood to
+        // agree lets the background-side neighbour keep the silhouette drawn, while a
+        // truly buried edge — covered on every side — still hides correctly.
         let occluded = |sx: f32, sy: f32, sd: f32| -> bool {
             let cx = ((sx - rect.min.x) / occ_cell) as i32;
             let cy = ((sy - rect.min.y) / occ_cell) as i32;
-            if cx < 0 || cy < 0 || cx as usize >= occ_w || cy as usize >= occ_h {
-                return false;
-            }
-            zbuf[cy as usize * occ_w + cx as usize] > sd + occ_bias
+            cell_occludes(cx, cy, sd)
+                && cell_occludes(cx - 1, cy, sd)
+                && cell_occludes(cx + 1, cy, sd)
+                && cell_occludes(cx, cy - 1, sd)
+                && cell_occludes(cx, cy + 1, sd)
         };
         let faces_camera = |n: (f32, f32, f32)| -> bool {
             let rz_n = sin_y * n.0 + cos_y * n.2;
@@ -967,7 +982,24 @@ impl ZeroCadApp {
 
                 match *pick {
                     BodyPick::Face(fid) => fill_face(Some(fid)),
-                    BodyPick::Edge(e) => highlight_edge(&painter, e as usize),
+                    BodyPick::Edge(g) => {
+                        // `g` is a topological edge group: light up every chord that
+                        // belongs to it so a whole fillet arc / rim draws as one
+                        // curve. A legacy mesh without grouping treats `g` as the
+                        // raw segment index (one chord).
+                        let ecount = mesh.edge_indices.len() / 2;
+                        if mesh.edge_groups.is_empty() {
+                            if (g as usize) < ecount {
+                                highlight_edge(&painter, g as usize);
+                            }
+                        } else {
+                            for seg in 0..ecount {
+                                if mesh.edge_groups.get(seg).copied() == Some(g) {
+                                    highlight_edge(&painter, seg);
+                                }
+                            }
+                        }
+                    }
                     BodyPick::Vertex(v) => {
                         let i = v as usize * 3;
                         if i + 2 < mesh.edge_vertices.len() {

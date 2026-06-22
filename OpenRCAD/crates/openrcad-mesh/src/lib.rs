@@ -215,7 +215,12 @@ pub fn tessellate(solid: &openrcad_topo::Solid, chord_err: f64, _angle_err: f64)
         .map(|(i, face)| triangulate::tessellate_face_local(face, chord_err, i as u32))
         .collect();
 
-    triangulate::combine(&meshes)
+    let mut combined = triangulate::combine(&meshes);
+    // Stitch lens cracks where two faces sampled a shared boundary differently
+    // (e.g. a fillet end cap chorded on the cylinder side, arced on the planar
+    // side) so the render/STL mesh is gap-free, not just the B-Rep.
+    triangulate::stitch_boundary_lenses(&mut combined);
+    combined
 }
 
 #[cfg(test)]

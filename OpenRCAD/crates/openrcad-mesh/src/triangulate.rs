@@ -449,9 +449,21 @@ pub fn sample_interior_points(
 ) -> Vec<Pnt2d> {
     let mut points = Vec::new();
 
+    // Cylinder and cone are RULED along v (straight lines), so interior samples add
+    // no shape accuracy — the v-boundary curves already pin the surface. But a few
+    // interior vertices still matter for *shading* (per-vertex normals along the
+    // round) and to give the Delaunay non-collinear points to triangulate the
+    // end-cap arcs against. The catch is the old full-width row: an interior point
+    // sampled right up against a tangent boundary routes that straight boundary's
+    // triangulation through it, bowing the tangent line off true and cracking it
+    // against the flat neighbour (the reported fillet "white line"). So for ruled
+    // surfaces the u samples are inset to the central band, well clear of both
+    // tangents — `u_inset` below.
+    let mut u_inset = 0.0;
     let (u_divs, v_divs) = match surf {
         GeomSurface::Plane(_) => (0, 0),
         GeomSurface::Cylinder(cyl) => {
+            u_inset = 0.25;
             let r = cyl.radius();
             let theta = 2.0 * (2.0 * chord_err / r).sqrt();
             let span = u_max - u_min;
@@ -468,6 +480,7 @@ pub fn sample_interior_points(
             (nu, nv)
         }
         GeomSurface::Cone(cone) => {
+            u_inset = 0.25;
             let r1 = cone.radius_at(v_min).abs();
             let r2 = cone.radius_at(v_max).abs();
             let r = f64::max(r1, r2);
@@ -499,7 +512,10 @@ pub fn sample_interior_points(
 
     if u_divs > 0 {
         for i in 1..u_divs {
-            let t_u = i as f64 / u_divs as f64;
+            // `u_inset` (ruled surfaces) maps the samples into the central band
+            // [u_inset, 1-u_inset] so none sits against a tangent boundary.
+            let t_raw = i as f64 / u_divs as f64;
+            let t_u = u_inset + t_raw * (1.0 - 2.0 * u_inset);
             let u = u_min + t_u * (u_max - u_min);
             if v_divs > 0 {
                 for j in 1..v_divs {
@@ -775,6 +791,54 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         });
     }
 
+    // A convex planar face whose boundary is a finely-sampled curve — a circular
+    // cap, a bored-hole rim — has many near-cocircular boundary points. Bowyer–
+    // Watson on those alone is numerically ambiguous and can leave a sliver "flap"
+    // triangle that chords the disc, cracking it against the cylinder wall (two
+    // single-referenced edges). For exactly this shape — one convex loop, no
+    // holes, many points — fan it from the centroid instead: a plane is flat so
+    // the fan is exact, the rim sub-edges stay identical to the wall's (no crack),
+    // and the spokes are interior. Everything else keeps the Delaunay path.
+    if matches!(surface, GeomSurface::Plane(_)) && loops_2d.len() == 1 && outer_pts.len() >= 10 {
+        let n = outer_pts.len();
+        let cu = outer_pts.iter().map(|p| p.x()).sum::<f64>() / n as f64;
+        let cv = outer_pts.iter().map(|p| p.y()).sum::<f64>() / n as f64;
+        // Only a genuinely (near-)cocircular boundary — a real circular cap or
+        // hole rim — triggers the Bowyer–Watson degeneracy this works around. A
+        // rounded rectangle (a filleted box side face) is convex and may reach 10
+        // points too, but its boundary points sit at wildly varying radii, and the
+        // Delaunay handles it cleanly; fanning it from the centroid would chord its
+        // straight edges and mismatch the neighbours. So require uniform radius.
+        let radii: Vec<f64> = outer_pts
+            .iter()
+            .map(|p| ((p.x() - cu).powi(2) + (p.y() - cv).powi(2)).sqrt())
+            .collect();
+        let mean_r = radii.iter().sum::<f64>() / n as f64;
+        let cocircular = mean_r > 1e-9
+            && radii.iter().all(|r| (r - mean_r).abs() <= 0.06 * mean_r);
+        if cocircular {
+            let c_id = all_points_2d.len();
+            all_points_2d.push(Pnt2d::new(cu, cv));
+            all_points_3d.push(surface.point(cu, cv));
+
+            let wants_ccw = face.orientation() != Orientation::Reversed;
+            let ring = &loops_2d[0];
+            let mut triangles = Vec::with_capacity(n);
+            for i in 0..n {
+                let ia = ring[i];
+                let ib = ring[(i + 1) % n];
+                let tri_ccw = ccw(all_points_2d[ia], all_points_2d[ib], all_points_2d[c_id]) > 0.0;
+                if tri_ccw == wants_ccw {
+                    triangles.push([ia as u32, ib as u32, c_id as u32]);
+                } else {
+                    triangles.push([ia as u32, c_id as u32, ib as u32]);
+                }
+            }
+            let face_ids = vec![face_index; triangles.len()];
+            return TriangleMesh::from_buffers_with_faces(all_points_3d, triangles, face_ids);
+        }
+    }
+
     // 3. Delaunay Triangulation in 2D, with trimming-loop edges recovered.
     let mut constraints = Vec::new();
     for loop_indices in &loops_2d {
@@ -864,6 +928,319 @@ pub fn combine(meshes: &[TriangleMesh]) -> TriangleMesh {
     }
 
     TriangleMesh::from_buffers_with_faces(all_vertices, all_triangles, all_face_ids)
+}
+
+/// Close tessellation cracks where one face *chords* a shared boundary that its
+/// neighbour *subdivides*.
+///
+/// Adjacent faces sample a shared curved boundary independently. A face whose
+/// (u, v) image of that boundary is a straight parameter line — e.g. a cylinder
+/// fillet's end cap, where the 3D arc maps to `v = const` — can only chord it
+/// (its collinear boundary points triangulate to degenerate slivers that get
+/// dropped), while the neighbour that sees the true arc (a planar side face)
+/// fans it with the full vertex chain. After welding, the chord is referenced by
+/// one triangle and the arc by the other, so the lens between them is a hole — a
+/// bright crack on screen and a leak in exported STL.
+///
+/// For every boundary edge (the *chord*) it finds the complementary chain of
+/// boundary edges spanning the same two endpoints (the *arc* the neighbour
+/// subdivided) and re-fans the chord's triangle through that chain, so both
+/// faces share the same sub-edges. It is purely topological — it threads the
+/// already-present, welded boundary vertices — so it adds no geometry and only
+/// subdivides an existing triangle; the inserted vertices lie on the true
+/// surface (the neighbour put them there), so nothing is distorted.
+///
+/// The chord is identified geometrically (it is the long edge the arc shortcuts;
+/// the arc stays close to it) rather than by face-id bookkeeping, so it is robust
+/// to any boundary topology — open arc chains, lens loops where the chord is
+/// *also* a single boundary edge, T-junctions where the neighbour's points lie
+/// **on** the chord, and cracks on extruded-prism or boolean (boss-union) bodies
+/// alike. On a closed solid the result has zero single-referenced edges.
+pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
+    use std::collections::VecDeque;
+    let key = |a: u32, b: u32| if a <= b { (a, b) } else { (b, a) };
+
+    // Shortest boundary path a..b that does NOT use the direct a–b hop — i.e. the
+    // arc the chord shortcuts. `None` if a and b are only directly connected.
+    let boundary_path = |adj: &HashMap<u32, Vec<u32>>, a: u32, b: u32| -> Option<Vec<u32>> {
+        let mut prev: HashMap<u32, u32> = HashMap::new();
+        let mut visited: HashSet<u32> = HashSet::new();
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        visited.insert(a);
+        queue.push_back(a);
+        while let Some(u) = queue.pop_front() {
+            for &w in adj.get(&u).into_iter().flatten() {
+                if u == a && w == b {
+                    continue; // forbid the direct chord edge
+                }
+                if w == a || visited.contains(&w) {
+                    continue;
+                }
+                visited.insert(w);
+                prev.insert(w, u);
+                if w == b {
+                    let mut path = vec![b];
+                    let mut cur = b;
+                    while cur != a {
+                        cur = prev[&cur];
+                        path.push(cur);
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                queue.push_back(w);
+            }
+        }
+        None
+    };
+
+    // One stitch pass can expose another (nested lenses); a few passes converge.
+    for _ in 0..6 {
+        // Edge -> the triangles using it. On a closed solid a boundary edge (used
+        // once) is a crack; the chord that shortcuts it is shared (used 2+).
+        let mut edge_tris: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (ti, t) in mesh.triangles.iter().enumerate() {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                edge_tris.entry(key(a, b)).or_default().push(ti);
+            }
+        }
+        let mut boundary: Vec<(u32, u32)> = edge_tris
+            .iter()
+            .filter(|(_, v)| v.len() == 1)
+            .map(|(&k, _)| k)
+            .collect();
+        if boundary.is_empty() {
+            break;
+        }
+        // Adjacency over boundary edges only.
+        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(a, b) in &boundary {
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+        // Process longest boundary edges first: a lens chord is longer than any
+        // single sub-edge of the arc it shortcuts, so this re-fans real chords
+        // before their own arc sub-edges get a chance to be mistaken for one.
+        let plen = |e: &(u32, u32)| mesh.vertices[e.0 as usize].distance(&mesh.vertices[e.1 as usize]);
+        boundary.sort_by(|x, y| plen(y).partial_cmp(&plen(x)).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut new_tris: Vec<[u32; 3]> = Vec::new();
+        let mut new_fids: Vec<u32> = Vec::new();
+        // Chord triangles re-fanned in phase B (replaced, not kept).
+        let mut removed: HashSet<usize> = HashSet::new();
+        // Vertices consumed by a fill this pass — keeps two overlapping fills from
+        // fighting over the same chain (the next pass mops up any leftover).
+        let mut touched: HashSet<u32> = HashSet::new();
+        let mut progressed = false;
+
+        // Unit flat normal of the single triangle on boundary edge `e`.
+        let tri_normal = |e: (u32, u32)| -> Option<[f64; 3]> {
+            let ti = *edge_tris.get(&key(e.0, e.1))?.first()?;
+            let t = mesh.triangles[ti];
+            let p = |i: u32| mesh.vertices[i as usize];
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            let u = [b.x() - a.x(), b.y() - a.y(), b.z() - a.z()];
+            let v = [c.x() - a.x(), c.y() - a.y(), c.z() - a.z()];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            (l > 1e-12).then(|| [n[0] / l, n[1] / l, n[2] / l])
+        };
+
+        for &(a, b) in &boundary {
+            if edge_tris.get(&key(a, b)).map(Vec::len) != Some(1) {
+                continue;
+            }
+            // The arc the chord (a, b) shortcuts.
+            let Some(path) = boundary_path(&adj, a, b) else {
+                continue;
+            };
+            if path.len() < 3 {
+                continue; // need >=1 intermediate vertex to bound a lens
+            }
+            if path.iter().any(|v| touched.contains(v)) {
+                continue;
+            }
+            // The arc must be a modest detour around the chord, not the long way
+            // round the whole loop (which means (a, b) is an arc sub-edge, not the
+            // chord) nor a genuine large open boundary. The real chord — longest, so
+            // processed first — passes; an arc sub-edge's complementary path is the
+            // rest of the loop and fails this, as does a true open hole.
+            let chord = mesh.vertices[a as usize].distance(&mesh.vertices[b as usize]);
+            if chord < 1e-9 {
+                continue;
+            }
+            let arc_len: f64 = path
+                .windows(2)
+                .map(|w| mesh.vertices[w[0] as usize].distance(&mesh.vertices[w[1] as usize]))
+                .sum();
+            if arc_len > 8.0 * chord {
+                continue;
+            }
+            // Fill the planar lens (chord + arc) by fanning from the chord endpoint
+            // `a`: a circular segment is convex, so the fan tiles it cleanly through
+            // the on-surface arc points. The filler belongs to the neighbour that
+            // subdivided the arc (a planar end/top face, or a bored hole rim), so it
+            // takes that face's id and is oriented to match its normal — seamless,
+            // adds no geometry, and leaves every lens edge shared by two triangles.
+            let arc_fid = mesh
+                .face_ids
+                .get(edge_tris[&key(path[0], path[1])][0])
+                .copied()
+                .unwrap_or(0);
+            let narc = tri_normal((path[0], path[1]));
+            for i in 1..path.len() - 1 {
+                let (p0, p1, p2) = (a, path[i], path[i + 1]);
+                if p1 == p0 || p2 == p0 || p1 == p2 {
+                    continue;
+                }
+                let mut tri = [p0, p1, p2];
+                if let Some(na) = narc {
+                    let q = |i: u32| mesh.vertices[i as usize];
+                    let (va, vb, vc) = (q(p0), q(p1), q(p2));
+                    let u = [vb.x() - va.x(), vb.y() - va.y(), vb.z() - va.z()];
+                    let v = [vc.x() - va.x(), vc.y() - va.y(), vc.z() - va.z()];
+                    let fnv = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
+                    if fnv[0] * na[0] + fnv[1] * na[1] + fnv[2] * na[2] < 0.0 {
+                        tri = [p0, p2, p1];
+                    }
+                }
+                new_tris.push(tri);
+                new_fids.push(arc_fid);
+            }
+            for &v in &path {
+                touched.insert(v);
+            }
+            progressed = true;
+        }
+
+        // Phase B — OPEN arc chains. The neighbour subdivided a shared boundary
+        // that the owner spanned with a single *internal* chord edge, so the
+        // chain's two ends reconnect only through the mesh interior and phase A's
+        // all-boundary path can't reach them. Walk each open chain (its ends have
+        // boundary-degree 1) and re-fan the owner's chord triangle through it, so
+        // the owner picks up the neighbour's sub-edges. This is the tangent-line /
+        // end-cap lens on an analytic fillet.
+        let mut starts: Vec<u32> = adj
+            .iter()
+            .filter(|(_, ns)| ns.len() == 1)
+            .map(|(&v, _)| v)
+            .collect();
+        starts.sort_unstable();
+        let mut walked: HashSet<(u32, u32)> = HashSet::new();
+        for start in starts {
+            if touched.contains(&start) {
+                continue;
+            }
+            let Some(&first) = adj.get(&start).and_then(|n| n.first()) else {
+                continue;
+            };
+            if walked.contains(&key(start, first)) {
+                continue;
+            }
+            let mut chain = vec![start];
+            let (mut prev, mut cur) = (start, first);
+            walked.insert(key(prev, cur));
+            loop {
+                chain.push(cur);
+                let nexts: Vec<u32> =
+                    adj[&cur].iter().copied().filter(|&w| w != prev).collect();
+                if nexts.len() != 1 {
+                    break;
+                }
+                let nxt = nexts[0];
+                if walked.contains(&key(cur, nxt)) {
+                    break;
+                }
+                walked.insert(key(cur, nxt));
+                prev = cur;
+                cur = nxt;
+            }
+            if chain.len() < 3 {
+                continue;
+            }
+            let (a, b) = (chain[0], *chain.last().unwrap());
+            if a == b || chain.iter().any(|v| touched.contains(v)) {
+                continue;
+            }
+            // The arc belongs to one face; the chord that shortcuts it is owned by
+            // the *other* face — re-fan that one through the chain.
+            let arc_fid = mesh
+                .face_ids
+                .get(edge_tris[&key(chain[0], chain[1])][0])
+                .copied()
+                .unwrap_or(0);
+            let Some(chord_tris) = edge_tris.get(&key(a, b)) else {
+                continue;
+            };
+            for &ti in chord_tris {
+                if removed.contains(&ti)
+                    || mesh.face_ids.get(ti).copied().unwrap_or(0) == arc_fid
+                {
+                    continue;
+                }
+                let tri = mesh.triangles[ti];
+                let opp = if tri[0] != a && tri[0] != b {
+                    tri[0]
+                } else if tri[1] != a && tri[1] != b {
+                    tri[1]
+                } else {
+                    tri[2]
+                };
+                let forward = (tri[0] == a && tri[1] == b)
+                    || (tri[1] == a && tri[2] == b)
+                    || (tri[2] == a && tri[0] == b);
+                let ch: Vec<u32> = if forward {
+                    chain.clone()
+                } else {
+                    chain.iter().rev().copied().collect()
+                };
+                let fid = mesh.face_ids.get(ti).copied().unwrap_or(0);
+                for w in ch.windows(2) {
+                    if w[0] == opp || w[1] == opp {
+                        continue;
+                    }
+                    new_tris.push([w[0], w[1], opp]);
+                    new_fids.push(fid);
+                }
+                removed.insert(ti);
+                for &v in &chain {
+                    touched.insert(v);
+                }
+                progressed = true;
+                break;
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+        if removed.is_empty() {
+            mesh.triangles.extend(new_tris);
+            mesh.face_ids.extend(new_fids);
+        } else {
+            let mut out_tris = Vec::with_capacity(mesh.triangles.len() + new_tris.len());
+            let mut out_fids = Vec::with_capacity(out_tris.capacity());
+            for (ti, t) in mesh.triangles.iter().enumerate() {
+                if removed.contains(&ti) {
+                    continue;
+                }
+                out_tris.push(*t);
+                out_fids.push(mesh.face_ids.get(ti).copied().unwrap_or(0));
+            }
+            out_tris.extend(new_tris);
+            out_fids.extend(new_fids);
+            mesh.triangles = out_tris;
+            mesh.face_ids = out_fids;
+        }
+    }
 }
 
 fn find_next_non_collapsed_u(

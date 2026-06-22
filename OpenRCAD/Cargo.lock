@@ -1248,6 +1248,7 @@ version = "0.1.0"
 dependencies = [
  "openrcad-foundation",
  "openrcad-geom",
+ "openrcad-mesh",
  "openrcad-primitives",
  "openrcad-topo",
  "serde",

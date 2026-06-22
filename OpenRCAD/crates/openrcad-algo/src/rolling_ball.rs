@@ -880,7 +880,7 @@ fn trim_face_along_spine(
     spine: &Edge,
     contact: &Edge,
 ) -> Result<Face, RollingBallError> {
-    ensure_simple_planar_outer_loop(face)?;
+    ensure_trimmable_face(face)?;
     let edges = face
         .outer_wire()
         .ok_or(RollingBallError::UnsupportedTrimTopology)?
@@ -946,7 +946,7 @@ fn trim_face_at_corner(
     contact_b: Pnt,
     arc: &Edge,
 ) -> Result<Face, RollingBallError> {
-    ensure_simple_planar_outer_loop(face)?;
+    ensure_trimmable_face(face)?;
     let edges = face
         .outer_wire()
         .ok_or(RollingBallError::UnsupportedTrimTopology)?
@@ -994,7 +994,7 @@ fn trim_face_at_corner(
     rebuild_face(face, Wire::from_edges(new_edges))
 }
 
-fn ensure_simple_planar_outer_loop(face: &Face) -> Result<(), RollingBallError> {
+fn ensure_trimmable_face(face: &Face) -> Result<(), RollingBallError> {
     if !matches!(face.surface(), Some(GeomSurface::Plane(_)) | Some(GeomSurface::Cylinder(_))) {
         return Err(RollingBallError::UnsolvableAdjacency {
             reason: AdjacencyReason::NotPlaneOrAnalytic,
@@ -1003,17 +1003,23 @@ fn ensure_simple_planar_outer_loop(face: &Face) -> Result<(), RollingBallError> 
     if face.outer_wire().is_none() {
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
-    if !face.inner_wires().is_empty() {
-        return Err(RollingBallError::UnsupportedTrimTopology);
-    }
+    // Inner wires (holes) are allowed: only the outer loop is re-trimmed for the
+    // blend, and `rebuild_face` carries the holes through untouched. A hole that
+    // intrudes on the trimmed boundary is caught by the final watertight gate.
     Ok(())
 }
 
 fn rebuild_face(face: &Face, outer: Wire) -> Result<Face, RollingBallError> {
+    // Preserve any inner (hole) loops. A face being trimmed for a blend may own
+    // holes — e.g. a top face with a bored pocket — that sit in the interior, far
+    // from the edge being filleted. Dropping them would re-fill the holes (and
+    // break watertightness against the bore wall). If a hole *does* reach the
+    // trimmed boundary, the result fails the watertight/health gate in
+    // `fillet_planar_edge` and surfaces as a clean error rather than bad geometry.
     Ok(Face::with_wires(
         face.surface().cloned(),
         Some(outer),
-        Vec::new(),
+        face.inner_wires(),
         face.orientation(),
     ))
 }
@@ -1076,8 +1082,18 @@ fn contact_arc(
     let end_v = (end - center)
         .normalized()
         .ok_or(RollingBallError::InvalidDihedral)?;
+    // A rolling-ball blend always sweeps the minor (convex) arc between its two
+    // contact points. `angle_about_axis` returns a value in [0, TAU) measured in
+    // one fixed rotational sense, so callers that feed `start`/`end` in opposite
+    // order get complementary angles — one the 90°-ish convex arc, the other its
+    // 270°-ish reflex complement. A `> PI` result means we measured the long way
+    // around: flip the axis to swing the short way instead (this also re-points
+    // the circle so the curve still runs start -> end). Without this clamp one of
+    // the two end arcs of a planar edge blend sweeps the reflex side, producing a
+    // cylinder face that renders round at one end and flat (chamfer-like) at the
+    // other.
     let mut angle = angle_about_axis(start_v, end_v, axis);
-    if angle <= tolerance::CONFUSION {
+    if angle > core::f64::consts::PI {
         axis = axis.reversed();
         angle = angle_about_axis(start_v, end_v, axis);
     }
@@ -1155,6 +1171,37 @@ mod tests {
             .filter(|face| matches!(face.surface(), Some(GeomSurface::Cylinder(_))))
             .count();
         assert_eq!(cylinders, 1);
+    }
+
+    #[test]
+    fn box_edge_blend_takes_the_minor_arc_on_both_ends() {
+        // Regression: `planar_blend` feeds `contact_arc` the two end arcs in
+        // opposite point-order (`b -> a` vs `a -> b`). `angle_about_axis` measures
+        // in one fixed rotational sense, so without the minor-arc clamp one end
+        // sweeps the convex ~90° arc and the other its ~270° reflex complement —
+        // a single cylinder face that renders round at one end and flat
+        // (chamfer-like) at the other. A convex blend must take the minor
+        // (<= PI) arc on *both* ends.
+        use core::f64::consts::PI;
+
+        let solid = make_box(&Pnt::origin(), 4.0, 5.0, 6.0);
+        let edge = origin_vertical_edge(&solid);
+        let blend = rolling_ball_fillet_edge(&solid, &edge, 0.5).unwrap();
+
+        // The arc edges store the sweep as their parameter span (first = 0).
+        let start_sweep = blend.start_arc.last() - blend.start_arc.first();
+        let end_sweep = blend.end_arc.last() - blend.end_arc.first();
+        assert!(
+            start_sweep <= PI + 1e-9,
+            "start arc swept the reflex side: {start_sweep} rad"
+        );
+        assert!(
+            end_sweep <= PI + 1e-9,
+            "end arc swept the reflex side: {end_sweep} rad"
+        );
+        // A square box edge blends a clean quarter-round on each end.
+        assert!((start_sweep - PI / 2.0).abs() < 1e-9, "start sweep {start_sweep}");
+        assert!((end_sweep - PI / 2.0).abs() < 1e-9, "end sweep {end_sweep}");
     }
 
     #[test]

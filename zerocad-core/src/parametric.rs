@@ -670,6 +670,12 @@ impl ParametricGraph {
         let region_solid = |r: &Region, cs: &CoordinateSystem, d: f32| {
             crate::mock_kernel::extruded_region_solid(&r.boundary, &r.holes, d, cs)
         };
+        // The smooth native-cylinder tool for a circular, hole-free region (None
+        // otherwise). Tried before the faceted prism so a round boss/pocket reads
+        // smooth — the kernel fuses/bores analytic cylinders watertight.
+        let cyl_tool = |r: &Region, cs: &CoordinateSystem, d: f32| {
+            crate::mock_kernel::circular_cylinder_tool(&r.boundary, &r.holes, d, cs)
+        };
 
         let mut newbody_tools: Vec<KernelSolid> = Vec::new();
         let mut cut_tools: Vec<CutTool> = Vec::new();
@@ -682,7 +688,12 @@ impl ParametricGraph {
             }
             match mode {
                 ExtrudeMode::NewBody => {
-                    if let Some(s) = region_solid(region, cs, depth) {
+                    // Prefer the smooth analytic cylinder for a circular profile so
+                    // a new-body cylinder stays round if it is later joined/cut
+                    // (re-tessellated from this solid); falls back to the prism.
+                    if let Some(s) =
+                        cyl_tool(region, cs, depth).or_else(|| region_solid(region, cs, depth))
+                    {
                         newbody_tools.push(s);
                     }
                     newbody_mesh.append(MockMesh::make_extruded_sketch(
@@ -708,6 +719,7 @@ impl ParametricGraph {
                     // face — the other half of the coplanarity problem
                     // `directional_cut` solves only for the end caps.
                     let (cut_cs, cut_depth) = directional_cut(cs, depth);
+                    let smooth = cyl_tool(region, &cut_cs, cut_depth);
                     let exact = region_solid(region, &cut_cs, cut_depth);
                     let grown_boundary = grow_loop(&region.boundary, true);
                     let grown_holes: Vec<Vec<(f32, f32)>> =
@@ -718,23 +730,44 @@ impl ParametricGraph {
                         cut_depth,
                         &cut_cs,
                     );
-                    if exact.is_some() || expanded.is_some() {
-                        cut_tools.push(CutTool { exact, expanded });
+                    // The same tool swept the other way, for the fall-back when the
+                    // drawn direction misses the body (see `CutTool`).
+                    let (rev_cs, rev_depth) = directional_cut(cs, -depth);
+                    let smooth_rev = cyl_tool(region, &rev_cs, rev_depth);
+                    let exact_rev = region_solid(region, &rev_cs, rev_depth);
+                    let expanded_rev = crate::mock_kernel::extruded_region_solid(
+                        &grown_boundary,
+                        &grown_holes,
+                        rev_depth,
+                        &rev_cs,
+                    );
+                    if smooth.is_some() || exact.is_some() || expanded.is_some() {
+                        cut_tools.push(CutTool {
+                            smooth,
+                            exact,
+                            expanded,
+                            smooth_rev,
+                            exact_rev,
+                            expanded_rev,
+                        });
                     }
                 }
                 ExtrudeMode::Join => {
-                    // exact = perfect geometry when it resolves; dipped = near cap
-                    // nudged INTO existing material to break the (almost always
+                    // smooth = analytic cylinder for a round boss (the kernel bores
+                    // its coplanar cap as a true circle, so the boss reads round).
+                    // exact = perfect prism geometry when it resolves; dipped = near
+                    // cap nudged INTO existing material to break the (almost always
                     // present) coplanarity with the face the sketch sits on. The
                     // dip is absorbed by the body it joins, leaving no artifact.
+                    let smooth = cyl_tool(region, cs, depth);
                     let exact = region_solid(region, cs, depth);
                     let dipped = region_solid(
                         region,
                         &overshoot_cs(cs, depth),
                         overshoot_depth(depth, 1.0),
                     );
-                    if exact.is_some() || dipped.is_some() {
-                        join_tools.push(JoinTool { exact, dipped });
+                    if smooth.is_some() || exact.is_some() || dipped.is_some() {
+                        join_tools.push(JoinTool { smooth, exact, dipped });
                     }
                 }
             }
@@ -840,22 +873,36 @@ const CUT_OVERSHOOT: f32 = 0.1;
 /// The in-plane analogue of `CUT_OVERSHOOT` (which handles the end caps).
 const CUT_WALL_GROW: f32 = 0.1;
 
-/// A join's tool in two forms: the exact extrusion (perfect geometry when the
-/// solver accepts it) and a fallback whose near cap dips into the target to
-/// dodge coplanar faces.
+/// A join's tool, tried in order. `smooth` is the true analytic cylinder for a
+/// circular boss (the kernel fuses it watertight, so a Ø-boss reads round, not
+/// faceted); `exact` is the faceted prism with perfect dimensions; `dipped` is
+/// a faceted fallback whose near cap dips into the target to dodge coplanar
+/// faces. `smooth` is `None` for non-circular profiles, which fall straight to
+/// the prism.
 struct JoinTool {
+    smooth: Option<KernelSolid>,
     exact: Option<KernelSolid>,
     dipped: Option<KernelSolid>,
 }
 
-/// A cut's tool in two forms, mirroring `JoinTool`: the exact extrusion (used
-/// when the solver accepts it, so the pocket keeps the dimensions the user
-/// drew) and an `expanded` fallback whose walls poke ~`CUT_WALL_GROW`mm past
-/// the body's faces to dodge the coplanar-face case that makes truck's boolean
-/// return `None`.
+/// A cut's tool, tried in order, mirroring `JoinTool`: `smooth` is the analytic
+/// cylinder for a circular pocket/drill (a clean round hole, not a 48-gon one);
+/// `exact` is the faceted prism with the drawn dimensions; `expanded` is a
+/// faceted fallback whose walls poke ~`CUT_WALL_GROW`mm past the body's faces to
+/// dodge the coplanar-face case. `smooth` is `None` for non-circular profiles.
 struct CutTool {
+    smooth: Option<KernelSolid>,
     exact: Option<KernelSolid>,
     expanded: Option<KernelSolid>,
+    // The same three tools swept the OPPOSITE direction. A cut is meant to remove
+    // material; when the drawn direction sweeps into empty air (e.g. a positive
+    // "pocket depth" on a top-face sketch, which `directional_cut` sends *up* away
+    // from the body) it bites nothing and the op silently does nothing — the
+    // reported "cut works once then never again". `apply_cut` falls back to these
+    // when the drawn direction removes nothing from a body it should have cut.
+    smooth_rev: Option<KernelSolid>,
+    exact_rev: Option<KernelSolid>,
+    expanded_rev: Option<KernelSolid>,
 }
 
 /// Grow (`outward`) or shrink a closed 2D loop about its centroid so its
@@ -960,8 +1007,9 @@ fn apply_join(
     for tool in tools {
         // Bounding box from whichever variant exists, for the overlap pre-test.
         let tbb = tool
-            .exact
+            .smooth
             .as_ref()
+            .or(tool.exact.as_ref())
             .or(tool.dipped.as_ref())
             .and_then(crate::mock_kernel::solid_aabb);
 
@@ -975,10 +1023,17 @@ fn apply_join(
                     if !overlaps {
                         continue;
                     }
+                    // Smooth analytic cylinder first (round boss), then the faceted
+                    // prism variants as robustness fallbacks.
                     let unioned = tool
-                        .exact
+                        .smooth
                         .as_ref()
                         .and_then(|t| crate::mock_kernel::union(part, t))
+                        .or_else(|| {
+                            tool.exact
+                                .as_ref()
+                                .and_then(|t| crate::mock_kernel::union(part, t))
+                        })
                         .or_else(|| {
                             tool.dipped
                                 .as_ref()
@@ -1007,7 +1062,12 @@ fn apply_join(
                             break 'bodies;
                         }
                     }
-                    if let Some(fallback) = tool.exact.as_ref().or(tool.dipped.as_ref()).cloned()
+                    if let Some(fallback) = tool
+                        .smooth
+                        .as_ref()
+                        .or(tool.exact.as_ref())
+                        .or(tool.dipped.as_ref())
+                        .cloned()
                     {
                         body.parts.push(fallback);
                         body.pristine = None;
@@ -1018,8 +1078,9 @@ fn apply_join(
             }
         }
         if !merged {
-            // Joined nothing — keep the exact (un-dipped) volume as its own body.
-            if let Some(s) = tool.exact.or(tool.dipped) {
+            // Joined nothing — keep the (preferably smooth) un-dipped volume as its
+            // own body.
+            if let Some(s) = tool.smooth.or(tool.exact).or(tool.dipped) {
                 warnings.push(format!(
                     "Join '{extrude_id}': the extruded volume didn't overlap an \
                      existing body, so it became a separate body."
@@ -1037,12 +1098,67 @@ fn apply_join(
     }
 }
 
+/// Subtract one direction's tool variants from `part`, trying smooth → exact →
+/// expanded (and their axis-aligned fallbacks). `None` if the tool's AABB misses
+/// the part or the solver couldn't subtract it. All use the body-splitting
+/// difference, so a cut that severs the part yields separate parts.
+fn cut_part_one_dir(
+    part: &KernelSolid,
+    pbb: Option<&([f32; 3], [f32; 3])>,
+    smooth: &Option<KernelSolid>,
+    exact: &Option<KernelSolid>,
+    expanded: &Option<KernelSolid>,
+    tbb: Option<&([f32; 3], [f32; 3])>,
+) -> Option<Vec<KernelSolid>> {
+    let tbb = tbb?;
+    let overlaps = pbb.is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, tbb, 0.05));
+    if !overlaps {
+        return None;
+    }
+    smooth
+        .as_ref()
+        .and_then(|t| crate::mock_kernel::difference_bodies(part, t))
+        .or_else(|| {
+            exact
+                .as_ref()
+                .and_then(|t| crate::mock_kernel::difference_bodies(part, t))
+        })
+        .or_else(|| {
+            expanded
+                .as_ref()
+                .and_then(|t| crate::mock_kernel::difference_bodies(part, t))
+        })
+        .or_else(|| {
+            exact
+                .as_ref()
+                .and_then(|t| crate::mock_kernel::axis_aligned_through_cut(part, t))
+                .map(|d| vec![d])
+        })
+        .or_else(|| {
+            expanded
+                .as_ref()
+                .and_then(|t| crate::mock_kernel::axis_aligned_through_cut(part, t))
+                .map(|d| vec![d])
+        })
+        .or_else(|| {
+            exact
+                .as_ref()
+                .and_then(|t| crate::mock_kernel::axis_aligned_cut_parts(part, t))
+        })
+        .or_else(|| {
+            expanded
+                .as_ref()
+                .and_then(|t| crate::mock_kernel::axis_aligned_cut_parts(part, t))
+        })
+}
+
 /// Apply a Cut extrude: subtract each tool from every body part whose AABB it
-/// overlaps. For each part it tries the exact tool first (the drawn pocket),
-/// then the expanded tool (walls clear of coplanar body faces). A solver
-/// failure on *both* leaves the original part intact (safer than dropping a
-/// valid body) and is surfaced as a warning, since the body then comes out
-/// without the pocket the user drew; a part fully consumed by the cut is removed.
+/// overlaps. For each part it tries the **drawn** direction first (smooth → exact
+/// → expanded), then falls back to the **opposite** sweep when the drawn one
+/// removes nothing — so a cut drawn away from the body (a positive pocket depth
+/// on a top face) still bites instead of silently doing nothing. A solver failure
+/// on a body the tool genuinely overlaps leaves the part intact (safer than
+/// dropping a valid body) and warns; a part fully consumed by the cut is removed.
 fn apply_cut(
     live: &mut [LiveBody],
     extrude_id: &str,
@@ -1050,74 +1166,88 @@ fn apply_cut(
     warnings: &mut Vec<String>,
 ) {
     for tool in &tools {
-        // Pre-test bbox from whichever variant exists (expanded ⊇ exact).
-        let Some(tbb) = tool
+        // Pre-test bbox per direction (expanded ⊇ exact ⊇ smooth).
+        let fwd_bb = tool
             .expanded
             .as_ref()
             .or(tool.exact.as_ref())
-            .and_then(crate::mock_kernel::solid_aabb)
-        else {
+            .or(tool.smooth.as_ref())
+            .and_then(crate::mock_kernel::solid_aabb);
+        let rev_bb = tool
+            .expanded_rev
+            .as_ref()
+            .or(tool.exact_rev.as_ref())
+            .or(tool.smooth_rev.as_ref())
+            .and_then(crate::mock_kernel::solid_aabb);
+        if fwd_bb.is_none() && rev_bb.is_none() {
             continue;
-        };
+        }
         // Did the solver fail to subtract this tool from a body it actually
-        // overlapped? If so the body keeps material the user meant to remove.
+        // overlapped (either direction)? If so the body keeps material the user
+        // meant to remove.
         let mut failed_on_overlap = false;
         for body in live.iter_mut() {
             let mut changed = false;
             let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
             for part in body.parts.drain(..) {
-                let overlaps = crate::mock_kernel::solid_aabb(&part).map_or(true, |pbb| {
-                    crate::mock_kernel::aabbs_overlap(&pbb, &tbb, 0.05)
-                });
-                if !overlaps {
-                    next.push(part);
-                    continue;
-                }
-                // Exact first (precise pocket), then the expanded fallback that
-                // breaks wall-coplanarity. Both use the body-splitting difference,
-                // so a cut that severs the part (slices it in two) yields separate
-                // parts instead of one shell holding both lumps. Both None → keep
-                // the part intact.
-                let cut_parts = tool
-                    .exact
-                    .as_ref()
-                    .and_then(|t| crate::mock_kernel::difference_bodies(&part, t))
-                    .or_else(|| {
-                        tool.expanded
-                            .as_ref()
-                            .and_then(|t| crate::mock_kernel::difference_bodies(&part, t))
+                let pbb = crate::mock_kernel::solid_aabb(&part);
+                let overlaps_dir = |tbb: Option<&([f32; 3], [f32; 3])>| {
+                    tbb.is_some_and(|t| {
+                        pbb.as_ref()
+                            .is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, t, 0.05))
                     })
-                    .or_else(|| {
-                        tool.exact
-                            .as_ref()
-                            .and_then(|t| crate::mock_kernel::axis_aligned_through_cut(&part, t))
-                            .map(|d| vec![d])
-                    })
-                    .or_else(|| {
-                        tool.expanded
-                            .as_ref()
-                            .and_then(|t| crate::mock_kernel::axis_aligned_through_cut(&part, t))
-                            .map(|d| vec![d])
-                    })
-                    .or_else(|| {
-                        tool.exact
-                            .as_ref()
-                            .and_then(|t| crate::mock_kernel::axis_aligned_cut_parts(&part, t))
-                    })
-                    .or_else(|| {
-                        tool.expanded
-                            .as_ref()
-                            .and_then(|t| crate::mock_kernel::axis_aligned_cut_parts(&part, t))
-                    });
+                };
+                // How much of this part the tool's AABB encloses, per direction.
+                // The drawn direction's `CUT_OVERSHOOT` dips ~0.1mm past the sketch
+                // plane, so a cut aimed *away* from the body still nicks a sliver and
+                // would count as "done"; ordering by overlap volume instead sends the
+                // cut the way the body actually lies (a deep pocket beats a sliver).
+                let overlap_vol = |tbb: Option<&([f32; 3], [f32; 3])>| -> f32 {
+                    match (pbb.as_ref(), tbb) {
+                        (Some(p), Some(t)) => (0..3)
+                            .map(|i| (p.1[i].min(t.1[i]) - p.0[i].max(t.0[i])).max(0.0))
+                            .product(),
+                        _ => 0.0,
+                    }
+                };
+                let fwd = (&tool.smooth, &tool.exact, &tool.expanded, fwd_bb.as_ref());
+                let rev = (
+                    &tool.smooth_rev,
+                    &tool.exact_rev,
+                    &tool.expanded_rev,
+                    rev_bb.as_ref(),
+                );
+                let (first, second) = if overlap_vol(rev_bb.as_ref()) > overlap_vol(fwd_bb.as_ref())
+                {
+                    (rev, fwd)
+                } else {
+                    (fwd, rev)
+                };
+                let cut_parts =
+                    cut_part_one_dir(&part, pbb.as_ref(), first.0, first.1, first.2, first.3)
+                        .or_else(|| {
+                            cut_part_one_dir(
+                                &part,
+                                pbb.as_ref(),
+                                second.0,
+                                second.1,
+                                second.2,
+                                second.3,
+                            )
+                        });
                 match cut_parts {
                     Some(parts) => {
                         changed = true;
                         next.extend(parts);
                     }
-                    // Solver failure or fully consumed. Keep the original part so
-                    // a failed boolean doesn't delete material.
                     None => {
-                        failed_on_overlap = true;
+                        // Only a genuine solver failure (the tool overlapped this
+                        // part in some direction) warrants the warning — a tool that
+                        // simply misses the body is normal once both directions are
+                        // tried.
+                        if overlaps_dir(fwd_bb.as_ref()) || overlaps_dir(rev_bb.as_ref()) {
+                            failed_on_overlap = true;
+                        }
                         next.push(part);
                     }
                 }

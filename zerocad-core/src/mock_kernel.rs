@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use openrcad::algo::{boolean_checked, fillet_edges, prism, BooleanOp};
 use openrcad::foundation::{Ax2, Dir, Pnt, Vec as GeomVec};
-use openrcad::geom::{Curve, GeomSurface, Plane};
+use openrcad::geom::{Curve, CylindricalSurface, GeomSurface, Plane};
 use openrcad::mesh::tessellate;
 use openrcad::primitives::{make_box, make_cylinder};
 use openrcad::topo::{Edge, Face, Orientation, Solid, Wire};
@@ -55,6 +55,13 @@ pub struct MockMesh {
     /// rebased on `append`/merge so combined meshes keep distinct faces.
     #[serde(default)]
     pub face_ids: Vec<u32>,
+    /// One group id per edge **segment** (length == `edge_indices.len() / 2`).
+    /// Segments sharing an id form a single topological edge — every chord of one
+    /// fillet arc, or the thirds of a cylinder's rim — so the viewport can select
+    /// and highlight a whole curved edge at once instead of a lone chord. Empty on
+    /// legacy/cached meshes; consumers then fall back to per-segment selection.
+    #[serde(default)]
+    pub edge_groups: Vec<u32>,
 }
 
 impl MockMesh {
@@ -66,6 +73,7 @@ impl MockMesh {
             edge_indices: Vec::new(),
             edge_face_normals: Vec::new(),
             face_ids: Vec::new(),
+            edge_groups: Vec::new(),
         }
     }
 
@@ -81,6 +89,9 @@ impl MockMesh {
         let e_offset = (self.edge_vertices.len() / 3) as u32;
         // Shift incoming face ids past ours so the two meshes' faces stay distinct.
         let f_offset = self.max_face_id().map_or(0, |m| m + 1);
+        // Likewise shift edge group ids so the two meshes' topological edges
+        // (e.g. each body's fillet arcs) stay independently selectable.
+        let g_offset = self.edge_groups.iter().copied().max().map_or(0, |m| m + 1);
 
         self.vertices.reserve(other.vertices.len());
         self.indices.reserve(other.indices.len());
@@ -88,6 +99,7 @@ impl MockMesh {
         self.edge_indices.reserve(other.edge_indices.len());
         self.edge_face_normals.reserve(other.edge_face_normals.len());
         self.face_ids.reserve(other.face_ids.len());
+        self.edge_groups.reserve(other.edge_groups.len());
 
         self.vertices.extend(other.vertices);
         for idx in other.indices {
@@ -101,6 +113,9 @@ impl MockMesh {
         for fid in other.face_ids {
             self.face_ids.push(fid + f_offset);
         }
+        for g in other.edge_groups {
+            self.edge_groups.push(g + g_offset);
+        }
     }
 
     /// Axis-aligned box with one corner at the origin, opposite corner at (w, h, d).
@@ -110,6 +125,7 @@ impl MockMesh {
         let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, false);
 
         let (edge_vertices, edge_indices, edge_face_normals) = build_box_wireframe(w, h, d);
+        let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
 
         Self {
             vertices,
@@ -118,6 +134,7 @@ impl MockMesh {
             edge_indices,
             edge_face_normals,
             face_ids,
+            edge_groups,
         }
     }
 
@@ -132,6 +149,7 @@ impl MockMesh {
         let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, false);
         let (edge_vertices, edge_indices, edge_face_normals) =
             build_cylinder_wireframe(r, h, segments.max(4));
+        let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
 
         Self {
             vertices,
@@ -140,6 +158,7 @@ impl MockMesh {
             edge_indices,
             edge_face_normals,
             face_ids,
+            edge_groups,
         }
     }
 
@@ -183,6 +202,7 @@ impl MockMesh {
             Some((cu, cv, r)) => build_oriented_cylinder_wireframe(cs, cu, cv, r, depth),
             None => build_extrusion_wireframe(points, holes, depth, cs),
         };
+        let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
 
         Self {
             vertices,
@@ -191,6 +211,7 @@ impl MockMesh {
             edge_indices,
             edge_face_normals,
             face_ids,
+            edge_groups,
         }
     }
 
@@ -207,17 +228,28 @@ impl MockMesh {
         // primitives, instead of x-raying every edge — and it silently drops the
         // degenerate zero-area "fin" edges a boolean can leave in the B-Rep
         // (they produce no triangle, so no feature edge, so no stray spike).
-        let (mut edge_vertices, mut edge_indices, mut edge_face_normals) =
-            mesh_feature_edges(&vertices, &indices, &face_ids);
+        // Faces on the same analytic cylinder (a wall the kernel splits into arc-
+        // faces) share a group id, so their construction seams aren't drawn as edges.
+        let surface_group = cylinder_surface_groups(solid);
+        let (mut edge_vertices, mut edge_indices, mut edge_face_normals, mut edge_pairs) =
+            mesh_feature_edges(&vertices, &indices, &face_ids, &surface_group);
         add_missing_straight_brep_edges(
             solid,
             &vertices,
             &indices,
             &face_ids,
+            &surface_group,
             &mut edge_vertices,
             &mut edge_indices,
             &mut edge_face_normals,
+            &mut edge_pairs,
         );
+        // Chain the per-triangle chord segments back into whole topological edges:
+        // two connected segments belong to the same edge when they border the same
+        // pair of *surfaces* (`edge_pairs`, canonicalized through `surface_group` so
+        // a cylinder split into arc-faces still reads as one). This is what lets the
+        // viewport select a fillet arc — or a full circular rim — as one curve.
+        let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, Some(&edge_pairs));
         Self {
             vertices,
             indices,
@@ -225,6 +257,7 @@ impl MockMesh {
             edge_indices,
             edge_face_normals,
             face_ids,
+            edge_groups,
         }
     }
 }
@@ -240,40 +273,31 @@ pub fn box_solid(w: f32, h: f32, d: f32) -> KernelSolid {
     make_box(&Pnt::origin(), w as f64, h as f64, d as f64)
 }
 
-/// Boolean-ready solid for a cylinder primitive: a polygonal prism along +Y,
-/// base centered at origin, **not** a true cylinder.
+/// Boolean-ready solid for a cylinder primitive: a **true smooth cylinder**
+/// along +Y, base centered at origin.
 ///
-/// This is the cylinder counterpart of `extruded_region_solid`'s "always a
-/// prism" rule. truck's boolean solver panics on smooth cylindrical faces, so a
-/// cylinder primitive fed to a join/cut would make the operation silently do
-/// nothing (the boolean returns `None` via `guarded_boolean` and the body is
-/// kept intact). Faceting it to a 48-gon — the same discretization sketched
-/// circles use, so a cylinder primitive and an extruded circle cut/join
-/// identically — lets booleans succeed. The smooth look is preserved for an
-/// untouched body by `make_cylinder` (the `pristine` display mesh); only once a
-/// boolean clears `pristine` does the body re-tessellate from this prism, at
-/// which point a 48-gon reads as a clean cylinder anyway.
+/// OpenRCAD's boolean engine handles smooth cylindrical faces natively — cuts,
+/// blind pockets, and (cylinder-as-object) booleans all come back watertight
+/// (see the kernel's `repro_cylinder` tests). So the body keeps its smooth
+/// analytic wall through a join/cut instead of re-tessellating into the striped
+/// 48-gon prism the old "always facet it" rule produced (a workaround for a
+/// since-retired truck panic). A 48-gon prism is kept only as a defensive
+/// fallback should the native build ever fail.
 pub fn cylinder_solid(r: f32, h: f32) -> Option<KernelSolid> {
-    use crate::geometry::{CoordinateSystem, Vec3};
-    // Matches the discretization sketched circles use (`crate::CIRCLE_SEGS`),
-    // so a cylinder primitive and an extruded circle cut/join identically.
-    const SEGS: usize = crate::CIRCLE_SEGS;
-    let pts: Vec<(f32, f32)> = (0..SEGS)
-        .map(|i| {
-            let a = (i as f32 / SEGS as f32) * std::f32::consts::TAU;
-            (r * a.cos(), r * a.sin())
-        })
-        .collect();
-    // Extrude the (CCW) circle on a RIGHT-HANDED frame whose normal is +Y
-    // (u = Z, v = X, so u × v = +Y), giving the base-at-origin, +Y-axis cylinder
-    // the primitive expects — and, critically, the solid orientation truck's
-    // booleans accept. Do NOT use `CoordinateSystem::XZ`: that const frame is
-    // left-handed (X × Z = −Y ≠ its +Y normal), and truck extrudes left-handed
-    // frames inside-out, which makes `difference` *add* the cut tool instead of
-    // subtracting it (the body's `enforce_outward_normals` only fixes display
-    // normals, not the solid handed to the solver).
-    let frame = CoordinateSystem::new(Vec3::ZERO, Vec3::Z, Vec3::X);
-    build_extrusion_solid(&pts, &[], h as f64, &frame)
+    build_cylinder_solid(r as f64, h as f64).or_else(|| {
+        use crate::geometry::{CoordinateSystem, Vec3};
+        let segs = crate::CIRCLE_SEGS;
+        let pts: Vec<(f32, f32)> = (0..segs)
+            .map(|i| {
+                let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                (r * a.cos(), r * a.sin())
+            })
+            .collect();
+        // Right-handed frame whose normal is +Y (u = Z, v = X ⇒ u × v = +Y),
+        // giving the base-at-origin, +Y-axis cylinder the primitive expects.
+        let frame = CoordinateSystem::new(Vec3::ZERO, Vec3::Z, Vec3::X);
+        build_extrusion_solid(&pts, &[], h as f64, &frame)
+    })
 }
 
 /// Solid for one extruded sketch region, as a polygonal prism. Holed profiles
@@ -565,6 +589,30 @@ fn oriented_cylinder_solid(
         Dir::new(cs.n.x as f64, cs.n.y as f64, cs.n.z as f64),
     );
     Some(make_cylinder(&axis, r as f64, depth.abs() as f64))
+}
+
+/// The **smooth native-cylinder** boolean tool for a circular, hole-free region:
+/// the same swept volume [`extruded_region_solid`] builds as a 48-gon prism, but
+/// with a true analytic cylindrical wall. Returns `None` for non-circular or
+/// holed profiles (those stay prisms).
+///
+/// OpenRCAD's boolean engine resolves smooth cylinder cuts, blind pockets and
+/// coplanar boss-unions natively and watertight (see the kernel's
+/// `repro_cylinder` tests), so feeding the smooth tool — tried *before* the
+/// faceted prism fallback in [`crate::parametric`]'s join/cut assembler — yields
+/// a clean round hole / boss instead of the striped, sectioned facet result the
+/// old "always a prism" rule produced.
+pub fn circular_cylinder_tool(
+    boundary: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<KernelSolid> {
+    if !holes.is_empty() || depth.abs() < f32::EPSILON {
+        return None;
+    }
+    let (cu, cv, r) = circle_profile(boundary)?;
+    oriented_cylinder_solid(cs, cu, cv, r, depth)
 }
 
 /// Run `f` with the panic hook silenced, restoring it afterward. `boolean_checked`
@@ -1069,11 +1117,21 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
     };
     let mut flipped = vec![false; tris];
     let mut visited = vec![false; tris];
+    // Component id per triangle. A join can leave a body as several disjoint
+    // watertight shells (a box with a smooth-cylinder boss fused on top often
+    // tessellates as two components that only touch). Winding consistency
+    // propagates only WITHIN a component, so the inside/outside sign must be
+    // decided per component — a single global flip would orient the larger shell
+    // correctly and leave the smaller one inside-out (its faces then back-face
+    // cull and "disappear" on screen).
+    let mut comp = vec![usize::MAX; tris];
+    let mut ncomp = 0usize;
     for seed in 0..tris {
         if visited[seed] {
             continue;
         }
         visited[seed] = true;
+        comp[seed] = ncomp;
         let mut queue = std::collections::VecDeque::from([seed]);
         while let Some(t) = queue.pop_front() {
             for &(ta, tb) in &directed(t, flipped[t]) {
@@ -1087,17 +1145,20 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
                     // (unflipped) traverses it the SAME way (ta→tb), flip it.
                     flipped[t2] = directed(t2, false).contains(&(ta, tb));
                     visited[t2] = true;
+                    comp[t2] = ncomp;
                     queue.push_back(t2);
                 }
             }
         }
+        ncomp += 1;
     }
-    // Signed volume (×6) with flips applied; negative ⇒ the shell is inside-out.
+    // Signed volume (×6) per component with flips applied; negative ⇒ that shell is
+    // inside-out and its whole component must be flipped.
     let pos = |vi: u32| -> [f64; 3] {
         let b = vi as usize * 6;
         [vertices[b] as f64, vertices[b + 1] as f64, vertices[b + 2] as f64]
     };
-    let mut vol6 = 0.0f64;
+    let mut comp_vol = vec![0.0f64; ncomp];
     for t in 0..tris {
         let (i0, i1, i2) = if flipped[t] {
             (indices[t * 3], indices[t * 3 + 2], indices[t * 3 + 1])
@@ -1105,15 +1166,14 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
             (indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2])
         };
         let (a, b, c) = (pos(i0), pos(i1), pos(i2));
-        vol6 += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+        comp_vol[comp[t]] += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
             + a[2] * (b[0] * c[1] - b[1] * c[0]);
     }
-    let global_flip = vol6 < 0.0;
     // Apply winding flips, then recompute each triangle's flat normal so the
     // normal agrees with the corrected winding (discarding any inconsistent
     // stored normal). Smoothing later blends genuinely-curved faces.
     for t in 0..tris {
-        if flipped[t] ^ global_flip {
+        if flipped[t] ^ (comp_vol[comp[t]] < 0.0) {
             indices.swap(t * 3 + 1, t * 3 + 2);
         }
         let (i0, i1, i2) = (
@@ -1200,9 +1260,11 @@ fn add_missing_straight_brep_edges(
     vertices: &[f32],
     indices: &[u32],
     face_ids: &[u32],
+    surface_group: &[u32],
     edge_vertices: &mut Vec<f32>,
     edge_indices: &mut Vec<u32>,
     edge_face_normals: &mut Vec<f32>,
+    edge_pairs: &mut Vec<(u32, u32)>,
 ) {
     let edge_key_from_points = |a: [f32; 3], b: [f32; 3]| {
         let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
@@ -1284,6 +1346,15 @@ fn add_missing_straight_brep_edges(
         if existing.contains(&key) || faces.len() < 2 {
             continue;
         }
+        // Don't re-introduce a same-surface cylinder seam (see `mesh_feature_edges`):
+        // a straight longitudinal edge whose two faces are arc-faces of one cylinder.
+        if faces.len() == 2 {
+            let g0 = surface_group.get(faces[0] as usize);
+            let g1 = surface_group.get(faces[1] as usize);
+            if g0.is_some() && g0 == g1 {
+                continue;
+            }
+        }
         let d2 = (pa[0] - pb[0]).powi(2)
             + (pa[1] - pb[1]).powi(2)
             + (pa[2] - pb[2]).powi(2);
@@ -1306,6 +1377,11 @@ fn add_missing_straight_brep_edges(
             .unwrap_or(n0);
         edge_face_normals.extend_from_slice(&n0);
         edge_face_normals.extend_from_slice(&n1);
+        // Each restored straight edge is one B-Rep edge: tag it with its bordering
+        // surface pair so it joins the same grouping pass as the feature edges.
+        let f0 = faces.first().copied().unwrap_or(0);
+        let f1 = faces.get(1).copied().unwrap_or(f0);
+        edge_pairs.push(canonical_surface_pair(f0, f1, surface_group));
     }
 }
 
@@ -1655,11 +1731,72 @@ fn build_oriented_cylinder_wireframe(
 /// boolean "stray lines": a degenerate zero-area fin face produces no triangle,
 /// so it contributes no edge, and back edges now get proper hidden-line removal
 /// instead of x-raying through the body.
+/// Group B-rep faces that lie on the *same* analytic cylinder, returning one
+/// group id per face in `solid.shell().faces()` order (which matches the mesh's
+/// `face_id`s). The kernel emits a cylindrical wall — a bored hole, a round boss
+/// — as 3 arc-faces (thirds), and the straight longitudinal seams between them
+/// are a construction artifact, not design edges: drawn, they make a hole read
+/// as a notched/faceted circle. Faces sharing a group are recognised as one
+/// surface so those seams can be suppressed. Every non-cylinder face (and each
+/// distinct cylinder) gets its own id, so only true co-cylindrical faces match.
+fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
+    // Quantized (axis-foot xyz, axis-dir xyz, radius) — a cylinder's identity.
+    type CylSig = (i64, i64, i64, i64, i64, i64, i64);
+    let q = |v: f64| (v * 1.0e4).round() as i64;
+    // A cylinder's identity is its axis *line* + radius, independent of which
+    // generator/location names the axis. Canonicalize the axis point to the foot
+    // of the perpendicular from the origin, and the direction to a fixed sign.
+    let sig = |s: &CylindricalSurface| -> CylSig {
+        let p = s.position();
+        let d = p.direction();
+        let (mut dx, mut dy, mut dz) = (d.x(), d.y(), d.z());
+        // Sign-normalize the direction so +axis and -axis hash the same.
+        let lead = if dx.abs() > 1e-9 {
+            dx
+        } else if dy.abs() > 1e-9 {
+            dy
+        } else {
+            dz
+        };
+        if lead < 0.0 {
+            dx = -dx;
+            dy = -dy;
+            dz = -dz;
+        }
+        let loc = p.location();
+        let t = loc.x() * dx + loc.y() * dy + loc.z() * dz; // (loc·d)
+        let (fx, fy, fz) = (loc.x() - dx * t, loc.y() - dy * t, loc.z() - dz * t);
+        (q(fx), q(fy), q(fz), q(dx), q(dy), q(dz), q(s.radius()))
+    };
+
+    let mut groups = Vec::with_capacity(solid.shell().faces().len());
+    let mut seen: HashMap<CylSig, u32> = HashMap::new();
+    let mut next = 0u32;
+    for face in solid.shell().faces() {
+        let id = match face.surface() {
+            Some(GeomSurface::Cylinder(c)) => *seen.entry(sig(c)).or_insert_with(|| {
+                let g = next;
+                next += 1;
+                g
+            }),
+            // Non-cylinder: a fresh, unshareable id.
+            _ => {
+                let g = next;
+                next += 1;
+                g
+            }
+        };
+        groups.push(id);
+    }
+    groups
+}
+
 fn mesh_feature_edges(
     vertices: &[f32],
     indices: &[u32],
     face_ids: &[u32],
-) -> (Vec<f32>, Vec<u32>, Vec<f32>) {
+    surface_group: &[u32],
+) -> (Vec<f32>, Vec<u32>, Vec<f32>, Vec<(u32, u32)>) {
     // Quantize a vertex position so the independent per-face copies of a shared
     // corner collapse to one key (1e-4 mm, matching the watertightness test).
     let key = |idx: usize| -> (i64, i64, i64) {
@@ -1736,6 +1873,10 @@ fn mesh_feature_edges(
     let mut edge_vertices: Vec<f32> = Vec::new();
     let mut edge_indices: Vec<u32> = Vec::new();
     let mut edge_face_normals: Vec<f32> = Vec::new();
+    // Per kept segment: the canonical pair of surface ids it borders. Aligned with
+    // each `edge_indices` pair, this is what `group_edge_segments` chains on so an
+    // arc's chords (constant surface pair along the whole arc) become one edge.
+    let mut edge_pairs: Vec<(u32, u32)> = Vec::new();
     for rec in edges.values() {
         // Keep only a crease between two *distinct* B-rep faces. This drops both
         // internal triangulation diagonals (two triangles of the SAME face) and
@@ -1746,6 +1887,19 @@ fn mesh_feature_edges(
         // design edges are always shared by ≥2 faces, so they're untouched.
         if rec.faces.len() < 2 {
             continue;
+        }
+        // Suppress a *same-surface* seam: the straight longitudinal edge where two
+        // arc-faces of ONE analytic cylinder meet (the kernel splits a cylindrical
+        // wall into thirds). It's a construction artifact, not a design edge — drawn,
+        // it makes a bored hole / round boss look notched. Recognised by surface
+        // identity rather than normals (the per-face representative normals here are
+        // too coarse: each 120° arc-face's sample normal can sit ~60° off the seam).
+        if rec.faces.len() == 2 {
+            let g0 = surface_group.get(rec.faces[0].0 as usize);
+            let g1 = surface_group.get(rec.faces[1].0 as usize);
+            if g0.is_some() && g0 == g1 {
+                continue;
+            }
         }
         // Suppress the *facet-boundary* lines of a curved surface: a crease whose
         // two faces meet at a shallow dihedral (their outward normals nearly
@@ -1764,6 +1918,9 @@ fn mesh_feature_edges(
             // top/bottom of a fillet, a cylinder's rim), so any shallow crease that
             // touches a curved face is kept. Only a shallow crease between two
             // genuinely flat faces is a faceted tessellation seam to hide.
+            // (A *same-surface* seam — two arc-faces of one cylinder — is handled
+            // separately above via `surface_group`; here the representative
+            // per-face normals are too coarse to recognise it.)
             let touches_curved = rec
                 .faces
                 .iter()
@@ -1790,9 +1947,149 @@ fn mesh_feature_edges(
         let n1 = rec.faces.get(1).map_or(n0, |(_, n)| *n);
         edge_face_normals.extend_from_slice(&n0);
         edge_face_normals.extend_from_slice(&n1);
+        // Bordering surface pair, canonicalized so arc-faces of one cylinder match.
+        let f0 = rec.faces[0].0;
+        let f1 = rec.faces.get(1).map_or(f0, |(f, _)| *f);
+        edge_pairs.push(canonical_surface_pair(f0, f1, surface_group));
     }
 
-    (edge_vertices, edge_indices, edge_face_normals)
+    (edge_vertices, edge_indices, edge_face_normals, edge_pairs)
+}
+
+/// Canonical, order-independent key for the pair of *surfaces* an edge borders.
+///
+/// Each face id is mapped through `surface_group` so the arc-faces a cylinder is
+/// split into collapse to one surface — then the smaller id is placed first.
+/// Segments that share this key and touch are chords of the same topological
+/// edge (see [`group_edge_segments`]).
+fn canonical_surface_pair(f0: u32, f1: u32, surface_group: &[u32]) -> (u32, u32) {
+    let g0 = surface_group.get(f0 as usize).copied().unwrap_or(f0);
+    let g1 = surface_group.get(f1 as usize).copied().unwrap_or(f1);
+    if g0 <= g1 {
+        (g0, g1)
+    } else {
+        (g1, g0)
+    }
+}
+
+/// Group edge **segments** into topological edges, returning one group id per
+/// segment (parallel to the `edge_indices` pairs).
+///
+/// Two segments that meet at a shared (welded) endpoint are placed in the same
+/// group when:
+/// * `surface_pairs` is given (B-Rep solids) — they border the same surface pair.
+///   An arc keeps one pair along its whole length, so its chords chain into one
+///   edge; a corner where the pair changes splits them.
+/// * `surface_pairs` is `None` (analytic primitive wireframes, which carry no
+///   face provenance) — exactly two segments meet there and pass through nearly
+///   straight (tangent-continuous). This chains a rim circle's chords while
+///   leaving a box's 90° corners as separate edges.
+fn group_edge_segments(
+    edge_vertices: &[f32],
+    edge_indices: &[u32],
+    surface_pairs: Option<&[(u32, u32)]>,
+) -> Vec<u32> {
+    let n = edge_indices.len() / 2;
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Weld endpoints by quantized position (1e-4 mm, matching the wireframe build).
+    let vkey = |vi: u32| -> (i64, i64, i64) {
+        let b = vi as usize * 3;
+        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (q(edge_vertices[b]), q(edge_vertices[b + 1]), q(edge_vertices[b + 2]))
+    };
+    let pos = |vi: u32| -> [f64; 3] {
+        let b = vi as usize * 3;
+        [
+            edge_vertices[b] as f64,
+            edge_vertices[b + 1] as f64,
+            edge_vertices[b + 2] as f64,
+        ]
+    };
+
+    // Welded vertex -> the segments incident to it.
+    let mut at: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for s in 0..n {
+        at.entry(vkey(edge_indices[s * 2])).or_default().push(s);
+        at.entry(vkey(edge_indices[s * 2 + 1])).or_default().push(s);
+    }
+
+    // Union-find over segments.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let union = |parent: &mut [usize], a: usize, b: usize| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra.max(rb)] = ra.min(rb);
+        }
+    };
+
+    // Direction of segment `s` pointing away from welded vertex `key`.
+    let dir_away = |s: usize, key: (i64, i64, i64)| -> Option<[f64; 3]> {
+        let (a, b) = (edge_indices[s * 2], edge_indices[s * 2 + 1]);
+        let (from, to) = if vkey(a) == key { (a, b) } else { (b, a) };
+        let (p, q) = (pos(from), pos(to));
+        let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        (l > 1e-9).then(|| [d[0] / l, d[1] / l, d[2] / l])
+    };
+
+    for (key, segs) in &at {
+        match surface_pairs {
+            Some(pairs) => {
+                // Chain every pair of incident segments that border the same surfaces.
+                for i in 0..segs.len() {
+                    for j in (i + 1)..segs.len() {
+                        if pairs[segs[i]] == pairs[segs[j]] {
+                            union(&mut parent, segs[i], segs[j]);
+                        }
+                    }
+                }
+            }
+            None => {
+                // Chain any pair of incident segments that pass through nearly
+                // straight (tangent-continuous). Their outward dirs point opposite
+                // for a smooth pass; ~25° slack chains coarse rim arcs yet splits
+                // corners. Pairwise (not degree-2 only) so a rim still chains
+                // *through* a silhouette strut's junction — the two rim chords are
+                // tangent while the strut, branching off, joins neither.
+                for i in 0..segs.len() {
+                    for j in (i + 1)..segs.len() {
+                        if let (Some(d0), Some(d1)) =
+                            (dir_away(segs[i], *key), dir_away(segs[j], *key))
+                        {
+                            let dot = d0[0] * d1[0] + d0[1] * d1[1] + d0[2] * d1[2];
+                            if dot < -0.9 {
+                                union(&mut parent, segs[i], segs[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Densely renumber roots into stable group ids.
+    let mut group = vec![0u32; n];
+    let mut remap: HashMap<usize, u32> = HashMap::new();
+    let mut next = 0u32;
+    for (s, g) in group.iter_mut().enumerate() {
+        let r = find(&mut parent, s);
+        *g = *remap.entry(r).or_insert_with(|| {
+            let id = next;
+            next += 1;
+            id
+        });
+    }
+    group
 }
 
 #[cfg(test)]
@@ -1838,6 +2135,31 @@ mod wireframe_tests {
     }
 
     #[test]
+    fn bored_hole_wall_has_no_fake_seam_struts() {
+        // A 40x20x10 block with a Ø8 pocket bored 6mm into its top face. The kernel
+        // builds the pocket wall as a smooth analytic cylinder, but represents it as
+        // 3 arc-faces (thirds); the longitudinal seams between those arc-faces are a
+        // construction artifact, not design edges. Drawing them made the hole read as
+        // a notched/faceted circle from the top. They run straight down the wall, so
+        // they're vertical struts of the *pocket* depth (6) — assert none survive,
+        // while the box's four real 90° corner edges (height 10) still draw.
+        let block = make_box(&Pnt::origin(), 40.0, 20.0, 10.0);
+        let drill = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 4.0), Dir::dz()), 4.0, 6.0);
+        let body = boolean_checked(&block, &drill, BooleanOp::Cut).expect("bore should cut");
+        let mesh = MockMesh::from_solid(&body);
+        assert_eq!(
+            count_struts(&mesh.edge_vertices, &mesh.edge_indices, 6.0),
+            0,
+            "the 3-arc cylinder wall's longitudinal seams must be suppressed"
+        );
+        assert_eq!(
+            count_struts(&mesh.edge_vertices, &mesh.edge_indices, 10.0),
+            4,
+            "the box's four real 90-degree corner edges must still draw"
+        );
+    }
+
+    #[test]
     fn lone_boundary_edges_are_dropped() {
         // Two coplanar triangles meeting along a diagonal, the four outer edges
         // owned by a single triangle each. On a closed solid such lone edges are
@@ -1854,7 +2176,7 @@ mod wireframe_tests {
         ];
         let indices = vec![0, 1, 2, 3, 4, 5];
         let face_ids = vec![0, 1];
-        let (_ev, ei, _) = mesh_feature_edges(&v, &indices, &face_ids);
+        let (_ev, ei, _, _) = mesh_feature_edges(&v, &indices, &face_ids, &[]);
         assert_eq!(ei.len() / 2, 0, "lone boundary/crack edges must be dropped");
     }
 
@@ -1874,7 +2196,7 @@ mod wireframe_tests {
         ];
         let indices = vec![0, 1, 2, 3, 4, 5];
         let face_ids = vec![0, 1];
-        let (ev, ei, _) = mesh_feature_edges(&v, &indices, &face_ids);
+        let (ev, ei, _, _) = mesh_feature_edges(&v, &indices, &face_ids, &[]);
 
         assert_eq!(ei.len() / 2, 1, "the 90° crease should be the one kept edge");
         let (a, b) = (ei[0] as usize * 3, ei[1] as usize * 3);
@@ -1884,5 +2206,84 @@ mod wireframe_tests {
         let shared = (on(a, (0.0, 0.0, 0.0)) && on(b, (1.0, 0.0, 0.0)))
             || (on(a, (1.0, 0.0, 0.0)) && on(b, (0.0, 0.0, 0.0)));
         assert!(shared, "kept edge should be the shared x-axis crease");
+    }
+
+    #[test]
+    fn fillet_arc_chords_group_into_one_edge() {
+        // Fillet a vertical box edge: the blend's two end arcs are circular, so
+        // each tessellates into several chords. Those chords must collapse into a
+        // single `edge_groups` id apiece, so the viewport selects the whole arc as
+        // one curve (the user's request) instead of a lone chord.
+        let solid = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let edge = solid
+            .edges()
+            .into_iter()
+            .find(|e| {
+                let p0 = e.start().point();
+                let p1 = e.end().point();
+                p0.x().abs() < 1e-9
+                    && p1.x().abs() < 1e-9
+                    && p0.y().abs() < 1e-9
+                    && p1.y().abs() < 1e-9
+                    && (p0.z() - p1.z()).abs() > 9.9
+            })
+            .expect("box has a vertical origin edge");
+        let filleted = fillet_edges(&solid, &[edge], 2.0).expect("fillet the box edge");
+        let mesh = MockMesh::from_solid(&filleted);
+
+        let seg_count = mesh.edge_indices.len() / 2;
+        assert!(seg_count > 0, "fillet produced no wireframe edges");
+        assert_eq!(
+            mesh.edge_groups.len(),
+            seg_count,
+            "one group id per edge segment"
+        );
+
+        let mut sizes: HashMap<u32, usize> = HashMap::new();
+        for &g in &mesh.edge_groups {
+            *sizes.entry(g).or_insert(0) += 1;
+        }
+        // At least one edge (a fillet end arc) is many chords grouped as one.
+        let max_group = sizes.values().copied().max().unwrap_or(0);
+        assert!(
+            max_group >= 2,
+            "no multi-chord arc was grouped into one edge: sizes={sizes:?}"
+        );
+        // Grouping actually collapsed segments — fewer groups than chords.
+        assert!(
+            sizes.len() < seg_count,
+            "grouping collapsed nothing: {} groups for {seg_count} chords",
+            sizes.len()
+        );
+    }
+
+    #[test]
+    fn smooth_circle_rim_groups_into_one_edge() {
+        // A sketched circle extrudes to a smooth cylinder whose rim is one circular
+        // edge drawn as many chords. The geometric (tangent-continuity) grouping —
+        // used where there's no B-Rep face provenance — must chain those chords
+        // into a single edge so the rim selects as one curve.
+        let n = crate::CIRCLE_SEGS;
+        let circle: Vec<(f32, f32)> = (0..n)
+            .map(|i| {
+                let a = (i as f32 / n as f32) * std::f32::consts::TAU;
+                (5.0 * a.cos(), 5.0 * a.sin())
+            })
+            .collect();
+        let mesh = MockMesh::make_extruded_sketch(&circle, &[], 8.0, &CoordinateSystem::XY);
+
+        let seg_count = mesh.edge_indices.len() / 2;
+        assert_eq!(mesh.edge_groups.len(), seg_count, "one group id per segment");
+
+        let mut sizes: HashMap<u32, usize> = HashMap::new();
+        for &g in &mesh.edge_groups {
+            *sizes.entry(g).or_insert(0) += 1;
+        }
+        // A rim circle chains into one large group (at least half its chords).
+        let big = sizes.values().filter(|&&c| c >= n / 2).count();
+        assert!(
+            big >= 1,
+            "rim circle was not chained into one edge: sizes={sizes:?}"
+        );
     }
 }

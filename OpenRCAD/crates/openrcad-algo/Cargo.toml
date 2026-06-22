@@ -19,3 +19,4 @@ serde.workspace = true
 
 [dev-dependencies]
 openrcad-primitives = { path = "../openrcad-primitives" }
+openrcad-mesh = { path = "../openrcad-mesh" }

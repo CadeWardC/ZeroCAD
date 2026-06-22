@@ -72,13 +72,16 @@ fn tris(g: &ParametricGraph) -> Vec<(String, usize)> {
         .collect()
 }
 
-// Cut is DIRECTIONAL: a positive depth sweeps along the sketch-plane normal.
-// On the top face the normal points OUTWARD (+Z, away from the body), so a
-// positive cut sweeps into empty space and must NOT carve a pocket into the
-// body (only a negligible sub-0.1mm surface nick from the coplanarity overshoot
-// is allowed). The user reaches into the body with a NEGATIVE depth instead.
+// A Cut carves toward the material, whichever way the depth is signed. The
+// cutter is built in both sweep directions and `apply_cut` keeps the one whose
+// AABB overlaps the body more — so a sketch on the TOP face cut with a POSITIVE
+// depth (which sweeps the tool *up*, away from the body) still bites a pocket
+// DOWN into the block, matching the Fusion-style "a cut removes material"
+// expectation. (Previously a positive top-face cut swept into empty air and did
+// nothing — the reported "cut does not work".) A cut still reaches a body that
+// lies on the *outward* side, because that direction would then have the overlap.
 #[test]
-fn cut_on_top_face_outward_positive_depth_no_pocket() {
+fn cut_on_top_face_carves_into_body_regardless_of_sign() {
     let mut g = ParametricGraph::new();
     add_sketch(
         &mut g,
@@ -88,7 +91,8 @@ fn cut_on_top_face_outward_positive_depth_no_pocket() {
     );
     add_extrude(&mut g, "extrude_2", "sketch_1", 10.0, ExtrudeMode::NewBody);
 
-    // Sketch on the TOP face (z=10, normal +Z), positive depth = away from body.
+    // Sketch on the TOP face (z=10, normal +Z), POSITIVE depth = drawn away from
+    // the body — must still carve a pocket into the block below.
     add_sketch(
         &mut g,
         "sketch_3",
@@ -97,12 +101,12 @@ fn cut_on_top_face_outward_positive_depth_no_pocket() {
     );
     add_extrude(&mut g, "extrude_4", "sketch_3", 5.0, ExtrudeMode::Cut);
     let after = tris(&g);
-    println!("after cut(+5 outward on top): {:?}", after);
+    println!("after cut(+5 on top): {:?}", after);
     assert_eq!(after.len(), 1, "cut should keep exactly one body");
     assert!(
-        !has_vertex_z(&g, 3.0, 7.0),
-        "an OUTWARD (+) cut on the top face must not carve a pocket into the body \
-         (no pocket floor mid-body near z=5)"
+        has_vertex_z(&g, 4.0, 6.0),
+        "a positive-depth cut on the top face must carve a pocket DOWN into the \
+         body (floor near z=5), not sweep into empty air and do nothing"
     );
 }
 

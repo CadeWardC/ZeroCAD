@@ -1036,24 +1036,69 @@ impl ZeroCadApp {
 
     /// Read a body edge's world-space geometry (endpoints + the two adjacent
     /// face normals) straight from its wireframe, packaged for an [`EdgeRef`].
+    ///
+    /// `e` is a topological **edge group** id (see [`BodyPick::Edge`]): the chord
+    /// segments of one whole edge. The endpoints returned are the chain's two free
+    /// ends — for a straight edge that's its own two corners; for a multi-chord
+    /// fillet arc, the arc's ends.
     fn edge_ref_from(&self, node_id: &str, e: u32) -> Option<EdgeRef> {
         let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == node_id)?;
-        let ei = e as usize * 2;
-        let ia = *mesh.edge_indices.get(ei)? as usize * 3;
-        let ib = *mesh.edge_indices.get(ei + 1)? as usize * 3;
-        let p0 = [
-            *mesh.edge_vertices.get(ia)?,
-            *mesh.edge_vertices.get(ia + 1)?,
-            *mesh.edge_vertices.get(ia + 2)?,
-        ];
-        let p1 = [
-            *mesh.edge_vertices.get(ib)?,
-            *mesh.edge_vertices.get(ib + 1)?,
-            *mesh.edge_vertices.get(ib + 2)?,
-        ];
-        let fo = e as usize * 6;
-        // Face normals may be absent on legacy meshes; without them we can't
-        // orient a cutter, so bail (the user sees the action do nothing).
+        let seg_count = mesh.edge_indices.len() / 2;
+
+        // Gather the group's chord segments. A legacy mesh without grouping treats
+        // `e` as a single raw segment index.
+        let segs: Vec<usize> = if mesh.edge_groups.is_empty() {
+            if (e as usize) < seg_count {
+                vec![e as usize]
+            } else {
+                return None;
+            }
+        } else {
+            (0..seg_count)
+                .filter(|&s| mesh.edge_groups.get(s).copied() == Some(e))
+                .collect()
+        };
+        let &first = segs.first()?;
+
+        let vpos = |seg: usize, which: usize| -> [f32; 3] {
+            let vi = mesh.edge_indices[seg * 2 + which] as usize * 3;
+            [
+                mesh.edge_vertices[vi],
+                mesh.edge_vertices[vi + 1],
+                mesh.edge_vertices[vi + 2],
+            ]
+        };
+        // A welded endpoint touched by exactly one of the group's chords is a free
+        // end of the chain. Two of them bound the edge; a closed loop has none, so
+        // fall back to the first chord's endpoints.
+        let qkey = |p: [f32; 3]| -> (i64, i64, i64) {
+            let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+            (q(p[0]), q(p[1]), q(p[2]))
+        };
+        let mut uses: HashMap<(i64, i64, i64), (u32, [f32; 3])> = HashMap::new();
+        for &s in &segs {
+            for w in 0..2 {
+                let p = vpos(s, w);
+                uses.entry(qkey(p)).or_insert((0, p)).0 += 1;
+            }
+        }
+        let mut ends: Vec<[f32; 3]> = uses
+            .values()
+            .filter(|(c, _)| *c == 1)
+            .map(|(_, p)| *p)
+            .collect();
+        // Deterministic order so the fillet's speculative precompute key is stable.
+        ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (p0, p1) = if ends.len() >= 2 {
+            (ends[0], ends[1])
+        } else {
+            (vpos(first, 0), vpos(first, 1))
+        };
+
+        // Adjacent face normals from the first chord (constant along a straight
+        // edge; representative for an arc). Absent on legacy meshes → can't orient
+        // a cutter, so bail (the user sees the action do nothing).
+        let fo = first * 6;
         if mesh.edge_face_normals.len() < fo + 6 {
             return None;
         }
@@ -1154,7 +1199,7 @@ impl ZeroCadApp {
         const EDGE_TOL_PX: f32 = 6.0;
 
         let mut best_vertex: Option<(String, u32, f32)> = None; // (node, vert, px)
-        let mut best_edge: Option<(String, u32, f32)> = None; // (node, edge, px)
+        let mut best_edge: Option<(String, u32, f32)> = None; // (node, edge GROUP, px)
         let mut best_face: Option<(String, u32, f32)> = None; // (node, face, depth)
 
         let faces_camera = |n: (f32, f32, f32)| -> bool {
@@ -1210,7 +1255,11 @@ impl ZeroCadApp {
                 );
                 let d = dist_point_to_segment(click, egui::pos2(a.0, a.1), egui::pos2(b.0, b.1));
                 if d < EDGE_TOL_PX && best_edge.as_ref().map_or(true, |b| d < b.2) {
-                    best_edge = Some((node_id.clone(), e as u32, d));
+                    // Map the hit chord to its topological edge group, so the whole
+                    // curve (a fillet arc, a circular rim) selects as one. Legacy
+                    // meshes without grouping fall back to the raw segment index.
+                    let g = mesh.edge_groups.get(e).copied().unwrap_or(e as u32);
+                    best_edge = Some((node_id.clone(), g, d));
                 }
             }
 
