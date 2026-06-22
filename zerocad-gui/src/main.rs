@@ -1021,17 +1021,30 @@ impl ZeroCadApp {
         }
     }
 
-    /// The single selected body **edge**, as `(node_id, edge_index)`, or `None`
-    /// unless exactly one edge (and nothing else) is selected. Gates the 3D
-    /// fillet/chamfer affordance.
-    fn selected_body_edge(&self) -> Option<(String, u32)> {
-        if self.selected_body.len() != 1 {
-            return None;
-        }
-        self.selected_body.iter().next().and_then(|(nid, pick)| match pick {
-            BodyPick::Edge(e) => Some((nid.clone(), *e)),
-            _ => None,
-        })
+    /// The selected body **edges** of a single body, as `(node_id, [edge_index,…])`,
+    /// or `None` when no edge is selected. With edges of more than one body
+    /// selected, only the first body's edges are returned (a fillet/chamfer feature
+    /// targets one body); non-edge picks (faces, points) are ignored. Gates the 3D
+    /// fillet/chamfer affordance and drives a multi-edge fillet.
+    fn selected_body_edges(&self) -> Option<(String, Vec<u32>)> {
+        let mut edges: Vec<(String, u32)> = self
+            .selected_body
+            .iter()
+            .filter_map(|(nid, pick)| match pick {
+                BodyPick::Edge(e) => Some((nid.clone(), *e)),
+                _ => None,
+            })
+            .collect();
+        // Deterministic: pick the lowest-id body, then its edges in id order, so the
+        // primary (anchor) edge and the apply order are stable across frames.
+        edges.sort();
+        let node = edges.first()?.0.clone();
+        let ids: Vec<u32> = edges
+            .into_iter()
+            .filter(|(n, _)| *n == node)
+            .map(|(_, e)| e)
+            .collect();
+        Some((node, ids))
     }
 
     /// Read a body edge's world-space geometry (endpoints + the two adjacent
@@ -3333,20 +3346,26 @@ impl eframe::App for ZeroCadApp {
                     }
                 }
 
-                // 3D edge fillet / chamfer: shown when exactly one body EDGE is
-                // selected (and we're not sketching/extruding). Rounds or bevels
-                // the real solid via a guarded boolean cut.
-                if !active_sketching
+                // 3D edge fillet / chamfer: shown when one or more body EDGES are
+                // selected (and we're not sketching/extruding). Rounds or bevels the
+                // real solid; several edges (Shift/Ctrl-click) fillet at once.
+                let edge_sel = (!active_sketching
                     && self.extrude_op.is_none()
-                    && self.edge_mod_op.is_none()
-                    && self.selected_body_edge().is_some()
-                {
+                    && self.edge_mod_op.is_none())
+                .then(|| self.selected_body_edges())
+                .flatten();
+                if let Some((_, edge_ids)) = edge_sel {
+                    let n_edges = edge_ids.len();
                     ui.separator();
                     ui.label(
-                        egui::RichText::new("Modify Edge")
-                            .strong()
-                            .size(12.0)
-                            .color(self.pal().text_strong),
+                        egui::RichText::new(if n_edges > 1 {
+                            format!("Modify {n_edges} Edges")
+                        } else {
+                            "Modify Edge".to_string()
+                        })
+                        .strong()
+                        .size(12.0)
+                        .color(self.pal().text_strong),
                     );
                     ui.add_space(4.0);
                     // One button: a left-click starts a Fillet (the default); a
@@ -3469,18 +3488,10 @@ impl eframe::App for ZeroCadApp {
                             response
                         };
 
-                        // Select tool (no drawing): lets the user pick body
-                        // faces/edges/vertices without leaving the sketch.
-                        {
-                            let is_active = self.active_tool.is_none();
-                            let btn = draw_tool_btn(ui, is_active, "Select", None);
-                            if btn.on_hover_text("Select body faces, edges and vertices (Esc)").clicked() {
-                                self.active_tool = None;
-                                self.cancel_in_progress_shape();
-                                self.clear_pending_corners();
-                                log::info!("Switched to Select (no drawing tool)");
-                            }
-                        }
+                        // No explicit "Select" button: pressing Esc returns to the
+                        // neutral Select state (`active_tool = None`), which lets the
+                        // user pick body faces/edges/vertices without leaving the
+                        // sketch — see the global Escape handler below.
 
                         // Line Tool (single mode, no flyout).
                         {
@@ -4776,6 +4787,11 @@ impl eframe::App for ZeroCadApp {
                     && !self.camera_anim_active
                 {
                     let is_double = response.double_clicked();
+                    // Shift / Ctrl (⌘ on macOS) extend the selection: each modified
+                    // click adds the picked face/edge/point to the set, or removes it
+                    // if already selected, instead of replacing the whole selection.
+                    let multi_select =
+                        ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
                     if let Some(click_pos) = response.interact_pointer_pos() {
                         // Local projection that captures only Copy values (not
                         // `self`), so it doesn't extend a borrow across the
@@ -4911,52 +4927,42 @@ impl eframe::App for ZeroCadApp {
                             // any body selection.
                             self.selected_body.clear();
 
-                            // Double-click a sketch → select the whole sketch (all
-                            // its regions). Single-click toggles one edge (priority)
-                            // or face, preserving the multi-face extrude workflow.
-                            if is_double {
-                                if let Some(sid) = hit_sketch {
-                                    let count = self
-                                        .graph
-                                        .graph
-                                        .node_indices()
-                                        .find_map(|idx| {
-                                            let n = &self.graph.graph[idx];
-                                            if n.id == sid {
-                                                if let FeatureType::Sketch { curves, shapes, corner_mods, .. } = &n.feature {
-                                                    let eff = zerocad_core::effective_curves(curves, shapes, corner_mods, &self.graph.variable_map());
-                                                    return Some(detect_regions(&eff).len());
-                                                }
-                                            }
-                                            None
-                                        })
-                                        .unwrap_or(0);
-                                    self.selected_faces.retain(|(s, _)| s != &sid);
-                                    self.selected_edges.retain(|(s, _)| s != &sid);
-                                    for i in 0..count {
-                                        self.selected_faces.insert((sid.clone(), i));
-                                    }
-                                    self.status_msg =
-                                        format!("Selected whole sketch {} ({} faces).", sid, count);
-                                }
-                            } else if let Some((sid, ei, _)) = best_edge {
+                            // A PLAIN click selects exactly the one element under
+                            // the cursor, replacing any prior sketch selection — so
+                            // "click a face, click Extrude" pulls only that face,
+                            // never the whole sketch. Shift/Ctrl EXTENDS the
+                            // selection (toggling the clicked element), which is the
+                            // multi-face extrude workflow. Edges take priority over
+                            // faces. (A double-click no longer selects every region —
+                            // that silently turned a one-face extrude into a whole-
+                            // sketch one; the sketch property panel's "Extrude whole
+                            // Sketch" button is the explicit way to get all regions.)
+                            if !multi_select {
+                                self.selected_faces.clear();
+                                self.selected_edges.clear();
+                            }
+                            if let Some((sid, ei, _)) = best_edge {
                                 let key = (sid, ei);
-                                if !self.selected_edges.insert(key.clone()) {
+                                if multi_select && !self.selected_edges.insert(key.clone()) {
                                     self.selected_edges.remove(&key);
+                                } else {
+                                    self.selected_edges.insert(key.clone());
                                 }
                                 self.status_msg = format!(
-                                    "Toggled edge {} of {}. Edges selected: {}.",
+                                    "Edge {} of {} selected. Edges: {}.",
                                     key.1,
                                     key.0,
                                     self.selected_edges.len(),
                                 );
                             } else if let Some((sid, ri, _)) = best {
                                 let key = (sid, ri);
-                                if !self.selected_faces.insert(key.clone()) {
+                                if multi_select && !self.selected_faces.insert(key.clone()) {
                                     self.selected_faces.remove(&key);
+                                } else {
+                                    self.selected_faces.insert(key.clone());
                                 }
                                 self.status_msg = format!(
-                                    "Toggled face {} of {}. Faces selected: {} (click Extrude to build).",
+                                    "Face {} of {} selected. Faces: {} (click Extrude to build).",
                                     key.1,
                                     key.0,
                                     self.selected_faces.len(),
@@ -4967,22 +4973,46 @@ impl eframe::App for ZeroCadApp {
                             let body_hit =
                                 self.pick_body_element(click_pos, &proj, sin_p, cos_p, sin_y, cos_y);
                             if let Some((node, pick)) = body_hit {
+                                // Sketch-region/edge selections are a separate
+                                // concept; a body pick always supersedes them.
                                 self.selected_faces.clear();
                                 self.selected_edges.clear();
-                                self.selected_body.clear();
-                                let final_pick = if is_double { BodyPick::Whole } else { pick };
-                                self.selected_body.insert((node.clone(), final_pick));
-                                self.status_msg = match final_pick {
-                                    BodyPick::Whole => format!("Selected whole body {}.", node),
-                                    BodyPick::Face(f) => {
-                                        format!("Selected face {} of {} (Draw Sketch to sketch on it).", f, node)
+                                if is_double {
+                                    // Double-click always selects the whole body.
+                                    self.selected_body.clear();
+                                    self.selected_body.insert((node.clone(), BodyPick::Whole));
+                                    self.status_msg = format!("Selected whole body {}.", node);
+                                } else if multi_select {
+                                    // Add to the selection, or remove it if already
+                                    // selected, so multiple faces/edges/points can be
+                                    // picked together (e.g. to fillet several edges).
+                                    let key = (node.clone(), pick);
+                                    if !self.selected_body.insert(key.clone()) {
+                                        self.selected_body.remove(&key);
                                     }
-                                    BodyPick::Edge(e) => format!("Selected edge {} of {}.", e, node),
-                                    BodyPick::Vertex(v) => format!("Selected point {} of {}.", v, node),
-                                };
-                            } else {
-                                // Nothing hit at all — clear everything.
+                                    self.status_msg =
+                                        format!("{} element(s) selected.", self.selected_body.len());
+                                } else {
+                                    // Plain click replaces the selection.
+                                    self.selected_body.clear();
+                                    self.selected_body.insert((node.clone(), pick));
+                                    self.status_msg = match pick {
+                                        BodyPick::Whole => format!("Selected whole body {}.", node),
+                                        BodyPick::Face(f) => {
+                                            format!("Selected face {} of {} (Draw Sketch to sketch on it).", f, node)
+                                        }
+                                        BodyPick::Edge(e) => format!("Selected edge {} of {}.", e, node),
+                                        BodyPick::Vertex(v) => format!("Selected point {} of {}.", v, node),
+                                    };
+                                }
+                            } else if !multi_select {
+                                // Nothing hit and no modifier held — clear everything
+                                // (body AND sketch face/edge selections), so an empty
+                                // click is a reliable "deselect all". With a modifier
+                                // down, keep the in-progress multi-selection intact.
                                 self.selected_body.clear();
+                                self.selected_faces.clear();
+                                self.selected_edges.clear();
                             }
                         } // end: sketch-first picking
                     }
@@ -5103,6 +5133,24 @@ impl eframe::App for ZeroCadApp {
                     "Tool deselected — select faces, edges, or points.".to_string();
                 log::info!("Escape: switched to Select mode");
             }
+        }
+
+        // In the plain 3D view (no sketch, no live op or dialog), Escape returns to
+        // the neutral Select state by clearing the current selection.
+        if !self.is_sketch_mode
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.dim_input.is_none()
+            && !self.is_plane_selection_mode
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && (!self.selected_body.is_empty()
+                || !self.selected_faces.is_empty()
+                || !self.selected_edges.is_empty())
+        {
+            self.selected_body.clear();
+            self.selected_faces.clear();
+            self.selected_edges.clear();
+            self.status_msg = "Selection cleared.".to_string();
         }
 
         // Persist preferences whenever the unit, theme, or onboarding toggle

@@ -13,11 +13,11 @@
 use std::collections::{HashMap, HashSet};
 
 use openrcad::algo::{boolean_checked, fillet_edges, prism, BooleanOp};
-use openrcad::foundation::{Ax2, Dir, Pnt, Vec as GeomVec};
-use openrcad::geom::{Curve, CylindricalSurface, GeomSurface, Plane};
+use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
+use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
 use openrcad::mesh::tessellate;
 use openrcad::primitives::{make_box, make_cylinder};
-use openrcad::topo::{Edge, Face, Orientation, Solid, Wire};
+use openrcad::topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
 use crate::geometry::Vec3;
 
@@ -188,15 +188,23 @@ impl MockMesh {
 
         let solid = match circle {
             Some((cu, cv, r)) => oriented_cylinder_solid(cs, cu, cv, r, depth),
-            None => build_extrusion_solid(points, holes, depth as f64, cs)
-                .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs)),
+            None => build_extrusion_solid(points, holes, depth as f64, cs, false)
+                .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs, false)),
         };
         let solid = match solid {
             Some(s) => s,
             None => return Self::empty(),
         };
 
-        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, true);
+        // Orient the shell robustly (triangle adjacency + signed volume) rather
+        // than the cheap per-triangle centroid repair. A region split out of an
+        // arrangement of overlapping sketch shapes is frequently NON-CONVEX (e.g.
+        // a rectangle with a circular bite where a circle crossed it); the
+        // centroid test then misjudges triangles on the concave side and leaves
+        // them inward-facing, so they back-face cull and the body renders with
+        // holes. Convex profiles (a plain rectangle, the cylinder cap) orient
+        // identically either way, so this is strictly safer.
+        let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, true, false);
 
         let (edge_vertices, edge_indices, edge_face_normals) = match circle {
             Some((cu, cv, r)) => build_oriented_cylinder_wireframe(cs, cu, cv, r, depth),
@@ -296,21 +304,23 @@ pub fn cylinder_solid(r: f32, h: f32) -> Option<KernelSolid> {
         // Right-handed frame whose normal is +Y (u = Z, v = X ⇒ u × v = +Y),
         // giving the base-at-origin, +Y-axis cylinder the primitive expects.
         let frame = CoordinateSystem::new(Vec3::ZERO, Vec3::Z, Vec3::X);
-        build_extrusion_solid(&pts, &[], h as f64, &frame)
+        build_extrusion_solid(&pts, &[], h as f64, &frame, true)
     })
 }
 
-/// Solid for one extruded sketch region, as a polygonal prism. Holed profiles
-/// try the holed plane first and fall back to the outer boundary alone if the
-/// kernel can't attach it.
+/// Solid for one extruded sketch region. Straight boundary runs sweep to planar
+/// laterals; co-circular runs (a drawn circle, a sketch-fillet arc) are rebuilt
+/// into true circular-arc edges by [`loop_to_wire`] so they sweep to *smooth*
+/// cylindrical walls instead of a fan of facets. Holed profiles try the holed
+/// plane first and fall back to the outer boundary alone if the kernel can't
+/// attach it.
 ///
-/// Note this is deliberately a *prism* even for circular profiles: `truck`'s
-/// boolean solver reliably handles polyhedral solids but fails (and sometimes
-/// panics) on the smooth cylindrical faces a true cylinder would introduce —
-/// e.g. a blind cylindrical pocket comes back empty. The *display* of a plain
-/// extruded circle is still a smooth cylinder (see `make_extruded_sketch`); only
-/// the geometry fed to join/cut booleans is faceted, and a fine circle polygon
-/// is visually indistinguishable from a cylinder once it's a hole anyway.
+/// OpenRCAD's boolean engine resolves native cylinder cuts/joins/bosses
+/// watertight (see the kernel's `repro_cylinder` tests), so feeding it smooth
+/// arc walls yields clean round pockets/bosses — not the striped facet result
+/// the old "always a prism" rule produced. The parametric assembler still tries
+/// the fully-analytic [`circular_cylinder_tool`] first for whole-circle
+/// profiles; this is the general fallback for everything else.
 pub fn extruded_region_solid(
     points: &[(f32, f32)],
     holes: &[Vec<(f32, f32)>],
@@ -320,8 +330,8 @@ pub fn extruded_region_solid(
     if points.len() < 3 || depth.abs() < f32::EPSILON {
         return None;
     }
-    build_extrusion_solid(points, holes, depth as f64, cs)
-        .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs))
+    build_extrusion_solid(points, holes, depth as f64, cs, true)
+        .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs, true))
 }
 
 /// Build the **cutter solid** for a 3D edge fillet/chamfer: subtract it from a
@@ -712,7 +722,7 @@ pub fn axis_aligned_through_cut(part: &KernelSolid, tool: &KernelSolid) -> Optio
             _ => crate::geometry::CoordinateSystem::new(origin, Vec3::X, Vec3::Y),
         };
 
-        return build_extrusion_solid(&outer, &[hole], (phi[axis] - plo[axis]) as f64, &cs);
+        return build_extrusion_solid(&outer, &[hole], (phi[axis] - plo[axis]) as f64, &cs, false);
     }
 
     None
@@ -772,13 +782,20 @@ pub fn axis_aligned_cut_parts(part: &KernelSolid, tool: &KernelSolid) -> Option<
 /// Round the edge running from `p0` to `p1` of `solid` by `radius`, using the
 /// native rolling-ball blend (no booleans). The edge is located in the solid's
 /// topology by matching its endpoints, so `p0`/`p1` are the world-space edge
-/// endpoints captured in an [`crate::parametric::EdgeRef`]. Returns `None` when
-/// the edge isn't found, isn't a blendable convex corner, or the blend fails.
-pub fn fillet_edge(solid: &KernelSolid, p0: [f32; 3], p1: [f32; 3], radius: f32) -> Option<KernelSolid> {
+/// endpoints captured in an [`crate::parametric::EdgeRef`]. Returns `Err` with a
+/// human-readable reason when the edge isn't found, isn't a blendable corner, or
+/// the blend fails — the caller surfaces it to the user instead of a generic
+/// "couldn't be rounded".
+pub fn fillet_edge(
+    solid: &KernelSolid,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    radius: f32,
+) -> Result<KernelSolid, String> {
     let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
     let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
     let e = Edge::between_points(a, b);
-    fillet_edges(solid, std::slice::from_ref(&e), radius as f64).ok()
+    fillet_edges(solid, std::slice::from_ref(&e), radius as f64).map_err(|err| err.to_string())
 }
 
 /// Axis-aligned bounding box of a solid from its B-Rep vertices, as
@@ -820,11 +837,303 @@ fn build_cylinder_solid(r: f64, h: f64) -> Option<KernelSolid> {
     Some(make_cylinder(&Ax2::new(Pnt::origin(), Dir::dy()), r, h))
 }
 
+// ---------------------------------------------------------------------------
+// Arc reconstruction for extruded sketch profiles
+//
+// Sketch region boundaries arrive as dense polylines: every circle/arc the user
+// drew (and every sketch-fillet) was flattened to line segments by region
+// detection, which keeps only points (no curve provenance). Extruding those
+// straight edges produces a fan of planar laterals — a "segmented" cylinder that
+// shades as facets and litters the wireframe with vertical struts.
+//
+// `loop_to_wire` rebuilds the true geometry before the sweep: it finds maximal
+// runs of consecutive boundary vertices that lie on a common circle and emits a
+// single circular-arc `Edge` per run (split into <=135° pieces, matching the
+// kernel's cylinder convention). `prism` then makes those arc edges into smooth
+// cylindrical walls. Polygons have no co-circular run, so their corners stay
+// sharp line edges — a rectangle still extrudes to a clean box.
+// ---------------------------------------------------------------------------
+
+/// Maximum central angle (radians) for a single reconstructed arc edge. Longer
+/// arcs are split into equal pieces — mirroring `make_cylinder`'s 3×120° wall so
+/// each cylindrical lateral face stays a comfortable sub-half-circle the
+/// tessellator handles cleanly.
+const MAX_ARC_PIECE: f64 = 0.75 * std::f64::consts::PI; // 135°
+
+/// Per-vertex turn beyond which a boundary vertex is a true corner, not a point
+/// on a smooth arc. A `CIRCLE_SEGS`-faceted circle turns ~7.5°/vertex and a
+/// sketch fillet arc <=3.6°; an octagon turns 45° and a hexagon 60°. ~23°
+/// cleanly separates real arcs from polygons the user wants left faceted.
+const ARC_MAX_TURN: f64 = 0.40;
+
+/// Minimum count of consecutive co-circular interior vertices for a run to count
+/// as an arc, so a stray pair of points can't masquerade as one.
+const ARC_MIN_RUN: usize = 3;
+
+/// Circumcircle `(cx, cy, r)` of three 2D points, or `None` when (near) collinear.
+fn circumcircle_2d(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> Option<(f64, f64, f64)> {
+    let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let a2 = a.0 * a.0 + a.1 * a.1;
+    let b2 = b.0 * b.0 + b.1 * b.1;
+    let c2 = c.0 * c.0 + c.1 * c.1;
+    let ux = (a2 * (b.1 - c.1) + b2 * (c.1 - a.1) + c2 * (a.1 - b.1)) / d;
+    let uy = (a2 * (c.0 - b.0) + b2 * (a.0 - c.0) + c2 * (b.0 - a.0)) / d;
+    let r = ((ux - a.0).powi(2) + (uy - a.1).powi(2)).sqrt();
+    Some((ux, uy, r))
+}
+
+/// Exterior turn angle (radians) at `cur` between the incoming and outgoing
+/// segments. ~0 on a straight run, large at a polygon corner.
+fn turn_angle_2d(prev: (f64, f64), cur: (f64, f64), next: (f64, f64)) -> f64 {
+    let v1 = (cur.0 - prev.0, cur.1 - prev.1);
+    let v2 = (next.0 - cur.0, next.1 - cur.1);
+    let l1 = v1.0.hypot(v1.1);
+    let l2 = v2.0.hypot(v2.1);
+    if l1 < 1e-12 || l2 < 1e-12 {
+        return 0.0;
+    }
+    (((v1.0 * v2.0 + v1.1 * v2.1) / (l1 * l2)).clamp(-1.0, 1.0)).acos()
+}
+
+/// Whether two per-vertex circumcircles describe the same underlying circle
+/// (so the vertices between them lie on one arc).
+fn same_circle(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+    let dc = (a.0 - b.0).hypot(a.1 - b.1);
+    let r = a.2.max(b.2);
+    dc <= 0.05 * r + 1e-2 && (a.2 - b.2).abs() <= 0.07 * r + 1e-2
+}
+
+/// Build a wire from a closed 2D boundary loop (`cs`-plane coordinates),
+/// reconstructing circular arcs from co-circular runs so an extruded sketch arc
+/// becomes one smooth cylindrical wall. Returns `None` for fewer than 3 distinct
+/// points.
+fn loop_to_wire(loop_pts: &[(f32, f32)], cs: &crate::geometry::CoordinateSystem) -> Option<Wire> {
+    // Dedup coincident consecutive (and wrap-around) points in 2D.
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_pts.len());
+    for &(u, v) in loop_pts {
+        let p = (u as f64, v as f64);
+        if pts
+            .last()
+            .is_none_or(|q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 1e-7)
+        {
+            pts.push(p);
+        }
+    }
+    if pts.len() >= 2 {
+        let (f, l) = (pts[0], *pts.last().unwrap());
+        if (f.0 - l.0).hypot(f.1 - l.1) <= 1e-7 {
+            pts.pop();
+        }
+    }
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+
+    let to_pnt = |p: (f64, f64)| -> Pnt {
+        let q = cs.unproject(p.0 as f32, p.1 as f32);
+        Pnt::new(q.x as f64, q.y as f64, q.z as f64)
+    };
+    let axis_n = Dir::new(cs.n.x as f64, cs.n.y as f64, cs.n.z as f64);
+    // Map a 2D plane offset (du, dv) to its 3D direction vector.
+    let dir3d = |d: (f64, f64)| -> GeomVec {
+        GeomVec::new(
+            cs.u.x as f64 * d.0 + cs.v.x as f64 * d.1,
+            cs.u.y as f64 * d.0 + cs.v.y as f64 * d.1,
+            cs.u.z as f64 * d.0 + cs.v.z as f64 * d.1,
+        )
+    };
+
+    // Per-vertex co-circularity: the circle through (prev, cur, next), gated so a
+    // sharp polygon corner classifies as a non-arc vertex (a run separator).
+    let arc_vert: Vec<Option<(f64, f64, f64)>> = (0..n)
+        .map(|i| {
+            let prev = pts[(i + n - 1) % n];
+            let cur = pts[i];
+            let next = pts[(i + 1) % n];
+            if turn_angle_2d(prev, cur, next) > ARC_MAX_TURN {
+                return None;
+            }
+            circumcircle_2d(prev, cur, next)
+        })
+        .collect();
+
+    let mut edges: Vec<Edge> = Vec::new();
+
+    // Append the arc covering rotated vertices [cs_v ..= ce_v] (ce_v may equal n,
+    // i.e. wrap to vertex 0) to `edges`, split into <=MAX_ARC_PIECE sub-arcs.
+    let emit_arc =
+        |edges: &mut Vec<Edge>, rp: &[(f64, f64)], cs_v: usize, ce_v: usize, circ: (f64, f64, f64)| {
+            let m = rp.len();
+            let (cx, cy, r) = circ;
+            let start2d = rp[cs_v % m];
+            let end2d = rp[ce_v % m];
+
+            // Sense: signed area of the covered chain about the centre picks which
+            // way `Circle::point(t)` (CCW about +main) must turn to trace it.
+            let mut signed = 0.0;
+            for k in cs_v..ce_v {
+                let p = rp[k % m];
+                let q = rp[(k + 1) % m];
+                signed += (p.0 - cx) * (q.1 - cy) - (p.1 - cy) * (q.0 - cx);
+            }
+            let main = if signed >= 0.0 { axis_n } else { axis_n.reversed() };
+
+            let center3d = to_pnt((cx, cy));
+            let xd = dir3d((start2d.0 - cx, start2d.1 - cy));
+            let mv = GeomVec::from_dir(main);
+            let xperp = xd - mv * xd.dot(&mv);
+            let Some(xdir) = Dir::from_vec(&xperp) else {
+                // Degenerate (start coincident with centre): fall back to chords.
+                for k in cs_v..ce_v {
+                    edges.push(Edge::between_points(to_pnt(rp[k % m]), to_pnt(rp[(k + 1) % m])));
+                }
+                return;
+            };
+            let circle = Circle::new(Ax3::new_axes(center3d, main, xdir), r);
+            let ydir = mv.cross(&GeomVec::from_dir(xdir));
+            let ang = |p2d: (f64, f64)| -> f64 {
+                let w = dir3d((p2d.0 - cx, p2d.1 - cy));
+                w.dot(&ydir).atan2(w.dot(&GeomVec::from_dir(xdir)))
+            };
+            let t0 = ang(start2d);
+            let mut t1 = ang(end2d);
+            while t1 <= t0 + 1e-9 {
+                t1 += 2.0 * std::f64::consts::PI;
+            }
+            let span = t1 - t0;
+            let pieces = ((span / MAX_ARC_PIECE).ceil() as usize).max(1);
+            let mut prev_v = Vertex::new(to_pnt(start2d));
+            for k in 1..=pieces {
+                let ts = t0 + span * ((k - 1) as f64 / pieces as f64);
+                let te = t0 + span * (k as f64 / pieces as f64);
+                let end_v = if k == pieces {
+                    Vertex::new(to_pnt(end2d))
+                } else {
+                    Vertex::new(circle.point(te))
+                };
+                edges.push(Edge::new(
+                    Some(GeomCurve::circle(circle)),
+                    ts,
+                    te,
+                    prev_v.clone(),
+                    end_v.clone(),
+                ));
+                prev_v = end_v;
+            }
+        };
+
+    // Pick a rotation start at a non-arc (corner) vertex so arc runs never wrap
+    // the array boundary. With no corner the loop is a full circle (or an
+    // ellipse, whose osculating circles never agree).
+    match arc_vert.iter().position(|a| a.is_none()) {
+        Some(off) => {
+            let rp: Vec<(f64, f64)> = (0..n).map(|i| pts[(i + off) % n]).collect();
+            let ra: Vec<Option<(f64, f64, f64)>> = (0..n).map(|i| arc_vert[(i + off) % n]).collect();
+
+            // Collect arc runs (covered vertex ranges) over the interior 1..n.
+            let mut runs: Vec<(usize, usize, (f64, f64, f64))> = Vec::new();
+            let mut i = 1;
+            while i < n {
+                let Some(ci) = ra[i] else {
+                    i += 1;
+                    continue;
+                };
+                let mut j = i;
+                while j < n - 1 {
+                    match (ra[j], ra[j + 1]) {
+                        (Some(a), Some(b)) if same_circle(a, b) => j += 1,
+                        _ => break,
+                    }
+                }
+                if j - i + 1 >= ARC_MIN_RUN {
+                    let (cs_v, ce_v) = (i - 1, j + 1);
+                    let mid = (cs_v + ce_v) / 2;
+                    let circ = circumcircle_2d(rp[cs_v % n], rp[mid % n], rp[ce_v % n])
+                        .unwrap_or(ci);
+                    runs.push((cs_v, ce_v, circ));
+                }
+                i = j + 1;
+            }
+
+            // Walk the loop, emitting arcs for runs and line edges between them.
+            let mut cur = 0usize;
+            let mut ri = 0usize;
+            while cur < n {
+                if ri < runs.len() && runs[ri].0 == cur {
+                    let (a, b, circ) = runs[ri];
+                    emit_arc(&mut edges, &rp, a, b, circ);
+                    cur = b;
+                    ri += 1;
+                } else {
+                    edges.push(Edge::between_points(to_pnt(rp[cur % n]), to_pnt(rp[(cur + 1) % n])));
+                    cur += 1;
+                }
+            }
+        }
+        None => {
+            // No corners. A full circle has one shared circle; an ellipse does not.
+            let avg = {
+                let (mut sx, mut sy, mut sr) = (0.0, 0.0, 0.0);
+                for c in arc_vert.iter().flatten() {
+                    sx += c.0;
+                    sy += c.1;
+                    sr += c.2;
+                }
+                (sx / n as f64, sy / n as f64, sr / n as f64)
+            };
+            let is_circle = arc_vert
+                .iter()
+                .flatten()
+                .all(|c| same_circle(*c, avg));
+            if is_circle {
+                let circ = circumcircle_2d(pts[0], pts[n / 3], pts[2 * n / 3]).unwrap_or(avg);
+                emit_arc(&mut edges, &pts, 0, n, circ);
+            } else {
+                for i in 0..n {
+                    edges.push(Edge::between_points(to_pnt(pts[i]), to_pnt(pts[(i + 1) % n])));
+                }
+            }
+        }
+    }
+
+    (edges.len() >= 2).then(|| Wire::from_edges(edges))
+}
+
+/// Build a wire directly from the region's sampled polyline. This is the stable
+/// path for visible sketch-extrude meshes: cap tessellation sees only straight
+/// edges, so mixed rectangle/circle regions cannot produce analytic-arc cap
+/// spikes in the preview render.
+fn loop_to_polyline_wire(
+    loop_pts: &[(f32, f32)],
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<Wire> {
+    if loop_pts.len() < 3 {
+        return None;
+    }
+    let pts: Vec<Pnt> = loop_pts
+        .iter()
+        .map(|&(u, v)| {
+            let p = cs.unproject(u, v);
+            Pnt::new(p.x as f64, p.y as f64, p.z as f64)
+        })
+        .collect();
+    let n = pts.len();
+    let edges: Vec<Edge> = (0..n)
+        .map(|i| Edge::between_points(pts[i], pts[(i + 1) % n]))
+        .collect();
+    Some(Wire::from_edges(edges))
+}
+
 fn build_extrusion_solid(
     points: &[(f32, f32)],
     holes: &[Vec<(f32, f32)>],
     depth: f64,
     cs: &crate::geometry::CoordinateSystem,
+    reconstruct_arcs: bool,
 ) -> Option<KernelSolid> {
     if points.len() < 3 || depth.abs() < f64::EPSILON {
         return None;
@@ -834,16 +1143,16 @@ fn build_extrusion_solid(
         let p = cs.unproject(u, v);
         Pnt::new(p.x as f64, p.y as f64, p.z as f64)
     };
+    // Boolean solids can reconstruct circular arcs so swept circle fragments
+    // become smooth cylindrical walls. Visible sketch-extrude meshes keep the
+    // sampled polyline: OpenRCAD's cap tessellator is more reliable on compound
+    // circle/line regions when the cap boundary contains only straight chords.
     let make_wire = |loop_pts: &[(f32, f32)]| -> Option<Wire> {
-        if loop_pts.len() < 3 {
-            return None;
+        if reconstruct_arcs {
+            loop_to_wire(loop_pts, cs)
+        } else {
+            loop_to_polyline_wire(loop_pts, cs)
         }
-        let pts: Vec<Pnt> = loop_pts.iter().map(|(u, v)| to_pnt(*u, *v)).collect();
-        let n = pts.len();
-        let edges: Vec<Edge> = (0..n)
-            .map(|i| Edge::between_points(pts[i], pts[(i + 1) % n]))
-            .collect();
-        Some(Wire::from_edges(edges))
     };
 
     // A planar face on the sketch frame: outer boundary plus holes as inner
@@ -2285,5 +2594,106 @@ mod wireframe_tests {
             big >= 1,
             "rim circle was not chained into one edge: sizes={sizes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod arc_reconstruction_tests {
+    use super::*;
+    use crate::geometry::CoordinateSystem;
+    use openrcad::geom::GeomSurface;
+
+    fn cylinder_faces(solid: &KernelSolid) -> usize {
+        solid
+            .shell()
+            .faces()
+            .iter()
+            .filter(|f| matches!(f.surface(), Some(GeomSurface::Cylinder(_))))
+            .count()
+    }
+
+    /// A finely-sampled circular arc (a sketch fillet / drawn arc) must rebuild
+    /// into cylindrical walls when extruded — not a fan of planar facets.
+    #[test]
+    fn semicircle_d_profile_extrudes_to_smooth_cylinder_wall() {
+        // "D" shape: a right semicircle (radius 5 about (5,5)) closed by three
+        // straight edges down the left. 24 arc facets — pre-fix this swept 24
+        // planar strips; now it must be smooth cylindrical wall(s).
+        let mut pts: Vec<(f32, f32)> = Vec::new();
+        let steps = 24;
+        for i in 0..=steps {
+            let t = -std::f32::consts::FRAC_PI_2
+                + (i as f32 / steps as f32) * std::f32::consts::PI;
+            pts.push((5.0 + 5.0 * t.cos(), 5.0 + 5.0 * t.sin()));
+        }
+        pts.push((0.0, 10.0));
+        pts.push((0.0, 0.0));
+
+        let solid = extruded_region_solid(&pts, &[], 5.0, &CoordinateSystem::XY)
+            .expect("D profile should extrude");
+        assert!(
+            cylinder_faces(&solid) >= 1,
+            "the semicircle must become cylindrical wall(s), got {} cylinders / {} faces",
+            cylinder_faces(&solid),
+            solid.face_count()
+        );
+        // A 180° arc capped at 135°/piece → 2 cylinder faces + 3 straight laterals
+        // + 2 caps. The exact split count isn't contractual, but the shell must be
+        // a closed, healthy solid.
+        assert!(solid.is_watertight(), "D extrusion must be watertight");
+        assert!(solid.health_report().is_healthy(), "D extrusion must be healthy");
+    }
+
+    /// A polygon the user genuinely wants faceted (here a rectangle) has no
+    /// co-circular run, so every corner stays a sharp line edge.
+    #[test]
+    fn rectangle_stays_a_six_face_box() {
+        let rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)];
+        let solid = extruded_region_solid(&rect, &[], 4.0, &CoordinateSystem::XY)
+            .expect("rectangle should extrude");
+        assert_eq!(cylinder_faces(&solid), 0, "a box must have no cylinder faces");
+        assert_eq!(solid.face_count(), 6, "a box is 6 faces");
+        assert!(solid.is_watertight());
+    }
+
+    /// A full sketched circle fed straight to the prism path (the boolean-tool
+    /// fallback) rebuilds into a smooth cylinder, not a 48-gon.
+    #[test]
+    fn full_circle_profile_rebuilds_to_cylinder() {
+        let n = crate::CIRCLE_SEGS;
+        let circle: Vec<(f32, f32)> = (0..n)
+            .map(|i| {
+                let a = (i as f32 / n as f32) * std::f32::consts::TAU;
+                (5.0 * a.cos(), 5.0 * a.sin())
+            })
+            .collect();
+        let solid = extruded_region_solid(&circle, &[], 8.0, &CoordinateSystem::XY)
+            .expect("circle should extrude");
+        assert!(
+            cylinder_faces(&solid) >= 1,
+            "a circle must rebuild to cylindrical wall(s), got {} cylinders",
+            cylinder_faces(&solid)
+        );
+        assert!(solid.is_watertight(), "circle extrusion must be watertight");
+    }
+
+    /// An octagon turns 45° per vertex — well past the arc-vs-corner threshold —
+    /// so it must stay a faceted prism, never collapse to a cylinder.
+    #[test]
+    fn octagon_is_not_mistaken_for_a_circle() {
+        let octagon: Vec<(f32, f32)> = (0..8)
+            .map(|i| {
+                let a = (i as f32 / 8.0) * std::f32::consts::TAU;
+                (5.0 * a.cos(), 5.0 * a.sin())
+            })
+            .collect();
+        let solid = extruded_region_solid(&octagon, &[], 4.0, &CoordinateSystem::XY)
+            .expect("octagon should extrude");
+        assert_eq!(
+            cylinder_faces(&solid),
+            0,
+            "an octagon is an intentional polygon — keep it faceted"
+        );
+        assert!(solid.is_watertight());
     }
 }

@@ -565,8 +565,9 @@ impl ZeroCadApp {
             edge_mod_anchor = Some(egui::pos2(c.0 + 40.0, c.1 - 14.0));
 
             // Outward bisector of the two adjacent faces (points away from the
-            // body for a convex edge) → the direction that grows the radius.
-            let (n1, n2) = (op.edge.n1, op.edge.n2);
+            // body for a convex edge) → the direction that grows the radius. Anchors
+            // on the primary (first) edge when several are being filleted at once.
+            let (n1, n2) = (op.primary().n1, op.primary().n2);
             let mut o = [n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]];
             let ol = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
             if ol > 1.0e-6 {

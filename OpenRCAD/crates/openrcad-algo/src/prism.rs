@@ -202,7 +202,16 @@ fn lateral_surface(
             }
             GeomCurve::Circle(circle) => {
                 if let Some(axis) = vector.normalized() {
-                    if circle.axis().is_parallel(&axis, 1e-8) {
+                    // A circular arc swept along an axis parallel to the circle's
+                    // own axis generates a cylinder (we build it on the exact sweep
+                    // `axis`, not the fitted one). The arc's axis is fitted from
+                    // possibly-f32 sketch samples, so it carries ~1e-7 rad of noise —
+                    // comparing at 1e-8 wrongly rejects a genuinely axis-aligned
+                    // extruded arc, leaving a `Ruled` wall that the rolling-ball
+                    // fillet/trim can't blend (it errors `NotPlaneOrAnalytic` the
+                    // moment that wall is a fillet's end cap). 1e-6 rad (~6e-5°) is
+                    // still far tighter than any real obliquity.
+                    if circle.axis().is_parallel(&axis, 1e-6) {
                         return GeomSurface::cylinder(CylindricalSurface::new(
                             Ax3::new_axes(circle.center(), axis, circle.position().x_direction()),
                             circle.radius(),
@@ -416,5 +425,46 @@ mod tests {
             .count();
         assert_eq!(cylinders, 3);
         assert!(solid.is_watertight());
+    }
+
+    /// An axis-aligned circular arc reconstructed from (f32) sketch samples carries
+    /// a tiny axis tilt. The lateral it sweeps must still be classified as a
+    /// CYLINDER, not a Ruled wall — otherwise a fillet whose end runs into that
+    /// wall fails with `NotPlaneOrAnalytic`. Regression for `fillet_problem.zcad`.
+    #[test]
+    fn slightly_tilted_circle_axis_still_makes_a_cylinder() {
+        // Axis tilted ~1e-7 rad off +z (well past the old 1e-8 gate, far under 1e-6).
+        let tilted = Dir::new(1.0e-7, 0.0, 1.0);
+        let circle = Circle::new(Ax3::new(Pnt::origin(), tilted), 2.0);
+        let edges: Vec<Edge> = [0.0, TAU / 3.0, 2.0 * TAU / 3.0, TAU]
+            .windows(2)
+            .map(|w| {
+                Edge::new(
+                    Some(GeomCurve::circle(circle)),
+                    w[0],
+                    w[1],
+                    Vertex::new(circle.point(w[0])),
+                    Vertex::new(circle.point(w[1])),
+                )
+            })
+            .collect();
+        let face = Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                tilted,
+            ))),
+            Wire::from_edges(edges),
+        );
+        let solid = prism(&face, GeomVec::new(0.0, 0.0, 5.0)).unwrap();
+        let cylinders = solid
+            .shell()
+            .faces()
+            .iter()
+            .filter(|face| matches!(face.surface(), Some(GeomSurface::Cylinder(_))))
+            .count();
+        assert_eq!(
+            cylinders, 3,
+            "a near-axis-aligned arc must sweep to cylinders, not Ruled walls"
+        );
     }
 }

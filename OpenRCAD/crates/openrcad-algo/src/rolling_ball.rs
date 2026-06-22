@@ -7,8 +7,11 @@
 use core::fmt;
 
 use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, Vec as GeomVec};
-use openrcad_geom::{Circle, CylindricalSurface, GeomCurve, GeomSurface, ToroidalSurface, GregorySurface, Curve, Surface};
-use openrcad_topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
+use openrcad_geom::{
+    Circle, CylindricalSurface, Curve, Ellipse, GeomCurve, GeomSurface, GregorySurface, Plane,
+    SphericalSurface, Surface, ToroidalSurface,
+};
+use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
 
 use crate::sew::sew;
 
@@ -267,12 +270,32 @@ fn make_gregory_corner_patch(
 }
 
 /// Apply a selected-edge rolling-ball fillet to a simple planar or curved solid.
+///
+/// When the filleted edge ends at a corner already rounded by an earlier fillet
+/// (two blends meeting at a shared vertex), the corner is closed with a smooth
+/// spherical patch — the rolling ball pivoting in the corner — instead of the
+/// degenerate flat trim that collapses the prior cylinder to its own axis (the
+/// "spike" artifact). If that smooth path leaves a non-watertight shell for an
+/// unusual corner, the build retries with the legacy corner trim, which always
+/// closes (it just creases).
 pub fn fillet_planar_edge(
     solid: &Solid,
     edge: &Edge,
     radius: f64,
 ) -> Result<Solid, RollingBallError> {
-    let blend = rolling_ball_fillet_edge(solid, edge, radius)?;
+    match fillet_planar_edge_inner(solid, edge, radius, true) {
+        Ok(solid) => Ok(solid),
+        Err(_) => fillet_planar_edge_inner(solid, edge, radius, false),
+    }
+}
+
+fn fillet_planar_edge_inner(
+    solid: &Solid,
+    edge: &Edge,
+    radius: f64,
+    use_sphere: bool,
+) -> Result<Solid, RollingBallError> {
+    let mut blend = rolling_ball_fillet_edge(solid, edge, radius)?;
     let start = edge.source().point();
     let end = edge.target().point();
 
@@ -282,67 +305,57 @@ pub fn fillet_planar_edge(
     let mut faces = Vec::new();
     let mut skipped_faces = std::collections::HashSet::new();
 
-    let trimmed_start = if start_caps.len() == 1 {
-        trim_face_at_corner(
-            &start_caps[0],
-            start,
-            blend.contact_a.start().point(),
-            blend.contact_b.start().point(),
-            &blend.start_arc,
-        )?
-    } else {
-        let patch = make_gregory_corner_patch(
-            start,
-            blend.contact_a.start().point(),
-            blend.contact_b.start().point(),
-            radius,
-        );
-        faces.push(patch);
-        for cap in &start_caps {
-            if let Ok(trimmed) = trim_face_at_corner(
-                cap,
-                start,
-                blend.contact_a.start().point(),
-                blend.contact_b.start().point(),
-                &blend.start_arc,
-            ) {
-                faces.push(trimmed);
-                skipped_faces.insert(cap.id());
-            }
-        }
-        Face::new(None, Wire::from_edges([]))
-    };
+    // First pass: smart corner closure, before the spine trims read the contacts
+    // (`try_corner_miter` extends the new blend toward the seam by mutating `blend`).
+    //
+    // - One earlier fillet meets this one and the corner's third edge is still
+    //   sharp → the two fillets *miter*, meeting along their mutual seam and leaving
+    //   the third edge sharp (`try_corner_miter`).
+    // - Two earlier fillets already meet here (mitered) and this is the third edge
+    //   at the corner → it closes into a spherical octant (`try_corner_sphere_two_caps`).
+    //
+    // The two-cap sphere is tried first (a two-cap corner is never a single-cap
+    // miter). Both are gated on `use_sphere`, so the retry path (use_sphere = false)
+    // falls back to the flat corner trim if either leaves a non-watertight shell.
+    let start_mitered = use_sphere
+        && (try_corner_sphere_two_caps(
+            solid, &blend, start, &start_caps, radius, &mut faces, &mut skipped_faces,
+        ) || try_corner_miter(
+            solid, &mut blend, start, &start_caps, radius, &mut faces, &mut skipped_faces,
+        ));
+    let end_mitered = use_sphere
+        && (try_corner_sphere_two_caps(
+            solid, &blend, end, &end_caps, radius, &mut faces, &mut skipped_faces,
+        ) || try_corner_miter(
+            solid, &mut blend, end, &end_caps, radius, &mut faces, &mut skipped_faces,
+        ));
 
-    let trimmed_end = if end_caps.len() == 1 {
-        trim_face_at_corner(
-            &end_caps[0],
-            end,
-            blend.contact_a.end().point(),
-            blend.contact_b.end().point(),
-            &blend.end_arc,
-        )?
-    } else {
-        let patch = make_gregory_corner_patch(
-            end,
-            blend.contact_a.end().point(),
-            blend.contact_b.end().point(),
+    if !start_mitered {
+        handle_corner_endpoint(
+            solid,
+            &blend,
+            start,
+            &start_caps,
+            &blend.start_arc,
             radius,
-        );
-        faces.push(patch);
-        for cap in &end_caps {
-            if let Ok(trimmed) = trim_face_at_corner(
-                cap,
-                end,
-                blend.contact_a.end().point(),
-                blend.contact_b.end().point(),
-                &blend.end_arc,
-            ) {
-                faces.push(trimmed);
-                skipped_faces.insert(cap.id());
-            }
-        }
-        Face::new(None, Wire::from_edges([]))
-    };
+            use_sphere,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
+    }
+    if !end_mitered {
+        handle_corner_endpoint(
+            solid,
+            &blend,
+            end,
+            &end_caps,
+            &blend.end_arc,
+            radius,
+            use_sphere,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
+    }
 
     let trimmed_a = trim_face_along_spine(&blend.face_a, &blend.spine, &blend.contact_a)?;
     let trimmed_b = trim_face_along_spine(&blend.face_b, &blend.spine, &blend.contact_b)?;
@@ -350,23 +363,15 @@ pub fn fillet_planar_edge(
     for face in solid.shell().faces() {
         if same_face(&face, &blend.face_a)
             || same_face(&face, &blend.face_b)
-            || (start_caps.len() == 1 && same_face(&face, &start_caps[0]))
-            || (end_caps.len() == 1 && same_face(&face, &end_caps[0]))
             || skipped_faces.contains(&face.id())
         {
             continue;
         }
         faces.push(face);
     }
-    
+
     faces.push(trimmed_a);
     faces.push(trimmed_b);
-    if start_caps.len() == 1 {
-        faces.push(trimmed_start);
-    }
-    if end_caps.len() == 1 {
-        faces.push(trimmed_end);
-    }
     faces.push(blend.blend_face);
 
     // Reject a blend that didn't close: a radius too large for the local geometry
@@ -378,6 +383,765 @@ pub fn fillet_planar_edge(
         return Err(RollingBallError::InvalidRadius { radius });
     }
     Ok(result)
+}
+
+/// Faces produced for one shared corner: the new faces to add and the original
+/// faces (the prior cylinder, the trimmed side face) those replace.
+struct CornerSphere {
+    new_faces: Vec<Face>,
+    skip_ids: Vec<FaceId>,
+}
+
+/// Trim/close the faces around one spine endpoint of a blend.
+///
+/// Three cases:
+/// - The endpoint cap is a single prior *blend* surface (a cylinder/torus) — two
+///   fillets share this corner. Round it with a [`corner_sphere_blend`].
+/// - The cap is a single planar face — trim that face for the blend's end arc.
+/// - Several cap faces (an n-valent vertex) — drop in a Gregory corner patch.
+#[allow(clippy::too_many_arguments)]
+fn handle_corner_endpoint(
+    solid: &Solid,
+    blend: &RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    arc: &Edge,
+    radius: f64,
+    use_sphere: bool,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> Result<(), RollingBallError> {
+    // The blend's two contact points at this corner (nearest endpoint of each
+    // contact curve), independent of spine orientation.
+    let ca = nearest_endpoint(&blend.contact_a, corner);
+    let cb = nearest_endpoint(&blend.contact_b, corner);
+
+    if caps.len() == 1 {
+        let cap = &caps[0];
+        let is_prior_blend = matches!(
+            cap.surface(),
+            Some(GeomSurface::Cylinder(_)) | Some(GeomSurface::Torus(_))
+        );
+        if use_sphere && is_prior_blend {
+            if let Some(cs) = corner_sphere_blend(solid, cap, corner, blend, ca, cb, radius) {
+                faces.extend(cs.new_faces);
+                skipped.extend(cs.skip_ids);
+                return Ok(());
+            }
+        }
+        let trimmed = trim_face_at_corner(cap, corner, ca, cb, arc)?;
+        faces.push(trimmed);
+        skipped.insert(cap.id());
+        Ok(())
+    } else {
+        let patch = make_gregory_corner_patch(corner, ca, cb, radius);
+        faces.push(patch);
+        for cap in caps {
+            if let Ok(trimmed) = trim_face_at_corner(cap, corner, ca, cb, arc) {
+                faces.push(trimmed);
+                skipped.insert(cap.id());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Position tolerance for corner-blend cross-checks, scaled to the fillet radius.
+///
+/// The corner constructors compare points they derive analytically (sphere/miter
+/// tangents `T`/`F`/`R`/`K`) against geometry the blend already built. When the
+/// GUI drives a fillet, those "already built" points are re-read from a quantized
+/// tessellated mesh, so they drift from the exact analytic values by a few parts
+/// in `1e4`. A fixed `1e-4` literal rejects genuine equal-radius perpendicular
+/// corners under that drift — they then fall to the flat-trim crease (the user's
+/// "becomes flat near the miter"). Scale the tolerance to the radius instead.
+fn corner_tol(r: f64) -> f64 {
+    (1e-4 * r.max(1.0)).max(10.0 * tolerance::CONFUSION)
+}
+
+/// The endpoint of `edge` nearest to `point`.
+fn nearest_endpoint(edge: &Edge, point: Pnt) -> Pnt {
+    let s = edge.source().point();
+    let t = edge.target().point();
+    if s.distance(&point) <= t.distance(&point) {
+        s
+    } else {
+        t
+    }
+}
+
+/// Round a corner where the new blend meets a cylinder left by an earlier fillet.
+///
+/// Geometry (a box's top-front-right corner with the top-front and top-right
+/// edges blended, radius `r`): the rolling ball, pivoting in the corner, sits at
+/// the point `C` tangent to all three faces (top, and the two sides). The corner
+/// is a spherical octant of radius `r` about `C`, meeting:
+/// - the prior cylinder along the great-circle arc T→F (so the prior cylinder is
+///   *retracted* to end on that arc instead of overrunning to its own axis),
+/// - the new blend cylinder along arc T→R (already built by the normal path),
+/// - a small planar closure face along arc F→R, capping the still-sharp third
+///   edge's stub.
+///
+/// `T`, `F`, `R` are the sphere's tangent points on the common (top), prior-side
+/// and new-side faces. Returns `None` (caller falls back to the flat trim) unless
+/// the corner is the supported convex, mutually-perpendicular, equal-radius case.
+fn corner_sphere_blend(
+    solid: &Solid,
+    cap: &Face,
+    corner: Pnt,
+    blend: &RollingBallBlend,
+    contact_a_corner: Pnt,
+    contact_b_corner: Pnt,
+    radius: f64,
+) -> Option<CornerSphere> {
+    let r = radius;
+    let near = |p: Pnt, q: Pnt| p.distance(&q) <= 10.0 * tolerance::CONFUSION;
+
+    // Sphere center: the rolling-ball center at this corner.
+    let c0 = blend.centerline.start().point();
+    let c1 = blend.centerline.end().point();
+    let center = if c0.distance(&corner) <= c1.distance(&corner) {
+        c0
+    } else {
+        c1
+    };
+
+    // The cap must be a cylinder whose axis passes through the sphere center
+    // (true for an equal-radius perpendicular meeting).
+    let cyl = match cap.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => return None,
+    };
+    if point_line_distance(center, cyl.position().location(), cyl.position().direction())
+        > 1e-5 * r.max(1.0) + 1e-6
+    {
+        return None;
+    }
+
+    // The cap's outer loop must be the simple "two straight contacts + two end
+    // arcs" of a single straight-edge fillet.
+    let cap_edges = cap.outer_wire()?.edges();
+    if cap_edges.len() != 4 {
+        return None;
+    }
+    let is_arc = |e: &Edge| matches!(e.curve(), Some(GeomCurve::Circle(_)));
+
+    // The corner-end arc of the cap: a circular edge with an endpoint at `corner`.
+    let corner_arc_idx = cap_edges
+        .iter()
+        .position(|e| is_arc(e) && (near(e.source().point(), corner) || near(e.target().point(), corner)))?;
+    let (arc_s, arc_t) = (
+        cap_edges[corner_arc_idx].source().point(),
+        cap_edges[corner_arc_idx].target().point(),
+    );
+    // The arc's other end sits on the cap's "side1" contact (the prior fillet's
+    // other planar face); it is also the sharp corner stub's top vertex `K`.
+    let other_corner = if near(arc_s, corner) { arc_t } else { arc_s };
+
+    // The two straight contact edges and the planar faces they ride on.
+    let straights: Vec<&Edge> = cap_edges.iter().filter(|e| !is_arc(e)).collect();
+    if straights.len() != 2 {
+        return None;
+    }
+    let top_contact = *straights
+        .iter()
+        .find(|e| near(e.source().point(), corner) || near(e.target().point(), corner))?;
+    let side1_contact = *straights
+        .iter()
+        .find(|e| near(e.source().point(), other_corner) || near(e.target().point(), other_corner))?;
+    let common = adjacent_planar_face(solid, top_contact, cap)?;
+    let side1 = adjacent_planar_face(solid, side1_contact, cap)?;
+
+    // The common face must be one of the new blend's two faces; the other new
+    // blend face is "side2".
+    let side2 = if same_face(&common, &blend.face_a) {
+        blend.face_b.clone()
+    } else if same_face(&common, &blend.face_b) {
+        blend.face_a.clone()
+    } else {
+        return None;
+    };
+
+    let n_top = planar_outward_normal(&common).ok()?;
+    let n_side1 = planar_outward_normal(&side1).ok()?;
+    let n_side2 = planar_outward_normal(&side2).ok()?;
+
+    // Supported only for a convex, mutually-perpendicular trihedral corner.
+    let perp = |a: Dir, b: Dir| GeomVec::from_dir(a).dot(&GeomVec::from_dir(b)).abs() < 1e-3;
+    if !(perp(n_top, n_side1) && perp(n_top, n_side2) && perp(n_side1, n_side2)) {
+        return None;
+    }
+
+    // Sphere tangent points on each face, and the sharp corner stub vertex K.
+    let tangent = |n: Dir| center + GeomVec::from_dir(n) * r;
+    let t = tangent(n_top);
+    let f = tangent(n_side1);
+    let rr = tangent(n_side2);
+    let k = f + (rr - center);
+
+    // Cross-checks against geometry the rest of the build already produced:
+    // T/R must coincide with the new blend's two corner contacts, and K with the
+    // cap's other corner vertex. Otherwise the corner is not the case we model.
+    let xtol = corner_tol(r);
+    let matches_a_or_b =
+        |x: Pnt| x.distance(&contact_a_corner) < xtol || x.distance(&contact_b_corner) < xtol;
+    if !matches_a_or_b(t) || !matches_a_or_b(rr) || k.distance(&other_corner) > xtol {
+        return None;
+    }
+
+    // Retract the prior cylinder: its corner-end arc becomes the sphere arc T→F,
+    // and its two contacts are shortened to T and F.
+    let mut new_cap_edges = Vec::with_capacity(4);
+    for (i, e) in cap_edges.iter().enumerate() {
+        if i == corner_arc_idx {
+            let s = if near(e.source().point(), corner) { t } else { f };
+            let d = if near(e.target().point(), corner) { t } else { f };
+            let a = arc_on_sphere(center, s, d, r).ok()?;
+            new_cap_edges.push(orient_edge_between(&a, s, d));
+        } else if is_arc(e) {
+            new_cap_edges.push(e.clone());
+        } else {
+            let remap = |p: Pnt| {
+                if near(p, corner) {
+                    t
+                } else if near(p, other_corner) {
+                    f
+                } else {
+                    p
+                }
+            };
+            new_cap_edges.push(Edge::between_points(remap(e.source().point()), remap(e.target().point())));
+        }
+    }
+    let retracted_cap = Face::with_wires(
+        cap.surface().cloned(),
+        Some(Wire::from_edges(new_cap_edges)),
+        cap.inner_wires(),
+        cap.orientation(),
+    );
+
+    // The spherical octant T→F→R.
+    let sphere_face = Face::new(
+        Some(GeomSurface::sphere(SphericalSurface::new(
+            Ax3::new_axes(center, n_top, n_side2),
+            r,
+        ))),
+        Wire::from_edges([
+            arc_on_sphere(center, t, f, r).ok()?,
+            arc_on_sphere(center, f, rr, r).ok()?,
+            arc_on_sphere(center, rr, t, r).ok()?,
+        ]),
+    );
+
+    // The planar closure capping the sharp corner stub, bounded by F→K, K→R and
+    // the sphere's R→F arc.
+    let closure_face = Face::new(
+        Some(GeomSurface::plane(Plane::from_point_normal(f, n_top))),
+        Wire::from_edges([
+            Edge::between_points(f, k),
+            Edge::between_points(k, rr),
+            orient_edge_between(&arc_on_sphere(center, rr, f, r).ok()?, rr, f),
+        ]),
+    );
+
+    // Split the prior fillet's side face so its contact edge ends at F (the rest
+    // of that edge, F→K, is shared with the closure face).
+    let side1_edges = side1.outer_wire()?.edges();
+    let mut new_side1 = Vec::with_capacity(side1_edges.len() + 1);
+    let mut split = false;
+    for e in &side1_edges {
+        if !split && same_undirected_edge(e, side1_contact) {
+            let (s, d) = (e.source().point(), e.target().point());
+            new_side1.push(Edge::between_points(s, f));
+            new_side1.push(Edge::between_points(f, d));
+            split = true;
+        } else {
+            new_side1.push(e.clone());
+        }
+    }
+    if !split {
+        return None;
+    }
+    let modified_side1 = Face::with_wires(
+        side1.surface().cloned(),
+        Some(Wire::from_edges(new_side1)),
+        side1.inner_wires(),
+        side1.orientation(),
+    );
+
+    Some(CornerSphere {
+        new_faces: vec![retracted_cap, sphere_face, closure_face, modified_side1],
+        skip_ids: vec![cap.id(), side1.id()],
+    })
+}
+
+/// Round a corner where the new blend meets exactly *one* earlier fillet's
+/// cylinder and the corner's third edge is still sharp — the Fusion-style miter.
+///
+/// Two equal-radius perpendicular fillets meeting at a corner whose third edge is
+/// NOT filleted must meet along their mutual intersection *seam* (a quarter-ellipse
+/// running from the shared top tangent point `T` down to the sharp corner stub
+/// vertex `K`), leaving that third edge a crisp edge running down from `K`. This
+/// is distinct from the spherical ball-corner, which only belongs when all three
+/// edges at the corner are rounded.
+///
+/// On the supported convex, mutually-perpendicular, equal-radius case this:
+/// - retracts the prior cylinder cap so its corner end follows the seam (its top
+///   contact shortens to `T`; its side contact already ends at `K`), pushing the
+///   retracted cap and skipping the original,
+/// - extends the new blend toward `K` and swaps its corner end arc for the seam,
+///   mutating `blend` so the later spine trims pick up the extension,
+/// - leaves the third edge's two side faces untouched (no closure, no sphere),
+///
+/// and returns `true`. Returns `false` (caller falls back to the sphere / flat
+/// corner trim) for any unsupported corner.
+#[allow(clippy::too_many_arguments)]
+fn try_corner_miter(
+    solid: &Solid,
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> bool {
+    let r = radius;
+    let near = |p: Pnt, q: Pnt| p.distance(&q) <= 10.0 * tolerance::CONFUSION;
+
+    if caps.len() != 1 {
+        return false;
+    }
+    let cap = &caps[0];
+    if !matches!(
+        cap.surface(),
+        Some(GeomSurface::Cylinder(_)) | Some(GeomSurface::Torus(_))
+    ) {
+        return false;
+    }
+
+    // The corner's two new-blend contacts (nearest endpoint of each contact curve).
+    let contact_a_corner = nearest_endpoint(&blend.contact_a, corner);
+    let contact_b_corner = nearest_endpoint(&blend.contact_b, corner);
+
+    // --- Corner frame: the rolling-ball center at this corner and the cap's
+    // contact/arc layout (the same analysis `corner_sphere_blend` performs). ---
+    let c0 = blend.centerline.start().point();
+    let c1 = blend.centerline.end().point();
+    let center = if c0.distance(&corner) <= c1.distance(&corner) {
+        c0
+    } else {
+        c1
+    };
+
+    let cyl = match cap.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => return false,
+    };
+    if point_line_distance(center, cyl.position().location(), cyl.position().direction())
+        > 1e-5 * r.max(1.0) + 1e-6
+    {
+        return false;
+    }
+
+    let Some(cap_wire) = cap.outer_wire() else {
+        return false;
+    };
+    let cap_edges = cap_wire.edges();
+    if cap_edges.len() != 4 {
+        return false;
+    }
+    let is_arc = |e: &Edge| matches!(e.curve(), Some(GeomCurve::Circle(_)));
+
+    let Some(corner_arc_idx) = cap_edges.iter().position(|e| {
+        is_arc(e) && (near(e.source().point(), corner) || near(e.target().point(), corner))
+    }) else {
+        return false;
+    };
+    let (arc_s, arc_t) = (
+        cap_edges[corner_arc_idx].source().point(),
+        cap_edges[corner_arc_idx].target().point(),
+    );
+    // The arc's far end is the sharp corner stub vertex `K`.
+    let other_corner = if near(arc_s, corner) { arc_t } else { arc_s };
+
+    // The cap's two contacts are its straight (line) edges. Select Lines
+    // explicitly: a cap already mitered at its *other* end carries an elliptical
+    // seam edge, which `!is_arc` (= "not a circle") would wrongly count here.
+    let straights: Vec<&Edge> = cap_edges
+        .iter()
+        .filter(|e| matches!(e.curve(), Some(GeomCurve::Line(_))))
+        .collect();
+    if straights.len() != 2 {
+        return false;
+    }
+    let Some(&top_contact) = straights
+        .iter()
+        .find(|e| near(e.source().point(), corner) || near(e.target().point(), corner))
+    else {
+        return false;
+    };
+    let Some(&side1_contact) = straights.iter().find(|e| {
+        near(e.source().point(), other_corner) || near(e.target().point(), other_corner)
+    }) else {
+        return false;
+    };
+    let Some(common) = adjacent_planar_face(solid, top_contact, cap) else {
+        return false;
+    };
+    let Some(side1) = adjacent_planar_face(solid, side1_contact, cap) else {
+        return false;
+    };
+
+    let side2 = if same_face(&common, &blend.face_a) {
+        blend.face_b.clone()
+    } else if same_face(&common, &blend.face_b) {
+        blend.face_a.clone()
+    } else {
+        return false;
+    };
+
+    let (Ok(n_top), Ok(n_side1), Ok(n_side2)) = (
+        planar_outward_normal(&common),
+        planar_outward_normal(&side1),
+        planar_outward_normal(&side2),
+    ) else {
+        return false;
+    };
+
+    let perp = |a: Dir, b: Dir| GeomVec::from_dir(a).dot(&GeomVec::from_dir(b)).abs() < 1e-3;
+    if !(perp(n_top, n_side1) && perp(n_top, n_side2) && perp(n_side1, n_side2)) {
+        return false;
+    }
+
+    // Seam endpoints: `T` (top tangent), `R` (new-blend side tangent), `K` (stub).
+    let t = center + GeomVec::from_dir(n_top) * r;
+    let rr = center + GeomVec::from_dir(n_side2) * r;
+    let k = center + (GeomVec::from_dir(n_side1) + GeomVec::from_dir(n_side2)) * r;
+
+    // Cross-check against the geometry the rest of the build already produced: `T`
+    // and `R` are the new blend's two corner contacts, and `K` the cap stub vertex.
+    let xtol = corner_tol(r);
+    let matches_a_or_b =
+        |x: Pnt| x.distance(&contact_a_corner) < xtol || x.distance(&contact_b_corner) < xtol;
+    if !matches_a_or_b(t) || !matches_a_or_b(rr) || k.distance(&other_corner) > xtol {
+        return false;
+    }
+
+    // The miter seam: cylinder cap ∩ new blend, a quarter-ellipse `K -> T`.
+    let Some(seam) = miter_seam_edge(center, n_top, n_side1, n_side2, r) else {
+        return false;
+    };
+
+    // Retract the prior cap: corner arc -> seam (T -> K), top contact -> T, side
+    // contact already ends at K. Curve edges other than the corner arc (the far
+    // end arc, or an elliptical seam from an earlier miter at the cap's other end)
+    // are preserved verbatim — only the straight contacts are remapped.
+    let mut new_cap_edges = Vec::with_capacity(4);
+    for (i, e) in cap_edges.iter().enumerate() {
+        if i == corner_arc_idx {
+            let s = if near(e.source().point(), corner) { t } else { k };
+            let d = if near(e.target().point(), corner) { t } else { k };
+            new_cap_edges.push(orient_edge_between(&seam, s, d));
+        } else if !matches!(e.curve(), Some(GeomCurve::Line(_))) {
+            new_cap_edges.push(e.clone());
+        } else {
+            let remap = |p: Pnt| if near(p, corner) { t } else { p };
+            new_cap_edges.push(Edge::between_points(
+                remap(e.source().point()),
+                remap(e.target().point()),
+            ));
+        }
+    }
+    let retracted_cap = Face::with_wires(
+        cap.surface().cloned(),
+        Some(Wire::from_edges(new_cap_edges)),
+        cap.inner_wires(),
+        cap.orientation(),
+    );
+
+    // Extend the new blend toward `K`: the contact on `side2` (corner point == R)
+    // is lengthened so it reaches the stub vertex; the contact on `common` (corner
+    // point == T) is unchanged.
+    let a_is_side2 = contact_a_corner.distance(&rr) < 1e-4;
+    if a_is_side2 {
+        blend.contact_a = extend_contact_corner(&blend.contact_a, corner, k);
+    } else {
+        blend.contact_b = extend_contact_corner(&blend.contact_b, corner, k);
+    }
+
+    // Swap the new blend's corner-side end arc for the seam, keeping the blend_face
+    // wire [contact_a, end_arc, contact_b.reversed(), start_arc] contiguous.
+    let corner_is_source = corner.distance(&blend.spine.source().point())
+        <= corner.distance(&blend.spine.target().point());
+    if corner_is_source {
+        let b0 = blend.contact_b.source().point();
+        let a0 = blend.contact_a.source().point();
+        blend.start_arc = orient_edge_between(&seam, b0, a0);
+    } else {
+        let a1 = blend.contact_a.target().point();
+        let b1 = blend.contact_b.target().point();
+        blend.end_arc = orient_edge_between(&seam, a1, b1);
+    }
+    blend.blend_face = Face::new(
+        blend.blend_face.surface().cloned(),
+        Wire::from_edges([
+            blend.contact_a.clone(),
+            blend.end_arc.clone(),
+            blend.contact_b.clone().reversed(),
+            blend.start_arc.clone(),
+        ]),
+    );
+
+    faces.push(retracted_cap);
+    skipped.insert(cap.id());
+    true
+}
+
+/// The miter seam between two equal-radius perpendicular fillets meeting at a
+/// corner with center `center`: the quarter-ellipse where their two cylinders
+/// intersect, running from the stub vertex `K = center + r(n_side1 + n_side2)`
+/// (parameter 0) to the shared top tangent `T = center + r·n_top` (parameter π/2).
+///
+/// The intersection of two equal-radius cylinders whose axes cross at right angles
+/// is a planar ellipse with semi-axes `r√2` (along `n_side1 + n_side2`) and `r`
+/// (along `n_top`).
+fn miter_seam_edge(center: Pnt, n_top: Dir, n_side1: Dir, n_side2: Dir, r: f64) -> Option<Edge> {
+    use core::f64::consts::{FRAC_PI_2, SQRT_2};
+    let to_dir = |v: GeomVec| {
+        v.normalized().map(|d| Dir::new(d.x(), d.y(), d.z()))
+    };
+    let major_vec = GeomVec::from_dir(n_side1) + GeomVec::from_dir(n_side2);
+    let major_dir = to_dir(major_vec)?;
+    let normal = to_dir(GeomVec::from_dir(major_dir).cross(&GeomVec::from_dir(n_top)))?;
+    let pos = Ax3::new_axes(center, normal, major_dir);
+    let ell = Ellipse::new(pos, r * SQRT_2, r);
+    let k = center + major_vec * r;
+    let t = center + GeomVec::from_dir(n_top) * r;
+    Some(Edge::new(
+        Some(GeomCurve::ellipse(ell)),
+        0.0,
+        FRAC_PI_2,
+        Vertex::new(k),
+        Vertex::new(t),
+    ))
+}
+
+/// Rebuild straight contact `contact` with the endpoint nearest `corner` moved to
+/// `new_pt` (lengthening the new blend's side contact to reach the stub vertex).
+fn extend_contact_corner(contact: &Edge, corner: Pnt, new_pt: Pnt) -> Edge {
+    let s = contact.source().point();
+    let t = contact.target().point();
+    if s.distance(&corner) <= t.distance(&corner) {
+        Edge::between_points(new_pt, t)
+    } else {
+        Edge::between_points(s, new_pt)
+    }
+}
+
+/// Whether `a` and `b` share at least one (undirected) boundary edge.
+fn faces_share_edge(a: &Face, b: &Face) -> bool {
+    let b_edges: Vec<Edge> = b.wires().into_iter().flat_map(|w| w.edges()).collect();
+    a.wires()
+        .into_iter()
+        .flat_map(|w| w.edges())
+        .any(|ea| b_edges.iter().any(|eb| same_undirected_edge(&ea, eb)))
+}
+
+/// Close a corner where the new blend is the *third* edge rounded at a corner —
+/// the two earlier fillets already meet there (two prior cylinder caps mitered
+/// along their seam). With all three edges now rounded the corner becomes a
+/// spherical octant (the rolling ball pivoting in the corner), tangent to all
+/// three faces.
+///
+/// This retracts BOTH prior caps so each ends on a great-circle arc of the sphere
+/// (`T -> F` for the side-1 cap, `T -> R` for the side-2 cap, replacing the miter
+/// seam they shared), inserts the spherical octant `T-F-R`, and skips the two
+/// originals. The new blend's own corner end arc (`F -> R`, in the plane through
+/// the two side tangents) already lies on the sphere, so the new blend face is
+/// left untouched. Returns `true` on the supported convex, mutually-perpendicular,
+/// equal-radius corner; `false` otherwise (caller falls back).
+#[allow(clippy::too_many_arguments)]
+fn try_corner_sphere_two_caps(
+    solid: &Solid,
+    blend: &RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> bool {
+    let _ = solid;
+    let r = radius;
+    let near = |p: Pnt, q: Pnt| p.distance(&q) <= 10.0 * tolerance::CONFUSION;
+
+    if caps.len() != 2 {
+        return false;
+    }
+    if !caps
+        .iter()
+        .all(|c| matches!(c.surface(), Some(GeomSurface::Cylinder(_))))
+    {
+        return false;
+    }
+
+    // Sphere center: the new blend's rolling-ball center at this corner.
+    let c0 = blend.centerline.start().point();
+    let c1 = blend.centerline.end().point();
+    let center = if c0.distance(&corner) <= c1.distance(&corner) {
+        c0
+    } else {
+        c1
+    };
+
+    // The new blend's two corner tangents (on its two side faces).
+    let side_a = nearest_endpoint(&blend.contact_a, corner);
+    let side_b = nearest_endpoint(&blend.contact_b, corner);
+
+    // The shared top tangent `T` is the far end of each cap's miter seam (the
+    // ellipse edge meeting this corner). Both caps must agree on it.
+    let seam_far = |cap: &Face| -> Option<Pnt> {
+        let w = cap.outer_wire()?;
+        for e in w.edges() {
+            if matches!(e.curve(), Some(GeomCurve::Ellipse(_))) {
+                let (s, t) = (e.source().point(), e.target().point());
+                if near(s, corner) {
+                    return Some(t);
+                }
+                if near(t, corner) {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    };
+    let (Some(t0), Some(t1)) = (seam_far(&caps[0]), seam_far(&caps[1])) else {
+        return false;
+    };
+    let xtol = corner_tol(r);
+    if t0.distance(&t1) > xtol {
+        return false;
+    }
+    let t = t0;
+
+    // All three tangent points must sit on the sphere of radius r about C.
+    let on_sphere = |p: Pnt| (p.distance(&center) - r).abs() < xtol;
+    if !(on_sphere(t) && on_sphere(side_a) && on_sphere(side_b)) {
+        return false;
+    }
+
+    // Map each cap to the side tangent it must retract to (the side it borders).
+    let side_pt_for = |cap: &Face| -> Option<Pnt> {
+        if faces_share_edge(cap, &blend.face_a) {
+            Some(side_a)
+        } else if faces_share_edge(cap, &blend.face_b) {
+            Some(side_b)
+        } else {
+            None
+        }
+    };
+    let (Some(side0), Some(side1)) = (side_pt_for(&caps[0]), side_pt_for(&caps[1])) else {
+        return false;
+    };
+    // The two caps must border different sides.
+    if side0.distance(&side1) < 1e-6 {
+        return false;
+    }
+
+    // Spherical octant T-F-R (F = side_a, R = side_b).
+    let n_top = match (t - center).normalized() {
+        Some(d) => Dir::new(d.x(), d.y(), d.z()),
+        None => return false,
+    };
+    let n_x = match (side_b - center).normalized() {
+        Some(d) => Dir::new(d.x(), d.y(), d.z()),
+        None => return false,
+    };
+    let (Ok(arc_tf), Ok(arc_fr), Ok(arc_rt)) = (
+        arc_on_sphere(center, t, side_a, r),
+        arc_on_sphere(center, side_a, side_b, r),
+        arc_on_sphere(center, side_b, t, r),
+    ) else {
+        return false;
+    };
+    let sphere_face = Face::new(
+        Some(GeomSurface::sphere(SphericalSurface::new(
+            Ax3::new_axes(center, n_top, n_x),
+            r,
+        ))),
+        Wire::from_edges([arc_tf, arc_fr, arc_rt]),
+    );
+
+    // Retract each cap: its miter seam becomes the sphere arc `T <-> side`, and its
+    // side contact shortens from the stub vertex (corner) to that side tangent.
+    for cap in caps {
+        let Some(side_pt) = side_pt_for(cap) else {
+            return false;
+        };
+        let Ok(sphere_arc) = arc_on_sphere(center, t, side_pt, r) else {
+            return false;
+        };
+        let Some(w) = cap.outer_wire() else {
+            return false;
+        };
+        let touches_corner =
+            |e: &Edge| near(e.source().point(), corner) || near(e.target().point(), corner);
+        let mut new_edges = Vec::with_capacity(4);
+        for e in w.edges() {
+            if matches!(e.curve(), Some(GeomCurve::Ellipse(_))) && touches_corner(&e) {
+                // This cap's seam at *this* corner becomes the sphere arc T <-> side.
+                let s = if near(e.source().point(), corner) { side_pt } else { t };
+                let d = if near(e.target().point(), corner) { side_pt } else { t };
+                new_edges.push(orient_edge_between(&sphere_arc, s, d));
+            } else if !matches!(e.curve(), Some(GeomCurve::Line(_))) {
+                // Far-end arcs and any seam from another corner are preserved.
+                new_edges.push(e.clone());
+            } else {
+                let remap = |p: Pnt| if near(p, corner) { side_pt } else { p };
+                new_edges.push(Edge::between_points(
+                    remap(e.source().point()),
+                    remap(e.target().point()),
+                ));
+            }
+        }
+        faces.push(Face::with_wires(
+            cap.surface().cloned(),
+            Some(Wire::from_edges(new_edges)),
+            cap.inner_wires(),
+            cap.orientation(),
+        ));
+        skipped.insert(cap.id());
+    }
+
+    faces.push(sphere_face);
+    true
+}
+
+/// A minor great-circle arc of the sphere centered at `center`, radius `r`, from
+/// `start` to `end` (both must lie on the sphere).
+fn arc_on_sphere(center: Pnt, start: Pnt, end: Pnt, r: f64) -> Result<Edge, RollingBallError> {
+    let axis_v = (start - center).cross(&(end - center));
+    let axis = axis_v
+        .normalized()
+        .map(|d| Dir::new(d.x(), d.y(), d.z()))
+        .ok_or(RollingBallError::InvalidDihedral)?;
+    let xref = (start - center)
+        .normalized()
+        .map(|d| Dir::new(d.x(), d.y(), d.z()))
+        .ok_or(RollingBallError::InvalidDihedral)?;
+    contact_arc(center, axis, xref, r, start, end)
+}
+
+/// The planar face of `solid`, other than `exclude`, whose boundary contains
+/// `edge` (matched undirected by endpoints).
+fn adjacent_planar_face(solid: &Solid, edge: &Edge, exclude: &Face) -> Option<Face> {
+    solid.shell().faces().into_iter().find(|f| {
+        !same_face(f, exclude)
+            && matches!(f.surface(), Some(GeomSurface::Plane(_)))
+            && f.wires()
+                .into_iter()
+                .flat_map(|w| w.edges())
+                .any(|c| same_undirected_edge(&c, edge))
+    })
 }
 
 /// Apply a constant-`radius` rolling-ball fillet to several selected `edges`.
@@ -398,11 +1162,11 @@ pub fn fillet_edges(
 ) -> Result<Solid, RollingBallError> {
     let mut current = solid.clone();
     for edge in edges {
-        let target = current
-            .edges()
-            .into_iter()
-            .find(|candidate| same_undirected_edge(candidate, edge))
-            .ok_or(RollingBallError::SpineNotOnFace)?;
+        // Re-locate the edge in the evolving body. `relocate_edge` tolerates the
+        // endpoint drift an earlier blend leaves when two requested edges share a
+        // corner (the shared vertex is consumed, shortening the survivor) — an
+        // exact endpoint match alone would fail there with `SpineNotOnFace`.
+        let target = relocate_edge(&current, edge).ok_or(RollingBallError::SpineNotOnFace)?;
         current = fillet_planar_edge(&current, &target, radius)?;
     }
     Ok(current)
@@ -851,6 +1615,64 @@ fn same_undirected_edge(a: &Edge, b: &Edge) -> bool {
         || (a0.distance(&b1) <= tol && a1.distance(&b0) <= tol)
 }
 
+/// Perpendicular distance from `p` to the infinite line through `origin` with
+/// unit direction `dir`.
+fn point_line_distance(p: Pnt, origin: Pnt, dir: Dir) -> f64 {
+    let v = p - origin;
+    let along = GeomVec::from_dir(dir) * v.dot(&GeomVec::from_dir(dir));
+    (v - along).magnitude()
+}
+
+/// Locate the current edge of `solid` that corresponds to `requested`, tolerating
+/// endpoint drift left by earlier blends.
+///
+/// First tries an exact undirected endpoint match (the common case). Failing
+/// that — e.g. when a prior fillet trimmed back the shared corner so one endpoint
+/// moved — it matches the current straight edge that is **collinear** with the
+/// request and **overlaps** its span the most: the surviving sub-segment of the
+/// originally-selected edge. Returns that edge with its *actual* current
+/// endpoints, so the blend runs along the surviving spine (the consumed end is
+/// already rounded by the earlier fillet). Without this, multi-edge fillets that
+/// share a corner fail with [`RollingBallError::SpineNotOnFace`].
+fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
+    let current = solid.edges();
+    if let Some(e) = current.iter().find(|c| same_undirected_edge(c, requested)) {
+        return Some(e.clone());
+    }
+
+    let r0 = requested.start().point();
+    let r1 = requested.end().point();
+    let len = r0.distance(&r1);
+    if len <= tolerance::CONFUSION {
+        return None;
+    }
+    let dir = (r1 - r0).normalized()?;
+    let dir_vec = GeomVec::from_dir(dir);
+    let tol = 10.0 * tolerance::CONFUSION;
+
+    let mut best: Option<(f64, Edge)> = None;
+    for c in &current {
+        let c0 = c.start().point();
+        let c1 = c.end().point();
+        // Both endpoints must lie on the request's infinite line (collinear).
+        if point_line_distance(c0, r0, dir) > tol || point_line_distance(c1, r0, dir) > tol {
+            continue;
+        }
+        // 1-D spans along the request direction; keep the largest overlap with
+        // [0, len]. A surviving sub-segment overlaps almost the whole request.
+        let t0 = (c0 - r0).dot(&dir_vec);
+        let t1 = (c1 - r0).dot(&dir_vec);
+        let overlap = t0.max(t1).min(len) - t0.min(t1).max(0.0);
+        if overlap <= tol {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(o, _)| overlap > *o) {
+            best = Some((overlap, c.clone()));
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
 fn same_face(a: &Face, b: &Face) -> bool {
     a.id() == b.id()
 }
@@ -873,6 +1695,48 @@ fn face_contains_point(face: &Face, point: Pnt) -> bool {
                 || edge.target().point().distance(&point) <= 10.0 * tolerance::CONFUSION
         })
     })
+}
+
+/// Shorten `edge` so the endpoint at `keep` stays put and its other endpoint moves
+/// to `moved`, PRESERVING the edge's curve.
+///
+/// `Edge::between_points` always builds a straight line. Using it to shorten an
+/// *arc* boundary edge — which happens when a fillet's end is trimmed against a
+/// cylindrical cap face (e.g. an extruded sketch-arc wall) — would replace that
+/// arc with an off-surface chord, so the cap face's wire no longer lies on its
+/// cylinder and the sewn solid fails the watertight/health gate. For a circular
+/// edge this rebuilds the true sub-arc; for any other curve it falls back to the
+/// straight segment (the previous behaviour, correct for the planar caps).
+fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
+    let Some(GeomCurve::Circle(circle)) = edge.curve() else {
+        return Edge::between_points(keep, moved);
+    };
+    let circle = *circle;
+    let center = circle.center();
+    let x = GeomVec::from_dir(circle.position().x_direction());
+    let y = GeomVec::from_dir(circle.axis()).cross(&x);
+    let raw_angle = {
+        let v = moved - center;
+        v.dot(&y).atan2(v.dot(&x))
+    };
+    let keep_is_source = keep.distance(&edge.source().point()) <= keep.distance(&edge.target().point());
+    let keep_param = if keep_is_source { edge.first() } else { edge.last() };
+    // Unwrap the moved endpoint's angle onto the same branch as the kept end so the
+    // sub-arc travels the original short way around, not the reflex complement.
+    let mut moved_param = raw_angle;
+    use core::f64::consts::PI;
+    while moved_param - keep_param > PI {
+        moved_param -= 2.0 * PI;
+    }
+    while keep_param - moved_param > PI {
+        moved_param += 2.0 * PI;
+    }
+    let curve = Some(GeomCurve::circle(circle));
+    if keep_is_source {
+        Edge::new(curve, edge.first(), moved_param, edge.source(), Vertex::new(moved))
+    } else {
+        Edge::new(curve, moved_param, edge.last(), Vertex::new(moved), edge.target())
+    }
 }
 
 fn trim_face_along_spine(
@@ -926,15 +1790,21 @@ fn trim_face_along_spine(
     let mut new_edges = Vec::with_capacity(n);
     for (i, edge) in edges.iter().enumerate() {
         if i == prev_idx {
-            new_edges.push(Edge::between_points(edge.source().point(), contact_start_clamped));
+            new_edges.push(shorten_edge_keep_curve(edge, edge.source().point(), contact_start_clamped));
         } else if i == idx {
             new_edges.push(oriented_contact.clone());
         } else if i == next_idx {
-            new_edges.push(Edge::between_points(contact_end_clamped, edge.target().point()));
+            new_edges.push(shorten_edge_keep_curve(edge, edge.target().point(), contact_end_clamped));
         } else {
             new_edges.push(edge.clone());
         }
     }
+
+    // A mitered corner extends the new blend's side contact onto the prior fillet's
+    // own corner vertex, which collapses this face's pre-corner edge to zero length
+    // (e.g. the side face's old fillet-end arc shrinks to a point). Drop any such
+    // degenerate edges so the trimmed loop stays valid.
+    new_edges.retain(|e| e.source().point().distance(&e.target().point()) > tolerance::CONFUSION);
 
     rebuild_face(face, Wire::from_edges(new_edges))
 }
@@ -982,10 +1852,10 @@ fn trim_face_at_corner(
     for offset in 0..n {
         let i = (prev_idx + offset) % n;
         if i == prev_idx {
-            new_edges.push(Edge::between_points(prev.source().point(), prev_contact));
+            new_edges.push(shorten_edge_keep_curve(prev, prev.source().point(), prev_contact));
             new_edges.push(oriented_arc.clone());
         } else if i == next_idx {
-            new_edges.push(Edge::between_points(next_contact, next.target().point()));
+            new_edges.push(shorten_edge_keep_curve(next, next.target().point(), next_contact));
         } else {
             new_edges.push(edges[i].clone());
         }

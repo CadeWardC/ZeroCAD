@@ -376,6 +376,27 @@ impl ParametricGraph {
         hidden: &std::collections::HashSet<String>,
         draft: bool,
     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+        let (live, warnings) = self.build_live(hidden, draft)?;
+        Ok((tessellate_bodies(live), warnings))
+    }
+
+    /// Diagnostic/test only: the raw B-Rep kernel solids per body, before
+    /// tessellation, keyed by body node id. Mirrors [`evaluate_bodies_inner`]
+    /// but skips meshing so callers can inspect surface/topology directly.
+    #[doc(hidden)]
+    pub fn debug_kernel_solids(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, Vec<crate::mock_kernel::KernelSolid>)>, String> {
+        let (live, _) = self.build_live(hidden, false)?;
+        Ok(live.into_iter().map(|b| (b.id, b.parts)).collect())
+    }
+
+    fn build_live(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        draft: bool,
+    ) -> Result<(Vec<LiveBody>, Vec<String>), String> {
         // Surface circular dependencies (toposort result is otherwise unused,
         // but a cycle should still fail the whole evaluation).
         toposort(&self.graph, None)
@@ -516,7 +537,7 @@ impl ParametricGraph {
 
         *self.eval_cache.borrow_mut() = EvalCache { checkpoints };
 
-        Ok((tessellate_bodies(live), warnings))
+        Ok((live, warnings))
     }
 
     /// Cumulative content hash of the geometry inputs for each node in `nodes`,
@@ -1332,32 +1353,39 @@ fn apply_fillet(
     warnings: &mut Vec<String>,
 ) {
     let mut applied = false;
+    let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
     for part in body.parts.drain(..) {
         // No pre-size gate: the kernel's rolling-ball blend rejects a radius too
-        // large for the local geometry (a non-watertight result → `None`), which
+        // large for the local geometry (a non-watertight result → `Err`), which
         // is the correct, geometry-aware bound. The old global-AABB heuristic was
         // both wrong (it measured the part's *thinnest* axis, not the filleted
         // edge's adjacent-face extents, so it blocked radii the kernel handles)
         // and asymmetric — chamfer never had it, which is why a radius would
         // chamfer but refuse to fillet.
-        let rounded = crate::mock_kernel::fillet_edge(&part, edge.p0, edge.p1, dist);
-        match rounded {
-            Some(f) => {
+        match crate::mock_kernel::fillet_edge(&part, edge.p0, edge.p1, dist) {
+            Ok(f) => {
                 applied = true;
                 next.push(f);
             }
-            None => next.push(part),
+            Err(reason) => {
+                last_err = Some(reason);
+                next.push(part);
+            }
         }
     }
     body.parts = next;
     if applied {
         body.pristine = None;
     } else {
+        // Surface the kernel's actual reason (radius too large, edge not found on
+        // an adjacent face, non-blendable wedge, …) instead of a generic guess.
+        let reason = last_err.unwrap_or_else(|| {
+            "the edge is no longer on the body".to_string()
+        });
         warnings.push(format!(
-            "Fillet '{mod_id}': the edge couldn't be rounded (it may not be a \
-             clean convex corner, the radius may be too large, or the edge is no \
-             longer on the body), so the body was left unchanged."
+            "Fillet '{mod_id}': the edge couldn't be rounded ({reason}), so the \
+             body was left unchanged."
         ));
     }
 }

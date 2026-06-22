@@ -16,6 +16,12 @@ pub struct Tri {
 struct BoundarySample {
     uv: Pnt2d,
     point: Pnt,
+    /// True when this sample lies on a miter-seam (elliptical) boundary edge.
+    /// Such edges are shared by two analytic faces whose surfaces are tangent
+    /// along the seam; without interior support the per-face triangulation
+    /// collapses to a flat fan over the shared seam vertices (see
+    /// [`add_seam_support`]).
+    on_seam: bool,
 }
 
 /// Robust 2D orientation test from predicates (CCW turn > 0, CW turn < 0, collinear == 0).
@@ -596,6 +602,10 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
     let mut loops_2d = Vec::new();
     let mut all_points_2d = Vec::new();
     let mut all_points_3d = Vec::new();
+    // (u, v) of every boundary sample that sits on a miter seam, for the
+    // interior-support pass that keeps two tangent faces from collapsing to a
+    // shared flat fan over the seam (see step 2b below).
+    let mut seam_uv: Vec<Pnt2d> = Vec::new();
 
     // Mapping to dedup vertices close to each other in 2D
     let mut point_map = HashMap::new();
@@ -637,6 +647,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                     loop_samples.push(BoundarySample {
                         uv: Pnt2d::new(u, v),
                         point: p_start,
+                        on_seam: false,
                     });
                     prev_hint = Some((u, v));
                 }
@@ -664,12 +675,14 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                     loop_samples.push(BoundarySample {
                         uv: Pnt2d::new(u, v),
                         point: p3d,
+                        on_seam: false,
                     });
                     prev_hint = Some((u, v));
                     continue;
                 }
             };
 
+            let on_seam = matches!(curve, GeomCurve::Ellipse(_));
             let params = discretize_edge_curve(curve, edge.first(), edge.last(), chord_err);
             let is_reversed = !edge.orientation().is_forward();
 
@@ -697,6 +710,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
                 loop_samples.push(BoundarySample {
                     uv: p2d,
                     point: p3d,
+                    on_seam,
                 });
                 prev_hint = Some((u, v));
             }
@@ -722,6 +736,9 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         let mut loop_indices = Vec::new();
         for sample in &loop_samples {
             let p2d = sample.uv;
+            if sample.on_seam {
+                seam_uv.push(p2d);
+            }
             let key = ((p2d.x() * 1e8) as i64, (p2d.y() * 1e8) as i64);
             let idx = *point_map.entry(key).or_insert_with(|| {
                 let id = all_points_2d.len();
@@ -789,6 +806,54 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
             all_points_3d.push(surface.point(p2d.x(), p2d.y()));
             id
         });
+    }
+
+    // 2b. Miter-seam interior support.
+    //
+    // A miter seam (an elliptical edge) is shared by two analytic faces whose
+    // surfaces are *tangent* along it. Near the seam's stub-vertex corner the
+    // per-face (u, v) region tapers to a thin wedge with no interior sample, so
+    // the triangulation degenerates to a flat fan that uses only the shared seam
+    // vertices — and since both faces produce the identical fan (same welded
+    // vertices), the result is two coincident, oppositely-wound triangle layers:
+    // a non-manifold "double membrane" that z-fights on screen at the corner.
+    //
+    // Seed one interior vertex just *inside* the region next to each seam sample,
+    // offset along the seam→region-centroid direction. On each face that vertex
+    // lands on that face's own curved surface (the two faces bulge opposite ways),
+    // so the triangulations no longer coincide and the membrane is gone. The
+    // offset is a small fraction toward the centroid, so it stays clear of the
+    // straight tangent contacts the seam meets at its ends (which a support point
+    // *on* a tangent would bow — the classic fillet "white line" crack).
+    if !seam_uv.is_empty() {
+        let cu = outer_pts.iter().map(|p| p.x()).sum::<f64>() / outer_pts.len() as f64;
+        let cv = outer_pts.iter().map(|p| p.y()).sum::<f64>() / outer_pts.len() as f64;
+        // One support vertex just inside the region next to each seam sample,
+        // offset a small fraction toward the centroid. The fraction (0.04) is small
+        // on purpose: a larger offset overshoots the *tiny* fan triangle at the
+        // seam's stub-vertex corner on elongated faces (where the centroid is far),
+        // leaving that one apex triangle coincident. 0.04 keeps the support close to
+        // the seam — enough to pull each face's near-seam triangles onto its own
+        // (oppositely-bulging) surface so the two faces no longer share identical
+        // flat triangles — while staying clear of the straight tangent contacts the
+        // seam meets at its ends (a support point *on* a tangent would bow it and
+        // crack against the flat neighbour). Verified to leave zero non-manifold and
+        // zero crack edges across a wide range of box aspect ratios and radii.
+        for s in &seam_uv {
+            let p2d = Pnt2d::new(s.x() + 0.04 * (cu - s.x()), s.y() + 0.04 * (cv - s.y()));
+            if !is_point_in_polygon(p2d, &outer_pts)
+                || inner_pts_list.iter().any(|h| is_point_in_polygon(p2d, h))
+            {
+                continue;
+            }
+            let key = ((p2d.x() * 1e8) as i64, (p2d.y() * 1e8) as i64);
+            point_map.entry(key).or_insert_with(|| {
+                let id = all_points_2d.len();
+                all_points_2d.push(p2d);
+                all_points_3d.push(surface.point(p2d.x(), p2d.y()));
+                id
+            });
+        }
     }
 
     // A convex planar face whose boundary is a finely-sampled curve — a circular

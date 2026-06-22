@@ -19,12 +19,17 @@ const EDGE_MOD_SETTLE: std::time::Duration = std::time::Duration::from_millis(15
 
 /// A live, uncommitted 3D edge fillet/chamfer. Holds the captured edge geometry
 /// and the editable size; the viewport shows the resulting body in real time.
+///
+/// One op can round/bevel **several** selected edges at once (Fusion's multi-edge
+/// fillet): they are applied as a chain of single-edge `EdgeMod` features, each
+/// re-locating its edge on the evolving body, so edges that share a corner blend
+/// correctly. The inline size box and drag handle anchor on the first edge.
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeModOp {
     /// Node id of the body being modified.
     pub(crate) target: String,
-    /// The edge being rounded/beveled, captured in world space.
-    pub(crate) edge: EdgeRef,
+    /// The edges being rounded/beveled, captured in world space. Always non-empty.
+    pub(crate) edges: Vec<EdgeRef>,
     /// Fillet (round) or Chamfer (bevel).
     pub(crate) kind: CornerKind,
     /// Resolved size in base units (mm), kept in sync with `dist_text`.
@@ -37,12 +42,18 @@ pub(crate) struct EdgeModOp {
 }
 
 impl EdgeModOp {
-    /// World-space midpoint of the edge — the anchor for the inline size box.
+    /// The primary (first) edge — the anchor for the inline box and drag handle.
+    pub(crate) fn primary(&self) -> &EdgeRef {
+        &self.edges[0]
+    }
+
+    /// World-space midpoint of the primary edge — the anchor for the inline box.
     pub(crate) fn edge_midpoint(&self) -> [f32; 3] {
+        let e = self.primary();
         [
-            (self.edge.p0[0] + self.edge.p1[0]) * 0.5,
-            (self.edge.p0[1] + self.edge.p1[1]) * 0.5,
-            (self.edge.p0[2] + self.edge.p1[2]) * 0.5,
+            (e.p0[0] + e.p1[0]) * 0.5,
+            (e.p0[1] + e.p1[1]) * 0.5,
+            (e.p0[2] + e.p1[2]) * 0.5,
         ]
     }
 }
@@ -52,19 +63,24 @@ impl ZeroCadApp {
     /// size from `edge_mod_dist_text` (remembered across uses) and opens the
     /// preview; nothing is committed until [`commit_edge_mod`](Self::commit_edge_mod).
     pub(crate) fn begin_edge_mod(&mut self, kind: CornerKind) {
-        let Some((node_id, e)) = self.selected_body_edge() else {
-            self.status_msg = "Select a single body edge first.".to_string();
+        let Some((node_id, edge_ids)) = self.selected_body_edges() else {
+            self.status_msg = "Select one or more body edges first.".to_string();
             return;
         };
-        let Some(edge) = self.edge_ref_from(&node_id, e) else {
-            self.status_msg = "That edge has no usable geometry to fillet/chamfer.".to_string();
+        let edges: Vec<EdgeRef> = edge_ids
+            .iter()
+            .filter_map(|&e| self.edge_ref_from(&node_id, e))
+            .collect();
+        if edges.is_empty() {
+            self.status_msg =
+                "Those edges have no usable geometry to fillet/chamfer.".to_string();
             return;
-        };
+        }
         let text = self.edge_mod_dist_text.clone();
         let dist = self.eval_dim(&text).unwrap_or(3.0).max(0.2);
         self.edge_mod_op = Some(EdgeModOp {
             target: node_id,
-            edge,
+            edges,
             kind,
             dist,
             dist_text: text,
@@ -100,11 +116,45 @@ impl ZeroCadApp {
         ((op.dist.max(0.2) / 0.01).round() as i64).hash(&mut h);
         (op.kind as u8).hash(&mut h);
         op.target.hash(&mut h);
-        for c in op.edge.p0.iter().chain(op.edge.p1.iter()) {
-            ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+        for edge in &op.edges {
+            for c in edge.p0.iter().chain(edge.p1.iter()) {
+                ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+            }
         }
         hidden_len.hash(&mut h);
         h.finish()
+    }
+
+    /// Append the op's edges as a chain of single-edge `EdgeMod` nodes onto a
+    /// cloned graph — each depending on the previous so they apply in order, each
+    /// at size `dist`. Temp ids are suffixed `id_counter + i` so `creation_key`
+    /// orders them after every committed node and in edge order. The kernel
+    /// re-locates each edge on the evolving body, so edges sharing a corner blend
+    /// correctly. Used by both the speculative-arc and live-preview graphs.
+    fn append_edge_mod_chain(
+        &self,
+        graph: &mut zerocad_core::ParametricGraph,
+        op: &EdgeModOp,
+        dist: f32,
+        tag: &str,
+    ) {
+        let mut prev = op.target.clone();
+        for (i, edge) in op.edges.iter().enumerate() {
+            let id = format!("edgemod_{tag}_{}", self.id_counter + i);
+            graph.add_feature(FeatureNode {
+                id: id.clone(),
+                name: format!("{tag} edge mod {i}"),
+                feature: FeatureType::EdgeMod {
+                    target: op.target.clone(),
+                    edge: edge.clone(),
+                    dist,
+                    dist_expr: None,
+                    kind: op.kind,
+                },
+            });
+            graph.add_dependency(&prev, &id);
+            prev = id;
+        }
     }
 
     /// Build the graph the speculative precompute evaluates: the current model
@@ -116,19 +166,7 @@ impl ZeroCadApp {
     fn build_edge_mod_arc_graph(&self) -> Option<zerocad_core::ParametricGraph> {
         let op = self.edge_mod_op.as_ref()?;
         let mut graph = self.graph.clone();
-        let id = format!("edgemod_spec_{}", self.id_counter);
-        graph.add_feature(FeatureNode {
-            id: id.clone(),
-            name: "Spec Edge Mod".to_string(),
-            feature: FeatureType::EdgeMod {
-                target: op.target.clone(),
-                edge: op.edge.clone(),
-                dist: op.dist.max(0.2),
-                dist_expr: None,
-                kind: op.kind,
-            },
-        });
-        graph.add_dependency(&op.target, &id);
+        self.append_edge_mod_chain(&mut graph, op, op.dist.max(0.2), "spec");
         Some(graph)
     }
 
@@ -218,20 +256,8 @@ impl ZeroCadApp {
     pub(crate) fn preview_edge_mod_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
         let op = self.edge_mod_op.as_ref()?;
         let mut graph = self.graph.clone();
-        // A temp id past the live counter — never persisted.
-        let id = format!("edgemod_preview_{}", self.id_counter);
-        graph.add_feature(FeatureNode {
-            id: id.clone(),
-            name: "Preview Edge Mod".to_string(),
-            feature: FeatureType::EdgeMod {
-                target: op.target.clone(),
-                edge: op.edge.clone(),
-                dist: op.dist.max(0.05),
-                dist_expr: None,
-                kind: op.kind,
-            },
-        });
-        graph.add_dependency(&op.target, &id);
+        // Temp ids past the live counter — never persisted.
+        self.append_edge_mod_chain(&mut graph, op, op.dist.max(0.05), "preview");
         // The preview fillet is appended as a trailing node, so the parametric
         // graph's per-node geometry cache (carried by the clone above) reuses the
         // committed prefix — the upstream booleans (e.g. a box∪boss union) are NOT
@@ -271,10 +297,12 @@ impl ZeroCadApp {
             ((op.dist / 0.05).round() as i64).hash(&mut h);
             (op.kind as u8).hash(&mut h);
             op.target.hash(&mut h);
-            // The edge itself — two edges of the same body share `target`, so
+            // The edges themselves — two edges of the same body share `target`, so
             // without this a fillet on edge B could reuse edge A's cached result.
-            for c in op.edge.p0.iter().chain(op.edge.p1.iter()) {
-                ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+            for edge in &op.edges {
+                for c in edge.p0.iter().chain(edge.p1.iter()) {
+                    ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+                }
             }
             self.id_counter.hash(&mut h);
             self.hidden_nodes.len().hash(&mut h);
@@ -304,20 +332,30 @@ impl ZeroCadApp {
         } else {
             None
         };
-        let id = format!("edgemod_{}", self.next_id());
-        let name = self.next_edge_mod_name(op.kind);
-        self.graph.add_feature(FeatureNode {
-            id: id.clone(),
-            name,
-            feature: FeatureType::EdgeMod {
-                target: op.target.clone(),
-                edge: op.edge,
-                dist: op.dist.max(0.2),
-                dist_expr,
-                kind: op.kind,
-            },
-        });
-        self.graph.add_dependency(&op.target, &id);
+        // One single-edge `EdgeMod` feature per selected edge, chained so they
+        // apply in order. The kernel re-locates each edge on the evolving body, so
+        // edges sharing a corner blend correctly (the earlier blend shortens the
+        // survivor, which `fillet_edges` tracks).
+        let dist = op.dist.max(0.2);
+        let edge_count = op.edges.len();
+        let mut prev = op.target.clone();
+        for edge in op.edges {
+            let id = format!("edgemod_{}", self.next_id());
+            let name = self.next_edge_mod_name(op.kind);
+            self.graph.add_feature(FeatureNode {
+                id: id.clone(),
+                name,
+                feature: FeatureType::EdgeMod {
+                    target: op.target.clone(),
+                    edge,
+                    dist,
+                    dist_expr: dist_expr.clone(),
+                    kind: op.kind,
+                },
+            });
+            self.graph.add_dependency(&prev, &id);
+            prev = id;
+        }
         // Remember the size for the next edge.
         self.edge_mod_dist_text = op.dist_text;
         self.selected_body.clear();
@@ -345,7 +383,7 @@ impl ZeroCadApp {
             CornerKind::Chamfer => "Chamfer",
         };
         if self.error_msg.is_none() {
-            self.status_msg = format!("{} applied to the edge.", noun);
+            self.status_msg = format!("{} applied to {} edge(s).", noun, edge_count);
         } else {
             self.status_msg = format!("{} couldn't be applied (see message).", noun);
         }
