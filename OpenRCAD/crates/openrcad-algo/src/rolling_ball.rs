@@ -1264,15 +1264,24 @@ pub fn rolling_ball_between_curved_faces(
                 return Err(RollingBallError::InvalidRadius { radius });
             }
 
+            // Parametrise the contacts in the SPINE CIRCLE's own frame, not the
+            // cylinder's. The edge's `first()/last()` params are angles in the spine
+            // circle's frame; a reconstructed sketch-arc rim has a different
+            // x-direction than the cylinder it bounds, so using `cyl`'s frame here
+            // swept the blend over the wrong arc range (an extruded sketch arc would
+            // fillet a different quarter of the rim than the selected edge).
+            let cax = circle.axis();
+            let cxr = circle.position().x_direction();
+
             let torus_center = center - GeomVec::from_dir(n_plane) * radius;
-            let pos = Ax3::new_axes(torus_center, axis_dir, cyl.position().x_direction());
+            let pos = Ax3::new_axes(torus_center, cax, cxr);
             let torus_surf = GeomSurface::torus(ToroidalSurface::new(pos, major_radius, radius));
 
             let contact_plane_r = major_radius;
             let contact_cyl_height = radius;
 
-            let c_plane = Circle::new(Ax3::new_axes(center, axis_dir, cyl.position().x_direction()), contact_plane_r);
-            let c_cyl = Circle::new(Ax3::new_axes(center - GeomVec::from_dir(n_plane) * contact_cyl_height, axis_dir, cyl.position().x_direction()), spine_r);
+            let c_plane = Circle::new(Ax3::new_axes(center, cax, cxr), contact_plane_r);
+            let c_cyl = Circle::new(Ax3::new_axes(center - GeomVec::from_dir(n_plane) * contact_cyl_height, cax, cxr), spine_r);
 
             let u0 = edge.first();
             let u1 = edge.last();
@@ -1299,18 +1308,18 @@ pub fn rolling_ball_between_curved_faces(
                 (contact_cyl_edge, contact_plane_edge)
             };
 
-            let c0 = torus_center + radial(axis_dir, cyl.position().x_direction(), u0) * major_radius;
-            let c1 = torus_center + radial(axis_dir, cyl.position().x_direction(), u1) * major_radius;
+            let c0 = torus_center + radial(cax, cxr, u0) * major_radius;
+            let c1 = torus_center + radial(cax, cxr, u1) * major_radius;
             let centerline = Edge::between_points(c0, c1);
 
-            let r0 = radial(axis_dir, cyl.position().x_direction(), u0);
+            let r0 = radial(cax, cxr, u0);
             let dir0 = Dir::new(r0.x(), r0.y(), r0.z());
-            let r1 = radial(axis_dir, cyl.position().x_direction(), u1);
+            let r1 = radial(cax, cxr, u1);
             let dir1 = Dir::new(r1.x(), r1.y(), r1.z());
 
-            let t0_vec = GeomVec::from_dir(axis_dir).cross(&r0).normalized().unwrap();
+            let t0_vec = GeomVec::from_dir(cax).cross(&r0).normalized().unwrap();
             let t0 = Dir::new(t0_vec.x(), t0_vec.y(), t0_vec.z());
-            let t1_vec = GeomVec::from_dir(axis_dir).cross(&r1).normalized().unwrap();
+            let t1_vec = GeomVec::from_dir(cax).cross(&r1).normalized().unwrap();
             let t1 = Dir::new(t1_vec.x(), t1_vec.y(), t1_vec.z());
 
             let arc_start = contact_arc(c0, t0, dir0, radius, contact_b.start().point(), contact_a.start().point())?;
