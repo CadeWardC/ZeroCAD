@@ -2743,15 +2743,12 @@ impl ZeroCadApp {
         }
     }
 
-    /// Rebuild the model. The **fast faceted draft** is computed synchronously and
-    /// shown immediately, so committing a fillet (or any edit) never stalls the
-    /// UI. If the model has a 3D fillet — whose true arc geometry needs the ~1s
-    /// boolean — the arc result is computed on a **background thread** and swapped
-    /// in when ready (see [`reevaluate_geometry_blocking`] for the rare callers
-    /// that must have the final geometry before continuing).
+    /// Rebuild the model using the committed native geometry. 3D fillets use
+    /// OpenRCAD's rolling-ball builder directly, so there is no separate
+    /// faceted-preview/arc-refine swap.
     fn reevaluate_geometry(&mut self) {
-        // Instant draft: faceted fillets + the (fast, planar) cut/join booleans.
-        match self.graph.evaluate_bodies_with_warnings_draft(&self.hidden_nodes) {
+        // Native fillets are final geometry, not a faceted draft.
+        match self.graph.evaluate_bodies_with_warnings(&self.hidden_nodes) {
             Ok((bodies, warnings)) => self.apply_eval_result(bodies, warnings),
             Err(err) => {
                 self.error_msg = Some(err);
@@ -2864,12 +2861,8 @@ impl eframe::App for ZeroCadApp {
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }
-        // Swap in any finished background arc-fillet refine.
+        // Swap in any finished background refine.
         self.poll_refine_eval();
-        // Speculatively precompute the smooth arc geometry for a settling fillet so
-        // committing it is instant rather than popping in ~1s later.
-        self.tick_speculative_edge_mod(ctx);
-
         // While the Welcome modal is up the workspace is inert, so its hotkeys
         // are suppressed (the modal reads Esc itself).
         if !self.onboarding_visible {

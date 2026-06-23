@@ -8,7 +8,7 @@ use core::fmt;
 
 use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
-    Circle, CylindricalSurface, Curve, Ellipse, GeomCurve, GeomSurface, GregorySurface, Plane,
+    Circle, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, GregorySurface, Plane,
     SphericalSurface, Surface, ToroidalSurface,
 };
 use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
@@ -66,7 +66,10 @@ impl fmt::Display for RollingBallError {
                 "rolling ball: selected edge must have exactly two adjacent faces, found {count}"
             ),
             Self::UnsolvableAdjacency { reason } => {
-                write!(f, "rolling ball: adjacent faces could not be blended ({reason:?})")
+                write!(
+                    f,
+                    "rolling ball: adjacent faces could not be blended ({reason:?})"
+                )
             }
             Self::InvalidDihedral => {
                 f.write_str("rolling ball: adjacent faces do not form a blendable wedge")
@@ -129,11 +132,12 @@ fn face_outward_normal_at(face: &Face, point: Pnt) -> Result<Dir, RollingBallErr
             let axis_dir = cyl.position().direction();
             let v = point - axis_pt;
             let proj = axis_pt + GeomVec::from_dir(axis_dir) * v.dot(&GeomVec::from_dir(axis_dir));
-            let radial = (point - proj)
-                .normalized()
-                .ok_or(RollingBallError::UnsolvableAdjacency {
-                    reason: AdjacencyReason::NotPlaneOrAnalytic,
-                })?;
+            let radial =
+                (point - proj)
+                    .normalized()
+                    .ok_or(RollingBallError::UnsolvableAdjacency {
+                        reason: AdjacencyReason::NotPlaneOrAnalytic,
+                    })?;
             Dir::new(radial.x(), radial.y(), radial.z())
         }
         Some(surf @ (GeomSurface::Cone(_) | GeomSurface::Sphere(_))) => {
@@ -223,48 +227,38 @@ fn radial(axis: Dir, xref: Dir, u: f64) -> GeomVec {
     x * u.cos() + y * u.sin()
 }
 
-fn make_gregory_corner_patch(
-    corner: Pnt,
-    p_a: Pnt,
-    p_b: Pnt,
-    _radius: f64,
-) -> Face {
+fn make_gregory_corner_patch(corner: Pnt, p_a: Pnt, p_b: Pnt, _radius: f64) -> Face {
     let p01 = corner;
     let p02 = corner;
-    
+
     let p10 = corner + (p_a - corner) * 0.33;
     let p20 = corner + (p_a - corner) * 0.66;
-    
+
     let p31 = p_a + (p_b - p_a) * 0.33;
     let p32 = p_a + (p_b - p_a) * 0.66;
-    
+
     let p13 = corner + (p_b - corner) * 0.33;
     let p23 = corner + (p_b - corner) * 0.66;
-    
+
     let p11_u = p10 + (p31 - p10) * 0.5;
     let p11_v = p13 + (p32 - p13) * 0.5;
     let p21_u = p20 + (p31 - p20) * 0.5;
     let p21_v = p23 + (p32 - p23) * 0.5;
-    
+
     let p12_u = p11_u;
     let p12_v = p11_v;
     let p22_u = p21_u;
     let p22_v = p21_v;
-    
+
     let surf = GregorySurface::new(
-        corner, p01, p02, corner,
-        p10, p20, p_a, p31, p32, p_b,
-        p13, p23,
-        p11_u, p11_v,
-        p21_u, p21_v,
-        p12_u, p12_v,
-        p22_u, p22_v,
+        corner, p01, p02, corner, p10, p20, p_a, p31, p32, p_b, p13, p23, p11_u, p11_v, p21_u,
+        p21_v, p12_u, p12_v, p22_u, p22_v,
     );
-    
+
     let e1 = Edge::between_points(corner, p_a);
     let e2 = Edge::between_points(p_a, p_b);
     let e3 = Edge::between_points(p_b, corner);
-    
+
     let wire = Wire::from_edges([e1, e2, e3]);
     Face::new(Some(GeomSurface::gregory(surf)), wire)
 }
@@ -317,18 +311,66 @@ fn fillet_planar_edge_inner(
     // The two-cap sphere is tried first (a two-cap corner is never a single-cap
     // miter). Both are gated on `use_sphere`, so the retry path (use_sphere = false)
     // falls back to the flat corner trim if either leaves a non-watertight shell.
-    let start_mitered = use_sphere
-        && (try_corner_sphere_two_caps(
-            solid, &blend, start, &start_caps, radius, &mut faces, &mut skipped_faces,
-        ) || try_corner_miter(
-            solid, &mut blend, start, &start_caps, radius, &mut faces, &mut skipped_faces,
-        ));
-    let end_mitered = use_sphere
-        && (try_corner_sphere_two_caps(
-            solid, &blend, end, &end_caps, radius, &mut faces, &mut skipped_faces,
-        ) || try_corner_miter(
-            solid, &mut blend, end, &end_caps, radius, &mut faces, &mut skipped_faces,
-        ));
+    // A blend endpoint that runs into a concave cut cylinder is trimmed flush
+    // against it (the cut stays a clean vertical cylinder). This is not a sphere
+    // path, so it runs regardless of `use_sphere`, and takes priority over the
+    // miter/sphere closures.
+    let start_cut = try_corner_cut(
+        solid,
+        &mut blend,
+        start,
+        &start_caps,
+        radius,
+        &mut faces,
+        &mut skipped_faces,
+    )?;
+    let start_mitered = start_cut
+        || (use_sphere
+            && (try_corner_sphere_two_caps(
+                solid,
+                &blend,
+                start,
+                &start_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            ) || try_corner_miter(
+                solid,
+                &mut blend,
+                start,
+                &start_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            )));
+    let end_cut = try_corner_cut(
+        solid,
+        &mut blend,
+        end,
+        &end_caps,
+        radius,
+        &mut faces,
+        &mut skipped_faces,
+    )?;
+    let end_mitered = end_cut
+        || (use_sphere
+            && (try_corner_sphere_two_caps(
+                solid,
+                &blend,
+                end,
+                &end_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            ) || try_corner_miter(
+                solid,
+                &mut blend,
+                end,
+                &end_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            )));
 
     if !start_mitered {
         handle_corner_endpoint(
@@ -460,7 +502,7 @@ fn corner_tol(r: f64) -> f64 {
 }
 
 /// The endpoint of `edge` nearest to `point`.
-fn nearest_endpoint(edge: &Edge, point: Pnt) -> Pnt {
+pub(crate) fn nearest_endpoint(edge: &Edge, point: Pnt) -> Pnt {
     let s = edge.source().point();
     let t = edge.target().point();
     if s.distance(&point) <= t.distance(&point) {
@@ -512,8 +554,11 @@ fn corner_sphere_blend(
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return None,
     };
-    if point_line_distance(center, cyl.position().location(), cyl.position().direction())
-        > 1e-5 * r.max(1.0) + 1e-6
+    if point_line_distance(
+        center,
+        cyl.position().location(),
+        cyl.position().direction(),
+    ) > 1e-5 * r.max(1.0) + 1e-6
     {
         return None;
     }
@@ -527,9 +572,9 @@ fn corner_sphere_blend(
     let is_arc = |e: &Edge| matches!(e.curve(), Some(GeomCurve::Circle(_)));
 
     // The corner-end arc of the cap: a circular edge with an endpoint at `corner`.
-    let corner_arc_idx = cap_edges
-        .iter()
-        .position(|e| is_arc(e) && (near(e.source().point(), corner) || near(e.target().point(), corner)))?;
+    let corner_arc_idx = cap_edges.iter().position(|e| {
+        is_arc(e) && (near(e.source().point(), corner) || near(e.target().point(), corner))
+    })?;
     let (arc_s, arc_t) = (
         cap_edges[corner_arc_idx].source().point(),
         cap_edges[corner_arc_idx].target().point(),
@@ -546,9 +591,9 @@ fn corner_sphere_blend(
     let top_contact = *straights
         .iter()
         .find(|e| near(e.source().point(), corner) || near(e.target().point(), corner))?;
-    let side1_contact = *straights
-        .iter()
-        .find(|e| near(e.source().point(), other_corner) || near(e.target().point(), other_corner))?;
+    let side1_contact = *straights.iter().find(|e| {
+        near(e.source().point(), other_corner) || near(e.target().point(), other_corner)
+    })?;
     let common = adjacent_planar_face(solid, top_contact, cap)?;
     let side1 = adjacent_planar_face(solid, side1_contact, cap)?;
 
@@ -594,8 +639,16 @@ fn corner_sphere_blend(
     let mut new_cap_edges = Vec::with_capacity(4);
     for (i, e) in cap_edges.iter().enumerate() {
         if i == corner_arc_idx {
-            let s = if near(e.source().point(), corner) { t } else { f };
-            let d = if near(e.target().point(), corner) { t } else { f };
+            let s = if near(e.source().point(), corner) {
+                t
+            } else {
+                f
+            };
+            let d = if near(e.target().point(), corner) {
+                t
+            } else {
+                f
+            };
             let a = arc_on_sphere(center, s, d, r).ok()?;
             new_cap_edges.push(orient_edge_between(&a, s, d));
         } else if is_arc(e) {
@@ -610,7 +663,10 @@ fn corner_sphere_blend(
                     p
                 }
             };
-            new_cap_edges.push(Edge::between_points(remap(e.source().point()), remap(e.target().point())));
+            new_cap_edges.push(Edge::between_points(
+                remap(e.source().point()),
+                remap(e.target().point()),
+            ));
         }
     }
     let retracted_cap = Face::with_wires(
@@ -675,6 +731,336 @@ fn corner_sphere_blend(
     })
 }
 
+/// True when `cap` is a *concave* cylindrical wall (a bored/cut cylinder) whose
+/// material lies *outside* the cylinder, as opposed to a *convex* prior-fillet
+/// blend cylinder (material inside).
+///
+/// Face orientation alone does not discriminate (a convex blend cylinder can be
+/// stored with the same winding as a cut wall), so we probe the solid directly:
+/// at a point in the *interior* of the cap face, step a little radially outward
+/// and inward and ask which side is material. A concave cut has material on the
+/// *outside* of the cylinder; a convex boss on the inside.
+pub(crate) fn is_concave_cut_cylinder(solid: &Solid, cap: &Face) -> bool {
+    let cyl = match cap.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => return false,
+    };
+    // A point in the middle of the cap face (centroid of its outer wire),
+    // re-projected onto the cylinder so it sits exactly on the wall, away from
+    // the boundary edges where containment is ambiguous.
+    let Some(wire) = cap.outer_wire() else {
+        return false;
+    };
+    let verts: std::vec::Vec<Pnt> = wire.edges().iter().map(|e| e.source().point()).collect();
+    if verts.is_empty() {
+        return false;
+    }
+    let mut sum = GeomVec::new(0.0, 0.0, 0.0);
+    for v in &verts {
+        sum += *v - Pnt::origin();
+    }
+    let centroid = Pnt::origin() + sum * (1.0 / verts.len() as f64);
+    let axis_pt = cyl.position().location();
+    let axis_dir = GeomVec::from_dir(cyl.position().direction());
+    let v = centroid - axis_pt;
+    let along = axis_dir * v.dot(&axis_dir);
+    let radial = match (v - along).normalized() {
+        Some(r) => GeomVec::from_dir(r),
+        None => return false,
+    };
+    let on_wall = axis_pt + along + radial * cyl.radius();
+    let eps = (cyl.radius() * 0.05).max(10.0 * tolerance::CONFUSION);
+    let outside = on_wall + radial * eps;
+    let inside = on_wall - radial * eps;
+    // Concave cut: material outside, void inside.
+    crate::boolean::point_in_solid(&outside, solid)
+        && !crate::boolean::point_in_solid(&inside, solid)
+}
+
+/// Intersect the infinite line `p0 + t·dir` with `cyl`, returning the hit point
+/// nearest `near` (or `None` if the line misses the cylinder).
+pub(crate) fn line_meets_cylinder(
+    p0: Pnt,
+    dir: Dir,
+    cyl: &CylindricalSurface,
+    near: Pnt,
+) -> Option<Pnt> {
+    let axis_pt = cyl.position().location();
+    let w = GeomVec::from_dir(cyl.position().direction());
+    let d = GeomVec::from_dir(dir);
+    // Components perpendicular to the cylinder axis.
+    let e = p0 - axis_pt;
+    let e_perp = e - w * e.dot(&w);
+    let d_perp = d - w * d.dot(&w);
+    let a = d_perp.dot(&d_perp);
+    if a <= tolerance::CONFUSION {
+        return None; // line parallel to axis: no transverse crossing
+    }
+    let b = 2.0 * e_perp.dot(&d_perp);
+    let c = e_perp.dot(&e_perp) - cyl.radius() * cyl.radius();
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let sq = disc.max(0.0).sqrt();
+    let t0 = (-b - sq) / (2.0 * a);
+    let t1 = (-b + sq) / (2.0 * a);
+    let p_at = |t: f64| p0 + d * t;
+    let (q0, q1) = (p_at(t0), p_at(t1));
+    Some(if q0.distance(&near) <= q1.distance(&near) {
+        q0
+    } else {
+        q1
+    })
+}
+
+/// A degree-1 (chorded) B-spline edge through `points`, from the first to the
+/// last. Used for the cut-cylinder ∩ blend-cylinder trim curve, which has no
+/// closed-form conic representation.
+pub(crate) fn polyline_edge(points: &[Pnt]) -> Edge {
+    use openrcad_geom::BSplineCurve;
+    let n = points.len();
+    let mut knots = vec![0.0];
+    let mut mults = vec![2usize];
+    let mut t = 0.0;
+    for i in 1..n {
+        t += points[i].distance(&points[i - 1]).max(1e-5);
+        knots.push(t);
+        mults.push(if i < n - 1 { 1 } else { 2 });
+    }
+    let curve = GeomCurve::bspline(BSplineCurve::new(1, points.to_vec(), None, knots, mults));
+    Edge::new(
+        Some(curve),
+        0.0,
+        t,
+        Vertex::new(points[0]),
+        Vertex::new(points[n - 1]),
+    )
+}
+
+/// Sample the intersection of the `blend` cylinder with the `cut` cylinder
+/// between contact points `p_a` (on the blend's A-side contact) and `p_b` (B-side),
+/// returning a chorded B-spline edge that lies on *both* surfaces.
+///
+/// Parametrised by the blend cylinder's angle about its own axis (monotonic along
+/// this quarter-arc of contact); for each angle the axial position is solved so
+/// the point also lands on the cut cylinder.
+fn cyl_cyl_trim_edge(
+    blend: &CylindricalSurface,
+    cut: &CylindricalSurface,
+    p_a: Pnt,
+    p_b: Pnt,
+) -> Option<Edge> {
+    let bl_pt = blend.position().location();
+    let bl_axis = GeomVec::from_dir(blend.position().direction());
+    let bx = GeomVec::from_dir(blend.position().x_direction());
+    let by = GeomVec::from_dir(blend.position().y_direction());
+    let r_b = blend.radius();
+
+    // Angle of a point about the blend axis.
+    let angle_of = |p: Pnt| -> f64 {
+        let v = p - bl_pt;
+        let vp = v - bl_axis * v.dot(&bl_axis);
+        vp.dot(&by).atan2(vp.dot(&bx))
+    };
+    let mut phi_a = angle_of(p_a);
+    let phi_b = angle_of(p_b);
+    // Sweep the short way between the two contacts.
+    use core::f64::consts::PI;
+    while phi_a - phi_b > PI {
+        phi_a -= 2.0 * PI;
+    }
+    while phi_b - phi_a > PI {
+        phi_a += 2.0 * PI;
+    }
+
+    let cut_pt = cut.position().location();
+    let cut_axis = GeomVec::from_dir(cut.position().direction());
+    // For a fixed blend angle phi, the blend-cylinder point is base(phi) + s·bl_axis;
+    // solve s so its distance from the cut axis equals the cut radius.
+    let solve = |phi: f64, prev: Pnt| -> Option<Pnt> {
+        let base = bl_pt + (bx * phi.cos() + by * phi.sin()) * r_b;
+        let u = base - cut_pt;
+        let u_perp = u - cut_axis * u.dot(&cut_axis);
+        let d_perp = bl_axis - cut_axis * bl_axis.dot(&cut_axis);
+        let a = d_perp.dot(&d_perp);
+        if a <= tolerance::CONFUSION {
+            return None;
+        }
+        let b = 2.0 * u_perp.dot(&d_perp);
+        let c = u_perp.dot(&u_perp) - cut.radius() * cut.radius();
+        let disc = b * b - 4.0 * a * c;
+        if disc < 0.0 {
+            return None;
+        }
+        let sq = disc.sqrt();
+        let s0 = (-b - sq) / (2.0 * a);
+        let s1 = (-b + sq) / (2.0 * a);
+        let q0 = base + bl_axis * s0;
+        let q1 = base + bl_axis * s1;
+        Some(if q0.distance(&prev) <= q1.distance(&prev) {
+            q0
+        } else {
+            q1
+        })
+    };
+
+    // Sample densely enough that the chorded curve hugs both cylinders to well
+    // under a render tolerance (≈0.05 mm chords), so the cut wall reads as a
+    // clean cylinder rather than a faceted boundary.
+    let steps = ((p_a.distance(&p_b) / 0.05).ceil() as usize).clamp(24, 160);
+    let mut pts = Vec::with_capacity(steps + 1);
+    pts.push(p_a);
+    let mut prev = p_a;
+    for k in 1..steps {
+        let phi = phi_a + (phi_b - phi_a) * (k as f64) / (steps as f64);
+        let p = solve(phi, prev)?;
+        prev = p;
+        pts.push(p);
+    }
+    pts.push(p_b);
+    Some(polyline_edge(&pts))
+}
+
+/// Trim the new blend flush against a concave cut cylinder it runs into at
+/// `corner`, leaving the cut a clean full-height vertical cylinder.
+///
+/// The fillet's quarter-circle end cap (which lies on the *blend* cylinder, not
+/// the cut) is replaced by the true blend ∩ cut intersection curve. The blend's
+/// two contact curves are extended to where they actually meet the cut wall, and
+/// the cut face is re-trimmed to share that same intersection edge — so its
+/// boundary stays on the cylinder and the seam is watertight by construction.
+/// Mutates `blend` (extended contacts + rebuilt blend face) so the later spine
+/// trims pick up the extension, mirroring [`try_corner_miter`]. Returns
+/// `Ok(false)` before a concave cut cylinder is recognized. Once one is
+/// recognized, failures are reported as clean errors instead of falling back to a
+/// flat endpoint cap that cannot share a valid edge with the cut wall.
+#[allow(clippy::too_many_arguments)]
+fn try_corner_cut(
+    solid: &Solid,
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    _radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> Result<bool, RollingBallError> {
+    if caps.len() != 1 {
+        return Ok(false);
+    }
+    let cap = &caps[0];
+    if !is_concave_cut_cylinder(solid, cap) {
+        return Ok(false);
+    }
+    let cut_cyl = match cap.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => return Err(RollingBallError::UnsupportedTrimTopology),
+    };
+    let blend_cyl = match blend.blend_face.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => {
+            return Err(RollingBallError::BlendSurfaceBuild(
+                "cut trim requires a cylindrical blend",
+            ))
+        }
+    };
+
+    // Which end of each contact runs into the cut.
+    let a_corner = nearest_endpoint(&blend.contact_a, corner);
+    let b_corner = nearest_endpoint(&blend.contact_b, corner);
+    let a_far = farthest_endpoint(&blend.contact_a, corner);
+    let b_far = farthest_endpoint(&blend.contact_b, corner);
+    let a_dir = match (a_corner - a_far).normalized() {
+        Some(v) => Dir::new(v.x(), v.y(), v.z()),
+        None => return Err(RollingBallError::DegenerateSpine),
+    };
+    let b_dir = match (b_corner - b_far).normalized() {
+        Some(v) => Dir::new(v.x(), v.y(), v.z()),
+        None => return Err(RollingBallError::DegenerateSpine),
+    };
+
+    // Where each contact line actually meets the cut wall (may extend past the
+    // spine endpoint when the cut boundary curves away).
+    let ca_real = match line_meets_cylinder(a_far, a_dir, &cut_cyl, a_corner) {
+        Some(p) => p,
+        None => return Err(RollingBallError::UnsupportedTrimTopology),
+    };
+    let cb_real = match line_meets_cylinder(b_far, b_dir, &cut_cyl, b_corner) {
+        Some(p) => p,
+        None => return Err(RollingBallError::UnsupportedTrimTopology),
+    };
+
+    // The shared trim curve, lying on both cylinders.
+    let trim = match cyl_cyl_trim_edge(&blend_cyl, &cut_cyl, ca_real, cb_real) {
+        Some(e) => e,
+        None => return Err(RollingBallError::BlendSurfaceBuild("cut trim curve")),
+    };
+
+    // Re-trim the cut face: shorten its rim/wall edges at `corner` to the real
+    // contacts and splice in the trim curve (reusing the corner trimmer).
+    let trimmed_cap = trim_face_at_corner(cap, corner, ca_real, cb_real, &trim)?;
+
+    // Extend the blend's contacts to the real meet points and rebuild the blend
+    // face with the trim curve replacing this end's cap arc. Build everything as
+    // locals first, then commit atomically so a fallback can't see a half-mutated
+    // blend.
+    let new_a = rebuild_contact(&blend.contact_a, a_far, ca_real);
+    let new_b = rebuild_contact(&blend.contact_b, b_far, cb_real);
+    // The cut is at the contacts' *end* if ca_real sits at their end vertex.
+    let is_end = new_a.end().point().distance(&ca_real) <= new_a.start().point().distance(&ca_real);
+    let new_blend_face = build_blend_face_with_trim(blend, &new_a, &new_b, &trim, is_end);
+
+    blend.contact_a = new_a;
+    blend.contact_b = new_b;
+    blend.blend_face = new_blend_face;
+    faces.push(trimmed_cap);
+    skipped.insert(cap.id());
+    Ok(true)
+}
+
+/// The endpoint of `edge` farthest from `point`.
+pub(crate) fn farthest_endpoint(edge: &Edge, point: Pnt) -> Pnt {
+    let s = edge.source().point();
+    let t = edge.target().point();
+    if s.distance(&point) >= t.distance(&point) {
+        s
+    } else {
+        t
+    }
+}
+
+/// Rebuild a straight contact edge keeping its `keep` endpoint and moving the
+/// other to `moved`.
+fn rebuild_contact(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
+    // `keep`/`moved` are passed as the far/real points; map them onto the edge's
+    // current source→target order so the contact direction is preserved.
+    let s = edge.source().point();
+    if s.distance(&keep) <= s.distance(&moved) {
+        Edge::between_points(keep, moved)
+    } else {
+        Edge::between_points(moved, keep)
+    }
+}
+
+/// Build the blend face's wire from the given contacts, replacing the end
+/// (`is_end`) or start cap arc with the `trim` curve. The blend cylinder surface
+/// is unchanged. The blend wire is always
+/// `[contact_a, end_arc, contact_b.reversed(), start_arc]`.
+fn build_blend_face_with_trim(
+    blend: &RollingBallBlend,
+    ca: &Edge,
+    cb: &Edge,
+    trim: &Edge,
+    is_end: bool,
+) -> Face {
+    let end_src = if is_end { trim } else { &blend.end_arc };
+    let start_src = if is_end { &blend.start_arc } else { trim };
+    let end_edge = orient_edge_between(end_src, ca.end().point(), cb.end().point());
+    let start_edge = orient_edge_between(start_src, cb.start().point(), ca.start().point());
+    let wire = Wire::from_edges([ca.clone(), end_edge, cb.clone().reversed(), start_edge]);
+    rebuild_face(&blend.blend_face, wire).expect("blend face rebuild is infallible")
+}
+
 /// Round a corner where the new blend meets exactly *one* earlier fillet's
 /// cylinder and the corner's third edge is still sharp — the Fusion-style miter.
 ///
@@ -737,8 +1123,11 @@ fn try_corner_miter(
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return false,
     };
-    if point_line_distance(center, cyl.position().location(), cyl.position().direction())
-        > 1e-5 * r.max(1.0) + 1e-6
+    if point_line_distance(
+        center,
+        cyl.position().location(),
+        cyl.position().direction(),
+    ) > 1e-5 * r.max(1.0) + 1e-6
     {
         return false;
     }
@@ -780,9 +1169,10 @@ fn try_corner_miter(
     else {
         return false;
     };
-    let Some(&side1_contact) = straights.iter().find(|e| {
-        near(e.source().point(), other_corner) || near(e.target().point(), other_corner)
-    }) else {
+    let Some(&side1_contact) = straights
+        .iter()
+        .find(|e| near(e.source().point(), other_corner) || near(e.target().point(), other_corner))
+    else {
         return false;
     };
     let Some(common) = adjacent_planar_face(solid, top_contact, cap) else {
@@ -839,8 +1229,16 @@ fn try_corner_miter(
     let mut new_cap_edges = Vec::with_capacity(4);
     for (i, e) in cap_edges.iter().enumerate() {
         if i == corner_arc_idx {
-            let s = if near(e.source().point(), corner) { t } else { k };
-            let d = if near(e.target().point(), corner) { t } else { k };
+            let s = if near(e.source().point(), corner) {
+                t
+            } else {
+                k
+            };
+            let d = if near(e.target().point(), corner) {
+                t
+            } else {
+                k
+            };
             new_cap_edges.push(orient_edge_between(&seam, s, d));
         } else if !matches!(e.curve(), Some(GeomCurve::Line(_))) {
             new_cap_edges.push(e.clone());
@@ -907,9 +1305,7 @@ fn try_corner_miter(
 /// (along `n_top`).
 fn miter_seam_edge(center: Pnt, n_top: Dir, n_side1: Dir, n_side2: Dir, r: f64) -> Option<Edge> {
     use core::f64::consts::{FRAC_PI_2, SQRT_2};
-    let to_dir = |v: GeomVec| {
-        v.normalized().map(|d| Dir::new(d.x(), d.y(), d.z()))
-    };
+    let to_dir = |v: GeomVec| v.normalized().map(|d| Dir::new(d.x(), d.y(), d.z()));
     let major_vec = GeomVec::from_dir(n_side1) + GeomVec::from_dir(n_side2);
     let major_dir = to_dir(major_vec)?;
     let normal = to_dir(GeomVec::from_dir(major_dir).cross(&GeomVec::from_dir(n_top)))?;
@@ -1089,8 +1485,16 @@ fn try_corner_sphere_two_caps(
         for e in w.edges() {
             if matches!(e.curve(), Some(GeomCurve::Ellipse(_))) && touches_corner(&e) {
                 // This cap's seam at *this* corner becomes the sphere arc T <-> side.
-                let s = if near(e.source().point(), corner) { side_pt } else { t };
-                let d = if near(e.target().point(), corner) { side_pt } else { t };
+                let s = if near(e.source().point(), corner) {
+                    side_pt
+                } else {
+                    t
+                };
+                let d = if near(e.target().point(), corner) {
+                    side_pt
+                } else {
+                    t
+                };
                 new_edges.push(orient_edge_between(&sphere_arc, s, d));
             } else if !matches!(e.curve(), Some(GeomCurve::Line(_))) {
                 // Far-end arcs and any seam from another corner are preserved.
@@ -1155,11 +1559,7 @@ fn adjacent_planar_face(solid: &Solid, edge: &Edge, exclude: &Face) -> Option<Fa
 /// Returns the first [`RollingBallError`] encountered, or
 /// [`RollingBallError::SpineNotOnFace`] if a requested edge can no longer be
 /// located after earlier blends consumed it.
-pub fn fillet_edges(
-    solid: &Solid,
-    edges: &[Edge],
-    radius: f64,
-) -> Result<Solid, RollingBallError> {
+pub fn fillet_edges(solid: &Solid, edges: &[Edge], radius: f64) -> Result<Solid, RollingBallError> {
     let mut current = solid.clone();
     for edge in edges {
         // Re-locate the edge in the evolving body. `relocate_edge` tolerates the
@@ -1221,15 +1621,16 @@ pub fn rolling_ball_between_curved_faces(
         return Err(RollingBallError::InvalidRadius { radius });
     }
 
-    let (plane_face, cyl_face, is_a_plane) = if matches!(face_a.surface(), Some(GeomSurface::Plane(_))) {
-        (face_a, face_b, true)
-    } else if matches!(face_b.surface(), Some(GeomSurface::Plane(_))) {
-        (face_b, face_a, false)
-    } else {
-        return Err(RollingBallError::UnsolvableAdjacency {
-            reason: AdjacencyReason::UnsupportedSurfacePair,
-        });
-    };
+    let (plane_face, cyl_face, is_a_plane) =
+        if matches!(face_a.surface(), Some(GeomSurface::Plane(_))) {
+            (face_a, face_b, true)
+        } else if matches!(face_b.surface(), Some(GeomSurface::Plane(_))) {
+            (face_b, face_a, false)
+        } else {
+            return Err(RollingBallError::UnsolvableAdjacency {
+                reason: AdjacencyReason::UnsupportedSurfacePair,
+            });
+        };
 
     let _plane = match plane_face.surface() {
         Some(GeomSurface::Plane(p)) => p,
@@ -1281,7 +1682,14 @@ pub fn rolling_ball_between_curved_faces(
             let contact_cyl_height = radius;
 
             let c_plane = Circle::new(Ax3::new_axes(center, cax, cxr), contact_plane_r);
-            let c_cyl = Circle::new(Ax3::new_axes(center - GeomVec::from_dir(n_plane) * contact_cyl_height, cax, cxr), spine_r);
+            let c_cyl = Circle::new(
+                Ax3::new_axes(
+                    center - GeomVec::from_dir(n_plane) * contact_cyl_height,
+                    cax,
+                    cxr,
+                ),
+                spine_r,
+            );
 
             let u0 = edge.first();
             let u1 = edge.last();
@@ -1322,8 +1730,22 @@ pub fn rolling_ball_between_curved_faces(
             let t1_vec = GeomVec::from_dir(cax).cross(&r1).normalized().unwrap();
             let t1 = Dir::new(t1_vec.x(), t1_vec.y(), t1_vec.z());
 
-            let arc_start = contact_arc(c0, t0, dir0, radius, contact_b.start().point(), contact_a.start().point())?;
-            let arc_end = contact_arc(c1, t1, dir1, radius, contact_a.end().point(), contact_b.end().point())?;
+            let arc_start = contact_arc(
+                c0,
+                t0,
+                dir0,
+                radius,
+                contact_b.start().point(),
+                contact_a.start().point(),
+            )?;
+            let arc_end = contact_arc(
+                c1,
+                t1,
+                dir1,
+                radius,
+                contact_a.end().point(),
+                contact_b.end().point(),
+            )?;
 
             let wire = Wire::from_edges([
                 contact_a.clone(),
@@ -1600,7 +2022,7 @@ fn planar_blend(
     })
 }
 
-fn adjacent_faces(solid: &Solid, edge: &Edge) -> Vec<Face> {
+pub(crate) fn adjacent_faces(solid: &Solid, edge: &Edge) -> Vec<Face> {
     solid
         .shell()
         .faces()
@@ -1643,7 +2065,7 @@ fn point_line_distance(p: Pnt, origin: Pnt, dir: Dir) -> f64 {
 /// endpoints, so the blend runs along the surviving spine (the consumed end is
 /// already rounded by the earlier fillet). Without this, multi-edge fillets that
 /// share a corner fail with [`RollingBallError::SpineNotOnFace`].
-fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
+pub(crate) fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
     let current = solid.edges();
     if let Some(e) = current.iter().find(|c| same_undirected_edge(c, requested)) {
         return Some(e.clone());
@@ -1682,11 +2104,16 @@ fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
     best.map(|(_, e)| e)
 }
 
-fn same_face(a: &Face, b: &Face) -> bool {
+pub(crate) fn same_face(a: &Face, b: &Face) -> bool {
     a.id() == b.id()
 }
 
-fn endpoint_cap_faces(solid: &Solid, point: Pnt, face_a: &Face, face_b: &Face) -> Vec<Face> {
+pub(crate) fn endpoint_cap_faces(
+    solid: &Solid,
+    point: Pnt,
+    face_a: &Face,
+    face_b: &Face,
+) -> Vec<Face> {
     solid
         .shell()
         .faces()
@@ -1728,8 +2155,13 @@ fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
         let v = moved - center;
         v.dot(&y).atan2(v.dot(&x))
     };
-    let keep_is_source = keep.distance(&edge.source().point()) <= keep.distance(&edge.target().point());
-    let keep_param = if keep_is_source { edge.first() } else { edge.last() };
+    let keep_is_source =
+        keep.distance(&edge.source().point()) <= keep.distance(&edge.target().point());
+    let keep_param = if keep_is_source {
+        edge.first()
+    } else {
+        edge.last()
+    };
     // Unwrap the moved endpoint's angle onto the same branch as the kept end so the
     // sub-arc travels the original short way around, not the reflex complement.
     let mut moved_param = raw_angle;
@@ -1742,13 +2174,25 @@ fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
     }
     let curve = Some(GeomCurve::circle(circle));
     if keep_is_source {
-        Edge::new(curve, edge.first(), moved_param, edge.source(), Vertex::new(moved))
+        Edge::new(
+            curve,
+            edge.first(),
+            moved_param,
+            edge.source(),
+            Vertex::new(moved),
+        )
     } else {
-        Edge::new(curve, moved_param, edge.last(), Vertex::new(moved), edge.target())
+        Edge::new(
+            curve,
+            moved_param,
+            edge.last(),
+            Vertex::new(moved),
+            edge.target(),
+        )
     }
 }
 
-fn trim_face_along_spine(
+pub(crate) fn trim_face_along_spine(
     face: &Face,
     spine: &Edge,
     contact: &Edge,
@@ -1799,11 +2243,19 @@ fn trim_face_along_spine(
     let mut new_edges = Vec::with_capacity(n);
     for (i, edge) in edges.iter().enumerate() {
         if i == prev_idx {
-            new_edges.push(shorten_edge_keep_curve(edge, edge.source().point(), contact_start_clamped));
+            new_edges.push(shorten_edge_keep_curve(
+                edge,
+                edge.source().point(),
+                contact_start_clamped,
+            ));
         } else if i == idx {
             new_edges.push(oriented_contact.clone());
         } else if i == next_idx {
-            new_edges.push(shorten_edge_keep_curve(edge, edge.target().point(), contact_end_clamped));
+            new_edges.push(shorten_edge_keep_curve(
+                edge,
+                edge.target().point(),
+                contact_end_clamped,
+            ));
         } else {
             new_edges.push(edge.clone());
         }
@@ -1818,7 +2270,7 @@ fn trim_face_along_spine(
     rebuild_face(face, Wire::from_edges(new_edges))
 }
 
-fn trim_face_at_corner(
+pub(crate) fn trim_face_at_corner(
     face: &Face,
     corner: Pnt,
     contact_a: Pnt,
@@ -1861,10 +2313,18 @@ fn trim_face_at_corner(
     for offset in 0..n {
         let i = (prev_idx + offset) % n;
         if i == prev_idx {
-            new_edges.push(shorten_edge_keep_curve(prev, prev.source().point(), prev_contact));
+            new_edges.push(shorten_edge_keep_curve(
+                prev,
+                prev.source().point(),
+                prev_contact,
+            ));
             new_edges.push(oriented_arc.clone());
         } else if i == next_idx {
-            new_edges.push(shorten_edge_keep_curve(next, next.target().point(), next_contact));
+            new_edges.push(shorten_edge_keep_curve(
+                next,
+                next.target().point(),
+                next_contact,
+            ));
         } else {
             new_edges.push(edges[i].clone());
         }
@@ -1874,7 +2334,10 @@ fn trim_face_at_corner(
 }
 
 fn ensure_trimmable_face(face: &Face) -> Result<(), RollingBallError> {
-    if !matches!(face.surface(), Some(GeomSurface::Plane(_)) | Some(GeomSurface::Cylinder(_))) {
+    if !matches!(
+        face.surface(),
+        Some(GeomSurface::Plane(_)) | Some(GeomSurface::Cylinder(_))
+    ) {
         return Err(RollingBallError::UnsolvableAdjacency {
             reason: AdjacencyReason::NotPlaneOrAnalytic,
         });
@@ -1903,7 +2366,7 @@ fn rebuild_face(face: &Face, outer: Wire) -> Result<Face, RollingBallError> {
     ))
 }
 
-fn contact_point_for_spine_vertex(spine: &Edge, contact: &Edge, point: Pnt) -> Pnt {
+pub(crate) fn contact_point_for_spine_vertex(spine: &Edge, contact: &Edge, point: Pnt) -> Pnt {
     let spine_start = spine.source().point();
     if point.distance(&spine_start) <= 10.0 * tolerance::CONFUSION {
         contact.start().point()
@@ -1912,7 +2375,7 @@ fn contact_point_for_spine_vertex(spine: &Edge, contact: &Edge, point: Pnt) -> P
     }
 }
 
-fn orient_edge_between(edge: &Edge, start: Pnt, end: Pnt) -> Edge {
+pub(crate) fn orient_edge_between(edge: &Edge, start: Pnt, end: Pnt) -> Edge {
     let tol = 10.0 * tolerance::CONFUSION;
     if edge.start().point().distance(&start) <= tol && edge.end().point().distance(&end) <= tol {
         edge.clone()
@@ -1931,7 +2394,7 @@ fn point_segment_distance(point: Pnt, a: Pnt, b: Pnt) -> f64 {
     point.distance(&(a + ab * t))
 }
 
-fn planar_outward_normal(face: &Face) -> Result<Dir, RollingBallError> {
+pub(crate) fn planar_outward_normal(face: &Face) -> Result<Dir, RollingBallError> {
     let normal = match face.surface() {
         Some(GeomSurface::Plane(plane)) => plane.normal(),
         _ => {
@@ -2079,7 +2542,10 @@ mod tests {
             "end arc swept the reflex side: {end_sweep} rad"
         );
         // A square box edge blends a clean quarter-round on each end.
-        assert!((start_sweep - PI / 2.0).abs() < 1e-9, "start sweep {start_sweep}");
+        assert!(
+            (start_sweep - PI / 2.0).abs() < 1e-9,
+            "start sweep {start_sweep}"
+        );
         assert!((end_sweep - PI / 2.0).abs() < 1e-9, "end sweep {end_sweep}");
     }
 
@@ -2145,7 +2611,8 @@ mod tests {
             .edges()
             .into_iter()
             .find(|e| {
-                e.start().point().z().abs() < 1e-9 && matches!(e.curve(), Some(GeomCurve::Circle(_)))
+                e.start().point().z().abs() < 1e-9
+                    && matches!(e.curve(), Some(GeomCurve::Circle(_)))
             })
             .unwrap();
 

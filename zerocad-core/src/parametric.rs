@@ -352,23 +352,12 @@ impl ParametricGraph {
         self.evaluate_bodies_inner(hidden, true)
     }
 
-    /// Whether the (non-hidden) model contains a 3D fillet whose committed,
-    /// arc-cutter geometry differs from its fast faceted draft. The GUI uses this
-    /// to decide if a background refine pass is worth spawning: with no such
-    /// fillet the draft result *is* the final result, so it skips the extra
-    /// (and otherwise redundant) async evaluation. Chamfers are excluded — their
-    /// bevel is a single planar face either way, so draft and final agree.
+    /// Whether the current draft result needs a background refinement pass before
+    /// it should be treated as final. Native rolling-ball fillets make draft and
+    /// committed geometry identical, so this is currently always false.
     pub fn has_arc_fillet(&self, hidden: &std::collections::HashSet<String>) -> bool {
-        self.graph.node_weights().any(|n| {
-            !hidden.contains(&n.id)
-                && matches!(
-                    &n.feature,
-                    FeatureType::EdgeMod {
-                        kind: crate::sketch::CornerKind::Fillet,
-                        ..
-                    }
-                )
-        })
+        let _ = hidden;
+        false
     }
 
     fn evaluate_bodies_inner(
@@ -438,93 +427,93 @@ impl ParametricGraph {
             }
             let node = &self.graph[idx];
             if !hidden.contains(&node.id) {
-            match &node.feature {
-                FeatureType::Box { w, h, d } => {
-                    live.push(LiveBody {
-                        id: node.id.clone(),
-                        parts: vec![crate::mock_kernel::box_solid(*w, *h, *d)],
-                        pristine: Some(MockMesh::make_box(*w, *h, *d)),
-                    });
-                }
-                FeatureType::Cylinder { r, h } => {
-                    if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
+                match &node.feature {
+                    FeatureType::Box { w, h, d } => {
                         live.push(LiveBody {
                             id: node.id.clone(),
-                            parts: vec![solid],
-                            pristine: Some(MockMesh::make_cylinder(*r, *h, 32)),
+                            parts: vec![crate::mock_kernel::box_solid(*w, *h, *d)],
+                            pristine: Some(MockMesh::make_box(*w, *h, *d)),
                         });
                     }
-                }
-                FeatureType::Extrude {
-                    depth,
-                    region_indices,
-                    mode,
-                    depth_expr,
-                } => {
-                    // An expression that still resolves drives the depth; a
-                    // missing/broken variable falls back to the stored value and
-                    // surfaces a warning (otherwise the model silently builds
-                    // with a stale depth — e.g. after a referenced variable is
-                    // deleted).
-                    let eff_depth = match depth_expr.as_ref() {
-                        Some(e) => match crate::expr::eval(e, &vars) {
-                            Ok(v) => v as f32,
-                            Err(_) => {
-                                warnings.push(format!(
+                    FeatureType::Cylinder { r, h } => {
+                        if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
+                            live.push(LiveBody {
+                                id: node.id.clone(),
+                                parts: vec![solid],
+                                pristine: Some(MockMesh::make_cylinder(*r, *h, 32)),
+                            });
+                        }
+                    }
+                    FeatureType::Extrude {
+                        depth,
+                        region_indices,
+                        mode,
+                        depth_expr,
+                    } => {
+                        // An expression that still resolves drives the depth; a
+                        // missing/broken variable falls back to the stored value and
+                        // surfaces a warning (otherwise the model silently builds
+                        // with a stale depth — e.g. after a referenced variable is
+                        // deleted).
+                        let eff_depth = match depth_expr.as_ref() {
+                            Some(e) => match crate::expr::eval(e, &vars) {
+                                Ok(v) => v as f32,
+                                Err(_) => {
+                                    warnings.push(format!(
                                     "Extrude '{}': depth expression \"{}\" no longer evaluates; \
                                      using last value {:.3}.",
                                     node.id, e, depth
                                 ));
-                                *depth
-                            }
-                        },
-                        None => *depth,
-                    };
-                    self.apply_extrude(
-                        idx,
-                        &node.id,
-                        eff_depth,
-                        region_indices,
-                        *mode,
-                        &sketch_cache,
-                        &mut live,
-                        &mut warnings,
-                    );
-                }
-                FeatureType::EdgeMod {
-                    target,
-                    edge,
-                    dist,
-                    dist_expr,
-                    kind,
-                } => {
-                    let eff_dist = match dist_expr.as_ref() {
-                        Some(e) => match crate::expr::eval(e, &vars) {
-                            Ok(v) => v as f32,
-                            Err(_) => {
-                                warnings.push(format!(
-                                    "Edge modifier '{}': distance expression \"{}\" no longer \
-                                     evaluates; using last value {:.3}.",
-                                    node.id, e, dist
-                                ));
-                                *dist
-                            }
-                        },
-                        None => *dist,
-                    };
-                    apply_edge_mod(
-                        &node.id,
+                                    *depth
+                                }
+                            },
+                            None => *depth,
+                        };
+                        self.apply_extrude(
+                            idx,
+                            &node.id,
+                            eff_depth,
+                            region_indices,
+                            *mode,
+                            &sketch_cache,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::EdgeMod {
                         target,
                         edge,
-                        eff_dist,
-                        *kind,
-                        draft,
-                        &mut live,
-                        &mut warnings,
-                    );
+                        dist,
+                        dist_expr,
+                        kind,
+                    } => {
+                        let eff_dist = match dist_expr.as_ref() {
+                            Some(e) => match crate::expr::eval(e, &vars) {
+                                Ok(v) => v as f32,
+                                Err(_) => {
+                                    warnings.push(format!(
+                                        "Edge modifier '{}': distance expression \"{}\" no longer \
+                                     evaluates; using last value {:.3}.",
+                                        node.id, e, dist
+                                    ));
+                                    *dist
+                                }
+                            },
+                            None => *dist,
+                        };
+                        apply_edge_mod(
+                            &node.id,
+                            target,
+                            edge,
+                            eff_dist,
+                            *kind,
+                            draft,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
             }
             // Snapshot the assembled bodies after this node so a later evaluation
             // that shares this prefix can resume from here.
@@ -788,7 +777,11 @@ impl ParametricGraph {
                         overshoot_depth(depth, 1.0),
                     );
                     if smooth.is_some() || exact.is_some() || dipped.is_some() {
-                        join_tools.push(JoinTool { smooth, exact, dipped });
+                        join_tools.push(JoinTool {
+                            smooth,
+                            exact,
+                            dipped,
+                        });
                     }
                 }
             }
@@ -1288,18 +1281,21 @@ fn apply_cut(
     }
 }
 
-/// Upper bound on facets approximating a 3D fillet's rounded surface. The cutter
+/// Legacy edge-cutter facet cap kept for the unused cutter helper below. Native
+/// fillet/chamfer edits no longer call this path. The cutter
 /// tessellates adaptively (~3.6°/segment) up to this cap, so a right-angle edge
 /// rounds with ~24 facets — smooth enough that, with the facet-boundary lines
 /// suppressed (see `mesh_feature_edges`), the fillet reads as one curved face —
 /// while keeping truck's boolean cutter face count bounded.
+#[allow(dead_code)]
 const EDGE_FILLET_SEGS: usize = 24;
 
-/// How far the fallback edge cutter inflates outward (mm). Must clear `BOOL_TOL`
+/// Legacy fallback edge-cutter grow amount. Must clear `BOOL_TOL`
 /// (0.05mm) by a healthy margin so the cutter's tangent edges read as cleanly
 /// *outside* the body faces rather than tangent — the configuration truck's
 /// boolean solver rejects. Costs up to this much chamfer/fillet size in the
 /// fallback path, the price of a boolean that resolves at all.
+#[allow(dead_code)]
 const EDGE_MOD_GROW: f32 = 0.2;
 
 /// Apply a 3D fillet or chamfer to the target body.
@@ -1311,15 +1307,13 @@ const EDGE_MOD_GROW: f32 = 0.2;
 /// smallest dimension, the same bar OpenRCAD's all-edge `fillet` uses) is
 /// rejected so the body is left intact rather than self-intersecting.
 ///
-/// **Chamfer** still subtracts a faceted edge cutter
-/// ([`crate::mock_kernel::edge_corner_cutter`]) via a guarded boolean, since the
-/// kernel has no native single-edge chamfer yet. As with [`apply_cut`], a
-/// boolean the kernel can't resolve leaves the part intact and warns rather than
-/// dropping a valid body.
+/// **Chamfer** uses OpenRCAD's native selected-edge bevel
+/// ([`crate::mock_kernel::chamfer_edge`]) and applies the same "leave unchanged
+/// on clean kernel error" behavior as fillet.
 ///
 /// `draft` is retained for API compatibility but no longer changes the result:
-/// the native fillet is exact in a single pass, so the live preview and the
-/// committed model are identical.
+/// the native edge modifiers are exact in a single pass, so the live preview and
+/// the committed model are identical.
 fn apply_edge_mod(
     mod_id: &str,
     target: &str,
@@ -1380,9 +1374,7 @@ fn apply_fillet(
     } else {
         // Surface the kernel's actual reason (radius too large, edge not found on
         // an adjacent face, non-blendable wedge, …) instead of a generic guess.
-        let reason = last_err.unwrap_or_else(|| {
-            "the edge is no longer on the body".to_string()
-        });
+        let reason = last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
         warnings.push(format!(
             "Fillet '{mod_id}': the edge couldn't be rounded ({reason}), so the \
              body was left unchanged."
@@ -1390,7 +1382,7 @@ fn apply_fillet(
     }
 }
 
-/// Faceted cutter-subtraction chamfer (no native single-edge chamfer yet).
+/// Native selected-edge chamfer of the captured edge on every part of `body`.
 fn apply_chamfer(
     mod_id: &str,
     edge: &EdgeRef,
@@ -1398,45 +1390,29 @@ fn apply_chamfer(
     body: &mut LiveBody,
     warnings: &mut Vec<String>,
 ) {
-    // exact = corner on the body edge (best geometry when the boolean takes it);
-    // robust = legs lifted just outside the body so they aren't coplanar with its
-    // faces. Both overshoot the edge ends.
-    let mut cutters: Vec<KernelSolid> = Vec::with_capacity(2);
-    cutters.extend(crate::mock_kernel::edge_corner_cutter(
-        edge.p0, edge.p1, edge.n1, edge.n2, dist, false, EDGE_FILLET_SEGS, 0.0, CUT_OVERSHOOT,
-    ));
-    cutters.extend(crate::mock_kernel::edge_corner_cutter(
-        edge.p0, edge.p1, edge.n1, edge.n2, dist, false, EDGE_FILLET_SEGS, EDGE_MOD_GROW, CUT_OVERSHOOT,
-    ));
-    if cutters.is_empty() {
-        warnings.push(format!(
-            "Chamfer '{mod_id}': the edge couldn't be turned into a cutter \
-             (degenerate edge or size), so the body was left unchanged."
-        ));
-        return;
-    }
-
     let mut applied = false;
+    let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
     for part in body.parts.drain(..) {
-        let cut = cutters.iter().find_map(|tool| {
-            crate::mock_kernel::difference(&part, tool).filter(|d| edge_mod_keeps_body(&part, d))
-        });
-        match cut {
-            Some(d) => {
+        match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
+            Ok(chamfered) => {
                 applied = true;
-                next.push(d);
+                next.push(chamfered);
             }
-            None => next.push(part),
+            Err(reason) => {
+                last_err = Some(reason);
+                next.push(part);
+            }
         }
     }
     body.parts = next;
     if applied {
         body.pristine = None;
     } else {
+        let reason = last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
         warnings.push(format!(
-            "Chamfer '{mod_id}': the solver couldn't apply it to the body (the \
-             edge may not be a clean convex corner), so the body was left unchanged."
+            "Chamfer '{mod_id}': the edge couldn't be beveled ({reason}), so the \
+             body was left unchanged."
         ));
     }
 }
@@ -1448,6 +1424,7 @@ fn apply_chamfer(
 /// material instead flares the result's bounds outside the part; rejecting that
 /// forces the caller to fall through to the robust cutter (or keep the body
 /// intact). Missing bounds → accept (vertexless can't be judged).
+#[allow(dead_code)]
 fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> bool {
     match (
         crate::mock_kernel::solid_aabb(part),
@@ -1464,9 +1441,7 @@ fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> bool {
             // slack covers the cutter's own end-overshoot/grow and tessellation
             // noise; real garbage flares out far more than this.
             const SLACK: f32 = 0.3;
-            let within = (0..3).all(|k| {
-                r.0[k] >= p.0[k] - SLACK && r.1[k] <= p.1[k] + SLACK
-            });
+            let within = (0..3).all(|k| r.0[k] >= p.0[k] - SLACK && r.1[k] <= p.1[k] + SLACK);
             keeps_bulk && within
         }
         (None, None) => true,
@@ -1575,9 +1550,13 @@ mod extrude_mode_tests {
 
         let footprint = |g: &ParametricGraph| -> f32 {
             // Span of the body in X = the square's width.
-            let bodies = g.evaluate_bodies(&std::collections::HashSet::new()).unwrap();
+            let bodies = g
+                .evaluate_bodies(&std::collections::HashSet::new())
+                .unwrap();
             let xs: Vec<f32> = bodies[0].1.vertices.chunks(6).map(|v| v[0]).collect();
-            let (mn, mx) = xs.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+            let (mn, mx) = xs
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
             mx - mn
         };
 
@@ -1625,7 +1604,9 @@ mod extrude_mode_tests {
         g.add_dependency("sketch_2", "extrude_3");
 
         let top_z = |g: &ParametricGraph| -> f32 {
-            let bodies = g.evaluate_bodies(&std::collections::HashSet::new()).unwrap();
+            let bodies = g
+                .evaluate_bodies(&std::collections::HashSet::new())
+                .unwrap();
             bodies[0]
                 .1
                 .vertices
@@ -1634,7 +1615,10 @@ mod extrude_mode_tests {
                 .fold(f32::MIN, f32::max)
         };
 
-        assert!((top_z(&g) - 5.0).abs() < 0.01, "depth should resolve to h=5");
+        assert!(
+            (top_z(&g) - 5.0).abs() < 0.01,
+            "depth should resolve to h=5"
+        );
 
         // Bump the variable to 20 and rebuild — the extrude must grow with it.
         for idx in g.graph.node_indices() {
@@ -1813,7 +1797,10 @@ mod extrude_mode_tests {
             mesh_digest(&cold_bodies),
             "cached re-eval after a radius drag must match a cold rebuild exactly"
         );
-        assert_eq!(warm_warn, cold_warn, "warnings must match the cold rebuild too");
+        assert_eq!(
+            warm_warn, cold_warn,
+            "warnings must match the cold rebuild too"
+        );
     }
 
     #[test]
@@ -1884,7 +1871,12 @@ mod extrude_mode_tests {
         g
     }
 
-    fn add_sketch_cs(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: SketchCurves) {
+    fn add_sketch_cs(
+        g: &mut ParametricGraph,
+        id: &str,
+        cs: CoordinateSystem,
+        curves: SketchCurves,
+    ) {
         g.add_feature(FeatureNode {
             id: id.to_string(),
             name: id.to_string(),
@@ -1908,7 +1900,11 @@ mod extrude_mode_tests {
         let mut curves = SketchCurves::new();
         curves.add_rectangle((0.0, 0.0), (40.0, 30.0));
         curves.add_circle((20.0, 15.0), 8.0);
-        assert_eq!(g.cached_regions(&curves).len(), 2, "rect+circle = annulus + disk");
+        assert_eq!(
+            g.cached_regions(&curves).len(),
+            2,
+            "rect+circle = annulus + disk"
+        );
 
         add_sketch(&mut g, "sketch_1", curves);
         add_extrude(&mut g, "extrude_2", "sketch_1", 11.62, ExtrudeMode::NewBody);
@@ -1937,9 +1933,14 @@ mod extrude_mode_tests {
                 },
             });
             g2.add_dependency("s", "e");
-            let b2 = g2.evaluate_bodies(&std::collections::HashSet::new()).unwrap();
+            let b2 = g2
+                .evaluate_bodies(&std::collections::HashSet::new())
+                .unwrap();
             let tris: usize = b2.iter().map(|(_, m)| m.indices.len() / 3).sum();
-            assert!(tris > 0, "region selection {sel:?} must render a body, got {tris} tris");
+            assert!(
+                tris > 0,
+                "region selection {sel:?} must render a body, got {tris} tris"
+            );
         }
     }
 
@@ -1949,7 +1950,10 @@ mod extrude_mode_tests {
         // not a make_box. Both chamfer AND fillet must apply to a top edge of such a
         // prism (pre-fix the fillet failed because the sewn top cap stored an inward
         // normal).
-        for kind in [crate::sketch::CornerKind::Chamfer, crate::sketch::CornerKind::Fillet] {
+        for kind in [
+            crate::sketch::CornerKind::Chamfer,
+            crate::sketch::CornerKind::Fillet,
+        ] {
             let mut g = ParametricGraph::new();
             add_sketch(&mut g, "s", rect_sketch((0.0, 0.0), (40.0, 30.0)));
             add_extrude(&mut g, "e", "s", 20.0, ExtrudeMode::NewBody);
@@ -1976,11 +1980,20 @@ mod extrude_mode_tests {
             hidden.insert("s".to_string());
             let (bodies, warnings) = g.evaluate_bodies_with_warnings(&hidden).unwrap();
             assert_eq!(bodies.len(), 1, "{kind:?} on a prism must stay one body");
-            assert!(warnings.is_empty(), "{kind:?} on a clean prism edge should not warn, got {warnings:?}");
+            assert!(
+                warnings.is_empty(),
+                "{kind:?} on a clean prism edge should not warn, got {warnings:?}"
+            );
             // The top-front sharp edge (y=0, z=20) must be gone — the edge-mod applied.
             let m = &bodies[0].1;
-            let sharp = m.vertices.chunks(6).any(|v| v[1].abs() < 0.02 && (v[2] - 20.0).abs() < 0.02);
-            assert!(!sharp, "{kind:?} should have removed the prism's top-front edge");
+            let sharp = m
+                .vertices
+                .chunks(6)
+                .any(|v| v[1].abs() < 0.02 && (v[2] - 20.0).abs() < 0.02);
+            assert!(
+                !sharp,
+                "{kind:?} should have removed the prism's top-front edge"
+            );
         }
     }
 
@@ -2014,9 +2027,14 @@ mod extrude_mode_tests {
         add_sketch_cs(&mut gc, "s_cut", top, cc);
         add_extrude(&mut gc, "e_cut", "s_cut", -16.62, ExtrudeMode::Cut);
         gc.add_dependency("e_base", "e_cut");
-        let (cb, cw) = gc.evaluate_bodies_with_warnings(&std::collections::HashSet::new()).unwrap();
+        let (cb, cw) = gc
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
         assert_eq!(cb.len(), 1, "cut stays one body");
-        assert!(cw.is_empty(), "a clean drill-through should not warn, got {cw:?}");
+        assert!(
+            cw.is_empty(),
+            "a clean drill-through should not warn, got {cw:?}"
+        );
         assert!(
             cb[0].1.indices.len() / 3 > plain_tris + 6,
             "cut must bore a hole (more tris than the plain box={plain_tris})"
@@ -2029,11 +2047,23 @@ mod extrude_mode_tests {
         add_sketch_cs(&mut gj, "s_join", top, jc);
         add_extrude(&mut gj, "e_join", "s_join", 8.0, ExtrudeMode::Join);
         gj.add_dependency("e_base", "e_join");
-        let (jb, jw) = gj.evaluate_bodies_with_warnings(&std::collections::HashSet::new()).unwrap();
+        let (jb, jw) = gj
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
         assert_eq!(jb.len(), 1, "join stays one body");
-        assert!(jw.is_empty(), "a clean boss join should not warn, got {jw:?}");
-        let max_z = jb.iter().flat_map(|(_, m)| m.vertices.chunks(6)).map(|v| v[2]).fold(f32::MIN, f32::max);
-        assert!(max_z >= 22.9, "join must add the boss (top z≈23), got {max_z}");
+        assert!(
+            jw.is_empty(),
+            "a clean boss join should not warn, got {jw:?}"
+        );
+        let max_z = jb
+            .iter()
+            .flat_map(|(_, m)| m.vertices.chunks(6))
+            .map(|v| v[2])
+            .fold(f32::MIN, f32::max);
+        assert!(
+            max_z >= 22.9,
+            "join must add the boss (top z≈23), got {max_z}"
+        );
     }
 
     #[test]
@@ -2047,7 +2077,11 @@ mod extrude_mode_tests {
         g.add_feature(FeatureNode {
             id: "box_1".to_string(),
             name: "Box".to_string(),
-            feature: FeatureType::Box { w: 10.0, h: 10.0, d: 10.0 },
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
         });
         let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, 10.0), Vec3::X, Vec3::Y);
         let mut circ = SketchCurves::new();
@@ -2059,10 +2093,26 @@ mod extrude_mode_tests {
         let (bodies, warnings) = g
             .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
             .unwrap();
-        assert_eq!(bodies.len(), 1, "boss-join must stay one body, got {}", bodies.len());
-        assert!(warnings.is_empty(), "a coplanar boss join should not warn, got {warnings:?}");
-        let max_z = bodies[0].1.vertices.chunks(6).map(|v| v[2]).fold(f32::MIN, f32::max);
-        assert!(max_z >= 14.9, "joined boss must reach z≈15 (top of boss), got {max_z}");
+        assert_eq!(
+            bodies.len(),
+            1,
+            "boss-join must stay one body, got {}",
+            bodies.len()
+        );
+        assert!(
+            warnings.is_empty(),
+            "a coplanar boss join should not warn, got {warnings:?}"
+        );
+        let max_z = bodies[0]
+            .1
+            .vertices
+            .chunks(6)
+            .map(|v| v[2])
+            .fold(f32::MIN, f32::max);
+        assert!(
+            max_z >= 14.9,
+            "joined boss must reach z≈15 (top of boss), got {max_z}"
+        );
     }
 
     fn box_with_boss_then_edge_mod(dist: f32, kind: crate::sketch::CornerKind) -> ParametricGraph {
@@ -2074,7 +2124,11 @@ mod extrude_mode_tests {
         g.add_feature(FeatureNode {
             id: "box_1".to_string(),
             name: "Box".to_string(),
-            feature: FeatureType::Box { w: 10.0, h: 10.0, d: 10.0 },
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
         });
         let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, 10.0), Vec3::X, Vec3::Y);
         let mut circ = SketchCurves::new();
@@ -2104,7 +2158,10 @@ mod extrude_mode_tests {
 
     #[test]
     fn edge_mod_on_boss_union_body_keeps_boss() {
-        for kind in [crate::sketch::CornerKind::Chamfer, crate::sketch::CornerKind::Fillet] {
+        for kind in [
+            crate::sketch::CornerKind::Chamfer,
+            crate::sketch::CornerKind::Fillet,
+        ] {
             let g = box_with_boss_then_edge_mod(2.0, kind);
             let (bodies, _warnings) = g
                 .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
@@ -2112,9 +2169,15 @@ mod extrude_mode_tests {
             assert_eq!(bodies.len(), 1, "{kind:?} on union body must stay one body");
             let m = &bodies[0].1;
             let max_z = m.vertices.chunks(6).map(|v| v[2]).fold(f32::MIN, f32::max);
-            assert!(max_z >= 14.9, "{kind:?} must preserve the boss (top z≈15), got {max_z}");
+            assert!(
+                max_z >= 14.9,
+                "{kind:?} must preserve the boss (top z≈15), got {max_z}"
+            );
             // The modified bottom-front corner must not still be sharp.
-            let sharp = m.vertices.chunks(6).any(|v| v[1].abs() < 0.01 && v[2].abs() < 0.01);
+            let sharp = m
+                .vertices
+                .chunks(6)
+                .any(|v| v[1].abs() < 0.01 && v[2].abs() < 0.01);
             assert!(!sharp, "{kind:?} should have removed the y=0,z=0 corner");
         }
     }
@@ -2133,7 +2196,10 @@ mod extrude_mode_tests {
                 && (-0.5..=10.5).contains(&v[1])
                 && (-0.5..=10.5).contains(&v[2])
         });
-        assert!(inside, "large chamfer flew vertices outside the 10³ block (runaway wedge)");
+        assert!(
+            inside,
+            "large chamfer flew vertices outside the 10³ block (runaway wedge)"
+        );
     }
 
     #[test]
@@ -2158,8 +2224,16 @@ mod extrude_mode_tests {
             "chamfer should create a 45° bevel face (normal ~ (0,-0.707,-0.707))"
         );
         // The bottom (y=0) and front (z=0) faces still exist away from the edge…
-        let min_y = mesh.vertices.chunks(6).map(|v| v[1]).fold(f32::MAX, f32::min);
-        let min_z = mesh.vertices.chunks(6).map(|v| v[2]).fold(f32::MAX, f32::min);
+        let min_y = mesh
+            .vertices
+            .chunks(6)
+            .map(|v| v[1])
+            .fold(f32::MAX, f32::min);
+        let min_z = mesh
+            .vertices
+            .chunks(6)
+            .map(|v| v[2])
+            .fold(f32::MAX, f32::min);
         assert!(
             min_y < 0.01 && min_z < 0.01,
             "the bottom and front faces should survive the chamfer (min_y={min_y}, min_z={min_z})"
@@ -2223,7 +2297,10 @@ mod extrude_mode_tests {
                 && (-0.4..=10.4).contains(&v[1])
                 && (-0.4..=10.4).contains(&v[2])
         });
-        assert!(inside, "filleted body has vertices outside the original block");
+        assert!(
+            inside,
+            "filleted body has vertices outside the original block"
+        );
         // The sharp y=0,z=0 edge is rounded away: no vertex sits on both faces.
         let sharp = mesh
             .vertices
@@ -2233,9 +2310,10 @@ mod extrude_mode_tests {
         // The round leaves intermediate facet normals between the two faces — at
         // least one vertex normal points partly along BOTH +(-y) and +(-z), i.e.
         // a curved-surface normal, not just the axis-aligned box faces.
-        let has_round = mesh.vertices.chunks(6).any(|v| {
-            v[4] < -0.15 && v[5] < -0.15 && v[3].abs() < 0.2
-        });
+        let has_round = mesh
+            .vertices
+            .chunks(6)
+            .any(|v| v[4] < -0.15 && v[5] < -0.15 && v[3].abs() < 0.2);
         assert!(has_round, "expected curved fillet-surface normals");
 
         // Smooth-face look: the fillet's *lengthwise facet seams* (the lines
@@ -2263,9 +2341,8 @@ mod extrude_mode_tests {
                     && (b[1] - a[1]).abs() < 0.05
                     && (b[2] - a[2]).abs() < 0.05;
                 // Strictly inside the round (not on the y=0 or z=0 box faces).
-                let interior = |p: &[f32; 3]| {
-                    p[1] > 0.05 && p[1] < 1.95 && p[2] > 0.05 && p[2] < 1.95
-                };
+                let interior =
+                    |p: &[f32; 3]| p[1] > 0.05 && p[1] < 1.95 && p[2] > 0.05 && p[2] < 1.95;
                 along_x && interior(&a) && interior(&b)
             })
             .count();
@@ -2414,14 +2491,12 @@ mod extrude_mode_tests {
             .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
             .unwrap();
         assert_eq!(bodies.len(), 1, "body must not disappear");
-        assert!(
-            !warnings.is_empty(),
-            "an oversized fillet should warn"
-        );
+        assert!(!warnings.is_empty(), "an oversized fillet should warn");
         let mesh = &bodies[0].1;
         let plain = MockMesh::make_box(10.0, 10.0, 10.0);
         assert_eq!(
-            mesh.indices.len(), plain.indices.len(),
+            mesh.indices.len(),
+            plain.indices.len(),
             "oversized fillet must leave the body unchanged"
         );
     }

@@ -70,6 +70,156 @@ pub fn merge_coplanar_faces(solid: &Solid) -> Solid {
     }
 }
 
+/// Merge adjacent cocylindrical faces (same axis frame, radius, and orientation)
+/// of `solid` into one face by dropping the shared seam edge(s).
+///
+/// A boolean Cut of a vertical cylinder out of a box corner leaves the concave
+/// wall split into two faces wherever the cut arc crosses a `make_cylinder` rim
+/// seam (the lateral wall is built in thirds at 0/120/240°). Re-uniting them gives
+/// one selectable face and lets the fillet's flush-trim corner path see a single
+/// cut cap instead of bailing on its two-cap guard and deforming the cut.
+///
+/// Returns the merged solid only when it is watertight, healthy, and has strictly
+/// fewer faces; otherwise returns `solid` unchanged — so it can only ever improve a
+/// boolean result.
+pub fn merge_cocylindrical_faces(solid: &Solid) -> Solid {
+    let mut brep = (**solid.brep()).clone();
+    let mut face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
+    let original_count = face_ids.len();
+
+    do_merge_cocylindrical(&mut brep, &mut face_ids);
+
+    if face_ids.len() >= original_count {
+        return solid.clone();
+    }
+
+    // Re-use the collinear-line cleanup so any straight side edges the imprint left
+    // split are restored to whole edges (arc rims are left as-is).
+    merge_collinear_edges(&mut brep, &face_ids);
+
+    brep.retain_faces(&face_ids);
+    let shell_id = brep.shells.insert(ShellData { faces: face_ids });
+    let merged = Solid::new(Shell::from_id(Arc::new(brep), shell_id));
+
+    if merged.is_watertight() && merged.health_report().is_healthy() {
+        merged
+    } else {
+        solid.clone()
+    }
+}
+
+/// Group cylinder faces by axis frame + radius + orientation, merge each group,
+/// and rewrite `face_ids` with the merged faces (other faces pass through).
+fn do_merge_cocylindrical(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
+    let qf = |x: f64| (x * 1.0e6).round() as i64;
+    // (axis location, axis direction, radius, orientation side).
+    type CylKey = (i64, i64, i64, i64, i64, i64, i64, u8);
+    let mut groups: HashMap<CylKey, Vec<FaceId>> = HashMap::new();
+    let mut passthrough: Vec<FaceId> = Vec::new();
+
+    for &fid in face_ids.iter() {
+        let Some(fd) = brep.faces.get(fid) else {
+            continue;
+        };
+        let Some(GeomSurface::Cylinder(cyl)) = &fd.surface else {
+            passthrough.push(fid);
+            continue;
+        };
+        let loc = cyl.position().location();
+        let dir = cyl.position().direction();
+        let side: u8 = if fd.orientation == Orientation::Reversed {
+            1
+        } else {
+            0
+        };
+        let key = (
+            qf(loc.x()),
+            qf(loc.y()),
+            qf(loc.z()),
+            qf(dir.x()),
+            qf(dir.y()),
+            qf(dir.z()),
+            qf(cyl.radius()),
+            side,
+        );
+        groups.entry(key).or_default().push(fid);
+    }
+
+    let mut result = passthrough;
+    for (_key, members) in groups {
+        if members.len() < 2 {
+            result.extend(members);
+            continue;
+        }
+        match try_merge_cyl_group(brep, &members) {
+            Some(new_faces) => result.extend(new_faces),
+            None => result.extend(members),
+        }
+    }
+    *face_ids = result;
+}
+
+/// Merge one cocylindrical group: cancel the shared seam edge(s), re-trace the
+/// boundary into a single loop, and rebuild one face. Returns `None` (keep the
+/// originals) for anything but the clean, single-loop, non-periodic case — the
+/// safety gate in the caller absorbs anything this conservatively skips.
+fn try_merge_cyl_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
+    let rep = brep.faces.get(members[0])?.clone();
+
+    // 1. Count co-edge usage across member loops; an edge used twice is the shared
+    //    seam (drop it), used once is a real boundary (keep it).
+    let mut count: HashMap<EdgeId, u32> = HashMap::new();
+    let mut all: Vec<OrientedEdge> = Vec::new();
+    for &fid in members {
+        let fd = brep.faces.get(fid)?;
+        let mut wires = Vec::new();
+        if let Some(w) = fd.outer_wire {
+            wires.push(w);
+        }
+        wires.extend(&fd.inner_wires);
+        for w in wires {
+            let l = brep.loops.get(w)?;
+            for oe in &l.edges {
+                *count.entry(oe.id).or_insert(0) += 1;
+                all.push(*oe);
+            }
+        }
+    }
+    // Nothing is actually shared between the members -> not adjacent, don't merge.
+    if !count.values().any(|&c| c >= 2) {
+        return None;
+    }
+    let boundary: Vec<OrientedEdge> = all.into_iter().filter(|oe| count[&oe.id] == 1).collect();
+    if boundary.len() < 3 {
+        return None;
+    }
+
+    // 2. Re-trace the boundary into closed loops; require exactly one (a partial
+    //    cut wall). Holes / multi-loop cases are left to the safety gate.
+    let loops = retrace_loops(brep, &boundary)?;
+    if loops.len() != 1 {
+        return None;
+    }
+    let outer = loops.into_iter().next()?;
+
+    // A full 360° wrap (e.g. a whole cylinder's three lateral faces) drops all its
+    // seams and re-traces into TWO rim loops, so it is already rejected above by the
+    // single-loop requirement. A partial cut wall always retraces into exactly one
+    // loop with two real side edges (the plane∩cylinder cuts, which are BSplines,
+    // not lines) — so no further guard is needed; the watertight/health/fewer-faces
+    // gate in the caller is the backstop.
+
+    // Build a single face on the shared cylinder surface.
+    let outer_loop = brep.loops.insert(LoopData { edges: outer });
+    let fid = brep.faces.insert(FaceData {
+        surface: rep.surface.clone(),
+        outer_wire: Some(outer_loop),
+        inner_wires: Vec::new(),
+        orientation: rep.orientation,
+    });
+    Some(vec![fid])
+}
+
 /// Group planar faces by support plane + outward side, merge each group, and
 /// rewrite `face_ids` with the merged faces (curved/lone faces pass through).
 fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
@@ -121,7 +271,9 @@ fn merge_collinear_edges(brep: &mut BRep, face_ids: &[FaceId]) {
         // Distinct edges incident to each vertex used by the merged faces.
         let mut vertex_edges: HashMap<VertexId, Vec<EdgeId>> = HashMap::new();
         for &lid in &loop_ids {
-            let Some(l) = brep.loops.get(lid) else { continue };
+            let Some(l) = brep.loops.get(lid) else {
+                continue;
+            };
             for oe in &l.edges {
                 let Some(e) = brep.edges.get(oe.id) else {
                     continue;
@@ -181,7 +333,8 @@ fn collinear_merge_endpoints(
     let ed1 = brep.edges.get(e1)?;
     let ed2 = brep.edges.get(e2)?;
     // Both must be straight lines.
-    if !matches!(ed1.curve, Some(GeomCurve::Line(_))) || !matches!(ed2.curve, Some(GeomCurve::Line(_)))
+    if !matches!(ed1.curve, Some(GeomCurve::Line(_)))
+        || !matches!(ed2.curve, Some(GeomCurve::Line(_)))
     {
         return None;
     }
@@ -239,7 +392,9 @@ fn apply_collinear_merge(
     });
 
     for &lid in loop_ids {
-        let Some(l) = brep.loops.get(lid) else { continue };
+        let Some(l) = brep.loops.get(lid) else {
+            continue;
+        };
         let n = l.edges.len();
         // Find the adjacent pair {e1, e2}.
         let mut pair = None;
@@ -485,12 +640,69 @@ fn point_in_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
     for i in 0..n {
         let (xi, yi) = poly[i];
         let (xj, yj) = poly[j];
-        if ((yi > py) != (yj > py))
-            && (px < (xj - xi) * (py - yi) / (yj - yi + f64::EPSILON) + xi)
+        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi + f64::EPSILON) + xi)
         {
             inside = !inside;
         }
         j = i;
     }
     inside
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openrcad_foundation::{Ax2, Dir};
+    use openrcad_primitives::{make_box, make_cylinder};
+
+    /// Count Ø8 (radius-4) vertical-axis cylinder faces.
+    fn vertical_cyl_faces(s: &Solid, r: f64) -> usize {
+        s.shell()
+            .faces()
+            .iter()
+            .filter(|f| match f.surface() {
+                Some(GeomSurface::Cylinder(c)) => {
+                    c.position().direction().dot(&Dir::dz()).abs() > 0.999
+                        && (c.radius() - r).abs() < 1e-6
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// A corner cut whose 180->270° arc crosses a rim seam (here rotated to 90° so a
+    /// seam lands at 210°) splits the concave wall into two cocylindrical faces; the
+    /// merge re-unites them into one.
+    #[test]
+    fn corner_cut_crossing_seam_merges_to_one_wall() {
+        use core::f64::consts::PI;
+        let cube = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let xdir = Dir::new((PI / 2.0).cos(), (PI / 2.0).sin(), 0.0);
+        let axis = Ax2::new_axes(Pnt::new(10.0, 10.0, -1.0), Dir::dz(), xdir);
+        let cyl = make_cylinder(&axis, 4.0, 12.0);
+        let cut = crate::boolean(&cube, &cyl, crate::BooleanOp::Cut);
+
+        assert!(cut.is_watertight() && cut.health_report().is_healthy());
+        // Seam-crossing -> the wall starts as two cocylindrical fragments; the merge
+        // leaves exactly one.
+        assert_eq!(
+            vertical_cyl_faces(&cut, 4.0),
+            1,
+            "the corner-cut wall must be a single cylinder face after the merge"
+        );
+    }
+
+    /// Negative control: the pass must NOT merge the three lateral faces of a plain
+    /// cylinder into a degenerate periodic face (the full-wrap guard rejects it).
+    #[test]
+    fn plain_cylinder_lateral_faces_are_left_alone() {
+        let cyl = make_cylinder(&Ax2::new(Pnt::origin(), Dir::dz()), 4.0, 10.0);
+        let before = cyl.shell().faces().len();
+        let after = merge_cocylindrical_faces(&cyl);
+        assert_eq!(
+            after.shell().faces().len(),
+            before,
+            "a plain cylinder (full 360° wall) must be left unchanged"
+        );
+    }
 }

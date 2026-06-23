@@ -43,9 +43,10 @@ pub use openrcad_topo as topo;
 /// ```
 pub mod prelude {
     pub use crate::algo::{
-        boolean, chamfer, fillet, fillet_planar_edge, prism, rolling_ball_between_planar_faces,
-        rolling_ball_fillet_edge, sew, shell_solid, sweep_prism, BlendError, BooleanOp,
-        RollingBallBlend, RollingBallError, SolidExt, SweepError,
+        boolean, chamfer, chamfer_edges, fillet, fillet_planar_edge, prism,
+        rolling_ball_between_planar_faces, rolling_ball_fillet_edge, sew, shell_solid, sweep_prism,
+        BlendError, BooleanOp, ChamferError, RollingBallBlend, RollingBallError, SolidExt,
+        SweepError,
     };
     pub use crate::document::{
         load_zcad, read_zcad, save_zcad, write_zcad, CachedMesh, Document, DocumentError,

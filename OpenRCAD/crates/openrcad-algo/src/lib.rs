@@ -80,6 +80,7 @@ pub mod fillet;
 pub mod offset;
 pub mod prism;
 pub mod rolling_ball;
+pub use chamfer::{chamfer_edges, ChamferError};
 
 /// Roll a constant-`radius` fillet along every edge of `solid`
 /// (OCCT `BRepFilletAPI_MakeFillet`).

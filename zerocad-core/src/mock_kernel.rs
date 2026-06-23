@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use openrcad::algo::{boolean_checked, fillet_edges, prism, BooleanOp};
+use openrcad::algo::{boolean_checked, chamfer_edges, fillet_edges, prism, BooleanOp};
 use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
 use openrcad::mesh::tessellate;
@@ -97,7 +97,8 @@ impl MockMesh {
         self.indices.reserve(other.indices.len());
         self.edge_vertices.reserve(other.edge_vertices.len());
         self.edge_indices.reserve(other.edge_indices.len());
-        self.edge_face_normals.reserve(other.edge_face_normals.len());
+        self.edge_face_normals
+            .reserve(other.edge_face_normals.len());
         self.face_ids.reserve(other.face_ids.len());
         self.edge_groups.reserve(other.edge_groups.len());
 
@@ -533,7 +534,14 @@ fn offset_polygon_outward(pts: &[(f32, f32)], grow: f32) -> Vec<(f32, f32)> {
         .map(|i| {
             let prev = (i + n - 1) % n;
             match intersect(off_pt[prev], dir[prev], off_pt[i], dir[i]) {
-                Some(p) if p.0.is_finite() && p.1.is_finite() && p.0.abs() < SPIKE_LIMIT && p.1.abs() < SPIKE_LIMIT => p,
+                Some(p)
+                    if p.0.is_finite()
+                        && p.1.is_finite()
+                        && p.0.abs() < SPIKE_LIMIT
+                        && p.1.abs() < SPIKE_LIMIT =>
+                {
+                    p
+                }
                 _ => off_pt[i],
             }
         })
@@ -668,7 +676,11 @@ pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
 pub fn difference_bodies(a: &KernelSolid, b: &KernelSolid) -> Option<Vec<KernelSolid>> {
     let result = difference(a, b)?;
     let parts = result.split_disconnected();
-    Some(if parts.is_empty() { vec![result] } else { parts })
+    Some(if parts.is_empty() {
+        vec![result]
+    } else {
+        parts
+    })
 }
 
 /// Fallback for the common "rectangular pocket clean through an axis-aligned
@@ -736,16 +748,8 @@ pub fn axis_aligned_cut_parts(part: &KernelSolid, tool: &KernelSolid) -> Option<
     let (tlo, thi) = solid_aabb(tool)?;
     const EPS: f32 = 0.01;
 
-    let rlo = [
-        tlo[0].max(plo[0]),
-        tlo[1].max(plo[1]),
-        tlo[2].max(plo[2]),
-    ];
-    let rhi = [
-        thi[0].min(phi[0]),
-        thi[1].min(phi[1]),
-        thi[2].min(phi[2]),
-    ];
+    let rlo = [tlo[0].max(plo[0]), tlo[1].max(plo[1]), tlo[2].max(plo[2])];
+    let rhi = [thi[0].min(phi[0]), thi[1].min(phi[1]), thi[2].min(phi[2])];
     if (0..3).any(|k| rhi[k] <= rlo[k] + EPS) {
         return None;
     }
@@ -798,6 +802,20 @@ pub fn fillet_edge(
     fillet_edges(solid, std::slice::from_ref(&e), radius as f64).map_err(|err| err.to_string())
 }
 
+/// Bevel the edge running from `p0` to `p1` of `solid` by `distance`, using the
+/// native selected-edge chamfer path (no boolean cutter fallback).
+pub fn chamfer_edge(
+    solid: &KernelSolid,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    distance: f32,
+) -> Result<KernelSolid, String> {
+    let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
+    let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
+    let e = Edge::between_points(a, b);
+    chamfer_edges(solid, std::slice::from_ref(&e), distance as f64).map_err(|err| err.to_string())
+}
+
 /// Axis-aligned bounding box of a solid from its B-Rep vertices, as
 /// `(min, max)`. Exact for polygonal solids; a conservative-enough estimate for
 /// curved ones (used only for cheap overlap pre-tests). `None` if vertexless.
@@ -822,7 +840,6 @@ pub fn aabbs_overlap(a: &([f32; 3], [f32; 3]), b: &([f32; 3], [f32; 3]), eps: f3
 pub fn aabb_contains(outer: &([f32; 3], [f32; 3]), inner: &([f32; 3], [f32; 3]), eps: f32) -> bool {
     (0..3).all(|k| outer.0[k] - eps <= inner.0[k] && inner.1[k] <= outer.1[k] + eps)
 }
-
 
 // ---------------------------------------------------------------------------
 // openrcad Solid builders
@@ -965,66 +982,76 @@ fn loop_to_wire(loop_pts: &[(f32, f32)], cs: &crate::geometry::CoordinateSystem)
 
     // Append the arc covering rotated vertices [cs_v ..= ce_v] (ce_v may equal n,
     // i.e. wrap to vertex 0) to `edges`, split into <=MAX_ARC_PIECE sub-arcs.
-    let emit_arc =
-        |edges: &mut Vec<Edge>, rp: &[(f64, f64)], cs_v: usize, ce_v: usize, circ: (f64, f64, f64)| {
-            let m = rp.len();
-            let (cx, cy, r) = circ;
-            let start2d = rp[cs_v % m];
-            let end2d = rp[ce_v % m];
+    let emit_arc = |edges: &mut Vec<Edge>,
+                    rp: &[(f64, f64)],
+                    cs_v: usize,
+                    ce_v: usize,
+                    circ: (f64, f64, f64)| {
+        let m = rp.len();
+        let (cx, cy, r) = circ;
+        let start2d = rp[cs_v % m];
+        let end2d = rp[ce_v % m];
 
-            // Sense: signed area of the covered chain about the centre picks which
-            // way `Circle::point(t)` (CCW about +main) must turn to trace it.
-            let mut signed = 0.0;
-            for k in cs_v..ce_v {
-                let p = rp[k % m];
-                let q = rp[(k + 1) % m];
-                signed += (p.0 - cx) * (q.1 - cy) - (p.1 - cy) * (q.0 - cx);
-            }
-            let main = if signed >= 0.0 { axis_n } else { axis_n.reversed() };
-
-            let center3d = to_pnt((cx, cy));
-            let xd = dir3d((start2d.0 - cx, start2d.1 - cy));
-            let mv = GeomVec::from_dir(main);
-            let xperp = xd - mv * xd.dot(&mv);
-            let Some(xdir) = Dir::from_vec(&xperp) else {
-                // Degenerate (start coincident with centre): fall back to chords.
-                for k in cs_v..ce_v {
-                    edges.push(Edge::between_points(to_pnt(rp[k % m]), to_pnt(rp[(k + 1) % m])));
-                }
-                return;
-            };
-            let circle = Circle::new(Ax3::new_axes(center3d, main, xdir), r);
-            let ydir = mv.cross(&GeomVec::from_dir(xdir));
-            let ang = |p2d: (f64, f64)| -> f64 {
-                let w = dir3d((p2d.0 - cx, p2d.1 - cy));
-                w.dot(&ydir).atan2(w.dot(&GeomVec::from_dir(xdir)))
-            };
-            let t0 = ang(start2d);
-            let mut t1 = ang(end2d);
-            while t1 <= t0 + 1e-9 {
-                t1 += 2.0 * std::f64::consts::PI;
-            }
-            let span = t1 - t0;
-            let pieces = ((span / MAX_ARC_PIECE).ceil() as usize).max(1);
-            let mut prev_v = Vertex::new(to_pnt(start2d));
-            for k in 1..=pieces {
-                let ts = t0 + span * ((k - 1) as f64 / pieces as f64);
-                let te = t0 + span * (k as f64 / pieces as f64);
-                let end_v = if k == pieces {
-                    Vertex::new(to_pnt(end2d))
-                } else {
-                    Vertex::new(circle.point(te))
-                };
-                edges.push(Edge::new(
-                    Some(GeomCurve::circle(circle)),
-                    ts,
-                    te,
-                    prev_v.clone(),
-                    end_v.clone(),
-                ));
-                prev_v = end_v;
-            }
+        // Sense: signed area of the covered chain about the centre picks which
+        // way `Circle::point(t)` (CCW about +main) must turn to trace it.
+        let mut signed = 0.0;
+        for k in cs_v..ce_v {
+            let p = rp[k % m];
+            let q = rp[(k + 1) % m];
+            signed += (p.0 - cx) * (q.1 - cy) - (p.1 - cy) * (q.0 - cx);
+        }
+        let main = if signed >= 0.0 {
+            axis_n
+        } else {
+            axis_n.reversed()
         };
+
+        let center3d = to_pnt((cx, cy));
+        let xd = dir3d((start2d.0 - cx, start2d.1 - cy));
+        let mv = GeomVec::from_dir(main);
+        let xperp = xd - mv * xd.dot(&mv);
+        let Some(xdir) = Dir::from_vec(&xperp) else {
+            // Degenerate (start coincident with centre): fall back to chords.
+            for k in cs_v..ce_v {
+                edges.push(Edge::between_points(
+                    to_pnt(rp[k % m]),
+                    to_pnt(rp[(k + 1) % m]),
+                ));
+            }
+            return;
+        };
+        let circle = Circle::new(Ax3::new_axes(center3d, main, xdir), r);
+        let ydir = mv.cross(&GeomVec::from_dir(xdir));
+        let ang = |p2d: (f64, f64)| -> f64 {
+            let w = dir3d((p2d.0 - cx, p2d.1 - cy));
+            w.dot(&ydir).atan2(w.dot(&GeomVec::from_dir(xdir)))
+        };
+        let t0 = ang(start2d);
+        let mut t1 = ang(end2d);
+        while t1 <= t0 + 1e-9 {
+            t1 += 2.0 * std::f64::consts::PI;
+        }
+        let span = t1 - t0;
+        let pieces = ((span / MAX_ARC_PIECE).ceil() as usize).max(1);
+        let mut prev_v = Vertex::new(to_pnt(start2d));
+        for k in 1..=pieces {
+            let ts = t0 + span * ((k - 1) as f64 / pieces as f64);
+            let te = t0 + span * (k as f64 / pieces as f64);
+            let end_v = if k == pieces {
+                Vertex::new(to_pnt(end2d))
+            } else {
+                Vertex::new(circle.point(te))
+            };
+            edges.push(Edge::new(
+                Some(GeomCurve::circle(circle)),
+                ts,
+                te,
+                prev_v.clone(),
+                end_v.clone(),
+            ));
+            prev_v = end_v;
+        }
+    };
 
     // Pick a rotation start at a non-arc (corner) vertex so arc runs never wrap
     // the array boundary. With no corner the loop is a full circle (or an
@@ -1032,7 +1059,8 @@ fn loop_to_wire(loop_pts: &[(f32, f32)], cs: &crate::geometry::CoordinateSystem)
     match arc_vert.iter().position(|a| a.is_none()) {
         Some(off) => {
             let rp: Vec<(f64, f64)> = (0..n).map(|i| pts[(i + off) % n]).collect();
-            let ra: Vec<Option<(f64, f64, f64)>> = (0..n).map(|i| arc_vert[(i + off) % n]).collect();
+            let ra: Vec<Option<(f64, f64, f64)>> =
+                (0..n).map(|i| arc_vert[(i + off) % n]).collect();
 
             // Collect arc runs (covered vertex ranges) over the interior 1..n.
             let mut runs: Vec<(usize, usize, (f64, f64, f64))> = Vec::new();
@@ -1052,8 +1080,8 @@ fn loop_to_wire(loop_pts: &[(f32, f32)], cs: &crate::geometry::CoordinateSystem)
                 if j - i + 1 >= ARC_MIN_RUN {
                     let (cs_v, ce_v) = (i - 1, j + 1);
                     let mid = (cs_v + ce_v) / 2;
-                    let circ = circumcircle_2d(rp[cs_v % n], rp[mid % n], rp[ce_v % n])
-                        .unwrap_or(ci);
+                    let circ =
+                        circumcircle_2d(rp[cs_v % n], rp[mid % n], rp[ce_v % n]).unwrap_or(ci);
                     runs.push((cs_v, ce_v, circ));
                 }
                 i = j + 1;
@@ -1069,7 +1097,10 @@ fn loop_to_wire(loop_pts: &[(f32, f32)], cs: &crate::geometry::CoordinateSystem)
                     cur = b;
                     ri += 1;
                 } else {
-                    edges.push(Edge::between_points(to_pnt(rp[cur % n]), to_pnt(rp[(cur + 1) % n])));
+                    edges.push(Edge::between_points(
+                        to_pnt(rp[cur % n]),
+                        to_pnt(rp[(cur + 1) % n]),
+                    ));
                     cur += 1;
                 }
             }
@@ -1085,16 +1116,16 @@ fn loop_to_wire(loop_pts: &[(f32, f32)], cs: &crate::geometry::CoordinateSystem)
                 }
                 (sx / n as f64, sy / n as f64, sr / n as f64)
             };
-            let is_circle = arc_vert
-                .iter()
-                .flatten()
-                .all(|c| same_circle(*c, avg));
+            let is_circle = arc_vert.iter().flatten().all(|c| same_circle(*c, avg));
             if is_circle {
                 let circ = circumcircle_2d(pts[0], pts[n / 3], pts[2 * n / 3]).unwrap_or(avg);
                 emit_arc(&mut edges, &pts, 0, n, circ);
             } else {
                 for i in 0..n {
-                    edges.push(Edge::between_points(to_pnt(pts[i]), to_pnt(pts[(i + 1) % n])));
+                    edges.push(Edge::between_points(
+                        to_pnt(pts[i]),
+                        to_pnt(pts[(i + 1) % n]),
+                    ));
                 }
             }
         }
@@ -1286,12 +1317,7 @@ const SHADE_CREASE_COS: f32 = 0.866;
 ///
 /// Operates on the interleaved `[x,y,z,nx,ny,nz]` buffer in place; `face_ids`
 /// gives the B-rep face of each triangle in `indices`.
-fn smooth_vertex_normals(
-    vertices: &mut [f32],
-    indices: &[u32],
-    face_ids: &[u32],
-    crease_cos: f32,
-) {
+fn smooth_vertex_normals(vertices: &mut [f32], indices: &[u32], face_ids: &[u32], crease_cos: f32) {
     let vcount = vertices.len() / 6;
     if vcount == 0 {
         return;
@@ -1407,14 +1433,23 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
     };
     // Per-triangle vertex keys in stored winding order.
     let tkeys: Vec<[(i64, i64, i64); 3]> = (0..tris)
-        .map(|t| [vkey(indices[t * 3]), vkey(indices[t * 3 + 1]), vkey(indices[t * 3 + 2])])
+        .map(|t| {
+            [
+                vkey(indices[t * 3]),
+                vkey(indices[t * 3 + 1]),
+                vkey(indices[t * 3 + 2]),
+            ]
+        })
         .collect();
     // Undirected edge -> incident triangles.
     let mut edge_tris: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
     for (t, k) in tkeys.iter().enumerate() {
         for ei in 0..3 {
             let (a, b) = (k[ei], k[(ei + 1) % 3]);
-            edge_tris.entry(if a <= b { (a, b) } else { (b, a) }).or_default().push(t);
+            edge_tris
+                .entry(if a <= b { (a, b) } else { (b, a) })
+                .or_default()
+                .push(t);
         }
     }
     // The three directed edges of a triangle given its current flip state.
@@ -1445,7 +1480,9 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
         while let Some(t) = queue.pop_front() {
             for &(ta, tb) in &directed(t, flipped[t]) {
                 let u = if ta <= tb { (ta, tb) } else { (tb, ta) };
-                let Some(adj) = edge_tris.get(&u) else { continue };
+                let Some(adj) = edge_tris.get(&u) else {
+                    continue;
+                };
                 for &t2 in adj {
                     if t2 == t || visited[t2] {
                         continue;
@@ -1465,7 +1502,11 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
     // inside-out and its whole component must be flipped.
     let pos = |vi: u32| -> [f64; 3] {
         let b = vi as usize * 6;
-        [vertices[b] as f64, vertices[b + 1] as f64, vertices[b + 2] as f64]
+        [
+            vertices[b] as f64,
+            vertices[b + 1] as f64,
+            vertices[b + 2] as f64,
+        ]
     };
     let mut comp_vol = vec![0.0f64; ncomp];
     for t in 0..tris {
@@ -1475,7 +1516,8 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
             (indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2])
         };
         let (a, b, c) = (pos(i0), pos(i1), pos(i2));
-        comp_vol[comp[t]] += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+        comp_vol[comp[t]] += a[0] * (b[1] * c[2] - b[2] * c[1])
+            - a[1] * (b[0] * c[2] - b[2] * c[0])
             + a[2] * (b[0] * c[1] - b[1] * c[0]);
     }
     // Apply winding flips, then recompute each triangle's flat normal so the
@@ -1503,7 +1545,11 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
         let nn = if len > 1.0e-12 {
             [n[0] / len, n[1] / len, n[2] / len]
         } else {
-            [vertices[i0 * 6 + 3], vertices[i0 * 6 + 4], vertices[i0 * 6 + 5]]
+            [
+                vertices[i0 * 6 + 3],
+                vertices[i0 * 6 + 4],
+                vertices[i0 * 6 + 5],
+            ]
         };
         for &vi in &[i0, i1, i2] {
             vertices[vi * 6 + 3] = nn[0];
@@ -1579,7 +1625,11 @@ fn add_missing_straight_brep_edges(
         let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
         let ka = (q(a[0]), q(a[1]), q(a[2]));
         let kb = (q(b[0]), q(b[1]), q(b[2]));
-        if ka <= kb { (ka, kb) } else { (kb, ka) }
+        if ka <= kb {
+            (ka, kb)
+        } else {
+            (kb, ka)
+        }
     };
 
     let mut existing = HashSet::new();
@@ -1635,9 +1685,8 @@ fn add_missing_straight_brep_edges(
                 let b = edge.end().point();
                 let pa = [a.x() as f32, a.y() as f32, a.z() as f32];
                 let pb = [b.x() as f32, b.y() as f32, b.z() as f32];
-                let d2 = (pa[0] - pb[0]).powi(2)
-                    + (pa[1] - pb[1]).powi(2)
-                    + (pa[2] - pb[2]).powi(2);
+                let d2 =
+                    (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2);
                 if d2 < 1.0e-8 || !edge_is_straight(&edge) {
                     continue;
                 }
@@ -1664,9 +1713,7 @@ fn add_missing_straight_brep_edges(
                 continue;
             }
         }
-        let d2 = (pa[0] - pb[0]).powi(2)
-            + (pa[1] - pb[1]).powi(2)
-            + (pa[2] - pb[2]).powi(2);
+        let d2 = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2);
         if d2 < 1.0e-6 {
             continue;
         }
@@ -2167,7 +2214,9 @@ fn mesh_feature_edges(
     let mut face_curved: HashMap<u32, bool> = HashMap::new();
     for (t, tri) in indices.chunks_exact(3).enumerate() {
         let fid = face_ids.get(t).copied().unwrap_or(0);
-        let r = *face_ref_n.entry(fid).or_insert_with(|| nrm(tri[0] as usize));
+        let r = *face_ref_n
+            .entry(fid)
+            .or_insert_with(|| nrm(tri[0] as usize));
         for &v in tri {
             let n = nrm(v as usize);
             // ~2.5°: a flat B-rep face's vertices share one (anchored) normal, so
@@ -2222,14 +2271,14 @@ fn mesh_feature_edges(
             let n1 = rec.faces[1].1;
             let dot = (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).clamp(-1.0, 1.0);
             const CREASE_COS: f32 = 0.95; // cos(~18°)
-            // A curved face (fillet/cylinder) meets its neighbour along a *tangent*
-            // edge whose normals nearly agree — yet it's a real design edge (the
-            // top/bottom of a fillet, a cylinder's rim), so any shallow crease that
-            // touches a curved face is kept. Only a shallow crease between two
-            // genuinely flat faces is a faceted tessellation seam to hide.
-            // (A *same-surface* seam — two arc-faces of one cylinder — is handled
-            // separately above via `surface_group`; here the representative
-            // per-face normals are too coarse to recognise it.)
+                                          // A curved face (fillet/cylinder) meets its neighbour along a *tangent*
+                                          // edge whose normals nearly agree — yet it's a real design edge (the
+                                          // top/bottom of a fillet, a cylinder's rim), so any shallow crease that
+                                          // touches a curved face is kept. Only a shallow crease between two
+                                          // genuinely flat faces is a faceted tessellation seam to hide.
+                                          // (A *same-surface* seam — two arc-faces of one cylinder — is handled
+                                          // separately above via `surface_group`; here the representative
+                                          // per-face normals are too coarse to recognise it.)
             let touches_curved = rec
                 .faces
                 .iter()
@@ -2307,7 +2356,11 @@ fn group_edge_segments(
     let vkey = |vi: u32| -> (i64, i64, i64) {
         let b = vi as usize * 3;
         let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
-        (q(edge_vertices[b]), q(edge_vertices[b + 1]), q(edge_vertices[b + 2]))
+        (
+            q(edge_vertices[b]),
+            q(edge_vertices[b + 1]),
+            q(edge_vertices[b + 2]),
+        )
     };
     let pos = |vi: u32| -> [f64; 3] {
         let b = vi as usize * 3;
@@ -2507,10 +2560,16 @@ mod wireframe_tests {
         let face_ids = vec![0, 1];
         let (ev, ei, _, _) = mesh_feature_edges(&v, &indices, &face_ids, &[]);
 
-        assert_eq!(ei.len() / 2, 1, "the 90° crease should be the one kept edge");
+        assert_eq!(
+            ei.len() / 2,
+            1,
+            "the 90° crease should be the one kept edge"
+        );
         let (a, b) = (ei[0] as usize * 3, ei[1] as usize * 3);
         let on = |k: usize, p: (f32, f32, f32)| {
-            (ev[k] - p.0).abs() < 1e-4 && (ev[k + 1] - p.1).abs() < 1e-4 && (ev[k + 2] - p.2).abs() < 1e-4
+            (ev[k] - p.0).abs() < 1e-4
+                && (ev[k + 1] - p.1).abs() < 1e-4
+                && (ev[k + 2] - p.2).abs() < 1e-4
         };
         let shared = (on(a, (0.0, 0.0, 0.0)) && on(b, (1.0, 0.0, 0.0)))
             || (on(a, (1.0, 0.0, 0.0)) && on(b, (0.0, 0.0, 0.0)));
@@ -2582,7 +2641,11 @@ mod wireframe_tests {
         let mesh = MockMesh::make_extruded_sketch(&circle, &[], 8.0, &CoordinateSystem::XY);
 
         let seg_count = mesh.edge_indices.len() / 2;
-        assert_eq!(mesh.edge_groups.len(), seg_count, "one group id per segment");
+        assert_eq!(
+            mesh.edge_groups.len(),
+            seg_count,
+            "one group id per segment"
+        );
 
         let mut sizes: HashMap<u32, usize> = HashMap::new();
         for &g in &mesh.edge_groups {
@@ -2622,8 +2685,7 @@ mod arc_reconstruction_tests {
         let mut pts: Vec<(f32, f32)> = Vec::new();
         let steps = 24;
         for i in 0..=steps {
-            let t = -std::f32::consts::FRAC_PI_2
-                + (i as f32 / steps as f32) * std::f32::consts::PI;
+            let t = -std::f32::consts::FRAC_PI_2 + (i as f32 / steps as f32) * std::f32::consts::PI;
             pts.push((5.0 + 5.0 * t.cos(), 5.0 + 5.0 * t.sin()));
         }
         pts.push((0.0, 10.0));
@@ -2641,7 +2703,10 @@ mod arc_reconstruction_tests {
         // + 2 caps. The exact split count isn't contractual, but the shell must be
         // a closed, healthy solid.
         assert!(solid.is_watertight(), "D extrusion must be watertight");
-        assert!(solid.health_report().is_healthy(), "D extrusion must be healthy");
+        assert!(
+            solid.health_report().is_healthy(),
+            "D extrusion must be healthy"
+        );
     }
 
     /// A polygon the user genuinely wants faceted (here a rectangle) has no
@@ -2651,7 +2716,11 @@ mod arc_reconstruction_tests {
         let rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)];
         let solid = extruded_region_solid(&rect, &[], 4.0, &CoordinateSystem::XY)
             .expect("rectangle should extrude");
-        assert_eq!(cylinder_faces(&solid), 0, "a box must have no cylinder faces");
+        assert_eq!(
+            cylinder_faces(&solid),
+            0,
+            "a box must have no cylinder faces"
+        );
         assert_eq!(solid.face_count(), 6, "a box is 6 faces");
         assert!(solid.is_watertight());
     }

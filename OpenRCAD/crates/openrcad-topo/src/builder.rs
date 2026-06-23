@@ -422,6 +422,7 @@ impl BRepBuilder {
             }
         };
 
+
         // 1. Gather all edges (outer boundary + splitting edges) and build both Forward and Reversed half-edges
         // so that the graph is symmetric and every edge is traversed in both directions (avoiding dead ends / bijections breaking).
         let mut edges_pool = Vec::new();

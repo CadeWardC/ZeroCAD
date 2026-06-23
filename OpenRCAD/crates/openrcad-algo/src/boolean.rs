@@ -1,6 +1,6 @@
 use crate::BooleanOp;
 use core::f64::consts::TAU;
-use openrcad_foundation::{Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{Dir, Pnt, Trsf, Vec as GeomVec};
 use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Surface};
 use openrcad_topo::arena::EdgeId;
 use openrcad_topo::{BRepBuilder, Face, FaceId, HealthReport, Solid, Wire};
@@ -41,6 +41,15 @@ pub enum BooleanError {
         /// Topology health diagnostics for the output.
         report: HealthReport,
     },
+    /// The result is topologically watertight but contains a degenerate "sliver":
+    /// two near-coincident, overlapping parallel faces forming a near-zero-
+    /// thickness wall. This passes the manifold/health checks yet is a tiny
+    /// geometric lie that breaks downstream operations (notably filleting), so it
+    /// is rejected up front rather than cached as a bad body.
+    DegenerateSliver {
+        /// The wall thickness detected (distance between the coincident planes).
+        thickness: f64,
+    },
 }
 
 impl core::fmt::Display for BooleanError {
@@ -55,6 +64,12 @@ impl core::fmt::Display for BooleanError {
             }
             Self::NonWatertightOutput { report } => {
                 write!(f, "boolean produced a non-watertight solid: {report:?}")
+            }
+            Self::DegenerateSliver { thickness } => {
+                write!(
+                    f,
+                    "boolean produced a degenerate sliver (wall {thickness:.2e})"
+                )
             }
         }
     }
@@ -116,6 +131,15 @@ pub fn boolean_checked_bodies(
 /// Apply `op` between `object` and `tool`.
 pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     let tol = 1e-5;
+
+    // 0. Fuzzy pre-snap: nudge the tool so a near-coincident, overlapping planar
+    //    face becomes exactly coincident with the object's. This collapses the
+    //    near-miss / flush cut onto the boolean's clean coincident-face path,
+    //    preventing the watertight "sliver" that would otherwise break a later
+    //    fillet. Narrow and size-relative, so a real clearance is never snapped.
+    let fuzz = (bbox_diag(object) * SNAP_REL).clamp(1e-12, SNAP_CAP);
+    let snapped = snap_tool_to_object(object, tool, fuzz);
+    let tool = &snapped;
 
     // 1. Build staging builders
     let mut builder_obj = BRepBuilder::from_brep((**object.brep()).clone());
@@ -185,10 +209,14 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     let mut tool_sub: std::collections::HashMap<FaceId, Vec<FaceId>> =
         faces_tool.iter().map(|f| (f.id(), vec![f.id()])).collect();
 
-    let mut splitting_edges_obj: std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>> =
-        std::collections::HashMap::new();
-    let mut splitting_edges_tool: std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>> =
-        std::collections::HashMap::new();
+    let mut splitting_edges_obj: std::collections::HashMap<
+        FaceId,
+        Vec<openrcad_topo::arena::EdgeId>,
+    > = std::collections::HashMap::new();
+    let mut splitting_edges_tool: std::collections::HashMap<
+        FaceId,
+        Vec<openrcad_topo::arena::EdgeId>,
+    > = std::collections::HashMap::new();
 
     for &(f_obj_id, f_tool_id) in &pairs {
         let f_obj = Face::from_id(
@@ -217,16 +245,38 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
                     if circle_inside_face(&circle, &f_obj) {
                         let c = GeomCurve::Circle(circle);
                         let sub = obj_sub.get_mut(&f_obj_id).unwrap();
-                        split_tracked(&mut builder_obj, sub, &c, 0.0, TAU, &mut splitting_edges_obj, tol);
+                        split_tracked(
+                            &mut builder_obj,
+                            sub,
+                            &c,
+                            0.0,
+                            TAU,
+                            &mut splitting_edges_obj,
+                            tol,
+                        );
                         continue;
                     }
                 }
                 for e_tool in w_tool.edges() {
                     if let Some(c_tool) = e_tool.curve() {
-                        let intervals = crate::intersect::trim_curve_to_face(c_tool, e_tool.first(), e_tool.last(), &f_obj, tol);
+                        let intervals = crate::intersect::trim_curve_to_face(
+                            c_tool,
+                            e_tool.first(),
+                            e_tool.last(),
+                            &f_obj,
+                            tol,
+                        );
                         for (first, last) in intervals {
                             let sub = obj_sub.get_mut(&f_obj_id).unwrap();
-                            split_tracked(&mut builder_obj, sub, c_tool, first, last, &mut splitting_edges_obj, tol);
+                            split_tracked(
+                                &mut builder_obj,
+                                sub,
+                                c_tool,
+                                first,
+                                last,
+                                &mut splitting_edges_obj,
+                                tol,
+                            );
                         }
                     }
                 }
@@ -236,16 +286,38 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
                     if circle_inside_face(&circle, &f_tool) {
                         let c = GeomCurve::Circle(circle);
                         let sub = tool_sub.get_mut(&f_tool_id).unwrap();
-                        split_tracked(&mut builder_tool, sub, &c, 0.0, TAU, &mut splitting_edges_tool, tol);
+                        split_tracked(
+                            &mut builder_tool,
+                            sub,
+                            &c,
+                            0.0,
+                            TAU,
+                            &mut splitting_edges_tool,
+                            tol,
+                        );
                         continue;
                     }
                 }
                 for e_obj in w_obj.edges() {
                     if let Some(c_obj) = e_obj.curve() {
-                        let intervals = crate::intersect::trim_curve_to_face(c_obj, e_obj.first(), e_obj.last(), &f_tool, tol);
+                        let intervals = crate::intersect::trim_curve_to_face(
+                            c_obj,
+                            e_obj.first(),
+                            e_obj.last(),
+                            &f_tool,
+                            tol,
+                        );
                         for (first, last) in intervals {
                             let sub = tool_sub.get_mut(&f_tool_id).unwrap();
-                            split_tracked(&mut builder_tool, sub, c_obj, first, last, &mut splitting_edges_tool, tol);
+                            split_tracked(
+                                &mut builder_tool,
+                                sub,
+                                c_obj,
+                                first,
+                                last,
+                                &mut splitting_edges_tool,
+                                tol,
+                            );
                         }
                     }
                 }
@@ -255,15 +327,36 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
             let curves = crate::intersect::surface_surface_curves(&f_obj, &f_tool, tol);
             for (curve, first, last) in curves {
                 let sub = obj_sub.get_mut(&f_obj_id).unwrap();
-                split_tracked(&mut builder_obj, sub, &curve, first, last, &mut splitting_edges_obj, tol);
+                split_tracked(
+                    &mut builder_obj,
+                    sub,
+                    &curve,
+                    first,
+                    last,
+                    &mut splitting_edges_obj,
+                    tol,
+                );
                 let sub = tool_sub.get_mut(&f_tool_id).unwrap();
-                split_tracked(&mut builder_tool, sub, &curve, first, last, &mut splitting_edges_tool, tol);
+                split_tracked(
+                    &mut builder_tool,
+                    sub,
+                    &curve,
+                    first,
+                    last,
+                    &mut splitting_edges_tool,
+                    tol,
+                );
             }
         }
     }
 
     // Partition faces that have accumulated splitting edges
-    let run_partition = |builder: &mut BRepBuilder, sub: &mut Vec<FaceId>, split_map: &mut std::collections::HashMap<FaceId, Vec<openrcad_topo::arena::EdgeId>>| {
+    let run_partition = |builder: &mut BRepBuilder,
+                         sub: &mut Vec<FaceId>,
+                         split_map: &mut std::collections::HashMap<
+        FaceId,
+        Vec<openrcad_topo::arena::EdgeId>,
+    >| {
         let mut new_sub = Vec::new();
         for &fid in sub.iter() {
             if let Some(edges) = split_map.remove(&fid) {
@@ -411,9 +504,12 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     let solid = Solid::new(shell);
 
     // 5. Merge coplanar faces split by the imprint (e.g. a union of two boxes
-    //    keeps the shared face as several coplanar strips). This is a no-op
-    //    fallback unless it produces a watertight, healthy, smaller solid.
-    crate::merge::merge_coplanar_faces(&solid)
+    //    keeps the shared face as several coplanar strips), then cocylindrical
+    //    faces split by it (a corner cut whose arc crosses a `make_cylinder` rim
+    //    seam leaves the concave wall as two faces). Each is a no-op fallback
+    //    unless it produces a watertight, healthy, smaller solid.
+    let solid = crate::merge::merge_coplanar_faces(&solid);
+    crate::merge::merge_cocylindrical_faces(&solid)
 }
 
 fn validate_operand(input: BooleanInput, solid: &Solid) -> Result<(), BooleanError> {
@@ -432,7 +528,198 @@ fn validate_output(solid: Solid) -> Result<Solid, BooleanError> {
     if !solid.is_watertight() {
         return Err(BooleanError::NonWatertightOutput { report });
     }
+    let sliver_tol = (bbox_diag(&solid) * SLIVER_REL).clamp(1e-12, SLIVER_CAP);
+    if let Some(thickness) = degenerate_sliver_thickness(&solid, sliver_tol) {
+        return Err(BooleanError::DegenerateSliver { thickness });
+    }
     Ok(solid)
+}
+
+// ---- Fuzzy coincidence handling (snap + sliver gate) -----------------------
+//
+// A cut tool whose planar face stops a hair short of (or flush with) a body face
+// is a near-coincidence. Left alone the boolean emits a near-zero-thickness
+// "sliver": topologically watertight, but a tiny geometric lie that breaks the
+// downstream fillet (the "funnel"). We handle it in two narrow, intent-preserving
+// steps — both size-relative with a hard cap so a deliberate clearance larger
+// than the fuzz is never touched:
+//   1. a pre-boolean snap that nudges the tool to make a near-coincident,
+//      overlapping face pair exactly coincident (`snap_tool_to_object`);
+//   2. a post-boolean gate that rejects any residual sliver
+//      (`degenerate_sliver_thickness`, wired into `validate_output`).
+
+/// Relative pre-boolean snap fuzz (× bbox diagonal), hard-capped. Only gaps below
+/// this — numerical near-coincidences, not real clearances — are snapped.
+const SNAP_REL: f64 = 1e-7;
+const SNAP_CAP: f64 = 1e-4;
+/// Relative sliver-rejection tolerance (× bbox diagonal), hard-capped. A wall
+/// thinner than this that survived snapping is rejected as degenerate.
+const SLIVER_REL: f64 = 1e-6;
+const SLIVER_CAP: f64 = 1e-3;
+
+/// A planar face reduced to its plane frame and outer-wire vertices.
+struct PlanarFaceInfo {
+    normal: Dir,
+    x: Dir,
+    y: Dir,
+    offset: f64, // normal · (point on plane)
+    verts: Vec<Pnt>,
+}
+
+fn planar_faces(solid: &Solid) -> Vec<PlanarFaceInfo> {
+    let mut out = Vec::new();
+    for f in solid.shell().faces() {
+        if let Some(GeomSurface::Plane(p)) = f.surface() {
+            let pos = p.position();
+            let n = pos.direction();
+            let loc = pos.location();
+            let verts: Vec<Pnt> = match f.outer_wire() {
+                Some(w) => w.edges().iter().map(|e| e.start().point()).collect(),
+                None => continue,
+            };
+            if verts.is_empty() {
+                continue;
+            }
+            out.push(PlanarFaceInfo {
+                normal: n,
+                x: pos.x_direction(),
+                y: pos.y_direction(),
+                offset: n.x() * loc.x() + n.y() * loc.y() + n.z() * loc.z(),
+                verts,
+            });
+        }
+    }
+    out
+}
+
+/// Diagonal of the solid's bounding box (≥ 1.0), the length scale for fuzz.
+fn bbox_diag(solid: &Solid) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for f in solid.shell().faces() {
+        if let Some(w) = f.outer_wire() {
+            for e in w.edges() {
+                let p = e.start().point();
+                for (k, c) in [p.x(), p.y(), p.z()].into_iter().enumerate() {
+                    lo[k] = lo[k].min(c);
+                    hi[k] = hi[k].max(c);
+                }
+            }
+        }
+    }
+    if lo[0] > hi[0] {
+        return 1.0;
+    }
+    ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2))
+        .sqrt()
+        .max(1.0)
+}
+
+#[inline]
+fn dir_dot(a: Dir, b: Dir) -> f64 {
+    a.x() * b.x() + a.y() * b.y() + a.z() * b.z()
+}
+
+/// Signed distance from `p` to face `f`'s plane.
+#[inline]
+fn plane_dist(f: &PlanarFaceInfo, p: Pnt) -> f64 {
+    f.normal.x() * p.x() + f.normal.y() * p.y() + f.normal.z() * p.z() - f.offset
+}
+
+/// Do the two near-parallel planar faces overlap when projected onto `a`'s
+/// in-plane axes? (Axis-aligned 2D bbox overlap — cheap and conservative.)
+fn overlap_in_plane(a: &PlanarFaceInfo, b: &PlanarFaceInfo) -> bool {
+    let proj = |verts: &[Pnt]| {
+        let (mut u0, mut u1, mut v0, mut v1) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in verts {
+            let u = a.x.x() * p.x() + a.x.y() * p.y() + a.x.z() * p.z();
+            let v = a.y.x() * p.x() + a.y.y() * p.y() + a.y.z() * p.z();
+            u0 = u0.min(u);
+            u1 = u1.max(u);
+            v0 = v0.min(v);
+            v1 = v1.max(v);
+        }
+        (u0, u1, v0, v1)
+    };
+    let (au0, au1, av0, av1) = proj(&a.verts);
+    let (bu0, bu1, bv0, bv1) = proj(&b.verts);
+    au0 <= bu1 && bu0 <= au1 && av0 <= bv1 && bv0 <= av1
+}
+
+/// Pre-boolean fuzzy snap. If the tool sits within `fuzz` of coincidence with the
+/// object on one or more compatible, overlapping planar-face pairs, translate the
+/// whole tool so those pairs become exactly coincident — but only if a single
+/// translation satisfies *every* detected pair. A conflicting multi-coincidence
+/// (which one translation can't resolve) is left for the sliver gate.
+fn snap_tool_to_object(object: &Solid, tool: &Solid, fuzz: f64) -> Solid {
+    let obj_planes = planar_faces(object);
+    let tool_planes = planar_faces(tool);
+    // One required translation per near-coincident, overlapping pair.
+    let mut reqs: Vec<(Dir, f64)> = Vec::new();
+    for tp in &tool_planes {
+        for op in &obj_planes {
+            if dir_dot(tp.normal, op.normal).abs() < 0.999 {
+                continue;
+            }
+            let d = plane_dist(op, tp.verts[0]); // tool plane's offset from obj plane
+            if d == 0.0 || d.abs() >= fuzz {
+                continue;
+            }
+            if !overlap_in_plane(op, tp) {
+                continue;
+            }
+            reqs.push((op.normal, -d)); // close the gap: translate by op.normal·(-d)
+        }
+    }
+    if reqs.is_empty() {
+        return tool.clone();
+    }
+    // Compose one translation; orthogonal requirements add, a real conflict fails.
+    let mut t = GeomVec::new(0.0, 0.0, 0.0);
+    for &(n, s) in &reqs {
+        t += GeomVec::from_dir(n) * s;
+    }
+    for &(n, s) in &reqs {
+        let achieved = n.x() * t.x() + n.y() * t.y() + n.z() * t.z();
+        if (achieved - s).abs() > fuzz * 0.5 {
+            return tool.clone(); // conflicting coincidences — let the gate handle it
+        }
+    }
+    if t.magnitude() < 1e-12 {
+        return tool.clone();
+    }
+    tool.transformed(&Trsf::translation(t))
+}
+
+/// Smallest wall thickness of a degenerate sliver in `solid`: two planar faces
+/// that are parallel, within `tol` of coincident, and overlap in projection.
+/// `None` if no sliver. (Exactly-coincident faces, `d ≈ 0`, are excluded — those
+/// surface as non-manifold/non-watertight and are caught earlier.)
+fn degenerate_sliver_thickness(solid: &Solid, tol: f64) -> Option<f64> {
+    let planes = planar_faces(solid);
+    let mut found: Option<f64> = None;
+    for i in 0..planes.len() {
+        for j in (i + 1)..planes.len() {
+            let (a, b) = (&planes[i], &planes[j]);
+            if dir_dot(a.normal, b.normal).abs() < 0.999 {
+                continue;
+            }
+            let d = plane_dist(a, b.verts[0]).abs();
+            if d <= 1e-12 || d >= tol {
+                continue;
+            }
+            if !overlap_in_plane(a, b) {
+                continue;
+            }
+            found = Some(found.map_or(d, |f| f.min(d)));
+        }
+    }
+    found
 }
 
 /// Split `edge_id` at `pt`, but only when `pt` genuinely lies in the *interior*
@@ -485,9 +772,13 @@ fn split_tracked(
 ) {
     let mut result = Vec::with_capacity(subfaces.len());
     for &fid in subfaces.iter() {
-        let (next_faces, new_edges) = crate::imprint::imprint_curve_on_face(builder, fid, curve, first, last, tol);
+        let (next_faces, new_edges) =
+            crate::imprint::imprint_curve_on_face(builder, fid, curve, first, last, tol);
         if !new_edges.is_empty() {
-            splitting_edges_map.entry(fid).or_default().extend(new_edges);
+            splitting_edges_map
+                .entry(fid)
+                .or_default()
+                .extend(new_edges);
         }
         result.extend(next_faces);
     }
@@ -704,6 +995,119 @@ fn is_point_inside_solid(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
     (count % 2) == 1
 }
 
+fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
+    // Parity of ray-surface crossings along one direction (`true` => odd => inside),
+    // skipping any cast whose hit grazes a face boundary edge (an unreliable count).
+    // Returns `None` if every perturbation of this direction kept grazing.
+    //
+    // A single ray can still silently mis-count without grazing — e.g. a hit that
+    // exits right at a cap/wall rim is dropped by the face-containment test, turning
+    // an even count odd. So the caller votes across several independent directions:
+    // an occasional miss is outvoted instead of flipping the classification.
+    let cast_parity = |base: Dir, seed: u64| -> Option<bool> {
+        let mut ray_dir = base;
+        let mut rng: u64 = seed;
+        for _attempt in 0..16 {
+            let mut intersection_count = 0;
+            let mut hit_boundary = false;
+            let ray_dir_vec = GeomVec::from_dir(ray_dir);
+
+            // Only test faces whose AABB the ray crosses (BVH prunes the rest), so
+            // each cast is O(log F + hits) and only hit faces are reconstructed.
+            'faces: for fid in bvh.ray_cast(p, &ray_dir_vec) {
+                let orientation = solid.brep().faces[fid].orientation;
+                let face = Face::from_id(solid.brep().clone(), fid, orientation);
+                for hit in crate::intersect::ray_face_all(p, &ray_dir_vec, &face, 1e-7) {
+                    let mut on_boundary = false;
+                    for wire in face.wires() {
+                        for edge in wire.edges() {
+                            if distance_point_to_edge(&hit, &edge) < 1e-5 {
+                                on_boundary = true;
+                                break;
+                            }
+                        }
+                        if on_boundary {
+                            break;
+                        }
+                    }
+                    if on_boundary {
+                        hit_boundary = true;
+                        break 'faces;
+                    }
+                    intersection_count += 1;
+                }
+            }
+
+            if hit_boundary {
+                rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                let rx = ((rng & 0xff) as f64 / 255.0) - 0.5;
+                rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                let ry = ((rng & 0xff) as f64 / 255.0) - 0.5;
+                rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                let rz = ((rng & 0xff) as f64 / 255.0) - 0.5;
+                ray_dir = Dir::from_vec(&(ray_dir_vec + GeomVec::new(rx, ry, rz) * 0.1))
+                    .unwrap_or(ray_dir);
+                continue;
+            }
+            return Some((intersection_count % 2) == 1);
+        }
+        None
+    };
+
+    // A spread of "generic" irrational-ish directions: a symmetric diagonal like
+    // (1,1,1) skewers the corners/edges of axis-aligned boxes, defeating parity, so
+    // every direction avoids integer-coordinate alignments. Voting across them makes
+    // the classifier robust to a single direction's occasional rim mis-count.
+    const DIRS: [(f64, f64, f64); 5] = [
+        (0.182_321, 0.523_157, 0.832_511),
+        (0.701_223, -0.337_419, 0.628_991),
+        (-0.487_633, 0.811_077, 0.324_551),
+        (0.273_194, 0.659_832, -0.700_447),
+        (-0.638_915, -0.451_273, 0.623_881),
+    ];
+
+    let mut inside_votes = 0i32;
+    let mut total = 0i32;
+    for (i, &(x, y, z)) in DIRS.iter().enumerate() {
+        let Some(dir) = Dir::from_vec(&GeomVec::new(x, y, z)) else {
+            continue;
+        };
+        if let Some(parity) = cast_parity(dir, 42 + i as u64) {
+            total += 1;
+            if parity {
+                inside_votes += 1;
+            }
+        }
+    }
+
+    if total == 0 {
+        // Every direction kept grazing: fall back to one no-veto parity reading so
+        // we always return a definite answer.
+        let ray_dir_vec = GeomVec::new(0.182_321, 0.523_157, 0.832_511);
+        let mut count = 0;
+        for fid in bvh.ray_cast(p, &ray_dir_vec) {
+            let orientation = solid.brep().faces[fid].orientation;
+            let face = Face::from_id(solid.brep().clone(), fid, orientation);
+            count += crate::intersect::ray_face_all(p, &ray_dir_vec, &face, 1e-7).len();
+        }
+        return (count % 2) == 1;
+    }
+
+    // Majority vote (ties -> inside is false, matching a strict-majority "inside").
+    inside_votes * 2 > total
+}
+
+/// Whether `p` lies inside `solid` (ray-parity test).
+///
+/// Public wrapper over [`is_point_inside_solid`] that builds the face BVH the
+/// same way the boolean engine does. Useful to classify a probe point against a
+/// body — e.g. the rolling-ball fillet distinguishing a concave cut wall
+/// (material outside the cylinder) from a convex prior-blend cylinder (inside).
+pub fn point_in_solid(p: &Pnt, solid: &Solid) -> bool {
+    let bvh = Bvh::build(&solid.shell().faces());
+    is_point_inside_solid_robust(p, solid, &bvh)
+}
+
 fn distance_point_to_edge(p: &Pnt, edge: &openrcad_topo::Edge) -> f64 {
     if let Some(curve) = edge.curve() {
         let (t_min, t_max) = (edge.first(), edge.last());
@@ -822,6 +1226,110 @@ mod tests {
         assert_eq!(sliver.euler_characteristic(), 2);
     }
 
+    // ---- Fuzzy snap + sliver gate ------------------------------------------
+
+    /// Box (21 × 11.5024 × 17.6) and a +Y cut cylinder whose back cap stops `gap`
+    /// short of the back face (`gap > 0` = near-miss/sliver; `gap = 0` = flush).
+    fn box_and_gap_cut(gap: f64) -> (Solid, Solid) {
+        use openrcad_foundation::Ax2;
+        use openrcad_primitives::make_cylinder;
+        let back = 11.5024;
+        let cube = make_box(&Pnt::new(-13.4, 0.0, -12.8), 21.0, back, 17.6);
+        let cap_y = back - gap;
+        let axis = Ax2::new_axes(Pnt::new(7.5, cap_y - 23.0, 5.0), Dir::dy(), Dir::dx());
+        let cyl = make_cylinder(&axis, 7.81, 23.0);
+        (cube, cyl)
+    }
+
+    /// Max vertex displacement between two structurally-identical solids.
+    fn max_vertex_shift(a: &Solid, b: &Solid) -> f64 {
+        let pts = |s: &Solid| -> Vec<Pnt> {
+            s.shell()
+                .faces()
+                .iter()
+                .filter_map(|f| f.outer_wire())
+                .flat_map(|w| w.edges().into_iter().map(|e| e.start().point()))
+                .collect()
+        };
+        pts(a)
+            .iter()
+            .zip(pts(b).iter())
+            .map(|(x, y)| x.distance(y))
+            .fold(0.0_f64, f64::max)
+    }
+
+    #[test]
+    fn snap_fires_for_tiny_gap_but_preserves_real_clearance() {
+        let (cube, _) = box_and_gap_cut(0.0);
+        let fuzz = (bbox_diag(&cube) * SNAP_REL).clamp(1e-12, SNAP_CAP);
+
+        // A tiny numerical gap (sub-fuzz) snaps: the tool is nudged.
+        let (cube, tool) = box_and_gap_cut(1e-7);
+        let snapped = snap_tool_to_object(&cube, &tool, fuzz);
+        assert!(
+            max_vertex_shift(&tool, &snapped) > 0.0,
+            "a sub-fuzz near-coincidence should snap"
+        );
+
+        // A deliberate 0.1 mm clearance is far above the fuzz: the tool must NOT
+        // move — the snap is not "CAD autocorrect with opinions".
+        let (cube, tool) = box_and_gap_cut(0.1);
+        let snapped = snap_tool_to_object(&cube, &tool, fuzz);
+        assert_eq!(
+            max_vertex_shift(&tool, &snapped),
+            0.0,
+            "a real clearance above the fuzz must be left untouched"
+        );
+    }
+
+    #[test]
+    fn snap_skips_when_planes_do_not_overlap() {
+        use openrcad_foundation::Ax2;
+        use openrcad_primitives::make_cylinder;
+        // A cylinder cap that is near-coplanar with the box's back face (gap 1e-7)
+        // but positioned far away in-plane (centre XZ = (100,100)) — no projected
+        // overlap, so it must NOT be snapped despite the near-coincident plane.
+        let back = 11.5024;
+        let cube = make_box(&Pnt::new(-13.4, 0.0, -12.8), 21.0, back, 17.6);
+        let cap_y = back - 1e-7;
+        let axis = Ax2::new_axes(Pnt::new(100.0, cap_y - 23.0, 100.0), Dir::dy(), Dir::dx());
+        let tool = make_cylinder(&axis, 2.0, 23.0);
+        let fuzz = (bbox_diag(&cube) * SNAP_REL).clamp(1e-12, SNAP_CAP);
+        let snapped = snap_tool_to_object(&cube, &tool, fuzz);
+        assert_eq!(
+            max_vertex_shift(&tool, &snapped),
+            0.0,
+            "near-coplanar but non-overlapping faces must not snap"
+        );
+    }
+
+    #[test]
+    fn tiny_gap_cut_is_clean_after_snap_and_fillets() {
+        let (cube, tool) = box_and_gap_cut(1e-7);
+        let cut = boolean_checked(&cube, &tool, BooleanOp::Cut)
+            .expect("a tiny-gap cut must snap to a clean, watertight body");
+        assert!(cut.is_watertight() && cut.health_report().is_healthy());
+
+        // The fillet that funneled in the GUI: top-back edge into the scoop.
+        let edge = openrcad_topo::Edge::between_points(
+            Pnt::new(-13.4, 11.5024, 4.8),
+            Pnt::new(-0.31, 11.5024, 4.8),
+        );
+        let filleted = crate::fillet_edges(&cut, std::slice::from_ref(&edge), 3.0)
+            .expect("filleting into the snapped cut must succeed");
+        assert!(filleted.is_watertight() && filleted.health_report().is_healthy());
+    }
+
+    #[test]
+    fn watertight_sliver_is_rejected_by_checked() {
+        // A gap above the snap fuzz but a degenerate sub-sliver-tol wall: the cut
+        // is watertight yet a tiny geometric lie. `boolean_checked` must reject it
+        // rather than hand back a body that breaks the fillet.
+        let (cube, tool) = box_and_gap_cut(2e-5);
+        let res = boolean_checked(&cube, &tool, BooleanOp::Cut);
+        assert!(res.is_err(), "a degenerate sliver must be rejected, got Ok");
+    }
+
     #[test]
     fn test_boolean_intersection_of_overlapping_cubes() {
         let cube1 = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
@@ -921,7 +1429,11 @@ mod tests {
                 for (w_idx, wire) in face.wires().iter().enumerate() {
                     println!("  Wire {}:", w_idx);
                     for edge in wire.edges() {
-                        println!("    Edge: {:?} -> {:?}", edge.start().point(), edge.end().point());
+                        println!(
+                            "    Edge: {:?} -> {:?}",
+                            edge.start().point(),
+                            edge.end().point()
+                        );
                     }
                 }
             }
@@ -999,7 +1511,11 @@ mod tests {
             assert_eq!(body.euler_characteristic(), 2);
             let (lo, hi) = body.bounding_box().corners().unwrap();
             // Each piece is a 10×10×10 cube; only its X span differs.
-            assert!((hi.x() - lo.x() - 10.0).abs() < 1e-4, "x span {}", hi.x() - lo.x());
+            assert!(
+                (hi.x() - lo.x() - 10.0).abs() < 1e-4,
+                "x span {}",
+                hi.x() - lo.x()
+            );
             assert!((hi.y() - lo.y() - 10.0).abs() < 1e-4);
             assert!((hi.z() - lo.z() - 10.0).abs() < 1e-4);
         }
@@ -1010,8 +1526,16 @@ mod tests {
             .map(|b| b.bounding_box().corners().unwrap().0.x())
             .collect();
         x_los.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert!((x_los[0] - 0.0).abs() < 1e-4, "near piece at x≈0, got {}", x_los[0]);
-        assert!((x_los[1] - 20.0).abs() < 1e-4, "far piece at x≈20, got {}", x_los[1]);
+        assert!(
+            (x_los[0] - 0.0).abs() < 1e-4,
+            "near piece at x≈0, got {}",
+            x_los[0]
+        );
+        assert!(
+            (x_los[1] - 20.0).abs() < 1e-4,
+            "far piece at x≈20, got {}",
+            x_los[1]
+        );
     }
 
     #[test]
@@ -1039,7 +1563,11 @@ mod tests {
                 for (w_idx, wire) in face.wires().iter().enumerate() {
                     println!("  Wire {}:", w_idx);
                     for edge in wire.edges() {
-                        println!("    Edge: {:?} -> {:?}", edge.start().point(), edge.end().point());
+                        println!(
+                            "    Edge: {:?} -> {:?}",
+                            edge.start().point(),
+                            edge.end().point()
+                        );
                     }
                 }
             }

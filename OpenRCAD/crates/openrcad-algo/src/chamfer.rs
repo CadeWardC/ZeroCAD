@@ -1,10 +1,92 @@
+use core::fmt;
+
 use openrcad_foundation::{tolerance, Dir, Pnt, Vec as GeomVec};
-use openrcad_geom::{GeomCurve, GeomSurface, Plane, RuledSurface};
-use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
-use std::collections::HashMap;
+use openrcad_geom::{CylindricalSurface, GeomCurve, GeomSurface, Plane, RuledSurface};
+use openrcad_topo::{Edge, Face, FaceId, Solid, Vertex, Wire};
+use std::collections::{HashMap, HashSet};
 
 use crate::blend::{chamfer_cylinder, detect_cylinder, BlendError};
+use crate::rolling_ball::{
+    adjacent_faces, endpoint_cap_faces, farthest_endpoint, is_concave_cut_cylinder,
+    line_meets_cylinder, nearest_endpoint, orient_edge_between, planar_outward_normal,
+    polyline_edge, relocate_edge, same_face, trim_face_along_spine, trim_face_at_corner,
+    RollingBallError,
+};
 use crate::sew::sew;
+
+/// Errors reported by selected-edge chamfer construction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChamferError {
+    /// Distance must be finite and non-negative.
+    InvalidDistance { distance: f64 },
+    /// The selected edge is degenerate.
+    DegenerateSpine,
+    /// The selected edge is not shared by exactly two faces in the solid.
+    EdgeAdjacency { count: usize },
+    /// Native chamfer v1 supports selected planar-planar edges.
+    UnsupportedSurfacePair,
+    /// The adjacent planes do not define a clean chamferable wedge.
+    InvalidDihedral,
+    /// The selected edge could not be re-located after earlier chamfers.
+    SpineNotOnFace,
+    /// Endpoint trimming could not be represented by the current local topology.
+    UnsupportedTrimTopology,
+    /// The rebuilt shell was not watertight and healthy.
+    InvalidTopology,
+}
+
+impl fmt::Display for ChamferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDistance { distance } => {
+                write!(
+                    f,
+                    "chamfer: distance must be finite and non-negative, got {distance}"
+                )
+            }
+            Self::DegenerateSpine => f.write_str("chamfer: selected edge is degenerate"),
+            Self::EdgeAdjacency { count } => write!(
+                f,
+                "chamfer: selected edge must have exactly two adjacent faces, found {count}"
+            ),
+            Self::UnsupportedSurfacePair => f.write_str(
+                "chamfer: native selected-edge chamfer currently supports planar-planar edges",
+            ),
+            Self::InvalidDihedral => {
+                f.write_str("chamfer: adjacent faces do not form a chamferable wedge")
+            }
+            Self::SpineNotOnFace => {
+                f.write_str("chamfer: selected edge was not found on the current body")
+            }
+            Self::UnsupportedTrimTopology => {
+                f.write_str("chamfer: endpoint trim topology is not supported")
+            }
+            Self::InvalidTopology => {
+                f.write_str("chamfer: rebuilt body is not watertight and healthy")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChamferError {}
+
+impl From<RollingBallError> for ChamferError {
+    fn from(value: RollingBallError) -> Self {
+        match value {
+            RollingBallError::InvalidRadius { radius } => {
+                ChamferError::InvalidDistance { distance: radius }
+            }
+            RollingBallError::DegenerateSpine => ChamferError::DegenerateSpine,
+            RollingBallError::EdgeAdjacency { count } => ChamferError::EdgeAdjacency { count },
+            RollingBallError::InvalidDihedral => ChamferError::InvalidDihedral,
+            RollingBallError::SpineNotOnFace => ChamferError::SpineNotOnFace,
+            RollingBallError::UnsupportedTrimTopology => ChamferError::UnsupportedTrimTopology,
+            RollingBallError::UnsolvableAdjacency { .. }
+            | RollingBallError::NewtonDiverged { .. }
+            | RollingBallError::BlendSurfaceBuild(_) => ChamferError::UnsupportedTrimTopology,
+        }
+    }
+}
 
 /// Chamfer every edge of `solid` by `distance`.
 pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
@@ -25,6 +107,345 @@ pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
         return chamfer_cylinder(&cyl, distance);
     }
     Err(BlendError::UnsupportedShape)
+}
+
+/// Apply a planar selected-edge chamfer to several edges.
+///
+/// Edges are chamfered sequentially, matching [`crate::rolling_ball::fillet_edges`]:
+/// after each rebuild the next requested edge is relocated in the evolving body.
+/// Unsupported local geometry returns a clean error and leaves upstream callers
+/// free to keep the original body.
+pub fn chamfer_edges(solid: &Solid, edges: &[Edge], distance: f64) -> Result<Solid, ChamferError> {
+    if !distance.is_finite() || distance < 0.0 {
+        return Err(ChamferError::InvalidDistance { distance });
+    }
+    if distance <= tolerance::CONFUSION {
+        return Ok(solid.clone());
+    }
+
+    let mut current = solid.clone();
+    for edge in edges {
+        let target = relocate_edge(&current, edge).ok_or(ChamferError::SpineNotOnFace)?;
+        current = chamfer_planar_edge(&current, &target, distance)?;
+    }
+    Ok(current)
+}
+
+#[derive(Clone)]
+struct ChamferBlend {
+    spine: Edge,
+    face_a: Face,
+    face_b: Face,
+    contact_a: Edge,
+    contact_b: Edge,
+    chamfer_face: Face,
+    start_edge: Edge,
+    end_edge: Edge,
+}
+
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Start,
+    End,
+}
+
+fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Solid, ChamferError> {
+    let adjacent = adjacent_faces(solid, edge);
+    if adjacent.len() != 2 {
+        return Err(ChamferError::EdgeAdjacency {
+            count: adjacent.len(),
+        });
+    }
+    if !matches!(adjacent[0].surface(), Some(GeomSurface::Plane(_)))
+        || !matches!(adjacent[1].surface(), Some(GeomSurface::Plane(_)))
+    {
+        return Err(ChamferError::UnsupportedSurfacePair);
+    }
+
+    let mut blend = planar_chamfer(edge, &adjacent[0], &adjacent[1], distance)?;
+    let start = edge.source().point();
+    let end = edge.target().point();
+    let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
+    let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+
+    let mut faces = Vec::new();
+    let mut skipped_faces = HashSet::new();
+    close_chamfer_endpoint(
+        solid,
+        &mut blend,
+        start,
+        &start_caps,
+        Endpoint::Start,
+        &mut faces,
+        &mut skipped_faces,
+    )?;
+    close_chamfer_endpoint(
+        solid,
+        &mut blend,
+        end,
+        &end_caps,
+        Endpoint::End,
+        &mut faces,
+        &mut skipped_faces,
+    )?;
+
+    let trimmed_a = trim_face_along_spine(&blend.face_a, &blend.spine, &blend.contact_a)?;
+    let trimmed_b = trim_face_along_spine(&blend.face_b, &blend.spine, &blend.contact_b)?;
+
+    for face in solid.shell().faces() {
+        if same_face(&face, &blend.face_a)
+            || same_face(&face, &blend.face_b)
+            || skipped_faces.contains(&face.id())
+        {
+            continue;
+        }
+        faces.push(face);
+    }
+
+    faces.push(trimmed_a);
+    faces.push(trimmed_b);
+    faces.push(blend.chamfer_face);
+
+    let result = Solid::new(sew(&faces, distance * 0.1));
+    if !result.is_watertight() || !result.health_report().is_healthy() {
+        return Err(ChamferError::InvalidTopology);
+    }
+    Ok(result)
+}
+
+fn planar_chamfer(
+    edge: &Edge,
+    face_a: &Face,
+    face_b: &Face,
+    distance: f64,
+) -> Result<ChamferBlend, ChamferError> {
+    let p0 = edge.source().point();
+    let p1 = edge.target().point();
+    let spine_vec = p1 - p0;
+    if spine_vec.magnitude() <= tolerance::CONFUSION {
+        return Err(ChamferError::DegenerateSpine);
+    }
+
+    let n_a = planar_outward_normal(face_a)?;
+    let n_b = planar_outward_normal(face_b)?;
+    let n_a_vec = GeomVec::from_dir(n_a);
+    let n_b_vec = GeomVec::from_dir(n_b);
+    if n_a_vec.cross(&n_b_vec).magnitude() <= tolerance::CONFUSION {
+        return Err(ChamferError::InvalidDihedral);
+    }
+
+    let offset_dir_a = project_onto_plane(-n_b_vec, n_a_vec)
+        .normalized()
+        .ok_or(ChamferError::InvalidDihedral)?;
+    let offset_dir_b = project_onto_plane(-n_a_vec, n_b_vec)
+        .normalized()
+        .ok_or(ChamferError::InvalidDihedral)?;
+
+    let off_a = GeomVec::from_dir(offset_dir_a) * distance;
+    let off_b = GeomVec::from_dir(offset_dir_b) * distance;
+    let a0 = p0 + off_a;
+    let a1 = p1 + off_a;
+    let b0 = p0 + off_b;
+    let b1 = p1 + off_b;
+
+    let contact_a = Edge::between_points(a0, a1);
+    let contact_b = Edge::between_points(b0, b1);
+    let start_edge = Edge::between_points(b0, a0);
+    let end_edge = Edge::between_points(a1, b1);
+    let chamfer_face = chamfer_face_from_edges(&contact_a, &contact_b, &start_edge, &end_edge)?;
+
+    Ok(ChamferBlend {
+        spine: edge.clone(),
+        face_a: face_a.clone(),
+        face_b: face_b.clone(),
+        contact_a,
+        contact_b,
+        chamfer_face,
+        start_edge,
+        end_edge,
+    })
+}
+
+fn project_onto_plane(v: GeomVec, normal: GeomVec) -> GeomVec {
+    v - normal * v.dot(&normal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn close_chamfer_endpoint(
+    solid: &Solid,
+    blend: &mut ChamferBlend,
+    corner: Pnt,
+    caps: &[Face],
+    endpoint: Endpoint,
+    faces: &mut Vec<Face>,
+    skipped: &mut HashSet<FaceId>,
+) -> Result<(), ChamferError> {
+    if caps.len() != 1 {
+        return Err(ChamferError::UnsupportedTrimTopology);
+    }
+    let cap = &caps[0];
+
+    let (ca, cb, trim) = if is_concave_cut_cylinder(solid, cap) {
+        let cut_cyl = match cap.surface() {
+            Some(GeomSurface::Cylinder(c)) => *c,
+            _ => return Err(ChamferError::UnsupportedTrimTopology),
+        };
+        let plane = match blend.chamfer_face.surface() {
+            Some(GeomSurface::Plane(p)) => *p,
+            _ => return Err(ChamferError::UnsupportedSurfacePair),
+        };
+
+        let a_corner = nearest_endpoint(&blend.contact_a, corner);
+        let b_corner = nearest_endpoint(&blend.contact_b, corner);
+        let a_far = farthest_endpoint(&blend.contact_a, corner);
+        let b_far = farthest_endpoint(&blend.contact_b, corner);
+        let a_dir = (a_corner - a_far)
+            .normalized()
+            .ok_or(ChamferError::DegenerateSpine)?;
+        let b_dir = (b_corner - b_far)
+            .normalized()
+            .ok_or(ChamferError::DegenerateSpine)?;
+        let ca_real = line_meets_cylinder(a_far, a_dir, &cut_cyl, a_corner)
+            .ok_or(ChamferError::UnsupportedTrimTopology)?;
+        let cb_real = line_meets_cylinder(b_far, b_dir, &cut_cyl, b_corner)
+            .ok_or(ChamferError::UnsupportedTrimTopology)?;
+        let trim = plane_cylinder_trim_edge(&plane, &cut_cyl, ca_real, cb_real)
+            .ok_or(ChamferError::UnsupportedTrimTopology)?;
+        (ca_real, cb_real, trim)
+    } else {
+        let ca = contact_endpoint(&blend.contact_a, endpoint);
+        let cb = contact_endpoint(&blend.contact_b, endpoint);
+        (ca, cb, Edge::between_points(ca, cb))
+    };
+
+    let trimmed_cap = trim_face_at_corner(cap, corner, ca, cb, &trim)?;
+    faces.push(trimmed_cap);
+    skipped.insert(cap.id());
+
+    if matches!(endpoint, Endpoint::Start) {
+        let keep_a = blend.contact_a.end().point();
+        let keep_b = blend.contact_b.end().point();
+        blend.contact_a = rebuild_contact(&blend.contact_a, keep_a, ca);
+        blend.contact_b = rebuild_contact(&blend.contact_b, keep_b, cb);
+        blend.start_edge = trim;
+    } else {
+        let keep_a = blend.contact_a.start().point();
+        let keep_b = blend.contact_b.start().point();
+        blend.contact_a = rebuild_contact(&blend.contact_a, keep_a, ca);
+        blend.contact_b = rebuild_contact(&blend.contact_b, keep_b, cb);
+        blend.end_edge = trim;
+    }
+    blend.chamfer_face = chamfer_face_from_edges(
+        &blend.contact_a,
+        &blend.contact_b,
+        &blend.start_edge,
+        &blend.end_edge,
+    )?;
+    Ok(())
+}
+
+fn contact_endpoint(edge: &Edge, endpoint: Endpoint) -> Pnt {
+    match endpoint {
+        Endpoint::Start => edge.start().point(),
+        Endpoint::End => edge.end().point(),
+    }
+}
+
+fn rebuild_contact(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
+    let s = edge.source().point();
+    if s.distance(&keep) <= s.distance(&moved) {
+        Edge::between_points(keep, moved)
+    } else {
+        Edge::between_points(moved, keep)
+    }
+}
+
+fn chamfer_face_from_edges(
+    contact_a: &Edge,
+    contact_b: &Edge,
+    start_edge: &Edge,
+    end_edge: &Edge,
+) -> Result<Face, ChamferError> {
+    let a0 = contact_a.start().point();
+    let a1 = contact_a.end().point();
+    let b0 = contact_b.start().point();
+    let b1 = contact_b.end().point();
+    let end_edge = orient_edge_between(end_edge, a1, b1);
+    let start_edge = orient_edge_between(start_edge, b0, a0);
+    let normal = (a1 - a0)
+        .cross(&(b1 - a1))
+        .normalized()
+        .ok_or(ChamferError::InvalidDihedral)
+        .map(GeomVec::from_dir)?;
+    let surf = GeomSurface::plane(Plane::from_point_normal(
+        a0,
+        Dir::new(normal.x(), normal.y(), normal.z()),
+    ));
+    let wire = Wire::from_edges([
+        contact_a.clone(),
+        end_edge,
+        contact_b.clone().reversed(),
+        start_edge,
+    ]);
+    Ok(Face::new(Some(surf), wire))
+}
+
+fn plane_cylinder_trim_edge(
+    plane: &Plane,
+    cut: &CylindricalSurface,
+    p_a: Pnt,
+    p_b: Pnt,
+) -> Option<Edge> {
+    use core::f64::consts::PI;
+
+    let axis_pt = cut.position().location();
+    let z = GeomVec::from_dir(cut.position().direction());
+    let x = GeomVec::from_dir(cut.position().x_direction());
+    let y = GeomVec::from_dir(cut.position().y_direction());
+    let n = GeomVec::from_dir(plane.normal());
+    let nz = z.dot(&n);
+    let tol = 100.0 * tolerance::CONFUSION;
+
+    if nz.abs() <= tol {
+        let chord = p_b - p_a;
+        if chord.cross(&z).magnitude() <= 1e-5 * chord.magnitude().max(1.0) {
+            return Some(Edge::between_points(p_a, p_b));
+        }
+        return None;
+    }
+
+    let angle_of = |p: Pnt| -> f64 {
+        let v = p - axis_pt;
+        let radial = v - z * v.dot(&z);
+        radial.dot(&y).atan2(radial.dot(&x))
+    };
+    let theta_a = angle_of(p_a);
+    let mut theta_b = angle_of(p_b);
+    while theta_b - theta_a > PI {
+        theta_b -= 2.0 * PI;
+    }
+    while theta_a - theta_b > PI {
+        theta_b += 2.0 * PI;
+    }
+
+    let span = (theta_b - theta_a).abs();
+    let steps = ((span / (PI / 32.0)).ceil() as usize).clamp(8, 64);
+    let mut pts = Vec::with_capacity(steps + 1);
+    for k in 0..=steps {
+        if k == 0 {
+            pts.push(p_a);
+            continue;
+        }
+        if k == steps {
+            pts.push(p_b);
+            continue;
+        }
+        let theta = theta_a + (theta_b - theta_a) * (k as f64) / (steps as f64);
+        let radial = x * theta.cos() + y * theta.sin();
+        let z_param = ((plane.location() - axis_pt) - radial * cut.radius()).dot(&n) / nz;
+        pts.push(axis_pt + radial * cut.radius() + z * z_param);
+    }
+    Some(polyline_edge(&pts))
 }
 
 struct LocalFrame {
@@ -486,6 +907,7 @@ fn chamfer_box(
 mod tests {
     use super::*;
     use openrcad_foundation::Pnt;
+    use openrcad_geom::Curve;
     use openrcad_primitives::make_box;
 
     #[test]
@@ -525,5 +947,50 @@ mod tests {
 
         assert_eq!(planes_count, 14);
         assert_eq!(ruled_count, 12);
+    }
+
+    #[test]
+    fn plane_cylinder_trim_samples_when_axis_not_parallel_to_plane() {
+        let cyl =
+            CylindricalSurface::new(openrcad_foundation::Ax3::new(Pnt::origin(), Dir::dz()), 2.0);
+        let n = Dir::new(-1.0, 0.0, 1.0);
+        let plane = Plane::from_point_normal(Pnt::origin(), n);
+        let p_a = Pnt::new(2.0, 0.0, 2.0);
+        let p_b = Pnt::new(0.0, 2.0, 0.0);
+
+        let edge = plane_cylinder_trim_edge(&plane, &cyl, p_a, p_b)
+            .expect("non-parallel plane-cylinder intersection should trim");
+        let curve = edge.curve().expect("trim edge has a curve");
+        for k in 0..=8 {
+            let t = edge.first() + (edge.last() - edge.first()) * (k as f64) / 8.0;
+            let p = curve.point(t);
+            let radial = (p.x() * p.x() + p.y() * p.y()).sqrt();
+            assert!((radial - 2.0).abs() < 5e-3, "sample must stay on cylinder");
+            assert!((p.z() - p.x()).abs() < 5e-3, "sample must stay on plane");
+        }
+    }
+
+    #[test]
+    fn plane_cylinder_trim_parallel_axis_requires_same_generator() {
+        let cyl =
+            CylindricalSurface::new(openrcad_foundation::Ax3::new(Pnt::origin(), Dir::dz()), 2.0);
+        let plane = Plane::from_point_normal(Pnt::new(2.0, 0.0, 0.0), Dir::dx());
+        let p_a = Pnt::new(2.0, 0.0, 0.0);
+        let p_b = Pnt::new(2.0, 0.0, 5.0);
+        let edge = plane_cylinder_trim_edge(&plane, &cyl, p_a, p_b)
+            .expect("same generator should be a straight trim");
+        assert!(edge.start().point().distance(&p_a) < 1e-9);
+        assert!(edge.end().point().distance(&p_b) < 1e-9);
+
+        let unsupported = plane_cylinder_trim_edge(
+            &Plane::from_point_normal(Pnt::origin(), Dir::dx()),
+            &cyl,
+            Pnt::new(0.0, 2.0, 0.0),
+            Pnt::new(0.0, -2.0, 5.0),
+        );
+        assert!(
+            unsupported.is_none(),
+            "different generators are unsupported"
+        );
     }
 }

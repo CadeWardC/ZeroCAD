@@ -15,6 +15,7 @@ use crate::ZeroCadApp;
 /// is precomputed on a worker thread (see [`ZeroCadApp::tick_speculative_edge_mod`]).
 /// Short enough to be ready by the time the user reaches for OK, long enough that
 /// a fast drag through many sizes doesn't spawn a job per step.
+#[allow(dead_code)]
 const EDGE_MOD_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// A live, uncommitted 3D edge fillet/chamfer. Holds the captured edge geometry
@@ -163,6 +164,7 @@ impl ZeroCadApp {
     /// yields exactly the bodies a commit at this size would — the round becomes one
     /// cylindrical B-rep face. Bodies key by `target`, not the node id, so this
     /// matches the committed result despite the throwaway node name.
+    #[allow(dead_code)]
     fn build_edge_mod_arc_graph(&self) -> Option<zerocad_core::ParametricGraph> {
         let op = self.edge_mod_op.as_ref()?;
         let mut graph = self.graph.clone();
@@ -177,6 +179,7 @@ impl ZeroCadApp {
     /// applies the smooth one-face geometry instantly instead of showing the
     /// faceted draft and swapping the arc in ~1s later. At most one job runs at a
     /// time; chamfers (already one planar face) and the no-edit case do nothing.
+    #[allow(dead_code)]
     pub(crate) fn tick_speculative_edge_mod(&mut self, ctx: &egui::Context) {
         // Drain a finished job into the cache first.
         if let Some(rx) = self.edge_mod_arc_rx.as_ref() {
