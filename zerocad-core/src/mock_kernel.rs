@@ -1290,6 +1290,7 @@ fn solid_to_flat_mesh(
     // flat face as a slope). Pairs with the renderer's Gouraud (per-vertex)
     // shading and `mesh_feature_edges`' matching crease filter, which hides the
     // facet-boundary lines.
+    apply_analytic_cylinder_normals(solid, &mut vertices, &indices, &face_ids);
     smooth_vertex_normals(&mut vertices, &indices, &face_ids, SHADE_CREASE_COS);
 
     (vertices, indices, face_ids)
@@ -1383,7 +1384,9 @@ fn smooth_vertex_normals(vertices: &mut [f32], indices: &[u32], face_ids: &[u32]
             let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);
             for &j in members {
                 let nj = nrm(j);
-                if ni[0] * nj[0] + ni[1] * nj[1] + ni[2] * nj[2] >= crease_cos {
+                let same_face = vert_face[i].is_some() && vert_face[i] == vert_face[j];
+                let required_dot = if same_face { crease_cos } else { 0.995 };
+                if ni[0] * nj[0] + ni[1] * nj[1] + ni[2] * nj[2] >= required_dot {
                     sx += nj[0];
                     sy += nj[1];
                     sz += nj[2];
@@ -1606,6 +1609,94 @@ fn enforce_outward_normals(vertices: &mut [f32], indices: &[u32], per_triangle: 
             vertices[v * 6 + 3] = -vertices[v * 6 + 3];
             vertices[v * 6 + 4] = -vertices[v * 6 + 4];
             vertices[v * 6 + 5] = -vertices[v * 6 + 5];
+        }
+    }
+}
+
+fn apply_analytic_cylinder_normals(
+    solid: &KernelSolid,
+    vertices: &mut [f32],
+    indices: &[u32],
+    face_ids: &[u32],
+) {
+    let faces = solid.shell().faces();
+    let cylinders: Vec<Option<CylindricalSurface>> = faces
+        .iter()
+        .map(|face| match face.surface() {
+            Some(GeomSurface::Cylinder(cyl)) => Some(*cyl),
+            _ => None,
+        })
+        .collect();
+
+    let current_normal = |vertices: &[f32], vi: u32| -> [f32; 3] {
+        let b = vi as usize * 6;
+        [vertices[b + 3], vertices[b + 4], vertices[b + 5]]
+    };
+
+    let radial_normal = |vertices: &[f32], vi: u32, cyl: &CylindricalSurface| -> Option<[f32; 3]> {
+        let b = vi as usize * 6;
+        let p = Pnt::new(
+            vertices[b] as f64,
+            vertices[b + 1] as f64,
+            vertices[b + 2] as f64,
+        );
+        let axis = GeomVec::from_dir(cyl.position().direction());
+        let from_axis = p - cyl.position().location();
+        let radial = from_axis.subtracted(&axis.multiplied(from_axis.dot(&axis)));
+        let len = radial.magnitude();
+        if len <= 1.0e-12 {
+            return None;
+        }
+        Some([
+            (radial.x() / len) as f32,
+            (radial.y() / len) as f32,
+            (radial.z() / len) as f32,
+        ])
+    };
+
+    let mut face_signs = vec![0.0f32; cylinders.len()];
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0) as usize;
+        let Some(Some(cyl)) = cylinders.get(fid) else {
+            continue;
+        };
+        if face_signs[fid] != 0.0 {
+            continue;
+        }
+
+        for &vi in tri {
+            let Some(n) = radial_normal(vertices, vi, cyl) else {
+                continue;
+            };
+            let reference = current_normal(vertices, vi);
+            let dot = n[0] * reference[0] + n[1] * reference[1] + n[2] * reference[2];
+            if dot.abs() > 1.0e-6 {
+                face_signs[fid] = if dot < 0.0 { -1.0 } else { 1.0 };
+                break;
+            }
+        }
+    }
+    for sign in &mut face_signs {
+        if *sign == 0.0 {
+            *sign = 1.0;
+        }
+    }
+
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0) as usize;
+        let Some(Some(cyl)) = cylinders.get(fid) else {
+            continue;
+        };
+        let sign = face_signs.get(fid).copied().unwrap_or(1.0);
+
+        for &vi in tri {
+            let Some(n) = radial_normal(vertices, vi, cyl) else {
+                continue;
+            };
+            let b = vi as usize * 6;
+            vertices[b + 3] = n[0] * sign;
+            vertices[b + 4] = n[1] * sign;
+            vertices[b + 5] = n[2] * sign;
         }
     }
 }
@@ -2470,6 +2561,28 @@ mod wireframe_tests {
                 (dz - depth.abs()).abs() < 1e-3 && dxy < 1e-3
             })
             .count()
+    }
+
+    #[test]
+    fn same_face_triangle_diagonal_is_not_a_feature_edge() {
+        let vertices = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            0.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+            0.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let face_ids = vec![0, 0];
+
+        let (_ev, ei, _, _) = mesh_feature_edges(&vertices, &indices, &face_ids, &[]);
+
+        assert_eq!(
+            ei.len() / 2,
+            0,
+            "triangle edges internal to one B-Rep face must not be selectable or drawn"
+        );
     }
 
     #[test]

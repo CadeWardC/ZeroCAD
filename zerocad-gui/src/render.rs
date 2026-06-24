@@ -12,6 +12,9 @@ use zerocad_core::{
 use crate::geom2d::draw_sketch_geometry;
 use crate::{BodyPick, ZeroCadApp};
 
+const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
+const SELECTED_BODY_BASE: (f32, f32, f32) = (50.0, 165.0, 245.0);
+
 // Unified render list structures for depth-sorted transparent overlays
 #[derive(Debug, Clone)]
 struct RenderItem {
@@ -35,6 +38,119 @@ enum RenderItemContent {
         label: &'static str,
         plane: SketchPlane,
     },
+}
+
+fn face_uses_selected_material(
+    node_id: Option<&str>,
+    face_id: u32,
+    selected_whole_bodies: &HashSet<&str>,
+    selected_faces: &HashSet<(&str, u32)>,
+) -> bool {
+    let Some(node_id) = node_id else {
+        return false;
+    };
+    selected_whole_bodies.contains(node_id) || selected_faces.contains(&(node_id, face_id))
+}
+
+fn selected_material_sets(
+    selected_body: &HashSet<(String, BodyPick)>,
+) -> (HashSet<&str>, HashSet<(&str, u32)>) {
+    let selected_whole_bodies = selected_body
+        .iter()
+        .filter_map(|(id, pick)| match pick {
+            BodyPick::Whole => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let selected_faces = selected_body
+        .iter()
+        .filter_map(|(id, pick)| match pick {
+            BodyPick::Face(fid) => Some((id.as_str(), *fid)),
+            _ => None,
+        })
+        .collect();
+    (selected_whole_bodies, selected_faces)
+}
+
+#[cfg(test)]
+mod selected_material_tests {
+    use super::*;
+
+    fn picks(
+        items: impl IntoIterator<Item = (&'static str, BodyPick)>,
+    ) -> HashSet<(String, BodyPick)> {
+        items
+            .into_iter()
+            .map(|(id, pick)| (id.to_string(), pick))
+            .collect()
+    }
+
+    #[test]
+    fn selected_face_tints_only_matching_face_id() {
+        let selected = picks([("body-a", BodyPick::Face(7))]);
+        let (whole, faces) = selected_material_sets(&selected);
+
+        assert!(face_uses_selected_material(
+            Some("body-a"),
+            7,
+            &whole,
+            &faces
+        ));
+        assert!(!face_uses_selected_material(
+            Some("body-a"),
+            8,
+            &whole,
+            &faces
+        ));
+        assert!(!face_uses_selected_material(
+            Some("body-b"),
+            7,
+            &whole,
+            &faces
+        ));
+    }
+
+    #[test]
+    fn selected_whole_body_tints_every_face_for_that_body() {
+        let selected = picks([("body-a", BodyPick::Whole)]);
+        let (whole, faces) = selected_material_sets(&selected);
+
+        assert!(face_uses_selected_material(
+            Some("body-a"),
+            1,
+            &whole,
+            &faces
+        ));
+        assert!(face_uses_selected_material(
+            Some("body-a"),
+            42,
+            &whole,
+            &faces
+        ));
+        assert!(!face_uses_selected_material(
+            Some("body-b"),
+            1,
+            &whole,
+            &faces
+        ));
+    }
+
+    #[test]
+    fn edge_and_vertex_selections_do_not_tint_faces() {
+        let selected = picks([
+            ("body-a", BodyPick::Edge(2)),
+            ("body-a", BodyPick::Vertex(3)),
+        ]);
+        let (whole, faces) = selected_material_sets(&selected);
+
+        assert!(!face_uses_selected_material(
+            Some("body-a"),
+            2,
+            &whole,
+            &faces
+        ));
+        assert!(!face_uses_selected_material(None, 2, &whole, &faces));
+    }
 }
 
 /// Rasterize one projected triangle's depth into the coarse occlusion buffer,
@@ -453,6 +569,7 @@ impl ZeroCadApp {
         // (the X-shaped "faint triangles") fringed by dark outline spikes poking
         // out of the body.
         struct Drawable<'a> {
+            node_id: Option<&'a str>,
             mesh: &'a MockMesh,
             base: (f32, f32, f32),
             alpha: u8,
@@ -462,9 +579,10 @@ impl ZeroCadApp {
         let mut meshes: Vec<Drawable> = if let Some(bodies) = preview_bodies.as_ref() {
             bodies
                 .iter()
-                .map(|(_, m)| Drawable {
+                .map(|(id, m)| Drawable {
+                    node_id: Some(id.as_str()),
                     mesh: m,
-                    base: (190.0, 196.0, 210.0),
+                    base: NORMAL_BODY_BASE,
                     alpha: body_alpha,
                     // A translucent ghost (Cut result) keeps its back faces.
                     cull_back: body_alpha == 255,
@@ -474,9 +592,10 @@ impl ZeroCadApp {
         } else {
             self.body_meshes
                 .iter()
-                .map(|(_, m)| Drawable {
+                .map(|(id, m)| Drawable {
+                    node_id: Some(id.as_str()),
                     mesh: m,
-                    base: (190.0, 196.0, 210.0),
+                    base: NORMAL_BODY_BASE,
                     alpha: 255,
                     cull_back: true,
                     draw_edges: true,
@@ -491,6 +610,7 @@ impl ZeroCadApp {
             Some(ExtrudeMode::Cut) => {
                 if let Some(pm) = preview_mesh.as_ref() {
                     meshes.push(Drawable {
+                        node_id: None,
                         mesh: pm,
                         base: (232.0, 66.0, 66.0),
                         alpha: 90,
@@ -508,6 +628,7 @@ impl ZeroCadApp {
                 if self.extrude_depth_dragging {
                     if let Some(pm) = preview_mesh.as_ref() {
                         meshes.push(Drawable {
+                            node_id: None,
                             mesh: pm,
                             base: (255.0, 178.0, 96.0),
                             alpha: 255,
@@ -521,6 +642,7 @@ impl ZeroCadApp {
             Some(ExtrudeMode::NewBody) | None => {
                 if let Some(pm) = preview_mesh.as_ref() {
                     meshes.push(Drawable {
+                        node_id: None,
                         mesh: pm,
                         base: (255.0, 178.0, 96.0),
                         alpha: 255,
@@ -608,9 +730,12 @@ impl ZeroCadApp {
         let mut zbuf = vec![f32::NEG_INFINITY; occ_w * occ_h];
         let (mut depth_min, mut depth_max) = (f32::INFINITY, f32::NEG_INFINITY);
 
+        let (selected_whole_bodies, selected_faces) =
+            selected_material_sets(&self.selected_body);
+
         // A. Gather Solid Mesh Triangles (committed model + extrude preview)
         for d in &meshes {
-            let (mesh, base, alpha, cull_back) = (d.mesh, &d.base, &d.alpha, d.cull_back);
+            let (mesh, alpha, cull_back) = (d.mesh, &d.alpha, d.cull_back);
             let num_tris = mesh.indices.len() / 3;
             for i in 0..num_tris {
                 let i0 = mesh.indices[i * 3] as usize * 6;
@@ -681,6 +806,17 @@ impl ZeroCadApp {
                 }
 
                 let avg_depth = (p0.2 + p1.2 + p2.2) / 3.0;
+                let face_id = mesh.face_ids.get(i).copied().unwrap_or(0);
+                let base = if face_uses_selected_material(
+                    d.node_id,
+                    face_id,
+                    &selected_whole_bodies,
+                    &selected_faces,
+                ) {
+                    SELECTED_BODY_BASE
+                } else {
+                    d.base
+                };
 
                 // Gouraud shading: one shade per vertex from its own normal, so a
                 // smoothly-varying normal across a fillet's facets blends into one
@@ -911,57 +1047,11 @@ impl ZeroCadApp {
 
         // --- 5a. DRAW BODY SELECTION HIGHLIGHTS (on top of the solids) ---
         if !self.selected_body.is_empty() {
-            let sel_fill = egui::Color32::from_rgba_unmultiplied(0, 140, 255, 90);
             let sel_edge = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 140, 0));
             let sel_vert = egui::Color32::from_rgb(255, 140, 0);
-            let faces_camera = |n: (f32, f32, f32)| -> bool {
-                let rz_n = sin_y * n.0 + cos_y * n.2;
-                sin_p * n.1 + cos_p * rz_n > 0.0
-            };
             for (node_id, pick) in &self.selected_body {
                 let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
                     continue;
-                };
-
-                // Translucent overlay over the selected face(s) — front-facing
-                // triangles only, emitted as one mesh (no feathering seams).
-                let fill_face = |want: Option<u32>| {
-                    let mut m = egui::Mesh::default();
-                    let ntris = mesh.indices.len() / 3;
-                    for t in 0..ntris {
-                        if let Some(w) = want {
-                            if mesh.face_ids.get(t).copied() != Some(w) {
-                                continue;
-                            }
-                        }
-                        let i0 = mesh.indices[t * 3] as usize * 6;
-                        let i1 = mesh.indices[t * 3 + 1] as usize * 6;
-                        let i2 = mesh.indices[t * 3 + 2] as usize * 6;
-                        let n = (
-                            mesh.vertices[i0 + 3],
-                            mesh.vertices[i0 + 4],
-                            mesh.vertices[i0 + 5],
-                        );
-                        if !faces_camera(n) {
-                            continue;
-                        }
-                        let pr = |i: usize| {
-                            let p = project_3d(
-                                mesh.vertices[i],
-                                mesh.vertices[i + 1],
-                                mesh.vertices[i + 2],
-                            );
-                            egui::pos2(p.0, p.1)
-                        };
-                        let base = m.vertices.len() as u32;
-                        m.colored_vertex(pr(i0), sel_fill);
-                        m.colored_vertex(pr(i1), sel_fill);
-                        m.colored_vertex(pr(i2), sel_fill);
-                        m.add_triangle(base, base + 1, base + 2);
-                    }
-                    if !m.is_empty() {
-                        painter.add(egui::Shape::mesh(m));
-                    }
                 };
 
                 // Highlight the visible (front-facing) edges of the body.
@@ -982,7 +1072,7 @@ impl ZeroCadApp {
                 };
 
                 match *pick {
-                    BodyPick::Face(fid) => fill_face(Some(fid)),
+                    BodyPick::Face(_) => {}
                     BodyPick::Edge(g) => {
                         // `g` is a topological edge group: light up every chord that
                         // belongs to it so a whole fillet arc / rim draws as one
@@ -1018,7 +1108,6 @@ impl ZeroCadApp {
                         }
                     }
                     BodyPick::Whole => {
-                        fill_face(None);
                         let ecount = mesh.edge_indices.len() / 2;
                         for e in 0..ecount {
                             highlight_edge(&painter, e);

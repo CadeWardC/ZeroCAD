@@ -181,6 +181,8 @@ fn surface_nearest_uv(surface: &GeomSurface, point: Pnt) -> (f64, f64) {
     if !v1.is_finite() {
         v1 = 100.0;
     }
+    let (u0, u1) = ordered_bounds(u0, u1);
+    let (v0, v1) = ordered_bounds(v0, v1);
 
     let n = 16;
     let mut best = (u0, v0);
@@ -212,13 +214,30 @@ fn surface_nearest_uv(surface: &GeomSurface, point: Pnt) -> (f64, f64) {
         }
         let step_u = (bu * gvv - bv * guv) / det;
         let step_v = (guu * bv - guv * bu) / det;
-        u = (u - step_u).clamp(u0, u1);
-        v = (v - step_v).clamp(v0, v1);
+        u = clamp_ordered(u - step_u, u0, u1);
+        v = clamp_ordered(v - step_v, v0, v1);
         if step_u.abs() + step_v.abs() <= 1e-12 {
             break;
         }
     }
     (u, v)
+}
+
+fn ordered_bounds(a: f64, b: f64) -> (f64, f64) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
+    let (lo, hi) = ordered_bounds(min, max);
+    if value.is_nan() {
+        lo
+    } else {
+        value.max(lo).min(hi)
+    }
 }
 
 fn radial(axis: Dir, xref: Dir, u: f64) -> GeomVec {
@@ -2470,6 +2489,13 @@ mod tests {
     use openrcad_foundation::Pnt;
     use openrcad_geom::{Plane, Surface};
     use openrcad_primitives::make_box;
+
+    #[test]
+    fn ordered_clamp_accepts_reversed_surface_bounds() {
+        assert_eq!(clamp_ordered(2.12, 2.14, 2.09), 2.12);
+        assert_eq!(clamp_ordered(2.00, 2.14, 2.09), 2.09);
+        assert_eq!(clamp_ordered(2.20, 2.14, 2.09), 2.14);
+    }
 
     #[test]
     fn solves_contacts_for_box_edge() {

@@ -184,6 +184,34 @@ fn clamp_bound(val: f64, default: f64) -> f64 {
     }
 }
 
+fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
+    match (min.is_finite(), max.is_finite()) {
+        (true, true) => {
+            let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+            if value.is_nan() {
+                lo
+            } else {
+                value.max(lo).min(hi)
+            }
+        }
+        (true, false) => {
+            if value.is_nan() {
+                min
+            } else {
+                value.max(min)
+            }
+        }
+        (false, true) => {
+            if value.is_nan() {
+                max
+            } else {
+                value.min(max)
+            }
+        }
+        (false, false) => value,
+    }
+}
+
 /// Nearest parameter to `p` on `c` within its bounds: coarse sample sweep then a
 /// few Newton steps. Used only by [`curves_overlap`].
 fn nearest_param_on_curve(c: &GeomCurve, p: &Pnt) -> f64 {
@@ -206,7 +234,7 @@ fn nearest_param_on_curve(c: &GeomCurve, p: &Pnt) -> f64 {
         let (pt, tan) = c.d1(t);
         let diff = pt - *p;
         let dt = diff.dot(&tan) / (tan.dot(&tan) + 1e-15);
-        t = (t - dt).clamp(a, b);
+        t = clamp_ordered(t - dt, a, b);
     }
     t
 }
@@ -566,8 +594,8 @@ fn curve_curve_refine(
         let dt = (c * v1.dot(&b) - b_coeff * (-v2.dot(&b))) / det;
         let ds = (a * (-v2.dot(&b)) - b_coeff * v1.dot(&b)) / det;
 
-        t = (t + dt).clamp(t1_min, t1_max);
-        s = (s + ds).clamp(t2_min, t2_max);
+        t = clamp_ordered(t + dt, t1_min, t1_max);
+        s = clamp_ordered(s + ds, t2_min, t2_max);
 
         if dt.abs() < 1e-9 && ds.abs() < 1e-9 {
             break;
@@ -790,9 +818,9 @@ fn curve_surface_refine(
 
         let rhs = ps - pc;
         if let Some((dt, du, dv)) = solve_3x3(vc, -su, -sv, rhs) {
-            t = (t + dt).clamp(t_min, t_max);
-            u = (u + du).clamp(u_min, u_max);
-            v = (v + dv).clamp(v_min, v_max);
+            t = clamp_ordered(t + dt, t_min, t_max);
+            u = clamp_ordered(u + du, u_min, u_max);
+            v = clamp_ordered(v + dv, v_min, v_max);
 
             if dt.abs() < 1e-9 && du.abs() < 1e-9 && dv.abs() < 1e-9 {
                 break;
@@ -1219,10 +1247,10 @@ fn refine_surface_surface_point(
             let du2 = -j2.dot(&y);
             let dv2 = -j3.dot(&y);
 
-            u1 = (u1 + du1).clamp(u1_min, u1_max);
-            v1 = (v1 + dv1).clamp(v1_min, v1_max);
-            u2 = (u2 - du2).clamp(u2_min, u2_max);
-            v2 = (v2 - dv2).clamp(v2_min, v2_max);
+            u1 = clamp_ordered(u1 + du1, u1_min, u1_max);
+            v1 = clamp_ordered(v1 + dv1, v1_min, v1_max);
+            u2 = clamp_ordered(u2 - du2, u2_min, u2_max);
+            v2 = clamp_ordered(v2 - dv2, v2_min, v2_max);
 
             if du1.abs() < 1e-9 && dv1.abs() < 1e-9 && du2.abs() < 1e-9 && dv2.abs() < 1e-9 {
                 break;
@@ -1344,8 +1372,8 @@ fn search_nearest_parameter_newton(s: &GeomSurface, p: &Pnt, hint: (f64, f64)) -
     let v_min = clamp_bound(v_min, -100.0);
     let v_max = clamp_bound(v_max, 100.0);
 
-    let mut u = hint.0.clamp(u_min, u_max);
-    let mut v = hint.1.clamp(v_min, v_max);
+    let mut u = clamp_ordered(hint.0, u_min, u_max);
+    let mut v = clamp_ordered(hint.1, v_min, v_max);
 
     for _ in 0..10 {
         let (ps, su, sv) = eval_d1(s, u, v);
@@ -1357,8 +1385,8 @@ fn search_nearest_parameter_newton(s: &GeomSurface, p: &Pnt, hint: (f64, f64)) -
         let du = diff.dot(&su) / (su.dot(&su) + 1e-15);
         let dv = diff.dot(&sv) / (sv.dot(&sv) + 1e-15);
 
-        u = (u - du).clamp(u_min, u_max);
-        v = (v - dv).clamp(v_min, v_max);
+        u = clamp_ordered(u - du, u_min, u_max);
+        v = clamp_ordered(v - dv, v_min, v_max);
 
         if du.abs() < 1e-9 && dv.abs() < 1e-9 {
             break;
@@ -1642,6 +1670,13 @@ mod tests {
     use super::*;
     use openrcad_foundation::{Ax1, Dir};
     use openrcad_geom::{Line, Plane};
+
+    #[test]
+    fn ordered_clamp_accepts_reversed_bounds() {
+        assert_eq!(clamp_ordered(2.12, 2.14, 2.09), 2.12);
+        assert_eq!(clamp_ordered(2.00, 2.14, 2.09), 2.09);
+        assert_eq!(clamp_ordered(2.20, 2.14, 2.09), 2.14);
+    }
 
     #[test]
     fn test_ray_face_intersection() {

@@ -786,16 +786,7 @@ fn split_tracked(
 }
 
 pub(crate) fn project_point_on_curve(p: &Pnt, curve: &GeomCurve, t_min: f64, t_max: f64) -> f64 {
-    let t_min = if t_min.is_infinite() || t_min.is_nan() {
-        -100.0
-    } else {
-        t_min
-    };
-    let t_max = if t_max.is_infinite() || t_max.is_nan() {
-        100.0
-    } else {
-        t_max
-    };
+    let (t_min, t_max) = ordered_curve_bounds(t_min, t_max);
     let mut best_t = t_min;
     let mut min_dist = p.distance(&curve.point(t_min));
     let steps = 10;
@@ -813,9 +804,28 @@ pub(crate) fn project_point_on_curve(p: &Pnt, curve: &GeomCurve, t_min: f64, t_m
         let (pt, tangent) = curve.d1(t);
         let diff = pt - *p;
         let dt = diff.dot(&tangent) / (tangent.dot(&tangent) + 1e-15);
-        t = (t - dt).clamp(t_min, t_max);
+        t = clamp_ordered(t - dt, t_min, t_max);
     }
     t
+}
+
+fn ordered_curve_bounds(t_min: f64, t_max: f64) -> (f64, f64) {
+    let t_min = if t_min.is_finite() { t_min } else { -100.0 };
+    let t_max = if t_max.is_finite() { t_max } else { 100.0 };
+    if t_min <= t_max {
+        (t_min, t_max)
+    } else {
+        (t_max, t_min)
+    }
+}
+
+fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
+    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+    if value.is_nan() {
+        lo
+    } else {
+        value.max(lo).min(hi)
+    }
 }
 
 fn point_on_face(face: &Face) -> Pnt {
@@ -1110,7 +1120,7 @@ pub fn point_in_solid(p: &Pnt, solid: &Solid) -> bool {
 
 fn distance_point_to_edge(p: &Pnt, edge: &openrcad_topo::Edge) -> f64 {
     if let Some(curve) = edge.curve() {
-        let (t_min, t_max) = (edge.first(), edge.last());
+        let (t_min, t_max) = ordered_curve_bounds(edge.first(), edge.last());
         let mut best_t = t_min;
         let mut min_dist = p.distance(&curve.point(t_min));
 
@@ -1129,7 +1139,7 @@ fn distance_point_to_edge(p: &Pnt, edge: &openrcad_topo::Edge) -> f64 {
             let (pt, tangent) = curve.d1(t);
             let diff = pt - *p;
             let dt = diff.dot(&tangent) / (tangent.dot(&tangent) + 1e-15);
-            t = (t - dt).clamp(t_min, t_max);
+            t = clamp_ordered(t - dt, t_min, t_max);
         }
         p.distance(&curve.point(t))
     } else {
@@ -1209,6 +1219,13 @@ mod tests {
     use openrcad_foundation::Pnt;
     use openrcad_primitives::make_box;
     use openrcad_topo::Shell;
+
+    #[test]
+    fn ordered_curve_bounds_accept_reversed_and_nonfinite_limits() {
+        assert_eq!(ordered_curve_bounds(2.14, 2.09), (2.09, 2.14));
+        assert_eq!(ordered_curve_bounds(f64::NAN, 2.09), (-100.0, 2.09));
+        assert_eq!(ordered_curve_bounds(2.14, f64::INFINITY), (2.14, 100.0));
+    }
 
     #[test]
     fn primitives_pass_structural_validation() {

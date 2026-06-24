@@ -1282,10 +1282,25 @@ impl ZeroCadApp {
                 let i0 = mesh.indices[t * 3] as usize * 6;
                 let i1 = mesh.indices[t * 3 + 1] as usize * 6;
                 let i2 = mesh.indices[t * 3 + 2] as usize * 6;
-                let normal = (
+                let n0 = (
                     mesh.vertices[i0 + 3],
                     mesh.vertices[i0 + 4],
                     mesh.vertices[i0 + 5],
+                );
+                let n1 = (
+                    mesh.vertices[i1 + 3],
+                    mesh.vertices[i1 + 4],
+                    mesh.vertices[i1 + 5],
+                );
+                let n2 = (
+                    mesh.vertices[i2 + 3],
+                    mesh.vertices[i2 + 4],
+                    mesh.vertices[i2 + 5],
+                );
+                let normal = (
+                    (n0.0 + n1.0 + n2.0) / 3.0,
+                    (n0.1 + n1.1 + n2.1) / 3.0,
+                    (n0.2 + n1.2 + n2.2) / 3.0,
                 );
                 if !faces_camera(normal) {
                     continue;

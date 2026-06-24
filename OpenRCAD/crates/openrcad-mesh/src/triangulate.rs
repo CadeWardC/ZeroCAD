@@ -420,12 +420,8 @@ pub fn project_point(surf: &GeomSurface, pt: Pnt, hint: Option<(f64, f64)>) -> (
         u -= du;
         v -= dv;
 
-        if !u_min.is_infinite() {
-            u = u.clamp(u_min, u_max);
-        }
-        if !v_min.is_infinite() {
-            v = v.clamp(v_min, v_max);
-        }
+        u = clamp_to_ordered_bounds(u, u_min, u_max);
+        v = clamp_to_ordered_bounds(v, v_min, v_max);
 
         if du.abs() < 1e-9 && dv.abs() < 1e-9 {
             break;
@@ -433,6 +429,34 @@ pub fn project_point(surf: &GeomSurface, pt: Pnt, hint: Option<(f64, f64)>) -> (
     }
 
     (u, v)
+}
+
+fn clamp_to_ordered_bounds(value: f64, min: f64, max: f64) -> f64 {
+    match (min.is_finite(), max.is_finite()) {
+        (true, true) => {
+            let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+            if value.is_nan() {
+                lo
+            } else {
+                value.max(lo).min(hi)
+            }
+        }
+        (true, false) => {
+            if value.is_nan() {
+                min
+            } else {
+                value.max(min)
+            }
+        }
+        (false, true) => {
+            if value.is_nan() {
+                max
+            } else {
+                value.min(max)
+            }
+        }
+        (false, false) => value,
+    }
 }
 
 /// Periodic unwrapping to prevent jumps across seams.
@@ -469,12 +493,21 @@ pub fn sample_interior_points(
     let (u_divs, v_divs) = match surf {
         GeomSurface::Plane(_) => (0, 0),
         GeomSurface::Cylinder(cyl) => {
-            u_inset = 0.25;
+            u_inset = 0.05;
             let r = cyl.radius();
-            let theta = 2.0 * (2.0 * chord_err / r).sqrt();
+            let err = chord_err.max(CONFUSION);
+            let theta = cylinder_step_angle(r, err);
             let span = u_max - u_min;
-            let n = f64::max(2.0, (span / theta).ceil()) as usize;
-            (n, 0)
+            let nu = f64::max(2.0, (span / theta).ceil()) as usize;
+            // A cylinder is ruled in v, but a single mid-v support row lets
+            // constrained Delaunay bridge trimmed walls with long corner chords.
+            // Use the angular chord budget as a target physical edge length for
+            // axial support too, so tall trimmed cylinders get local triangles
+            // without changing their B-Rep topology or boundary samples.
+            let target_len = f64::max(r * theta, err);
+            let v_span = (v_max - v_min).abs();
+            let nv = f64::max(2.0, (v_span / target_len).ceil()) as usize;
+            (nu, nv)
         }
         GeomSurface::Sphere(sph) => {
             let r = sph.radius();
@@ -537,6 +570,507 @@ pub fn sample_interior_points(
     }
 
     points
+}
+
+fn cylinder_step_angle(radius: f64, chord_err: f64) -> f64 {
+    if radius > CONFUSION {
+        2.0 * (2.0 * chord_err / radius).sqrt()
+    } else {
+        std::f64::consts::PI / 2.0
+    }
+}
+
+fn cylinder_uv_target_len(surf: &GeomSurface, chord_err: f64) -> Option<f64> {
+    let GeomSurface::Cylinder(cyl) = surf else {
+        return None;
+    };
+    let err = chord_err.max(CONFUSION);
+    let theta = cylinder_step_angle(cyl.radius(), err);
+    Some(f64::max(cyl.radius() * theta, err))
+}
+
+fn surface_uv_segment_len(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> f64 {
+    match surf {
+        GeomSurface::Cylinder(cyl) => {
+            let du = (b.x() - a.x()).abs() * cyl.radius();
+            let dv = (b.y() - a.y()).abs();
+            du.hypot(dv)
+        }
+        _ => a.distance(&b),
+    }
+}
+
+fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64, f64, f64, f64)> {
+    let GeomSurface::Cylinder(cyl) = surf else {
+        return None;
+    };
+    let r = cyl.radius().abs();
+    let du = shortest_angle_delta(a.x(), b.x());
+    let hoop = du * r;
+    let axial = (a.y() - b.y()).abs();
+    let surface_len = hoop.hypot(axial);
+    let sagitta = if r > CONFUSION {
+        r * (1.0 - (0.5 * du).cos())
+    } else {
+        0.0
+    };
+    Some((hoop, axial, surface_len, sagitta))
+}
+
+fn cylinder_edge_needs_refinement(
+    surf: &GeomSurface,
+    a: Pnt2d,
+    b: Pnt2d,
+    chord_err: f64,
+) -> bool {
+    let Some((_, _, surface_len, sagitta)) = cylinder_edge_metrics(surf, a, b) else {
+        return false;
+    };
+    let Some(target_len) = cylinder_uv_target_len(surf, chord_err) else {
+        return false;
+    };
+    sagitta > chord_err.max(CONFUSION) || surface_len > target_len
+}
+
+fn uv_midpoint(a: Pnt2d, b: Pnt2d) -> Pnt2d {
+    Pnt2d::new(0.5 * (a.x() + b.x()), 0.5 * (a.y() + b.y()))
+}
+
+fn shortest_angle_delta(a: f64, b: f64) -> f64 {
+    let mut d = (a - b).abs();
+    while d > std::f64::consts::TAU {
+        d -= std::f64::consts::TAU;
+    }
+    if d > std::f64::consts::PI {
+        std::f64::consts::TAU - d
+    } else {
+        d
+    }
+}
+
+fn dist2_point_segment(p: Pnt2d, a: Pnt2d, b: Pnt2d) -> f64 {
+    let abx = b.x() - a.x();
+    let aby = b.y() - a.y();
+    let apx = p.x() - a.x();
+    let apy = p.y() - a.y();
+    let len2 = abx * abx + aby * aby;
+    if len2 <= 1e-24 {
+        return apx * apx + apy * apy;
+    }
+    let t = ((apx * abx + apy * aby) / len2).clamp(0.0, 1.0);
+    let dx = apx - t * abx;
+    let dy = apy - t * aby;
+    dx * dx + dy * dy
+}
+
+fn point_on_loop(p: Pnt2d, loop_pts: &[Pnt2d]) -> bool {
+    if loop_pts.len() < 2 {
+        return false;
+    }
+    let tol2 = 1e-14;
+    for i in 0..loop_pts.len() {
+        let a = loop_pts[i];
+        let b = loop_pts[(i + 1) % loop_pts.len()];
+        if dist2_point_segment(p, a, b) <= tol2 {
+            return true;
+        }
+    }
+    false
+}
+
+fn point_in_trim_region(p: Pnt2d, outer_pts: &[Pnt2d], inner_pts_list: &[Vec<Pnt2d>]) -> bool {
+    if !is_point_in_polygon(p, outer_pts) && !point_on_loop(p, outer_pts) {
+        return false;
+    }
+    for hole in inner_pts_list {
+        if is_point_in_polygon(p, hole) && !point_on_loop(p, hole) {
+            return false;
+        }
+    }
+    true
+}
+
+fn triangle_in_trim_region(
+    pa: Pnt2d,
+    pb: Pnt2d,
+    pc: Pnt2d,
+    outer_pts: &[Pnt2d],
+    inner_pts_list: &[Vec<Pnt2d>],
+    check_edge_midpoints: bool,
+) -> bool {
+    let centroid = Pnt2d::new(
+        (pa.x() + pb.x() + pc.x()) / 3.0,
+        (pa.y() + pb.y() + pc.y()) / 3.0,
+    );
+    if !point_in_trim_region(centroid, outer_pts, inner_pts_list) {
+        return false;
+    }
+    if !check_edge_midpoints {
+        return true;
+    }
+    [uv_midpoint(pa, pb), uv_midpoint(pb, pc), uv_midpoint(pc, pa)]
+        .into_iter()
+        .all(|p| point_in_trim_region(p, outer_pts, inner_pts_list))
+}
+
+fn trimmed_constrained_tris(
+    points: &[Pnt2d],
+    constraints: &[(usize, usize)],
+    outer_pts: &[Pnt2d],
+    inner_pts_list: &[Vec<Pnt2d>],
+    wants_ccw: bool,
+    check_edge_midpoints: bool,
+) -> Vec<Tri> {
+    let tris = recover_constrained_edges(delaunay_triangulate(points), points, constraints);
+    let mut out = Vec::new();
+    for t in tris {
+        let pa = points[t.a];
+        let pb = points[t.b];
+        let pc = points[t.c];
+        if !triangle_in_trim_region(
+            pa,
+            pb,
+            pc,
+            outer_pts,
+            inner_pts_list,
+            check_edge_midpoints,
+        ) {
+            continue;
+        }
+        let tri_ccw = ccw(pa, pb, pc) > 0.0;
+        if tri_ccw == wants_ccw {
+            out.push(t);
+        } else {
+            out.push(Tri {
+                a: t.a,
+                b: t.c,
+                c: t.b,
+            });
+        }
+    }
+    out
+}
+
+fn refine_cylinder_tris(
+    surface: &GeomSurface,
+    points_2d: &mut Vec<Pnt2d>,
+    points_3d: &mut Vec<Pnt>,
+    point_map: &mut HashMap<(i64, i64), usize>,
+    constraints: &[(usize, usize)],
+    outer_pts: &[Pnt2d],
+    inner_pts_list: &[Vec<Pnt2d>],
+    wants_ccw: bool,
+    chord_err: f64,
+) -> Vec<Tri> {
+    const MAX_ITERS: usize = 16;
+    const MAX_POINTS: usize = 20_000;
+
+    let check_edge_midpoints = matches!(surface, GeomSurface::Cylinder(_));
+    let mut constraints = constraints.to_vec();
+    let mut tris = trimmed_constrained_tris(
+        points_2d,
+        &constraints,
+        outer_pts,
+        inner_pts_list,
+        wants_ccw,
+        check_edge_midpoints,
+    );
+    if !check_edge_midpoints {
+        return tris;
+    }
+
+    for _ in 0..MAX_ITERS {
+        if points_2d.len() >= MAX_POINTS {
+            break;
+        }
+        let constraint_edges: HashSet<(usize, usize)> =
+            constraints.iter().map(|&(a, b)| edge_key(a, b)).collect();
+        let mut seen_edges = HashSet::new();
+        let mut candidates = Vec::new();
+        for tri in &tris {
+            for (a, b) in [(tri.a, tri.b), (tri.b, tri.c), (tri.c, tri.a)] {
+                let key = edge_key(a, b);
+                if !seen_edges.insert(key) {
+                    continue;
+                }
+                let pa = points_2d[a];
+                let pb = points_2d[b];
+                if cylinder_edge_needs_refinement(surface, pa, pb, chord_err) {
+                    let mid = uv_midpoint(pa, pb);
+                    if point_in_trim_region(mid, outer_pts, inner_pts_list) {
+                        candidates.push((a, b, constraint_edges.contains(&key), mid));
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            break;
+        }
+
+        let mut inserted = false;
+        for (a, b, split_constraint, p2d) in candidates {
+            if points_2d.len() >= MAX_POINTS {
+                break;
+            }
+            let key = ((p2d.x() * 1e8) as i64, (p2d.y() * 1e8) as i64);
+            if let Some(&id) = point_map.get(&key) {
+                if split_constraint {
+                    split_constraint_edge(&mut constraints, a, b, id);
+                    inserted = true;
+                }
+                continue;
+            }
+            let id = points_2d.len();
+            point_map.insert(key, id);
+            points_2d.push(p2d);
+            points_3d.push(surface.point(p2d.x(), p2d.y()));
+            if split_constraint {
+                split_constraint_edge(&mut constraints, a, b, id);
+            }
+            inserted = true;
+        }
+        if !inserted {
+            break;
+        }
+
+        tris = trimmed_constrained_tris(
+            points_2d,
+            &constraints,
+            outer_pts,
+            inner_pts_list,
+            wants_ccw,
+            true,
+        );
+    }
+
+    tris
+}
+
+fn split_constraint_edge(constraints: &mut Vec<(usize, usize)>, a: usize, b: usize, mid: usize) {
+    for i in 0..constraints.len() {
+        if constraints[i] == (a, b) {
+            constraints[i] = (a, mid);
+            constraints.push((mid, b));
+            return;
+        }
+        if constraints[i] == (b, a) {
+            constraints[i] = (b, mid);
+            constraints.push((mid, a));
+            return;
+        }
+    }
+}
+
+fn mesh_from_uv_tris(
+    points_3d: Vec<Pnt>,
+    tris: Vec<Tri>,
+    face_index: u32,
+) -> TriangleMesh {
+    let triangles = tris
+        .into_iter()
+        .map(|t| [t.a as u32, t.b as u32, t.c as u32])
+        .collect::<Vec<_>>();
+    let face_ids = vec![face_index; triangles.len()];
+    TriangleMesh::from_buffers_with_faces(points_3d, triangles, face_ids)
+}
+
+pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face], chord_err: f64) {
+    const MAX_ITERS: usize = 8;
+    const MAX_VERTS: usize = 100_000;
+
+    for _ in 0..MAX_ITERS {
+        if mesh.vertices.len() >= MAX_VERTS {
+            break;
+        }
+
+        let mut edge_tris: HashMap<(PointKey3d, PointKey3d), Vec<(usize, u32, u32)>> =
+            HashMap::new();
+        for (ti, tri) in mesh.triangles.iter().enumerate() {
+            for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                let ka = point_key_3d(mesh.vertices[a as usize]);
+                let kb = point_key_3d(mesh.vertices[b as usize]);
+                let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+                edge_tris.entry(key).or_default().push((ti, a, b));
+            }
+        }
+
+        let mut vertex_map: HashMap<(i64, i64, i64), u32> = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (point_key_3d(*p), i as u32))
+            .collect();
+        let mut removed = HashSet::new();
+        let mut new_tris = Vec::new();
+        let mut new_fids = Vec::new();
+        let mut progressed = false;
+        let mut edges: Vec<_> = edge_tris.keys().copied().collect();
+        edges.sort_unstable();
+
+        for key in edges {
+            let Some(adj) = edge_tris.get(&key) else {
+                continue;
+            };
+            if adj.len() < 2 || adj.iter().any(|(ti, _, _)| removed.contains(ti)) {
+                continue;
+            }
+            let fid = mesh.face_ids.get(adj[0].0).copied().unwrap_or(0);
+            if adj
+                .iter()
+                .any(|&(ti, _, _)| mesh.face_ids.get(ti).copied().unwrap_or(0) != fid)
+            {
+                continue;
+            }
+            let Some(GeomSurface::Cylinder(cyl)) =
+                faces.get(fid as usize).and_then(|face| face.surface())
+            else {
+                continue;
+            };
+            let surface = GeomSurface::Cylinder(*cyl);
+            let (_, a, b) = adj[0];
+            let pa = mesh.vertices[a as usize];
+            let pb = mesh.vertices[b as usize];
+            let (ua, va) = project_point(&surface, pa, None);
+            let (mut ub, vb) = project_point(&surface, pb, Some((ua, va)));
+            ub = unwrap_coordinate(ub, ua, std::f64::consts::TAU);
+            let a_uv = Pnt2d::new(ua, va);
+            let b_uv = Pnt2d::new(ub, vb);
+            if !cylinder_edge_needs_refinement(&surface, a_uv, b_uv, chord_err) {
+                continue;
+            }
+
+            let mid_uv = uv_midpoint(a_uv, b_uv);
+            let mid_point = surface.point(mid_uv.x(), mid_uv.y());
+            let mid_key = point_key_3d(mid_point);
+            let mid = if let Some(&idx) = vertex_map.get(&mid_key) {
+                idx
+            } else {
+                if mesh.vertices.len() >= MAX_VERTS {
+                    break;
+                }
+                let idx = mesh.vertices.len() as u32;
+                mesh.vertices.push(mid_point);
+                vertex_map.insert(mid_key, idx);
+                idx
+            };
+            if mid == a || mid == b {
+                continue;
+            }
+
+            for &(ti, ea, eb) in adj {
+                if removed.contains(&ti) {
+                    continue;
+                }
+                let Some((t0, t1)) = split_triangle_edge(mesh.triangles[ti], ea, eb, mid) else {
+                    continue;
+                };
+                removed.insert(ti);
+                new_tris.push(t0);
+                new_fids.push(fid);
+                new_tris.push(t1);
+                new_fids.push(fid);
+            }
+            progressed = true;
+        }
+
+        if !progressed {
+            break;
+        }
+
+        let mut out_tris = Vec::with_capacity(mesh.triangles.len() + new_tris.len());
+        let mut out_fids = Vec::with_capacity(mesh.face_ids.len() + new_fids.len());
+        for (ti, tri) in mesh.triangles.iter().enumerate() {
+            if removed.contains(&ti) {
+                continue;
+            }
+            out_tris.push(*tri);
+            out_fids.push(mesh.face_ids.get(ti).copied().unwrap_or(0));
+        }
+        out_tris.extend(new_tris);
+        out_fids.extend(new_fids);
+        mesh.triangles = out_tris;
+        mesh.face_ids = out_fids;
+    }
+}
+
+type PointKey3d = (i64, i64, i64);
+
+fn point_key_3d(p: Pnt) -> PointKey3d {
+    (
+        (p.x() * 1e9).round() as i64,
+        (p.y() * 1e9).round() as i64,
+        (p.z() * 1e9).round() as i64,
+    )
+}
+
+fn split_triangle_edge(tri: [u32; 3], a: u32, b: u32, mid: u32) -> Option<([u32; 3], [u32; 3])> {
+    let split = |x, y, o| Some(([x, mid, o], [mid, y, o]));
+    if (tri[0] == a && tri[1] == b) || (tri[0] == b && tri[1] == a) {
+        split(tri[0], tri[1], tri[2])
+    } else if (tri[1] == a && tri[2] == b) || (tri[1] == b && tri[2] == a) {
+        split(tri[1], tri[2], tri[0])
+    } else if (tri[2] == a && tri[0] == b) || (tri[2] == b && tri[0] == a) {
+        split(tri[2], tri[0], tri[1])
+    } else {
+        None
+    }
+}
+
+fn refine_surface_edge_params(
+    surf: &GeomSurface,
+    curve: &GeomCurve,
+    params: &[f64],
+    chord_err: f64,
+) -> Vec<f64> {
+    let Some(target_len) = cylinder_uv_target_len(surf, chord_err) else {
+        return params.to_vec();
+    };
+    if params.len() < 2 || !target_len.is_finite() || target_len <= CONFUSION {
+        return params.to_vec();
+    }
+
+    let mut uvs = Vec::with_capacity(params.len());
+    let mut prev_hint = None;
+    for &t in params {
+        let p = curve.point(t);
+        let (mut u, mut v) = project_point(surf, p, prev_hint);
+        if let Some((pu, pv)) = prev_hint {
+            if surf.is_uclosed() {
+                u = unwrap_coordinate(u, pu, 2.0 * std::f64::consts::PI);
+            }
+            if surf.is_vclosed() {
+                v = unwrap_coordinate(v, pv, 2.0 * std::f64::consts::PI);
+            }
+        }
+        prev_hint = Some((u, v));
+        uvs.push(Pnt2d::new(u, v));
+    }
+
+    let mut refined = Vec::new();
+    for i in 0..(params.len() - 1) {
+        let t0 = params[i];
+        let t1 = params[i + 1];
+        if refined
+            .last()
+            .map_or(true, |last: &f64| (*last - t0).abs() > 1e-12)
+        {
+            refined.push(t0);
+        }
+
+        let len = surface_uv_segment_len(surf, uvs[i], uvs[i + 1]);
+        let divs = f64::max(1.0, (len / target_len).ceil()) as usize;
+        for j in 1..divs {
+            let f = j as f64 / divs as f64;
+            refined.push(t0 + f * (t1 - t0));
+        }
+    }
+
+    if let Some(&last) = params.last() {
+        refined.push(last);
+    }
+    refined.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    refined.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    refined
 }
 
 /// Discretize an edge's curve to satisfy the chordal error budget.
@@ -684,6 +1218,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
 
             let on_seam = matches!(curve, GeomCurve::Ellipse(_));
             let params = discretize_edge_curve(curve, edge.first(), edge.last(), chord_err);
+            let params = refine_surface_edge_params(surface, curve, &params, chord_err);
             let is_reversed = !edge.orientation().is_forward();
 
             let params_directed: Vec<f64> = if is_reversed {
@@ -916,47 +1451,20 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         }
     }
 
-    let tris = recover_constrained_edges(
-        delaunay_triangulate(&all_points_2d),
-        &all_points_2d,
+    let wants_ccw = face.orientation() != Orientation::Reversed;
+    let tris = refine_cylinder_tris(
+        surface,
+        &mut all_points_2d,
+        &mut all_points_3d,
+        &mut point_map,
         &constraints,
+        &outer_pts,
+        &inner_pts_list,
+        wants_ccw,
+        chord_err,
     );
 
-    // 4. Centroid trimming and construction of output TriangleMesh
-    let mut triangles = Vec::new();
-    for t in tris {
-        let pa = all_points_2d[t.a];
-        let pb = all_points_2d[t.b];
-        let pc = all_points_2d[t.c];
-
-        // Centroid of the triangle
-        let centroid = Pnt2d::new(
-            (pa.x() + pb.x() + pc.x()) / 3.0,
-            (pa.y() + pb.y() + pc.y()) / 3.0,
-        );
-
-        if is_point_in_polygon(centroid, &outer_pts) {
-            let mut inside_hole = false;
-            for hole in &inner_pts_list {
-                if is_point_in_polygon(centroid, hole) {
-                    inside_hole = true;
-                    break;
-                }
-            }
-            if !inside_hole {
-                let tri_ccw = ccw(pa, pb, pc) > 0.0;
-                let wants_ccw = face.orientation() != Orientation::Reversed;
-                if tri_ccw == wants_ccw {
-                    triangles.push([t.a as u32, t.b as u32, t.c as u32]);
-                } else {
-                    triangles.push([t.a as u32, t.c as u32, t.b as u32]);
-                }
-            }
-        }
-    }
-
-    let face_ids = vec![face_index; triangles.len()];
-    TriangleMesh::from_buffers_with_faces(all_points_3d, triangles, face_ids)
+    mesh_from_uv_tris(all_points_3d, tris, face_index)
 }
 
 /// Combine multiple TriangleMeshes into a single watertight TriangleMesh by welding coincident vertices.
@@ -1377,8 +1885,8 @@ fn find_prev_non_collapsed_u(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openrcad_foundation::{Dir, Pnt};
-    use openrcad_geom::{GeomSurface, Plane};
+    use openrcad_foundation::{Ax3, Dir, Pnt};
+    use openrcad_geom::{CylindricalSurface, GeomSurface, Plane};
     use openrcad_topo::{Edge, Face, Orientation, Wire};
 
     fn square_face(z: f64, orientation: Orientation) -> Face {
@@ -1406,6 +1914,44 @@ mod tests {
         (b - a).cross(&(c - a)).z()
     }
 
+    fn test_cylinder_surface(radius: f64) -> GeomSurface {
+        GeomSurface::cylinder(CylindricalSurface::new(
+            Ax3::new(Pnt::origin(), Dir::dz()),
+            radius,
+        ))
+    }
+
+    fn point_key(p: Pnt2d) -> (i64, i64) {
+        ((p.x() * 1e8) as i64, (p.y() * 1e8) as i64)
+    }
+
+    fn refine_test_points(surface: &GeomSurface, points: Vec<Pnt2d>) -> Vec<Pnt2d> {
+        let mut points_2d = points;
+        let outer_pts = points_2d.clone();
+        let mut points_3d: Vec<Pnt> = points_2d
+            .iter()
+            .map(|p| surface.point(p.x(), p.y()))
+            .collect();
+        let mut point_map: HashMap<(i64, i64), usize> = points_2d
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (point_key(p), i))
+            .collect();
+        let inner_pts_list = Vec::new();
+        let _tris = refine_cylinder_tris(
+            surface,
+            &mut points_2d,
+            &mut points_3d,
+            &mut point_map,
+            &[],
+            &outer_pts,
+            &inner_pts_list,
+            true,
+            0.05,
+        );
+        points_2d
+    }
+
     #[test]
     fn recovers_missing_constrained_edge_by_flipping() {
         let points = vec![
@@ -1419,6 +1965,97 @@ mod tests {
         let recovered = recover_constrained_edges(tris, &points, &[(1, 3)]);
 
         assert!(mesh_has_edge(&recovered, 1, 3));
+    }
+
+    #[test]
+    fn ordered_bounds_clamp_swaps_reversed_projection_limits() {
+        assert_eq!(clamp_to_ordered_bounds(2.12, 2.14, 2.09), 2.12);
+        assert_eq!(clamp_to_ordered_bounds(2.00, 2.14, 2.09), 2.09);
+        assert_eq!(clamp_to_ordered_bounds(2.20, 2.14, 2.09), 2.14);
+    }
+
+    #[test]
+    fn cylinder_refinement_splits_pure_hoop_chord() {
+        let surface = test_cylinder_surface(10.0);
+        let points = refine_test_points(
+            &surface,
+            vec![
+                Pnt2d::new(0.0, 0.0),
+                Pnt2d::new(1.0, 0.0),
+                Pnt2d::new(0.0, 1.0),
+            ],
+        );
+
+        assert!(
+            points
+                .iter()
+                .any(|p| (p.x() - 0.5).abs() < 1e-9 && p.y().abs() < 1e-9),
+            "expected midpoint support on the long pure-hoop edge"
+        );
+    }
+
+    #[test]
+    fn cylinder_refinement_splits_mixed_axial_hoop_chord() {
+        let surface = test_cylinder_surface(10.0);
+        let points = refine_test_points(
+            &surface,
+            vec![
+                Pnt2d::new(0.0, 0.0),
+                Pnt2d::new(0.5, 3.0),
+                Pnt2d::new(0.0, 3.0),
+            ],
+        );
+
+        assert!(
+            points
+                .iter()
+                .any(|p| (p.x() - 0.25).abs() < 1e-9 && (p.y() - 1.5).abs() < 1e-9),
+            "expected midpoint support on the long mixed cylinder edge"
+        );
+    }
+
+    #[test]
+    fn uv_triangle_mesh_preserves_source_face_id() {
+        let mesh = mesh_from_uv_tris(
+            vec![
+                Pnt::origin(),
+                Pnt::new(1.0, 0.0, 0.0),
+                Pnt::new(0.0, 1.0, 0.0),
+                Pnt::new(1.0, 1.0, 0.0),
+            ],
+            vec![Tri { a: 0, b: 1, c: 2 }, Tri { a: 1, b: 3, c: 2 }],
+            42,
+        );
+
+        assert_eq!(mesh.face_ids, vec![42, 42]);
+    }
+
+    #[test]
+    fn post_stitch_cylinder_refinement_splits_same_face_axial_edge() {
+        let surface = test_cylinder_surface(10.0);
+        let pts = [
+            surface.point(0.0, 0.0),
+            surface.point(0.0, 10.0),
+            surface.point(0.2, 0.0),
+            surface.point(-0.2, 10.0),
+        ];
+        let face = Face::with_wires(
+            Some(surface),
+            None,
+            Vec::new(),
+            Orientation::Forward,
+        );
+        let mut mesh = TriangleMesh::from_buffers_with_faces(
+            pts.to_vec(),
+            vec![[0, 1, 2], [1, 0, 3]],
+            vec![0, 0],
+        );
+
+        refine_cylinder_mesh_edges(&mut mesh, &[face], 0.05);
+
+        assert!(mesh.vertices.len() > pts.len());
+        assert!(mesh.triangles.len() > 2);
+        assert!(mesh.face_ids.iter().all(|&fid| fid == 0));
     }
 
     #[test]
