@@ -32,6 +32,10 @@ pub enum BooleanOp {
 
 pub mod boolean;
 pub use boolean::{BooleanError, BooleanInput};
+pub mod contour;
+pub use contour::{
+    apply_blend_contour, BlendContour, BlendContourError, BlendCurveHint, BlendKind, BlendLaw,
+};
 
 /// Apply `op` between `object` and `tool` (OCCT `BRepAlgoAPI_Fuse/Cut/Common`).
 ///
@@ -134,8 +138,8 @@ pub fn shell_solid(
 pub mod sew;
 pub use prism::{prism, sweep_prism, SweepError};
 pub use rolling_ball::{
-    fillet_edges, fillet_planar_edge, rolling_ball_between_planar_faces, rolling_ball_fillet_edge,
-    RollingBallBlend, RollingBallError,
+    fillet_circular_edge_chain, fillet_edges, fillet_planar_edge, rolling_ball_between_planar_faces,
+    rolling_ball_fillet_edge, RollingBallBlend, RollingBallError,
 };
 
 /// Sew a collection of faces into a single shell, joining edges within `tol`

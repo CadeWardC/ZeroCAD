@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{
     detect_regions, CoordinateSystem, CornerKind, CornerMod, Dimension, EdgeRef, ExtrudeMode,
     FeatureNode, FeatureType, MockMesh, ParametricGraph, Region, SketchCurves, SketchPlane,
@@ -204,7 +205,9 @@ fn sketch_variable_dims(shapes: &[SketchShape]) -> Vec<String> {
         let dims: Vec<&Dimension> = match s {
             SketchShape::Rectangle { w, h, .. } => vec![w, h],
             SketchShape::Circle { diameter, .. } => vec![diameter],
-            SketchShape::Line { length, angle_deg, .. } => vec![length, angle_deg],
+            SketchShape::Line {
+                length, angle_deg, ..
+            } => vec![length, angle_deg],
             SketchShape::Raw { .. } => vec![],
         };
         for d in dims {
@@ -295,10 +298,7 @@ struct SaveDialogState {
 
 /// Result delivered by a background refine evaluation: its generation tag (to
 /// discard superseded jobs) and the evaluated bodies + warnings (or an error).
-type EvalResult = (
-    u64,
-    Result<(Vec<(String, MockMesh)>, Vec<String>), String>,
-);
+type EvalResult = (u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>);
 
 struct ZeroCadApp {
     graph: ParametricGraph,
@@ -443,7 +443,9 @@ struct ZeroCadApp {
     /// to the size it was computed for) and the channel it reports on. At most one
     /// runs at a time — while it's busy, size changes don't spawn more.
     edge_mod_arc_inflight: Option<u64>,
-    edge_mod_arc_rx: Option<std::sync::mpsc::Receiver<(u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>)>>,
+    edge_mod_arc_rx: Option<
+        std::sync::mpsc::Receiver<(u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>)>,
+    >,
     /// Debounce tracker for the speculative precompute: the current size key and
     /// when it was first observed. The arc job is spawned only once a key has been
     /// stable for `EDGE_MOD_SETTLE`, so a fast drag doesn't kick off a job per step.
@@ -546,6 +548,55 @@ struct ZeroCadApp {
     /// of every frame so any change to the unit / dark mode / onboarding toggle
     /// is saved without threading a save call through each edit site.
     settings_baseline: settings::AppSettings,
+}
+
+fn circle_from_three_2d(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<(f32, f32, f32)> {
+    let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
+    if d.abs() < 1.0e-7 {
+        return None;
+    }
+    let a2 = a.0 * a.0 + a.1 * a.1;
+    let b2 = b.0 * b.0 + b.1 * b.1;
+    let c2 = c.0 * c.0 + c.1 * c.1;
+    let ux = (a2 * (b.1 - c.1) + b2 * (c.1 - a.1) + c2 * (a.1 - b.1)) / d;
+    let uy = (a2 * (c.0 - b.0) + b2 * (a.0 - c.0) + c2 * (b.0 - a.0)) / d;
+    let r = ((ux - a.0).powi(2) + (uy - a.1).powi(2)).sqrt();
+    Some((ux, uy, r))
+}
+
+fn normalize_positive(mut a: f32) -> f32 {
+    while a < 0.0 {
+        a += std::f32::consts::TAU;
+    }
+    while a >= std::f32::consts::TAU {
+        a -= std::f32::consts::TAU;
+    }
+    a
+}
+
+fn angle_in_span_f32(angle: f32, start: f32, end: f32, tol: f32) -> bool {
+    if (end - start).abs() >= std::f32::consts::TAU - tol {
+        return true;
+    }
+    if end >= start {
+        let mut rel = angle - start;
+        while rel < -tol {
+            rel += std::f32::consts::TAU;
+        }
+        while rel > std::f32::consts::TAU + tol {
+            rel -= std::f32::consts::TAU;
+        }
+        rel <= end - start + tol
+    } else {
+        let mut rel = start - angle;
+        while rel < -tol {
+            rel += std::f32::consts::TAU;
+        }
+        while rel > std::f32::consts::TAU + tol {
+            rel -= std::f32::consts::TAU;
+        }
+        rel <= start - end + tol
+    }
 }
 
 impl ZeroCadApp {
@@ -743,12 +794,8 @@ impl ZeroCadApp {
         let vars = self.graph.variable_map();
         let mut mods = self.sketch_corner_mods.clone();
         mods.extend(self.pending_corner_mods());
-        self.sketch_curves = zerocad_core::effective_curves(
-            &SketchCurves::new(),
-            &self.sketch_shapes,
-            &mods,
-            &vars,
-        );
+        self.sketch_curves =
+            zerocad_core::effective_curves(&SketchCurves::new(), &self.sketch_shapes, &mods, &vars);
         self.recompute_sketch_regions();
     }
 
@@ -921,7 +968,10 @@ impl ZeroCadApp {
                 egui::Frame::none()
                     .fill(egui::Color32::WHITE)
                     .rounding(3.0)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(170, 180, 190)))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(170, 180, 190),
+                    ))
                     .shadow(egui::epaint::Shadow {
                         extrusion: 8.0,
                         color: egui::Color32::from_black_alpha(35),
@@ -1056,6 +1106,30 @@ impl ZeroCadApp {
     /// fillet arc, the arc's ends.
     fn edge_ref_from(&self, node_id: &str, e: u32) -> Option<EdgeRef> {
         let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == node_id)?;
+        if let Some(edge_ref) = mesh.edge_refs.iter().find(|edge_ref| edge_ref.group == e) {
+            let topology = edge_ref.topology.as_ref().map(|topology| {
+                let mut topology = zerocad_core::TopologyEdgeRef {
+                    body_id: topology.body_id.clone(),
+                    topology_version: topology.topology_version,
+                    edge_id: topology.edge_id.clone(),
+                    adjacent_face_ids: topology.adjacent_face_ids.clone(),
+                    curve_kind: topology.curve_kind.clone(),
+                    adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+                };
+                if topology.body_id.is_none() {
+                    topology.body_id = Some(node_id.to_string());
+                }
+                topology
+            });
+            return Some(EdgeRef {
+                p0: edge_ref.p0,
+                p1: edge_ref.p1,
+                n1: edge_ref.n1,
+                n2: edge_ref.n2,
+                curve: edge_ref.curve.clone(),
+                topology,
+            });
+        }
         let seg_count = mesh.edge_indices.len() / 2;
 
         // Gather the group's chord segments. A legacy mesh without grouping treats
@@ -1102,6 +1176,7 @@ impl ZeroCadApp {
             .collect();
         // Deterministic order so the fillet's speculative precompute key is stable.
         ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let closed = ends.len() < 2;
         let (p0, p1) = if ends.len() >= 2 {
             (ends[0], ends[1])
         } else {
@@ -1125,7 +1200,191 @@ impl ZeroCadApp {
             mesh.edge_face_normals[fo + 4],
             mesh.edge_face_normals[fo + 5],
         ];
-        Some(EdgeRef { p0, p1, n1, n2 })
+        let curve = Self::edge_curve_hint_from_group(mesh, &segs, p0, p1, n1, n2, closed);
+        Some(EdgeRef {
+            p0,
+            p1,
+            n1,
+            n2,
+            curve,
+            topology: None,
+        })
+    }
+
+    fn edge_curve_hint_from_group(
+        mesh: &MockMesh,
+        segs: &[usize],
+        p0: [f32; 3],
+        p1: [f32; 3],
+        n1: [f32; 3],
+        n2: [f32; 3],
+        closed: bool,
+    ) -> Option<EdgeCurveHint> {
+        let vpos = |seg: usize, which: usize| -> Vec3 {
+            let vi = mesh.edge_indices[seg * 2 + which] as usize * 3;
+            Vec3::new(
+                mesh.edge_vertices[vi],
+                mesh.edge_vertices[vi + 1],
+                mesh.edge_vertices[vi + 2],
+            )
+        };
+        let mut pts: Vec<Vec3> = Vec::new();
+        for &s in segs {
+            for w in 0..2 {
+                let p = vpos(s, w);
+                if !pts.iter().any(|q| q.sub(p).length() <= 1.0e-4) {
+                    pts.push(p);
+                }
+            }
+        }
+        if pts.len() < 3 {
+            return Some(EdgeCurveHint::Line);
+        }
+
+        let p0v = Vec3::new(p0[0], p0[1], p0[2]);
+        let p1v = Vec3::new(p1[0], p1[1], p1[2]);
+        let mut axes = vec![
+            Vec3::new(n1[0], n1[1], n1[2]).normalize(),
+            Vec3::new(n2[0], n2[1], n2[2]).normalize(),
+        ];
+        let mut chord_axis = Vec3::ZERO;
+        for i in 1..pts.len() {
+            for j in (i + 1)..pts.len() {
+                let axis = pts[i].sub(pts[0]).cross(pts[j].sub(pts[0]));
+                if axis.length() > chord_axis.length() {
+                    chord_axis = axis;
+                }
+            }
+        }
+        let chord_axis = chord_axis.normalize();
+        axes.push(chord_axis);
+
+        let mut best: Option<(f32, EdgeCurveHint)> = None;
+        for axis in axes {
+            if axis.length() < 0.5 {
+                continue;
+            }
+            if let Some((score, hint)) = Self::fit_circle_hint_on_axis(&pts, p0v, p1v, axis, closed)
+            {
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_score, _)| score < *best_score)
+                {
+                    best = Some((score, hint));
+                }
+            }
+        }
+        best.map(|(_, hint)| hint).or(Some(EdgeCurveHint::Line))
+    }
+
+    fn fit_circle_hint_on_axis(
+        pts: &[Vec3],
+        p0: Vec3,
+        p1: Vec3,
+        axis: Vec3,
+        closed: bool,
+    ) -> Option<(f32, EdgeCurveHint)> {
+        let axis = axis.normalize();
+        let base = if axis.dot(Vec3::X).abs() < 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let u = base.sub(axis.mul(base.dot(axis))).normalize();
+        if u.length() < 0.5 {
+            return None;
+        }
+        let v = axis.cross(u).normalize();
+        let origin = pts[0];
+        let project = |p: Vec3| -> (f32, f32, f32) {
+            let d = p.sub(origin);
+            (d.dot(u), d.dot(v), d.dot(axis))
+        };
+        let projected: Vec<(f32, f32)> = pts
+            .iter()
+            .map(|&p| {
+                let (x, y, _) = project(p);
+                (x, y)
+            })
+            .collect();
+        if pts
+            .iter()
+            .map(|&p| project(p).2.abs())
+            .fold(0.0f32, f32::max)
+            > 0.05
+        {
+            return None;
+        }
+
+        let mut circle = None;
+        'outer: for i in 0..projected.len() {
+            for j in (i + 1)..projected.len() {
+                for k in (j + 1)..projected.len() {
+                    if let Some(c) = circle_from_three_2d(projected[i], projected[j], projected[k])
+                    {
+                        circle = Some(c);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let (cx, cy, radius) = circle?;
+        if radius <= 1.0e-4 {
+            return None;
+        }
+        let residual = projected
+            .iter()
+            .map(|&(x, y)| ((x - cx).hypot(y - cy) - radius).abs())
+            .fold(0.0f32, f32::max);
+        if residual > (0.01 * radius).max(0.05) {
+            return None;
+        }
+
+        let center = origin.add(u.mul(cx)).add(v.mul(cy));
+        let mut x_dir = p0.sub(center).normalize();
+        if x_dir.length() < 0.5 {
+            x_dir = pts[0].sub(center).normalize();
+        }
+        x_dir = x_dir.sub(axis.mul(x_dir.dot(axis))).normalize();
+        if x_dir.length() < 0.5 {
+            return None;
+        }
+        let y_dir = axis.cross(x_dir).normalize();
+        let angle = |p: Vec3| {
+            let d = p.sub(center);
+            d.dot(y_dir).atan2(d.dot(x_dir))
+        };
+        let end = if closed {
+            std::f32::consts::TAU
+        } else {
+            let raw_end = angle(p1);
+            let forward = normalize_positive(raw_end);
+            let reverse = forward - std::f32::consts::TAU;
+            let contains = |span_end: f32| -> bool {
+                pts.iter()
+                    .all(|&p| angle_in_span_f32(angle(p), 0.0, span_end, 0.08))
+            };
+            if contains(forward) {
+                forward
+            } else if contains(reverse) {
+                reverse
+            } else {
+                raw_end
+            }
+        };
+
+        Some((
+            residual,
+            EdgeCurveHint::Circle {
+                center: [center.x, center.y, center.z],
+                axis: [axis.x, axis.y, axis.z],
+                x_dir: [x_dir.x, x_dir.y, x_dir.z],
+                radius,
+                start: 0.0,
+                end,
+                closed,
+            },
+        ))
     }
 
     /// Display name for the next 3D fillet/chamfer (Fillet_1, Chamfer_2, …).
@@ -1737,7 +1996,11 @@ impl ZeroCadApp {
                 } else {
                     self.pal().text_body
                 };
-                let icon = if hidden { icons::Icon::EyeClosed } else { icons::Icon::EyeOpen };
+                let icon = if hidden {
+                    icons::Icon::EyeClosed
+                } else {
+                    icons::Icon::EyeOpen
+                };
                 let eye_btn = icon.icon_button(
                     ui,
                     egui::Color32::TRANSPARENT,
@@ -1799,9 +2062,7 @@ impl ZeroCadApp {
                 self.pal().text_strong // dark slate-800
             };
 
-            let rich_text = egui::RichText::new(name)
-                .color(label_color)
-                .size(13.0);
+            let rich_text = egui::RichText::new(name).color(label_color).size(13.0);
 
             let rich_text = if is_selected {
                 rich_text.strong()
@@ -1919,8 +2180,9 @@ impl ZeroCadApp {
             ExtrudeMode::Join => "Join",
             ExtrudeMode::Cut => "Cut",
         };
-        let n = self
-            .next_feature_index(|f| matches!(f, FeatureType::Extrude { mode: m, .. } if *m == mode));
+        let n = self.next_feature_index(
+            |f| matches!(f, FeatureType::Extrude { mode: m, .. } if *m == mode),
+        );
         format!("{}_{}", prefix, n)
     }
 
@@ -2117,11 +2379,8 @@ impl ZeroCadApp {
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
-                ui.painter().rect_filled(
-                    screen,
-                    0.0,
-                    egui::Color32::from_black_alpha(120),
-                );
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
                 // Consume clicks on the backdrop so they don't fall through.
                 ui.allocate_rect(screen, egui::Sense::click());
             });
@@ -2201,10 +2460,7 @@ impl ZeroCadApp {
                             for folder in &folders {
                                 let label = folder.display().to_string();
                                 let selected = *folder == state.save_dir;
-                                if ui
-                                    .selectable_label(selected, &label)
-                                    .clicked()
-                                {
+                                if ui.selectable_label(selected, &label).clicked() {
                                     state.save_dir = folder.clone();
                                 }
                             }
@@ -2214,7 +2470,11 @@ impl ZeroCadApp {
 
                 // --- Full path preview ---
                 let state = self.save_dialog.as_ref().unwrap();
-                let full_path = state.save_dir.join(format!("{}.{}", state.project_title, state.save_format.extension()));
+                let full_path = state.save_dir.join(format!(
+                    "{}.{}",
+                    state.project_title,
+                    state.save_format.extension()
+                ));
                 ui.horizontal(|ui| {
                     ui.label("File:");
                     ui.monospace(full_path.display().to_string());
@@ -2288,7 +2548,8 @@ impl ZeroCadApp {
             image,
             egui::TextureOptions::LINEAR,
         );
-        self.onboarding_textures.insert(path.to_path_buf(), tex.clone());
+        self.onboarding_textures
+            .insert(path.to_path_buf(), tex.clone());
         Some(tex)
     }
 
@@ -2387,9 +2648,11 @@ impl ZeroCadApp {
                 });
                 ui.add_space(2.0);
                 ui.label(
-                    egui::RichText::new("Start a new project, open one, or pick up where you left off.")
-                        .size(13.0)
-                        .color(pal.text_muted),
+                    egui::RichText::new(
+                        "Start a new project, open one, or pick up where you left off.",
+                    )
+                    .size(13.0)
+                    .color(pal.text_muted),
                 );
                 ui.add_space(16.0);
 
@@ -2729,7 +2992,8 @@ impl ZeroCadApp {
                 })
             });
             if let Some((key, mods)) = captured {
-                self.keymap.set(action, shortcuts::Hotkey::from_event(key, mods));
+                self.keymap
+                    .set(action, shortcuts::Hotkey::from_event(key, mods));
                 self.keymap.save();
                 self.capturing_shortcut = None;
             }
@@ -2878,6 +3142,7 @@ impl eframe::App for ZeroCadApp {
         }
         // Swap in any finished background refine.
         self.poll_refine_eval();
+        self.tick_speculative_edge_mod(ctx);
         // While the Welcome modal is up the workspace is inert, so its hotkeys
         // are suppressed (the modal reads Esc itself).
         if !self.onboarding_visible {
@@ -2939,7 +3204,8 @@ impl eframe::App for ZeroCadApp {
                 .default_width(460.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
                         icons::Icon::Settings.draw(ui.painter(), rect, strong);
                         ui.label(egui::RichText::new("Settings").strong().size(14.0));
                     });
@@ -2953,131 +3219,151 @@ impl eframe::App for ZeroCadApp {
                         egui::vec2(444.0, 270.0),
                         egui::Layout::left_to_right(egui::Align::Min),
                         |ui| {
-                        // Left rail: tab list.
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(110.0, 270.0),
-                            egui::Layout::top_down_justified(egui::Align::Min),
-                            |ui| {
-                                for &tab in SettingsTab::ALL {
-                                    ui.selectable_value(&mut self.settings_tab, tab, tab.label());
-                                }
-                            },
-                        );
+                            // Left rail: tab list.
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(110.0, 270.0),
+                                egui::Layout::top_down_justified(egui::Align::Min),
+                                |ui| {
+                                    for &tab in SettingsTab::ALL {
+                                        ui.selectable_value(
+                                            &mut self.settings_tab,
+                                            tab,
+                                            tab.label(),
+                                        );
+                                    }
+                                },
+                            );
 
-                        ui.separator();
+                            ui.separator();
 
-                        // Right pane: content for the selected tab.
-                        ui.vertical(|ui| {
-                            match self.settings_tab {
-                                SettingsTab::General => {
-                                    // --- Units ---
-                                    ui.label(egui::RichText::new("Default measurement unit").strong());
-                                    ui.add_space(2.0);
-                                    egui::ComboBox::from_id_source("pref_unit_select")
-                                        .selected_text(match self.current_unit {
-                                            Unit::Millimeter => "Millimeters (mm)",
-                                            Unit::Inch => "Inches (in)",
-                                            Unit::Meter => "Meters (m)",
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.current_unit,
-                                                Unit::Millimeter,
-                                                "Millimeters (mm)",
-                                            );
-                                            ui.selectable_value(&mut self.current_unit, Unit::Inch, "Inches (in)");
-                                            ui.selectable_value(&mut self.current_unit, Unit::Meter, "Meters (m)");
-                                        });
+                            // Right pane: content for the selected tab.
+                            ui.vertical(|ui| {
+                                match self.settings_tab {
+                                    SettingsTab::General => {
+                                        // --- Units ---
+                                        ui.label(
+                                            egui::RichText::new("Default measurement unit")
+                                                .strong(),
+                                        );
+                                        ui.add_space(2.0);
+                                        egui::ComboBox::from_id_source("pref_unit_select")
+                                            .selected_text(match self.current_unit {
+                                                Unit::Millimeter => "Millimeters (mm)",
+                                                Unit::Inch => "Inches (in)",
+                                                Unit::Meter => "Meters (m)",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.current_unit,
+                                                    Unit::Millimeter,
+                                                    "Millimeters (mm)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.current_unit,
+                                                    Unit::Inch,
+                                                    "Inches (in)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.current_unit,
+                                                    Unit::Meter,
+                                                    "Meters (m)",
+                                                );
+                                            });
 
-                                    ui.add_space(12.0);
+                                        ui.add_space(12.0);
 
-                                    // --- Onboarding ---
-                                    ui.checkbox(&mut self.show_onboarding, "Onboarding Screen");
-                                }
-                                SettingsTab::Shortcuts => {
-                                    ui.label(
-                                        egui::RichText::new("Keyboard shortcuts").strong(),
-                                    );
-                                    ui.add_space(2.0);
-                                    ui.weak(
+                                        // --- Onboarding ---
+                                        ui.checkbox(&mut self.show_onboarding, "Onboarding Screen");
+                                    }
+                                    SettingsTab::Shortcuts => {
+                                        ui.label(
+                                            egui::RichText::new("Keyboard shortcuts").strong(),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.weak(
                                         "Click a shortcut, then press the new combo. Esc cancels.",
                                     );
-                                    ui.add_space(8.0);
+                                        ui.add_space(8.0);
 
-                                    // Deferred mutations so the keymap isn't borrowed
-                                    // mutably while the rows read it.
-                                    let mut toggle_capture: Option<ShortcutAction> = None;
-                                    let mut clear_action: Option<ShortcutAction> = None;
+                                        // Deferred mutations so the keymap isn't borrowed
+                                        // mutably while the rows read it.
+                                        let mut toggle_capture: Option<ShortcutAction> = None;
+                                        let mut clear_action: Option<ShortcutAction> = None;
 
-                                    egui::ScrollArea::vertical()
-                                        .max_height(190.0)
-                                        .show(ui, |ui| {
-                                            for &action in ShortcutAction::ALL {
-                                                ui.horizontal(|ui| {
-                                                    ui.add_sized(
-                                                        [150.0, 24.0],
-                                                        egui::Label::new(action.label()),
-                                                    );
-                                                    let capturing =
-                                                        self.capturing_shortcut == Some(action);
-                                                    let text = if capturing {
-                                                        "Press a key…".to_string()
-                                                    } else {
-                                                        self.keymap
-                                                            .get(action)
-                                                            .map(|h| h.label())
-                                                            .unwrap_or_else(|| "Unbound".to_string())
-                                                    };
-                                                    let mut btn = egui::Button::new(text)
-                                                        .min_size(egui::vec2(120.0, 24.0));
-                                                    if capturing {
-                                                        btn = btn.fill(egui::Color32::from_rgb(
-                                                            0, 120, 215,
-                                                        ));
-                                                    }
-                                                    if ui.add(btn).clicked() {
-                                                        toggle_capture = Some(action);
-                                                    }
-                                                    if ui
-                                                        .small_button("✕")
-                                                        .on_hover_text("Unbind")
-                                                        .clicked()
-                                                    {
-                                                        clear_action = Some(action);
-                                                    }
-                                                });
-                                                ui.add_space(2.0);
-                                            }
-                                        });
+                                        egui::ScrollArea::vertical().max_height(190.0).show(
+                                            ui,
+                                            |ui| {
+                                                for &action in ShortcutAction::ALL {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_sized(
+                                                            [150.0, 24.0],
+                                                            egui::Label::new(action.label()),
+                                                        );
+                                                        let capturing =
+                                                            self.capturing_shortcut == Some(action);
+                                                        let text = if capturing {
+                                                            "Press a key…".to_string()
+                                                        } else {
+                                                            self.keymap
+                                                                .get(action)
+                                                                .map(|h| h.label())
+                                                                .unwrap_or_else(|| {
+                                                                    "Unbound".to_string()
+                                                                })
+                                                        };
+                                                        let mut btn = egui::Button::new(text)
+                                                            .min_size(egui::vec2(120.0, 24.0));
+                                                        if capturing {
+                                                            btn =
+                                                                btn.fill(egui::Color32::from_rgb(
+                                                                    0, 120, 215,
+                                                                ));
+                                                        }
+                                                        if ui.add(btn).clicked() {
+                                                            toggle_capture = Some(action);
+                                                        }
+                                                        if ui
+                                                            .small_button("✕")
+                                                            .on_hover_text("Unbind")
+                                                            .clicked()
+                                                        {
+                                                            clear_action = Some(action);
+                                                        }
+                                                    });
+                                                    ui.add_space(2.0);
+                                                }
+                                            },
+                                        );
 
-                                    ui.add_space(10.0);
-                                    if ui.button("Reset to defaults").clicked() {
-                                        self.keymap.reset_to_defaults();
-                                        self.keymap.save();
-                                        self.capturing_shortcut = None;
-                                    }
-
-                                    // Apply the deferred row actions.
-                                    if let Some(action) = toggle_capture {
-                                        // Clicking the row already capturing cancels it.
-                                        self.capturing_shortcut =
-                                            if self.capturing_shortcut == Some(action) {
-                                                None
-                                            } else {
-                                                Some(action)
-                                            };
-                                    }
-                                    if let Some(action) = clear_action {
-                                        self.keymap.unbind(action);
-                                        self.keymap.save();
-                                        if self.capturing_shortcut == Some(action) {
+                                        ui.add_space(10.0);
+                                        if ui.button("Reset to defaults").clicked() {
+                                            self.keymap.reset_to_defaults();
+                                            self.keymap.save();
                                             self.capturing_shortcut = None;
+                                        }
+
+                                        // Apply the deferred row actions.
+                                        if let Some(action) = toggle_capture {
+                                            // Clicking the row already capturing cancels it.
+                                            self.capturing_shortcut =
+                                                if self.capturing_shortcut == Some(action) {
+                                                    None
+                                                } else {
+                                                    Some(action)
+                                                };
+                                        }
+                                        if let Some(action) = clear_action {
+                                            self.keymap.unbind(action);
+                                            self.keymap.save();
+                                            if self.capturing_shortcut == Some(action) {
+                                                self.capturing_shortcut = None;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        });
-                    });
+                            });
+                        },
+                    );
 
                     ui.add_space(12.0);
                     ui.separator();
@@ -5137,8 +5423,7 @@ impl eframe::App for ZeroCadApp {
                 self.status_msg = "Shape cancelled.".to_string();
             } else if self.active_tool.is_some() {
                 self.active_tool = None;
-                self.status_msg =
-                    "Tool deselected — select faces, edges, or points.".to_string();
+                self.status_msg = "Tool deselected — select faces, edges, or points.".to_string();
                 log::info!("Escape: switched to Select mode");
             }
         }

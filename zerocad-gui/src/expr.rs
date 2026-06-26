@@ -177,7 +177,10 @@ pub(crate) fn autocomplete_field(
     let mut clicked: Option<usize> = None;
     let mut popup_hovered = false;
     if !accept_now {
-        if let Some(a) = ac.as_ref().filter(|a| a.owner == id && !a.matches.is_empty()) {
+        if let Some(a) = ac
+            .as_ref()
+            .filter(|a| a.owner == id && !a.matches.is_empty())
+        {
             let anchor = response.rect.left_bottom() + egui::vec2(0.0, 3.0);
             let area = egui::Area::new(id.with("ac_popup"))
                 .order(egui::Order::Tooltip)
@@ -212,10 +215,7 @@ pub(crate) fn autocomplete_field(
     };
     let mut accepted = false;
     if let Some(idx) = accept_index {
-        let chosen = ac
-            .as_ref()
-            .and_then(|a| a.matches.get(idx))
-            .cloned();
+        let chosen = ac.as_ref().and_then(|a| a.matches.get(idx)).cloned();
         if let Some(name) = chosen {
             let (start, end, _p) = token_at(&chars, cursor);
             let mut new: String = chars[..start].iter().collect();

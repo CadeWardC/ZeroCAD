@@ -52,6 +52,8 @@ pub enum RollingBallError {
     NewtonDiverged { iterations: usize },
     /// The blend surface could not be constructed.
     BlendSurfaceBuild(&'static str),
+    /// The local edit built faces, but the sewn shell was not watertight/healthy.
+    InvalidTopology,
 }
 
 impl fmt::Display for RollingBallError {
@@ -86,6 +88,9 @@ impl fmt::Display for RollingBallError {
             ),
             Self::BlendSurfaceBuild(msg) => {
                 write!(f, "rolling ball: blend surface could not be built ({msg})")
+            }
+            Self::InvalidTopology => {
+                f.write_str("rolling ball: rebuilt body is not watertight and healthy")
             }
         }
     }
@@ -440,10 +445,16 @@ fn fillet_planar_edge_inner(
     // non-watertight / degenerate shell. Surface that as an error rather than
     // returning a broken solid the application would cache.
     let result = Solid::new(sew(&faces, radius * 0.1));
-    if !result.is_watertight() || !result.health_report().is_healthy() {
-        return Err(RollingBallError::InvalidRadius { radius });
+    let merged = crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(
+        &result,
+    ));
+    if merged.is_watertight() && merged.health_report().is_healthy() {
+        return Ok(merged);
     }
-    Ok(result)
+    if result.is_watertight() && result.health_report().is_healthy() {
+        return Ok(result);
+    }
+    Err(RollingBallError::InvalidTopology)
 }
 
 /// Faces produced for one shared corner: the new faces to add and the original
@@ -1591,6 +1602,186 @@ pub fn fillet_edges(solid: &Solid, edges: &[Edge], radius: f64) -> Result<Solid,
     Ok(current)
 }
 
+/// Fillet a logical circular edge that is represented in the B-Rep as several
+/// co-circular edge fragments.
+///
+/// Cylinder booleans often split a circular rim at construction seams. Those
+/// split points are not design corners, so sequentially filleting each fragment
+/// asks the corner code to cap fake endpoints and produces invalid topology.
+/// This treats the fragments as one selected edge: contacts and adjacent faces
+/// are trimmed across the whole chain, while only the requested spine endpoints
+/// are closed against real cap faces.
+pub fn fillet_circular_edge_chain(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    radius: f64,
+) -> Result<Solid, RollingBallError> {
+    if chain_edges.is_empty() {
+        return Err(RollingBallError::SpineNotOnFace);
+    }
+
+    let (plane_face, cyl_faces) = circular_chain_support_faces(solid, chain_edges)?;
+    let mut blend =
+        rolling_ball_between_curved_faces(solid, spine, &plane_face, &cyl_faces[0], radius)?;
+    split_blend_face_for_spine_chain(&mut blend, spine, chain_edges)?;
+    let start = spine.source().point();
+    let end = spine.target().point();
+
+    let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
+    let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+
+    let mut faces = Vec::new();
+    let mut skipped_faces = std::collections::HashSet::new();
+
+    let start_cut = try_corner_cut(
+        solid,
+        &mut blend,
+        start,
+        &start_caps,
+        radius,
+        &mut faces,
+        &mut skipped_faces,
+    )?;
+    if !start_cut {
+        handle_corner_endpoint(
+            solid,
+            &blend,
+            start,
+            &start_caps,
+            &blend.start_arc,
+            radius,
+            false,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
+    }
+
+    let end_cut = try_corner_cut(
+        solid,
+        &mut blend,
+        end,
+        &end_caps,
+        radius,
+        &mut faces,
+        &mut skipped_faces,
+    )?;
+    if !end_cut {
+        handle_corner_endpoint(
+            solid,
+            &blend,
+            end,
+            &end_caps,
+            &blend.end_arc,
+            radius,
+            false,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
+    }
+
+    let trimmed_plane =
+        trim_face_along_spine_segments(&plane_face, chain_edges, spine, &blend.contact_a)?;
+    let mut trimmed_cyls = Vec::new();
+    for cyl in &cyl_faces {
+        trimmed_cyls.push(trim_face_along_spine_segments(
+            cyl,
+            chain_edges,
+            spine,
+            &blend.contact_b,
+        )?);
+    }
+
+    for face in solid.shell().faces() {
+        if same_face(&face, &plane_face)
+            || cyl_faces.iter().any(|cyl| same_face(&face, cyl))
+            || skipped_faces.contains(&face.id())
+        {
+            continue;
+        }
+        faces.push(face);
+    }
+
+    faces.push(trimmed_plane);
+    faces.extend(trimmed_cyls);
+    faces.push(blend.blend_face);
+
+    let result = Solid::new(sew(&faces, radius * 0.1));
+    let merged = crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(
+        &result,
+    ));
+    if merged.is_watertight() && merged.health_report().is_healthy() {
+        return Ok(merged);
+    }
+    if result.is_watertight() && result.health_report().is_healthy() {
+        return Ok(result);
+    }
+    Err(RollingBallError::InvalidTopology)
+}
+
+fn circular_chain_support_faces(
+    solid: &Solid,
+    edges: &[Edge],
+) -> Result<(Face, Vec<Face>), RollingBallError> {
+    let mut plane: Option<Face> = None;
+    for face in adjacent_faces(solid, &edges[0]) {
+        if !matches!(face.surface(), Some(GeomSurface::Plane(_))) {
+            continue;
+        }
+        if edges.iter().skip(1).all(|edge| {
+            adjacent_faces(solid, edge)
+                .into_iter()
+                .any(|candidate| same_face(&candidate, &face))
+        }) {
+            plane = Some(face);
+            break;
+        }
+    }
+    let plane = plane.ok_or(RollingBallError::EdgeAdjacency { count: 1 })?;
+
+    let mut cyls: Vec<Face> = Vec::new();
+    for edge in edges {
+        for face in adjacent_faces(solid, edge) {
+            if same_face(&face, &plane) || !matches!(face.surface(), Some(GeomSurface::Cylinder(_)))
+            {
+                continue;
+            }
+            if cyls.iter().any(|seen| same_face(seen, &face)) {
+                continue;
+            }
+            if let Some(first) = cyls.first() {
+                if !cylinders_same_support(first, &face) {
+                    return Err(RollingBallError::UnsolvableAdjacency {
+                        reason: AdjacencyReason::UnsupportedSurfacePair,
+                    });
+                }
+            }
+            cyls.push(face);
+        }
+    }
+    if cyls.is_empty() {
+        return Err(RollingBallError::EdgeAdjacency { count: 1 });
+    }
+    Ok((plane, cyls))
+}
+
+fn cylinders_same_support(a: &Face, b: &Face) -> bool {
+    let (Some(GeomSurface::Cylinder(a)), Some(GeomSurface::Cylinder(b))) =
+        (a.surface(), b.surface())
+    else {
+        return false;
+    };
+    let ac = a.position().location();
+    let bc = b.position().location();
+    ac.distance(&bc) <= 1.0e-6
+        && a.position()
+            .direction()
+            .dot(&b.position().direction())
+            .abs()
+            > 0.999_999
+        && (a.radius() - b.radius()).abs() <= 1.0e-6
+}
+
 /// Find the two faces adjacent to `edge` in `solid`, solve the
 /// rolling-ball contact curves, and build the blend face.
 pub fn rolling_ball_fillet_edge(
@@ -1618,7 +1809,7 @@ pub fn rolling_ball_fillet_edge(
         let n_b = planar_outward_normal(&adjacent[1])?;
         planar_blend(edge, &adjacent[0], &adjacent[1], n_a, n_b, radius)
     } else {
-        rolling_ball_between_curved_faces(edge, &adjacent[0], &adjacent[1], radius)
+        rolling_ball_between_curved_faces(solid, edge, &adjacent[0], &adjacent[1], radius)
     }
 }
 
@@ -1631,6 +1822,7 @@ pub fn rolling_ball_fillet_edge(
 ///   so the shared edge is a straight generator of the wall; the blend is a
 ///   cylinder with straight-line contacts (see [`rolling_ball_plane_perp_cylinder`]).
 pub fn rolling_ball_between_curved_faces(
+    solid: &Solid,
     edge: &Edge,
     face_a: &Face,
     face_b: &Face,
@@ -1679,7 +1871,12 @@ pub fn rolling_ball_between_curved_faces(
         let spine_r = circle.radius();
 
         if n_plane.is_parallel(&axis_dir, 1e-4) {
-            let major_radius = spine_r - radius;
+            let concave_cut = is_concave_cut_cylinder(solid, cyl_face);
+            let major_radius = if concave_cut {
+                spine_r + radius
+            } else {
+                spine_r - radius
+            };
             if major_radius <= tolerance::CONFUSION {
                 return Err(RollingBallError::InvalidRadius { radius });
             }
@@ -2050,7 +2247,10 @@ pub(crate) fn adjacent_faces(solid: &Solid, edge: &Edge) -> Vec<Face> {
             face.wires()
                 .into_iter()
                 .flat_map(|wire| wire.edges())
-                .any(|candidate| same_undirected_edge(&candidate, edge))
+                .any(|candidate| {
+                    same_undirected_edge(&candidate, edge)
+                        || edge_contains_requested_span(&candidate, edge)
+                })
         })
         .collect()
 }
@@ -2063,6 +2263,31 @@ fn same_undirected_edge(a: &Edge, b: &Edge) -> bool {
     let tol = 10.0 * tolerance::CONFUSION;
     (a0.distance(&b0) <= tol && a1.distance(&b1) <= tol)
         || (a0.distance(&b1) <= tol && a1.distance(&b0) <= tol)
+}
+
+fn edge_contains_requested_span(container: &Edge, requested: &Edge) -> bool {
+    let c0 = container.start().point();
+    let c1 = container.end().point();
+    let r0 = requested.start().point();
+    let r1 = requested.end().point();
+    let c_len = c0.distance(&c1);
+    let r_len = r0.distance(&r1);
+    let tol = 10.0 * tolerance::CONFUSION;
+    if c_len <= tol || r_len <= tol || r_len > c_len + tol {
+        return false;
+    }
+
+    let Some(dir) = (c1 - c0).normalized() else {
+        return false;
+    };
+    if point_line_distance(r0, c0, dir) > tol || point_line_distance(r1, c0, dir) > tol {
+        return false;
+    }
+
+    let dir_vec = GeomVec::from_dir(dir);
+    let t0 = (r0 - c0).dot(&dir_vec);
+    let t1 = (r1 - c0).dot(&dir_vec);
+    t0 >= -tol && t0 <= c_len + tol && t1 >= -tol && t1 <= c_len + tol
 }
 
 /// Perpendicular distance from `p` to the infinite line through `origin` with
@@ -2088,6 +2313,12 @@ pub(crate) fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
     let current = solid.edges();
     if let Some(e) = current.iter().find(|c| same_undirected_edge(c, requested)) {
         return Some(e.clone());
+    }
+    if let Some(candidate) = current
+        .iter()
+        .find(|candidate| edge_contains_requested_span(candidate, requested))
+    {
+        return Some(snap_requested_span_to_container(candidate, requested));
     }
 
     let r0 = requested.start().point();
@@ -2121,6 +2352,38 @@ pub(crate) fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
         }
     }
     best.map(|(_, e)| e)
+}
+
+fn snap_requested_span_to_container(container: &Edge, requested: &Edge) -> Edge {
+    let c0 = container.start().point();
+    let c1 = container.end().point();
+    let r0 = requested.start().point();
+    let r1 = requested.end().point();
+    let c_len = c0.distance(&c1);
+    let snap_tol = (c_len * 5.0e-4).clamp(10.0 * tolerance::CONFUSION, 0.01);
+
+    let start = snap_point_to_edge_endpoint(r0, c0, c1, snap_tol);
+    let end = snap_point_to_edge_endpoint(r1, c0, c1, snap_tol);
+    if (start.distance(&c0) <= tolerance::CONFUSION && end.distance(&c1) <= tolerance::CONFUSION)
+        || (start.distance(&c1) <= tolerance::CONFUSION
+            && end.distance(&c0) <= tolerance::CONFUSION)
+    {
+        return container.clone();
+    }
+    if start.distance(&r0) > tolerance::CONFUSION || end.distance(&r1) > tolerance::CONFUSION {
+        return Edge::between_points(start, end);
+    }
+    requested.clone()
+}
+
+fn snap_point_to_edge_endpoint(point: Pnt, a: Pnt, b: Pnt, tol: f64) -> Pnt {
+    if point.distance(&a) <= tol {
+        a
+    } else if point.distance(&b) <= tol {
+        b
+    } else {
+        point
+    }
 }
 
 pub(crate) fn same_face(a: &Face, b: &Face) -> bool {
@@ -2164,7 +2427,11 @@ fn face_contains_point(face: &Face, point: Pnt) -> bool {
 /// straight segment (the previous behaviour, correct for the planar caps).
 fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
     let Some(GeomCurve::Circle(circle)) = edge.curve() else {
-        return Edge::between_points(keep, moved);
+        let source = edge.source().point();
+        if source.distance(&keep) <= source.distance(&moved) {
+            return Edge::between_points(keep, moved);
+        }
+        return Edge::between_points(moved, keep);
     };
     let circle = *circle;
     let center = circle.center();
@@ -2211,6 +2478,62 @@ fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
     }
 }
 
+fn move_edge_endpoint_keep_curve(edge: &Edge, old: Pnt, new: Pnt) -> Edge {
+    let tol = 10.0 * tolerance::CONFUSION;
+    let source = edge.source().point();
+    let target = edge.target().point();
+    if source.distance(&old) <= tol {
+        return rebuild_edge_with_endpoints(edge, new, target);
+    }
+    if target.distance(&old) <= tol {
+        return rebuild_edge_with_endpoints(edge, source, new);
+    }
+    edge.clone()
+}
+
+fn rebuild_edge_with_endpoints(edge: &Edge, start: Pnt, end: Pnt) -> Edge {
+    let Some(GeomCurve::Circle(circle)) = edge.curve() else {
+        return Edge::between_points(start, end);
+    };
+    let circle = *circle;
+    let start_param = circle_parameter_for_point(&circle, start, edge.first(), edge.last());
+    let end_param = circle_parameter_for_point(&circle, end, edge.first(), edge.last());
+    Edge::new(
+        Some(GeomCurve::circle(circle)),
+        start_param,
+        end_param,
+        Vertex::new(start),
+        Vertex::new(end),
+    )
+}
+
+fn circle_parameter_for_point(circle: &Circle, point: Pnt, first: f64, last: f64) -> f64 {
+    let center = circle.center();
+    let x = GeomVec::from_dir(circle.position().x_direction());
+    let y = GeomVec::from_dir(circle.axis()).cross(&x);
+    let v = point - center;
+    let raw = v.dot(&y).atan2(v.dot(&x));
+    let lo = first.min(last);
+    let hi = first.max(last);
+    let mut best = raw;
+    let mut best_score = f64::INFINITY;
+    for k in -3..=3 {
+        let candidate = raw + (k as f64) * core::f64::consts::TAU;
+        let score = if candidate < lo {
+            lo - candidate
+        } else if candidate > hi {
+            candidate - hi
+        } else {
+            0.0
+        };
+        if score < best_score {
+            best = candidate;
+            best_score = score;
+        }
+    }
+    best
+}
+
 pub(crate) fn trim_face_along_spine(
     face: &Face,
     spine: &Edge,
@@ -2229,7 +2552,13 @@ pub(crate) fn trim_face_along_spine(
         .iter()
         .position(|candidate| same_undirected_edge(candidate, spine))
     else {
-        return Err(RollingBallError::SpineNotOnFace);
+        let Some(idx) = edges
+            .iter()
+            .position(|candidate| edge_contains_requested_span(candidate, spine))
+        else {
+            return Err(RollingBallError::SpineNotOnFace);
+        };
+        return trim_face_along_subspine(face, &edges, idx, spine, contact);
     };
 
     let prev_idx = (idx + n - 1) % n;
@@ -2286,6 +2615,176 @@ pub(crate) fn trim_face_along_spine(
     // degenerate edges so the trimmed loop stays valid.
     new_edges.retain(|e| e.source().point().distance(&e.target().point()) > tolerance::CONFUSION);
 
+    rebuild_face(face, Wire::from_edges(new_edges))
+}
+
+fn trim_face_along_subspine(
+    face: &Face,
+    edges: &[Edge],
+    idx: usize,
+    spine: &Edge,
+    contact: &Edge,
+) -> Result<Face, RollingBallError> {
+    let selected = &edges[idx];
+    let s0 = selected.source().point();
+    let s1 = selected.target().point();
+    let len2 = (s1 - s0).magnitude_squared();
+    if len2 <= tolerance::CONFUSION * tolerance::CONFUSION {
+        return Err(RollingBallError::DegenerateSpine);
+    }
+
+    let a = spine.source().point();
+    let b = spine.target().point();
+    let ta = (a - s0).dot(&(s1 - s0)) / len2;
+    let tb = (b - s0).dot(&(s1 - s0)) / len2;
+    let (run_start, run_end) = if ta <= tb { (a, b) } else { (b, a) };
+    let contact_start = contact_point_for_spine_vertex(spine, contact, run_start);
+    let contact_end = contact_point_for_spine_vertex(spine, contact, run_end);
+    let oriented_contact = orient_edge_between(contact, contact_start, contact_end);
+
+    let mut new_edges = Vec::with_capacity(edges.len() + 4);
+    for (i, edge) in edges.iter().enumerate() {
+        if i != idx {
+            new_edges.push(edge.clone());
+            continue;
+        }
+
+        push_nonzero_edge(&mut new_edges, shorten_edge_keep_curve(edge, s0, run_start));
+        push_nonzero_edge(&mut new_edges, Edge::between_points(run_start, contact_start));
+        push_nonzero_edge(&mut new_edges, oriented_contact.clone());
+        push_nonzero_edge(&mut new_edges, Edge::between_points(contact_end, run_end));
+        push_nonzero_edge(&mut new_edges, shorten_edge_keep_curve(edge, s1, run_end));
+    }
+
+    rebuild_face(face, Wire::from_edges(new_edges))
+}
+
+fn push_nonzero_edge(edges: &mut Vec<Edge>, edge: Edge) {
+    if edge.source().point().distance(&edge.target().point()) > tolerance::CONFUSION {
+        edges.push(edge);
+    }
+}
+
+fn split_blend_face_for_spine_chain(
+    blend: &mut RollingBallBlend,
+    spine: &Edge,
+    spine_edges: &[Edge],
+) -> Result<(), RollingBallError> {
+    let mut spans: Vec<(f64, f64)> = spine_edges
+        .iter()
+        .map(|edge| {
+            let a = spine_parameter_for_point(spine, edge.source().point())?;
+            let b = spine_parameter_for_point(spine, edge.target().point())?;
+            Ok(if spine.last() >= spine.first() {
+                (a.min(b), a.max(b))
+            } else {
+                (a.max(b), a.min(b))
+            })
+        })
+        .collect::<Result<_, RollingBallError>>()?;
+    spans.sort_by(|a, b| {
+        a.0.min(a.1)
+            .partial_cmp(&b.0.min(b.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut contact_a = Vec::new();
+    let mut contact_b = Vec::new();
+    for &(a, b) in &spans {
+        contact_a.push(edge_on_contact_between_params(&blend.contact_a, a, b)?);
+        contact_b.push(edge_on_contact_between_params(&blend.contact_b, a, b)?);
+    }
+
+    let mut wire_edges = Vec::with_capacity(contact_a.len() + contact_b.len() + 2);
+    wire_edges.extend(contact_a);
+    wire_edges.push(blend.end_arc.clone());
+    wire_edges.extend(contact_b.into_iter().rev().map(|edge| edge.reversed()));
+    wire_edges.push(blend.start_arc.clone());
+
+    blend.blend_face = Face::new(
+        blend.blend_face.surface().cloned(),
+        Wire::from_edges(wire_edges),
+    );
+    Ok(())
+}
+
+fn trim_face_along_spine_segments(
+    face: &Face,
+    spine_edges: &[Edge],
+    spine: &Edge,
+    contact: &Edge,
+) -> Result<Face, RollingBallError> {
+    ensure_trimmable_face(face)?;
+    let edges = face
+        .outer_wire()
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?
+        .edges();
+    let n = edges.len();
+    if n < 3 || spine_edges.is_empty() || spine_edges.len() >= n {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let selected: std::collections::HashSet<usize> = edges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, candidate)| {
+            spine_edges
+                .iter()
+                .any(|spine_edge| same_undirected_edge(candidate, spine_edge))
+                .then_some(i)
+        })
+        .collect();
+    if selected.is_empty() {
+        return Err(RollingBallError::SpineNotOnFace);
+    }
+
+    let run_start = selected
+        .iter()
+        .copied()
+        .find(|&i| !selected.contains(&((i + n - 1) % n)))
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+    let mut run = Vec::new();
+    let mut i = run_start;
+    loop {
+        if !selected.contains(&i) {
+            break;
+        }
+        run.push(i);
+        i = (i + 1) % n;
+        if i == run_start {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+    }
+    if run.len() != selected.len() {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let run_end = *run
+        .last()
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+    let prev_idx = (run_start + n - 1) % n;
+    let next_idx = (run_end + 1) % n;
+    if selected.contains(&prev_idx) || selected.contains(&next_idx) || prev_idx == next_idx {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let run_start_point = edges[run_start].source().point();
+    let run_end_point = edges[run_end].target().point();
+    let contact_start = contact_point_for_spine_point(spine, contact, run_start_point)?;
+    let contact_end = contact_point_for_spine_point(spine, contact, run_end_point)?;
+
+    let mut new_edges = Vec::with_capacity(n);
+    for (i, edge) in edges.iter().enumerate() {
+        if selected.contains(&i) {
+            new_edges.push(contact_subedge_for_spine_edge(spine, contact, edge)?);
+        } else {
+            let moved_start = move_edge_endpoint_keep_curve(edge, run_start_point, contact_start);
+            let moved = move_edge_endpoint_keep_curve(&moved_start, run_end_point, contact_end);
+            new_edges.push(moved);
+        }
+    }
+
+    new_edges.retain(|e| e.source().point().distance(&e.target().point()) > tolerance::CONFUSION);
     rebuild_face(face, Wire::from_edges(new_edges))
 }
 
@@ -2392,6 +2891,89 @@ pub(crate) fn contact_point_for_spine_vertex(spine: &Edge, contact: &Edge, point
     } else {
         contact.end().point()
     }
+}
+
+fn contact_point_for_spine_point(
+    spine: &Edge,
+    contact: &Edge,
+    point: Pnt,
+) -> Result<Pnt, RollingBallError> {
+    let Some(curve) = contact.curve() else {
+        return Ok(contact_point_for_spine_vertex(spine, contact, point));
+    };
+    let t = spine_parameter_for_point(spine, point)?;
+    Ok(curve.point(t))
+}
+
+fn contact_subedge_for_spine_edge(
+    spine: &Edge,
+    contact: &Edge,
+    edge: &Edge,
+) -> Result<Edge, RollingBallError> {
+    let t0 = spine_parameter_for_point(spine, edge.source().point())?;
+    let t1 = spine_parameter_for_point(spine, edge.target().point())?;
+    edge_on_contact_between_params(contact, t0, t1)
+}
+
+fn edge_on_contact_between_params(
+    contact: &Edge,
+    t0: f64,
+    t1: f64,
+) -> Result<Edge, RollingBallError> {
+    let Some(curve) = contact.curve().cloned() else {
+        return Ok(Edge::between_points(
+            contact.start().point(),
+            contact.end().point(),
+        ));
+    };
+    let p0 = curve.point(t0);
+    let p1 = curve.point(t1);
+    Ok(Edge::new(
+        Some(curve),
+        t0,
+        t1,
+        Vertex::new(p0),
+        Vertex::new(p1),
+    ))
+}
+
+fn spine_parameter_for_point(spine: &Edge, point: Pnt) -> Result<f64, RollingBallError> {
+    let Some(GeomCurve::Circle(circle)) = spine.curve() else {
+        let a = spine.start().point();
+        let b = spine.end().point();
+        let ab = b - a;
+        let len2 = ab.magnitude_squared();
+        if len2 <= tolerance::CONFUSION * tolerance::CONFUSION {
+            return Err(RollingBallError::DegenerateSpine);
+        }
+        let t = (point - a).dot(&ab) / len2;
+        return Ok(spine.first() + (spine.last() - spine.first()) * t);
+    };
+
+    let center = circle.center();
+    let x = GeomVec::from_dir(circle.position().x_direction());
+    let y = GeomVec::from_dir(circle.axis()).cross(&x);
+    let v = point - center;
+    let raw = v.dot(&y).atan2(v.dot(&x));
+    let lo = spine.first().min(spine.last());
+    let hi = spine.first().max(spine.last());
+    let mut best = raw;
+    let mut best_score = f64::INFINITY;
+    for k in -3..=3 {
+        let candidate = raw + (k as f64) * core::f64::consts::TAU;
+        let score = if candidate < lo {
+            lo - candidate
+        } else if candidate > hi {
+            candidate - hi
+        } else {
+            0.0
+        };
+        if score < best_score {
+            best = candidate;
+            best_score = score;
+        }
+    }
+    Ok(best)
 }
 
 pub(crate) fn orient_edge_between(edge: &Edge, start: Pnt, end: Pnt) -> Edge {
@@ -2601,6 +3183,7 @@ mod tests {
                 RollingBallError::UnsupportedTrimTopology => "t",
                 RollingBallError::NewtonDiverged { .. } => "n",
                 RollingBallError::BlendSurfaceBuild(_) => "b",
+                RollingBallError::InvalidTopology => "h",
             }
         }
     }

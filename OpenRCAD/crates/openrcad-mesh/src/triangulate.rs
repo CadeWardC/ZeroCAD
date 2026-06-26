@@ -862,16 +862,51 @@ fn split_constraint_edge(constraints: &mut Vec<(usize, usize)>, a: usize, b: usi
 }
 
 fn mesh_from_uv_tris(
+    points_2d: &[Pnt2d],
+    surface: &GeomSurface,
+    wants_ccw: bool,
     points_3d: Vec<Pnt>,
     tris: Vec<Tri>,
     face_index: u32,
 ) -> TriangleMesh {
     let triangles = tris
         .into_iter()
-        .map(|t| [t.a as u32, t.b as u32, t.c as u32])
+        .map(|t| orient_triangle_to_surface(points_2d, &points_3d, surface, wants_ccw, t))
         .collect::<Vec<_>>();
     let face_ids = vec![face_index; triangles.len()];
     TriangleMesh::from_buffers_with_faces(points_3d, triangles, face_ids)
+}
+
+fn orient_triangle_to_surface(
+    points_2d: &[Pnt2d],
+    points_3d: &[Pnt],
+    surface: &GeomSurface,
+    wants_ccw: bool,
+    tri: Tri,
+) -> [u32; 3] {
+    let mut out = [tri.a as u32, tri.b as u32, tri.c as u32];
+    let pa = points_3d[tri.a];
+    let pb = points_3d[tri.b];
+    let pc = points_3d[tri.c];
+    let normal = (pb - pa).cross(&(pc - pa));
+    if normal.magnitude() <= 1.0e-12 {
+        return out;
+    }
+
+    let ua = points_2d[tri.a];
+    let ub = points_2d[tri.b];
+    let uc = points_2d[tri.c];
+    let u = (ua.x() + ub.x() + uc.x()) / 3.0;
+    let v = (ua.y() + ub.y() + uc.y()) / 3.0;
+    let (_, du, dv) = surface.d1(u, v);
+    let mut desired = du.cross(&dv);
+    if !wants_ccw {
+        desired = -desired;
+    }
+    if desired.magnitude() > 1.0e-12 && normal.dot(&desired) < 0.0 {
+        out.swap(1, 2);
+    }
+    out
 }
 
 pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face], chord_err: f64) {
@@ -921,15 +956,19 @@ pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face]
             {
                 continue;
             }
-            let Some(GeomSurface::Cylinder(cyl)) =
-                faces.get(fid as usize).and_then(|face| face.surface())
-            else {
+            let Some(face) = faces.get(fid as usize) else {
+                continue;
+            };
+            let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
                 continue;
             };
             let surface = GeomSurface::Cylinder(*cyl);
             let (_, a, b) = adj[0];
             let pa = mesh.vertices[a as usize];
             let pb = mesh.vertices[b as usize];
+            if face_has_miter_seam(face) {
+                continue;
+            }
             let (ua, va) = project_point(&surface, pa, None);
             let (mut ub, vb) = project_point(&surface, pb, Some((ua, va)));
             ub = unwrap_coordinate(ub, ua, std::f64::consts::TAU);
@@ -991,6 +1030,14 @@ pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face]
         mesh.triangles = out_tris;
         mesh.face_ids = out_fids;
     }
+}
+
+fn face_has_miter_seam(face: &Face) -> bool {
+    face.wires().into_iter().any(|wire| {
+        wire.edges()
+            .iter()
+            .any(|edge| matches!(edge.curve(), Some(GeomCurve::Ellipse(_))))
+    })
 }
 
 type PointKey3d = (i64, i64, i64);
@@ -1464,7 +1511,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         chord_err,
     );
 
-    mesh_from_uv_tris(all_points_3d, tris, face_index)
+    mesh_from_uv_tris(&all_points_2d, surface, wants_ccw, all_points_3d, tris, face_index)
 }
 
 /// Combine multiple TriangleMeshes into a single watertight TriangleMesh by welding coincident vertices.
@@ -1792,6 +1839,92 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
             }
         }
 
+        // Phase C - straight closed-loop contact chains. Multi-edge fillets can
+        // leave a cylinder contact sampled as many collinear boundary sub-edges
+        // while the adjacent face still owns one long chord. In all-four-edge
+        // top fillets those chains are part of a closed boundary graph, so the
+        // open-chain phase above never sees degree-1 starts. Re-fan the chord
+        // owner through each maximal straight chain.
+        let boundary_set: HashSet<(u32, u32)> = boundary.iter().copied().collect();
+        let mut stitched_edges: HashSet<(u32, u32)> = HashSet::new();
+        for &(a0, b0) in &boundary {
+            let edge_key = key(a0, b0);
+            if stitched_edges.contains(&edge_key)
+                || touched.contains(&a0)
+                || touched.contains(&b0)
+            {
+                continue;
+            }
+            let Some(&owner_tri) = edge_tris.get(&edge_key).and_then(|tris| tris.first()) else {
+                continue;
+            };
+            let owner_fid = mesh.face_ids.get(owner_tri).copied().unwrap_or(0);
+            let mut chain = vec![a0, b0];
+            extend_collinear_boundary_chain(
+                mesh,
+                &edge_tris,
+                &boundary_set,
+                &adj,
+                &mut chain,
+                owner_fid,
+                false,
+            );
+            extend_collinear_boundary_chain(
+                mesh,
+                &edge_tris,
+                &boundary_set,
+                &adj,
+                &mut chain,
+                owner_fid,
+                true,
+            );
+            if chain.len() < 3 || chain.iter().any(|v| touched.contains(v)) {
+                continue;
+            }
+            let (a, b) = (chain[0], *chain.last().unwrap());
+            if a == b || !chain_is_straight(mesh, &chain) {
+                continue;
+            }
+            let Some(chord_tris) = edge_tris.get(&key(a, b)) else {
+                continue;
+            };
+            let Some(&ti) = chord_tris.iter().find(|&&ti| {
+                !removed.contains(&ti) && mesh.face_ids.get(ti).copied().unwrap_or(0) != owner_fid
+            }) else {
+                continue;
+            };
+            let tri = mesh.triangles[ti];
+            let opp = if tri[0] != a && tri[0] != b {
+                tri[0]
+            } else if tri[1] != a && tri[1] != b {
+                tri[1]
+            } else {
+                tri[2]
+            };
+            let forward = (tri[0] == a && tri[1] == b)
+                || (tri[1] == a && tri[2] == b)
+                || (tri[2] == a && tri[0] == b);
+            let ch: Vec<u32> = if forward {
+                chain.clone()
+            } else {
+                chain.iter().rev().copied().collect()
+            };
+            let fid = mesh.face_ids.get(ti).copied().unwrap_or(0);
+            for w in ch.windows(2) {
+                if w[0] == opp || w[1] == opp {
+                    continue;
+                }
+                new_tris.push([w[0], w[1], opp]);
+                new_fids.push(fid);
+                stitched_edges.insert(key(w[0], w[1]));
+            }
+            removed.insert(ti);
+            for &v in &chain {
+                touched.insert(v);
+            }
+            progressed = true;
+        }
+
         if !progressed {
             break;
         }
@@ -1814,6 +1947,94 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
             mesh.face_ids = out_fids;
         }
     }
+}
+
+fn extend_collinear_boundary_chain(
+    mesh: &TriangleMesh,
+    edge_tris: &HashMap<(u32, u32), Vec<usize>>,
+    boundary_set: &HashSet<(u32, u32)>,
+    adj: &HashMap<u32, Vec<u32>>,
+    chain: &mut Vec<u32>,
+    owner_fid: u32,
+    reverse: bool,
+) {
+    loop {
+        let (prev, head) = if reverse {
+            (chain[1], chain[0])
+        } else {
+            let n = chain.len();
+            (chain[n - 2], chain[n - 1])
+        };
+        let Some(candidates) = adj.get(&head) else {
+            break;
+        };
+        let mut next = None;
+        for &candidate in candidates {
+            if candidate == prev || chain.contains(&candidate) {
+                continue;
+            }
+            let edge_key = if head <= candidate {
+                (head, candidate)
+            } else {
+                (candidate, head)
+            };
+            if !boundary_set.contains(&edge_key) {
+                continue;
+            }
+            let Some(&ti) = edge_tris.get(&edge_key).and_then(|tris| tris.first()) else {
+                continue;
+            };
+            if mesh.face_ids.get(ti).copied().unwrap_or(0) != owner_fid {
+                continue;
+            }
+            if boundary_turn_is_collinear(mesh, prev, head, candidate) {
+                next = Some(candidate);
+                break;
+            }
+        }
+        let Some(next) = next else {
+            break;
+        };
+        if reverse {
+            chain.insert(0, next);
+        } else {
+            chain.push(next);
+        }
+    }
+}
+
+fn boundary_turn_is_collinear(mesh: &TriangleMesh, a: u32, b: u32, c: u32) -> bool {
+    let pa = mesh.vertices[a as usize];
+    let pb = mesh.vertices[b as usize];
+    let pc = mesh.vertices[c as usize];
+    let Some(ba) = (pa - pb).normalized() else {
+        return false;
+    };
+    let Some(bc) = (pc - pb).normalized() else {
+        return false;
+    };
+    GeomVec::from_dir(ba).dot(&GeomVec::from_dir(bc)).abs() > 0.999_999
+}
+
+fn chain_is_straight(mesh: &TriangleMesh, chain: &[u32]) -> bool {
+    if chain.len() < 3 {
+        return false;
+    }
+    let a = mesh.vertices[chain[0] as usize];
+    let b = mesh.vertices[*chain.last().unwrap() as usize];
+    let Some(dir) = (b - a).normalized() else {
+        return false;
+    };
+    chain
+        .iter()
+        .copied()
+        .all(|vi| point_line_distance_3d(mesh.vertices[vi as usize], a, dir) <= 1.0e-7)
+}
+
+fn point_line_distance_3d(p: Pnt, origin: Pnt, dir: openrcad_foundation::Dir) -> f64 {
+    let v = p - origin;
+    let along = GeomVec::from_dir(dir) * v.dot(&GeomVec::from_dir(dir));
+    (v - along).magnitude()
 }
 
 fn find_next_non_collapsed_u(
@@ -2016,7 +2237,17 @@ mod tests {
 
     #[test]
     fn uv_triangle_mesh_preserves_source_face_id() {
+        let surface = GeomSurface::plane(Plane::from_point_normal(Pnt::origin(), Dir::dz()));
+        let points_2d = vec![
+            Pnt2d::new(0.0, 0.0),
+            Pnt2d::new(1.0, 0.0),
+            Pnt2d::new(0.0, 1.0),
+            Pnt2d::new(1.0, 1.0),
+        ];
         let mesh = mesh_from_uv_tris(
+            &points_2d,
+            &surface,
+            true,
             vec![
                 Pnt::origin(),
                 Pnt::new(1.0, 0.0, 0.0),

@@ -17,10 +17,14 @@ pub const CIRCLE_SEGS: usize = 48;
 pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
-pub use parametric::{EdgeRef, ExtrudeMode, FeatureNode, FeatureType, ParametricGraph, Variable};
+pub use parametric::{
+    EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, ParametricGraph, TopologyEdgeRef,
+    Variable,
+};
 pub use sketch::{
-    build_sketch_curves, detect_regions, effective_curves, Circle, CornerKind, CornerMod,
-    Dimension, LineSegment, Region, SketchCurves, SketchShape,
+    build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves, Circle,
+    CornerKind, CornerMod, Dimension, LineSegment, Region, RegionProvenance,
+    RegionProvenanceFragment, RegionWithProvenance, SketchCurves, SketchShape,
 };
 pub use stl::{meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};

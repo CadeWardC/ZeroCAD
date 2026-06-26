@@ -8,6 +8,7 @@ use core::f64::consts::PI;
 use openrcad_algo::{boolean, chamfer_edges, fillet_edges, BooleanOp};
 use openrcad_foundation::{Ax2, Dir, Pnt};
 use openrcad_geom::{Curve, GeomSurface};
+use openrcad_mesh::tessellate;
 use openrcad_primitives::{make_box, make_cylinder};
 use openrcad_topo::{Edge, Face, Solid};
 
@@ -32,6 +33,13 @@ fn cut_body_seam_crossing() -> Solid {
     let axis = Ax2::new_axes(Pnt::new(10.0, 10.0, -1.0), Dir::dz(), xdir);
     let cyl = make_cylinder(&axis, 4.0, 12.0);
     boolean(&cube, &cyl, BooleanOp::Cut)
+}
+
+fn zerocad_circular_bite_body() -> Solid {
+    let base = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+    let axis = Ax2::new(Pnt::new(20.0, 8.0, -0.25), Dir::dz());
+    let cyl = make_cylinder(&axis, 14.0, 10.5);
+    boolean(&base, &cyl, BooleanOp::Cut)
 }
 
 fn has_sphere(s: &Solid) -> bool {
@@ -81,7 +89,6 @@ fn boundary_on_cut_cylinder(face: &Face, axis_xy: (f64, f64), radius: f64) -> bo
 }
 
 fn cracks(s: &Solid) -> usize {
-    use openrcad_mesh::tessellate;
     use std::collections::HashMap;
     let mesh = tessellate(s, 0.05, 0.5);
     let gpu = mesh.gpu_mesh();
@@ -104,6 +111,41 @@ fn cracks(s: &Solid) -> usize {
         }
     }
     edges.values().filter(|&&c| c == 1).count()
+}
+
+fn zerocad_non_cylinder_ghost_samples(s: &Solid) -> usize {
+    let mesh = tessellate(s, 0.05, 0.5);
+    let faces = s.shell().faces();
+    let inside_void = |p: Pnt| {
+        let r = ((p.x() - 20.0).powi(2) + (p.y() - 8.0).powi(2)).sqrt();
+        r < 13.0 && p.y() > 5.1 && (-0.05..=10.05).contains(&p.z())
+    };
+    let preserved_cut_cylinder = |fid: u32| {
+        matches!(
+            faces.get(fid as usize).and_then(|face| face.surface()),
+            Some(GeomSurface::Cylinder(c))
+                if c.position().direction().dot(&Dir::dz()).abs() > 0.999
+                    && (c.radius() - 14.0).abs() < 1e-3
+        )
+    };
+    let mut count = 0;
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        if preserved_cut_cylinder(mesh.face_ids.get(i).copied().unwrap_or(0)) {
+            continue;
+        }
+        let a = mesh.vertices[tri[0] as usize];
+        let b = mesh.vertices[tri[1] as usize];
+        let c = mesh.vertices[tri[2] as usize];
+        let p = Pnt::new(
+            (a.x() + b.x() + c.x()) / 3.0,
+            (a.y() + b.y() + c.y()) / 3.0,
+            (a.z() + b.z() + c.z()) / 3.0,
+        );
+        if inside_void(p) {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Test A — the bug: filleting a top edge into the cut must trim flush, leaving
@@ -270,4 +312,54 @@ fn chamfer_into_cut_trims_flush_and_keeps_cut_clean() {
             assert_eq!(cracks(&s), 0, "d={d}: result must tessellate crack-free");
         }
     }
+}
+
+#[test]
+fn zerocad_circular_bite_chamfer_into_cut_stays_analytic() {
+    let body = zerocad_circular_bite_body();
+    assert!(body.is_watertight(), "precondition: cut body is watertight");
+    assert!(
+        body.health_report().is_healthy(),
+        "precondition: cut body is healthy: {:?}",
+        body.health_report().errors
+    );
+
+    let x = 20.0 - (14.0_f64 * 14.0 - 3.0_f64 * 3.0).sqrt();
+    let edge = Edge::between_points(Pnt::new(0.0, 5.0, 10.0), Pnt::new(x, 5.0, 10.0));
+    let s = chamfer_edges(&body, std::slice::from_ref(&edge), 1.0)
+        .unwrap_or_else(|e| panic!("ZeroCAD circular-bite chamfer must succeed: {e:?}"));
+
+    assert!(s.is_watertight(), "result must be watertight");
+    assert!(
+        s.health_report().is_healthy(),
+        "result must be healthy: {:?}",
+        s.health_report().errors
+    );
+    assert_eq!(
+        zerocad_non_cylinder_ghost_samples(&s),
+        0,
+        "result must not tessellate material into the removed cylinder"
+    );
+
+    let cut_faces: Vec<_> = s
+        .shell()
+        .faces()
+        .into_iter()
+        .filter(|f| {
+            matches!(
+                f.surface(),
+                Some(GeomSurface::Cylinder(c))
+                    if c.position().direction().dot(&Dir::dz()).abs() > 0.999
+                        && (c.radius() - 14.0).abs() < 1e-3
+            )
+        })
+        .collect();
+    assert!(!cut_faces.is_empty(), "radius-14 cut wall must survive");
+    for cut in &cut_faces {
+        assert!(
+            boundary_on_cut_cylinder(cut, (20.0, 8.0), 14.0),
+            "the cut wall's boundary must stay on the cut cylinder"
+        );
+    }
+    assert_eq!(cracks(&s), 0, "result must tessellate crack-free");
 }

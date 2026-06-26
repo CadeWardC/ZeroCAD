@@ -349,9 +349,18 @@ fn fillet_three_edges_makes_spherical_corner() {
     // ball center C). Only the patch's own vertices have a radial normal; boundary
     // vertices shared with the cylinders are tangential (dot≈0) and skipped.
     let m = tessellate(&s, 0.05, 0.5).gpu_mesh();
+    let faces = s.shell().faces();
     let c = [(w - r) as f32, r as f32, (d - r) as f32];
     let (mut radial_pts, mut outward) = (0u32, 0u32);
     for i in 0..(m.positions.len() / 3) {
+        let tri = i / 3;
+        let fid = m.face_ids.get(tri).copied().unwrap_or(0);
+        if !matches!(
+            faces.get(fid as usize).and_then(|f| f.surface()),
+            Some(GeomSurface::Sphere(_))
+        ) {
+            continue;
+        }
         let to_c = [
             m.positions[3 * i] - c[0],
             m.positions[3 * i + 1] - c[1],

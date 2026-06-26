@@ -12,7 +12,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use openrcad::algo::{boolean_checked, chamfer_edges, fillet_edges, prism, BooleanOp};
+use openrcad::algo::{
+    apply_blend_contour, boolean_checked, prism, BlendContour, BlendCurveHint, BlendKind, BooleanOp,
+};
 use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
 use openrcad::mesh::tessellate;
@@ -25,6 +27,62 @@ use crate::geometry::Vec3;
 /// parametric evaluator can hold solids between features and combine them with
 /// boolean operations (join/cut) before tessellating to a `MockMesh`.
 pub type KernelSolid = Solid;
+
+/// Analytic curve metadata for a selected display edge.
+///
+/// Viewport wireframes are rendered as line segments, but selected-edge CAD
+/// operations need the original analytic curve when a group of segments is
+/// really one circular rim. This hint is intentionally small and serializable so
+/// parametric edge-mod features can persist the selected curve without storing
+/// kernel topology ids.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind")]
+pub enum EdgeCurveHint {
+    Line,
+    Circle {
+        center: [f32; 3],
+        axis: [f32; 3],
+        x_dir: [f32; 3],
+        radius: f32,
+        start: f32,
+        end: f32,
+        closed: bool,
+    },
+}
+
+/// Exact-ish selectable edge metadata aligned to a [`MockMesh::edge_groups`] id.
+///
+/// Wireframe segments are drawn as chords, but selection and later edge mods need
+/// one stable topological edge record: endpoints, adjacent normals, and the
+/// analytic curve when the selected group is a circular rim.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MeshEdgeRef {
+    pub group: u32,
+    pub p0: [f32; 3],
+    pub p1: [f32; 3],
+    pub n1: [f32; 3],
+    pub n2: [f32; 3],
+    #[serde(default)]
+    pub curve: Option<EdgeCurveHint>,
+    #[serde(default)]
+    pub topology: Option<MeshTopologyEdgeRef>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MeshTopologyEdgeRef {
+    #[serde(default)]
+    pub body_id: Option<String>,
+    #[serde(default)]
+    pub topology_version: Option<u64>,
+    #[serde(default)]
+    pub edge_id: Option<String>,
+    #[serde(default)]
+    pub adjacent_face_ids: Vec<String>,
+    #[serde(default)]
+    pub curve_kind: Option<String>,
+    #[serde(default)]
+    pub adjacent_surface_kinds: Vec<String>,
+}
 
 /// Tessellation chordal tolerance (in model units / mm). 0.05mm produces a
 /// smooth cylinder without explosive triangle counts. Will become a user-facing
@@ -62,6 +120,11 @@ pub struct MockMesh {
     /// legacy/cached meshes; consumers then fall back to per-segment selection.
     #[serde(default)]
     pub edge_groups: Vec<u32>,
+    /// One record per selectable edge group. New B-Rep tessellations populate
+    /// this so the GUI can pass exact topological edge data into EdgeMod instead
+    /// of re-inferring it from drawn chord segments.
+    #[serde(default)]
+    pub edge_refs: Vec<MeshEdgeRef>,
 }
 
 impl MockMesh {
@@ -74,6 +137,7 @@ impl MockMesh {
             edge_face_normals: Vec::new(),
             face_ids: Vec::new(),
             edge_groups: Vec::new(),
+            edge_refs: Vec::new(),
         }
     }
 
@@ -101,6 +165,7 @@ impl MockMesh {
             .reserve(other.edge_face_normals.len());
         self.face_ids.reserve(other.face_ids.len());
         self.edge_groups.reserve(other.edge_groups.len());
+        self.edge_refs.reserve(other.edge_refs.len());
 
         self.vertices.extend(other.vertices);
         for idx in other.indices {
@@ -117,6 +182,17 @@ impl MockMesh {
         for g in other.edge_groups {
             self.edge_groups.push(g + g_offset);
         }
+        for mut edge_ref in other.edge_refs {
+            let old_group = edge_ref.group;
+            edge_ref.group += g_offset;
+            if let Some(topology) = &mut edge_ref.topology {
+                let old_generated = format!("mesh:{old_group}");
+                if topology.edge_id.as_deref() == Some(old_generated.as_str()) {
+                    topology.edge_id = Some(format!("mesh:{}", edge_ref.group));
+                }
+            }
+            self.edge_refs.push(edge_ref);
+        }
     }
 
     /// Axis-aligned box with one corner at the origin, opposite corner at (w, h, d).
@@ -127,6 +203,12 @@ impl MockMesh {
 
         let (edge_vertices, edge_indices, edge_face_normals) = build_box_wireframe(w, h, d);
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
+        let edge_refs = mesh_edge_refs_from_groups(
+            &edge_vertices,
+            &edge_indices,
+            &edge_face_normals,
+            &edge_groups,
+        );
 
         Self {
             vertices,
@@ -136,6 +218,7 @@ impl MockMesh {
             edge_face_normals,
             face_ids,
             edge_groups,
+            edge_refs,
         }
     }
 
@@ -151,6 +234,12 @@ impl MockMesh {
         let (edge_vertices, edge_indices, edge_face_normals) =
             build_cylinder_wireframe(r, h, segments.max(4));
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
+        let edge_refs = mesh_edge_refs_from_groups(
+            &edge_vertices,
+            &edge_indices,
+            &edge_face_normals,
+            &edge_groups,
+        );
 
         Self {
             vertices,
@@ -160,6 +249,7 @@ impl MockMesh {
             edge_face_normals,
             face_ids,
             edge_groups,
+            edge_refs,
         }
     }
 
@@ -212,6 +302,12 @@ impl MockMesh {
             None => build_extrusion_wireframe(points, holes, depth, cs),
         };
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
+        let edge_refs = mesh_edge_refs_from_groups(
+            &edge_vertices,
+            &edge_indices,
+            &edge_face_normals,
+            &edge_groups,
+        );
 
         Self {
             vertices,
@@ -221,6 +317,7 @@ impl MockMesh {
             edge_face_normals,
             face_ids,
             edge_groups,
+            edge_refs,
         }
     }
 
@@ -259,6 +356,12 @@ impl MockMesh {
         // a cylinder split into arc-faces still reads as one). This is what lets the
         // viewport select a fillet arc — or a full circular rim — as one curve.
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, Some(&edge_pairs));
+        let edge_refs = mesh_edge_refs_from_groups(
+            &edge_vertices,
+            &edge_indices,
+            &edge_face_normals,
+            &edge_groups,
+        );
         Self {
             vertices,
             indices,
@@ -267,6 +370,7 @@ impl MockMesh {
             edge_face_normals,
             face_ids,
             edge_groups,
+            edge_refs,
         }
     }
 }
@@ -331,8 +435,253 @@ pub fn extruded_region_solid(
     if points.len() < 3 || depth.abs() < f32::EPSILON {
         return None;
     }
+    if let Some(solid) = rect_minus_circle_region_solid(points, holes, depth, cs) {
+        return Some(solid);
+    }
     build_extrusion_solid(points, holes, depth as f64, cs, true)
         .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs, true))
+}
+
+/// Boolean fallback solid for one extruded sketch region, keeping the sampled
+/// sketch polyline instead of reconstructing arcs into analytic cylinders.
+///
+/// The normal sketch-solid path above is preferred because it gives circular
+/// cutouts true cylindrical topology. This faceted twin is only for emergency
+/// edge-mod fallbacks where a cutter runout meets that cylindrical wall and the
+/// boolean solver rejects the tangent analytic topology outright.
+pub fn extruded_region_faceted_solid(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<KernelSolid> {
+    if points.len() < 3 || depth.abs() < f32::EPSILON {
+        return None;
+    }
+    build_extrusion_solid(points, holes, depth as f64, cs, false)
+        .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs, false))
+}
+
+/// Canonical solid for a sketch region that is exactly a rectangle with one
+/// circular side bite. This matches the user-visible box-minus-cylinder workflow:
+/// build the rectangular prism first, then subtract an analytic cylinder.
+pub fn rect_minus_circle_region_solid(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<KernelSolid> {
+    let (base, cutter) = rect_minus_circle_region_base_and_cutter(points, holes, depth, cs)?;
+    difference(&base, &cutter)
+}
+
+/// Return the rectangular prism and analytic cylinder cutter for an unambiguous
+/// rectangle-minus-circle sketch region.
+pub fn rect_minus_circle_region_base_and_cutter(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<(KernelSolid, KernelSolid)> {
+    rect_minus_circle_region_base_and_cutter_with_grow(points, holes, depth, cs, 0.0)
+}
+
+pub fn rect_minus_circle_region_base_and_grown_cutter(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+    radius_grow: f32,
+) -> Option<(KernelSolid, KernelSolid)> {
+    rect_minus_circle_region_base_and_cutter_with_grow(points, holes, depth, cs, radius_grow)
+}
+
+/// Return the rectangular prism and analytic cylinder cutter from the original
+/// sketch primitives, avoiding the brittle "recover the circle from the sampled
+/// region boundary" path used for generic fallback recognition.
+pub fn rect_circle_base_and_cutter_from_primitives(
+    rect_min: (f32, f32),
+    rect_max: (f32, f32),
+    circle_center: (f32, f32),
+    circle_radius: f32,
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+    radius_grow: f32,
+) -> Option<(KernelSolid, KernelSolid)> {
+    let (min_x, max_x) = if rect_min.0 <= rect_max.0 {
+        (rect_min.0, rect_max.0)
+    } else {
+        (rect_max.0, rect_min.0)
+    };
+    let (min_y, max_y) = if rect_min.1 <= rect_max.1 {
+        (rect_min.1, rect_max.1)
+    } else {
+        (rect_max.1, rect_min.1)
+    };
+    if max_x - min_x <= 1.0e-3
+        || max_y - min_y <= 1.0e-3
+        || circle_radius <= 1.0e-3
+        || depth.abs() < f32::EPSILON
+    {
+        return None;
+    }
+
+    let rect = vec![
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ];
+    let base = build_extrusion_solid(&rect, &[], depth as f64, cs, true)?;
+
+    let sign = if depth < 0.0 { -1.0 } else { 1.0 };
+    let overshoot = 0.25;
+    let cut_cs = crate::geometry::CoordinateSystem::new(
+        cs.origin.add(cs.n.mul(-sign * overshoot)),
+        cs.u,
+        cs.v,
+    );
+    let cylinder_profile = circle_loop_2d(circle_center, circle_radius + radius_grow.max(0.0));
+    let cutter = circular_cylinder_tool(
+        &cylinder_profile,
+        &[],
+        depth + sign * 2.0 * overshoot,
+        &cut_cs,
+    )?;
+    Some((base, cutter))
+}
+
+fn rect_minus_circle_region_base_and_cutter_with_grow(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+    radius_grow: f32,
+) -> Option<(KernelSolid, KernelSolid)> {
+    if !holes.is_empty() || points.len() < 8 || depth.abs() < f32::EPSILON {
+        return None;
+    }
+
+    let ((min_x, min_y), (max_x, max_y)) = loop_bounds_2d(points)?;
+    if max_x - min_x <= 1.0e-3 || max_y - min_y <= 1.0e-3 {
+        return None;
+    }
+
+    let on_rect_side = |p: (f32, f32)| {
+        const SIDE_EPS: f32 = 0.08;
+        (p.0 - min_x).abs() <= SIDE_EPS
+            || (p.0 - max_x).abs() <= SIDE_EPS
+            || (p.1 - min_y).abs() <= SIDE_EPS
+            || (p.1 - max_y).abs() <= SIDE_EPS
+    };
+
+    let arc_pts: Vec<(f32, f32)> = points
+        .iter()
+        .copied()
+        .filter(|&p| !on_rect_side(p))
+        .collect();
+    if arc_pts.len() < 5 {
+        return None;
+    }
+
+    let (cx, cy, r) = circle_from_three_points_2d(
+        arc_pts[0],
+        arc_pts[arc_pts.len() / 2],
+        arc_pts[arc_pts.len() - 1],
+    )?;
+    if !cx.is_finite() || !cy.is_finite() || !r.is_finite() || r <= 1.0e-3 {
+        return None;
+    }
+
+    let circle_tol = (0.02 * r).max(0.12);
+    let near_circle = |p: (f32, f32)| ((p.0 - cx).hypot(p.1 - cy) - r).abs() <= circle_tol;
+    if arc_pts.iter().filter(|&&p| near_circle(p)).count() < arc_pts.len() * 3 / 4 {
+        return None;
+    }
+
+    // Require the circular run to enter and leave through the same rectangle
+    // side. Rounded rectangle corners touch two different sides and should keep
+    // the normal arc-reconstructed extrusion path.
+    let side_hit_count = |side: usize| -> usize {
+        points
+            .iter()
+            .filter(|&&p| {
+                let on_side = match side {
+                    0 => (p.0 - min_x).abs() <= 0.08,
+                    1 => (p.0 - max_x).abs() <= 0.08,
+                    2 => (p.1 - min_y).abs() <= 0.08,
+                    _ => (p.1 - max_y).abs() <= 0.08,
+                };
+                on_side && near_circle(p)
+            })
+            .count()
+    };
+    if (0..4).map(side_hit_count).max().unwrap_or(0) < 2 {
+        return None;
+    }
+
+    rect_circle_base_and_cutter_from_primitives(
+        (min_x, min_y),
+        (max_x, max_y),
+        (cx, cy),
+        r,
+        depth,
+        cs,
+        radius_grow,
+    )
+}
+
+/// Display mesh for one extruded sketch region. Plain polygon profiles keep the
+/// lightweight analytic-prism mesh, while profiles containing reconstructed
+/// circular arcs render from the same B-Rep solid used for booleans so the
+/// viewport matches a box-minus-cylinder cutout.
+pub fn extruded_region_display_mesh(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> MockMesh {
+    if points.len() < 3 || depth.abs() < f32::EPSILON {
+        return MockMesh::empty();
+    }
+
+    // Full circles already have a dedicated oriented-cylinder display path with
+    // clean rim wireframes.
+    if holes.is_empty() && circle_profile(points).is_some() {
+        return MockMesh::make_extruded_sketch(points, holes, depth, cs);
+    }
+
+    if let Some(solid) = rect_minus_circle_region_solid(points, holes, depth, cs) {
+        let mesh = MockMesh::from_solid(&solid);
+        if !mesh.indices.is_empty()
+            && render_mesh_normals_follow_winding(&mesh)
+            && render_mesh_is_closed_manifold(&mesh)
+        {
+            return mesh;
+        }
+    }
+
+    if profile_has_reconstructable_arcs(points, holes) {
+        if let Some(solid) = build_extrusion_solid(points, holes, depth as f64, cs, true) {
+            if solid_has_cylindrical_face(&solid) {
+                let mesh = MockMesh::from_solid(&solid);
+                let needs_clean_fallback = !holes.is_empty() || loop_is_concave(points);
+                if !mesh.indices.is_empty()
+                    && render_mesh_normals_follow_winding(&mesh)
+                    && (!needs_clean_fallback || render_mesh_is_closed_manifold(&mesh))
+                {
+                    return mesh;
+                }
+            }
+        }
+    }
+
+    let mut mesh = MockMesh::make_extruded_sketch(points, holes, depth, cs);
+    if profile_has_reconstructable_arcs(points, holes) {
+        let targets = arc_display_targets(points, holes);
+        apply_arc_display_targets(&mut mesh, &targets, cs);
+    }
+    mesh
 }
 
 /// Build the **cutter solid** for a 3D edge fillet/chamfer: subtract it from a
@@ -368,6 +717,84 @@ pub fn edge_corner_cutter(
     grow: f32,
     end_overshoot: f32,
 ) -> Option<KernelSolid> {
+    let profile =
+        edge_corner_cutter_profile(p0, p1, n1, n2, dist, fillet, segments, grow, end_overshoot)?;
+    // Edge-mod cutters must remain faceted for boolean robustness. Sketch
+    // extrusion solids reconstruct arcs into analytic cylinders, which is right
+    // for circular cutout bodies but too fragile for subtracting the cutter back
+    // into tangent curved walls.
+    build_extrusion_solid(
+        &profile.loop_pts,
+        &[],
+        profile.depth as f64,
+        &profile.cs,
+        false,
+    )
+}
+
+/// Build a fillet fallback as a fan of convex triangular cutters. Subtracting
+/// the pieces one by one is more robust than subtracting one rounded cutter when
+/// the selected edge runs into a tangent curved wall.
+#[allow(clippy::too_many_arguments)]
+pub fn edge_corner_cutter_pieces(
+    p0: [f32; 3],
+    p1: [f32; 3],
+    n1: [f32; 3],
+    n2: [f32; 3],
+    dist: f32,
+    fillet: bool,
+    segments: usize,
+    grow: f32,
+    end_overshoot: f32,
+) -> Option<Vec<KernelSolid>> {
+    let profile =
+        edge_corner_cutter_profile(p0, p1, n1, n2, dist, fillet, segments, grow, end_overshoot)?;
+
+    if !fillet || profile.loop_pts.len() <= 3 {
+        return edge_corner_cutter(p0, p1, n1, n2, dist, fillet, segments, grow, end_overshoot)
+            .map(|solid| vec![solid]);
+    }
+
+    let corner = profile.loop_pts[0];
+    let mut pieces = Vec::new();
+    for pair in profile.loop_pts[1..].windows(2) {
+        let tri = [corner, pair[0], pair[1]];
+        let area = ((tri[0].0 * (tri[1].1 - tri[2].1)
+            + tri[1].0 * (tri[2].1 - tri[0].1)
+            + tri[2].0 * (tri[0].1 - tri[1].1))
+            * 0.5)
+            .abs();
+        if area <= 1.0e-6 {
+            continue;
+        }
+        if let Some(solid) =
+            build_extrusion_solid(&tri, &[], profile.depth as f64, &profile.cs, false)
+        {
+            pieces.push(solid);
+        }
+    }
+
+    (!pieces.is_empty()).then_some(pieces)
+}
+
+struct EdgeCutterProfile {
+    loop_pts: Vec<(f32, f32)>,
+    cs: crate::geometry::CoordinateSystem,
+    depth: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edge_corner_cutter_profile(
+    p0: [f32; 3],
+    p1: [f32; 3],
+    n1: [f32; 3],
+    n2: [f32; 3],
+    dist: f32,
+    fillet: bool,
+    segments: usize,
+    grow: f32,
+    end_overshoot: f32,
+) -> Option<EdgeCutterProfile> {
     use crate::geometry::{CoordinateSystem, Vec3};
 
     if dist <= 1.0e-4 {
@@ -481,7 +908,11 @@ pub fn edge_corner_cutter(
         loop_pts = offset_polygon_outward(&loop_pts, grow);
     }
 
-    extruded_region_solid(&loop_pts, &[], len + 2.0 * end_overshoot, &cs)
+    Some(EdgeCutterProfile {
+        loop_pts,
+        cs,
+        depth: len + 2.0 * end_overshoot,
+    })
 }
 
 /// Offset a simple **CCW** polygon outward by `grow`, the robust way: slide every
@@ -579,6 +1010,55 @@ fn circle_profile(points: &[(f32, f32)]) -> Option<(f32, f32, f32)> {
         .iter()
         .all(|d| (d - r).abs() <= 0.02 * r)
         .then_some((cx, cy, r))
+}
+
+fn loop_bounds_2d(points: &[(f32, f32)]) -> Option<((f32, f32), (f32, f32))> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut any = false;
+    for &(x, y) in points {
+        any = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    any.then_some(((min_x, min_y), (max_x, max_y)))
+}
+
+fn circle_from_three_points_2d(
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+) -> Option<(f32, f32, f32)> {
+    let ax = a.0 as f64;
+    let ay = a.1 as f64;
+    let bx = b.0 as f64;
+    let by = b.1 as f64;
+    let cx = c.0 as f64;
+    let cy = c.1 as f64;
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if d.abs() <= 1.0e-9 {
+        return None;
+    }
+    let a2 = ax * ax + ay * ay;
+    let b2 = bx * bx + by * by;
+    let c2 = cx * cx + cy * cy;
+    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let r = ((ux - ax).powi(2) + (uy - ay).powi(2)).sqrt();
+    Some((ux as f32, uy as f32, r as f32))
+}
+
+fn circle_loop_2d(center: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
+    (0..crate::CIRCLE_SEGS)
+        .map(|i| {
+            let a = (i as f32 / crate::CIRCLE_SEGS as f32) * std::f32::consts::TAU;
+            (center.0 + radius * a.cos(), center.1 + radius * a.sin())
+        })
+        .collect()
 }
 
 /// A real cylinder: a circular face of radius `r` centred at `(cu, cv)` on the
@@ -796,10 +1276,159 @@ pub fn fillet_edge(
     p1: [f32; 3],
     radius: f32,
 ) -> Result<KernelSolid, String> {
+    fillet_edge_with_hint(solid, p0, p1, None, radius)
+}
+
+pub fn fillet_edge_with_hint(
+    solid: &KernelSolid,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    curve: Option<&EdgeCurveHint>,
+    radius: f32,
+) -> Result<KernelSolid, String> {
+    if let Some(hint @ EdgeCurveHint::Circle { .. }) = curve {
+        let chain = circle_edge_requests(solid, hint).ok_or_else(|| {
+            "curved circular-rim fillet could not be matched to the body topology".to_string()
+        })?;
+        if chain.len() == 1 {
+            let contour = BlendContour::constant(
+                chain,
+                BlendKind::Fillet,
+                radius as f64,
+                Some(BlendCurveHint::Circle),
+            );
+            return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
+        }
+        let contour = BlendContour::constant(
+            chain,
+            BlendKind::Fillet,
+            radius as f64,
+            Some(BlendCurveHint::Circle),
+        );
+        return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
+    }
+
     let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
     let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
     let e = Edge::between_points(a, b);
-    fillet_edges(solid, std::slice::from_ref(&e), radius as f64).map_err(|err| err.to_string())
+    let contour = BlendContour::constant(vec![e], BlendKind::Fillet, radius as f64, None);
+    apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
+}
+
+#[allow(dead_code)]
+fn circle_edge_requests(solid: &KernelSolid, hint: &EdgeCurveHint) -> Option<Vec<Edge>> {
+    let EdgeCurveHint::Circle {
+        center,
+        axis,
+        x_dir,
+        radius,
+        start,
+        end,
+        closed,
+    } = *hint
+    else {
+        return None;
+    };
+    if radius <= 1.0e-5 {
+        return None;
+    }
+
+    let mut matching = Vec::new();
+    for edge in solid.edges() {
+        let Some(GeomCurve::Circle(circle)) = edge.curve() else {
+            continue;
+        };
+        if !circle_matches_hint(circle, center, axis, radius) {
+            continue;
+        }
+        if closed
+            || circle_edge_midpoint_in_span(&edge, center, axis, x_dir, start as f64, end as f64)
+        {
+            matching.push(edge);
+        }
+    }
+    matching.sort_by(|a, b| {
+        a.first()
+            .partial_cmp(&b.first())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (!matching.is_empty()).then_some(matching)
+}
+
+fn circle_matches_hint(circle: &Circle, center: [f32; 3], axis: [f32; 3], radius: f32) -> bool {
+    let c = circle.center();
+    let dc = ((c.x() - center[0] as f64).powi(2)
+        + (c.y() - center[1] as f64).powi(2)
+        + (c.z() - center[2] as f64).powi(2))
+    .sqrt();
+    let r = radius as f64;
+    if dc > (0.002 * r).max(1.0e-3) || (circle.radius() - r).abs() > (0.002 * r).max(1.0e-3) {
+        return false;
+    }
+    let a = GeomVec::from_dir(circle.axis());
+    let b = GeomVec::new(axis[0] as f64, axis[1] as f64, axis[2] as f64);
+    let bl = b.magnitude();
+    bl > 1.0e-9 && (a.dot(&b) / bl).abs() > 0.999
+}
+
+fn circle_edge_midpoint_in_span(
+    edge: &Edge,
+    center: [f32; 3],
+    axis: [f32; 3],
+    x_dir: [f32; 3],
+    start: f64,
+    end: f64,
+) -> bool {
+    let Some(GeomCurve::Circle(circle)) = edge.curve() else {
+        return false;
+    };
+    let mid = circle.point((edge.first() + edge.last()) * 0.5);
+    let Some(angle) = hint_circle_angle(mid, center, axis, x_dir) else {
+        return false;
+    };
+    angle_in_span(angle, start, end, 0.05)
+}
+
+fn normalized_dir(v: [f32; 3]) -> Option<Dir> {
+    let l = ((v[0] as f64).powi(2) + (v[1] as f64).powi(2) + (v[2] as f64).powi(2)).sqrt();
+    (l > 1.0e-9).then(|| Dir::new(v[0] as f64 / l, v[1] as f64 / l, v[2] as f64 / l))
+}
+
+fn hint_circle_angle(point: Pnt, center: [f32; 3], axis: [f32; 3], x_dir: [f32; 3]) -> Option<f64> {
+    let c = Pnt::new(center[0] as f64, center[1] as f64, center[2] as f64);
+    let axis = GeomVec::from_dir(normalized_dir(axis)?);
+    let mut x = GeomVec::from_dir(normalized_dir(x_dir)?);
+    x = x - axis * x.dot(&axis);
+    let x = GeomVec::from_dir(x.normalized()?);
+    let y = axis.cross(&x);
+    let v = point - c;
+    Some(v.dot(&y).atan2(v.dot(&x)))
+}
+
+fn angle_in_span(angle: f64, start: f64, end: f64, tol: f64) -> bool {
+    let span = end - start;
+    if span.abs() >= std::f64::consts::TAU - tol {
+        return true;
+    }
+    if span >= 0.0 {
+        let mut rel = angle - start;
+        while rel < -tol {
+            rel += std::f64::consts::TAU;
+        }
+        while rel > std::f64::consts::TAU + tol {
+            rel -= std::f64::consts::TAU;
+        }
+        rel <= span + tol
+    } else {
+        let mut rel = start - angle;
+        while rel < -tol {
+            rel += std::f64::consts::TAU;
+        }
+        while rel > std::f64::consts::TAU + tol {
+            rel -= std::f64::consts::TAU;
+        }
+        rel <= -span + tol
+    }
 }
 
 /// Bevel the edge running from `p0` to `p1` of `solid` by `distance`, using the
@@ -813,7 +1442,8 @@ pub fn chamfer_edge(
     let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
     let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
     let e = Edge::between_points(a, b);
-    chamfer_edges(solid, std::slice::from_ref(&e), distance as f64).map_err(|err| err.to_string())
+    let contour = BlendContour::constant(vec![e], BlendKind::Chamfer, distance as f64, None);
+    apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
 }
 
 /// Axis-aligned bounding box of a solid from its B-Rep vertices, as
@@ -886,6 +1516,574 @@ const ARC_MAX_TURN: f64 = 0.40;
 /// Minimum count of consecutive co-circular interior vertices for a run to count
 /// as an arc, so a stray pair of points can't masquerade as one.
 const ARC_MIN_RUN: usize = 3;
+
+pub fn solid_has_cylindrical_face(solid: &KernelSolid) -> bool {
+    solid
+        .shell()
+        .faces()
+        .iter()
+        .any(|face| matches!(face.surface(), Some(GeomSurface::Cylinder(_))))
+}
+
+pub fn preserves_cylindrical_faces(reference: &KernelSolid, candidate: &KernelSolid) -> bool {
+    let reference = cylinder_identity_signatures(reference);
+    if reference.is_empty() {
+        return true;
+    }
+    let candidate = cylinder_identity_signatures(candidate);
+    reference
+        .iter()
+        .all(|sig| candidate.iter().any(|cand| cand == sig))
+}
+
+pub fn preserved_cylindrical_face_ids(
+    reference: &KernelSolid,
+    candidate: &KernelSolid,
+) -> std::collections::HashSet<u32> {
+    let reference = cylinder_identity_signatures(reference);
+    if reference.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let mut out = std::collections::HashSet::new();
+    for (i, face) in candidate.shell().faces().iter().enumerate() {
+        let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
+            continue;
+        };
+        if reference
+            .iter()
+            .any(|sig| *sig == cylinder_identity_signature(cyl))
+        {
+            out.insert(i as u32);
+        }
+    }
+    out
+}
+
+fn cylinder_identity_signatures(solid: &KernelSolid) -> Vec<(i64, i64, i64, i64, i64, i64, i64)> {
+    let mut out = Vec::new();
+    for face in solid.shell().faces() {
+        let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
+            continue;
+        };
+        let sig = cylinder_identity_signature(cyl);
+        if !out.contains(&sig) {
+            out.push(sig);
+        }
+    }
+    out
+}
+
+fn cylinder_identity_signature(cyl: &CylindricalSurface) -> (i64, i64, i64, i64, i64, i64, i64) {
+    let q = |v: f64| (v * 1.0e4).round() as i64;
+    let p = cyl.position();
+    let d = p.direction();
+    let (mut dx, mut dy, mut dz) = (d.x(), d.y(), d.z());
+    let lead = if dx.abs() > 1e-9 {
+        dx
+    } else if dy.abs() > 1e-9 {
+        dy
+    } else {
+        dz
+    };
+    if lead < 0.0 {
+        dx = -dx;
+        dy = -dy;
+        dz = -dz;
+    }
+    let loc = p.location();
+    let t = loc.x() * dx + loc.y() * dy + loc.z() * dz;
+    let (fx, fy, fz) = (loc.x() - dx * t, loc.y() - dy * t, loc.z() - dz * t);
+    (q(fx), q(fy), q(fz), q(dx), q(dy), q(dz), q(cyl.radius()))
+}
+
+fn render_mesh_is_closed_manifold(mesh: &MockMesh) -> bool {
+    let q = |i: usize| -> (i64, i64, i64) {
+        let b = i * 6;
+        let quant = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (
+            quant(mesh.vertices[b]),
+            quant(mesh.vertices[b + 1]),
+            quant(mesh.vertices[b + 2]),
+        )
+    };
+    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+            let (ka, kb) = (q(tri[a] as usize), q(tri[b] as usize));
+            let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+    edges.values().all(|&count| count == 2)
+}
+
+fn render_mesh_normals_follow_winding(mesh: &MockMesh) -> bool {
+    for tri in mesh.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            let b = i as usize * 6;
+            [
+                mesh.vertices[b] as f64,
+                mesh.vertices[b + 1] as f64,
+                mesh.vertices[b + 2] as f64,
+            ]
+        };
+        let n = |i: u32| {
+            let b = i as usize * 6;
+            [
+                mesh.vertices[b + 3] as f64,
+                mesh.vertices[b + 4] as f64,
+                mesh.vertices[b + 5] as f64,
+            ]
+        };
+        let a = p(tri[0]);
+        let b = p(tri[1]);
+        let c = p(tri[2]);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let winding = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let navg = [
+            (n(tri[0])[0] + n(tri[1])[0] + n(tri[2])[0]) / 3.0,
+            (n(tri[0])[1] + n(tri[1])[1] + n(tri[2])[1]) / 3.0,
+            (n(tri[0])[2] + n(tri[1])[2] + n(tri[2])[2]) / 3.0,
+        ];
+        if winding[0] * navg[0] + winding[1] * navg[1] + winding[2] * navg[2] < -1.0e-7 {
+            return false;
+        }
+    }
+    true
+}
+
+fn loop_is_concave(loop_pts: &[(f32, f32)]) -> bool {
+    if loop_pts.len() < 4 {
+        return false;
+    }
+    let pts: Vec<(f64, f64)> = loop_pts
+        .iter()
+        .map(|&(x, y)| (x as f64, y as f64))
+        .collect();
+    let area = pts
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let q = pts[(i + 1) % pts.len()];
+            p.0 * q.1 - p.1 * q.0
+        })
+        .sum::<f64>();
+    let winding = area.signum();
+    if winding == 0.0 {
+        return false;
+    }
+
+    for i in 0..pts.len() {
+        let a = pts[(i + pts.len() - 1) % pts.len()];
+        let b = pts[i];
+        let c = pts[(i + 1) % pts.len()];
+        let ab = (b.0 - a.0, b.1 - a.1);
+        let bc = (c.0 - b.0, c.1 - b.1);
+        let cross = ab.0 * bc.1 - ab.1 * bc.0;
+        if cross * winding < -1.0e-7 {
+            return true;
+        }
+    }
+    false
+}
+
+fn profile_has_reconstructable_arcs(points: &[(f32, f32)], holes: &[Vec<(f32, f32)>]) -> bool {
+    loop_has_reconstructable_arcs(points) || holes.iter().any(|h| loop_has_reconstructable_arcs(h))
+}
+
+fn loop_has_reconstructable_arcs(loop_pts: &[(f32, f32)]) -> bool {
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_pts.len());
+    for &(u, v) in loop_pts {
+        let p = (u as f64, v as f64);
+        if pts
+            .last()
+            .is_none_or(|q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 1e-7)
+        {
+            pts.push(p);
+        }
+    }
+    if pts.len() >= 2 {
+        let (first, last) = (pts[0], *pts.last().unwrap());
+        if (first.0 - last.0).hypot(first.1 - last.1) <= 1e-7 {
+            pts.pop();
+        }
+    }
+
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+
+    let arc_vert: Vec<Option<(f64, f64, f64)>> = (0..n)
+        .map(|i| {
+            let prev = pts[(i + n - 1) % n];
+            let cur = pts[i];
+            let next = pts[(i + 1) % n];
+            if turn_angle_2d(prev, cur, next) > ARC_MAX_TURN {
+                return None;
+            }
+            circumcircle_2d(prev, cur, next)
+        })
+        .collect();
+
+    match arc_vert.iter().position(|a| a.is_none()) {
+        Some(off) => {
+            let ra: Vec<Option<(f64, f64, f64)>> =
+                (0..n).map(|i| arc_vert[(i + off) % n]).collect();
+            let mut i = 1;
+            while i < n {
+                let Some(_) = ra[i] else {
+                    i += 1;
+                    continue;
+                };
+                let mut j = i;
+                while j < n - 1 {
+                    match (ra[j], ra[j + 1]) {
+                        (Some(a), Some(b)) if same_circle(a, b) => j += 1,
+                        _ => break,
+                    }
+                }
+                if j - i + 1 >= ARC_MIN_RUN {
+                    return true;
+                }
+                i = j + 1;
+            }
+            false
+        }
+        None => {
+            let avg = {
+                let (mut sx, mut sy, mut sr) = (0.0, 0.0, 0.0);
+                for c in arc_vert.iter().flatten() {
+                    sx += c.0;
+                    sy += c.1;
+                    sr += c.2;
+                }
+                (sx / n as f64, sy / n as f64, sr / n as f64)
+            };
+            arc_vert.iter().flatten().all(|c| same_circle(*c, avg))
+        }
+    }
+}
+
+fn arc_display_targets(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+) -> HashMap<(i64, i64), (f64, f64)> {
+    let mut targets = HashMap::new();
+    add_arc_display_targets(points, &mut targets);
+    for h in holes {
+        add_arc_display_targets(h, &mut targets);
+    }
+    targets
+}
+
+fn add_arc_display_targets(loop_pts: &[(f32, f32)], targets: &mut HashMap<(i64, i64), (f64, f64)>) {
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_pts.len());
+    for &(u, v) in loop_pts {
+        let p = (u as f64, v as f64);
+        if pts
+            .last()
+            .is_none_or(|q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 1e-7)
+        {
+            pts.push(p);
+        }
+    }
+    if pts.len() >= 2 {
+        let (first, last) = (pts[0], *pts.last().unwrap());
+        if (first.0 - last.0).hypot(first.1 - last.1) <= 1e-7 {
+            pts.pop();
+        }
+    }
+
+    let n = pts.len();
+    if n < 3 {
+        return;
+    }
+
+    let arc_vert: Vec<Option<(f64, f64, f64)>> = (0..n)
+        .map(|i| {
+            let prev = pts[(i + n - 1) % n];
+            let cur = pts[i];
+            let next = pts[(i + 1) % n];
+            if turn_angle_2d(prev, cur, next) > ARC_MAX_TURN {
+                return None;
+            }
+            circumcircle_2d(prev, cur, next)
+        })
+        .collect();
+
+    let key = |p: (f64, f64)| -> (i64, i64) {
+        (
+            (p.0 * 10_000.0).round() as i64,
+            (p.1 * 10_000.0).round() as i64,
+        )
+    };
+
+    match arc_vert.iter().position(|a| a.is_none()) {
+        Some(off) => {
+            let rp: Vec<(f64, f64)> = (0..n).map(|i| pts[(i + off) % n]).collect();
+            let ra: Vec<Option<(f64, f64, f64)>> =
+                (0..n).map(|i| arc_vert[(i + off) % n]).collect();
+            let mut i = 1;
+            while i < n {
+                let Some(ci) = ra[i] else {
+                    i += 1;
+                    continue;
+                };
+                let mut j = i;
+                while j < n - 1 {
+                    match (ra[j], ra[j + 1]) {
+                        (Some(a), Some(b)) if same_circle(a, b) => j += 1,
+                        _ => break,
+                    }
+                }
+                if j - i + 1 >= ARC_MIN_RUN {
+                    let (cs_v, ce_v) = (i - 1, j + 1);
+                    let mid = (cs_v + ce_v) / 2;
+                    let circ =
+                        circumcircle_2d(rp[cs_v % n], rp[mid % n], rp[ce_v % n]).unwrap_or(ci);
+                    for k in (cs_v + 1)..ce_v {
+                        targets.insert(key(rp[k % n]), (circ.0, circ.1));
+                    }
+                }
+                i = j + 1;
+            }
+        }
+        None => {
+            let avg = {
+                let (mut sx, mut sy, mut sr) = (0.0, 0.0, 0.0);
+                for c in arc_vert.iter().flatten() {
+                    sx += c.0;
+                    sy += c.1;
+                    sr += c.2;
+                }
+                (sx / n as f64, sy / n as f64, sr / n as f64)
+            };
+            if arc_vert.iter().flatten().all(|c| same_circle(*c, avg)) {
+                for &p in &pts {
+                    targets.insert(key(p), (avg.0, avg.1));
+                }
+            }
+        }
+    }
+}
+
+fn apply_arc_display_targets(
+    mesh: &mut MockMesh,
+    targets: &HashMap<(i64, i64), (f64, f64)>,
+    cs: &crate::geometry::CoordinateSystem,
+) {
+    if targets.is_empty() {
+        return;
+    }
+
+    let key = |u: f32, v: f32| -> (i64, i64) {
+        (
+            (u as f64 * 10_000.0).round() as i64,
+            (v as f64 * 10_000.0).round() as i64,
+        )
+    };
+    let circle_candidates: Vec<((f64, f64), f64)> = targets
+        .iter()
+        .filter_map(|(&(ku, kv), &(cu, cv))| {
+            let u = ku as f64 / 10_000.0;
+            let v = kv as f64 / 10_000.0;
+            let r = (u - cu).hypot(v - cv);
+            (r > 1e-9).then_some(((cu, cv), r))
+        })
+        .collect();
+
+    for vtx in mesh.vertices.chunks_exact_mut(6) {
+        let p = Vec3::new(vtx[0], vtx[1], vtx[2]);
+        let (u, v) = cs.project(p);
+        let center = targets.get(&key(u, v)).copied().or_else(|| {
+            circle_candidates.iter().find_map(|&((cu, cv), r)| {
+                let d = (u as f64 - cu).hypot(v as f64 - cv);
+                ((d - r).abs() <= (0.02 * r).max(0.05)).then_some((cu, cv))
+            })
+        });
+        let Some((cu, cv)) = center else {
+            continue;
+        };
+        let current = Vec3::new(vtx[3], vtx[4], vtx[5]);
+        if current.dot(cs.n).abs() > 0.5 {
+            continue;
+        }
+        let du = u as f64 - cu;
+        let dv = v as f64 - cv;
+        let len = du.hypot(dv);
+        if len <= 1e-9 {
+            continue;
+        }
+        let mut radial =
+            cs.u.mul((du / len) as f32)
+                .add(cs.v.mul((dv / len) as f32))
+                .normalize();
+        let radial_dot = current.dot(radial);
+        if radial_dot.abs() < 0.90 {
+            continue;
+        }
+        if radial_dot < 0.0 {
+            radial = radial.mul(-1.0);
+        }
+        vtx[3] = radial.x;
+        vtx[4] = radial.y;
+        vtx[5] = radial.z;
+    }
+
+    merge_arc_wall_face_ids(mesh, &circle_candidates, cs);
+    suppress_arc_internal_struts(mesh, targets, cs);
+}
+
+fn merge_arc_wall_face_ids(
+    mesh: &mut MockMesh,
+    circle_candidates: &[((f64, f64), f64)],
+    cs: &crate::geometry::CoordinateSystem,
+) {
+    if mesh.face_ids.is_empty() || circle_candidates.is_empty() {
+        return;
+    }
+
+    let pos = |vi: u32, vertices: &[f32]| -> Vec3 {
+        let b = vi as usize * 6;
+        Vec3::new(vertices[b], vertices[b + 1], vertices[b + 2])
+    };
+    let normal = |vi: u32, vertices: &[f32]| -> Vec3 {
+        let b = vi as usize * 6;
+        Vec3::new(vertices[b + 3], vertices[b + 4], vertices[b + 5])
+    };
+    let on_circle = |p: Vec3, center: (f64, f64), radius: f64| -> bool {
+        let (u, v) = cs.project(p);
+        let d = (u as f64 - center.0).hypot(v as f64 - center.1);
+        (d - radius).abs() <= (0.02 * radius).max(0.05)
+    };
+
+    let mut remap: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let side_wall = tri
+            .iter()
+            .all(|&vi| normal(vi, &mesh.vertices).dot(cs.n).abs() < 0.5);
+        if !side_wall {
+            continue;
+        }
+
+        let Some(&((cu, cv), radius)) = circle_candidates.iter().find(|&&((cu, cv), r)| {
+            tri.iter()
+                .all(|&vi| on_circle(pos(vi, &mesh.vertices), (cu, cv), r))
+        }) else {
+            continue;
+        };
+
+        let sig = (
+            (cu * 10_000.0).round() as i64,
+            (cv * 10_000.0).round() as i64,
+            (radius * 10_000.0).round() as i64,
+        );
+        let fid = mesh.face_ids.get(t).copied().unwrap_or(0);
+        remap
+            .entry(sig)
+            .and_modify(|existing| *existing = (*existing).min(fid))
+            .or_insert(fid);
+    }
+
+    for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let side_wall = tri
+            .iter()
+            .all(|&vi| normal(vi, &mesh.vertices).dot(cs.n).abs() < 0.5);
+        if !side_wall {
+            continue;
+        }
+
+        let Some(&((cu, cv), radius)) = circle_candidates.iter().find(|&&((cu, cv), r)| {
+            tri.iter()
+                .all(|&vi| on_circle(pos(vi, &mesh.vertices), (cu, cv), r))
+        }) else {
+            continue;
+        };
+
+        let sig = (
+            (cu * 10_000.0).round() as i64,
+            (cv * 10_000.0).round() as i64,
+            (radius * 10_000.0).round() as i64,
+        );
+        if let Some(&fid) = remap.get(&sig) {
+            if let Some(face_id) = mesh.face_ids.get_mut(t) {
+                *face_id = fid;
+            }
+        }
+    }
+}
+
+fn suppress_arc_internal_struts(
+    mesh: &mut MockMesh,
+    targets: &HashMap<(i64, i64), (f64, f64)>,
+    cs: &crate::geometry::CoordinateSystem,
+) {
+    let edge_count = mesh.edge_indices.len() / 2;
+    if edge_count == 0 {
+        return;
+    }
+
+    let key = |p: Vec3| -> (i64, i64) {
+        let (u, v) = cs.project(p);
+        (
+            (u as f64 * 10_000.0).round() as i64,
+            (v as f64 * 10_000.0).round() as i64,
+        )
+    };
+    let pos = |edge_vertices: &[f32], vi: u32| -> Vec3 {
+        let b = vi as usize * 3;
+        Vec3::new(edge_vertices[b], edge_vertices[b + 1], edge_vertices[b + 2])
+    };
+
+    let old_indices = std::mem::take(&mut mesh.edge_indices);
+    let old_normals = std::mem::take(&mut mesh.edge_face_normals);
+    let old_groups = std::mem::take(&mut mesh.edge_groups);
+    let has_normals = old_normals.len() >= edge_count * 6;
+    let has_groups = old_groups.len() == edge_count;
+
+    let mut edge_indices = Vec::with_capacity(old_indices.len());
+    let mut edge_face_normals = Vec::with_capacity(old_normals.len());
+    let mut edge_groups = Vec::with_capacity(old_groups.len());
+    for e in 0..edge_count {
+        let ia = old_indices[e * 2];
+        let ib = old_indices[e * 2 + 1];
+        let a = pos(&mesh.edge_vertices, ia);
+        let b = pos(&mesh.edge_vertices, ib);
+        let ka = key(a);
+        let kb = key(b);
+        let d = b.sub(a);
+        let axial = d.dot(cs.n).abs();
+        let lateral = d.sub(cs.n.mul(d.dot(cs.n))).length();
+        let internal_arc_strut =
+            ka == kb && targets.contains_key(&ka) && axial > 1e-4 && lateral < 0.05;
+        if internal_arc_strut {
+            continue;
+        }
+
+        edge_indices.push(ia);
+        edge_indices.push(ib);
+        if has_normals {
+            edge_face_normals.extend_from_slice(&old_normals[e * 6..e * 6 + 6]);
+        }
+        if has_groups {
+            edge_groups.push(old_groups[e]);
+        }
+    }
+
+    mesh.edge_indices = edge_indices;
+    mesh.edge_face_normals = if has_normals {
+        edge_face_normals
+    } else {
+        old_normals
+    };
+    mesh.edge_groups = if has_groups { edge_groups } else { old_groups };
+}
 
 /// Circumcircle `(cx, cy, r)` of three 2D points, or `None` when (near) collinear.
 fn circumcircle_2d(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> Option<(f64, f64, f64)> {
@@ -1292,6 +2490,8 @@ fn solid_to_flat_mesh(
     // facet-boundary lines.
     apply_analytic_cylinder_normals(solid, &mut vertices, &indices, &face_ids);
     smooth_vertex_normals(&mut vertices, &indices, &face_ids, SHADE_CREASE_COS);
+    align_normals_to_winding(&mut vertices, &indices);
+    apply_analytic_cylinder_normals(solid, &mut vertices, &indices, &face_ids);
 
     (vertices, indices, face_ids)
 }
@@ -1558,6 +2758,50 @@ fn orient_mesh_outward(vertices: &mut [f32], indices: &mut [u32]) {
             vertices[vi * 6 + 3] = nn[0];
             vertices[vi * 6 + 4] = nn[1];
             vertices[vi * 6 + 5] = nn[2];
+        }
+    }
+}
+
+fn align_normals_to_winding(vertices: &mut [f32], indices: &[u32]) {
+    for tri in indices.chunks_exact(3) {
+        let p = |i: u32| {
+            let b = i as usize * 6;
+            [
+                vertices[b] as f64,
+                vertices[b + 1] as f64,
+                vertices[b + 2] as f64,
+            ]
+        };
+        let n = |i: u32| {
+            let b = i as usize * 6;
+            [
+                vertices[b + 3] as f64,
+                vertices[b + 4] as f64,
+                vertices[b + 5] as f64,
+            ]
+        };
+        let a = p(tri[0]);
+        let b = p(tri[1]);
+        let c = p(tri[2]);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let winding = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let navg = [
+            (n(tri[0])[0] + n(tri[1])[0] + n(tri[2])[0]) / 3.0,
+            (n(tri[0])[1] + n(tri[1])[1] + n(tri[2])[1]) / 3.0,
+            (n(tri[0])[2] + n(tri[1])[2] + n(tri[2])[2]) / 3.0,
+        ];
+        if winding[0] * navg[0] + winding[1] * navg[1] + winding[2] * navg[2] < 0.0 {
+            for &vi in tri {
+                let b = vi as usize * 6;
+                vertices[b + 3] = -vertices[b + 3];
+                vertices[b + 4] = -vertices[b + 4];
+                vertices[b + 5] = -vertices[b + 5];
+            }
         }
     }
 }
@@ -2545,6 +3789,304 @@ fn group_edge_segments(
     group
 }
 
+fn mesh_edge_refs_from_groups(
+    edge_vertices: &[f32],
+    edge_indices: &[u32],
+    edge_face_normals: &[f32],
+    edge_groups: &[u32],
+) -> Vec<MeshEdgeRef> {
+    let seg_count = edge_indices.len() / 2;
+    if seg_count == 0 || edge_groups.len() != seg_count {
+        return Vec::new();
+    }
+
+    let mut by_group: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (seg, &group) in edge_groups.iter().enumerate() {
+        by_group.entry(group).or_default().push(seg);
+    }
+
+    let mut out = Vec::with_capacity(by_group.len());
+    for (group, segs) in by_group {
+        let Some(&first) = segs.first() else {
+            continue;
+        };
+        let vpos = |seg: usize, which: usize| -> [f32; 3] {
+            let vi = edge_indices[seg * 2 + which] as usize * 3;
+            [
+                edge_vertices[vi],
+                edge_vertices[vi + 1],
+                edge_vertices[vi + 2],
+            ]
+        };
+        let qkey = |p: [f32; 3]| -> (i64, i64, i64) {
+            let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+            (q(p[0]), q(p[1]), q(p[2]))
+        };
+
+        let mut uses: HashMap<(i64, i64, i64), (u32, [f32; 3])> = HashMap::new();
+        let mut pts = Vec::new();
+        for &seg in &segs {
+            for which in 0..2 {
+                let p = vpos(seg, which);
+                uses.entry(qkey(p)).or_insert((0, p)).0 += 1;
+                if !pts.iter().any(|q: &[f32; 3]| dist3(*q, p) <= 1.0e-4) {
+                    pts.push(p);
+                }
+            }
+        }
+
+        let mut ends: Vec<[f32; 3]> = uses
+            .values()
+            .filter(|(count, _)| *count == 1)
+            .map(|(_, p)| *p)
+            .collect();
+        ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let closed = ends.len() < 2;
+        let (p0, p1) = if ends.len() >= 2 {
+            (ends[0], ends[1])
+        } else {
+            (vpos(first, 0), vpos(first, 1))
+        };
+
+        let fo = first * 6;
+        if edge_face_normals.len() < fo + 6 {
+            continue;
+        }
+        let n1 = [
+            edge_face_normals[fo],
+            edge_face_normals[fo + 1],
+            edge_face_normals[fo + 2],
+        ];
+        let n2 = [
+            edge_face_normals[fo + 3],
+            edge_face_normals[fo + 4],
+            edge_face_normals[fo + 5],
+        ];
+        let curve = edge_curve_hint_from_points(&pts, p0, p1, n1, n2, closed);
+        let curve_kind = match curve {
+            Some(EdgeCurveHint::Circle { .. }) => Some("circle".to_string()),
+            Some(EdgeCurveHint::Line) => Some("line".to_string()),
+            None => None,
+        };
+        let edge_id = Some(format!("mesh:{group}"));
+        out.push(MeshEdgeRef {
+            group,
+            p0,
+            p1,
+            n1,
+            n2,
+            curve,
+            topology: Some(MeshTopologyEdgeRef {
+                topology_version: Some(0),
+                edge_id,
+                curve_kind,
+                adjacent_surface_kinds: vec!["unknown".to_string(), "unknown".to_string()],
+                ..MeshTopologyEdgeRef::default()
+            }),
+        });
+    }
+    out.sort_by_key(|edge| edge.group);
+    out
+}
+
+fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn edge_curve_hint_from_points(
+    points: &[[f32; 3]],
+    p0: [f32; 3],
+    p1: [f32; 3],
+    n1: [f32; 3],
+    n2: [f32; 3],
+    closed: bool,
+) -> Option<EdgeCurveHint> {
+    if points.len() < 3 {
+        return Some(EdgeCurveHint::Line);
+    }
+
+    let pts: Vec<Vec3> = points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+    let p0v = Vec3::new(p0[0], p0[1], p0[2]);
+    let p1v = Vec3::new(p1[0], p1[1], p1[2]);
+    let mut axes = vec![
+        Vec3::new(n1[0], n1[1], n1[2]).normalize(),
+        Vec3::new(n2[0], n2[1], n2[2]).normalize(),
+    ];
+    let mut chord_axis = Vec3::ZERO;
+    for i in 1..pts.len() {
+        for j in (i + 1)..pts.len() {
+            let axis = pts[i].sub(pts[0]).cross(pts[j].sub(pts[0]));
+            if axis.length() > chord_axis.length() {
+                chord_axis = axis;
+            }
+        }
+    }
+    axes.push(chord_axis.normalize());
+
+    let mut best: Option<(f32, EdgeCurveHint)> = None;
+    for axis in axes {
+        if axis.length() < 0.5 {
+            continue;
+        }
+        if let Some((score, hint)) = fit_circle_hint_on_axis(&pts, p0v, p1v, axis, closed) {
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score < *best_score)
+            {
+                best = Some((score, hint));
+            }
+        }
+    }
+    best.map(|(_, hint)| hint).or(Some(EdgeCurveHint::Line))
+}
+
+fn fit_circle_hint_on_axis(
+    pts: &[Vec3],
+    p0: Vec3,
+    p1: Vec3,
+    axis: Vec3,
+    closed: bool,
+) -> Option<(f32, EdgeCurveHint)> {
+    let axis = axis.normalize();
+    let base = if axis.dot(Vec3::X).abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let u = base.sub(axis.mul(base.dot(axis))).normalize();
+    if u.length() < 0.5 {
+        return None;
+    }
+    let v = axis.cross(u).normalize();
+    let origin = pts[0];
+    let project = |p: Vec3| -> (f32, f32, f32) {
+        let d = p.sub(origin);
+        (d.dot(u), d.dot(v), d.dot(axis))
+    };
+    if pts
+        .iter()
+        .map(|&p| project(p).2.abs())
+        .fold(0.0f32, f32::max)
+        > 0.05
+    {
+        return None;
+    }
+
+    let projected: Vec<(f32, f32)> = pts
+        .iter()
+        .map(|&p| {
+            let (x, y, _) = project(p);
+            (x, y)
+        })
+        .collect();
+    let mut circle = None;
+    'outer: for i in 0..projected.len() {
+        for j in (i + 1)..projected.len() {
+            for k in (j + 1)..projected.len() {
+                if let Some(c) =
+                    circle_from_three_points_2d(projected[i], projected[j], projected[k])
+                {
+                    circle = Some(c);
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let (cx, cy, radius) = circle?;
+    if radius <= 1.0e-4 {
+        return None;
+    }
+    let residual = projected
+        .iter()
+        .map(|&(x, y)| ((x - cx).hypot(y - cy) - radius).abs())
+        .fold(0.0f32, f32::max);
+    if residual > (0.01 * radius).max(0.05) {
+        return None;
+    }
+
+    let center = origin.add(u.mul(cx)).add(v.mul(cy));
+    let mut x_dir = p0.sub(center).normalize();
+    if x_dir.length() < 0.5 {
+        x_dir = pts[0].sub(center).normalize();
+    }
+    x_dir = x_dir.sub(axis.mul(x_dir.dot(axis))).normalize();
+    if x_dir.length() < 0.5 {
+        return None;
+    }
+    let y_dir = axis.cross(x_dir).normalize();
+    let angle = |p: Vec3| {
+        let d = p.sub(center);
+        d.dot(y_dir).atan2(d.dot(x_dir))
+    };
+    let end = if closed {
+        std::f32::consts::TAU
+    } else {
+        let raw_end = angle(p1);
+        let forward = normalize_positive(raw_end);
+        let reverse = forward - std::f32::consts::TAU;
+        let contains = |span_end: f32| -> bool {
+            pts.iter()
+                .all(|&p| angle_in_span_f32(angle(p), 0.0, span_end, 0.08))
+        };
+        if contains(forward) {
+            forward
+        } else if contains(reverse) {
+            reverse
+        } else {
+            raw_end
+        }
+    };
+
+    Some((
+        residual,
+        EdgeCurveHint::Circle {
+            center: [center.x, center.y, center.z],
+            axis: [axis.x, axis.y, axis.z],
+            x_dir: [x_dir.x, x_dir.y, x_dir.z],
+            radius,
+            start: 0.0,
+            end,
+            closed,
+        },
+    ))
+}
+
+fn normalize_positive(mut a: f32) -> f32 {
+    while a < 0.0 {
+        a += std::f32::consts::TAU;
+    }
+    while a >= std::f32::consts::TAU {
+        a -= std::f32::consts::TAU;
+    }
+    a
+}
+
+fn angle_in_span_f32(angle: f32, start: f32, end: f32, tol: f32) -> bool {
+    let span = end - start;
+    if span.abs() >= std::f32::consts::TAU - tol {
+        return true;
+    }
+    if span >= 0.0 {
+        let mut rel = angle - start;
+        while rel < -tol {
+            rel += std::f32::consts::TAU;
+        }
+        while rel > std::f32::consts::TAU + tol {
+            rel -= std::f32::consts::TAU;
+        }
+        rel <= span + tol
+    } else {
+        let mut rel = start - angle;
+        while rel < -tol {
+            rel += std::f32::consts::TAU;
+        }
+        while rel > std::f32::consts::TAU + tol {
+            rel -= std::f32::consts::TAU;
+        }
+        rel <= -span + tol
+    }
+}
+
 #[cfg(test)]
 mod wireframe_tests {
     use super::*;
@@ -2709,7 +4251,8 @@ mod wireframe_tests {
                     && (p0.z() - p1.z()).abs() > 9.9
             })
             .expect("box has a vertical origin edge");
-        let filleted = fillet_edges(&solid, &[edge], 2.0).expect("fillet the box edge");
+        let filleted =
+            openrcad::algo::fillet_edges(&solid, &[edge], 2.0).expect("fillet the box edge");
         let mesh = MockMesh::from_solid(&filleted);
 
         let seg_count = mesh.edge_indices.len() / 2;
@@ -2822,6 +4365,35 @@ mod arc_reconstruction_tests {
         );
     }
 
+    #[test]
+    fn display_mesh_for_mixed_profiles_is_render_safe() {
+        let mut pts: Vec<(f32, f32)> = Vec::new();
+        let steps = 24;
+        for i in 0..=steps {
+            let t = -std::f32::consts::FRAC_PI_2 + (i as f32 / steps as f32) * std::f32::consts::PI;
+            pts.push((5.0 + 5.0 * t.cos(), 5.0 + 5.0 * t.sin()));
+        }
+        pts.push((0.0, 10.0));
+        pts.push((0.0, 0.0));
+
+        let solid = extruded_region_solid(&pts, &[], 5.0, &CoordinateSystem::XY)
+            .expect("D profile should extrude");
+        assert!(
+            cylinder_faces(&solid) >= 1,
+            "D-profile kernel solid should keep a cylindrical wall"
+        );
+
+        let mesh = extruded_region_display_mesh(&pts, &[], 5.0, &CoordinateSystem::XY);
+        assert!(
+            render_mesh_is_closed_manifold(&mesh),
+            "D-profile display mesh should be closed and manifold"
+        );
+        assert!(
+            render_mesh_normals_follow_winding(&mesh),
+            "D-profile display mesh normals should agree with winding"
+        );
+    }
+
     /// A polygon the user genuinely wants faceted (here a rectangle) has no
     /// co-circular run, so every corner stays a sharp line edge.
     #[test]
@@ -2857,6 +4429,23 @@ mod arc_reconstruction_tests {
             cylinder_faces(&solid)
         );
         assert!(solid.is_watertight(), "circle extrusion must be watertight");
+    }
+
+    #[test]
+    fn display_mesh_keeps_intentional_octagon_faceted() {
+        let octagon: Vec<(f32, f32)> = (0..8)
+            .map(|i| {
+                let a = (i as f32 / 8.0) * std::f32::consts::TAU;
+                (5.0 * a.cos(), 5.0 * a.sin())
+            })
+            .collect();
+        let mesh = extruded_region_display_mesh(&octagon, &[], 4.0, &CoordinateSystem::XY);
+        let faces: std::collections::HashSet<u32> = mesh.face_ids.iter().copied().collect();
+        assert!(
+            faces.len() >= 10,
+            "octagon display should stay an 8-sided prism, got {} faces",
+            faces.len()
+        );
     }
 
     /// An octagon turns 45° per vertex — well past the arc-vs-corner threshold —

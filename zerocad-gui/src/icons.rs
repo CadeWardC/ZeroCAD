@@ -13,7 +13,7 @@
 //! 2. Define a new `pub const NAME: &str` at the top of this file using `include_str!("path/to/icon.svg")`.
 //! 3. Add a corresponding variant to the `Icon` enum (e.g., `Icon::MyNewIcon`).
 //! 4. Map the new enum variant to its constant in the `Icon::svg(&self)` match block.
-//! 
+//!
 //! Call `.labeled_button()`, `.icon_button()`, or `.menu_button()` directly on the `Icon` variant in `main.rs` to render.
 
 use eframe::egui;
@@ -23,7 +23,8 @@ pub const LINE: &str = include_str!("../../icons/sketch/line.svg");
 pub const RECTANGLE: &str = include_str!("../../icons/sketch/square-corner-to-corner.svg");
 pub const CIRCLE: &str = include_str!("../../icons/sketch/one-point-circle.svg");
 pub const RECTANGLE_FROM_CENTER: &str = include_str!("../../icons/sketch/square3d-from-center.svg");
-pub const RECTANGLE_THREE_POINTS: &str = include_str!("../../icons/sketch/square3d-three-points.svg");
+pub const RECTANGLE_THREE_POINTS: &str =
+    include_str!("../../icons/sketch/square3d-three-points.svg");
 pub const THREE_POINT_CIRCLE: &str = include_str!("../../icons/sketch/three-points-circle.svg");
 pub const ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d.svg");
 pub const THREE_POINT_ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d-three-points.svg");
@@ -359,16 +360,16 @@ fn flatten(d: &str) -> Vec<Vec<(f32, f32)>> {
     let mut i = 0;
     let mut cmd = ' ';
     let num = |toks: &[Tok], i: &mut usize| -> Option<f32> {
-        while *i < toks.len() {
-            match toks[*i] {
-                Tok::Num(n) => {
-                    *i += 1;
-                    return Some(n);
-                }
-                Tok::Cmd(_) => return None,
+        if *i < toks.len() {
+            if let Tok::Num(n) = toks[*i] {
+                *i += 1;
+                Some(n)
+            } else {
+                None
             }
+        } else {
+            None
         }
-        None
     };
     while i < toks.len() {
         if let Tok::Cmd(c) = toks[i] {
@@ -416,14 +417,7 @@ fn flatten(d: &str) -> Vec<Vec<(f32, f32)>> {
                 }
             }
             'C' => {
-                while let (
-                    Some(x1),
-                    Some(y1),
-                    Some(x2),
-                    Some(y2),
-                    Some(ex),
-                    Some(ey),
-                ) = (
+                while let (Some(x1), Some(y1), Some(x2), Some(y2), Some(ex), Some(ey)) = (
                     num(&toks, &mut i),
                     num(&toks, &mut i),
                     num(&toks, &mut i),
@@ -469,7 +463,15 @@ fn flatten(d: &str) -> Vec<Vec<(f32, f32)>> {
 }
 
 fn cubic(
-    p0x: f32, p0y: f32, c1x: f32, c1y: f32, c2x: f32, c2y: f32, p1x: f32, p1y: f32, t: f32,
+    p0x: f32,
+    p0y: f32,
+    c1x: f32,
+    c1y: f32,
+    c2x: f32,
+    c2y: f32,
+    p1x: f32,
+    p1y: f32,
+    t: f32,
 ) -> (f32, f32) {
     let u = 1.0 - t;
     let w0 = u * u * u;

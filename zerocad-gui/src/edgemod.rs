@@ -7,16 +7,15 @@
 //! inline dialog ([`ZeroCadApp::show_edge_mod_dialog`]) until the user commits.
 
 use eframe::egui;
-use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, MockMesh};
+use zerocad_core::{CornerKind, EdgeModScope, EdgeRef, FeatureNode, FeatureType, MockMesh};
 
 use crate::ZeroCadApp;
 
-/// How long a fillet size must hold steady before its slow analytic-arc geometry
-/// is precomputed on a worker thread (see [`ZeroCadApp::tick_speculative_edge_mod`]).
+/// How long an edge-mod size must hold steady before its preview geometry is
+/// computed on a worker thread (see [`ZeroCadApp::tick_speculative_edge_mod`]).
 /// Short enough to be ready by the time the user reaches for OK, long enough that
 /// a fast drag through many sizes doesn't spawn a job per step.
-#[allow(dead_code)]
-const EDGE_MOD_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+const EDGE_MOD_SETTLE: std::time::Duration = std::time::Duration::from_millis(160);
 
 /// A live, uncommitted 3D edge fillet/chamfer. Holds the captured edge geometry
 /// and the editable size; the viewport shows the resulting body in real time.
@@ -73,8 +72,7 @@ impl ZeroCadApp {
             .filter_map(|&e| self.edge_ref_from(&node_id, e))
             .collect();
         if edges.is_empty() {
-            self.status_msg =
-                "Those edges have no usable geometry to fillet/chamfer.".to_string();
+            self.status_msg = "Those edges have no usable geometry to fillet/chamfer.".to_string();
             return;
         }
         let text = self.edge_mod_dist_text.clone();
@@ -87,14 +85,13 @@ impl ZeroCadApp {
             dist_text: text,
             focus_request: true,
         });
-        // Start each edit with a clean speculative-arc slate so a stale precompute
-        // from a previous fillet can't be mistaken for this one.
+        // Start each edit with a clean speculative edge-mod slate so a stale
+        // precompute from a previous edit can't be mistaken for this one.
         self.clear_edge_mod_speculation();
-        self.status_msg =
-            "Set the size, then Enter / OK to apply (Esc cancels).".to_string();
+        self.status_msg = "Set the size, then Enter / OK to apply (Esc cancels).".to_string();
     }
 
-    /// Reset all speculative arc-fillet precompute state (cache, in-flight job,
+    /// Reset all speculative edge-mod precompute state (cache, in-flight job,
     /// debounce). Any worker thread still running harmlessly sends into a dropped
     /// channel. Called when an edit begins, commits, or is cancelled.
     pub(crate) fn clear_edge_mod_speculation(&mut self) {
@@ -104,7 +101,7 @@ impl ZeroCadApp {
         self.edge_mod_settle = None;
     }
 
-    /// Hash of everything that determines a fillet's committed arc geometry — the
+    /// Hash of everything that determines an edge-mod's committed geometry — the
     /// size (quantized to 0.01mm, finer than the faceted preview's 0.05mm so the
     /// precompute matches the exact committed size), kind, target body, edge, and
     /// the hidden set. [`commit_edge_mod`](Self::commit_edge_mod) recomputes this
@@ -131,7 +128,7 @@ impl ZeroCadApp {
     /// at size `dist`. Temp ids are suffixed `id_counter + i` so `creation_key`
     /// orders them after every committed node and in edge order. The kernel
     /// re-locates each edge on the evolving body, so edges sharing a corner blend
-    /// correctly. Used by both the speculative-arc and live-preview graphs.
+    /// correctly. Used by both the speculative and live-preview graphs.
     fn append_edge_mod_chain(
         &self,
         graph: &mut zerocad_core::ParametricGraph,
@@ -150,6 +147,7 @@ impl ZeroCadApp {
                     edge: edge.clone(),
                     dist,
                     dist_expr: None,
+                    scope: EdgeModScope::default(),
                     kind: op.kind,
                 },
             });
@@ -159,12 +157,10 @@ impl ZeroCadApp {
     }
 
     /// Build the graph the speculative precompute evaluates: the current model
-    /// plus the live fillet as a real `EdgeMod` node, using the same `dist.max(0.2)`
-    /// the commit will. Evaluated **non-draft** (arc cutter) on a worker thread, it
-    /// yields exactly the bodies a commit at this size would — the round becomes one
-    /// cylindrical B-rep face. Bodies key by `target`, not the node id, so this
-    /// matches the committed result despite the throwaway node name.
-    #[allow(dead_code)]
+    /// plus the live edit as real `EdgeMod` nodes, using the same `dist.max(0.2)`
+    /// the commit will. Evaluated on a worker thread, it yields exactly the bodies
+    /// a commit at this size would. Bodies key by `target`, not the node id, so
+    /// this matches the committed result despite the throwaway node name.
     fn build_edge_mod_arc_graph(&self) -> Option<zerocad_core::ParametricGraph> {
         let op = self.edge_mod_op.as_ref()?;
         let mut graph = self.graph.clone();
@@ -172,14 +168,12 @@ impl ZeroCadApp {
         Some(graph)
     }
 
-    /// Drive the speculative arc-fillet precompute. Called once per frame. While a
-    /// fillet is being edited, the moment its size has held steady for
-    /// [`EDGE_MOD_SETTLE`] this spawns the slow analytic-arc evaluation for that
-    /// size on a worker thread and caches the result, so committing at that size
-    /// applies the smooth one-face geometry instantly instead of showing the
-    /// faceted draft and swapping the arc in ~1s later. At most one job runs at a
-    /// time; chamfers (already one planar face) and the no-edit case do nothing.
-    #[allow(dead_code)]
+    /// Drive the speculative edge-mod precompute. Called once per frame. While an
+    /// edge edit is being sized, the moment its size has held steady for
+    /// [`EDGE_MOD_SETTLE`] this spawns the kernel evaluation for that size on a
+    /// worker thread and caches the result, so committing at that size can reuse
+    /// the ready geometry. At most one job runs at a time; curved-rim selections
+    /// and the no-edit case do nothing.
     pub(crate) fn tick_speculative_edge_mod(&mut self, ctx: &egui::Context) {
         // Drain a finished job into the cache first.
         if let Some(rx) = self.edge_mod_arc_rx.as_ref() {
@@ -188,7 +182,16 @@ impl ZeroCadApp {
                     self.edge_mod_arc_rx = None;
                     self.edge_mod_arc_inflight = None;
                     if let Ok((bodies, warnings)) = result {
-                        self.edge_mod_arc_cache = Some((key, bodies, warnings));
+                        if warnings.is_empty() {
+                            self.edge_mod_arc_cache = Some((key, bodies, warnings));
+                        } else {
+                            // Speculative graph nodes use temporary ids like
+                            // `edgemod_spec_*`. Failed previews must not leak
+                            // those warnings into the real document or be reused
+                            // on OK; the committed feature will evaluate with its
+                            // stable id if the user applies it.
+                            self.edge_mod_arc_cache = None;
+                        }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -202,11 +205,6 @@ impl ZeroCadApp {
         let Some(op) = self.edge_mod_op.as_ref() else {
             return;
         };
-        // A chamfer's bevel is a single planar face in draft already — nothing
-        // slower to precompute.
-        if !matches!(op.kind, CornerKind::Fillet) {
-            return;
-        }
         let key = Self::edge_mod_arc_key(op, self.hidden_nodes.len());
 
         // Already computed (or computing) the arc for this exact size.
@@ -256,6 +254,7 @@ impl ZeroCadApp {
     /// Evaluate the model as if the live edge mod had been committed, so the
     /// viewport shows the actual rounded/beveled body in real time. Mirrors
     /// [`preview_extrude_bodies`](Self::preview_extrude_bodies).
+    #[allow(dead_code)]
     pub(crate) fn preview_edge_mod_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
         let op = self.edge_mod_op.as_ref()?;
         let mut graph = self.graph.clone();
@@ -316,9 +315,8 @@ impl ZeroCadApp {
                 return Some(bodies.clone());
             }
         }
-        let bodies = self.preview_edge_mod_bodies();
-        self.edge_mod_preview_cache = bodies.as_ref().map(|b| (key, b.clone()));
-        bodies
+        self.edge_mod_preview_cache = None;
+        None
     }
 
     /// Commit the live edge mod into history as a real `EdgeMod` feature, binding
@@ -353,6 +351,7 @@ impl ZeroCadApp {
                     edge,
                     dist,
                     dist_expr: dist_expr.clone(),
+                    scope: EdgeModScope::default(),
                     kind: op.kind,
                 },
             });
@@ -368,24 +367,31 @@ impl ZeroCadApp {
         // faceted-then-arc "pop" a second later. Otherwise fall back to the normal
         // path (instant faceted draft + background arc refine).
         let precomputed = match self.edge_mod_arc_cache.take() {
-            Some((k, bodies, warnings)) if k == arc_key => Some((bodies, warnings)),
+            Some((k, bodies, warnings)) if k == arc_key && warnings.is_empty() => {
+                Some((bodies, warnings))
+            }
             _ => None,
         };
-        if let Some((bodies, warnings)) = precomputed {
+        let applied_immediately = if let Some((bodies, warnings)) = precomputed {
             // Supersede any in-flight refine so its late result can't clobber this.
             self.eval_gen += 1;
             self.eval_rx = None;
             self.eval_pending = false;
             self.apply_eval_result(bodies, warnings);
+            true
         } else {
-            self.reevaluate_geometry();
-        }
+            self.spawn_refine_eval();
+            self.eval_pending = true;
+            false
+        };
         self.clear_edge_mod_speculation();
         let noun = match op.kind {
             CornerKind::Fillet => "Fillet",
             CornerKind::Chamfer => "Chamfer",
         };
-        if self.error_msg.is_none() {
+        if !applied_immediately {
+            self.status_msg = format!("Applying {} to {} edge(s)…", noun, edge_count);
+        } else if self.error_msg.is_none() {
             self.status_msg = format!("{} applied to {} edge(s).", noun, edge_count);
         } else {
             self.status_msg = format!("{} couldn't be applied (see message).", noun);
@@ -429,7 +435,10 @@ impl ZeroCadApp {
                 egui::Frame::none()
                     .fill(egui::Color32::WHITE)
                     .rounding(3.0)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(170, 180, 190)))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(170, 180, 190),
+                    ))
                     .shadow(egui::epaint::Shadow {
                         extrusion: 8.0,
                         color: egui::Color32::from_black_alpha(35),
@@ -475,7 +484,10 @@ impl ZeroCadApp {
                                     let r = resp.rect;
                                     ui.painter().line_segment(
                                         [r.left_bottom(), r.right_bottom()],
-                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215)),
+                                        egui::Stroke::new(
+                                            1.5,
+                                            egui::Color32::from_rgb(0, 120, 215),
+                                        ),
                                     );
                                 }
                                 ui.label(
@@ -491,9 +503,10 @@ impl ZeroCadApp {
                         if let Some(op) = self.edge_mod_op.as_mut() {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(3.0, 0.0);
-                                for (kind, label) in
-                                    [(CornerKind::Fillet, "Fillet"), (CornerKind::Chamfer, "Chamfer")]
-                                {
+                                for (kind, label) in [
+                                    (CornerKind::Fillet, "Fillet"),
+                                    (CornerKind::Chamfer, "Chamfer"),
+                                ] {
                                     let selected = op.kind == kind;
                                     let (fill, text) = if selected {
                                         (egui::Color32::from_rgb(0, 120, 215), egui::Color32::WHITE)

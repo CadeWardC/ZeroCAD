@@ -91,11 +91,7 @@ pub fn render_thumbnail(meshes: &[(String, MockMesh)], size: usize) -> (usize, u
                 .collect();
             // Flat shade from the first vertex's normal (rotated into camera space).
             let nb = tri[0] as usize * 6;
-            let (nx, ny, nz) = rotate(
-                m.vertices[nb + 3],
-                m.vertices[nb + 4],
-                m.vertices[nb + 5],
-            );
+            let (nx, ny, nz) = rotate(m.vertices[nb + 3], m.vertices[nb + 4], m.vertices[nb + 5]);
             let n = normalize3([nx, ny, nz]);
             // Two-sided: meshes are outward-facing, but a stray inverted normal
             // shouldn't render a face pure black.

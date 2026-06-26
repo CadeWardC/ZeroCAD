@@ -69,7 +69,7 @@ impl ExtrudeOp {
         for t in &self.targets {
             for &ri in &t.indices {
                 if let Some(r) = t.regions.get(ri) {
-                    mesh.append(MockMesh::make_extruded_sketch(
+                    mesh.append(zerocad_core::mock_kernel::extruded_region_display_mesh(
                         &r.boundary,
                         &r.holes,
                         self.depth,

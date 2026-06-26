@@ -432,24 +432,23 @@ impl ZeroCadApp {
         // --- 3. 3D PROJECTED ACTIVE PLANE GRID (drawn behind solid parts) ---
         // The grid is drawn in the active plane's own (u, v) coordinates and
         // unprojected to 3D, so it aligns to an origin plane OR a body face.
-        let grid_cs: Option<CoordinateSystem> = if self.extrude_op.is_some()
-            || self.edge_mod_op.is_some()
-        {
-            // While pushing/pulling an extrude or edge mod the sketch grid isn't
-            // needed — and viewed at the oblique angle those ops are done from, its
-            // far lines fan into long rays across the model. Hide it.
-            None
-        } else if self.is_sketch_mode {
-            Some(self.active_sketch_cs)
-        } else if self.is_plane_selection_mode {
-            self.hovered_plane.map(|p| match p {
-                SketchPlane::XY => CoordinateSystem::XY,
-                SketchPlane::XZ => CoordinateSystem::XZ,
-                SketchPlane::YZ => CoordinateSystem::YZ,
-            })
-        } else {
-            None
-        };
+        let grid_cs: Option<CoordinateSystem> =
+            if self.extrude_op.is_some() || self.edge_mod_op.is_some() {
+                // While pushing/pulling an extrude or edge mod the sketch grid isn't
+                // needed — and viewed at the oblique angle those ops are done from, its
+                // far lines fan into long rays across the model. Hide it.
+                None
+            } else if self.is_sketch_mode {
+                Some(self.active_sketch_cs)
+            } else if self.is_plane_selection_mode {
+                self.hovered_plane.map(|p| match p {
+                    SketchPlane::XY => CoordinateSystem::XY,
+                    SketchPlane::XZ => CoordinateSystem::XZ,
+                    SketchPlane::YZ => CoordinateSystem::YZ,
+                })
+            } else {
+                None
+            };
 
         if let Some(cs) = grid_cs {
             let r_grid = 150.0f32;
@@ -464,41 +463,40 @@ impl ZeroCadApp {
             if facing_mul <= 0.01 {
                 // Effectively edge-on — skip the grid entirely this frame.
             } else {
-
-            // Fade + clip each plane-grid line the same way the floor grid does:
-            // clip it to a disc of radius `r_grid` and fade each sub-segment by its
-            // distance from the plane origin. Drawing the grid full-span instead
-            // made every line run to ±150 and, on a VERTICAL sketch plane viewed
-            // in perspective, converge into bright rays fanning far above and
-            // below the model (visible straight through a fresh cut, too) — the
-            // exact artifact the floor grid was already fixed for.
-            let faded_plane_line =
-                |u0: f32, v0: f32, u1: f32, v1: f32, width: f32, base_alpha: f32| {
-                    const SUBS: usize = 10;
-                    for s in 0..SUBS {
-                        let t0 = s as f32 / SUBS as f32;
-                        let t1 = (s + 1) as f32 / SUBS as f32;
-                        let (au, av) = (u0 + (u1 - u0) * t0, v0 + (v1 - v0) * t0);
-                        let (bu, bv) = (u0 + (u1 - u0) * t1, v0 + (v1 - v0) * t1);
-                        let mr = (((au + bu) * 0.5).powi(2) + ((av + bv) * 0.5).powi(2)).sqrt();
-                        let fade = (1.0 - mr / r_grid).clamp(0.0, 1.0).powf(1.5);
-                        let a = (base_alpha * fade) as u8;
-                        if a <= 3 {
-                            continue;
+                // Fade + clip each plane-grid line the same way the floor grid does:
+                // clip it to a disc of radius `r_grid` and fade each sub-segment by its
+                // distance from the plane origin. Drawing the grid full-span instead
+                // made every line run to ±150 and, on a VERTICAL sketch plane viewed
+                // in perspective, converge into bright rays fanning far above and
+                // below the model (visible straight through a fresh cut, too) — the
+                // exact artifact the floor grid was already fixed for.
+                let faded_plane_line =
+                    |u0: f32, v0: f32, u1: f32, v1: f32, width: f32, base_alpha: f32| {
+                        const SUBS: usize = 10;
+                        for s in 0..SUBS {
+                            let t0 = s as f32 / SUBS as f32;
+                            let t1 = (s + 1) as f32 / SUBS as f32;
+                            let (au, av) = (u0 + (u1 - u0) * t0, v0 + (v1 - v0) * t0);
+                            let (bu, bv) = (u0 + (u1 - u0) * t1, v0 + (v1 - v0) * t1);
+                            let mr = (((au + bu) * 0.5).powi(2) + ((av + bv) * 0.5).powi(2)).sqrt();
+                            let fade = (1.0 - mr / r_grid).clamp(0.0, 1.0).powf(1.5);
+                            let a = (base_alpha * fade) as u8;
+                            if a <= 3 {
+                                continue;
+                            }
+                            let wa = cs.unproject(au, av);
+                            let wb = cs.unproject(bu, bv);
+                            let pa = project_3d(wa.x, wa.y, wa.z);
+                            let pb = project_3d(wb.x, wb.y, wb.z);
+                            painter.line_segment(
+                                [egui::pos2(pa.0, pa.1), egui::pos2(pb.0, pb.1)],
+                                egui::Stroke::new(
+                                    width,
+                                    egui::Color32::from_rgba_unmultiplied(110, 110, 124, a),
+                                ),
+                            );
                         }
-                        let wa = cs.unproject(au, av);
-                        let wb = cs.unproject(bu, bv);
-                        let pa = project_3d(wa.x, wa.y, wa.z);
-                        let pb = project_3d(wb.x, wb.y, wb.z);
-                        painter.line_segment(
-                            [egui::pos2(pa.0, pa.1), egui::pos2(pb.0, pb.1)],
-                            egui::Stroke::new(
-                                width,
-                                egui::Color32::from_rgba_unmultiplied(110, 110, 124, a),
-                            ),
-                        );
-                    }
-                };
+                    };
 
                 let mut i = -r_grid;
                 while i <= r_grid + 0.001 {
@@ -730,8 +728,7 @@ impl ZeroCadApp {
         let mut zbuf = vec![f32::NEG_INFINITY; occ_w * occ_h];
         let (mut depth_min, mut depth_max) = (f32::INFINITY, f32::NEG_INFINITY);
 
-        let (selected_whole_bodies, selected_faces) =
-            selected_material_sets(&self.selected_body);
+        let (selected_whole_bodies, selected_faces) = selected_material_sets(&self.selected_body);
 
         // A. Gather Solid Mesh Triangles (committed model + extrude preview)
         for d in &meshes {
@@ -763,7 +760,11 @@ impl ZeroCadApp {
                 // field). Each drives its own vertex shade for Gouraud; their
                 // average decides back-face culling for the whole triangle.
                 let vnorm = |o: usize| {
-                    (mesh.vertices[o + 3], mesh.vertices[o + 4], mesh.vertices[o + 5])
+                    (
+                        mesh.vertices[o + 3],
+                        mesh.vertices[o + 4],
+                        mesh.vertices[o + 5],
+                    )
                 };
                 let n0 = vnorm(i0);
                 let n1 = vnorm(i1);
@@ -1133,7 +1134,14 @@ impl ZeroCadApp {
             if self.hidden_nodes.contains(&node.id) {
                 continue; // hidden sketch — don't draw
             }
-            if let FeatureType::Sketch { cs, curves, shapes, corner_mods, .. } = &node.feature {
+            if let FeatureType::Sketch {
+                cs,
+                curves,
+                shapes,
+                corner_mods,
+                ..
+            } = &node.feature
+            {
                 let cs = *cs;
                 let to_screen = |p: (f32, f32)| -> egui::Pos2 {
                     let w = cs.unproject(p.0, p.1);
@@ -1185,11 +1193,7 @@ impl ZeroCadApp {
             for &at in &self.pending_corners {
                 let p = to_screen(at);
                 painter.circle_filled(p, 4.5, egui::Color32::from_rgb(255, 140, 0));
-                painter.circle_stroke(
-                    p,
-                    4.5,
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
-                );
+                painter.circle_stroke(p, 4.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
             }
 
             // Anchor the inline radius box at the last staged corner, or — before
@@ -1197,13 +1201,19 @@ impl ZeroCadApp {
             // Once a corner is staged, also place the drag manipulator on it: a
             // handle along the corner's bisector whose screen axis carries
             // px-per-mm, so dragging maps 1:1 to radius.
-            if self.active_tool.map_or(false, |t| t.corner_kind().is_some()) {
+            if self
+                .active_tool
+                .map_or(false, |t| t.corner_kind().is_some())
+            {
                 if let Some(&last) = self.pending_corners.last() {
                     let p = to_screen(last);
                     corner_anchor = Some(egui::pos2(p.x + 14.0, p.y - 30.0));
 
                     if let Some((v, bis)) = self.corner_bisector(last) {
-                        let radius = self.eval_dim(&self.corner_radius_text).unwrap_or(5.0).max(0.1);
+                        let radius = self
+                            .eval_dim(&self.corner_radius_text)
+                            .unwrap_or(5.0)
+                            .max(0.1);
                         let corner_s = to_screen(v);
                         let along = to_screen((v.0 + bis.0, v.1 + bis.1));
                         // Screen vector for 1mm along the (interior) bisector.
@@ -1236,19 +1246,13 @@ impl ZeroCadApp {
                         let mut chain = self.sketch_points.clone();
                         chain.push(cursor);
                         for w in chain.windows(2) {
-                            painter.line_segment(
-                                [to_screen(w[0]), to_screen(w[1])],
-                                guide_stroke,
-                            );
+                            painter.line_segment([to_screen(w[0]), to_screen(w[1])], guide_stroke);
                         }
                     }
 
                     let shape = self.shape_from_points(cursor);
                     for seg in &shape.segments {
-                        painter.line_segment(
-                            [to_screen(seg.a), to_screen(seg.b)],
-                            preview_stroke,
-                        );
+                        painter.line_segment([to_screen(seg.a), to_screen(seg.b)], preview_stroke);
                     }
                     for c in &shape.circles {
                         let mut prev_pt: Option<egui::Pos2> = None;

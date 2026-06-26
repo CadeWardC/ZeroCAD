@@ -195,9 +195,7 @@ pub enum SketchShape {
     },
     /// Pre-built geometry with no variable bindings (3-point rect/circle,
     /// ellipses). Stored as-is and emitted verbatim.
-    Raw {
-        curves: SketchCurves,
-    },
+    Raw { curves: SketchCurves },
 }
 
 impl SketchShape {
@@ -235,7 +233,10 @@ impl SketchShape {
             } => {
                 let len = length.resolve(vars);
                 let ang = angle_deg.resolve(vars).to_radians();
-                c.add_line(*start, (start.0 + len * ang.cos(), start.1 + len * ang.sin()));
+                c.add_line(
+                    *start,
+                    (start.0 + len * ang.cos(), start.1 + len * ang.sin()),
+                );
             }
             SketchShape::Raw { curves } => c = curves.clone(),
         }
@@ -479,6 +480,154 @@ impl Region {
         }
         !self.holes.iter().any(|h| point_in_polygon(p, h))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RegionWithProvenance {
+    pub region: Region,
+    pub provenance: RegionProvenance,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RegionProvenance {
+    #[serde(default)]
+    pub fragments: Vec<RegionProvenanceFragment>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum RegionProvenanceFragment {
+    RectangleEdge {
+        shape_id: Option<usize>,
+        edge_index: usize,
+        rect_min: (f32, f32),
+        rect_max: (f32, f32),
+    },
+    CircleArc {
+        shape_id: Option<usize>,
+        center: (f32, f32),
+        radius: f32,
+    },
+    SketchFilletArc {
+        shape_id: Option<usize>,
+    },
+    SketchChamferEdge {
+        shape_id: Option<usize>,
+    },
+    Slot {
+        shape_id: Option<usize>,
+    },
+    RoundedRectangle {
+        shape_id: Option<usize>,
+    },
+    RawPolyline {
+        shape_id: Option<usize>,
+    },
+}
+
+pub fn detect_regions_with_provenance(
+    curves: &SketchCurves,
+    shapes: &[SketchShape],
+) -> Vec<RegionWithProvenance> {
+    let regions = detect_regions(curves);
+    let provenance = build_region_provenance(curves, shapes, &regions);
+    regions
+        .into_iter()
+        .zip(provenance)
+        .map(|(region, provenance)| RegionWithProvenance { region, provenance })
+        .collect()
+}
+
+pub fn build_region_provenance(
+    curves: &SketchCurves,
+    shapes: &[SketchShape],
+    regions: &[Region],
+) -> Vec<RegionProvenance> {
+    let fragments = sketch_provenance_fragments(curves, shapes);
+    regions
+        .iter()
+        .map(|_| RegionProvenance {
+            fragments: fragments.clone(),
+        })
+        .collect()
+}
+
+fn sketch_provenance_fragments(
+    curves: &SketchCurves,
+    shapes: &[SketchShape],
+) -> Vec<RegionProvenanceFragment> {
+    let mut fragments = Vec::new();
+    if let Some((rect_min, rect_max)) = rectangle_bounds_from_segments(&curves.segments) {
+        for edge_index in 0..4 {
+            fragments.push(RegionProvenanceFragment::RectangleEdge {
+                shape_id: None,
+                edge_index,
+                rect_min,
+                rect_max,
+            });
+        }
+    }
+    for circle in &curves.circles {
+        fragments.push(RegionProvenanceFragment::CircleArc {
+            shape_id: None,
+            center: circle.center,
+            radius: circle.radius,
+        });
+    }
+    if fragments.is_empty() && !curves.segments.is_empty() {
+        fragments.push(RegionProvenanceFragment::RawPolyline {
+            shape_id: shapes
+                .iter()
+                .position(|shape| matches!(shape, SketchShape::Raw { .. })),
+        });
+    }
+    fragments
+}
+
+fn rectangle_bounds_from_segments(segments: &[LineSegment]) -> Option<((f32, f32), (f32, f32))> {
+    if segments.len() != 4 {
+        return None;
+    }
+    let mut pts: Vec<(f32, f32)> = Vec::new();
+    for seg in segments {
+        for p in [seg.a, seg.b] {
+            if !pts.iter().any(|q| (q.0 - p.0).hypot(q.1 - p.1) <= 1.0e-4) {
+                pts.push(p);
+            }
+        }
+    }
+    if pts.len() != 4 {
+        return None;
+    }
+
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (x, y) in pts {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if max_x - min_x <= 1.0e-3 || max_y - min_y <= 1.0e-3 {
+        return None;
+    }
+
+    let has_corner = |p: (f32, f32)| {
+        segments
+            .iter()
+            .flat_map(|s| [s.a, s.b])
+            .any(|q| (q.0 - p.0).abs() <= 1.0e-4 && (q.1 - p.1).abs() <= 1.0e-4)
+    };
+    for corner in [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ] {
+        if !has_corner(corner) {
+            return None;
+        }
+    }
+    Some(((min_x, min_y), (max_x, max_y)))
 }
 
 // ---------------------------------------------------------------------------
@@ -953,7 +1102,11 @@ mod tests {
         let mut c = SketchCurves::new();
         c.add_ellipse((3.0, 3.0), (7.07, 7.07), 4.0);
         let regions = detect_regions(&c);
-        assert_eq!(regions.len(), 1, "rotated ellipse should still be one region");
+        assert_eq!(
+            regions.len(),
+            1,
+            "rotated ellipse should still be one region"
+        );
     }
 
     #[test]

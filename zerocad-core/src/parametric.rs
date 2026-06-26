@@ -1,6 +1,9 @@
-use crate::geometry::CoordinateSystem;
-use crate::mock_kernel::{KernelSolid, MockMesh};
-use crate::sketch::{detect_regions, Region, SketchCurves};
+use crate::geometry::{CoordinateSystem, Vec3};
+use crate::mock_kernel::{EdgeCurveHint, KernelSolid, MeshTopologyEdgeRef, MockMesh};
+use crate::sketch::{
+    build_region_provenance, detect_regions, Circle, Region, RegionProvenance,
+    RegionProvenanceFragment, SketchCurves,
+};
 use crate::units::Unit;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -51,22 +54,59 @@ impl Variable {
     }
 }
 
+/// Optional stable topology identity for a selected edge.
+///
+/// These fields are additive document metadata. Edge modifiers try this stable
+/// identity first, then fall back to the captured world-space geometry for
+/// legacy documents or genuinely changed topology.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyEdgeRef {
+    #[serde(default)]
+    pub body_id: Option<String>,
+    #[serde(default)]
+    pub topology_version: Option<u64>,
+    #[serde(default)]
+    pub edge_id: Option<String>,
+    #[serde(default)]
+    pub adjacent_face_ids: Vec<String>,
+    #[serde(default)]
+    pub curve_kind: Option<String>,
+    #[serde(default)]
+    pub adjacent_surface_kinds: Vec<String>,
+}
+
 /// A solid edge captured geometrically for a 3D fillet/chamfer. The endpoints
 /// and the two adjacent face normals are recorded in **world space** at
 /// selection time (read straight from the body's wireframe — see
 /// `MockMesh::edge_vertices` / `edge_face_normals`), which is all
 /// [`crate::mock_kernel::edge_corner_cutter`] needs to orient its cutter.
 ///
-/// Because the edge is frozen in world space, an `EdgeMod` does not follow an
-/// upstream dimension change; if the body it targets is later resized by a
-/// variable, the modifier still cuts at the captured location (the guarded
-/// boolean degrades gracefully if that no longer meets material).
+/// The topology field lets an `EdgeMod` follow equivalent upstream dimension
+/// edits. If the stable identity no longer resolves, the captured world-space
+/// edge is still used as a legacy geometric fallback.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeRef {
     pub p0: [f32; 3],
     pub p1: [f32; 3],
     pub n1: [f32; 3],
     pub n2: [f32; 3],
+    #[serde(default)]
+    pub curve: Option<EdgeCurveHint>,
+    #[serde(default)]
+    pub topology: Option<TopologyEdgeRef>,
+}
+
+/// Legacy serialized edge-mod span. The current fillet/chamfer tool no longer
+/// exposes or evaluates separate full/partial modes; this remains only so older
+/// `.zcad` documents with a `scope` field can still load.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum EdgeModScope {
+    #[default]
+    FullEdge,
+    Partial {
+        start_t: f32,
+        end_t: f32,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -142,6 +182,10 @@ pub enum FeatureType {
         /// re-evaluated every build. `dist` holds the last resolved value.
         #[serde(default)]
         dist_expr: Option<String>,
+        /// Legacy field kept so older documents deserialize. New fillet/chamfer
+        /// edits always use the selected edge as captured.
+        #[serde(default)]
+        scope: EdgeModScope,
         /// Whether to round (Fillet) or bevel (Chamfer) the edge.
         kind: crate::sketch::CornerKind,
     },
@@ -200,6 +244,14 @@ struct EvalCheckpoint {
     key: u64,
     live: Vec<LiveBody>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SketchEval {
+    cs: CoordinateSystem,
+    curves: SketchCurves,
+    regions: Vec<Region>,
+    provenance: Vec<RegionProvenance>,
 }
 
 impl ParametricGraph {
@@ -433,6 +485,8 @@ impl ParametricGraph {
                             id: node.id.clone(),
                             parts: vec![crate::mock_kernel::box_solid(*w, *h, *d)],
                             pristine: Some(MockMesh::make_box(*w, *h, *d)),
+                            sketch_source: None,
+                            cut_tools: Vec::new(),
                         });
                     }
                     FeatureType::Cylinder { r, h } => {
@@ -441,6 +495,8 @@ impl ParametricGraph {
                                 id: node.id.clone(),
                                 parts: vec![solid],
                                 pristine: Some(MockMesh::make_cylinder(*r, *h, 32)),
+                                sketch_source: None,
+                                cut_tools: Vec::new(),
                             });
                         }
                     }
@@ -485,6 +541,7 @@ impl ParametricGraph {
                         edge,
                         dist,
                         dist_expr,
+                        scope,
                         kind,
                     } => {
                         let eff_dist = match dist_expr.as_ref() {
@@ -505,6 +562,7 @@ impl ParametricGraph {
                             &node.id,
                             target,
                             edge,
+                            scope,
                             eff_dist,
                             *kind,
                             draft,
@@ -582,10 +640,7 @@ impl ParametricGraph {
     /// Detect (or fetch from the region cache) the planar regions of every
     /// sketch in the graph, keyed by node index. Sketches are cached even when
     /// hidden — hiding a sketch must not break dependent extrudes.
-    fn sketch_region_cache(
-        &self,
-        vars: &HashMap<String, f64>,
-    ) -> HashMap<NodeIndex, (CoordinateSystem, Vec<Region>)> {
+    fn sketch_region_cache(&self, vars: &HashMap<String, f64>) -> HashMap<NodeIndex, SketchEval> {
         let mut cache = HashMap::new();
         for idx in self.graph.node_indices() {
             if let FeatureType::Sketch {
@@ -600,7 +655,17 @@ impl ParametricGraph {
                 // current variables; the region-cache key (a hash of the
                 // resolved curves) then changes whenever a variable does.
                 let effective = crate::sketch::effective_curves(curves, shapes, corner_mods, vars);
-                cache.insert(idx, (*cs, self.cached_regions(&effective)));
+                let regions = self.cached_regions(&effective);
+                let provenance = build_region_provenance(&effective, shapes, &regions);
+                cache.insert(
+                    idx,
+                    SketchEval {
+                        cs: *cs,
+                        regions,
+                        provenance,
+                        curves: effective,
+                    },
+                );
             }
         }
         cache
@@ -657,7 +722,7 @@ impl ParametricGraph {
         depth: f32,
         region_indices: &[usize],
         mode: ExtrudeMode,
-        sketch_cache: &HashMap<NodeIndex, (CoordinateSystem, Vec<Region>)>,
+        sketch_cache: &HashMap<NodeIndex, SketchEval>,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
     ) {
@@ -666,9 +731,11 @@ impl ParametricGraph {
             .graph
             .neighbors_directed(idx, petgraph::Direction::Incoming)
             .find_map(|p| sketch_cache.get(&p));
-        let Some((cs, regions)) = parent else {
+        let Some(sketch) = parent else {
             return;
         };
+        let cs = &sketch.cs;
+        let regions = &sketch.regions;
         if regions.is_empty() {
             return;
         }
@@ -688,30 +755,118 @@ impl ParametricGraph {
         };
 
         let mut newbody_tools: Vec<KernelSolid> = Vec::new();
+        let mut newbody_cut_tools: Vec<KernelSolid> = Vec::new();
         let mut cut_tools: Vec<CutTool> = Vec::new();
         let mut join_tools: Vec<JoinTool> = Vec::new();
+        let mut sketch_source = SketchExtrudeSource {
+            regions: Vec::new(),
+        };
         let mut newbody_mesh = MockMesh::empty();
 
         for (i, region) in regions.iter().enumerate() {
             if !take_all && !region_indices.contains(&i) {
                 continue;
             }
+            let provenance = sketch.provenance.get(i);
             match mode {
                 ExtrudeMode::NewBody => {
+                    let source_rect_circle_exact = provenance
+                        .and_then(|provenance| {
+                            rect_circle_region_base_and_cutter_from_provenance(
+                                provenance, region, depth, cs, 0.0,
+                            )
+                        })
+                        .or_else(|| {
+                            rect_circle_region_base_and_cutter_from_sketch(
+                                &sketch.curves,
+                                region,
+                                depth,
+                                cs,
+                                0.0,
+                            )
+                        });
+                    let rect_circle_exact = source_rect_circle_exact.clone().or_else(|| {
+                        crate::mock_kernel::rect_minus_circle_region_base_and_cutter(
+                            &region.boundary,
+                            &region.holes,
+                            depth,
+                            cs,
+                        )
+                    });
+                    let canonical_rect_circle = rect_circle_exact.as_ref().map(|(base, cutter)| {
+                        RectCircleCanonicalSource {
+                            base: base.clone(),
+                            cutter: cutter.clone(),
+                            body: crate::mock_kernel::difference(base, cutter),
+                        }
+                    });
                     // Prefer the smooth analytic cylinder for a circular profile so
                     // a new-body cylinder stays round if it is later joined/cut
                     // (re-tessellated from this solid); falls back to the prism.
-                    if let Some(s) =
-                        cyl_tool(region, cs, depth).or_else(|| region_solid(region, cs, depth))
-                    {
+                    let body_tool = canonical_rect_circle
+                        .as_ref()
+                        .and_then(|canonical| canonical.body.clone())
+                        .or_else(|| cyl_tool(region, cs, depth))
+                        .or_else(|| region_solid(region, cs, depth));
+                    if let Some(s) = body_tool {
                         newbody_tools.push(s);
                     }
-                    newbody_mesh.append(MockMesh::make_extruded_sketch(
+                    if let Some((_base, cutter)) = provenance
+                        .and_then(|provenance| {
+                            rect_circle_region_base_and_cutter_from_provenance(
+                                provenance,
+                                region,
+                                depth,
+                                cs,
+                                CUT_WALL_GROW,
+                            )
+                        })
+                        .or_else(|| {
+                            rect_circle_region_base_and_cutter_from_sketch(
+                                &sketch.curves,
+                                region,
+                                depth,
+                                cs,
+                                CUT_WALL_GROW,
+                            )
+                        })
+                    {
+                        newbody_cut_tools.push(cutter);
+                    } else if let Some((_base, cutter)) =
+                        crate::mock_kernel::rect_minus_circle_region_base_and_grown_cutter(
+                            &region.boundary,
+                            &region.holes,
+                            depth,
+                            cs,
+                            CUT_WALL_GROW,
+                        )
+                    {
+                        newbody_cut_tools.push(cutter);
+                    } else if let Some((_, cutter)) = rect_circle_exact.as_ref() {
+                        newbody_cut_tools.push(cutter.clone());
+                    }
+                    sketch_source.regions.push(SketchExtrudeRegionSource {
+                        boundary: region.boundary.clone(),
+                        holes: region.holes.clone(),
+                        depth,
+                        cs: *cs,
+                        rect_circle: canonical_rect_circle,
+                    });
+                    let mut region_mesh = crate::mock_kernel::extruded_region_display_mesh(
                         &region.boundary,
                         &region.holes,
                         depth,
                         cs,
-                    ));
+                    );
+                    stamp_sketch_extrude_edge_refs(
+                        &mut region_mesh,
+                        node_id,
+                        i,
+                        provenance,
+                        cs,
+                        depth,
+                    );
+                    newbody_mesh.append(region_mesh);
                 }
                 ExtrudeMode::Cut => {
                     // Cut in the drawn direction (the sign of `depth`): a negative
@@ -752,6 +907,14 @@ impl ParametricGraph {
                         &rev_cs,
                     );
                     if smooth.is_some() || exact.is_some() || expanded.is_some() {
+                        let circle = if sketch.curves.segments.is_empty()
+                            && sketch.curves.circles.len() == 1
+                            && region.holes.is_empty()
+                        {
+                            sketch.curves.circles.first().copied()
+                        } else {
+                            None
+                        };
                         cut_tools.push(CutTool {
                             smooth,
                             exact,
@@ -759,6 +922,7 @@ impl ParametricGraph {
                             smooth_rev,
                             exact_rev,
                             expanded_rev,
+                            circle,
                         });
                     }
                 }
@@ -794,6 +958,8 @@ impl ParametricGraph {
                         id: node_id.to_string(),
                         parts: newbody_tools,
                         pristine: (!newbody_mesh.indices.is_empty()).then_some(newbody_mesh),
+                        sketch_source: (!sketch_source.regions.is_empty()).then_some(sketch_source),
+                        cut_tools: newbody_cut_tools,
                     });
                 }
             }
@@ -826,6 +992,215 @@ fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> {
     bodies
 }
 
+fn stamp_sketch_extrude_edge_refs(
+    mesh: &mut MockMesh,
+    body_id: &str,
+    region_index: usize,
+    provenance: Option<&RegionProvenance>,
+    cs: &CoordinateSystem,
+    depth: f32,
+) {
+    let Some(provenance) = provenance else {
+        return;
+    };
+    if provenance.fragments.is_empty() {
+        return;
+    }
+
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for edge_ref in &mut mesh.edge_refs {
+        let role = sketch_extrude_edge_role(edge_ref.p0, edge_ref.p1, cs, depth);
+        let fragment_id = sketch_extrude_edge_fragment_id(edge_ref, provenance, cs)
+            .unwrap_or_else(|| "unknown".to_string());
+        let base_id =
+            format!("sketch:{body_id}:region:{region_index}:fragment:{fragment_id}:role:{role}");
+        let occurrence = occurrences.entry(base_id.clone()).or_insert(0);
+        let edge_id = if *occurrence == 0 {
+            base_id
+        } else {
+            format!("{base_id}:occ:{occurrence}")
+        };
+        *occurrence += 1;
+
+        let curve_kind = match edge_ref.curve {
+            Some(EdgeCurveHint::Circle { .. }) => Some("circle".to_string()),
+            Some(EdgeCurveHint::Line) => Some("line".to_string()),
+            None => None,
+        };
+        edge_ref.topology = Some(MeshTopologyEdgeRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            edge_id: Some(edge_id),
+            curve_kind,
+            adjacent_surface_kinds: Vec::new(),
+            adjacent_face_ids: Vec::new(),
+        });
+    }
+}
+
+fn sketch_extrude_edge_role(
+    p0: [f32; 3],
+    p1: [f32; 3],
+    cs: &CoordinateSystem,
+    depth: f32,
+) -> &'static str {
+    let offset = |p: [f32; 3]| {
+        Vec3::new(p[0], p[1], p[2])
+            .sub(cs.origin)
+            .dot(cs.n.normalize())
+    };
+    let a = offset(p0);
+    let b = offset(p1);
+    let tol = (depth.abs() * 1.0e-3).max(0.02);
+    if a.abs() <= tol && b.abs() <= tol {
+        "bottom"
+    } else if (a - depth).abs() <= tol && (b - depth).abs() <= tol {
+        "top"
+    } else {
+        "side"
+    }
+}
+
+fn sketch_extrude_edge_fragment_id(
+    edge_ref: &crate::mock_kernel::MeshEdgeRef,
+    provenance: &RegionProvenance,
+    cs: &CoordinateSystem,
+) -> Option<String> {
+    match edge_ref.curve {
+        Some(EdgeCurveHint::Circle { center, radius, .. }) => {
+            let center_2d = cs.project(Vec3::new(center[0], center[1], center[2]));
+            provenance
+                .fragments
+                .iter()
+                .enumerate()
+                .find_map(|(i, fragment)| match fragment {
+                    RegionProvenanceFragment::CircleArc {
+                        shape_id,
+                        center,
+                        radius: source_radius,
+                    } if (center.0 - center_2d.0).hypot(center.1 - center_2d.1) <= 0.05
+                        && (*source_radius - radius).abs() <= 0.05 =>
+                    {
+                        Some(provenance_fragment_stable_id(i, fragment, *shape_id))
+                    }
+                    _ => None,
+                })
+        }
+        _ => sketch_extrude_linear_fragment_id(edge_ref, provenance, cs),
+    }
+}
+
+fn sketch_extrude_linear_fragment_id(
+    edge_ref: &crate::mock_kernel::MeshEdgeRef,
+    provenance: &RegionProvenance,
+    cs: &CoordinateSystem,
+) -> Option<String> {
+    let mid = [
+        (edge_ref.p0[0] + edge_ref.p1[0]) * 0.5,
+        (edge_ref.p0[1] + edge_ref.p1[1]) * 0.5,
+        (edge_ref.p0[2] + edge_ref.p1[2]) * 0.5,
+    ];
+    let mid_2d = cs.project(Vec3::new(mid[0], mid[1], mid[2]));
+
+    let mut best_rect: Option<(f32, String)> = None;
+    let mut best_circle: Option<(f32, String)> = None;
+    let mut raw: Option<String> = None;
+    for (i, fragment) in provenance.fragments.iter().enumerate() {
+        match fragment {
+            RegionProvenanceFragment::RectangleEdge {
+                shape_id,
+                edge_index,
+                rect_min,
+                rect_max,
+            } => {
+                let dist = distance_to_rect_edge(mid_2d, *edge_index, *rect_min, *rect_max);
+                if best_rect.as_ref().map_or(true, |(best, _)| dist < *best) {
+                    best_rect = Some((dist, provenance_fragment_stable_id(i, fragment, *shape_id)));
+                }
+            }
+            RegionProvenanceFragment::CircleArc {
+                shape_id,
+                center,
+                radius,
+            } => {
+                let dist = ((mid_2d.0 - center.0).hypot(mid_2d.1 - center.1) - radius).abs();
+                if best_circle.as_ref().map_or(true, |(best, _)| dist < *best) {
+                    best_circle =
+                        Some((dist, provenance_fragment_stable_id(i, fragment, *shape_id)));
+                }
+            }
+            RegionProvenanceFragment::RawPolyline { shape_id }
+            | RegionProvenanceFragment::SketchFilletArc { shape_id }
+            | RegionProvenanceFragment::SketchChamferEdge { shape_id }
+            | RegionProvenanceFragment::Slot { shape_id }
+            | RegionProvenanceFragment::RoundedRectangle { shape_id } => {
+                raw.get_or_insert_with(|| provenance_fragment_stable_id(i, fragment, *shape_id));
+            }
+        }
+    }
+
+    if let Some((dist, id)) = best_circle {
+        if dist <= 0.08 {
+            return Some(id);
+        }
+    }
+    if let Some((dist, id)) = best_rect {
+        if dist <= 0.08 {
+            return Some(id);
+        }
+    }
+    raw
+}
+
+fn distance_to_rect_edge(
+    p: (f32, f32),
+    edge_index: usize,
+    rect_min: (f32, f32),
+    rect_max: (f32, f32),
+) -> f32 {
+    match edge_index {
+        0 => {
+            let x = p.0.clamp(rect_min.0, rect_max.0);
+            (p.0 - x).hypot(p.1 - rect_min.1)
+        }
+        1 => {
+            let y = p.1.clamp(rect_min.1, rect_max.1);
+            (p.0 - rect_max.0).hypot(p.1 - y)
+        }
+        2 => {
+            let x = p.0.clamp(rect_min.0, rect_max.0);
+            (p.0 - x).hypot(p.1 - rect_max.1)
+        }
+        _ => {
+            let y = p.1.clamp(rect_min.1, rect_max.1);
+            (p.0 - rect_min.0).hypot(p.1 - y)
+        }
+    }
+}
+
+fn provenance_fragment_stable_id(
+    fallback_index: usize,
+    fragment: &RegionProvenanceFragment,
+    shape_id: Option<usize>,
+) -> String {
+    let owner = shape_id
+        .map(|id| format!("shape:{id}"))
+        .unwrap_or_else(|| format!("fragment:{fallback_index}"));
+    match fragment {
+        RegionProvenanceFragment::RectangleEdge { edge_index, .. } => {
+            format!("{owner}:rectangle-edge:{edge_index}")
+        }
+        RegionProvenanceFragment::CircleArc { .. } => format!("{owner}:circle"),
+        RegionProvenanceFragment::SketchFilletArc { .. } => format!("{owner}:sketch-fillet"),
+        RegionProvenanceFragment::SketchChamferEdge { .. } => format!("{owner}:sketch-chamfer"),
+        RegionProvenanceFragment::Slot { .. } => format!("{owner}:slot"),
+        RegionProvenanceFragment::RoundedRectangle { .. } => {
+            format!("{owner}:rounded-rectangle")
+        }
+        RegionProvenanceFragment::RawPolyline { .. } => format!("{owner}:raw-polyline"),
+    }
+}
+
 /// A body being assembled during evaluation. `parts` are the kernel solids that
 /// make it up (more than one only when disjoint lumps share a node); `pristine`
 /// holds the analytic mesh while the body is untouched by any boolean, so plain
@@ -836,6 +1211,333 @@ struct LiveBody {
     id: String,
     parts: Vec<KernelSolid>,
     pristine: Option<MockMesh>,
+    sketch_source: Option<SketchExtrudeSource>,
+    cut_tools: Vec<KernelSolid>,
+}
+
+#[derive(Debug, Clone)]
+struct SketchExtrudeSource {
+    regions: Vec<SketchExtrudeRegionSource>,
+}
+
+#[derive(Debug, Clone)]
+struct SketchExtrudeRegionSource {
+    boundary: Vec<(f32, f32)>,
+    holes: Vec<Vec<(f32, f32)>>,
+    depth: f32,
+    cs: CoordinateSystem,
+    rect_circle: Option<RectCircleCanonicalSource>,
+}
+
+#[derive(Debug, Clone)]
+struct RectCircleCanonicalSource {
+    base: KernelSolid,
+    cutter: KernelSolid,
+    body: Option<KernelSolid>,
+}
+
+fn rect_circle_region_base_and_cutter_from_sketch(
+    curves: &SketchCurves,
+    region: &Region,
+    depth: f32,
+    cs: &CoordinateSystem,
+    radius_grow: f32,
+) -> Option<(KernelSolid, KernelSolid)> {
+    if region.holes.len() > 0 {
+        return None;
+    }
+    let (rect_min, rect_max) = rectangle_bounds_from_source_curves(curves)?;
+    let circle = curves.circles.first().copied()?;
+    if curves.circles.len() != 1 {
+        return None;
+    }
+    if !circle_intersects_rect_boundary(rect_min, rect_max, circle.center, circle.radius) {
+        return None;
+    }
+    if !region_is_rect_minus_circle_material(
+        region,
+        rect_min,
+        rect_max,
+        circle.center,
+        circle.radius,
+    ) {
+        return None;
+    }
+    crate::mock_kernel::rect_circle_base_and_cutter_from_primitives(
+        rect_min,
+        rect_max,
+        circle.center,
+        circle.radius,
+        depth,
+        cs,
+        radius_grow,
+    )
+}
+
+fn rect_circle_region_base_and_cutter_from_provenance(
+    provenance: &RegionProvenance,
+    region: &Region,
+    depth: f32,
+    cs: &CoordinateSystem,
+    radius_grow: f32,
+) -> Option<(KernelSolid, KernelSolid)> {
+    if !region.holes.is_empty() {
+        return None;
+    }
+    let mut rect: Option<((f32, f32), (f32, f32))> = None;
+    let mut circle: Option<((f32, f32), f32)> = None;
+    for fragment in &provenance.fragments {
+        match fragment {
+            RegionProvenanceFragment::RectangleEdge {
+                rect_min, rect_max, ..
+            } => {
+                let candidate = (*rect_min, *rect_max);
+                if rect.is_none() {
+                    rect = Some(candidate);
+                } else if rect != Some(candidate) {
+                    return None;
+                }
+            }
+            RegionProvenanceFragment::CircleArc { center, radius, .. } => {
+                let candidate = (*center, *radius);
+                if circle.is_none() {
+                    circle = Some(candidate);
+                } else if circle != Some(candidate) {
+                    return None;
+                }
+            }
+            RegionProvenanceFragment::RawPolyline { .. } => return None,
+            _ => {}
+        }
+    }
+    let (rect_min, rect_max) = rect?;
+    let (circle_center, circle_radius) = circle?;
+    if !circle_intersects_rect_boundary(rect_min, rect_max, circle_center, circle_radius) {
+        return None;
+    }
+    if !region_is_rect_minus_circle_material(
+        region,
+        rect_min,
+        rect_max,
+        circle_center,
+        circle_radius,
+    ) {
+        return None;
+    }
+    crate::mock_kernel::rect_circle_base_and_cutter_from_primitives(
+        rect_min,
+        rect_max,
+        circle_center,
+        circle_radius,
+        depth,
+        cs,
+        radius_grow,
+    )
+}
+
+fn sketch_source_after_circle_cut(
+    source: &SketchExtrudeSource,
+    circle: Circle,
+) -> Option<SketchExtrudeSource> {
+    let mut next = source.clone();
+    let mut any = false;
+    for region in &mut next.regions {
+        if !region.holes.is_empty() || region.rect_circle.is_some() {
+            continue;
+        }
+        let (rect_min, rect_max) = loop_bounds_2d(&region.boundary)?;
+        if !circle_intersects_rect_boundary(rect_min, rect_max, circle.center, circle.radius) {
+            continue;
+        }
+        let mut provenance_curves = SketchCurves::new();
+        provenance_curves.add_rectangle(rect_min, rect_max);
+        provenance_curves.add_circle(circle.center, circle.radius);
+        if let Some(material_region) = detect_regions(&provenance_curves).into_iter().find(|r| {
+            region_is_rect_minus_circle_material(
+                r,
+                rect_min,
+                rect_max,
+                circle.center,
+                circle.radius,
+            )
+        }) {
+            region.boundary = material_region.boundary;
+            region.holes = material_region.holes;
+        }
+        let Some((base, cutter)) = crate::mock_kernel::rect_circle_base_and_cutter_from_primitives(
+            rect_min,
+            rect_max,
+            circle.center,
+            circle.radius,
+            region.depth,
+            &region.cs,
+            0.0,
+        ) else {
+            continue;
+        };
+        region.rect_circle = Some(RectCircleCanonicalSource {
+            body: crate::mock_kernel::difference(&base, &cutter),
+            base,
+            cutter,
+        });
+        any = true;
+    }
+    any.then_some(next)
+}
+
+fn rectangle_bounds_from_source_curves(curves: &SketchCurves) -> Option<((f32, f32), (f32, f32))> {
+    if curves.segments.len() != 4 {
+        return None;
+    }
+    let mut pts: Vec<(f32, f32)> = Vec::new();
+    for seg in &curves.segments {
+        for p in [seg.a, seg.b] {
+            if !pts.iter().any(|q| (q.0 - p.0).hypot(q.1 - p.1) <= 1.0e-4) {
+                pts.push(p);
+            }
+        }
+    }
+    if pts.len() != 4 {
+        return None;
+    }
+
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (x, y) in pts {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if max_x - min_x <= 1.0e-3 || max_y - min_y <= 1.0e-3 {
+        return None;
+    }
+
+    let has_corner = |p: (f32, f32)| {
+        curves
+            .segments
+            .iter()
+            .flat_map(|s| [s.a, s.b])
+            .any(|q| (q.0 - p.0).abs() <= 1.0e-4 && (q.1 - p.1).abs() <= 1.0e-4)
+    };
+    for corner in [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ] {
+        if !has_corner(corner) {
+            return None;
+        }
+    }
+
+    let mut sides = [false; 4];
+    for seg in &curves.segments {
+        let horizontal = (seg.a.1 - seg.b.1).abs() <= 1.0e-4;
+        let vertical = (seg.a.0 - seg.b.0).abs() <= 1.0e-4;
+        if horizontal {
+            if (seg.a.1 - min_y).abs() <= 1.0e-4 {
+                sides[0] = true;
+            } else if (seg.a.1 - max_y).abs() <= 1.0e-4 {
+                sides[2] = true;
+            } else {
+                return None;
+            }
+        } else if vertical {
+            if (seg.a.0 - max_x).abs() <= 1.0e-4 {
+                sides[1] = true;
+            } else if (seg.a.0 - min_x).abs() <= 1.0e-4 {
+                sides[3] = true;
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    sides
+        .iter()
+        .all(|s| *s)
+        .then_some(((min_x, min_y), (max_x, max_y)))
+}
+
+fn circle_intersects_rect_boundary(
+    rect_min: (f32, f32),
+    rect_max: (f32, f32),
+    center: (f32, f32),
+    radius: f32,
+) -> bool {
+    let ((min_x, min_y), (max_x, max_y)) = ordered_rect(rect_min, rect_max);
+    let mut hits = 0usize;
+    let eps = 1.0e-4;
+    for y in [min_y, max_y] {
+        let dy = y - center.1;
+        if dy.abs() <= radius + eps {
+            let dx2 = radius * radius - dy * dy;
+            if dx2 >= -eps {
+                let dx = dx2.max(0.0).sqrt();
+                for x in [center.0 - dx, center.0 + dx] {
+                    if x >= min_x - eps && x <= max_x + eps {
+                        hits += 1;
+                    }
+                }
+            }
+        }
+    }
+    for x in [min_x, max_x] {
+        let dx = x - center.0;
+        if dx.abs() <= radius + eps {
+            let dy2 = radius * radius - dx * dx;
+            if dy2 >= -eps {
+                let dy = dy2.max(0.0).sqrt();
+                for y in [center.1 - dy, center.1 + dy] {
+                    if y >= min_y - eps && y <= max_y + eps {
+                        hits += 1;
+                    }
+                }
+            }
+        }
+    }
+    hits >= 2
+}
+
+fn region_is_rect_minus_circle_material(
+    region: &Region,
+    rect_min: (f32, f32),
+    rect_max: (f32, f32),
+    center: (f32, f32),
+    radius: f32,
+) -> bool {
+    if region.contains(center) {
+        return false;
+    }
+    let ((min_x, min_y), (max_x, max_y)) = ordered_rect(rect_min, rect_max);
+    let rect_area = (max_x - min_x) * (max_y - min_y);
+    if region.area <= 1.0e-3 || region.area >= rect_area - 1.0e-3 {
+        return false;
+    }
+
+    let mut has_material_sample = false;
+    let mut has_removed_circle_sample = false;
+    for ix in 1..5 {
+        for iy in 1..5 {
+            let x = min_x + (max_x - min_x) * (ix as f32 / 5.0);
+            let y = min_y + (max_y - min_y) * (iy as f32 / 5.0);
+            let inside_circle = (x - center.0).hypot(y - center.1) < radius - 0.05;
+            let inside_region = region.contains((x, y));
+            if inside_region && !inside_circle {
+                has_material_sample = true;
+            }
+            if inside_region && inside_circle {
+                has_removed_circle_sample = true;
+            }
+        }
+    }
+    has_material_sample && !has_removed_circle_sample
+}
+
+fn ordered_rect(a: (f32, f32), b: (f32, f32)) -> ((f32, f32), (f32, f32)) {
+    ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
 }
 
 /// Upper bound on distinct sketch states retained in [`ParametricGraph::region_cache`].
@@ -917,6 +1619,7 @@ struct CutTool {
     smooth_rev: Option<KernelSolid>,
     exact_rev: Option<KernelSolid>,
     expanded_rev: Option<KernelSolid>,
+    circle: Option<Circle>,
 }
 
 /// Grow (`outward`) or shrink a closed 2D loop about its centroid so its
@@ -1072,6 +1775,7 @@ fn apply_join(
                         if keeps_body {
                             *part = u;
                             body.pristine = None;
+                            body.sketch_source = None;
                             merged = true;
                             break 'bodies;
                         }
@@ -1085,6 +1789,7 @@ fn apply_join(
                     {
                         body.parts.push(fallback);
                         body.pristine = None;
+                        body.sketch_source = None;
                         merged = true;
                         break 'bodies;
                     }
@@ -1108,6 +1813,8 @@ fn apply_join(
             id: extrude_id.to_string(),
             parts: orphans,
             pristine: None,
+            sketch_source: None,
+            cut_tools: Vec::new(),
         });
     }
 }
@@ -1268,7 +1975,13 @@ fn apply_cut(
             }
             body.parts = next;
             if changed {
+                let next_source = body.sketch_source.as_ref().and_then(|source| {
+                    tool.circle
+                        .and_then(|circle| sketch_source_after_circle_cut(source, circle))
+                });
                 body.pristine = None;
+                body.sketch_source = next_source;
+                body.cut_tools.extend(cut_tool_recutter_solids(tool));
             }
         }
         if failed_on_overlap {
@@ -1281,8 +1994,16 @@ fn apply_cut(
     }
 }
 
-/// Legacy edge-cutter facet cap kept for the unused cutter helper below. Native
-/// fillet/chamfer edits no longer call this path. The cutter
+fn cut_tool_recutter_solids(tool: &CutTool) -> Vec<KernelSolid> {
+    [tool.expanded.as_ref(), tool.expanded_rev.as_ref()]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// Edge-cutter facet cap for the boolean fallback. Native
+/// fillet/chamfer edits call this path only after native failure. The cutter
 /// tessellates adaptively (~3.6°/segment) up to this cap, so a right-angle edge
 /// rounds with ~24 facets — smooth enough that, with the facet-boundary lines
 /// suppressed (see `mesh_feature_edges`), the fillet reads as one curved face —
@@ -1290,13 +2011,23 @@ fn apply_cut(
 #[allow(dead_code)]
 const EDGE_FILLET_SEGS: usize = 24;
 
-/// Legacy fallback edge-cutter grow amount. Must clear `BOOL_TOL`
+/// Robust fallback edge-cutter grow amount. Must clear `BOOL_TOL`
 /// (0.05mm) by a healthy margin so the cutter's tangent edges read as cleanly
 /// *outside* the body faces rather than tangent — the configuration truck's
 /// boolean solver rejects. Costs up to this much chamfer/fillet size in the
 /// fallback path, the price of a boolean that resolves at all.
-#[allow(dead_code)]
 const EDGE_MOD_GROW: f32 = 0.2;
+
+/// Robust fallback cutter overshoot past each selected edge endpoint. The exact
+/// fallback tries no overshoot first; this second pass clears endpoint caps and
+/// curved-wall runout tangencies.
+#[allow(dead_code)]
+const EDGE_MOD_END_OVERSHOOT: f32 = 1.0;
+
+/// A fillet/chamfer is subtractive, but B-Rep kernels can occasionally return a
+/// topologically valid-looking result that renders new material. Permit only a
+/// tiny numerical skin outside the pre-edge-mod body.
+const EDGE_MOD_CONTAINMENT_TOL: f32 = EDGE_MOD_GROW + 0.05;
 
 /// Apply a 3D fillet or chamfer to the target body.
 ///
@@ -1308,16 +2039,21 @@ const EDGE_MOD_GROW: f32 = 0.2;
 /// rejected so the body is left intact rather than self-intersecting.
 ///
 /// **Chamfer** uses OpenRCAD's native selected-edge bevel
-/// ([`crate::mock_kernel::chamfer_edge`]) and applies the same "leave unchanged
-/// on clean kernel error" behavior as fillet.
+/// ([`crate::mock_kernel::chamfer_edge`]).
+///
+/// Unsupported curved rims, oversized distances, and large runouts into curved
+/// cut walls are rejected before entering the kernel. Native candidates are also
+/// validated as subtractive edits; if a candidate refills a cut void or adds
+/// visible material, the body is left unchanged with a warning.
 ///
 /// `draft` is retained for API compatibility but no longer changes the result:
-/// the native edge modifiers are exact in a single pass, so the live preview and
+/// edge modifiers resolve in a single pass, so the live preview and
 /// the committed model are identical.
 fn apply_edge_mod(
     mod_id: &str,
     target: &str,
     edge: &EdgeRef,
+    _scope: &EdgeModScope,
     dist: f32,
     kind: crate::sketch::CornerKind,
     _draft: bool,
@@ -1332,16 +2068,159 @@ fn apply_edge_mod(
         return;
     };
 
-    match kind {
-        crate::sketch::CornerKind::Fillet => apply_fillet(mod_id, edge, dist, body, warnings),
-        crate::sketch::CornerKind::Chamfer => apply_chamfer(mod_id, edge, dist, body, warnings),
+    let label = match kind {
+        crate::sketch::CornerKind::Fillet => "Fillet",
+        crate::sketch::CornerKind::Chamfer => "Chamfer",
+    };
+    let resolved_edge = resolve_edge_ref_by_topology(body, edge).unwrap_or_else(|| edge.clone());
+    if let Err(reason) = edge_mod_preflight(body, &resolved_edge, dist) {
+        warnings.push(format!(
+            "{label} '{mod_id}': {reason}, so the body was left unchanged."
+        ));
+        return;
     }
+    let selection = EdgeModSelection::new(&resolved_edge);
+
+    match kind {
+        crate::sketch::CornerKind::Fillet => apply_fillet(mod_id, &selection, dist, body, warnings),
+        crate::sketch::CornerKind::Chamfer => {
+            apply_chamfer(mod_id, &selection, dist, body, warnings)
+        }
+    }
+}
+
+fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> Option<EdgeRef> {
+    let requested = edge.topology.as_ref()?;
+    let requested_edge_id = requested.edge_id.as_deref()?;
+    if requested
+        .body_id
+        .as_deref()
+        .is_some_and(|body_id| body_id != body.id)
+    {
+        return None;
+    }
+
+    if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| {
+        mesh.edge_refs
+            .iter()
+            .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
+            .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+    }) {
+        return Some(resolved);
+    }
+
+    let mesh = edge_mod_reference_mesh(body);
+    mesh.edge_refs
+        .iter()
+        .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
+        .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+}
+
+fn topology_edge_id(edge: &crate::mock_kernel::MeshEdgeRef) -> Option<&str> {
+    edge.topology
+        .as_ref()
+        .and_then(|topology| topology.edge_id.as_deref())
+}
+
+fn edge_ref_from_mesh_candidate(
+    body: &LiveBody,
+    candidate: &crate::mock_kernel::MeshEdgeRef,
+    requested: &TopologyEdgeRef,
+) -> EdgeRef {
+    let mut topology = candidate.topology.as_ref().map(|topology| TopologyEdgeRef {
+        body_id: topology.body_id.clone().or_else(|| Some(body.id.clone())),
+        topology_version: topology.topology_version,
+        edge_id: topology.edge_id.clone(),
+        adjacent_face_ids: topology.adjacent_face_ids.clone(),
+        curve_kind: topology.curve_kind.clone(),
+        adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+    });
+    if topology.is_none() {
+        topology = Some(requested.clone());
+    }
+    EdgeRef {
+        p0: candidate.p0,
+        p1: candidate.p1,
+        n1: candidate.n1,
+        n2: candidate.n2,
+        curve: candidate.curve.clone(),
+        topology,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EdgeModSelection {
+    original_edge: EdgeRef,
+    active_edge: EdgeRef,
+}
+
+impl EdgeModSelection {
+    fn new(edge: &EdgeRef) -> Self {
+        Self {
+            original_edge: edge.clone(),
+            active_edge: edge.clone(),
+        }
+    }
+}
+
+struct EdgeModResult {
+    parts: Vec<KernelSolid>,
+    pristine: Option<MockMesh>,
+}
+
+impl EdgeModResult {
+    fn single(part: KernelSolid) -> Self {
+        Self {
+            parts: vec![part],
+            pristine: None,
+        }
+    }
+}
+
+fn edge_mod_preflight(_body: &LiveBody, edge: &EdgeRef, dist: f32) -> Result<(), String> {
+    if !dist.is_finite() || dist <= 0.0 {
+        return Err("distance must be positive".to_string());
+    }
+
+    let run = edge_ref_local_clearance(edge);
+    if run <= 1.0e-4 {
+        return Err("selected edge is too short".to_string());
+    }
+    let max_dist = run * 0.5;
+    if dist > max_dist + 1.0e-4 {
+        return Err(format!(
+            "requested distance {dist:.2}mm is larger than this edge's local clearance \
+             (about {max_dist:.2}mm)"
+        ));
+    }
+    Ok(())
+}
+
+fn edge_ref_length(edge: &EdgeRef) -> f32 {
+    let dx = edge.p1[0] - edge.p0[0];
+    let dy = edge.p1[1] - edge.p0[1];
+    let dz = edge.p1[2] - edge.p0[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn edge_ref_local_clearance(edge: &EdgeRef) -> f32 {
+    match edge.curve {
+        Some(EdgeCurveHint::Circle { radius, .. }) => radius.abs(),
+        _ => edge_ref_length(edge),
+    }
+}
+
+fn edge_mod_native_only(selection: &EdgeModSelection) -> bool {
+    matches!(
+        selection.active_edge.curve,
+        Some(EdgeCurveHint::Circle { .. })
+    )
 }
 
 /// Native rolling-ball fillet of the captured edge on every part of `body`.
 fn apply_fillet(
     mod_id: &str,
-    edge: &EdgeRef,
+    selection: &EdgeModSelection,
     dist: f32,
     body: &mut LiveBody,
     warnings: &mut Vec<String>,
@@ -1349,7 +2228,13 @@ fn apply_fillet(
     let mut applied = false;
     let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
-    for part in body.parts.drain(..) {
+    let mut next_pristine = MockMesh::empty();
+    let mut can_use_pristine = true;
+    let reference_mesh = edge_mod_reference_mesh(body);
+    let sketch_source = body.sketch_source.clone();
+    let recut_tools = body.cut_tools.clone();
+    for (part_index, part) in body.parts.drain(..).enumerate() {
+        let mut part_failures = Vec::new();
         // No pre-size gate: the kernel's rolling-ball blend rejects a radius too
         // large for the local geometry (a non-watertight result → `Err`), which
         // is the correct, geometry-aware bound. The old global-AABB heuristic was
@@ -1357,20 +2242,103 @@ fn apply_fillet(
         // edge's adjacent-face extents, so it blocked radii the kernel handles)
         // and asymmetric — chamfer never had it, which is why a radius would
         // chamfer but refuse to fillet.
-        match crate::mock_kernel::fillet_edge(&part, edge.p0, edge.p1, dist) {
+        let sketch_region = sketch_source
+            .as_ref()
+            .and_then(|source| source.regions.get(part_index));
+        let circular_bite_locality = sketch_region.map(|region| (region, selection, dist));
+        let mut accepted: Option<EdgeModResult> = None;
+        let native_only = edge_mod_native_only(selection);
+        let native_reason = match edge_mod_try_native_fillet(
+            &reference_mesh,
+            &part,
+            &part,
+            selection,
+            dist,
+            "native",
+            &recut_tools,
+            circular_bite_locality,
+        ) {
             Ok(f) => {
-                applied = true;
-                next.push(f);
+                accepted = Some(EdgeModResult::single(f));
+                None
             }
-            Err(reason) => {
-                last_err = Some(reason);
-                next.push(part);
+            Err(reason) => Some(reason),
+        };
+        if accepted.is_none() {
+            if let Some(reason) = native_reason.clone() {
+                part_failures.push(reason);
             }
+        }
+
+        let alternate_parts = if accepted.is_none() && !native_only {
+            sketch_source
+                .as_ref()
+                .map(|source| sketch_source_alternate_parts(source, part_index))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if accepted.is_none() && !native_only {
+            for (label, alternate_part) in &alternate_parts {
+                match edge_mod_try_native_fillet(
+                    &reference_mesh,
+                    &part,
+                    alternate_part,
+                    selection,
+                    dist,
+                    &format!("{label} native"),
+                    &recut_tools,
+                    circular_bite_locality,
+                ) {
+                    Ok(f) => {
+                        accepted = Some(EdgeModResult::single(f));
+                        break;
+                    }
+                    Err(reason) => {
+                        part_failures.push(reason);
+                    }
+                }
+            }
+        }
+
+        if accepted.is_none() && !native_only {
+            if let Some(region) = sketch_region {
+                match edge_mod_rect_circle_precut_fallback(
+                    region,
+                    &part,
+                    selection,
+                    dist,
+                    crate::sketch::CornerKind::Fillet,
+                    &reference_mesh,
+                ) {
+                    Ok(fallback) => accepted = Some(fallback),
+                    Err(reason) => part_failures.push(reason),
+                }
+            }
+        }
+
+        if let Some(result) = accepted {
+            applied = true;
+            if let Some(mesh) = result.pristine {
+                next_pristine.append(mesh);
+            } else {
+                can_use_pristine = false;
+            }
+            next.extend(result.parts);
+        } else {
+            can_use_pristine = false;
+            if !part_failures.is_empty() {
+                last_err = Some(part_failures.join("; "));
+            }
+            next.push(part);
         }
     }
     body.parts = next;
     if applied {
-        body.pristine = None;
+        body.pristine =
+            (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
+        body.sketch_source = None;
     } else {
         // Surface the kernel's actual reason (radius too large, edge not found on
         // an adjacent face, non-blendable wedge, …) instead of a generic guess.
@@ -1382,38 +2350,1332 @@ fn apply_fillet(
     }
 }
 
+fn edge_mod_try_native_fillet(
+    reference_mesh: &MockMesh,
+    original_part: &KernelSolid,
+    fillet_part: &KernelSolid,
+    selection: &EdgeModSelection,
+    dist: f32,
+    label: &str,
+    recut_tools: &[KernelSolid],
+    circular_bite_locality: Option<(&SketchExtrudeRegionSource, &EdgeModSelection, f32)>,
+) -> Result<KernelSolid, String> {
+    let edge = &selection.active_edge;
+    let mut failures = Vec::new();
+    for (suffix, p0, p1) in [("", edge.p0, edge.p1), (" reversed", edge.p1, edge.p0)] {
+        match crate::mock_kernel::fillet_edge_with_hint(
+            fillet_part,
+            p0,
+            p1,
+            edge.curve.as_ref(),
+            dist,
+        ) {
+            Ok(f) => match edge_mod_accept_candidate_or_recut(
+                reference_mesh,
+                original_part,
+                f,
+                recut_tools,
+                circular_bite_locality,
+            ) {
+                Ok(f) => match edge_mod_reject_unhealthy_native_curve_result(selection, &f) {
+                    Ok(()) => return Ok(f),
+                    Err(reason) => {
+                        failures.push(format!("{label}{suffix} result rejected: {reason}"))
+                    }
+                },
+                Err(reason) => failures.push(format!("{label}{suffix} result rejected: {reason}")),
+            },
+            Err(reason) => failures.push(format!("{label}{suffix} failed: {reason}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
 /// Native selected-edge chamfer of the captured edge on every part of `body`.
 fn apply_chamfer(
     mod_id: &str,
-    edge: &EdgeRef,
+    selection: &EdgeModSelection,
     dist: f32,
     body: &mut LiveBody,
     warnings: &mut Vec<String>,
 ) {
+    let edge = &selection.active_edge;
     let mut applied = false;
     let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
-    for part in body.parts.drain(..) {
-        match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
-            Ok(chamfered) => {
-                applied = true;
-                next.push(chamfered);
+    let mut next_pristine = MockMesh::empty();
+    let mut can_use_pristine = true;
+    let reference_mesh = edge_mod_reference_mesh(body);
+    let sketch_source = body.sketch_source.clone();
+    let recut_tools = body.cut_tools.clone();
+    for (part_index, part) in body.parts.drain(..).enumerate() {
+        let sketch_region = sketch_source
+            .as_ref()
+            .and_then(|source| source.regions.get(part_index));
+        let circular_bite_locality = sketch_region.map(|region| (region, selection, dist));
+        let mut accepted: Option<EdgeModResult> = None;
+        let mut part_failures = Vec::new();
+        let native_only = edge_mod_native_only(selection);
+        let native_reason = match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
+            Ok(chamfered) => match edge_mod_accept_candidate_or_recut(
+                &reference_mesh,
+                &part,
+                chamfered,
+                &recut_tools,
+                circular_bite_locality,
+            ) {
+                Ok(chamfered) => {
+                    match edge_mod_reject_unhealthy_native_curve_result(selection, &chamfered) {
+                        Ok(()) => {
+                            accepted = Some(EdgeModResult::single(chamfered));
+                            None
+                        }
+                        Err(reason) => Some(format!("native result rejected: {reason}")),
+                    }
+                }
+                Err(reason) => Some(format!("native result rejected: {reason}")),
+            },
+            Err(reason) => Some(format!("native failed: {reason}")),
+        };
+        if accepted.is_none() {
+            if let Some(reason) = native_reason.clone() {
+                part_failures.push(reason);
             }
-            Err(reason) => {
-                last_err = Some(reason);
-                next.push(part);
+        }
+
+        let alternate_parts = if accepted.is_none() && !native_only {
+            sketch_source
+                .as_ref()
+                .map(|source| sketch_source_alternate_parts(source, part_index))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if accepted.is_none() && !native_only {
+            for (label, alternate_part) in &alternate_parts {
+                let candidate =
+                    crate::mock_kernel::chamfer_edge(alternate_part, edge.p0, edge.p1, dist);
+                match candidate {
+                    Ok(chamfered) => {
+                        match edge_mod_accept_candidate_or_recut(
+                            &reference_mesh,
+                            &part,
+                            chamfered,
+                            &recut_tools,
+                            circular_bite_locality,
+                        ) {
+                            Ok(chamfered) => {
+                                accepted = Some(EdgeModResult::single(chamfered));
+                                break;
+                            }
+                            Err(reason) => part_failures
+                                .push(format!("{label} native result rejected: {reason}")),
+                        }
+                    }
+                    Err(reason) => {
+                        part_failures.push(format!("{label} native failed: {reason}"));
+                    }
+                }
             }
+        }
+
+        if accepted.is_none() && !native_only {
+            if let Some(region) = sketch_region {
+                match edge_mod_rect_circle_precut_fallback(
+                    region,
+                    &part,
+                    selection,
+                    dist,
+                    crate::sketch::CornerKind::Chamfer,
+                    &reference_mesh,
+                ) {
+                    Ok(fallback) => accepted = Some(fallback),
+                    Err(reason) => part_failures.push(reason),
+                }
+            }
+        }
+
+        if let Some(result) = accepted {
+            applied = true;
+            if let Some(mesh) = result.pristine {
+                next_pristine.append(mesh);
+            } else {
+                can_use_pristine = false;
+            }
+            next.extend(result.parts);
+        } else {
+            can_use_pristine = false;
+            if !part_failures.is_empty() {
+                last_err = Some(part_failures.join("; "));
+            }
+            next.push(part);
         }
     }
     body.parts = next;
     if applied {
-        body.pristine = None;
+        body.pristine =
+            (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
+        body.sketch_source = None;
     } else {
         let reason = last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
         warnings.push(format!(
             "Chamfer '{mod_id}': the edge couldn't be beveled ({reason}), so the \
              body was left unchanged."
         ));
+    }
+}
+
+fn edge_mod_rect_circle_precut_fallback(
+    region: &SketchExtrudeRegionSource,
+    original_part: &KernelSolid,
+    selection: &EdgeModSelection,
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+    reference_mesh: &MockMesh,
+) -> Result<EdgeModResult, String> {
+    let edge = &selection.active_edge;
+    let (base, circle_cutter) = if let Some(canonical) = &region.rect_circle {
+        (canonical.base.clone(), canonical.cutter.clone())
+    } else if let Some((base, circle_cutter)) =
+        crate::mock_kernel::rect_minus_circle_region_base_and_cutter(
+            &region.boundary,
+            &region.holes,
+            region.depth,
+            &region.cs,
+        )
+    {
+        (base, circle_cutter)
+    } else {
+        return Err("pre-cut circular-bite fallback did not match this sketch region".to_string());
+    };
+
+    let split_base = split_rect_base_for_edge(region, edge).unwrap_or_else(|| base.clone());
+    let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
+    let mut failures = Vec::new();
+
+    // Native edge mods on the already-cut body can sometimes build the right
+    // local blend but leave a sliver/cap inside the circular void. Re-cutting the
+    // result with the original analytic cylinder removes any such added material
+    // while preserving the requested radius/distance.
+    let circular_bite_locality = Some((region, selection, dist));
+
+    let native_on_cut = if fillet {
+        crate::mock_kernel::fillet_edge(original_part, edge.p0, edge.p1, dist)
+    } else {
+        crate::mock_kernel::chamfer_edge(original_part, edge.p0, edge.p1, dist)
+    };
+    match native_on_cut {
+        Ok(edge_modded) => match crate::mock_kernel::difference(&edge_modded, &circle_cutter) {
+            Some(result) => {
+                match edge_mod_accept_candidate_for_edge(
+                    reference_mesh,
+                    original_part,
+                    result,
+                    circular_bite_locality,
+                ) {
+                    Ok(result) => return Ok(EdgeModResult::single(result)),
+                    Err(reason) => {
+                        failures.push(format!("post-cut native result rejected: {reason}"))
+                    }
+                }
+            }
+            None => failures.push("post-cut native circle boolean failed".to_string()),
+        },
+        Err(reason) => failures.push(format!("post-cut native failed: {reason}")),
+    }
+
+    match edge_mod_fallback_cut_against_part(
+        original_part,
+        original_part,
+        edge,
+        dist,
+        kind,
+        reference_mesh,
+        "post-cut cutter ",
+    ) {
+        Ok(result) => {
+            match edge_mod_accept_candidate_for_edge(
+                reference_mesh,
+                original_part,
+                result,
+                circular_bite_locality,
+            ) {
+                Ok(result) => return Ok(EdgeModResult::single(result)),
+                Err(reason) => failures.push(format!("post-cut cutter result rejected: {reason}")),
+            }
+        }
+        Err(reason) => failures.push(reason),
+    }
+
+    let native = if fillet {
+        crate::mock_kernel::fillet_edge(&split_base, edge.p0, edge.p1, dist)
+    } else {
+        crate::mock_kernel::chamfer_edge(&split_base, edge.p0, edge.p1, dist)
+    };
+    match native {
+        Ok(edge_cut_base) => match crate::mock_kernel::difference(&edge_cut_base, &circle_cutter) {
+            Some(result) => {
+                match edge_mod_accept_candidate_for_edge(
+                    reference_mesh,
+                    original_part,
+                    result,
+                    circular_bite_locality,
+                ) {
+                    Ok(result) => return Ok(EdgeModResult::single(result)),
+                    Err(reason) => {
+                        failures.push(format!("pre-cut native result rejected: {reason}"))
+                    }
+                }
+            }
+            None => failures.push("pre-cut native circle boolean failed".to_string()),
+        },
+        Err(reason) => failures.push(format!("pre-cut native failed: {reason}")),
+    }
+
+    let split_base_reference = MockMesh::from_solid(&split_base);
+    match edge_mod_fallback_cut_against_part(
+        &split_base,
+        &split_base,
+        edge,
+        dist,
+        kind,
+        &split_base_reference,
+        "pre-cut cutter ",
+    ) {
+        Ok(edge_cut_base) => match crate::mock_kernel::difference(&edge_cut_base, &circle_cutter) {
+            Some(result) => {
+                match edge_mod_accept_candidate_for_edge(
+                    reference_mesh,
+                    original_part,
+                    result,
+                    circular_bite_locality,
+                ) {
+                    Ok(result) => return Ok(EdgeModResult::single(result)),
+                    Err(reason) => {
+                        failures.push(format!("pre-cut cutter result rejected: {reason}"))
+                    }
+                }
+            }
+            None => failures.push("pre-cut cutter circle boolean failed".to_string()),
+        },
+        Err(reason) => failures.push(reason),
+    }
+
+    Err(if failures.is_empty() {
+        "pre-cut circular-bite fallback produced no candidate".to_string()
+    } else {
+        format!(
+            "pre-cut circular-bite fallback failed: {}",
+            failures.join("; ")
+        )
+    })
+}
+
+fn split_rect_base_for_edge(
+    region: &SketchExtrudeRegionSource,
+    edge: &EdgeRef,
+) -> Option<KernelSolid> {
+    let ((min_x, min_y), (max_x, max_y)) = loop_bounds_2d(&region.boundary)?;
+    let p0 = region
+        .cs
+        .project(Vec3::new(edge.p0[0], edge.p0[1], edge.p0[2]));
+    let p1 = region
+        .cs
+        .project(Vec3::new(edge.p1[0], edge.p1[1], edge.p1[2]));
+    let side_eps = 0.12;
+    let push_unique = |out: &mut Vec<(f32, f32)>, p: (f32, f32)| {
+        if out
+            .last()
+            .is_none_or(|q| (q.0 - p.0).hypot(q.1 - p.1) > 1.0e-4)
+        {
+            out.push(p);
+        }
+    };
+    let mut profile = Vec::new();
+    if (p0.1 - min_y).abs() <= side_eps && (p1.1 - min_y).abs() <= side_eps {
+        let mut split = [p0, p1];
+        split.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for p in [
+            (min_x, min_y),
+            split[0],
+            split[1],
+            (max_x, min_y),
+            (max_x, max_y),
+            (min_x, max_y),
+        ] {
+            push_unique(&mut profile, p);
+        }
+    } else if (p0.0 - max_x).abs() <= side_eps && (p1.0 - max_x).abs() <= side_eps {
+        let mut split = [p0, p1];
+        split.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for p in [
+            (min_x, min_y),
+            (max_x, min_y),
+            split[0],
+            split[1],
+            (max_x, max_y),
+            (min_x, max_y),
+        ] {
+            push_unique(&mut profile, p);
+        }
+    } else if (p0.1 - max_y).abs() <= side_eps && (p1.1 - max_y).abs() <= side_eps {
+        let mut split = [p0, p1];
+        split.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for p in [
+            (min_x, min_y),
+            (max_x, min_y),
+            (max_x, max_y),
+            split[0],
+            split[1],
+            (min_x, max_y),
+        ] {
+            push_unique(&mut profile, p);
+        }
+    } else if (p0.0 - min_x).abs() <= side_eps && (p1.0 - min_x).abs() <= side_eps {
+        let mut split = [p0, p1];
+        split.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for p in [
+            (min_x, min_y),
+            (max_x, min_y),
+            (max_x, max_y),
+            (min_x, max_y),
+            split[0],
+            split[1],
+        ] {
+            push_unique(&mut profile, p);
+        }
+    } else {
+        return None;
+    }
+    if profile.len() >= 2 {
+        let first = profile[0];
+        if profile
+            .last()
+            .is_some_and(|last| (last.0 - first.0).hypot(last.1 - first.1) <= 1.0e-4)
+        {
+            profile.pop();
+        }
+    }
+    crate::mock_kernel::extruded_region_solid(&profile, &[], region.depth, &region.cs)
+}
+
+fn loop_bounds_2d(points: &[(f32, f32)]) -> Option<((f32, f32), (f32, f32))> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut any = false;
+    for &(x, y) in points {
+        any = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    any.then_some(((min_x, min_y), (max_x, max_y)))
+}
+
+#[allow(dead_code)]
+fn edge_mod_fallback_cut(
+    part: &KernelSolid,
+    edge: &EdgeRef,
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+    reference_mesh: &MockMesh,
+    alternate_parts: &[(&'static str, KernelSolid)],
+) -> Result<KernelSolid, String> {
+    let mut failures = Vec::new();
+    match edge_mod_fallback_cut_against_part(part, part, edge, dist, kind, reference_mesh, "") {
+        Ok(result) => return Ok(result),
+        Err(reason) => failures.push(reason),
+    }
+    for (label, alternate_part) in alternate_parts {
+        let prefix = format!("{label} ");
+        match edge_mod_fallback_cut_against_part(
+            alternate_part,
+            part,
+            edge,
+            dist,
+            kind,
+            reference_mesh,
+            &prefix,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(reason) => failures.push(reason),
+        }
+    }
+
+    Err(if failures.is_empty() {
+        "no fallback candidate was produced".to_string()
+    } else {
+        failures.join("; ")
+    })
+}
+
+#[allow(dead_code)]
+fn edge_mod_fallback_cut_against_part(
+    cut_part: &KernelSolid,
+    original_part: &KernelSolid,
+    edge: &EdgeRef,
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+    reference_mesh: &MockMesh,
+    label_prefix: &str,
+) -> Result<KernelSolid, String> {
+    let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
+    let robust_overshoot = EDGE_MOD_END_OVERSHOOT;
+    let mut failures = Vec::new();
+    for (label, grow, end_overshoot) in [
+        ("exact cutter", 0.0, 0.0),
+        ("grown cutter", EDGE_MOD_GROW, 0.0),
+        ("overshot cutter", 0.0, robust_overshoot),
+        ("robust cutter", EDGE_MOD_GROW, robust_overshoot),
+    ] {
+        let Some(cutter) = crate::mock_kernel::edge_corner_cutter(
+            edge.p0,
+            edge.p1,
+            edge.n1,
+            edge.n2,
+            dist,
+            fillet,
+            EDGE_FILLET_SEGS,
+            grow,
+            end_overshoot,
+        ) else {
+            failures.push(format!("{label} could not be built"));
+            continue;
+        };
+        let Some(result) = crate::mock_kernel::difference(cut_part, &cutter) else {
+            failures.push(format!("{label} boolean failed"));
+            continue;
+        };
+        match edge_mod_accept_candidate(reference_mesh, original_part, result) {
+            Ok(result) => return Ok(result),
+            Err(reason) => failures.push(format!("{label} rejected: {reason}")),
+        }
+    }
+
+    if fillet {
+        for (label, grow, end_overshoot) in [
+            ("piecewise exact cutter", 0.0, 0.0),
+            ("piecewise grown cutter", EDGE_MOD_GROW, 0.0),
+            ("piecewise robust cutter", EDGE_MOD_GROW, robust_overshoot),
+        ] {
+            let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
+                edge.p0,
+                edge.p1,
+                edge.n1,
+                edge.n2,
+                dist,
+                true,
+                EDGE_FILLET_SEGS,
+                grow,
+                end_overshoot,
+            ) else {
+                failures.push(format!("{label} could not be built"));
+                continue;
+            };
+
+            let mut result = cut_part.clone();
+            let mut failed = None;
+            for cutter in pieces {
+                match crate::mock_kernel::difference(&result, &cutter) {
+                    Some(next) => result = next,
+                    None => {
+                        failed = Some(format!("{label} boolean failed"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = failed {
+                failures.push(reason);
+                continue;
+            }
+
+            match edge_mod_accept_candidate(reference_mesh, original_part, result) {
+                Ok(result) => return Ok(result),
+                Err(reason) => failures.push(format!("{label} rejected: {reason}")),
+            }
+        }
+
+        for trim in [0.05, EDGE_MOD_GROW, 0.5] {
+            let Some(trimmed) = trimmed_edge_ref(edge, trim) else {
+                failures.push(format!(
+                    "trimmed piecewise cutter {trim:.2} could not be built"
+                ));
+                continue;
+            };
+            let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
+                trimmed.p0,
+                trimmed.p1,
+                trimmed.n1,
+                trimmed.n2,
+                dist,
+                true,
+                EDGE_FILLET_SEGS,
+                EDGE_MOD_GROW,
+                0.0,
+            ) else {
+                failures.push(format!(
+                    "trimmed piecewise cutter {trim:.2} could not be built"
+                ));
+                continue;
+            };
+
+            let mut result = cut_part.clone();
+            let mut failed = None;
+            for cutter in pieces {
+                match crate::mock_kernel::difference(&result, &cutter) {
+                    Some(next) => result = next,
+                    None => {
+                        failed = Some(format!("trimmed piecewise cutter {trim:.2} boolean failed"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = failed {
+                failures.push(reason);
+                continue;
+            }
+
+            match edge_mod_accept_candidate(reference_mesh, original_part, result) {
+                Ok(result) => return Ok(result),
+                Err(reason) => failures.push(format!(
+                    "trimmed piecewise cutter {trim:.2} rejected: {reason}"
+                )),
+            }
+        }
+    }
+
+    Err(if failures.is_empty() {
+        "no fallback candidate was produced".to_string()
+    } else {
+        format!("{label_prefix}{}", failures.join("; "))
+    })
+}
+
+fn sketch_source_alternate_parts(
+    source: &SketchExtrudeSource,
+    part_index: usize,
+) -> Vec<(&'static str, KernelSolid)> {
+    let mut out = Vec::new();
+    let Some(region) = source.regions.get(part_index) else {
+        return out;
+    };
+
+    if let Some(canonical) = &region.rect_circle {
+        if let Some(part) = canonical.body.clone() {
+            out.push(("box-cylinder sketch", part));
+        }
+        return out;
+    }
+
+    if let Some(part) = crate::mock_kernel::rect_minus_circle_region_solid(
+        &region.boundary,
+        &region.holes,
+        region.depth,
+        &region.cs,
+    ) {
+        out.push(("box-cylinder sketch", part));
+        return out;
+    }
+
+    if let Some(part) = crate::mock_kernel::extruded_region_faceted_solid(
+        &region.boundary,
+        &region.holes,
+        region.depth,
+        &region.cs,
+    ) {
+        out.push(("faceted sketch", part));
+    }
+
+    out
+}
+
+#[allow(dead_code)]
+fn trimmed_edge_ref(edge: &EdgeRef, trim: f32) -> Option<EdgeRef> {
+    trimmed_edge_ref_asymmetric(edge, trim, trim)
+}
+
+fn trimmed_edge_ref_asymmetric(edge: &EdgeRef, start_trim: f32, end_trim: f32) -> Option<EdgeRef> {
+    let d = [
+        edge.p1[0] - edge.p0[0],
+        edge.p1[1] - edge.p0[1],
+        edge.p1[2] - edge.p0[2],
+    ];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len <= start_trim + end_trim + 1.0e-4 {
+        return None;
+    }
+    let t = [d[0] / len, d[1] / len, d[2] / len];
+    Some(EdgeRef {
+        p0: [
+            edge.p0[0] + t[0] * start_trim,
+            edge.p0[1] + t[1] * start_trim,
+            edge.p0[2] + t[2] * start_trim,
+        ],
+        p1: [
+            edge.p1[0] - t[0] * end_trim,
+            edge.p1[1] - t[1] * end_trim,
+            edge.p1[2] - t[2] * end_trim,
+        ],
+        n1: edge.n1,
+        n2: edge.n2,
+        curve: None,
+        topology: None,
+    })
+}
+
+fn edge_mod_reference_mesh(body: &LiveBody) -> MockMesh {
+    let mut mesh = MockMesh::empty();
+    for part in &body.parts {
+        mesh.append(MockMesh::from_solid(part));
+    }
+    if !mesh.indices.is_empty() {
+        mesh
+    } else {
+        body.pristine.clone().unwrap_or_else(MockMesh::empty)
+    }
+}
+
+fn edge_mod_accept_candidate_or_recut(
+    reference_mesh: &MockMesh,
+    original_part: &KernelSolid,
+    candidate: KernelSolid,
+    recut_tools: &[KernelSolid],
+    circular_bite_locality: Option<(&SketchExtrudeRegionSource, &EdgeModSelection, f32)>,
+) -> Result<KernelSolid, String> {
+    let first_reason = match edge_mod_accept_candidate_for_edge(
+        reference_mesh,
+        original_part,
+        candidate.clone(),
+        circular_bite_locality,
+    ) {
+        Ok(candidate) => return Ok(candidate),
+        Err(reason) => reason,
+    };
+
+    let mut failures = Vec::new();
+    for tool in recut_tools {
+        match crate::mock_kernel::difference(&candidate, tool) {
+            Some(recut) => {
+                match edge_mod_accept_candidate_for_edge(
+                    reference_mesh,
+                    original_part,
+                    recut,
+                    circular_bite_locality,
+                ) {
+                    Ok(recut) => return Ok(recut),
+                    Err(reason) => failures.push(format!("recut result rejected: {reason}")),
+                }
+            }
+            None => failures.push("recut boolean failed".to_string()),
+        }
+    }
+
+    if failures.is_empty() {
+        Err(first_reason)
+    } else {
+        Err(format!(
+            "{first_reason}; analytic recut failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn edge_mod_accept_candidate_for_edge(
+    reference_mesh: &MockMesh,
+    original_part: &KernelSolid,
+    candidate: KernelSolid,
+    circular_bite_locality: Option<(&SketchExtrudeRegionSource, &EdgeModSelection, f32)>,
+) -> Result<KernelSolid, String> {
+    let candidate = edge_mod_accept_candidate(reference_mesh, original_part, candidate)?;
+    if let Some((region, selection, _dist)) = circular_bite_locality {
+        edge_mod_circular_bite_locality(region, &candidate, selection)?;
+    }
+    Ok(candidate)
+}
+
+fn edge_mod_circular_bite_locality(
+    region: &SketchExtrudeRegionSource,
+    candidate: &KernelSolid,
+    selection: &EdgeModSelection,
+) -> Result<(), String> {
+    if region.rect_circle.is_none() {
+        return Ok(());
+    }
+    let candidate_mesh = MockMesh::from_solid(candidate);
+    if candidate_mesh.indices.is_empty() {
+        return Err("candidate tessellated to an empty mesh".to_string());
+    }
+
+    edge_mod_circular_bite_locality_mesh(region, &candidate_mesh, selection)
+}
+
+fn edge_mod_circular_bite_locality_mesh(
+    region: &SketchExtrudeRegionSource,
+    candidate_mesh: &MockMesh,
+    selection: &EdgeModSelection,
+) -> Result<(), String> {
+    for (p0, p1) in circular_bite_unselected_side_segments(region, selection) {
+        if !mesh_wire_path_covers(&candidate_mesh, p0, p1, 0.08) {
+            return Err(format!(
+                "candidate removed unselected circular-bite side span [{:.3}, {:.3}, {:.3}] -> [{:.3}, {:.3}, {:.3}]",
+                p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn circular_bite_unselected_side_segments(
+    region: &SketchExtrudeRegionSource,
+    selection: &EdgeModSelection,
+) -> Vec<([f32; 3], [f32; 3])> {
+    let Some(((min_x, min_y), (max_x, max_y))) = loop_bounds_2d(&region.boundary) else {
+        return Vec::new();
+    };
+    let original = &selection.original_edge;
+    let selected = &selection.active_edge;
+    let p0_world = Vec3::new(original.p0[0], original.p0[1], original.p0[2]);
+    let p1_world = Vec3::new(original.p1[0], original.p1[1], original.p1[2]);
+    let p0 = region.cs.project(p0_world);
+    let p1 = region.cs.project(p1_world);
+    let sel0_world = Vec3::new(selected.p0[0], selected.p0[1], selected.p0[2]);
+    let sel1_world = Vec3::new(selected.p1[0], selected.p1[1], selected.p1[2]);
+    let sel0 = region.cs.project(sel0_world);
+    let sel1 = region.cs.project(sel1_world);
+    let offset0 = p0_world
+        .sub(region.cs.unproject(p0.0, p0.1))
+        .dot(region.cs.n);
+    let offset1 = p1_world
+        .sub(region.cs.unproject(p1.0, p1.1))
+        .dot(region.cs.n);
+    let offset = (offset0 + offset1) * 0.5;
+    let cap_tol = 0.2;
+    if offset.abs() > cap_tol && (offset - region.depth).abs() > cap_tol {
+        return Vec::new();
+    }
+    let side_eps = 0.12;
+
+    let side = if (p0.1 - min_y).abs() <= side_eps && (p1.1 - min_y).abs() <= side_eps {
+        0usize
+    } else if (p0.0 - max_x).abs() <= side_eps && (p1.0 - max_x).abs() <= side_eps {
+        1
+    } else if (p0.1 - max_y).abs() <= side_eps && (p1.1 - max_y).abs() <= side_eps {
+        2
+    } else if (p0.0 - min_x).abs() <= side_eps && (p1.0 - min_x).abs() <= side_eps {
+        3
+    } else {
+        return Vec::new();
+    };
+
+    let on_side = |p: (f32, f32)| match side {
+        0 => (p.1 - min_y).abs() <= side_eps,
+        1 => (p.0 - max_x).abs() <= side_eps,
+        2 => (p.1 - max_y).abs() <= side_eps,
+        _ => (p.0 - min_x).abs() <= side_eps,
+    };
+    let same_original_segment = |a: (f32, f32), b: (f32, f32)| {
+        (dist2(a, p0) <= side_eps && dist2(b, p1) <= side_eps)
+            || (dist2(a, p1) <= side_eps && dist2(b, p0) <= side_eps)
+    };
+    let selected_matches_boundary = (0..region.boundary.len()).any(|i| {
+        let a = region.boundary[i];
+        let b = region.boundary[(i + 1) % region.boundary.len()];
+        on_side(a) && on_side(b) && same_original_segment(a, b)
+    });
+    if !selected_matches_boundary {
+        return Vec::new();
+    }
+    let same_segment = |a: (f32, f32), b: (f32, f32)| {
+        (dist2(a, sel0) <= side_eps && dist2(b, sel1) <= side_eps)
+            || (dist2(a, sel1) <= side_eps && dist2(b, sel0) <= side_eps)
+    };
+    let to_world = |p: (f32, f32)| {
+        let q = region.cs.unproject(p.0, p.1).add(region.cs.n.mul(offset));
+        [q.x, q.y, q.z]
+    };
+    let coord = |p: (f32, f32)| {
+        if side == 0 || side == 2 {
+            p.0
+        } else {
+            p.1
+        }
+    };
+    let point_at = |a: (f32, f32), v: f32| {
+        if side == 0 || side == 2 {
+            (v, a.1)
+        } else {
+            (a.0, v)
+        }
+    };
+
+    let mut out = Vec::new();
+    for i in 0..region.boundary.len() {
+        let a = region.boundary[i];
+        let b = region.boundary[(i + 1) % region.boundary.len()];
+        if !on_side(a) || !on_side(b) || dist2(a, b) <= 0.15 || same_segment(a, b) {
+            continue;
+        }
+        let lo = coord(a).min(coord(b));
+        let hi = coord(a).max(coord(b));
+        let sel_lo = coord(sel0).min(coord(sel1));
+        let sel_hi = coord(sel0).max(coord(sel1));
+        let overlap_lo = lo.max(sel_lo);
+        let overlap_hi = hi.min(sel_hi);
+        let mut push_span = |s0: f32, s1: f32| {
+            if (s1 - s0).abs() <= 0.15 {
+                return;
+            }
+            let q0 = point_at(a, s0);
+            let q1 = point_at(a, s1);
+            if coord(a) <= coord(b) {
+                out.push((to_world(q0), to_world(q1)));
+            } else {
+                out.push((to_world(q1), to_world(q0)));
+            }
+        };
+        if overlap_hi <= overlap_lo + 1.0e-3 {
+            push_span(lo, hi);
+        } else {
+            push_span(lo, overlap_lo);
+            push_span(overlap_hi, hi);
+        }
+    }
+    out
+}
+
+fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+fn edge_mod_accept_candidate(
+    reference_mesh: &MockMesh,
+    original_part: &KernelSolid,
+    candidate: KernelSolid,
+) -> Result<KernelSolid, String> {
+    if !edge_mod_keeps_body(original_part, &candidate) {
+        return Err("candidate expands outside the original part bounds".to_string());
+    }
+    if !crate::mock_kernel::preserves_cylindrical_faces(original_part, &candidate) {
+        return Err(
+            "candidate lost an analytic cylindrical face from the original body".to_string(),
+        );
+    }
+    if let Some((lo, hi)) = mesh_position_aabb(reference_mesh) {
+        if mesh_is_aabb_box(reference_mesh, lo, hi, EDGE_MOD_CONTAINMENT_TOL) {
+            return Ok(candidate);
+        }
+    }
+    let candidate_mesh = MockMesh::from_solid(&candidate);
+    if candidate_mesh.indices.is_empty() {
+        return Err("candidate tessellated to an empty mesh".to_string());
+    }
+    let preserved_cylinder_faces =
+        crate::mock_kernel::preserved_cylindrical_face_ids(original_part, &candidate);
+    edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
+    edge_mod_mesh_stays_inside_reference(
+        reference_mesh,
+        &candidate_mesh,
+        EDGE_MOD_CONTAINMENT_TOL,
+        Some(&preserved_cylinder_faces),
+    )?;
+    Ok(candidate)
+}
+
+fn edge_mod_render_mesh_has_no_cracks(mesh: &MockMesh) -> Result<(), String> {
+    let q = |i: usize| -> (i64, i64, i64) {
+        let b = i * 6;
+        let quant = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (
+            quant(mesh.vertices[b]),
+            quant(mesh.vertices[b + 1]),
+            quant(mesh.vertices[b + 2]),
+        )
+    };
+    let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+        std::collections::HashMap::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+            let (ka, kb) = (q(tri[a] as usize), q(tri[b] as usize));
+            let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let cracks = edges.values().filter(|&&count| count == 1).count();
+    if cracks == 0 {
+        Ok(())
+    } else {
+        Err(format!("candidate render mesh has {cracks} crack edges"))
+    }
+}
+
+fn edge_mod_reject_unhealthy_native_curve_result(
+    selection: &EdgeModSelection,
+    candidate: &KernelSolid,
+) -> Result<(), String> {
+    if !edge_mod_native_only(selection) {
+        return Ok(());
+    }
+    let mesh = MockMesh::from_solid(candidate);
+    if mesh.indices.is_empty() {
+        return Err("candidate tessellated to an empty mesh".to_string());
+    }
+    let nonmanifold = edge_mod_render_mesh_nonmanifold_edges(&mesh);
+    if nonmanifold == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "candidate render mesh is not watertight and healthy \
+             (0 crack edges, {nonmanifold} non-manifold edges)"
+        ))
+    }
+}
+
+fn edge_mod_render_mesh_nonmanifold_edges(mesh: &MockMesh) -> usize {
+    let q = |i: usize| -> (i64, i64, i64) {
+        let b = i * 6;
+        let quant = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (
+            quant(mesh.vertices[b]),
+            quant(mesh.vertices[b + 1]),
+            quant(mesh.vertices[b + 2]),
+        )
+    };
+    let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+        std::collections::HashMap::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+            let (ka, kb) = (q(tri[a] as usize), q(tri[b] as usize));
+            let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+    edges.values().filter(|&&count| count > 2).count()
+}
+
+#[cfg(test)]
+fn edge_mod_candidate_stays_inside_reference(
+    reference_mesh: &MockMesh,
+    candidate: &KernelSolid,
+) -> Result<(), String> {
+    let candidate_mesh = MockMesh::from_solid(candidate);
+    if candidate_mesh.indices.is_empty() {
+        return Err("candidate tessellated to an empty mesh".to_string());
+    }
+    edge_mod_mesh_stays_inside_reference(
+        reference_mesh,
+        &candidate_mesh,
+        EDGE_MOD_CONTAINMENT_TOL,
+        None,
+    )
+}
+
+fn edge_mod_mesh_stays_inside_reference(
+    reference_mesh: &MockMesh,
+    candidate_mesh: &MockMesh,
+    tol: f32,
+    preserved_cylinder_faces: Option<&std::collections::HashSet<u32>>,
+) -> Result<(), String> {
+    if reference_mesh.indices.is_empty() {
+        return Err("reference body could not be tessellated".to_string());
+    }
+    if candidate_mesh.indices.is_empty() {
+        return Err("candidate body could not be tessellated".to_string());
+    }
+
+    let Some((lo, hi)) = mesh_position_aabb(reference_mesh) else {
+        return Err("reference body has no render vertices".to_string());
+    };
+    let aabb_only = mesh_is_aabb_box(reference_mesh, lo, hi, tol);
+
+    for (i, v) in candidate_mesh.vertices.chunks_exact(6).enumerate() {
+        let p = [v[0], v[1], v[2]];
+        if !point_in_aabb(p, lo, hi, tol) {
+            return Err(format!(
+                "candidate vertex {i} at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body bounds",
+                p[0], p[1], p[2]
+            ));
+        }
+        if !aabb_only && !point_inside_triangle_mesh(reference_mesh, p, tol) {
+            return Err(format!(
+                "candidate vertex {i} at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body",
+                p[0], p[1], p[2]
+            ));
+        }
+    }
+
+    for (i, tri) in candidate_mesh.indices.chunks_exact(3).enumerate() {
+        let a = mesh_vertex_pos6(candidate_mesh, tri[0]);
+        let b = mesh_vertex_pos6(candidate_mesh, tri[1]);
+        let c = mesh_vertex_pos6(candidate_mesh, tri[2]);
+        let p = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
+        if !point_in_aabb(p, lo, hi, tol) {
+            return Err(format!(
+                "candidate triangle {i} centroid at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body bounds",
+                p[0], p[1], p[2]
+            ));
+        }
+        if !aabb_only && !point_inside_triangle_mesh(reference_mesh, p, tol) {
+            let face_id = candidate_mesh.face_ids.get(i).copied().unwrap_or(0);
+            if preserved_cylinder_faces.is_some_and(|faces| faces.contains(&face_id)) {
+                continue;
+            }
+            return Err(format!(
+                "candidate triangle {i} centroid at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body",
+                p[0], p[1], p[2]
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn mesh_is_aabb_box(mesh: &MockMesh, lo: [f32; 3], hi: [f32; 3], tol: f32) -> bool {
+    let key = |p: [f32; 3]| -> (i64, i64, i64) {
+        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (q(p[0]), q(p[1]), q(p[2]))
+    };
+    let mut unique = std::collections::HashSet::new();
+    for v in mesh.vertices.chunks_exact(6) {
+        let p = [v[0], v[1], v[2]];
+        if !(0..3).all(|k| (p[k] - lo[k]).abs() <= tol || (p[k] - hi[k]).abs() <= tol) {
+            return false;
+        }
+        unique.insert(key(p));
+    }
+    !unique.is_empty() && unique.len() <= 8
+}
+
+fn mesh_position_aabb(mesh: &MockMesh) -> Option<([f32; 3], [f32; 3])> {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    let mut any = false;
+    for v in mesh.vertices.chunks_exact(6) {
+        any = true;
+        for k in 0..3 {
+            lo[k] = lo[k].min(v[k]);
+            hi[k] = hi[k].max(v[k]);
+        }
+    }
+    any.then_some((lo, hi))
+}
+
+fn point_in_aabb(p: [f32; 3], lo: [f32; 3], hi: [f32; 3], tol: f32) -> bool {
+    (0..3).all(|k| p[k] >= lo[k] - tol && p[k] <= hi[k] + tol)
+}
+
+fn point_inside_triangle_mesh(mesh: &MockMesh, p: [f32; 3], tol: f32) -> bool {
+    let tol2 = tol * tol;
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = mesh_vertex_pos6(mesh, tri[0]);
+        let b = mesh_vertex_pos6(mesh, tri[1]);
+        let c = mesh_vertex_pos6(mesh, tri[2]);
+        if point_triangle_distance_sq(p, a, b, c) <= tol2 {
+            return true;
+        }
+    }
+
+    let dir = normalize3([2.0, 3.0, 5.0]);
+    let mut hits = Vec::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = mesh_vertex_pos6(mesh, tri[0]);
+        let b = mesh_vertex_pos6(mesh, tri[1]);
+        let c = mesh_vertex_pos6(mesh, tri[2]);
+        if let Some(t) = ray_triangle_intersection(p, dir, a, b, c) {
+            if t > tol.max(1.0e-5) {
+                hits.push(t);
+            }
+        }
+    }
+    hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    hits.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-4);
+    hits.len() % 2 == 1
+}
+
+fn mesh_vertex_pos6(mesh: &MockMesh, vi: u32) -> [f32; 3] {
+    let b = vi as usize * 6;
+    [mesh.vertices[b], mesh.vertices[b + 1], mesh.vertices[b + 2]]
+}
+
+fn mesh_edge_vertex_pos3(mesh: &MockMesh, vi: u32) -> [f32; 3] {
+    let b = vi as usize * 3;
+    [
+        mesh.edge_vertices[b],
+        mesh.edge_vertices[b + 1],
+        mesh.edge_vertices[b + 2],
+    ]
+}
+
+fn mesh_wire_path_covers(mesh: &MockMesh, p0: [f32; 3], p1: [f32; 3], tol: f32) -> bool {
+    let axis = sub3(p1, p0);
+    let len_sq = length_sq3(axis);
+    if len_sq <= 1.0e-12 {
+        return false;
+    }
+    let margin = (tol / len_sq.sqrt()).max(1.0e-4);
+    let endpoint_interval = |p: [f32; 3]| -> Option<f32> {
+        let t = dot3(sub3(p, p0), axis) / len_sq;
+        if !(-margin..=1.0 + margin).contains(&t) {
+            return None;
+        }
+        let nearest = add3(p0, mul3(axis, t.clamp(0.0, 1.0)));
+        (length_sq3(sub3(p, nearest)).sqrt() <= tol).then_some(t.clamp(0.0, 1.0))
+    };
+
+    let mut intervals = Vec::new();
+    for edge in mesh.edge_indices.chunks_exact(2) {
+        let a = mesh_edge_vertex_pos3(mesh, edge[0]);
+        let b = mesh_edge_vertex_pos3(mesh, edge[1]);
+        let (Some(ta), Some(tb)) = (endpoint_interval(a), endpoint_interval(b)) else {
+            continue;
+        };
+        if (ta - tb).abs() <= margin {
+            continue;
+        }
+        intervals.push((ta.min(tb), ta.max(tb)));
+    }
+    if intervals.is_empty() {
+        return false;
+    }
+    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut covered = 0.0f32;
+    for (start, end) in intervals {
+        if start > covered + margin {
+            break;
+        }
+        covered = covered.max(end);
+        if covered >= 1.0 - margin {
+            return true;
+        }
+    }
+    false
+}
+
+fn ray_triangle_intersection(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+) -> Option<f32> {
+    const EPS: f32 = 1.0e-7;
+    let e1 = sub3(b, a);
+    let e2 = sub3(c, a);
+    let h = cross3(dir, e2);
+    let det = dot3(e1, h);
+    if det.abs() < EPS {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = sub3(origin, a);
+    let u = dot3(s, h) * inv_det;
+    if !(-EPS..=1.0 + EPS).contains(&u) {
+        return None;
+    }
+    let q = cross3(s, e1);
+    let v = dot3(dir, q) * inv_det;
+    if v < -EPS || u + v > 1.0 + EPS {
+        return None;
+    }
+    let t = dot3(e2, q) * inv_det;
+    (t > EPS).then_some(t)
+}
+
+fn point_triangle_distance_sq(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let ab = sub3(b, a);
+    let ac = sub3(c, a);
+    let ap = sub3(p, a);
+    let d1 = dot3(ab, ap);
+    let d2 = dot3(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return length_sq3(ap);
+    }
+
+    let bp = sub3(p, b);
+    let d3 = dot3(ab, bp);
+    let d4 = dot3(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return length_sq3(bp);
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return length_sq3(sub3(p, add3(a, mul3(ab, v))));
+    }
+
+    let cp = sub3(p, c);
+    let d5 = dot3(ab, cp);
+    let d6 = dot3(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return length_sq3(cp);
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return length_sq3(sub3(p, add3(a, mul3(ac, w))));
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return length_sq3(sub3(p, add3(b, mul3(sub3(c, b), w))));
+    }
+
+    let n = cross3(ab, ac);
+    let n_len_sq = length_sq3(n);
+    if n_len_sq <= 1.0e-12 {
+        return length_sq3(ap).min(length_sq3(bp)).min(length_sq3(cp));
+    }
+    let dist = dot3(ap, n).abs() / n_len_sq.sqrt();
+    dist * dist
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn mul3(a: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn length_sq3(a: [f32; 3]) -> f32 {
+    dot3(a, a)
+}
+
+fn normalize3(a: [f32; 3]) -> [f32; 3] {
+    let len = length_sq3(a).sqrt();
+    if len <= 1.0e-12 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [a[0] / len, a[1] / len, a[2] / len]
     }
 }
 
@@ -1424,7 +3686,6 @@ fn apply_chamfer(
 /// material instead flares the result's bounds outside the part; rejecting that
 /// forces the caller to fall through to the robust cutter (or keep the body
 /// intact). Missing bounds → accept (vertexless can't be judged).
-#[allow(dead_code)]
 fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> bool {
     match (
         crate::mock_kernel::solid_aabb(part),
@@ -1493,6 +3754,28 @@ mod extrude_mode_tests {
                 on_face: false,
             },
         });
+    }
+
+    fn edge_ref_from_mesh_edge(body_id: &str, edge: &crate::mock_kernel::MeshEdgeRef) -> EdgeRef {
+        let topology = edge.topology.as_ref().map(|topology| TopologyEdgeRef {
+            body_id: topology
+                .body_id
+                .clone()
+                .or_else(|| Some(body_id.to_string())),
+            topology_version: topology.topology_version,
+            edge_id: topology.edge_id.clone(),
+            adjacent_face_ids: topology.adjacent_face_ids.clone(),
+            curve_kind: topology.curve_kind.clone(),
+            adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+        });
+        EdgeRef {
+            p0: edge.p0,
+            p1: edge.p1,
+            n1: edge.n1,
+            n2: edge.n2,
+            curve: edge.curve.clone(),
+            topology,
+        }
     }
 
     #[test]
@@ -1570,6 +3853,118 @@ mod extrude_mode_tests {
         assert!(
             (footprint(&g) - 30.0).abs() < 0.05,
             "changing the variable must resize the sketch (and the solid)"
+        );
+    }
+
+    #[test]
+    fn topology_edge_ref_reattaches_after_sketch_dimension_edit() {
+        use crate::sketch::{Dimension, SketchShape};
+        use crate::units::Unit;
+
+        let mut g = ParametricGraph::new();
+        g.add_feature(FeatureNode {
+            id: "vars_1".to_string(),
+            name: "Vars".to_string(),
+            feature: FeatureType::VariableSet {
+                variables: vec![Variable {
+                    name: "w".to_string(),
+                    value: 20.0,
+                    unit: Unit::Millimeter,
+                }],
+            },
+        });
+        g.add_feature(FeatureNode {
+            id: "sketch_2".to_string(),
+            name: "Sketch".to_string(),
+            feature: FeatureType::Sketch {
+                cs: CoordinateSystem::XY,
+                curves: SketchCurves::new(),
+                shapes: vec![SketchShape::Rectangle {
+                    origin: (0.0, 0.0),
+                    sx: 1.0,
+                    sy: 1.0,
+                    w: Dimension {
+                        value: 20.0,
+                        expr: Some("w".to_string()),
+                    },
+                    h: Dimension::literal(12.0),
+                    from_center: false,
+                }],
+                corner_mods: vec![],
+                on_face: false,
+            },
+        });
+        add_extrude(&mut g, "extrude_3", "sketch_2", 8.0, ExtrudeMode::NewBody);
+
+        let initial = g
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap();
+        let mesh = &initial[0].1;
+        let captured = mesh
+            .edge_refs
+            .iter()
+            .find(|edge| {
+                edge.topology
+                    .as_ref()
+                    .and_then(|topology| topology.edge_id.as_deref())
+                    .is_some_and(|id| id.contains("rectangle-edge:1:role:top"))
+            })
+            .expect("right-side top sketch edge should have a stable topology id");
+        assert!(
+            captured.p0[0] > 19.9 && captured.p1[0] > 19.9,
+            "captured edge starts on the original width"
+        );
+        let edge = edge_ref_from_mesh_edge("extrude_3", captured);
+        assert!(
+            edge.topology
+                .as_ref()
+                .and_then(|topology| topology.edge_id.as_ref())
+                .is_some(),
+            "captured edge ref must carry additive topology metadata"
+        );
+
+        g.add_feature(FeatureNode {
+            id: "edgemod_4".to_string(),
+            name: "Fillet".to_string(),
+            feature: FeatureType::EdgeMod {
+                target: "extrude_3".to_string(),
+                edge,
+                dist: 1.0,
+                dist_expr: None,
+                scope: EdgeModScope::FullEdge,
+                kind: crate::sketch::CornerKind::Fillet,
+            },
+        });
+        g.add_dependency("extrude_3", "edgemod_4");
+        let (_, initial_warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert!(
+            initial_warnings.is_empty(),
+            "initial topology-backed edge mod should solve, got {initial_warnings:?}"
+        );
+
+        for idx in g.graph.node_indices() {
+            if let FeatureType::VariableSet { variables } = &mut g.graph[idx].feature {
+                variables[0].value = 30.0;
+            }
+        }
+        let (resized, warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert!(
+            warnings.is_empty(),
+            "edge mod should reattach after equivalent topology edit, got {warnings:?}"
+        );
+        let max_x = resized[0]
+            .1
+            .vertices
+            .chunks(6)
+            .map(|v| v[0])
+            .fold(f32::MIN, f32::max);
+        assert!(
+            max_x > 29.5,
+            "resized body should use the edited width after reattach, max_x={max_x}"
         );
     }
 
@@ -1861,9 +4256,12 @@ mod extrude_mode_tests {
                     p1: [10.0, 0.0, 0.0],
                     n1: [0.0, 0.0, -1.0],
                     n2: [0.0, -1.0, 0.0],
+                    curve: None,
+                    topology: None,
                 },
                 dist,
                 dist_expr: None,
+                scope: EdgeModScope::FullEdge,
                 kind,
             },
         });
@@ -1888,6 +4286,431 @@ mod extrude_mode_tests {
                 on_face: false,
             },
         });
+    }
+
+    fn circular_bite_curves() -> SketchCurves {
+        let mut c = SketchCurves::new();
+        c.add_rectangle((0.0, 5.0), (40.0, 35.0));
+        c.add_circle((20.0, 8.0), 14.0);
+        c
+    }
+
+    fn circular_bite_region_index(curves: &SketchCurves) -> usize {
+        let regions = detect_regions(curves);
+        regions
+            .iter()
+            .position(|r| r.contains((5.0, 30.0)))
+            .expect("rectangular material region above the circular bite")
+    }
+
+    fn circular_bite_graph_with_depth(
+        edge_mod: Option<crate::sketch::CornerKind>,
+        depth: f32,
+    ) -> ParametricGraph {
+        let curves = circular_bite_curves();
+        let region = circular_bite_region_index(&curves);
+        let mut g = ParametricGraph::new();
+        add_sketch(&mut g, "s", curves);
+        g.add_feature(FeatureNode {
+            id: "e".to_string(),
+            name: "e".to_string(),
+            feature: FeatureType::Extrude {
+                depth,
+                region_indices: vec![region],
+                mode: ExtrudeMode::NewBody,
+                depth_expr: None,
+            },
+        });
+        g.add_dependency("s", "e");
+
+        if let Some(kind) = edge_mod {
+            g.add_feature(FeatureNode {
+                id: "em".to_string(),
+                name: "Edge Mod".to_string(),
+                feature: FeatureType::EdgeMod {
+                    target: "e".to_string(),
+                    edge: EdgeRef {
+                        p0: [0.0, 35.0, depth],
+                        p1: [40.0, 35.0, depth],
+                        n1: [0.0, 0.0, 1.0],
+                        n2: [0.0, 1.0, 0.0],
+                        curve: None,
+                        topology: None,
+                    },
+                    dist: 1.5,
+                    dist_expr: None,
+                    scope: EdgeModScope::FullEdge,
+                    kind,
+                },
+            });
+            g.add_dependency("e", "em");
+        }
+
+        g
+    }
+
+    fn circular_bite_graph(edge_mod: Option<crate::sketch::CornerKind>) -> ParametricGraph {
+        circular_bite_graph_with_depth(edge_mod, 10.0)
+    }
+
+    fn circular_bite_cutoff_edge_at_depth(depth: f32) -> EdgeRef {
+        let x = 20.0 - (14.0_f32 * 14.0 - 3.0_f32 * 3.0).sqrt();
+        EdgeRef {
+            p0: [0.0, 5.0, depth],
+            p1: [x, 5.0, depth],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, -1.0, 0.0],
+            curve: None,
+            topology: None,
+        }
+    }
+
+    fn circular_bite_cutoff_edge() -> EdgeRef {
+        circular_bite_cutoff_edge_at_depth(10.0)
+    }
+
+    fn circular_bite_opposite_cutoff_edge_at_depth(depth: f32) -> EdgeRef {
+        let x = 20.0 + (14.0_f32 * 14.0 - 3.0_f32 * 3.0).sqrt();
+        EdgeRef {
+            p0: [x, 5.0, depth],
+            p1: [40.0, 5.0, depth],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, -1.0, 0.0],
+            curve: None,
+            topology: None,
+        }
+    }
+
+    fn gui_captured_circular_bite_cutoff_edge(depth: f32) -> EdgeRef {
+        let g = circular_bite_graph_with_depth(None, depth);
+        let bodies = g
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap();
+        let mesh = &bodies[0].1;
+        let expected = circular_bite_cutoff_edge_at_depth(depth);
+        let same_edge = |edge: &crate::mock_kernel::MeshEdgeRef| {
+            let d = |a: [f32; 3], b: [f32; 3]| {
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+            };
+            matches!(
+                edge.curve,
+                None | Some(crate::mock_kernel::EdgeCurveHint::Line)
+            ) && ((d(edge.p0, expected.p0) <= 0.08 && d(edge.p1, expected.p1) <= 0.08)
+                || (d(edge.p0, expected.p1) <= 0.08 && d(edge.p1, expected.p0) <= 0.08))
+        };
+        let edge = mesh
+            .edge_refs
+            .iter()
+            .find(|edge| same_edge(edge))
+            .unwrap_or_else(|| {
+                panic!(
+                    "display mesh should expose exact cutoff-edge metadata; refs={:?}",
+                    mesh.edge_refs
+                )
+            });
+        EdgeRef {
+            p0: edge.p0,
+            p1: edge.p1,
+            n1: edge.n1,
+            n2: edge.n2,
+            curve: edge.curve.clone(),
+            topology: None,
+        }
+    }
+
+    fn circular_bite_cutoff_edge_graph_with_dist(
+        kind: crate::sketch::CornerKind,
+        dist: f32,
+    ) -> ParametricGraph {
+        let edge = circular_bite_cutoff_edge();
+        let mut g = circular_bite_graph(None);
+        g.add_feature(FeatureNode {
+            id: "em".to_string(),
+            name: "Edge Mod".to_string(),
+            feature: FeatureType::EdgeMod {
+                target: "e".to_string(),
+                edge,
+                dist,
+                dist_expr: None,
+                scope: EdgeModScope::FullEdge,
+                kind,
+            },
+        });
+        g.add_dependency("e", "em");
+        g
+    }
+
+    fn circular_bite_cutoff_edge_graph(kind: crate::sketch::CornerKind) -> ParametricGraph {
+        circular_bite_cutoff_edge_graph_with_dist(kind, 1.0)
+    }
+
+    fn box_cut_circular_bite_graph_with_dist(
+        kind: crate::sketch::CornerKind,
+        dist: f32,
+    ) -> ParametricGraph {
+        box_cut_circular_bite_graph_at_depth_with_dist(kind, dist, 10.0)
+    }
+
+    fn box_cut_circular_bite_graph_at_depth_with_dist(
+        kind: crate::sketch::CornerKind,
+        dist: f32,
+        depth: f32,
+    ) -> ParametricGraph {
+        let edge = circular_bite_cutoff_edge_at_depth(depth);
+        let mut g = ParametricGraph::new();
+        add_sketch(&mut g, "s_base", rect_sketch((0.0, 5.0), (40.0, 35.0)));
+        add_extrude(&mut g, "e_base", "s_base", depth, ExtrudeMode::NewBody);
+
+        let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, depth), Vec3::X, Vec3::Y);
+        let mut circle = SketchCurves::new();
+        circle.add_circle((20.0, 8.0), 14.0);
+        add_sketch_cs(&mut g, "s_cut", top, circle);
+        add_extrude(
+            &mut g,
+            "e_cut",
+            "s_cut",
+            -(depth.abs() + 1.5),
+            ExtrudeMode::Cut,
+        );
+        g.add_dependency("e_base", "e_cut");
+
+        g.add_feature(FeatureNode {
+            id: "em".to_string(),
+            name: "Edge Mod".to_string(),
+            feature: FeatureType::EdgeMod {
+                target: "e_base".to_string(),
+                edge,
+                dist,
+                dist_expr: None,
+                scope: EdgeModScope::FullEdge,
+                kind,
+            },
+        });
+        g.add_dependency("e_cut", "em");
+        g
+    }
+
+    fn mesh_stats(m: &MockMesh) -> (usize, usize, usize) {
+        use std::collections::HashMap;
+        let q = |i: usize| -> (i64, i64, i64) {
+            let b = i * 6;
+            let quant = |v: f32| (v as f64 * 1e4).round() as i64;
+            (
+                quant(m.vertices[b]),
+                quant(m.vertices[b + 1]),
+                quant(m.vertices[b + 2]),
+            )
+        };
+        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+        let mut inward = 0usize;
+        for tri in m.indices.chunks_exact(3) {
+            for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+                let (ka, kb) = (q(tri[a] as usize), q(tri[b] as usize));
+                let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+
+            let pos = |i: u32| {
+                let b = i as usize * 6;
+                [
+                    m.vertices[b] as f64,
+                    m.vertices[b + 1] as f64,
+                    m.vertices[b + 2] as f64,
+                ]
+            };
+            let nrm = |i: u32| {
+                let b = i as usize * 6;
+                [
+                    m.vertices[b + 3] as f64,
+                    m.vertices[b + 4] as f64,
+                    m.vertices[b + 5] as f64,
+                ]
+            };
+            let a = pos(tri[0]);
+            let b = pos(tri[1]);
+            let c = pos(tri[2]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let winding = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let navg = [
+                (nrm(tri[0])[0] + nrm(tri[1])[0] + nrm(tri[2])[0]) / 3.0,
+                (nrm(tri[0])[1] + nrm(tri[1])[1] + nrm(tri[2])[1]) / 3.0,
+                (nrm(tri[0])[2] + nrm(tri[1])[2] + nrm(tri[2])[2]) / 3.0,
+            ];
+            if winding[0] * navg[0] + winding[1] * navg[1] + winding[2] * navg[2] < 0.0 {
+                inward += 1;
+            }
+        }
+
+        (
+            edges.values().filter(|&&c| c == 1).count(),
+            edges.values().filter(|&&c| c > 2).count(),
+            inward,
+        )
+    }
+
+    fn on_internal_circular_bite_wall(x: f32, y: f32) -> bool {
+        let r = ((x - 20.0).powi(2) + (y - 8.0).powi(2)).sqrt();
+        (r - 14.0).abs() < 0.08 && y > 5.25
+    }
+
+    fn circular_bite_internal_wall_struts(m: &MockMesh) -> usize {
+        (0..m.edge_indices.len() / 2)
+            .filter(|&e| {
+                let ia = m.edge_indices[e * 2] as usize * 3;
+                let ib = m.edge_indices[e * 2 + 1] as usize * 3;
+                let a = [
+                    m.edge_vertices[ia],
+                    m.edge_vertices[ia + 1],
+                    m.edge_vertices[ia + 2],
+                ];
+                let b = [
+                    m.edge_vertices[ib],
+                    m.edge_vertices[ib + 1],
+                    m.edge_vertices[ib + 2],
+                ];
+                (a[0] - b[0]).abs() < 0.05
+                    && (a[1] - b[1]).abs() < 0.05
+                    && (a[2] - b[2]).abs() > 9.0
+                    && on_internal_circular_bite_wall(a[0], a[1])
+                    && on_internal_circular_bite_wall(b[0], b[1])
+            })
+            .count()
+    }
+
+    fn circular_bite_wall_normal_splits(m: &MockMesh) -> usize {
+        use std::collections::HashMap;
+
+        let quant = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        let mut normals: HashMap<(i64, i64, i64), Vec<[f32; 3]>> = HashMap::new();
+        for v in m.vertices.chunks_exact(6) {
+            if !on_internal_circular_bite_wall(v[0], v[1]) || v[5].abs() > 0.5 {
+                continue;
+            }
+            normals
+                .entry((quant(v[0]), quant(v[1]), quant(v[2])))
+                .or_default()
+                .push([v[3], v[4], v[5]]);
+        }
+
+        normals
+            .values()
+            .filter(|ns| {
+                ns.len() >= 2
+                    && ns.iter().enumerate().any(|(i, a)| {
+                        ns.iter().skip(i + 1).any(|b| {
+                            (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0) < 0.999
+                        })
+                    })
+            })
+            .count()
+    }
+
+    fn circular_bite_wall_face_ids(m: &MockMesh) -> std::collections::HashSet<u32> {
+        let mut faces = std::collections::HashSet::new();
+        for (t, tri) in m.indices.chunks_exact(3).enumerate() {
+            let on_wall = tri.iter().all(|&vi| {
+                let b = vi as usize * 6;
+                on_internal_circular_bite_wall(m.vertices[b], m.vertices[b + 1])
+                    && m.vertices[b + 5].abs() < 0.5
+            });
+            if on_wall {
+                faces.insert(m.face_ids.get(t).copied().unwrap_or(0));
+            }
+        }
+        faces
+    }
+
+    fn mesh_has_wire_edge_between(m: &MockMesh, p0: [f32; 3], p1: [f32; 3], tol: f32) -> bool {
+        let dist = |a: [f32; 3], b: [f32; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let point = |idx: u32| {
+            let b = idx as usize * 3;
+            [
+                m.edge_vertices[b],
+                m.edge_vertices[b + 1],
+                m.edge_vertices[b + 2],
+            ]
+        };
+        (0..m.edge_indices.len() / 2).any(|e| {
+            let a = point(m.edge_indices[e * 2]);
+            let b = point(m.edge_indices[e * 2 + 1]);
+            (dist(a, p0) <= tol && dist(b, p1) <= tol) || (dist(a, p1) <= tol && dist(b, p0) <= tol)
+        })
+    }
+
+    fn inside_removed_circular_bite_volume(p: [f32; 3]) -> bool {
+        let r = ((p[0] - 20.0).powi(2) + (p[1] - 8.0).powi(2)).sqrt();
+        r < 13.0 && p[1] > 5.1 && (-0.05..=10.05).contains(&p[2])
+    }
+
+    fn circular_bite_wall_chord_sample(p: [f32; 3], n: [f32; 3]) -> bool {
+        let radial = [p[0] - 20.0, p[1] - 8.0];
+        let r = (radial[0] * radial[0] + radial[1] * radial[1]).sqrt();
+        if !(12.0..=14.25).contains(&r) || p[1] <= 5.0 || n[2].abs() > 0.55 {
+            return false;
+        }
+        let nl = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        if nl <= 1.0e-5 || r <= 1.0e-5 {
+            return false;
+        }
+        let dot = (radial[0] / r) * (n[0] / nl) + (radial[1] / r) * (n[1] / nl);
+        dot.abs() > 0.75
+    }
+
+    fn circular_bite_ghost_sample_count(m: &MockMesh) -> usize {
+        let vertex6 = |vi: u32| {
+            let b = vi as usize * 6;
+            [
+                m.vertices[b],
+                m.vertices[b + 1],
+                m.vertices[b + 2],
+                m.vertices[b + 3],
+                m.vertices[b + 4],
+                m.vertices[b + 5],
+            ]
+        };
+        let mut count = 0usize;
+        for v in m.vertices.chunks_exact(6) {
+            let p = [v[0], v[1], v[2]];
+            let n = [v[3], v[4], v[5]];
+            if inside_removed_circular_bite_volume(p) && !circular_bite_wall_chord_sample(p, n) {
+                count += 1;
+            }
+        }
+        for tri in m.indices.chunks_exact(3) {
+            let a = vertex6(tri[0]);
+            let b = vertex6(tri[1]);
+            let c = vertex6(tri[2]);
+            let p = [
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            ];
+            let n = [
+                (a[3] + b[3] + c[3]) / 3.0,
+                (a[4] + b[4] + c[4]) / 3.0,
+                (a[5] + b[5] + c[5]) / 3.0,
+            ];
+            if inside_removed_circular_bite_volume(p) && !circular_bite_wall_chord_sample(p, n) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn circle_points(center: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
+        (0..crate::CIRCLE_SEGS)
+            .map(|i| {
+                let a = (i as f32 / crate::CIRCLE_SEGS as f32) * std::f32::consts::TAU;
+                (center.0 + radius * a.cos(), center.1 + radius * a.sin())
+            })
+            .collect()
     }
 
     #[test]
@@ -1945,6 +4768,514 @@ mod extrude_mode_tests {
     }
 
     #[test]
+    fn circular_bite_newbody_keeps_clean_mesh_and_cylindrical_solid() {
+        let g = circular_bite_graph(None);
+        let bodies = g
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "selected circular-bite region makes one body"
+        );
+        let mesh = &bodies[0].1;
+        let (cracks, nonmanifold, inward) = mesh_stats(mesh);
+        assert_eq!(
+            cracks, 0,
+            "circular-bite display mesh has {cracks} crack edges"
+        );
+        assert_eq!(
+            nonmanifold, 0,
+            "circular-bite display mesh has {nonmanifold} non-manifold edges"
+        );
+        assert_eq!(
+            inward, 0,
+            "circular-bite display mesh has {inward} inward triangles"
+        );
+
+        let solids = g
+            .debug_kernel_solids(&std::collections::HashSet::new())
+            .unwrap();
+        let has_cylinder =
+            solids.iter().any(|(_, parts)| {
+                parts.iter().any(|solid| {
+                    solid.shell().faces().iter().any(|f| {
+                        matches!(f.surface(), Some(openrcad::geom::GeomSurface::Cylinder(_)))
+                    })
+                })
+            });
+        assert!(
+            has_cylinder,
+            "circular-bite body should keep an analytic cylindrical wall in the kernel solid"
+        );
+    }
+
+    #[test]
+    fn circular_bite_newbody_hides_internal_wall_segments() {
+        let g = circular_bite_graph(None);
+        let bodies = g
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "selected circular-bite region makes one body"
+        );
+        let mesh = &bodies[0].1;
+        assert_eq!(
+            circular_bite_internal_wall_struts(mesh),
+            0,
+            "circular-bite display should not draw vertical construction seams inside the wall"
+        );
+        assert_eq!(
+            circular_bite_wall_normal_splits(mesh),
+            0,
+            "circular-bite wall should not shade as separate flat panels"
+        );
+        let wall_faces = circular_bite_wall_face_ids(mesh);
+        assert_eq!(
+            wall_faces.len(),
+            1,
+            "circular-bite wall should select as one face, got face ids {wall_faces:?}"
+        );
+    }
+
+    #[test]
+    fn edge_mod_on_circular_bite_body_clears_pristine_mesh() {
+        for kind in [
+            crate::sketch::CornerKind::Chamfer,
+            crate::sketch::CornerKind::Fillet,
+        ] {
+            let g = circular_bite_graph(Some(kind));
+            let (live, warnings) = g
+                .build_live(&std::collections::HashSet::new(), false)
+                .unwrap();
+            assert!(
+                warnings.is_empty(),
+                "{kind:?} on circular-bite body should not warn, got {warnings:?}"
+            );
+            assert_eq!(live.len(), 1, "{kind:?} keeps one live body");
+            assert!(
+                live[0].pristine.is_none(),
+                "{kind:?} must clear the pristine sketch display mesh after modifying the B-Rep"
+            );
+
+            let bodies = tessellate_bodies(live);
+            assert_eq!(bodies.len(), 1, "{kind:?} keeps one rendered body");
+            let mesh = &bodies[0].1;
+            let (cracks, _nonmanifold, _inward) = mesh_stats(mesh);
+            assert_eq!(
+                cracks, 0,
+                "{kind:?} circular-bite edge-mod mesh has {cracks} cracks"
+            );
+            let max_z = mesh
+                .vertices
+                .chunks(6)
+                .map(|v| v[2])
+                .fold(f32::MIN, f32::max);
+            assert!(
+                max_z > 9.0,
+                "{kind:?} should preserve most of the 10mm body height"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_mod_on_circular_bite_cutoff_edge_succeeds() {
+        for kind in [
+            crate::sketch::CornerKind::Chamfer,
+            crate::sketch::CornerKind::Fillet,
+        ] {
+            let edge = circular_bite_cutoff_edge();
+            let unmodified = circular_bite_graph(None)
+                .evaluate_bodies(&std::collections::HashSet::new())
+                .unwrap();
+            assert!(
+                mesh_has_wire_edge_between(&unmodified[0].1, edge.p0, edge.p1, 0.08),
+                "test setup should expose the original sharp edge before {kind:?}"
+            );
+
+            let g = circular_bite_cutoff_edge_graph(kind);
+            let (live, warnings) = g
+                .build_live(&std::collections::HashSet::new(), false)
+                .unwrap();
+            assert!(
+                warnings.is_empty(),
+                "{kind:?} on edge ending at circular bite should not warn, got {warnings:?}"
+            );
+            assert_eq!(live.len(), 1, "{kind:?} keeps one live body");
+            assert!(
+                live[0].pristine.is_none(),
+                "{kind:?} must clear pristine after modifying the B-Rep"
+            );
+
+            let bodies = tessellate_bodies(live);
+            assert_eq!(bodies.len(), 1, "{kind:?} keeps one rendered body");
+            let mesh = &bodies[0].1;
+            assert_eq!(
+                circular_bite_ghost_sample_count(mesh),
+                0,
+                "{kind:?} cutoff-edge result should not show a ghost cylinder/disk"
+            );
+            assert!(
+                !mesh_has_wire_edge_between(mesh, edge.p0, edge.p1, 0.08),
+                "{kind:?} should remove the original sharp cutoff edge"
+            );
+            let (cracks, _nonmanifold, _inward) = mesh_stats(mesh);
+            assert_eq!(cracks, 0, "{kind:?} cutoff-edge result has {cracks} cracks");
+        }
+    }
+
+    #[test]
+    fn screenshot_radius_edge_mod_on_circular_bite_cutoff_edge_succeeds() {
+        let edge = circular_bite_cutoff_edge();
+        for kind in [
+            crate::sketch::CornerKind::Fillet,
+            crate::sketch::CornerKind::Chamfer,
+        ] {
+            let g = circular_bite_cutoff_edge_graph_with_dist(kind, 3.0);
+            let (live, warnings) = g
+                .build_live(&std::collections::HashSet::new(), false)
+                .unwrap();
+            assert!(
+                warnings.is_empty(),
+                "3.0mm {kind:?} runout should succeed without warning, got {warnings:?}"
+            );
+            assert_eq!(live.len(), 1, "3.0mm {kind:?} keeps one live body");
+            assert!(
+                live[0].pristine.is_none(),
+                "3.0mm {kind:?} must clear pristine after modifying the B-Rep"
+            );
+
+            let bodies = tessellate_bodies(live);
+            assert_eq!(bodies.len(), 1, "3.0mm {kind:?} keeps one rendered body");
+            let mesh = &bodies[0].1;
+            assert_eq!(
+                circular_bite_ghost_sample_count(mesh),
+                0,
+                "3.0mm {kind:?} should not show a ghost cylinder/disk"
+            );
+            assert!(
+                !mesh_has_wire_edge_between(mesh, edge.p0, edge.p1, 0.08),
+                "3.0mm {kind:?} should remove the original sharp cutoff edge"
+            );
+            let (cracks, _nonmanifold, _inward) = mesh_stats(mesh);
+            assert_eq!(cracks, 0, "3.0mm {kind:?} result has {cracks} cracks");
+        }
+    }
+
+    #[test]
+    fn gui_captured_circular_bite_cutoff_edge_fillet_matches_cylinder_cut() {
+        let depth = 7.23;
+        let edge = gui_captured_circular_bite_cutoff_edge(depth);
+        let untouched = circular_bite_opposite_cutoff_edge_at_depth(depth);
+        for kind in [
+            crate::sketch::CornerKind::Fillet,
+            crate::sketch::CornerKind::Chamfer,
+        ] {
+            let mut g = circular_bite_graph_with_depth(None, depth);
+            g.add_feature(FeatureNode {
+                id: format!("em_gui_{kind:?}"),
+                name: "GUI Edge Mod".to_string(),
+                feature: FeatureType::EdgeMod {
+                    target: "e".to_string(),
+                    edge: edge.clone(),
+                    dist: 3.0,
+                    dist_expr: None,
+                    scope: EdgeModScope::FullEdge,
+                    kind,
+                },
+            });
+            g.add_dependency("e", &format!("em_gui_{kind:?}"));
+
+            let (live, warnings) = g
+                .build_live(&std::collections::HashSet::new(), false)
+                .unwrap();
+            assert!(
+                warnings.is_empty(),
+                "GUI-captured 3mm {kind:?} should not warn, got {warnings:?}"
+            );
+            assert_eq!(live.len(), 1, "GUI-captured {kind:?} keeps one body");
+            assert!(
+                live[0].pristine.is_none(),
+                "GUI-captured {kind:?} must clear pristine after modifying the B-Rep"
+            );
+
+            let bodies = tessellate_bodies(live);
+            assert_eq!(bodies.len(), 1, "GUI-captured {kind:?} renders one body");
+            let mesh = &bodies[0].1;
+            assert_eq!(
+                circular_bite_ghost_sample_count(mesh),
+                0,
+                "GUI-captured {kind:?} should not show a ghost cylinder/disk"
+            );
+            assert!(
+                !mesh_has_wire_edge_between(mesh, edge.p0, edge.p1, 0.08),
+                "GUI-captured {kind:?} should remove the original sharp edge"
+            );
+            assert!(
+                mesh_wire_path_covers(mesh, untouched.p0, untouched.p1, 0.08),
+                "GUI-captured {kind:?} must not modify the opposite unselected front span"
+            );
+            assert_eq!(
+                circular_bite_wall_normal_splits(mesh),
+                0,
+                "GUI-captured {kind:?} must keep the circular wall smooth"
+            );
+            let (cracks, _nonmanifold, _inward) = mesh_stats(mesh);
+            assert_eq!(
+                cracks, 0,
+                "GUI-captured {kind:?} result has {cracks} cracks"
+            );
+        }
+    }
+
+    #[test]
+    fn reported_depth6_1_56mm_circular_bite_fillet_succeeds() {
+        let dist = 1.56;
+        for depth in [6.0, 9.2] {
+            let edge = gui_captured_circular_bite_cutoff_edge(depth);
+            let untouched = circular_bite_opposite_cutoff_edge_at_depth(depth);
+
+            let mut sketch = circular_bite_graph_with_depth(None, depth);
+            sketch.add_feature(FeatureNode {
+                id: format!("em_reported_{depth:.1}"),
+                name: "Reported Fillet".to_string(),
+                feature: FeatureType::EdgeMod {
+                    target: "e".to_string(),
+                    edge: edge.clone(),
+                    dist,
+                    dist_expr: None,
+                    scope: EdgeModScope::FullEdge,
+                    kind: crate::sketch::CornerKind::Fillet,
+                },
+            });
+            sketch.add_dependency("e", &format!("em_reported_{depth:.1}"));
+
+            let explicit = box_cut_circular_bite_graph_at_depth_with_dist(
+                crate::sketch::CornerKind::Fillet,
+                dist,
+                depth,
+            );
+
+            for (label, graph) in [("sketch", sketch), ("box-minus-cylinder", explicit)] {
+                let (bodies, warnings) = graph
+                    .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+                    .unwrap();
+                assert!(
+                    warnings.is_empty(),
+                    "{label} depth {depth:.2} 1.56mm fillet should not warn, got {warnings:?}"
+                );
+                assert_eq!(
+                    bodies.len(),
+                    1,
+                    "{label} depth {depth:.2} fillet keeps one body"
+                );
+                let mesh = &bodies[0].1;
+                assert_eq!(
+                    circular_bite_ghost_sample_count(mesh),
+                    0,
+                    "{label} depth {depth:.2} fillet should not show ghost cylinder material"
+                );
+                assert!(
+                    !mesh_has_wire_edge_between(mesh, edge.p0, edge.p1, 0.08),
+                    "{label} depth {depth:.2} fillet should remove the original selected sharp edge"
+                );
+                assert!(
+                    mesh_wire_path_covers(mesh, untouched.p0, untouched.p1, 0.08),
+                    "{label} depth {depth:.2} fillet must preserve the unselected same-side span"
+                );
+                assert_eq!(
+                    circular_bite_wall_normal_splits(mesh),
+                    0,
+                    "{label} depth {depth:.2} fillet must keep the circular wall smooth"
+                );
+                let (cracks, _nonmanifold, _inward) = mesh_stats(mesh);
+                assert_eq!(
+                    cracks, 0,
+                    "{label} depth {depth:.2} fillet result has {cracks} cracks"
+                );
+
+                let solids = graph
+                    .debug_kernel_solids(&std::collections::HashSet::new())
+                    .unwrap();
+                assert!(
+                    solids.iter().any(|(_, parts)| parts
+                        .iter()
+                        .any(crate::mock_kernel::solid_has_cylindrical_face)),
+                    "{label} depth {depth:.2} fillet should preserve analytic cylindrical topology"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn circular_bite_runout_does_not_accept_full_side_fallback() {
+        for kind in [
+            crate::sketch::CornerKind::Fillet,
+            crate::sketch::CornerKind::Chamfer,
+        ] {
+            let g = circular_bite_cutoff_edge_graph_with_dist(kind, 3.0);
+            let (bodies, warnings) = g
+                .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+                .unwrap();
+            assert!(
+                warnings.is_empty(),
+                "sketch circular-bite {kind:?} should not warn, got {warnings:?}"
+            );
+            let untouched = circular_bite_opposite_cutoff_edge_at_depth(10.0);
+            assert!(
+                mesh_wire_path_covers(&bodies[0].1, untouched.p0, untouched.p1, 0.08),
+                "sketch circular-bite {kind:?} must preserve the unselected same-side span"
+            );
+            assert_eq!(
+                circular_bite_ghost_sample_count(&bodies[0].1),
+                0,
+                "sketch circular-bite {kind:?} should not show ghost cylinder material"
+            );
+
+            let g = box_cut_circular_bite_graph_with_dist(kind, 3.0);
+            let (bodies, warnings) = g
+                .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+                .unwrap();
+            assert!(
+                warnings.is_empty(),
+                "box-minus-cylinder {kind:?} should not warn, got {warnings:?}"
+            );
+            assert!(
+                mesh_wire_path_covers(&bodies[0].1, untouched.p0, untouched.p1, 0.08),
+                "box-minus-cylinder {kind:?} must preserve the unselected same-side span"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_circular_bite_runout_fails_fast_and_leaves_body() {
+        let unmodified = circular_bite_graph(None)
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap();
+        let g = circular_bite_cutoff_edge_graph_with_dist(crate::sketch::CornerKind::Fillet, 9.52);
+        let (bodies, warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("local clearance")),
+            "oversized circular-bite fillet should fail preflight, got {warnings:?}"
+        );
+        assert_eq!(bodies.len(), 1, "failed oversized fillet keeps one body");
+        assert_eq!(
+            bodies[0].1.indices.len(),
+            unmodified[0].1.indices.len(),
+            "oversized circular-bite fillet leaves the body unchanged"
+        );
+    }
+
+    #[test]
+    fn curved_circular_rim_selection_reaches_native_solver_and_fails_safely() {
+        let mut g = circular_bite_graph(None);
+        let x0 = 20.0 - (14.0_f32 * 14.0 - 3.0_f32 * 3.0).sqrt();
+        let x1 = 20.0 + (14.0_f32 * 14.0 - 3.0_f32 * 3.0).sqrt();
+        g.add_feature(FeatureNode {
+            id: "em_rim".to_string(),
+            name: "Edge Mod".to_string(),
+            feature: FeatureType::EdgeMod {
+                target: "e".to_string(),
+                edge: EdgeRef {
+                    p0: [x0, 5.0, 10.0],
+                    p1: [x1, 5.0, 10.0],
+                    n1: [0.0, 0.0, 1.0],
+                    n2: [0.0, -1.0, 0.0],
+                    curve: Some(EdgeCurveHint::Circle {
+                        center: [20.0, 8.0, 10.0],
+                        axis: [0.0, 0.0, 1.0],
+                        x_dir: [1.0, 0.0, 0.0],
+                        radius: 14.0,
+                        start: 0.0,
+                        end: std::f32::consts::PI,
+                        closed: false,
+                    }),
+                    topology: None,
+                },
+                dist: 3.0,
+                dist_expr: None,
+                scope: EdgeModScope::FullEdge,
+                kind: crate::sketch::CornerKind::Fillet,
+            },
+        });
+        g.add_dependency("e", "em_rim");
+
+        let (bodies, warnings) = g
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(bodies.len(), 1, "unsupported rim fillet keeps one body");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("cut trim requires a cylindrical blend")
+                    || w.contains("not watertight and healthy")
+                    || w.contains("non-manifold edges")),
+            "curved rim fillet should reach the native solver and fail safely, got {warnings:?}"
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains("not supported yet")),
+            "curved rim fillet must not be rejected by the old app-level gate: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn direct_box_cylinder_cut_3mm_edge_mod_parity() {
+        for kind in [
+            crate::sketch::CornerKind::Fillet,
+            crate::sketch::CornerKind::Chamfer,
+        ] {
+            let g = box_cut_circular_bite_graph_with_dist(kind, 3.0);
+            let (bodies, warnings) = g
+                .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+                .unwrap();
+            assert_eq!(
+                bodies.len(),
+                1,
+                "direct box-minus-cylinder {kind:?} keeps one body"
+            );
+            assert!(
+                warnings.is_empty(),
+                "direct box-minus-cylinder {kind:?} runout should not warn, got {warnings:?}"
+            );
+            let untouched = circular_bite_opposite_cutoff_edge_at_depth(10.0);
+            assert!(
+                mesh_wire_path_covers(&bodies[0].1, untouched.p0, untouched.p1, 0.08),
+                "direct box-minus-cylinder {kind:?} must preserve the unselected front span"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_mod_validator_rejects_full_cylinder_ghost_for_circular_bite() {
+        let reference = circular_bite_graph(None)
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap();
+        let ghost = crate::mock_kernel::circular_cylinder_tool(
+            &circle_points((20.0, 8.0), 14.0),
+            &[],
+            10.0,
+            &CoordinateSystem::XY,
+        )
+        .expect("test ghost cylinder should build");
+        let ghost_mesh = MockMesh::from_solid(&ghost);
+        assert!(
+            circular_bite_ghost_sample_count(&ghost_mesh) > 0,
+            "test setup should include samples inside the removed circular bite volume"
+        );
+
+        let err = edge_mod_candidate_stays_inside_reference(&reference[0].1, &ghost)
+            .expect_err("full cylinder ghost must be rejected");
+        assert!(
+            err.contains("outside"),
+            "validator should explain the ghost escaped the reference body, got {err}"
+        );
+    }
+
+    #[test]
     fn edge_mod_on_sketched_prism_applies() {
         // The screenshots' box is a sketch→extrude prism (build_extrusion_solid),
         // not a make_box. Both chamfer AND fillet must apply to a top edge of such a
@@ -1969,9 +5300,12 @@ mod extrude_mode_tests {
                         p1: [40.0, 0.0, 20.0],
                         n1: [0.0, 0.0, 1.0],
                         n2: [0.0, -1.0, 0.0],
+                        curve: None,
+                        topology: None,
                     },
                     dist: 2.11,
                     dist_expr: None,
+                    scope: EdgeModScope::FullEdge,
                     kind,
                 },
             });
@@ -2146,9 +5480,12 @@ mod extrude_mode_tests {
                     p1: [10.0, 0.0, 0.0],
                     n1: [0.0, 0.0, -1.0],
                     n2: [0.0, -1.0, 0.0],
+                    curve: None,
+                    topology: None,
                 },
                 dist,
                 dist_expr: None,
+                scope: EdgeModScope::FullEdge,
                 kind,
             },
         });

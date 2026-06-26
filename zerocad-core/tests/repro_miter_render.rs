@@ -10,11 +10,11 @@
 //! the render mesh is manifold and crack-free across a range of box aspect
 //! ratios / radii.
 
-use std::collections::HashMap;
 use openrcad::algo::fillet_edges;
 use openrcad::foundation::Pnt;
 use openrcad::primitives::make_box;
 use openrcad::topo::Edge;
+use std::collections::HashMap;
 use zerocad_core::MockMesh;
 
 type Key = (i64, i64, i64);
@@ -24,7 +24,11 @@ fn edge_health(mesh: &MockMesh) -> (usize, usize) {
     let q = |i: usize| -> Key {
         let b = i * 6;
         let f = |v: f32| (v as f64 * 1e4).round() as i64;
-        (f(mesh.vertices[b]), f(mesh.vertices[b + 1]), f(mesh.vertices[b + 2]))
+        (
+            f(mesh.vertices[b]),
+            f(mesh.vertices[b + 1]),
+            f(mesh.vertices[b + 2]),
+        )
     };
     let mut edges: HashMap<(Key, Key), u32> = HashMap::new();
     for t in mesh.indices.chunks_exact(3) {
@@ -61,6 +65,9 @@ fn mitered_corner_render_mesh_is_manifold() {
             nonmanifold, 0,
             "miter {w}x{h}x{d} r={r}: render mesh has a coincident double-membrane at the seam"
         );
-        assert_eq!(cracks, 0, "miter {w}x{h}x{d} r={r}: render mesh has crack edges");
+        assert_eq!(
+            cracks, 0,
+            "miter {w}x{h}x{d} r={r}: render mesh has crack edges"
+        );
     }
 }

@@ -84,6 +84,7 @@ impl From<RollingBallError> for ChamferError {
             RollingBallError::UnsolvableAdjacency { .. }
             | RollingBallError::NewtonDiverged { .. }
             | RollingBallError::BlendSurfaceBuild(_) => ChamferError::UnsupportedTrimTopology,
+            RollingBallError::InvalidTopology => ChamferError::InvalidTopology,
         }
     }
 }
@@ -207,10 +208,16 @@ fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Soli
     faces.push(blend.chamfer_face);
 
     let result = Solid::new(sew(&faces, distance * 0.1));
-    if !result.is_watertight() || !result.health_report().is_healthy() {
-        return Err(ChamferError::InvalidTopology);
+    let merged = crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(
+        &result,
+    ));
+    if merged.is_watertight() && merged.health_report().is_healthy() {
+        return Ok(merged);
     }
-    Ok(result)
+    if result.is_watertight() && result.health_report().is_healthy() {
+        return Ok(result);
+    }
+    Err(ChamferError::InvalidTopology)
 }
 
 fn planar_chamfer(
@@ -280,6 +287,14 @@ fn close_chamfer_endpoint(
     faces: &mut Vec<Face>,
     skipped: &mut HashSet<FaceId>,
 ) -> Result<(), ChamferError> {
+    if caps.is_empty() {
+        let ca = contact_endpoint(&blend.contact_a, endpoint);
+        let cb = contact_endpoint(&blend.contact_b, endpoint);
+        let trim = Edge::between_points(ca, cb);
+        faces.push(chamfer_internal_stop_face(corner, ca, cb)?);
+        update_chamfer_endpoint(blend, endpoint, ca, cb, trim)?;
+        return Ok(());
+    }
     if caps.len() != 1 {
         return Err(ChamferError::UnsupportedTrimTopology);
     }
@@ -322,6 +337,17 @@ fn close_chamfer_endpoint(
     faces.push(trimmed_cap);
     skipped.insert(cap.id());
 
+    update_chamfer_endpoint(blend, endpoint, ca, cb, trim)?;
+    Ok(())
+}
+
+fn update_chamfer_endpoint(
+    blend: &mut ChamferBlend,
+    endpoint: Endpoint,
+    ca: Pnt,
+    cb: Pnt,
+    trim: Edge,
+) -> Result<(), ChamferError> {
     if matches!(endpoint, Endpoint::Start) {
         let keep_a = blend.contact_a.end().point();
         let keep_b = blend.contact_b.end().point();
@@ -342,6 +368,26 @@ fn close_chamfer_endpoint(
         &blend.end_edge,
     )?;
     Ok(())
+}
+
+fn chamfer_internal_stop_face(corner: Pnt, ca: Pnt, cb: Pnt) -> Result<Face, ChamferError> {
+    let normal = (ca - corner)
+        .cross(&(cb - corner))
+        .normalized()
+        .ok_or(ChamferError::InvalidDihedral)
+        .map(GeomVec::from_dir)?;
+    let surf = GeomSurface::plane(Plane::from_point_normal(
+        corner,
+        Dir::new(normal.x(), normal.y(), normal.z()),
+    ));
+    Ok(Face::new(
+        Some(surf),
+        Wire::from_edges(vec![
+            Edge::between_points(corner, ca),
+            Edge::between_points(ca, cb),
+            Edge::between_points(cb, corner),
+        ]),
+    ))
 }
 
 fn contact_endpoint(edge: &Edge, endpoint: Endpoint) -> Pnt {

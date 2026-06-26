@@ -8,17 +8,19 @@ use std::collections::{BTreeMap, HashSet};
 
 use openrcad::foundation::{Pnt, Vec as GeomVec};
 use openrcad::geom::{CylindricalSurface, GeomSurface};
-use zerocad_core::{read_zcad, MockMesh};
+use zerocad_core::{
+    CoordinateSystem, CornerKind, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
+    MockMesh, ParametricGraph, SketchCurves, Vec3,
+};
 
 const MESH_CHORD_ERR: f64 = 0.05;
 
 #[test]
 fn cutout_fillet_cylinder_mesh_has_no_visual_diagonal() {
-    let loaded = load_repro();
+    let graph = cutout_fillet_repro_graph();
     let hidden = HashSet::new();
 
-    let (bodies, warnings) = loaded
-        .graph
+    let (bodies, warnings) = graph
         .evaluate_bodies_with_warnings(&hidden)
         .expect("evaluate repro model");
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -31,10 +33,7 @@ fn cutout_fillet_cylinder_mesh_has_no_visual_diagonal() {
         "render mesh must stay closed; cracks would be drawn as stray edges"
     );
 
-    let solids = loaded
-        .graph
-        .debug_kernel_solids(&hidden)
-        .expect("kernel solids");
+    let solids = graph.debug_kernel_solids(&hidden).expect("kernel solids");
     let (_, parts) = solids
         .iter()
         .find(|(id, _)| id == body_id)
@@ -103,13 +102,73 @@ fn cutout_fillet_cylinder_mesh_has_no_visual_diagonal() {
     );
 }
 
-fn load_repro() -> zerocad_core::LoadedZcad {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../cutout_fillet_meshproblem.zcad"
-    );
-    let bytes = std::fs::read(path).expect("read cutout_fillet_meshproblem.zcad");
-    read_zcad(&bytes).expect("parse .zcad")
+fn cutout_fillet_repro_graph() -> ParametricGraph {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 40.0,
+            h: 30.0,
+            d: 15.0,
+        },
+    });
+
+    let mut cut = SketchCurves::new();
+    cut.add_circle((20.0, 15.0), 6.0);
+    graph.add_feature(FeatureNode {
+        id: "sketch_2".into(),
+        name: "Cut circle".into(),
+        feature: FeatureType::Sketch {
+            cs: top_plane(15.0),
+            curves: cut,
+            shapes: vec![],
+            corner_mods: vec![],
+            on_face: true,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "extrude_3".into(),
+        name: "Through cut".into(),
+        feature: FeatureType::Extrude {
+            depth: -20.0,
+            region_indices: vec![],
+            mode: ExtrudeMode::Cut,
+            depth_expr: None,
+        },
+    });
+    graph.add_dependency("sketch_2", "extrude_3");
+    graph.add_dependency("box_1", "extrude_3");
+
+    graph.add_feature(FeatureNode {
+        id: "edgemod_4".into(),
+        name: "Front top fillet".into(),
+        feature: FeatureType::EdgeMod {
+            target: "box_1".into(),
+            edge: EdgeRef {
+                p0: [0.0, 0.0, 15.0],
+                p1: [40.0, 0.0, 15.0],
+                n1: [0.0, 0.0, 1.0],
+                n2: [0.0, -1.0, 0.0],
+                curve: None,
+                topology: None,
+            },
+            dist: 3.0,
+            dist_expr: None,
+            scope: EdgeModScope::FullEdge,
+            kind: CornerKind::Fillet,
+        },
+    });
+    graph.add_dependency("extrude_3", "edgemod_4");
+    graph
+}
+
+fn top_plane(z: f32) -> CoordinateSystem {
+    CoordinateSystem::new(
+        Vec3::new(0.0, 0.0, z),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+    )
 }
 
 fn crack_edge_count(mesh: &MockMesh) -> usize {
@@ -119,7 +178,7 @@ fn crack_edge_count(mesh: &MockMesh) -> usize {
         (q(p.x()), q(p.y()), q(p.z()))
     };
 
-    let mut counts: BTreeMap<((i64, i64, i64), (i64, i64, i64)), u32> = BTreeMap::new();
+    let mut counts: BTreeMap<MeshEdgeKey, u32> = BTreeMap::new();
     for tri in mesh.indices.chunks_exact(3) {
         for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
             let ka = key(tri[a]);
@@ -207,7 +266,7 @@ fn cylinder_face_stats(mesh: &MockMesh, fid: u32, cyl: CylindricalSurface) -> Cy
             let edge_key = mesh_edge_key(mesh, tri[a], tri[b]);
             if edge_faces
                 .get(&edge_key)
-                .map_or(false, |faces| faces.iter().any(|&edge_fid| edge_fid != fid))
+                .is_some_and(|faces| faces.iter().any(|&edge_fid| edge_fid != fid))
             {
                 continue;
             }
@@ -256,7 +315,11 @@ fn mesh_edge_key(mesh: &MockMesh, a: u32, b: u32) -> MeshEdgeKey {
     };
     let ka = key(a);
     let kb = key(b);
-    if ka <= kb { (ka, kb) } else { (kb, ka) }
+    if ka <= kb {
+        (ka, kb)
+    } else {
+        (kb, ka)
+    }
 }
 
 fn pos(mesh: &MockMesh, vi: u32) -> Pnt {

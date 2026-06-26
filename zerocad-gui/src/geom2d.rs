@@ -161,11 +161,7 @@ pub fn draw_sketch_geometry(
 
 /// The circle through three points (center, radius), or `None` if they are
 /// (near-)collinear. Used by the 3-point circle tool.
-pub fn circumcircle(
-    a: (f32, f32),
-    b: (f32, f32),
-    c: (f32, f32),
-) -> Option<((f32, f32), f32)> {
+pub fn circumcircle(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<((f32, f32), f32)> {
     let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
     if d.abs() < 1e-6 {
         return None;
@@ -246,9 +242,8 @@ fn triangulate_simple(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
     // zero-area (collinear / slit-tip) corners for free instead of leaving them
     // to jam the search.
     const COINCIDE: f32 = 1e-4;
-    let coincident = |p: egui::Pos2, q: egui::Pos2| {
-        (p.x - q.x).abs() < COINCIDE && (p.y - q.y).abs() < COINCIDE
-    };
+    let coincident =
+        |p: egui::Pos2, q: egui::Pos2| (p.x - q.x).abs() < COINCIDE && (p.y - q.y).abs() < COINCIDE;
 
     let mut guard = 0;
     while idx.len() > 3 && guard < 40000 {
@@ -462,7 +457,10 @@ mod tests {
     fn circumcircle_of_unit_axis_points() {
         // Points (1,0), (0,1), (-1,0) lie on the unit circle centered at origin.
         let (c, r) = circumcircle((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)).unwrap();
-        assert!(c.0.abs() < 1e-4 && c.1.abs() < 1e-4, "center should be origin, got {c:?}");
+        assert!(
+            c.0.abs() < 1e-4 && c.1.abs() < 1e-4,
+            "center should be origin, got {c:?}"
+        );
         assert!((r - 1.0).abs() < 1e-4, "radius should be 1, got {r}");
     }
 
