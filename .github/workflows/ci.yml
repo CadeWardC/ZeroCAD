@@ -38,20 +38,30 @@ jobs:
       - name: Test zerocad-core
         run: cargo test -p zerocad-core --locked
 
-  # Style and lint feedback. Informational for now (the codebase is not yet
-  # rustfmt-normalized and has pre-existing clippy suggestions); flip
-  # `continue-on-error` off once those are cleaned up to make them gates.
-  lint:
-    name: Format & clippy (informational)
+  # Formatting is normalized and required.
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  # Clippy remains advisory while geometry-heavy code still has useful but
+  # non-blocking suggestions.
+  clippy:
+    name: Clippy (core, advisory)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --all -- --check
       - name: clippy (core)
         run: cargo clippy -p zerocad-core --all-targets

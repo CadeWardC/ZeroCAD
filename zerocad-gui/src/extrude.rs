@@ -441,6 +441,42 @@ impl ZeroCadApp {
         })
     }
 
+    /// True when any sketch feeding the live extrude has overlapping drawn shapes
+    /// (so its extrude resolves as a boolean). The warm ghost preview would show
+    /// the un-booleaned split regions, so the caller switches to the real
+    /// evaluated body preview instead. Sketches with sketch fillets/chamfers
+    /// (`corner_mods`) take the legacy per-region path and are not boolean.
+    pub(crate) fn op_has_overlapping_shapes(&self) -> bool {
+        let Some(op) = self.extrude_op.as_ref() else {
+            return false;
+        };
+        let var_map = self.graph.variable_map();
+        op.targets.iter().any(|t| {
+            self.graph.graph.node_indices().any(|idx| {
+                let node = &self.graph.graph[idx];
+                if node.id != t.sketch_id {
+                    return false;
+                }
+                if let FeatureType::Sketch {
+                    shapes,
+                    corner_mods,
+                    ..
+                } = &node.feature
+                {
+                    if !corner_mods.is_empty() {
+                        return false;
+                    }
+                    let loops = zerocad_core::shape_loops(shapes, &var_map);
+                    zerocad_core::overlap_clusters(&loops)
+                        .iter()
+                        .any(|c| c.len() >= 2)
+                } else {
+                    false
+                }
+            })
+        })
+    }
+
     /// Begin a live extrude operation from a set of `(sketch_id, region_index)`
     /// faces. Opens the right-hand tool window and starts the push/pull preview
     /// instead of committing immediately.

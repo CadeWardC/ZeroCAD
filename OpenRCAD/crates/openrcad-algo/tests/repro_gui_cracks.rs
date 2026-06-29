@@ -21,7 +21,11 @@ fn crack_report(solid: &openrcad_topo::Solid) -> (usize, Vec<(u32, u32)>) {
     let q = |i: usize| -> Key {
         let b = i * 3;
         let g = |v: f32| (v as f64 * 1e4).round() as i64;
-        (g(gpu.positions[b]), g(gpu.positions[b + 1]), g(gpu.positions[b + 2]))
+        (
+            g(gpu.positions[b]),
+            g(gpu.positions[b + 1]),
+            g(gpu.positions[b + 2]),
+        )
     };
     // edge -> (count, face_ids seen)
     let mut edges: HashMap<(Key, Key), (u32, Vec<u32>)> = HashMap::new();
@@ -51,7 +55,10 @@ fn crack_report(solid: &openrcad_topo::Solid) -> (usize, Vec<(u32, u32)>) {
 
 fn rect_face(w: f64, h: f64) -> Face {
     Face::new(
-        Some(GeomSurface::plane(Plane::from_point_normal(Pnt::origin(), Dir::dz()))),
+        Some(GeomSurface::plane(Plane::from_point_normal(
+            Pnt::origin(),
+            Dir::dz(),
+        ))),
         Wire::from_edges([
             Edge::between_points(Pnt::origin(), Pnt::new(w, 0.0, 0.0)),
             Edge::between_points(Pnt::new(w, 0.0, 0.0), Pnt::new(w, h, 0.0)),
@@ -65,7 +72,10 @@ fn rect_face(w: f64, h: f64) -> Face {
 fn diag_prism_plain() {
     let solid = prism(&rect_face(40.0, 30.0), GeomVec::new(0.0, 0.0, 15.0)).unwrap();
     let (cracks, faces) = crack_report(&solid);
-    println!("PLAIN PRISM: faces={} cracks={cracks} crack_face_ids={faces:?}", solid.face_count());
+    println!(
+        "PLAIN PRISM: faces={} cracks={cracks} crack_face_ids={faces:?}",
+        solid.face_count()
+    );
     assert_eq!(cracks, 0, "a plain extruded box must tessellate crack-free");
 }
 
@@ -76,8 +86,14 @@ fn diag_prism_filleted() {
     let filleted = fillet_edges(&solid, std::slice::from_ref(&edge), 4.0)
         .expect("prism edge fillet should succeed");
     let (cracks, faces) = crack_report(&filleted);
-    println!("FILLETED PRISM: faces={} cracks={cracks} crack_face_ids={faces:?}", filleted.face_count());
-    assert_eq!(cracks, 0, "a filleted extruded box must tessellate crack-free");
+    println!(
+        "FILLETED PRISM: faces={} cracks={cracks} crack_face_ids={faces:?}",
+        filleted.face_count()
+    );
+    assert_eq!(
+        cracks, 0,
+        "a filleted extruded box must tessellate crack-free"
+    );
 }
 
 #[test]
@@ -90,9 +106,15 @@ fn diag_boss_union() {
         12.0,
     );
     let body = boolean(&box_, &cyl, BooleanOp::Fuse);
-    println!("boss union: faces={} watertight={}", body.face_count(), body.is_watertight());
+    println!(
+        "boss union: faces={} watertight={}",
+        body.face_count(),
+        body.is_watertight()
+    );
     let (cracks, faces) = crack_report(&body);
     println!("BOSS UNION: cracks={cracks} crack_face_ids={faces:?}");
-    assert_eq!(cracks, 0, "a cylinder boss-union must tessellate crack-free");
+    assert_eq!(
+        cracks, 0,
+        "a cylinder boss-union must tessellate crack-free"
+    );
 }
-

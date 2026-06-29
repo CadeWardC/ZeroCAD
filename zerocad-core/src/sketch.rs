@@ -556,19 +556,27 @@ fn sketch_provenance_fragments(
     shapes: &[SketchShape],
 ) -> Vec<RegionProvenanceFragment> {
     let mut fragments = Vec::new();
+    let rectangle_shape_id = shapes
+        .iter()
+        .position(|shape| matches!(shape, SketchShape::Rectangle { .. }));
+    let circle_shape_ids: Vec<usize> = shapes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, shape)| matches!(shape, SketchShape::Circle { .. }).then_some(i))
+        .collect();
     if let Some((rect_min, rect_max)) = rectangle_bounds_from_segments(&curves.segments) {
         for edge_index in 0..4 {
             fragments.push(RegionProvenanceFragment::RectangleEdge {
-                shape_id: None,
+                shape_id: rectangle_shape_id,
                 edge_index,
                 rect_min,
                 rect_max,
             });
         }
     }
-    for circle in &curves.circles {
+    for (i, circle) in curves.circles.iter().enumerate() {
         fragments.push(RegionProvenanceFragment::CircleArc {
-            shape_id: None,
+            shape_id: circle_shape_ids.get(i).copied(),
             center: circle.center,
             radius: circle.radius,
         });
@@ -977,7 +985,7 @@ fn centroid(poly: &[(f32, f32)]) -> (f32, f32) {
 /// an "ear" (a convex corner whose triangle contains no other vertex) and
 /// return that triangle's centroid — which is always interior. Falls back to
 /// the vertex centroid only for degenerate input.
-fn polygon_interior_point(poly: &[(f32, f32)]) -> (f32, f32) {
+pub(crate) fn polygon_interior_point(poly: &[(f32, f32)]) -> (f32, f32) {
     let n = poly.len();
     if n < 3 {
         return centroid(poly);
@@ -1050,6 +1058,224 @@ pub fn point_in_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
         j = i;
     }
     inside
+}
+
+// ---------------------------------------------------------------------------
+// Whole-shape recovery and overlap detection (boolean extrude)
+// ---------------------------------------------------------------------------
+
+/// Distance (mm) within which a point is considered to lie *on* a polygon edge
+/// rather than strictly inside — keeps boundary-only-touching shapes from
+/// registering as overlapping.
+const BOUNDARY_TOL: f32 = 1e-3;
+
+/// The full closed outline of one drawn sketch shape (rectangle, circle, …),
+/// recovered before region-splitting so overlapping shapes can be combined as a
+/// boolean. `circle` is set for true circles so the kernel can keep a smooth
+/// analytic cylinder instead of a faceted prism.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeLoop {
+    /// Closed boundary polygon in sketch plane coordinates (circles are
+    /// discretized to [`CIRCLE_SEGS`] points so all overlap tests are uniform).
+    pub boundary: Vec<(f32, f32)>,
+    /// `Some((center, radius))` when this loop is a true circle.
+    pub circle: Option<((f32, f32), f32)>,
+}
+
+/// Recover each drawn shape's full closed outline (before region-splitting).
+/// Circles become smooth-flagged loops; rectangles / closed polylines (ellipses,
+/// 3-point shapes) are chained into one loop. Open profiles (lone lines) and any
+/// shape that does not close are skipped — they form no region and take no part
+/// in booleans.
+pub fn shape_loops(shapes: &[SketchShape], vars: &HashMap<String, f64>) -> Vec<ShapeLoop> {
+    let mut out = Vec::new();
+    for shape in shapes {
+        let curves = shape.build(vars);
+        for c in &curves.circles {
+            if c.radius > 0.0 {
+                out.push(ShapeLoop {
+                    boundary: circle_boundary(c.center, c.radius),
+                    circle: Some((c.center, c.radius)),
+                });
+            }
+        }
+        if let Some(boundary) = segments_to_loop(&curves) {
+            out.push(ShapeLoop {
+                boundary,
+                circle: None,
+            });
+        }
+    }
+    out
+}
+
+fn circle_boundary(center: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
+    (0..CIRCLE_SEGS)
+        .map(|i| {
+            let t = (i as f32 / CIRCLE_SEGS as f32) * std::f32::consts::TAU;
+            (center.0 + radius * t.cos(), center.1 + radius * t.sin())
+        })
+        .collect()
+}
+
+/// Chain a shape's line segments into a single closed loop by matching shared
+/// endpoints. Returns `None` if the segments don't form one closed ring.
+fn segments_to_loop(curves: &SketchCurves) -> Option<Vec<(f32, f32)>> {
+    let segs = &curves.segments;
+    if segs.len() < 3 {
+        return None;
+    }
+    let tol = 1e-4f32;
+    let close = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() <= tol && (a.1 - b.1).abs() <= tol;
+
+    let mut used = vec![false; segs.len()];
+    let mut loop_pts: Vec<(f32, f32)> = Vec::with_capacity(segs.len());
+    used[0] = true;
+    loop_pts.push(segs[0].a);
+    let start = segs[0].a;
+    let mut current = segs[0].b;
+
+    while !close(current, start) {
+        let mut found = false;
+        for i in 0..segs.len() {
+            if used[i] {
+                continue;
+            }
+            if close(segs[i].a, current) {
+                used[i] = true;
+                loop_pts.push(segs[i].a);
+                current = segs[i].b;
+                found = true;
+                break;
+            } else if close(segs[i].b, current) {
+                used[i] = true;
+                loop_pts.push(segs[i].b);
+                current = segs[i].a;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    if loop_pts.len() < 3 {
+        return None;
+    }
+    Some(loop_pts)
+}
+
+/// True if segments `a0a1` and `b0b1` cross at an interior point of *both*
+/// (shared endpoints of one closed loop don't count as crossings).
+pub fn segments_cross_2d(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> bool {
+    if let Some((t, u, _)) = intersect(P::from(a0), P::from(a1), P::from(b0), P::from(b1)) {
+        let e = 1e-6;
+        t > e && t < 1.0 - e && u > e && u < 1.0 - e
+    } else {
+        false
+    }
+}
+
+fn midpoint(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
+}
+
+fn seg_point_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+    let (wx, wy) = (p.0 - a.0, p.1 - a.1);
+    let len2 = vx * vx + vy * vy;
+    if len2 <= 1e-12 {
+        return (wx * wx + wy * wy).sqrt();
+    }
+    let t = ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0);
+    let (cx, cy) = (a.0 + t * vx, a.1 + t * vy);
+    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+}
+
+fn point_on_boundary(p: (f32, f32), poly: &[(f32, f32)], tol: f32) -> bool {
+    let n = poly.len();
+    (0..n).any(|i| seg_point_dist(p, poly[i], poly[(i + 1) % n]) <= tol)
+}
+
+/// Inside the polygon and not within [`BOUNDARY_TOL`] of its boundary.
+fn point_strictly_inside(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
+    point_in_polygon(p, poly) && !point_on_boundary(p, poly, BOUNDARY_TOL)
+}
+
+/// True if two shape outlines overlap by area. Covers three cases: a proper edge
+/// crossing; one loop's vertex strictly inside the other (fully-contained
+/// shapes); or one loop's edge midpoint strictly inside the other (edge-aligned
+/// rectangles that share a span — collinear edges never "cross"). Boundary-only
+/// touching is *not* an overlap.
+pub fn shapes_overlap(a: &ShapeLoop, b: &ShapeLoop) -> bool {
+    let (pa, pb) = (&a.boundary, &b.boundary);
+    let (na, nb) = (pa.len(), pb.len());
+    if na < 3 || nb < 3 {
+        return false;
+    }
+    for i in 0..na {
+        let (a0, a1) = (pa[i], pa[(i + 1) % na]);
+        for j in 0..nb {
+            if segments_cross_2d(a0, a1, pb[j], pb[(j + 1) % nb]) {
+                return true;
+            }
+        }
+    }
+    if pa.iter().any(|&v| point_strictly_inside(v, pb)) {
+        return true;
+    }
+    if pb.iter().any(|&v| point_strictly_inside(v, pa)) {
+        return true;
+    }
+    if (0..na).any(|i| point_strictly_inside(midpoint(pa[i], pa[(i + 1) % na]), pb)) {
+        return true;
+    }
+    if (0..nb).any(|j| point_strictly_inside(midpoint(pb[j], pb[(j + 1) % nb]), pa)) {
+        return true;
+    }
+    false
+}
+
+/// Group shape loops into connected components by the overlap relation. A
+/// singleton cluster is a non-overlapping shape (extrudes independently); a
+/// cluster of ≥2 becomes one boolean solid.
+pub fn overlap_clusters(loops: &[ShapeLoop]) -> Vec<Vec<usize>> {
+    let n = loops.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = x;
+        while parent[c] != c {
+            let nx = parent[c];
+            parent[c] = r;
+            c = nx;
+        }
+        r
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if shapes_overlap(&loops[i], &loops[j]) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    let mut clusters: Vec<Vec<usize>> = groups.into_values().collect();
+    for c in &mut clusters {
+        c.sort_unstable();
+    }
+    clusters.sort_by_key(|c| c[0]);
+    clusters
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,5 +1553,131 @@ mod tests {
             "circle straddling rect edge should split into multiple regions, got {:?}",
             regions
         );
+    }
+
+    // -- Whole-shape recovery + overlap detection (boolean extrude) ----------
+
+    fn rect_shape(x0: f32, y0: f32, x1: f32, y1: f32) -> SketchShape {
+        SketchShape::Rectangle {
+            origin: (x0, y0),
+            sx: 1.0,
+            sy: 1.0,
+            w: Dimension::literal(x1 - x0),
+            h: Dimension::literal(y1 - y0),
+            from_center: false,
+        }
+    }
+
+    fn circle_shape(cx: f32, cy: f32, r: f32) -> SketchShape {
+        SketchShape::Circle {
+            center: (cx, cy),
+            diameter: Dimension::literal(r * 2.0),
+        }
+    }
+
+    #[test]
+    fn shape_loops_recovers_full_outlines() {
+        let vars: HashMap<String, f64> = HashMap::new();
+        let shapes = vec![
+            rect_shape(0.0, 0.0, 10.0, 10.0),
+            circle_shape(8.0, 5.0, 4.0),
+        ];
+        let loops = shape_loops(&shapes, &vars);
+        assert_eq!(loops.len(), 2);
+        // Rectangle loop is the 4-corner polygon, no circle flag.
+        assert!(loops[0].circle.is_none());
+        assert_eq!(loops[0].boundary.len(), 4);
+        // Circle loop keeps the analytic flag for smooth cylinders.
+        assert_eq!(loops[1].circle, Some(((8.0, 5.0), 4.0)));
+        assert_eq!(loops[1].boundary.len(), CIRCLE_SEGS);
+    }
+
+    #[test]
+    fn overlap_partial_circle_and_rect() {
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 10.0, 10.0),
+                circle_shape(10.0, 5.0, 4.0),
+            ],
+            &vars,
+        );
+        assert!(shapes_overlap(&loops[0], &loops[1]));
+        let clusters = overlap_clusters(&loops);
+        assert_eq!(clusters, vec![vec![0, 1]], "one cluster of two");
+    }
+
+    #[test]
+    fn disjoint_shapes_are_singletons() {
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 10.0, 10.0),
+                circle_shape(30.0, 5.0, 4.0),
+            ],
+            &vars,
+        );
+        assert!(!shapes_overlap(&loops[0], &loops[1]));
+        assert_eq!(overlap_clusters(&loops), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn circle_fully_inside_rect_overlaps_via_containment() {
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(-10.0, -10.0, 10.0, 10.0),
+                circle_shape(0.0, 0.0, 4.0),
+            ],
+            &vars,
+        );
+        assert!(
+            shapes_overlap(&loops[0], &loops[1]),
+            "fully-contained circle must register as overlap (→ cut)"
+        );
+    }
+
+    #[test]
+    fn edge_aligned_rects_overlap_via_midpoint() {
+        // Same vertical span, horizontally overlapping: no proper crossing and no
+        // strictly-interior vertex — only the edge-midpoint test catches it.
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 2.0, 2.0),
+                rect_shape(1.0, 0.0, 3.0, 2.0),
+            ],
+            &vars,
+        );
+        assert!(shapes_overlap(&loops[0], &loops[1]));
+    }
+
+    #[test]
+    fn boundary_only_touching_is_not_overlap() {
+        // Shared edge x=2, no area overlap → must stay independent.
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 2.0, 2.0),
+                rect_shape(2.0, 0.0, 4.0, 2.0),
+            ],
+            &vars,
+        );
+        assert!(!shapes_overlap(&loops[0], &loops[1]));
+        assert_eq!(overlap_clusters(&loops), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn three_chained_shapes_one_cluster() {
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 4.0, 4.0),
+                rect_shape(3.0, 0.0, 7.0, 4.0),
+                rect_shape(6.0, 0.0, 10.0, 4.0),
+            ],
+            &vars,
+        );
+        assert_eq!(overlap_clusters(&loops), vec![vec![0, 1, 2]]);
     }
 }

@@ -83,6 +83,83 @@ fn round_trip_with_thumbnail_and_mesh_cache() {
 }
 
 #[test]
+fn round_trip_overlapping_boolean_extrude() {
+    use std::collections::HashMap;
+    use zerocad_core::{
+        CoordinateSystem, Dimension, ExtrudeMode, Region, SketchCurves, SketchShape,
+    };
+
+    // A rectangle (kept) with a circle overlapping its right edge (cut): the
+    // overlapping-shapes-as-boolean case must survive a save/load round-trip,
+    // because the boolean is recomputed from the persisted `shapes` +
+    // `region_indices`.
+    let rect = SketchShape::Rectangle {
+        origin: (0.0, 0.0),
+        sx: 1.0,
+        sy: 1.0,
+        w: Dimension::literal(20.0),
+        h: Dimension::literal(10.0),
+        from_center: false,
+    };
+    let circle = SketchShape::Circle {
+        center: (18.0, 5.0),
+        diameter: Dimension::literal(8.0),
+    };
+    let shapes = vec![rect, circle];
+
+    // The rect-only material region (selected base).
+    let curves = zerocad_core::build_sketch_curves(&shapes, &HashMap::new());
+    let base: Vec<usize> = zerocad_core::detect_regions(&curves)
+        .iter()
+        .enumerate()
+        .filter(|(_, r): &(usize, &Region)| r.contains((5.0, 5.0)))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(base.len(), 1);
+
+    let mut pg = ParametricGraph::new();
+    pg.add_feature(FeatureNode {
+        id: "s".to_string(),
+        name: "Sketch".to_string(),
+        feature: FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes,
+            corner_mods: vec![],
+            on_face: false,
+        },
+    });
+    pg.add_feature(FeatureNode {
+        id: "e".to_string(),
+        name: "Extrude".to_string(),
+        feature: FeatureType::Extrude {
+            depth: 10.0,
+            region_indices: base,
+            mode: ExtrudeMode::NewBody,
+            depth_expr: None,
+        },
+    });
+    pg.add_dependency("s", "e");
+
+    let before = pg.evaluate_bodies(&HashSet::new()).expect("eval original");
+    let bytes = write_zcad(&doc_for(&pg)).expect("write");
+    let loaded = read_zcad(&bytes).expect("read");
+    let after = loaded
+        .graph
+        .evaluate_bodies(&HashSet::new())
+        .expect("eval restored");
+
+    assert_eq!(before.len(), 1, "boolean extrude makes one body");
+    assert_eq!(after.len(), before.len(), "body count survives round-trip");
+    assert_eq!(
+        after[0].1.indices.len(),
+        before[0].1.indices.len(),
+        "boolean result mesh identical after reload"
+    );
+    assert_eq!(after[0].1.vertices.len(), before[0].1.vertices.len());
+}
+
+#[test]
 fn corrupt_payload_is_detected_not_panicked() {
     let pg = sample_graph();
     let mut bytes = write_zcad(&doc_for(&pg)).expect("write");
@@ -133,7 +210,11 @@ fn legacy_json_still_loads() {
 
 #[test]
 fn garbage_is_not_zcad() {
-    for bad in [b"not a cad file".as_slice(), b"\x00\x01\x02\x03".as_slice(), b"".as_slice()] {
+    for bad in [
+        b"not a cad file".as_slice(),
+        b"\x00\x01\x02\x03".as_slice(),
+        b"".as_slice(),
+    ] {
         match read_zcad(bad) {
             Err(ZcadError::NotZcad) | Err(ZcadError::Truncated) => {}
             other => panic!("expected NotZcad for {bad:?}, got {other:?}"),

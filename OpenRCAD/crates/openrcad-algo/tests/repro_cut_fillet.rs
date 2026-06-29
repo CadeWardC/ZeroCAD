@@ -42,6 +42,11 @@ fn zerocad_circular_bite_body() -> Solid {
     boolean(&base, &cyl, BooleanOp::Cut)
 }
 
+fn zerocad_circular_bite_cutoff_edge() -> Edge {
+    let x = 20.0 - (14.0_f64 * 14.0 - 3.0_f64 * 3.0).sqrt();
+    Edge::between_points(Pnt::new(0.0, 5.0, 10.0), Pnt::new(x, 5.0, 10.0))
+}
+
 fn has_sphere(s: &Solid) -> bool {
     s.shell()
         .faces()
@@ -315,6 +320,69 @@ fn chamfer_into_cut_trims_flush_and_keeps_cut_clean() {
 }
 
 #[test]
+fn zerocad_circular_bite_fillet_into_cut_stays_analytic() {
+    let r = 3.0;
+    let body = zerocad_circular_bite_body();
+    assert!(body.is_watertight(), "precondition: cut body is watertight");
+    assert!(
+        body.health_report().is_healthy(),
+        "precondition: cut body is healthy: {:?}",
+        body.health_report().errors
+    );
+
+    let edge = zerocad_circular_bite_cutoff_edge();
+    let s = fillet_edges(&body, std::slice::from_ref(&edge), r)
+        .unwrap_or_else(|e| panic!("ZeroCAD circular-bite fillet r={r} must succeed: {e:?}"));
+
+    assert!(s.is_watertight(), "r={r}: result must be watertight");
+    assert!(
+        s.health_report().is_healthy(),
+        "r={r}: result must be healthy: {:?}",
+        s.health_report().errors
+    );
+    assert!(
+        !has_sphere(&s),
+        "r={r}: the cut wall must not be rounded into a sphere"
+    );
+    assert_eq!(
+        zerocad_non_cylinder_ghost_samples(&s),
+        0,
+        "r={r}: result must not tessellate material into the removed cylinder"
+    );
+
+    let cut_faces: Vec<_> = s
+        .shell()
+        .faces()
+        .into_iter()
+        .filter(|f| {
+            matches!(
+                f.surface(),
+                Some(GeomSurface::Cylinder(c))
+                    if c.position().direction().dot(&Dir::dz()).abs() > 0.999
+                        && (c.radius() - 14.0).abs() < 1e-3
+            )
+        })
+        .collect();
+    assert!(
+        !cut_faces.is_empty(),
+        "r={r}: radius-14 cut wall must survive"
+    );
+    for cut in &cut_faces {
+        assert!(
+            boundary_on_cut_cylinder(cut, (20.0, 8.0), 14.0),
+            "r={r}: the cut wall's boundary must stay on the cut cylinder"
+        );
+    }
+    assert!(
+        s.shell().faces().iter().any(|f| {
+            matches!(f.surface(), Some(GeomSurface::Cylinder(c)) if (c.radius() - r).abs() < 1e-3)
+        }),
+        "r={r}: the fillet blend cylinder must be present"
+    );
+    assert_eq!(cracks(&s), 0, "r={r}: result must tessellate crack-free");
+}
+
+#[test]
 fn zerocad_circular_bite_chamfer_into_cut_stays_analytic() {
     let body = zerocad_circular_bite_body();
     assert!(body.is_watertight(), "precondition: cut body is watertight");
@@ -324,8 +392,7 @@ fn zerocad_circular_bite_chamfer_into_cut_stays_analytic() {
         body.health_report().errors
     );
 
-    let x = 20.0 - (14.0_f64 * 14.0 - 3.0_f64 * 3.0).sqrt();
-    let edge = Edge::between_points(Pnt::new(0.0, 5.0, 10.0), Pnt::new(x, 5.0, 10.0));
+    let edge = zerocad_circular_bite_cutoff_edge();
     let s = chamfer_edges(&body, std::slice::from_ref(&edge), 1.0)
         .unwrap_or_else(|e| panic!("ZeroCAD circular-bite chamfer must succeed: {e:?}"));
 

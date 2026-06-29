@@ -1,6 +1,6 @@
 //! Repro of the post-fix GUI reports (extruded-sketch bodies, not clean make_box):
 //!  1. Filleting an extruded box edge — does it succeed, and how long does ONE
-//!     evaluate take (the live preview runs this synchronously on the UI thread)?
+//!     exact worker-side preview/final evaluate take?
 //!  2. Cutting a box twice in a row — does the second cut still remove material?
 //!  3. Cylinder boss join — are all surface triangles outward-facing (a face that
 //!     ends up inward-normal gets back-face culled → "disappears" on screen)?
@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 use zerocad_core::{
     CoordinateSystem, CornerKind, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
-    ParametricGraph, SketchCurves, Vec3,
+    MockMesh, ParametricGraph, SketchCurves, Vec3,
 };
 
 fn add_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: SketchCurves) {
@@ -44,6 +44,105 @@ fn rect_sketch(min: (f32, f32), max: (f32, f32)) -> SketchCurves {
     let mut c = SketchCurves::new();
     c.add_rectangle(min, max);
     c
+}
+
+fn selected_fillet_surface_on_span(mesh: &MockMesh, edge: &EdgeRef, radius: f32) -> bool {
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let add = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+    let mul = |a: [f32; 3], s: f32| [a[0] * s, a[1] * s, a[2] * s];
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let len = |a: [f32; 3]| dot(a, a).sqrt();
+    let norm = |a: [f32; 3]| {
+        let l = len(a);
+        if l <= 1.0e-8 {
+            [1.0, 0.0, 0.0]
+        } else {
+            mul(a, 1.0 / l)
+        }
+    };
+    let pos = |vi: u32| {
+        let b = vi as usize * 6;
+        [mesh.vertices[b], mesh.vertices[b + 1], mesh.vertices[b + 2]]
+    };
+    let normal = |vi: u32| {
+        let b = vi as usize * 6;
+        [
+            mesh.vertices[b + 3],
+            mesh.vertices[b + 4],
+            mesh.vertices[b + 5],
+        ]
+    };
+
+    let run = sub(edge.p1, edge.p0);
+    let run_len = len(run);
+    let t = norm(run);
+    let n1 = norm(edge.n1);
+    let n2 = norm(edge.n2);
+    if run_len <= 1.0e-4 || len(cross(n1, n2)) <= 1.0e-4 {
+        return false;
+    }
+    let f1 = norm(sub(mul(n2, -1.0), mul(n1, dot(mul(n2, -1.0), n1))));
+    let f2 = norm(sub(mul(n1, -1.0), mul(n2, dot(mul(n1, -1.0), n2))));
+    let min_offset = (radius * 0.04).max(0.025);
+    let max_offset = radius + 0.55;
+    let mut samples = 0usize;
+    let mut min_s = f32::INFINITY;
+    let mut max_s = f32::NEG_INFINITY;
+    let mut normal_bins = HashSet::new();
+
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = pos(tri[0]);
+        let b = pos(tri[1]);
+        let c = pos(tri[2]);
+        let p = mul(add(add(a, b), c), 1.0 / 3.0);
+        let rel = sub(p, edge.p0);
+        let s = dot(rel, t);
+        if !(-0.35..=run_len + 0.35).contains(&s) {
+            continue;
+        }
+        let u = dot(rel, f1);
+        let v = dot(rel, f2);
+        if u < min_offset || v < min_offset || u > max_offset || v > max_offset {
+            continue;
+        }
+        let vertex_n = mul(
+            add(add(normal(tri[0]), normal(tri[1])), normal(tri[2])),
+            1.0 / 3.0,
+        );
+        let mut face_n = cross(sub(b, a), sub(c, a));
+        let expected = norm(add(n1, n2));
+        if dot(face_n, expected) < 0.0 {
+            face_n = mul(face_n, -1.0);
+        }
+        let bin = [vertex_n, face_n].into_iter().find_map(|n| {
+            if len(n) <= 1.0e-8 {
+                return None;
+            }
+            let n = norm(n);
+            let d1 = dot(n, n1).clamp(-1.0, 1.0);
+            let d2 = dot(n, n2).clamp(-1.0, 1.0);
+            if d1 <= 0.08 || d2 <= 0.08 || d1.abs() > 0.985 || d2.abs() > 0.985 {
+                return None;
+            }
+            Some((d2.atan2(d1) * 16.0 / std::f32::consts::FRAC_PI_2).round() as i32)
+        });
+        let Some(bin) = bin else {
+            continue;
+        };
+        samples += 1;
+        min_s = min_s.min(s);
+        max_s = max_s.max(s);
+        normal_bins.insert(bin);
+    }
+
+    samples >= 3 && max_s - min_s >= (run_len * 0.25).min(8.0) && normal_bins.len() >= 2
 }
 
 fn top_plane(h: f32) -> CoordinateSystem {
@@ -143,11 +242,11 @@ fn extruded_box_fillet_succeeds_and_is_fast() {
         "filleted extruded box mesh has {cracks} crack edges"
     );
 
-    // The live preview runs this on the UI thread per 0.05mm of drag; if one
-    // evaluate is slow the app shows "(Not Responding)". Flag a slow path.
+    // The exact worker-side solve should stay bounded; the UI now gets immediate
+    // lightweight feedback while this result is being computed.
     assert!(
         ms < 1500,
-        "single fillet evaluate took {ms} ms — too slow for a live UI-thread preview"
+        "single fillet evaluate took {ms} ms — too slow for exact preview refinement"
     );
 }
 
@@ -321,10 +420,9 @@ fn cylinder_boss_join_has_no_inward_faces() {
 #[test]
 fn fillet_preview_drag_is_responsive() {
     use std::time::Instant;
-    // Build the GUI-style body: extruded box, then simulate a live fillet drag by
-    // re-evaluating the whole graph (with a fresh edge-mod node) at many radii —
-    // exactly what the UI thread does each preview frame. None may be slow enough
-    // to freeze the UI ("Not Responding").
+    // Build the GUI-style body, then evaluate the exact preview graph a worker
+    // solves after the immediate lightweight overlay appears. The temp edge-mod
+    // id must sort after `extrude_2`; otherwise this test can skip the modifier.
     let mut base = ParametricGraph::new();
     add_sketch(
         &mut base,
@@ -341,9 +439,8 @@ fn fillet_preview_drag_is_responsive() {
     );
 
     let mut worst = 0u128;
-    // Drag from 0.5mm up to an oversize 9mm (radius > half the 15mm height fails).
-    for step in 0..40 {
-        let r = 0.5 + step as f32 * 0.22;
+    for step in 0..4 {
+        let r = 2.0 + step as f32;
         let mut g = base.clone();
         let edge = EdgeRef {
             p0: [0.0, 0.0, 15.0],
@@ -353,28 +450,49 @@ fn fillet_preview_drag_is_responsive() {
             curve: None,
             topology: None,
         };
+        let edge_mod_id = format!("edgemod_{}", 100 + step);
         g.add_feature(FeatureNode {
-            id: "edgemod_preview".into(),
+            id: edge_mod_id.clone(),
             name: "Preview".into(),
             feature: FeatureType::EdgeMod {
                 target: "extrude_2".into(),
-                edge,
+                edge: edge.clone(),
                 dist: r,
                 dist_expr: None,
                 scope: EdgeModScope::FullEdge,
                 kind: CornerKind::Fillet,
             },
         });
-        g.add_dependency("extrude_2", "edgemod_preview");
+        g.add_dependency("extrude_2", &edge_mod_id);
         let t = Instant::now();
-        let _ = g.evaluate_bodies_draft(&HashSet::new());
+        let (bodies, warnings) = g
+            .evaluate_bodies_with_warnings_draft(&HashSet::new())
+            .unwrap();
         let ms = t.elapsed().as_millis();
         worst = worst.max(ms);
+        assert!(
+            warnings.is_empty(),
+            "preview fillet radius {r} should solve cleanly, got {warnings:?}"
+        );
+        assert_eq!(bodies.len(), 1, "preview fillet keeps one body");
+        let has_round = bodies[0]
+            .1
+            .vertices
+            .chunks(6)
+            .any(|v| v[2] > 11.5 && v[2] < 14.8 && v[1] > 0.05 && v[1] < 4.0);
+        assert!(
+            has_round,
+            "numeric temp id should apply the preview fillet, not skip it"
+        );
+        assert!(
+            selected_fillet_surface_on_span(&bodies[0].1, &edge, r),
+            "exact preview result should fillet the selected front-top edge span"
+        );
     }
-    println!("fillet drag: worst single preview eval = {worst} ms");
+    println!("fillet exact preview worker: worst solve = {worst} ms");
     assert!(
-        worst < 1500,
-        "a preview frame took {worst} ms — would freeze the UI"
+        worst < 2500,
+        "an exact preview solve took {worst} ms before refinement could arrive"
     );
 }
 

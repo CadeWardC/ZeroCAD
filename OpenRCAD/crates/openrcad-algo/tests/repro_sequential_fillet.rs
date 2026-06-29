@@ -20,7 +20,11 @@ fn cracks(solid: &Solid) -> usize {
     let q = |i: usize| -> Key {
         let b = i * 3;
         let g = |v: f32| (v as f64 * 1e4).round() as i64;
-        (g(gpu.positions[b]), g(gpu.positions[b + 1]), g(gpu.positions[b + 2]))
+        (
+            g(gpu.positions[b]),
+            g(gpu.positions[b + 1]),
+            g(gpu.positions[b + 2]),
+        )
     };
     let mut edges: HashMap<(Key, Key), u32> = HashMap::new();
     for t in gpu.indices.chunks_exact(3) {
@@ -42,7 +46,11 @@ fn nonmanifold(solid: &Solid) -> usize {
     let q = |i: usize| -> Key {
         let b = i * 3;
         let g = |v: f32| (v as f64 * 1e4).round() as i64;
-        (g(gpu.positions[b]), g(gpu.positions[b + 1]), g(gpu.positions[b + 2]))
+        (
+            g(gpu.positions[b]),
+            g(gpu.positions[b + 1]),
+            g(gpu.positions[b + 2]),
+        )
     };
     let mut edges: HashMap<(Key, Key), u32> = HashMap::new();
     for t in gpu.indices.chunks_exact(3) {
@@ -123,7 +131,12 @@ fn fillet_two_perpendicular_top_edges() {
         if on(a) && on(b) {
             println!(
                 "  edge ({:.2},{:.2},{:.2})->({:.2},{:.2},{:.2})",
-                a.x(), a.y(), a.z(), b.x(), b.y(), b.z()
+                a.x(),
+                a.y(),
+                a.z(),
+                b.x(),
+                b.y(),
+                b.z()
             );
             surviving = Some(Edge::between_points(a, b));
         }
@@ -141,7 +154,10 @@ fn fillet_two_perpendicular_top_edges() {
     }
     let s = s2.expect("second perpendicular fillet should succeed");
     assert!(s.is_watertight(), "two-fillet body must be watertight");
-    assert!(s.health_report().is_healthy(), "two-fillet body must be healthy");
+    assert!(
+        s.health_report().is_healthy(),
+        "two-fillet body must be healthy"
+    );
     assert_eq!(cracks(&s), 0, "two-fillet body must tessellate crack-free");
 }
 
@@ -164,9 +180,19 @@ fn fillet_two_parallel_top_edges() {
         Err(e) => println!("fillet 2 (back-top) ERR {e:?}"),
     }
     let s = s2.expect("second parallel fillet should succeed");
-    assert!(s.is_watertight(), "two-parallel-fillet body must be watertight");
-    assert!(s.health_report().is_healthy(), "two-parallel-fillet body must be healthy");
-    assert_eq!(cracks(&s), 0, "two-parallel-fillet body must tessellate crack-free");
+    assert!(
+        s.is_watertight(),
+        "two-parallel-fillet body must be watertight"
+    );
+    assert!(
+        s.health_report().is_healthy(),
+        "two-parallel-fillet body must be healthy"
+    );
+    assert_eq!(
+        cracks(&s),
+        0,
+        "two-parallel-fillet body must tessellate crack-free"
+    );
 }
 
 /// Both edges in one call, ORIGINAL coordinates (how the GUI drives a multi-edge
@@ -183,7 +209,10 @@ fn fillet_two_perpendicular_in_one_call() {
     let s = fillet_edges(&cube, &[front_top, right_top], r)
         .expect("two shared-corner edges must fillet in one call (relocate the survivor)");
     describe("both-in-one-call", &s);
-    assert!(s.is_watertight() && s.health_report().is_healthy(), "must be watertight+healthy");
+    assert!(
+        s.is_watertight() && s.health_report().is_healthy(),
+        "must be watertight+healthy"
+    );
     assert_eq!(cracks(&s), 0, "two-fillet body must tessellate crack-free");
 }
 
@@ -202,13 +231,20 @@ fn fillet_all_four_top_edges_in_one_call() {
     ];
     let s = fillet_edges(&cube, &edges, r).expect("all four top edges must fillet in one call");
     describe("all-four-top-edges", &s);
-    assert!(s.is_watertight() && s.health_report().is_healthy(), "must be watertight+healthy");
+    assert!(
+        s.is_watertight() && s.health_report().is_healthy(),
+        "must be watertight+healthy"
+    );
     assert_eq!(cracks(&s), 0, "four-fillet body must tessellate crack-free");
     // Only the two top edges meet at each top corner; the vertical edge there is
     // NOT filleted, so each corner must MITER (the two fillets meet along a seam)
     // — not round into a ball. No spheres; one elliptical seam per corner.
     assert_eq!(spheres(&s), 0, "two-edge corners must miter, not sphere");
-    assert_eq!(miter_seams(&s), 4, "every shared top corner must miter along a seam");
+    assert_eq!(
+        miter_seams(&s),
+        4,
+        "every shared top corner must miter along a seam"
+    );
     // The four vertical edges stay sharp from z=0 up to the corner stub z=d-r.
     let sharp_verticals = s
         .edges()
@@ -221,7 +257,10 @@ fn fillet_all_four_top_edges_in_one_call() {
                 && (a.y() - b.y()).abs() < 1e-6
         })
         .count();
-    assert_eq!(sharp_verticals, 4, "all four vertical edges must stay sharp");
+    assert_eq!(
+        sharp_verticals, 4,
+        "all four vertical edges must stay sharp"
+    );
 }
 
 /// Two perpendicular top edges sharing a corner — with the corner's third edge
@@ -242,7 +281,10 @@ fn fillet_two_perpendicular_makes_miter_seam() {
     let right_top = Edge::between_points(Pnt::new(w, 0.0, d), Pnt::new(w, h, d));
     let s = fillet_edges(&cube, &[front_top, right_top], r).expect("shared-corner fillet");
 
-    assert!(s.is_watertight() && s.health_report().is_healthy(), "must be watertight+healthy");
+    assert!(
+        s.is_watertight() && s.health_report().is_healthy(),
+        "must be watertight+healthy"
+    );
     assert_eq!(cracks(&s), 0, "mitered body must tessellate crack-free");
     assert_eq!(
         nonmanifold(&s),
@@ -250,8 +292,16 @@ fn fillet_two_perpendicular_makes_miter_seam() {
         "the two mitered cylinders must not fan coincident flat triangles over the \
          shared seam (a z-fighting double membrane at the corner)"
     );
-    assert_eq!(spheres(&s), 0, "a two-edge corner must NOT round into a sphere");
-    assert_eq!(miter_seams(&s), 1, "the two fillets must meet along one elliptical seam");
+    assert_eq!(
+        spheres(&s),
+        0,
+        "a two-edge corner must NOT round into a sphere"
+    );
+    assert_eq!(
+        miter_seams(&s),
+        1,
+        "the two fillets must meet along one elliptical seam"
+    );
 
     // The vertical edge at the shared corner (x=w, y=0) stays sharp, shortened to
     // run from z=0 up to the stub vertex K at z=d-r.
@@ -264,7 +314,10 @@ fn fillet_two_perpendicular_makes_miter_seam() {
             && b.y().abs() < 1e-6
             && (a.z() - b.z()).abs() > (d - r) - 1e-6
     });
-    assert!(sharp_vertical, "the corner's third (vertical) edge must stay sharp from z=0 to z=d-r");
+    assert!(
+        sharp_vertical,
+        "the corner's third (vertical) edge must stay sharp from z=0 to z=d-r"
+    );
 
     // No cylinder wire vertex may collapse onto the cylinder axis (the old spike).
     for f in s.shell().faces() {
@@ -314,7 +367,11 @@ fn miter_tessellation_is_manifold_across_aspect_ratios() {
             0,
             "miter {w}x{h}x{d} r={r} fanned coincident triangles over the seam"
         );
-        assert_eq!(cracks(&s), 0, "miter {w}x{h}x{d} r={r} must tessellate crack-free");
+        assert_eq!(
+            cracks(&s),
+            0,
+            "miter {w}x{h}x{d} r={r} must tessellate crack-free"
+        );
     }
 }
 
@@ -340,10 +397,25 @@ fn fillet_three_edges_makes_spherical_corner() {
         .expect("rounding the third (vertical) edge must close the corner with a sphere");
     describe("three-edge corner", &s);
 
-    assert!(s.is_watertight() && s.health_report().is_healthy(), "must be watertight+healthy");
-    assert_eq!(cracks(&s), 0, "three-fillet corner must tessellate crack-free");
-    assert_eq!(spheres(&s), 1, "all-three-edges corner must round into one spherical octant");
-    assert_eq!(miter_seams(&s), 0, "the sphere must subsume the two-fillet miter seam");
+    assert!(
+        s.is_watertight() && s.health_report().is_healthy(),
+        "must be watertight+healthy"
+    );
+    assert_eq!(
+        cracks(&s),
+        0,
+        "three-fillet corner must tessellate crack-free"
+    );
+    assert_eq!(
+        spheres(&s),
+        1,
+        "all-three-edges corner must round into one spherical octant"
+    );
+    assert_eq!(
+        miter_seams(&s),
+        0,
+        "the sphere must subsume the two-fillet miter seam"
+    );
 
     // The spherical patch must render OUTWARD (mesh normals point away from the
     // ball center C). Only the patch's own vertices have a radial normal; boundary
@@ -381,7 +453,10 @@ fn fillet_three_edges_makes_spherical_corner() {
         }
     }
     assert!(radial_pts > 0, "no spherical-patch vertices tessellated");
-    assert_eq!(outward, radial_pts, "spherical corner patch renders inside-out");
+    assert_eq!(
+        outward, radial_pts,
+        "spherical corner patch renders inside-out"
+    );
 }
 
 /// Two perpendicular top edges sharing a corner, filleted with DIFFERENT radii
@@ -426,9 +501,19 @@ fn fillet_two_unequal_radius_perpendicular_corner() {
         Err(e) => println!("fillet 2 (right-top r=2) ERR {e:?}"),
     }
     let s = s2.expect("unequal-radius perpendicular fillet must succeed");
-    assert!(s.is_watertight(), "unequal-radius corner body must be watertight");
-    assert!(s.health_report().is_healthy(), "unequal-radius corner body must be healthy");
-    assert_eq!(cracks(&s), 0, "unequal-radius corner must tessellate crack-free (no spike)");
+    assert!(
+        s.is_watertight(),
+        "unequal-radius corner body must be watertight"
+    );
+    assert!(
+        s.health_report().is_healthy(),
+        "unequal-radius corner body must be healthy"
+    );
+    assert_eq!(
+        cracks(&s),
+        0,
+        "unequal-radius corner must tessellate crack-free (no spike)"
+    );
     assert_eq!(
         nonmanifold(&s),
         0,
@@ -436,7 +521,11 @@ fn fillet_two_unequal_radius_perpendicular_corner() {
     );
     // The corner is NOT equal-radius, so the analytic equal-radius sphere must not
     // fire; the general corner patch fills it instead.
-    assert_eq!(spheres(&s), 0, "unequal-radius corner must not use the equal-radius sphere");
+    assert_eq!(
+        spheres(&s),
+        0,
+        "unequal-radius corner must not use the equal-radius sphere"
+    );
     assert_eq!(
         gregory_patches(&s),
         1,
@@ -487,10 +576,24 @@ fn fillet_top_edge_into_existing_vertical_round() {
         Err(e) => println!("top fillet into round ERR {e:?}"),
     }
     let s = s2.expect("a top edge running into an existing round must fillet (not no-op)");
-    assert!(s.is_watertight(), "fillet-into-round body must be watertight");
-    assert!(s.health_report().is_healthy(), "fillet-into-round body must be healthy");
-    assert_eq!(cracks(&s), 0, "fillet-into-round must tessellate crack-free");
-    assert_eq!(nonmanifold(&s), 0, "fillet-into-round must be manifold at the join");
+    assert!(
+        s.is_watertight(),
+        "fillet-into-round body must be watertight"
+    );
+    assert!(
+        s.health_report().is_healthy(),
+        "fillet-into-round body must be healthy"
+    );
+    assert_eq!(
+        cracks(&s),
+        0,
+        "fillet-into-round must tessellate crack-free"
+    );
+    assert_eq!(
+        nonmanifold(&s),
+        0,
+        "fillet-into-round must be manifold at the join"
+    );
     // The new fillet meets the prior round of a DIFFERENT radius, so the
     // equal-radius sphere can't fire; the join must round through a general
     // (Gregory) corner patch rather than a flat-trim crease.

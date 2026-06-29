@@ -31,14 +31,14 @@ cargo fmt --all
 cargo clippy --workspace
 ```
 
-CI runs `rustfmt --check` and `clippy` as **informational** (non-blocking) jobs
-today, because the codebase is not yet fully `rustfmt`-normalized and has some
-pre-existing clippy suggestions. Don't reformat unrelated code in a feature PR —
-keep diffs focused. Normalizing formatting and turning these into required gates
-is a welcome standalone PR.
+CI treats `cargo fmt --all -- --check` as a required gate. Clippy remains
+advisory because there are still useful but non-blocking suggestions in the
+geometry-heavy code. Don't reformat unrelated code in a feature PR — keep diffs
+focused.
 
-The hard CI gates are **build + test** (Windows full workspace, Linux core).
-A change that doesn't compile or breaks a test will be flagged.
+The hard CI gates are **format + build + test** (Windows full workspace, Linux
+core). A change that doesn't compile, breaks a test, or fails rustfmt will be
+flagged.
 
 ## Adding a feature
 

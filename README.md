@@ -18,11 +18,12 @@ ZeroCAD/
 ├── zerocad-core/        # Pure geometry + parametric engine. No UI, no GPU.
 │   ├── geometry.rs      # Vec3, CoordinateSystem (project/unproject a plane).
 │   ├── sketch.rs        # 2D curves + detect_regions() (planar arrangement).
-│   ├── parametric.rs    # Feature graph (the history tree) + evaluator.
-│   ├── mock_kernel.rs   # Thin wrapper over `truck` B-Rep + tessellation.
+│   ├── parametric/      # Feature graph, evaluator, extrude/join/cut/edge-mod logic.
+│   ├── mock_kernel/     # Thin wrapper over OpenRCAD B-Rep + tessellation.
 │   └── units.rs         # mm / inch / meter conversions (base unit = mm).
 └── zerocad-gui/         # egui/eframe + wgpu front end.
-    ├── main.rs          # App state (ZeroCadApp) + event loop + browser UI.
+    ├── main.rs          # App state types, tool enums, and process entrypoint.
+    ├── app/             # ZeroCadApp methods split by workflow and UI surface.
     ├── render.rs        # CPU-projected viewport (painter's algorithm).
     ├── extrude.rs       # Extrude tool + live preview + default-mode logic.
     ├── sketch_ui.rs     # Fusion-style inline dimension dialogs.
@@ -54,7 +55,7 @@ Toggle Dark Mode `Ctrl+D`, Settings `Ctrl+,`.
 
 ---
 
-## The evaluation pipeline (`parametric.rs`)
+## The evaluation pipeline (`zerocad-core/src/parametric/`)
 
 `ParametricGraph` is a `petgraph::DiGraph<FeatureNode, ()>`. Each node is a
 `FeatureType` (`Origin`, `Box`, `Cylinder`, `Sketch`, `Extrude`, `VariableSet`).
@@ -77,15 +78,17 @@ preview path use it.
 
 ### Adding a new feature type — the checklist
 
-1. Add a variant to `FeatureType` in `parametric.rs`.
+1. Add a variant to `FeatureType` in `zerocad-core/src/parametric/types.rs`.
 2. If it produces a solid, add it to the `matches!` in
    `body_nodes_in_creation_order` and a match arm in
    `evaluate_bodies_with_warnings`.
-3. Add a solid builder in `mock_kernel.rs` returning `KernelSolid`. **Read the
-   invariants below first** — orientation and handedness will bite you.
+3. Add a solid builder under `zerocad-core/src/mock_kernel/` returning
+   `KernelSolid`. **Read the invariants below first** — orientation and
+   handedness will bite you.
 4. Add a regression test to `tests/realistic_modes.rs` that asserts the geometry
    actually changed, not just the triangle count.
-5. Add the GUI affordance in `main.rs` / a tool module if it's user-facing.
+5. Add the GUI affordance under `zerocad-gui/src/app/` or the relevant tool
+   module if it's user-facing.
 
 ---
 
@@ -295,7 +298,7 @@ the history; its distance and type stay editable in the property panel and the
 distance can follow a variable.
 
 The truck kernel has no fillet/chamfer builder, so it's done with a **boolean
-cut**: [`edge_corner_cutter`](zerocad-core/src/mock_kernel.rs) sweeps the corner
+cut**: [`edge_corner_cutter`](zerocad-core/src/mock_kernel/edge_ops.rs) sweeps the corner
 cross-section perpendicular to the edge — a right triangle (chamfer) or that
 triangle minus a faceted circular segment (fillet) — along the edge using the
 same tested `extruded_region_solid` prism path, then `apply_edge_mod` subtracts it
@@ -323,13 +326,13 @@ look like one smooth face three ways:
 
 1. The cutter tessellates the arc adaptively (~3.6°/segment, up to
    `EDGE_FILLET_SEGS`) for a smooth silhouette.
-2. [`smooth_vertex_normals`](zerocad-core/src/mock_kernel.rs) blends the facet
+2. [`smooth_vertex_normals`](zerocad-core/src/mock_kernel/tessellation.rs) blends the facet
    normals across shallow creases (`SHADE_CREASE_COS`, ~30°) so the round carries a
    continuous normal field, and the renderer shades it **Gouraud** (one
    interpolated color per vertex) instead of flat-per-facet — so there's no shading
    banding. Sharp features (90° box corners, 45° chamfers) diverge past the crease
    angle and keep per-face normals, so they stay crisply shaded.
-3. [`mesh_feature_edges`](zerocad-core/src/mock_kernel.rs) **suppresses the
+3. [`mesh_feature_edges`](zerocad-core/src/mock_kernel/mesh_topology.rs) **suppresses the
    facet-boundary wireframe lines** — a crease below ~18° is a tessellation seam,
    not a design edge, so it isn't drawn.
 

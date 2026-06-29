@@ -6,11 +6,13 @@
 
 use core::fmt;
 
-use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{tolerance, Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
     Circle, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, GregorySurface, Plane,
     SphericalSurface, Surface, ToroidalSurface,
 };
+use openrcad_mesh::tessellate;
+use openrcad_primitives::make_cylinder;
 use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
 
 use crate::sew::sew;
@@ -319,6 +321,7 @@ fn fillet_planar_edge_inner(
 
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
     let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+    let cut_guards = cut_cylinder_guards(solid, &start_caps, &end_caps);
 
     let mut faces = Vec::new();
     let mut skipped_faces = std::collections::HashSet::new();
@@ -348,7 +351,21 @@ fn fillet_planar_edge_inner(
         &mut faces,
         &mut skipped_faces,
     )?;
+    let start_tangent_wall = if start_cut {
+        false
+    } else {
+        try_tangent_curved_wall_runout(
+            solid,
+            &mut blend,
+            start,
+            &start_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?
+    };
     let start_mitered = start_cut
+        || start_tangent_wall
         || (use_sphere
             && (try_corner_sphere_two_caps(
                 solid,
@@ -376,7 +393,21 @@ fn fillet_planar_edge_inner(
         &mut faces,
         &mut skipped_faces,
     )?;
+    let end_tangent_wall = if end_cut {
+        false
+    } else {
+        try_tangent_curved_wall_runout(
+            solid,
+            &mut blend,
+            end,
+            &end_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?
+    };
     let end_mitered = end_cut
+        || end_tangent_wall
         || (use_sphere
             && (try_corner_sphere_two_caps(
                 solid,
@@ -445,16 +476,180 @@ fn fillet_planar_edge_inner(
     // non-watertight / degenerate shell. Surface that as an error rather than
     // returning a broken solid the application would cache.
     let result = Solid::new(sew(&faces, radius * 0.1));
-    let merged = crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(
-        &result,
-    ));
-    if merged.is_watertight() && merged.health_report().is_healthy() {
-        return Ok(merged);
-    }
-    if result.is_watertight() && result.health_report().is_healthy() {
-        return Ok(result);
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
+    if cut_guards.is_empty() {
+        if let Some(accepted) = accept_subtractive_blend_result(&merged, &cut_guards) {
+            return Ok(accepted);
+        }
+        if let Some(accepted) = accept_subtractive_blend_result(&result, &cut_guards) {
+            return Ok(accepted);
+        }
+    } else {
+        if let Some(accepted) = accept_subtractive_blend_result(&result, &cut_guards) {
+            return Ok(accepted);
+        }
+        if let Some(accepted) = accept_subtractive_blend_result(&merged, &cut_guards) {
+            return Ok(accepted);
+        }
     }
     Err(RollingBallError::InvalidTopology)
+}
+
+#[derive(Clone)]
+struct CutCylinderGuard {
+    cyl: CylindricalSurface,
+    v_min: f64,
+    v_max: f64,
+}
+
+fn cut_cylinder_guards(
+    solid: &Solid,
+    start_caps: &[Face],
+    end_caps: &[Face],
+) -> Vec<CutCylinderGuard> {
+    start_caps
+        .iter()
+        .chain(end_caps.iter())
+        .filter(|cap| is_concave_cut_cylinder(solid, cap))
+        .filter_map(|cap| {
+            let Some(GeomSurface::Cylinder(cyl)) = cap.surface() else {
+                return None;
+            };
+            let mut v_min = f64::INFINITY;
+            let mut v_max = f64::NEG_INFINITY;
+            let axis_loc = cyl.position().location();
+            let axis = GeomVec::from_dir(cyl.position().direction());
+            for wire in cap.wires() {
+                for edge in wire.edges() {
+                    let Some(curve) = edge.curve() else {
+                        continue;
+                    };
+                    let (t0, t1) = (edge.first(), edge.last());
+                    for k in 0..=8 {
+                        let t = t0 + (t1 - t0) * (k as f64) / 8.0;
+                        let p = curve.point(t);
+                        let v = (p - axis_loc).dot(&axis);
+                        v_min = v_min.min(v);
+                        v_max = v_max.max(v);
+                    }
+                }
+            }
+            v_min.is_finite().then_some(CutCylinderGuard {
+                cyl: *cyl,
+                v_min,
+                v_max,
+            })
+        })
+        .collect()
+}
+
+fn accept_subtractive_blend_result(
+    candidate: &Solid,
+    cut_guards: &[CutCylinderGuard],
+) -> Option<Solid> {
+    if !candidate.is_watertight() || !candidate.health_report().is_healthy() {
+        return None;
+    }
+    if cut_guards.is_empty() {
+        return Some(candidate.clone());
+    }
+    let intrudes = solid_surface_intrudes_into_cut(candidate, cut_guards);
+    if !intrudes {
+        return Some(candidate.clone());
+    }
+
+    let mut clipped = candidate.clone();
+    for guard in cut_guards {
+        if !solid_surface_intrudes_into_cut(&clipped, std::slice::from_ref(guard)) {
+            continue;
+        }
+        let axis = guard.cyl.position();
+        let dir = axis.direction();
+        let base = axis.location() + GeomVec::from_dir(dir) * (guard.v_min - 0.25);
+        let cutter_axis = Ax2::new_axes(base, dir, axis.x_direction());
+        let cutter = make_cylinder(
+            &cutter_axis,
+            guard.cyl.radius(),
+            (guard.v_max - guard.v_min).abs() + 0.5,
+        );
+        clipped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::boolean_checked(&clipped, &cutter, crate::BooleanOp::Cut)
+        }))
+        .ok()
+        .and_then(Result::ok)?;
+        clipped =
+            crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&clipped));
+    }
+    (clipped.is_watertight()
+        && clipped.health_report().is_healthy()
+        && !solid_surface_intrudes_into_cut(&clipped, cut_guards))
+    .then_some(clipped)
+}
+
+fn solid_surface_intrudes_into_cut(candidate: &Solid, cut_guards: &[CutCylinderGuard]) -> bool {
+    solid_surface_intrudes_into_cut_once(candidate, cut_guards)
+}
+
+fn solid_surface_intrudes_into_cut_once(
+    candidate: &Solid,
+    cut_guards: &[CutCylinderGuard],
+) -> bool {
+    let mesh = tessellate(candidate, 0.05, 0.5);
+    let faces = candidate.shell().faces();
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        let a = mesh.vertices[tri[0] as usize];
+        let b = mesh.vertices[tri[1] as usize];
+        let c = mesh.vertices[tri[2] as usize];
+        let centroid = Pnt::new(
+            (a.x() + b.x() + c.x()) / 3.0,
+            (a.y() + b.y() + c.y()) / 3.0,
+            (a.z() + b.z() + c.z()) / 3.0,
+        );
+        let face = mesh
+            .face_ids
+            .get(i)
+            .and_then(|fid| faces.get(*fid as usize));
+        for guard in cut_guards {
+            if face
+                .and_then(|face| face.surface())
+                .is_some_and(|surface| match surface {
+                    GeomSurface::Cylinder(cyl) => cylinders_same_surface(&cyl, &guard.cyl),
+                    _ => false,
+                })
+            {
+                continue;
+            }
+            if point_inside_cut_guard(centroid, guard, 0.75) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn cylinders_same_surface(a: &CylindricalSurface, b: &CylindricalSurface) -> bool {
+    if (a.radius() - b.radius()).abs() > 1.0e-6 {
+        return false;
+    }
+    let ad = GeomVec::from_dir(a.position().direction());
+    let bd = GeomVec::from_dir(b.position().direction());
+    if ad.dot(&bd).abs() < 0.999_999 {
+        return false;
+    }
+    let delta = b.position().location() - a.position().location();
+    (delta - ad * delta.dot(&ad)).magnitude() <= 1.0e-5
+}
+
+fn point_inside_cut_guard(p: Pnt, guard: &CutCylinderGuard, margin: f64) -> bool {
+    let axis_loc = guard.cyl.position().location();
+    let axis = GeomVec::from_dir(guard.cyl.position().direction());
+    let v = (p - axis_loc).dot(&axis);
+    if v < guard.v_min - 0.05 || v > guard.v_max + 0.05 {
+        return false;
+    }
+    let radial = (p - axis_loc) - axis * v;
+    radial.magnitude() < guard.cyl.radius() - margin
 }
 
 /// Faces produced for one shared corner: the new faces to add and the original
@@ -775,9 +970,6 @@ pub(crate) fn is_concave_cut_cylinder(solid: &Solid, cap: &Face) -> bool {
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return false,
     };
-    // A point in the middle of the cap face (centroid of its outer wire),
-    // re-projected onto the cylinder so it sits exactly on the wall, away from
-    // the boundary edges where containment is ambiguous.
     let Some(wire) = cap.outer_wire() else {
         return false;
     };
@@ -815,6 +1007,15 @@ pub(crate) fn line_meets_cylinder(
     cyl: &CylindricalSurface,
     near: Pnt,
 ) -> Option<Pnt> {
+    let hits = line_cylinder_intersections(p0, dir, cyl)?;
+    Some(if hits[0].distance(&near) <= hits[1].distance(&near) {
+        hits[0]
+    } else {
+        hits[1]
+    })
+}
+
+fn line_cylinder_intersections(p0: Pnt, dir: Dir, cyl: &CylindricalSurface) -> Option<[Pnt; 2]> {
     let axis_pt = cyl.position().location();
     let w = GeomVec::from_dir(cyl.position().direction());
     let d = GeomVec::from_dir(dir);
@@ -836,12 +1037,65 @@ pub(crate) fn line_meets_cylinder(
     let t0 = (-b - sq) / (2.0 * a);
     let t1 = (-b + sq) / (2.0 * a);
     let p_at = |t: f64| p0 + d * t;
-    let (q0, q1) = (p_at(t0), p_at(t1));
-    Some(if q0.distance(&near) <= q1.distance(&near) {
-        q0
+    Some([p_at(t0), p_at(t1)])
+}
+
+fn line_meets_cylinder_on_edge(
+    p0: Pnt,
+    dir: Dir,
+    cyl: &CylindricalSurface,
+    near: Pnt,
+    edge: &Edge,
+) -> Option<Pnt> {
+    let hits = line_cylinder_intersections(p0, dir, cyl)?;
+    let score = |p: Pnt| point_on_edge_score(edge, p) + 1.0e-7 * p.distance(&near);
+    Some(if score(hits[0]) <= score(hits[1]) {
+        hits[0]
     } else {
-        q1
+        hits[1]
     })
+}
+
+fn point_on_edge_score(edge: &Edge, point: Pnt) -> f64 {
+    match edge.curve() {
+        Some(GeomCurve::Line(_)) | None => {
+            point_segment_distance(point, edge.source().point(), edge.target().point())
+        }
+        Some(GeomCurve::Circle(circle)) => {
+            let center = circle.center();
+            let axis = GeomVec::from_dir(circle.axis());
+            let x = GeomVec::from_dir(circle.position().x_direction());
+            let y = GeomVec::from_dir(circle.position().y_direction());
+            let v = point - center;
+            let axial = v.dot(&axis).abs();
+            let radial_vec = v - axis * v.dot(&axis);
+            let radial = radial_vec.magnitude();
+            let raw = radial_vec.dot(&y).atan2(radial_vec.dot(&x));
+            let lo = edge.first().min(edge.last());
+            let hi = edge.first().max(edge.last());
+            let mut param_penalty = f64::INFINITY;
+            for k in -3..=3 {
+                let u = raw + (k as f64) * core::f64::consts::TAU;
+                let penalty = if u < lo {
+                    (lo - u) * circle.radius()
+                } else if u > hi {
+                    (u - hi) * circle.radius()
+                } else {
+                    0.0
+                };
+                param_penalty = param_penalty.min(penalty);
+            }
+            axial + (radial - circle.radius()).abs() + param_penalty
+        }
+        Some(curve) => {
+            let mut best = f64::INFINITY;
+            for k in 0..=24 {
+                let t = edge.first() + (edge.last() - edge.first()) * (k as f64) / 24.0;
+                best = best.min(point.distance(&curve.point(t)));
+            }
+            best
+        }
+    }
 }
 
 /// A degree-1 (chorded) B-spline edge through `points`, from the first to the
@@ -950,6 +1204,171 @@ fn cyl_cyl_trim_edge(
     }
     pts.push(p_b);
     Some(polyline_edge(&pts))
+}
+
+/// Trim a selected-edge fillet into an extruded sketch arc that is tangent to
+/// one of the selected edge's planar side faces.
+///
+/// This is distinct from [`try_corner_cut`]: the wall is convex material
+/// boundary, not a void. One blend contact may therefore shorten back along the
+/// selected edge until it reaches the wall, while the other contact can end at
+/// the original tangent point. The shared endpoint edge is still the true
+/// cylinder-cylinder intersection between the blend cylinder and the wall
+/// cylinder, so both surfaces keep analytic support and sew without cracks.
+#[allow(clippy::too_many_arguments)]
+fn try_tangent_curved_wall_runout(
+    solid: &Solid,
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> Result<bool, RollingBallError> {
+    if caps.len() != 1 {
+        return Ok(false);
+    }
+    let cap = &caps[0];
+    if is_concave_cut_cylinder(solid, cap) {
+        return Ok(false);
+    }
+    let wall_cyl = match cap.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => return Ok(false),
+    };
+    let blend_cyl = match blend.blend_face.surface() {
+        Some(GeomSurface::Cylinder(c)) => *c,
+        _ => return Ok(false),
+    };
+
+    // Prior fillets are also cylindrical endpoint caps. They are handled by the
+    // miter/sphere paths when the cap axis passes through the rolling-ball center
+    // at this corner. A tangent sketch wall sits away from that center.
+    let center = nearest_endpoint(&blend.centerline, corner);
+    if point_line_distance(
+        center,
+        wall_cyl.position().location(),
+        wall_cyl.position().direction(),
+    ) <= 1.0e-5 * radius.max(1.0) + 1.0e-6
+    {
+        return Ok(false);
+    }
+    if !wall_is_tangent_to_selected_side(cap, &wall_cyl, blend, corner)? {
+        return Ok(false);
+    }
+
+    let a_corner = nearest_endpoint(&blend.contact_a, corner);
+    let b_corner = nearest_endpoint(&blend.contact_b, corner);
+    let a_far = farthest_endpoint(&blend.contact_a, corner);
+    let b_far = farthest_endpoint(&blend.contact_b, corner);
+    let a_dir = match (a_corner - a_far).normalized() {
+        Some(v) => Dir::new(v.x(), v.y(), v.z()),
+        None => return Err(RollingBallError::DegenerateSpine),
+    };
+    let b_dir = match (b_corner - b_far).normalized() {
+        Some(v) => Dir::new(v.x(), v.y(), v.z()),
+        None => return Err(RollingBallError::DegenerateSpine),
+    };
+
+    let (prev_edge, next_edge) = cap_edges_at_corner(cap, corner)?;
+    let da_prev = point_on_edge_score(&prev_edge, a_corner);
+    let db_prev = point_on_edge_score(&prev_edge, b_corner);
+    let (a_trim_edge, b_trim_edge) = if da_prev <= db_prev {
+        (&prev_edge, &next_edge)
+    } else {
+        (&next_edge, &prev_edge)
+    };
+
+    let ca_real = match line_meets_cylinder_on_edge(a_far, a_dir, &wall_cyl, a_corner, a_trim_edge)
+    {
+        Some(p) => p,
+        None => return Err(RollingBallError::UnsupportedTrimTopology),
+    };
+    let cb_real = match line_meets_cylinder_on_edge(b_far, b_dir, &wall_cyl, b_corner, b_trim_edge)
+    {
+        Some(p) => p,
+        None => return Err(RollingBallError::UnsupportedTrimTopology),
+    };
+    if ca_real.distance(&cb_real) <= tolerance::CONFUSION {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let trim = match cyl_cyl_trim_edge(&blend_cyl, &wall_cyl, ca_real, cb_real) {
+        Some(e) => e,
+        None => {
+            return Err(RollingBallError::BlendSurfaceBuild(
+                "tangent wall trim curve",
+            ))
+        }
+    };
+    let trimmed_cap = trim_face_at_corner(cap, corner, ca_real, cb_real, &trim)?;
+
+    let new_a = rebuild_contact(&blend.contact_a, a_far, ca_real);
+    let new_b = rebuild_contact(&blend.contact_b, b_far, cb_real);
+    let is_end = new_a.end().point().distance(&ca_real) <= new_a.start().point().distance(&ca_real);
+    let new_blend_face = build_blend_face_with_trim(blend, &new_a, &new_b, &trim, is_end);
+
+    blend.contact_a = new_a;
+    blend.contact_b = new_b;
+    blend.blend_face = new_blend_face;
+    faces.push(trimmed_cap);
+    skipped.insert(cap.id());
+    Ok(true)
+}
+
+fn cap_edges_at_corner(face: &Face, corner: Pnt) -> Result<(Edge, Edge), RollingBallError> {
+    let edges = face
+        .outer_wire()
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?
+        .edges();
+    let n = edges.len();
+    if n < 3 {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+    let Some(next_idx) = edges
+        .iter()
+        .position(|edge| edge.source().point().distance(&corner) <= 10.0 * tolerance::CONFUSION)
+    else {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    };
+    let prev_idx = (next_idx + n - 1) % n;
+    if edges[prev_idx].target().point().distance(&corner) > 10.0 * tolerance::CONFUSION {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+    Ok((edges[prev_idx].clone(), edges[next_idx].clone()))
+}
+
+fn wall_is_tangent_to_selected_side(
+    cap: &Face,
+    wall_cyl: &CylindricalSurface,
+    blend: &RollingBallBlend,
+    corner: Pnt,
+) -> Result<bool, RollingBallError> {
+    let axis_pt = wall_cyl.position().location();
+    let axis = GeomVec::from_dir(wall_cyl.position().direction());
+    let v = corner - axis_pt;
+    let radial = v - axis * v.dot(&axis);
+    let Some(radial_dir) = radial.normalized() else {
+        return Ok(false);
+    };
+    let radial_vec = GeomVec::from_dir(radial_dir);
+    if (radial.magnitude() - wall_cyl.radius()).abs() > 1.0e-4 * wall_cyl.radius().max(1.0) {
+        return Ok(false);
+    }
+
+    let tangent_to = |face: &Face| -> Result<bool, RollingBallError> {
+        let n = planar_outward_normal(face)?;
+        Ok(radial_vec.dot(&GeomVec::from_dir(n)).abs() > 0.999)
+    };
+
+    let tangent = tangent_to(&blend.face_a)? || tangent_to(&blend.face_b)?;
+    if !tangent {
+        return Ok(false);
+    }
+
+    // Require the cap to actually own the endpoint; otherwise a same-support
+    // cylinder elsewhere in the shell could be mistaken for the runout wall.
+    Ok(face_contains_point(cap, corner))
 }
 
 /// Trim the new blend flush against a concave cut cylinder it runs into at
@@ -1630,6 +2049,7 @@ pub fn fillet_circular_edge_chain(
 
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
     let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+    let cut_guards = cut_cylinder_guards(solid, &start_caps, &end_caps);
 
     let mut faces = Vec::new();
     let mut skipped_faces = std::collections::HashSet::new();
@@ -1707,14 +2127,22 @@ pub fn fillet_circular_edge_chain(
     faces.push(blend.blend_face);
 
     let result = Solid::new(sew(&faces, radius * 0.1));
-    let merged = crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(
-        &result,
-    ));
-    if merged.is_watertight() && merged.health_report().is_healthy() {
-        return Ok(merged);
-    }
-    if result.is_watertight() && result.health_report().is_healthy() {
-        return Ok(result);
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
+    if cut_guards.is_empty() {
+        if let Some(accepted) = accept_subtractive_blend_result(&merged, &cut_guards) {
+            return Ok(accepted);
+        }
+        if let Some(accepted) = accept_subtractive_blend_result(&result, &cut_guards) {
+            return Ok(accepted);
+        }
+    } else {
+        if let Some(accepted) = accept_subtractive_blend_result(&result, &cut_guards) {
+            return Ok(accepted);
+        }
+        if let Some(accepted) = accept_subtractive_blend_result(&merged, &cut_guards) {
+            return Ok(accepted);
+        }
     }
     Err(RollingBallError::InvalidTopology)
 }
@@ -2650,7 +3078,10 @@ fn trim_face_along_subspine(
         }
 
         push_nonzero_edge(&mut new_edges, shorten_edge_keep_curve(edge, s0, run_start));
-        push_nonzero_edge(&mut new_edges, Edge::between_points(run_start, contact_start));
+        push_nonzero_edge(
+            &mut new_edges,
+            Edge::between_points(run_start, contact_start),
+        );
         push_nonzero_edge(&mut new_edges, oriented_contact.clone());
         push_nonzero_edge(&mut new_edges, Edge::between_points(contact_end, run_end));
         push_nonzero_edge(&mut new_edges, shorten_edge_keep_curve(edge, s1, run_end));

@@ -27,7 +27,12 @@ fn report(name: &str, s: &openrcad_topo::Solid) {
 
 /// Mirror ZeroCAD: it calls `boolean_checked`, which rejects unhealthy/leaky
 /// output and returns Err -> ZeroCAD shows nothing / falls back.
-fn report_checked(name: &str, object: &openrcad_topo::Solid, tool: &openrcad_topo::Solid, op: BooleanOp) {
+fn report_checked(
+    name: &str,
+    object: &openrcad_topo::Solid,
+    tool: &openrcad_topo::Solid,
+    op: BooleanOp,
+) {
     match boolean_checked(object, tool, op) {
         Ok(s) => println!("{name}: boolean_checked OK ({} faces)", s.face_count()),
         Err(e) => println!("{name}: boolean_checked REJECTED -> {e}"),

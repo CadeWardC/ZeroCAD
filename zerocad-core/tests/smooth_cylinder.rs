@@ -84,16 +84,29 @@ const SMOOTH_FACE_CAP: usize = 24;
 fn cylinder_boss_join_is_smooth_and_merged() {
     let mut g = ParametricGraph::new();
     box_base(&mut g, 40.0, 30.0, 15.0);
-    add_sketch(&mut g, "sketch_2", top_plane(15.0), circle_sketch((20.0, 15.0), 6.0));
+    add_sketch(
+        &mut g,
+        "sketch_2",
+        top_plane(15.0),
+        circle_sketch((20.0, 15.0), 6.0),
+    );
     add_extrude(&mut g, "extrude_3", "sketch_2", 12.0, ExtrudeMode::Join);
     g.add_dependency("box_1", "extrude_3");
 
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
     assert_eq!(bodies.len(), 1, "boss join must stay one merged body");
-    assert!(warnings.is_empty(), "a clean boss join should not warn, got {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "a clean boss join should not warn, got {warnings:?}"
+    );
 
     // Boss reaches z≈27.
-    let max_z = bodies[0].1.vertices.chunks(6).map(|v| v[2]).fold(f32::MIN, f32::max);
+    let max_z = bodies[0]
+        .1
+        .vertices
+        .chunks(6)
+        .map(|v| v[2])
+        .fold(f32::MIN, f32::max);
     assert!(max_z >= 26.9, "boss must rise to z≈27, got {max_z}");
 
     let faces = distinct_faces(&g);
@@ -111,14 +124,22 @@ fn cylinder_cut_through_is_smooth_and_bores_a_hole() {
     box_base(&mut g, 40.0, 30.0, 15.0);
     let plain_faces = distinct_faces(&g);
 
-    add_sketch(&mut g, "sketch_2", top_plane(15.0), circle_sketch((20.0, 15.0), 6.0));
+    add_sketch(
+        &mut g,
+        "sketch_2",
+        top_plane(15.0),
+        circle_sketch((20.0, 15.0), 6.0),
+    );
     // Negative depth drills DOWN into the block (top normal is outward +Z).
     add_extrude(&mut g, "extrude_3", "sketch_2", -19.46, ExtrudeMode::Cut);
     g.add_dependency("box_1", "extrude_3");
 
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
     assert_eq!(bodies.len(), 1, "cut must stay one body");
-    assert!(warnings.is_empty(), "a clean drill-through should not warn, got {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "a clean drill-through should not warn, got {warnings:?}"
+    );
 
     let faces = distinct_faces(&g);
     println!("cut-through distinct faces = {faces} (plain box = {plain_faces})");
@@ -136,14 +157,22 @@ fn cylinder_cut_through_is_smooth_and_bores_a_hole() {
 fn cylinder_blind_pocket_is_smooth_and_watertight() {
     let mut g = ParametricGraph::new();
     box_base(&mut g, 40.0, 30.0, 20.0);
-    add_sketch(&mut g, "sketch_2", top_plane(20.0), circle_sketch((20.0, 15.0), 6.0));
+    add_sketch(
+        &mut g,
+        "sketch_2",
+        top_plane(20.0),
+        circle_sketch((20.0, 15.0), 6.0),
+    );
     // A blind pocket: only 8mm into a 20mm-thick block.
     add_extrude(&mut g, "extrude_3", "sketch_2", -8.0, ExtrudeMode::Cut);
     g.add_dependency("box_1", "extrude_3");
 
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
     assert_eq!(bodies.len(), 1, "blind pocket must stay one body");
-    assert!(warnings.is_empty(), "a clean blind pocket should not warn, got {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "a clean blind pocket should not warn, got {warnings:?}"
+    );
 
     // The pocket floor sits ~8mm down (z≈12); the uncut block has no surface there.
     let floor = bodies[0]
@@ -206,11 +235,16 @@ fn cylinder_primitive_is_smooth() {
     for t in m.indices.chunks_exact(3) {
         for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
             let (ka, kb) = (q(t[a]), q(t[b]));
-            *edges.entry(if ka <= kb { (ka, kb) } else { (kb, ka) }).or_insert(0) += 1;
+            *edges
+                .entry(if ka <= kb { (ka, kb) } else { (kb, ka) })
+                .or_insert(0) += 1;
         }
     }
     let cracks = edges.values().filter(|&&c| c == 1).count();
-    assert_eq!(cracks, 0, "bored cylinder must be watertight, got {cracks} crack edges");
+    assert_eq!(
+        cracks, 0,
+        "bored cylinder must be watertight, got {cracks} crack edges"
+    );
 
     let faces = distinct_faces(&g);
     println!("cut cylinder-primitive distinct faces = {faces}");

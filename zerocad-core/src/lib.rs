@@ -22,9 +22,10 @@ pub use parametric::{
     Variable,
 };
 pub use sketch::{
-    build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves, Circle,
-    CornerKind, CornerMod, Dimension, LineSegment, Region, RegionProvenance,
-    RegionProvenanceFragment, RegionWithProvenance, SketchCurves, SketchShape,
+    build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,
+    overlap_clusters, shape_loops, shapes_overlap, Circle, CornerKind, CornerMod, Dimension,
+    LineSegment, Region, RegionProvenance, RegionProvenanceFragment, RegionWithProvenance,
+    ShapeLoop, SketchCurves, SketchShape,
 };
 pub use stl::{meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};

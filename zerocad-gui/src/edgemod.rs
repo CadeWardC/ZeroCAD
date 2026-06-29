@@ -3,19 +3,122 @@
 //! inline size box, committed into the parametric graph on confirm.
 //!
 //! It mirrors the extrude tool's shape ([`crate::extrude`]): an in-progress op
-//! drives a temp-node preview ([`ZeroCadApp::preview_edge_mod_bodies`]) and an
+//! drives an immediate lightweight mesh, an exact worker-computed preview, and an
 //! inline dialog ([`ZeroCadApp::show_edge_mod_dialog`]) until the user commits.
 
 use eframe::egui;
+use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{CornerKind, EdgeModScope, EdgeRef, FeatureNode, FeatureType, MockMesh};
 
 use crate::ZeroCadApp;
 
 /// How long an edge-mod size must hold steady before its preview geometry is
-/// computed on a worker thread (see [`ZeroCadApp::tick_speculative_edge_mod`]).
-/// Short enough to be ready by the time the user reaches for OK, long enough that
-/// a fast drag through many sizes doesn't spawn a job per step.
+/// computed on a worker thread after the first instant solve (see
+/// [`ZeroCadApp::tick_speculative_edge_mod`]). Short enough to be ready by the
+/// time the user reaches for OK, long enough that a fast drag through many sizes
+/// doesn't spawn a job per step.
 const EDGE_MOD_SETTLE: std::time::Duration = std::time::Duration::from_millis(160);
+const EDGE_MOD_PREVIEW_FILLET_SEGS: usize = 8;
+
+fn v_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn v_scale(v: [f32; 3], s: f32) -> [f32; 3] {
+    [v[0] * s, v[1] * s, v[2] * s]
+}
+
+fn v_len(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn v_norm(v: [f32; 3]) -> Option<[f32; 3]> {
+    let len = v_len(v);
+    (len > 1.0e-6).then(|| v_scale(v, 1.0 / len))
+}
+
+fn push_preview_vertex(mesh: &mut MockMesh, p: [f32; 3], n: [f32; 3]) {
+    mesh.vertices
+        .extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
+}
+
+fn push_preview_edge(mesh: &mut MockMesh, a: [f32; 3], b: [f32; 3]) {
+    let i = (mesh.edge_vertices.len() / 3) as u32;
+    mesh.edge_vertices
+        .extend_from_slice(&[a[0], a[1], a[2], b[0], b[1], b[2]]);
+    mesh.edge_indices.extend_from_slice(&[i, i + 1]);
+}
+
+fn edge_mod_edge_preview_mesh(edge: &EdgeRef, dist: f32, kind: CornerKind) -> Option<MockMesh> {
+    if !matches!(edge.curve, None | Some(EdgeCurveHint::Line)) {
+        return None;
+    }
+
+    let n1 = v_norm(edge.n1)?;
+    let n2 = v_norm(edge.n2)?;
+    let dist = dist.max(0.05);
+    let mut rails: Vec<([f32; 3], [f32; 3])> = Vec::new();
+    match kind {
+        CornerKind::Chamfer => {
+            let normal = v_norm(v_add(n1, n2)).unwrap_or(n1);
+            rails.push((v_scale(n1, -dist), normal));
+            rails.push((v_scale(n2, -dist), normal));
+        }
+        CornerKind::Fillet => {
+            let center_offset = v_add(v_scale(n1, -dist), v_scale(n2, -dist));
+            for i in 0..=EDGE_MOD_PREVIEW_FILLET_SEGS {
+                let theta =
+                    i as f32 / EDGE_MOD_PREVIEW_FILLET_SEGS as f32 * std::f32::consts::FRAC_PI_2;
+                let dir = v_norm(v_add(v_scale(n2, theta.cos()), v_scale(n1, theta.sin())))?;
+                rails.push((v_add(center_offset, v_scale(dir, dist)), dir));
+            }
+        }
+    }
+    if rails.len() < 2 {
+        return None;
+    }
+
+    let mut mesh = MockMesh::empty();
+    for (offset, normal) in &rails {
+        push_preview_vertex(&mut mesh, v_add(edge.p0, *offset), *normal);
+        push_preview_vertex(&mut mesh, v_add(edge.p1, *offset), *normal);
+    }
+    for i in 0..rails.len() - 1 {
+        let a0 = (i * 2) as u32;
+        let a1 = a0 + 1;
+        let b0 = a0 + 2;
+        let b1 = a0 + 3;
+        mesh.indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+        mesh.face_ids.push(i as u32 + 1);
+        mesh.face_ids.push(i as u32 + 1);
+    }
+
+    let rail_edges: Vec<[f32; 3]> = match kind {
+        CornerKind::Chamfer => rails.iter().map(|(offset, _)| *offset).collect(),
+        CornerKind::Fillet => rails
+            .first()
+            .zip(rails.last())
+            .map(|(first, last)| vec![first.0, last.0])
+            .unwrap_or_default(),
+    };
+    for offset in rail_edges {
+        push_preview_edge(&mut mesh, v_add(edge.p0, offset), v_add(edge.p1, offset));
+    }
+    for window in rails.windows(2) {
+        push_preview_edge(
+            &mut mesh,
+            v_add(edge.p0, window[0].0),
+            v_add(edge.p0, window[1].0),
+        );
+        push_preview_edge(
+            &mut mesh,
+            v_add(edge.p1, window[0].0),
+            v_add(edge.p1, window[1].0),
+        );
+    }
+
+    Some(mesh)
+}
 
 /// A live, uncommitted 3D edge fillet/chamfer. Holds the captured edge geometry
 /// and the editable size; the viewport shows the resulting body in real time.
@@ -55,6 +158,118 @@ impl EdgeModOp {
             (e.p0[1] + e.p1[1]) * 0.5,
             (e.p0[2] + e.p1[2]) * 0.5,
         ]
+    }
+
+    /// Cheap immediate visual feedback for selected straight edges. The exact
+    /// committed B-Rep still comes from the worker-computed edge-mod graph.
+    pub(crate) fn immediate_preview_mesh(&self) -> MockMesh {
+        let mut mesh = MockMesh::empty();
+        for edge in &self.edges {
+            if let Some(edge_mesh) = edge_mod_edge_preview_mesh(edge, self.dist, self.kind) {
+                mesh.append(edge_mesh);
+            }
+        }
+        mesh
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn straight_box_edge() -> EdgeRef {
+        EdgeRef {
+            p0: [0.0, 0.0, 15.0],
+            p1: [40.0, 0.0, 15.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, -1.0, 0.0],
+            curve: None,
+            topology: None,
+        }
+    }
+
+    fn test_op(kind: CornerKind, dist: f32) -> EdgeModOp {
+        EdgeModOp {
+            target: "body".to_string(),
+            edges: vec![straight_box_edge()],
+            kind,
+            dist,
+            dist_text: format!("{dist:.2}"),
+            focus_request: false,
+        }
+    }
+
+    fn y_z_bounds(mesh: &MockMesh) -> (f32, f32, f32, f32) {
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut min_z = f32::INFINITY;
+        let mut max_z = f32::NEG_INFINITY;
+        for v in mesh.vertices.chunks_exact(6) {
+            min_y = min_y.min(v[1]);
+            max_y = max_y.max(v[1]);
+            min_z = min_z.min(v[2]);
+            max_z = max_z.max(v[2]);
+        }
+        (min_y, max_y, min_z, max_z)
+    }
+
+    #[test]
+    fn immediate_edge_mod_preview_mesh_is_bounded_and_kind_specific() {
+        let fillet = test_op(CornerKind::Fillet, 3.0).immediate_preview_mesh();
+        let chamfer = test_op(CornerKind::Chamfer, 3.0).immediate_preview_mesh();
+        assert!(
+            !fillet.vertices.is_empty(),
+            "fillet overlay should be available immediately"
+        );
+        assert!(
+            !chamfer.vertices.is_empty(),
+            "chamfer overlay should be available immediately"
+        );
+        assert!(
+            fillet.indices.len() > chamfer.indices.len(),
+            "fillet overlay should be faceted while chamfer is one bevel strip"
+        );
+        assert_eq!(
+            fillet.edge_indices.len() / 2,
+            EDGE_MOD_PREVIEW_FILLET_SEGS * 2 + 2,
+            "fillet overlay should draw tangent/end edges, not every internal rail"
+        );
+        assert_eq!(
+            chamfer.edge_indices.len() / 2,
+            4,
+            "chamfer overlay should draw the two bevel rails and two end edges"
+        );
+
+        for (label, mesh) in [("fillet", &fillet), ("chamfer", &chamfer)] {
+            let (min_y, max_y, min_z, max_z) = y_z_bounds(mesh);
+            assert!(
+                min_y >= -1.0e-4,
+                "{label} preview dipped outside front face"
+            );
+            assert!(
+                max_y <= 3.0 + 1.0e-4,
+                "{label} preview exceeded selected distance"
+            );
+            assert!(
+                min_z >= 12.0 - 1.0e-4,
+                "{label} preview cut deeper than selected distance"
+            );
+            assert!(
+                max_z <= 15.0 + 1.0e-4,
+                "{label} preview rose above top face"
+            );
+        }
+
+        let larger = test_op(CornerKind::Fillet, 5.0).immediate_preview_mesh();
+        let (_min_y, max_y, min_z, _max_z) = y_z_bounds(&larger);
+        assert!(
+            max_y > 4.9,
+            "larger radius should visibly widen the overlay"
+        );
+        assert!(
+            min_z < 10.1,
+            "larger radius should visibly deepen the overlay"
+        );
     }
 }
 
@@ -99,27 +314,76 @@ impl ZeroCadApp {
         self.edge_mod_arc_inflight = None;
         self.edge_mod_arc_rx = None;
         self.edge_mod_settle = None;
+        self.edge_mod_preview_mesh_cache = None;
+    }
+
+    fn hash_quantized_f32(h: &mut impl std::hash::Hasher, v: f32, scale: f64) {
+        use std::hash::Hash;
+        ((v as f64 / scale).round() as i64).hash(h);
+    }
+
+    fn hash_edge_ref(h: &mut impl std::hash::Hasher, edge: &EdgeRef) {
+        use std::hash::Hash;
+        for c in edge
+            .p0
+            .iter()
+            .chain(edge.p1.iter())
+            .chain(edge.n1.iter())
+            .chain(edge.n2.iter())
+        {
+            Self::hash_quantized_f32(h, *c, 1.0e-4);
+        }
+        match &edge.curve {
+            None => 0u8.hash(h),
+            Some(EdgeCurveHint::Line) => 1u8.hash(h),
+            Some(EdgeCurveHint::Circle {
+                center,
+                axis,
+                x_dir,
+                radius,
+                start,
+                end,
+                closed,
+            }) => {
+                2u8.hash(h);
+                for c in center.iter().chain(axis.iter()).chain(x_dir.iter()) {
+                    Self::hash_quantized_f32(h, *c, 1.0e-4);
+                }
+                Self::hash_quantized_f32(h, *radius, 1.0e-4);
+                Self::hash_quantized_f32(h, *start, 1.0e-6);
+                Self::hash_quantized_f32(h, *end, 1.0e-6);
+                closed.hash(h);
+            }
+        }
+        if let Some(topology) = &edge.topology {
+            topology.body_id.hash(h);
+            topology.topology_version.hash(h);
+            topology.edge_id.hash(h);
+            topology.curve_kind.hash(h);
+            topology.adjacent_face_ids.hash(h);
+            topology.adjacent_surface_kinds.hash(h);
+        } else {
+            0u8.hash(h);
+        }
     }
 
     /// Hash of everything that determines an edge-mod's committed geometry — the
-    /// size (quantized to 0.01mm, finer than the faceted preview's 0.05mm so the
-    /// precompute matches the exact committed size), kind, target body, edge, and
-    /// the hidden set. [`commit_edge_mod`](Self::commit_edge_mod) recomputes this
-    /// to decide whether the speculative result applies, and
-    /// [`tick_speculative_edge_mod`](Self::tick_speculative_edge_mod) uses it both
-    /// to debounce and to tag the job.
-    fn edge_mod_arc_key(op: &EdgeModOp, hidden_len: usize) -> u64 {
+    /// exact size, kind, target body, selected edge identity, and hidden nodes.
+    /// The preview worker result is only reusable when this full identity matches.
+    fn edge_mod_arc_key(op: &EdgeModOp, hidden_nodes: &std::collections::HashSet<String>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         ((op.dist.max(0.2) / 0.01).round() as i64).hash(&mut h);
         (op.kind as u8).hash(&mut h);
         op.target.hash(&mut h);
         for edge in &op.edges {
-            for c in edge.p0.iter().chain(edge.p1.iter()) {
-                ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
-            }
+            Self::hash_edge_ref(&mut h, edge);
         }
-        hidden_len.hash(&mut h);
+        let mut hidden: Vec<&String> = hidden_nodes.iter().collect();
+        hidden.sort();
+        for id in hidden {
+            id.hash(&mut h);
+        }
         h.finish()
     }
 
@@ -168,12 +432,26 @@ impl ZeroCadApp {
         Some(graph)
     }
 
-    /// Drive the speculative edge-mod precompute. Called once per frame. While an
-    /// edge edit is being sized, the moment its size has held steady for
-    /// [`EDGE_MOD_SETTLE`] this spawns the kernel evaluation for that size on a
-    /// worker thread and caches the result, so committing at that size can reuse
-    /// the ready geometry. At most one job runs at a time; curved-rim selections
-    /// and the no-edit case do nothing.
+    fn spawn_edge_mod_arc_eval(&mut self, ctx: &egui::Context, key: u64) {
+        let Some(graph) = self.build_edge_mod_arc_graph() else {
+            return;
+        };
+        let hidden = self.hidden_nodes.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.edge_mod_arc_rx = Some(rx);
+        self.edge_mod_arc_inflight = Some(key);
+        std::thread::spawn(move || {
+            let result = graph.evaluate_bodies_with_warnings(&hidden);
+            let _ = tx.send((key, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drive the speculative edge-mod precompute. Called once per frame. The
+    /// first exact solve starts immediately so the preview can refine as soon as
+    /// possible; later size changes wait for [`EDGE_MOD_SETTLE`] before spawning
+    /// another worker job. At most one job runs at a time.
     pub(crate) fn tick_speculative_edge_mod(&mut self, ctx: &egui::Context) {
         // Drain a finished job into the cache first.
         if let Some(rx) = self.edge_mod_arc_rx.as_ref() {
@@ -205,13 +483,29 @@ impl ZeroCadApp {
         let Some(op) = self.edge_mod_op.as_ref() else {
             return;
         };
-        let key = Self::edge_mod_arc_key(op, self.hidden_nodes.len());
+        let key = Self::edge_mod_arc_key(op, &self.hidden_nodes);
 
         // Already computed (or computing) the arc for this exact size.
         if matches!(&self.edge_mod_arc_cache, Some((k, _, _)) if *k == key) {
             return;
         }
         if self.edge_mod_arc_inflight == Some(key) {
+            return;
+        }
+        if self
+            .edge_mod_arc_inflight
+            .is_some_and(|inflight| inflight != key)
+        {
+            // The user has moved on to a different size/edge state. Drop the
+            // receiver so the stale worker result cannot populate the cache, and
+            // let the current key schedule normally below.
+            self.edge_mod_arc_rx = None;
+            self.edge_mod_arc_inflight = None;
+        }
+
+        if self.edge_mod_settle.is_none() {
+            self.edge_mod_settle = Some((key, std::time::Instant::now()));
+            self.spawn_edge_mod_arc_eval(ctx, key);
             return;
         }
 
@@ -236,24 +530,12 @@ impl ZeroCadApp {
             return;
         }
 
-        let Some(graph) = self.build_edge_mod_arc_graph() else {
-            return;
-        };
-        let hidden = self.hidden_nodes.clone();
-        let ctx = ctx.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.edge_mod_arc_rx = Some(rx);
-        self.edge_mod_arc_inflight = Some(key);
-        std::thread::spawn(move || {
-            let result = graph.evaluate_bodies_with_warnings(&hidden);
-            let _ = tx.send((key, result));
-            ctx.request_repaint();
-        });
+        self.spawn_edge_mod_arc_eval(ctx, key);
     }
 
-    /// Evaluate the model as if the live edge mod had been committed, so the
-    /// viewport shows the actual rounded/beveled body in real time. Mirrors
-    /// [`preview_extrude_bodies`](Self::preview_extrude_bodies).
+    /// Synchronous exact preview builder retained for diagnostics. Interactive
+    /// preview uses [`EdgeModOp::immediate_preview_mesh`] immediately and refines
+    /// through [`tick_speculative_edge_mod`](Self::tick_speculative_edge_mod).
     #[allow(dead_code)]
     pub(crate) fn preview_edge_mod_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
         let op = self.edge_mod_op.as_ref()?;
@@ -286,7 +568,7 @@ impl ZeroCadApp {
         // size: showing the final one-face round *in the preview* means committing
         // changes nothing on screen — the round refines gently while the user is
         // still adjusting, instead of the body popping faceted→arc after commit.
-        let arc_key = Self::edge_mod_arc_key(op, self.hidden_nodes.len());
+        let arc_key = Self::edge_mod_arc_key(op, &self.hidden_nodes);
         if let Some((k, bodies, _)) = self.edge_mod_arc_cache.as_ref() {
             if *k == arc_key {
                 return Some(bodies.clone());
@@ -302,12 +584,14 @@ impl ZeroCadApp {
             // The edges themselves — two edges of the same body share `target`, so
             // without this a fillet on edge B could reuse edge A's cached result.
             for edge in &op.edges {
-                for c in edge.p0.iter().chain(edge.p1.iter()) {
-                    ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
-                }
+                Self::hash_edge_ref(&mut h, edge);
             }
             self.id_counter.hash(&mut h);
-            self.hidden_nodes.len().hash(&mut h);
+            let mut hidden: Vec<&String> = self.hidden_nodes.iter().collect();
+            hidden.sort();
+            for id in hidden {
+                id.hash(&mut h);
+            }
             h.finish()
         };
         if let Some((cached_key, bodies)) = self.edge_mod_preview_cache.as_ref() {
@@ -319,6 +603,48 @@ impl ZeroCadApp {
         None
     }
 
+    /// Memoized lightweight overlay mesh used until the exact worker result is
+    /// available. This path is cheap and synchronous, so the edge edit responds on
+    /// the first frame even when the kernel solve takes much longer.
+    pub(crate) fn cached_preview_edge_mod_mesh(&mut self) -> Option<MockMesh> {
+        use std::hash::{Hash, Hasher};
+        let Some(op) = self.edge_mod_op.as_ref() else {
+            self.edge_mod_preview_mesh_cache = None;
+            return None;
+        };
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ((op.dist / 0.05).round() as i64).hash(&mut h);
+            (op.kind as u8).hash(&mut h);
+            op.target.hash(&mut h);
+            for edge in &op.edges {
+                for c in edge
+                    .p0
+                    .iter()
+                    .chain(edge.p1.iter())
+                    .chain(edge.n1.iter())
+                    .chain(edge.n2.iter())
+                {
+                    ((*c as f64 / 1.0e-4).round() as i64).hash(&mut h);
+                }
+            }
+            h.finish()
+        };
+        if let Some((cached_key, mesh)) = self.edge_mod_preview_mesh_cache.as_ref() {
+            if *cached_key == key {
+                return Some(mesh.clone());
+            }
+        }
+        let mesh = op.immediate_preview_mesh();
+        if mesh.vertices.is_empty() {
+            self.edge_mod_preview_mesh_cache = None;
+            None
+        } else {
+            self.edge_mod_preview_mesh_cache = Some((key, mesh.clone()));
+            Some(mesh)
+        }
+    }
+
     /// Commit the live edge mod into history as a real `EdgeMod` feature, binding
     /// the size to a variable expression when the text references one.
     pub(crate) fn commit_edge_mod(&mut self) {
@@ -326,7 +652,7 @@ impl ZeroCadApp {
             return;
         };
         // Key the speculative precompute before `op`'s fields are moved below.
-        let arc_key = Self::edge_mod_arc_key(&op, self.hidden_nodes.len());
+        let arc_key = Self::edge_mod_arc_key(&op, &self.hidden_nodes);
         self.push_undo();
         let dist_expr = if zerocad_core::expr::references_variable(&op.dist_text) {
             Some(op.dist_text.trim().to_string())

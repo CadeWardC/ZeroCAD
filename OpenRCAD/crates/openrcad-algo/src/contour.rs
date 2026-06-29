@@ -121,8 +121,7 @@ pub fn apply_blend_contour(
 
     match contour.kind {
         BlendKind::Fillet => {
-            if matches!(contour.curve_hint, Some(BlendCurveHint::Circle))
-                && contour.edges.len() > 1
+            if matches!(contour.curve_hint, Some(BlendCurveHint::Circle)) && contour.edges.len() > 1
             {
                 let spine = circular_spine_from_chain(&contour.edges)
                     .unwrap_or_else(|| contour.edges[0].clone());

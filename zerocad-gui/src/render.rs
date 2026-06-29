@@ -525,16 +525,23 @@ impl ZeroCadApp {
         // A live 3D edge fillet/chamfer previews the resulting (cut) body, the
         // same way a Cut/Join extrude does — and suppresses the extrude preview.
         let edge_mod_active = self.edge_mod_op.is_some();
-        let preview_mesh = if edge_mod_active {
+        let preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
+        // A New Body extrude of overlapping shapes is a boolean (box-minus-cylinder
+        // etc.): the warm ghost would draw the un-booleaned split regions, so
+        // (once the drag settles) suppress it and show the real evaluated body.
+        let newbody_overlap = !edge_mod_active
+            && !self.extrude_depth_dragging
+            && preview_mode == Some(ExtrudeMode::NewBody)
+            && self.op_has_overlapping_shapes();
+        let extrude_preview_mesh = if edge_mod_active || newbody_overlap {
             None
         } else {
             // Memoized: only re-tessellated when the depth/targets change.
             self.cached_preview_mesh()
         };
-        let preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
         let preview_bodies = if edge_mod_active {
-            // Memoized: the full-model re-evaluation (truck boolean) only reruns
-            // when the fillet/chamfer size/kind/target change, not every frame.
+            // Exact edge-mod bodies arrive from the worker cache. Until then the
+            // lightweight overlay mesh below gives immediate visual feedback.
             self.cached_preview_edge_mod_bodies()
         } else if self.extrude_depth_dragging {
             // Live ghost drag: skip the (expensive) truck boolean entirely. We
@@ -547,8 +554,18 @@ impl ZeroCadApp {
                 // Memoized: the full-model re-evaluation (truck booleans) only
                 // reruns when the depth/mode/targets change, not every frame.
                 Some(ExtrudeMode::Join | ExtrudeMode::Cut) => self.cached_preview_extrude_bodies(),
+                // A boolean New Body (overlapping shapes) likewise previews its
+                // real evaluated result instead of the ghost.
+                Some(ExtrudeMode::NewBody) if newbody_overlap => {
+                    self.cached_preview_extrude_bodies()
+                }
                 _ => None,
             }
+        };
+        let edge_mod_preview_mesh = if edge_mod_active && preview_bodies.is_none() {
+            self.cached_preview_edge_mod_mesh()
+        } else {
+            None
         };
 
         // A Cut preview ghosts the resulting body (alpha < 255) so the pocket /
@@ -606,7 +623,7 @@ impl ZeroCadApp {
             // where it punches out the far side of a body. Back faces culled +
             // no wireframe so it stays a clean translucent red solid.
             Some(ExtrudeMode::Cut) => {
-                if let Some(pm) = preview_mesh.as_ref() {
+                if let Some(pm) = extrude_preview_mesh.as_ref() {
                     meshes.push(Drawable {
                         node_id: None,
                         mesh: pm,
@@ -624,7 +641,7 @@ impl ZeroCadApp {
             // full-rate feedback. On release the merge runs and replaces it.
             Some(ExtrudeMode::Join) => {
                 if self.extrude_depth_dragging {
-                    if let Some(pm) = preview_mesh.as_ref() {
+                    if let Some(pm) = extrude_preview_mesh.as_ref() {
                         meshes.push(Drawable {
                             node_id: None,
                             mesh: pm,
@@ -638,7 +655,7 @@ impl ZeroCadApp {
             }
             // New Body: the warm additive tool volume floats over the live model.
             Some(ExtrudeMode::NewBody) | None => {
-                if let Some(pm) = preview_mesh.as_ref() {
+                if let Some(pm) = extrude_preview_mesh.as_ref() {
                     meshes.push(Drawable {
                         node_id: None,
                         mesh: pm,
@@ -650,13 +667,23 @@ impl ZeroCadApp {
                 }
             }
         }
+        if let Some(pm) = edge_mod_preview_mesh.as_ref() {
+            meshes.push(Drawable {
+                node_id: None,
+                mesh: pm,
+                base: (255.0, 178.0, 96.0),
+                alpha: 235,
+                cull_back: false,
+                draw_edges: true,
+            });
+        }
 
         // Screen anchor for the inline extrude distance box: the projected
         // centroid of the live preview, nudged up-right so it floats clear of
         // the body. Applied to `self.extrude_dim_pos` at the end of the frame
         // (the `meshes`/`project_3d` borrows of `self` are still live here).
         let mut extrude_anchor: Option<egui::Pos2> = None;
-        if let Some(pm) = preview_mesh.as_ref() {
+        if let Some(pm) = extrude_preview_mesh.as_ref() {
             let vcount = pm.vertices.len() / 6;
             if vcount > 0 {
                 let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);

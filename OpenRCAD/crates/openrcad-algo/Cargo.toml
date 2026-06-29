@@ -14,9 +14,9 @@ keywords = ["cad", "boolean", "fillet", "occt"]
 [dependencies]
 openrcad-foundation.workspace = true
 openrcad-geom.workspace = true
+openrcad-mesh = { path = "../openrcad-mesh" }
+openrcad-primitives = { path = "../openrcad-primitives" }
 openrcad-topo.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-openrcad-primitives = { path = "../openrcad-primitives" }
-openrcad-mesh = { path = "../openrcad-mesh" }

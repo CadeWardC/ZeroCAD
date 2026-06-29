@@ -236,7 +236,11 @@ fn join_into_body_negative_depth_keeps_original() {
     add_extrude(&mut g, "extrude_4", "sketch_3", -5.0, ExtrudeMode::Join);
 
     let bodies = g.evaluate_bodies(&HashSet::new()).unwrap();
-    assert_eq!(bodies.len(), 1, "join must yield a single body, got {bodies:?}");
+    assert_eq!(
+        bodies.len(),
+        1,
+        "join must yield a single body, got {bodies:?}"
+    );
 
     // The merged body must still enclose the original 10x10x10 block.
     let (mut mn, mut mx) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);

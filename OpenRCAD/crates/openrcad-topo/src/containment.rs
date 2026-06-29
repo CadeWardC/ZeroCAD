@@ -32,7 +32,7 @@ pub fn point_in_polygon_2d(q: (f64, f64), poly: &[(f64, f64)]) -> bool {
     let mut j = n - 1;
     for i in 0..n {
         let (a, b) = (poly[j], poly[i]); // directed edge a -> b
-        // Does the edge straddle the horizontal line through q?
+                                         // Does the edge straddle the horizontal line through q?
         if (a.1 > q.1) != (b.1 > q.1) {
             // The +x ray from q crosses edge a->b iff q lies on the side of the
             // directed edge that faces the crossing: for an upward edge that is

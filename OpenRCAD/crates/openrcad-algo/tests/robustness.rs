@@ -11,9 +11,7 @@
 //! They are runnable with `cargo test --ignored` and encode the watertight goal
 //! the boolean engine does not yet meet, so progress (or regress) is measurable.
 
-use openrcad_algo::{
-    boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt,
-};
+use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
 use openrcad_foundation::{Ax1, Ax2, Dir, Pnt, Trsf};
 use openrcad_primitives::{make_box, make_cylinder};
 use openrcad_topo::Solid;

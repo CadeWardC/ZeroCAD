@@ -74,7 +74,11 @@ fn search_nearest_parameter(surface: &GeomSurface, pt: openrcad_foundation::Pnt)
 }
 
 fn ordered_bounds(a: f64, b: f64) -> (f64, f64) {
-    if a <= b { (a, b) } else { (b, a) }
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
@@ -404,11 +408,7 @@ impl BRepBuilder {
     /// The splitting edges can form arbitrary networks of edges (e.g. sharing internal vertices),
     /// partitioning the face into multiple regions.
     /// Distributes any inner loops (holes) of the original face to the correct new face.
-    pub fn partition_face(
-        &mut self,
-        face_id: FaceId,
-        splitting_edges: &[EdgeId],
-    ) -> Vec<FaceId> {
+    pub fn partition_face(&mut self, face_id: FaceId, splitting_edges: &[EdgeId]) -> Vec<FaceId> {
         let face_data = self
             .brep
             .faces
@@ -437,7 +437,6 @@ impl BRepBuilder {
             }
         };
 
-
         // 1. Gather all edges (outer boundary + splitting edges) and build both Forward and Reversed half-edges
         // so that the graph is symmetric and every edge is traversed in both directions (avoiding dead ends / bijections breaking).
         let mut edges_pool = Vec::new();
@@ -465,43 +464,49 @@ impl BRepBuilder {
         }
 
         // Helper to project 3D point to 2D parametric UV coordinates
-        let project_point_on_surface = |pt: openrcad_foundation::Pnt, s: &openrcad_geom::GeomSurface| -> (f64, f64) {
-            match s {
-                openrcad_geom::GeomSurface::Plane(plane) => {
-                    let diff = pt - plane.location();
-                    let u = diff.dot(&openrcad_foundation::Vec::from_dir(plane.position().x_direction()));
-                    let v = diff.dot(&openrcad_foundation::Vec::from_dir(plane.position().y_direction()));
-                    (u, v)
+        let project_point_on_surface =
+            |pt: openrcad_foundation::Pnt, s: &openrcad_geom::GeomSurface| -> (f64, f64) {
+                match s {
+                    openrcad_geom::GeomSurface::Plane(plane) => {
+                        let diff = pt - plane.location();
+                        let u = diff.dot(&openrcad_foundation::Vec::from_dir(
+                            plane.position().x_direction(),
+                        ));
+                        let v = diff.dot(&openrcad_foundation::Vec::from_dir(
+                            plane.position().y_direction(),
+                        ));
+                        (u, v)
+                    }
+                    other => {
+                        // General surfaces: locate the nearest (u, v) by a bounded
+                        // Gauss-Newton search seeded from a coarse parameter sweep.
+                        search_nearest_parameter(other, pt)
+                    }
                 }
-                other => {
-                    // General surfaces: locate the nearest (u, v) by a bounded
-                    // Gauss-Newton search seeded from a coarse parameter sweep.
-                    search_nearest_parameter(other, pt)
-                }
-            }
-        };
+            };
 
         // Helper to get polar angle of outgoing tangent direction of oriented edge at its start vertex
-        let get_tangent_angle = |brep: &BRep, oe: OrientedEdge, surf: &openrcad_geom::GeomSurface| -> f64 {
-            let e = &brep.edges[oe.id];
-            let curve = e.curve.as_ref().expect("partition_face: edge has no curve");
-            let (first, last) = (e.first, e.last);
-            let (t_start, _) = match oe.orientation {
-                Orientation::Reversed => (last, first),
-                _ => (first, last),
+        let get_tangent_angle =
+            |brep: &BRep, oe: OrientedEdge, surf: &openrcad_geom::GeomSurface| -> f64 {
+                let e = &brep.edges[oe.id];
+                let curve = e.curve.as_ref().expect("partition_face: edge has no curve");
+                let (first, last) = (e.first, e.last);
+                let (t_start, _) = match oe.orientation {
+                    Orientation::Reversed => (last, first),
+                    _ => (first, last),
+                };
+                let dt = 1e-4 * (last - first);
+                let t_step = if oe.orientation == Orientation::Reversed {
+                    t_start - dt
+                } else {
+                    t_start + dt
+                };
+                let p0 = curve.point(t_start);
+                let p1 = curve.point(t_step);
+                let uv0 = project_point_on_surface(p0, surf);
+                let uv1 = project_point_on_surface(p1, surf);
+                (uv1.1 - uv0.1).atan2(uv1.0 - uv0.0)
             };
-            let dt = 1e-4 * (last - first);
-            let t_step = if oe.orientation == Orientation::Reversed {
-                t_start - dt
-            } else {
-                t_start + dt
-            };
-            let p0 = curve.point(t_start);
-            let p1 = curve.point(t_step);
-            let uv0 = project_point_on_surface(p0, surf);
-            let uv1 = project_point_on_surface(p1, surf);
-            (uv1.1 - uv0.1).atan2(uv1.0 - uv0.0)
-        };
 
         // Sort outgoing half-edges counter-clockwise by polar angle of outgoing tangent direction
         for list in adjacency.values_mut() {
@@ -509,7 +514,9 @@ impl BRepBuilder {
             list.sort_by(|&a, &b| {
                 let angle_a = get_tangent_angle(self_brep, a, surface);
                 let angle_b = get_tangent_angle(self_brep, b, surface);
-                angle_a.partial_cmp(&angle_b).unwrap_or(std::cmp::Ordering::Equal)
+                angle_a
+                    .partial_cmp(&angle_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
 
@@ -659,10 +666,12 @@ impl BRepBuilder {
         // Find containers for each loop
         let mut containers = vec![Vec::new(); n_loops];
         for i in 0..n_loops {
-            let set_i: std::collections::HashSet<_> = inner_loop_edges_list[i].iter().map(|oe| oe.id).collect();
+            let set_i: std::collections::HashSet<_> =
+                inner_loop_edges_list[i].iter().map(|oe| oe.id).collect();
             for j in 0..n_loops {
                 if i != j {
-                    let set_j: std::collections::HashSet<_> = inner_loop_edges_list[j].iter().map(|oe| oe.id).collect();
+                    let set_j: std::collections::HashSet<_> =
+                        inner_loop_edges_list[j].iter().map(|oe| oe.id).collect();
                     if set_i == set_j {
                         continue;
                     }
@@ -672,23 +681,34 @@ impl BRepBuilder {
                     let mid_t = 0.5 * (e.first + e.last);
                     let mid_p = e.curve.as_ref().unwrap().point(mid_t);
                     let (_, tangent) = e.curve.as_ref().unwrap().d1(mid_t);
-                    let tangent = if oe.orientation == Orientation::Reversed { -tangent } else { tangent };
-                    
+                    let tangent = if oe.orientation == Orientation::Reversed {
+                        -tangent
+                    } else {
+                        tangent
+                    };
+
                     let normal = match surface {
                         openrcad_geom::GeomSurface::Plane(plane) => plane.normal(),
                         _ => {
                             if let openrcad_geom::GeomSurface::Cylinder(cyl) = surface {
                                 let axis_pt = cyl.position().axis().location();
-                                let axis_dir = openrcad_foundation::Vec::from_dir(cyl.position().axis().direction());
+                                let axis_dir = openrcad_foundation::Vec::from_dir(
+                                    cyl.position().axis().direction(),
+                                );
                                 let diff = mid_p - axis_pt;
                                 let proj = axis_pt + axis_dir * diff.dot(&axis_dir);
-                                (mid_p - proj).normalized().unwrap_or(openrcad_foundation::Dir::dz())
+                                (mid_p - proj)
+                                    .normalized()
+                                    .unwrap_or(openrcad_foundation::Dir::dz())
                             } else {
                                 openrcad_foundation::Dir::dz()
                             }
                         }
                     };
-                    let left_dir = tangent.cross(&openrcad_foundation::Vec::from_dir(normal)).normalized().unwrap();
+                    let left_dir = tangent
+                        .cross(&openrcad_foundation::Vec::from_dir(normal))
+                        .normalized()
+                        .unwrap();
                     let left_vec = openrcad_foundation::Vec::from_dir(left_dir);
                     let probe_p = mid_p + left_vec * 1e-3;
                     let uv = project_point_on_surface(probe_p, surface);
@@ -1048,8 +1068,20 @@ mod tests {
         builder.split_edge(top_edge_id, v_top_split, 5.0);
 
         // Get the corner vertex ids
-        let v0 = builder.brep.vertices.iter().find(|(_, d)| d.point.distance(&p0) < 1e-5).map(|(k,_)| k).unwrap();
-        let v1 = builder.brep.vertices.iter().find(|(_, d)| d.point.distance(&p1) < 1e-5).map(|(k,_)| k).unwrap();
+        let v0 = builder
+            .brep
+            .vertices
+            .iter()
+            .find(|(_, d)| d.point.distance(&p0) < 1e-5)
+            .map(|(k, _)| k)
+            .unwrap();
+        let v1 = builder
+            .brep
+            .vertices
+            .iter()
+            .find(|(_, d)| d.point.distance(&p1) < 1e-5)
+            .map(|(k, _)| k)
+            .unwrap();
 
         // Create the center vertex
         let v_center = builder.brep.vertices.insert(crate::arena::VertexData {

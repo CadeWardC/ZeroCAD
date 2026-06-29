@@ -70,7 +70,7 @@ pub(crate) fn imprint_curve_on_face(
                 if e_curve.point(t_edge).distance(&pt) > 1e-6 {
                     continue;
                 }
-                
+
                 let t_curve = project_point_on_curve(&pt, curve, first, last);
                 if curve.point(t_curve).distance(&pt) > 1e-6 {
                     continue; // outside the segment bounds
@@ -110,11 +110,15 @@ pub(crate) fn imprint_curve_on_face(
     params.push((last, last_info));
 
     // 4. Filter sub-intervals to those whose interior lies inside the face
-    let probe = Face::from_id(std::sync::Arc::new(builder.brep().clone()), face_id, face_data.orientation);
+    let probe = Face::from_id(
+        std::sync::Arc::new(builder.brep().clone()),
+        face_id,
+        face_data.orientation,
+    );
     let mut inside_segments = Vec::new();
     for i in 0..(params.len() - 1) {
         let t_start = params[i].0;
-        let t_end = params[i+1].0;
+        let t_end = params[i + 1].0;
         if t_end - t_start < tol {
             continue;
         }
@@ -122,7 +126,7 @@ pub(crate) fn imprint_curve_on_face(
         let mid_p = curve.point(t_mid);
         let (u, v) = uv_of(surface, &mid_p);
         if is_inside_trimming_loops(u, v, &probe) {
-            inside_segments.push((t_start, params[i].1, t_end, params[i+1].1));
+            inside_segments.push((t_start, params[i].1, t_end, params[i + 1].1));
         }
     }
 
@@ -131,7 +135,8 @@ pub(crate) fn imprint_curve_on_face(
     }
 
     // Case B: A closed curve lying entirely inside the face cuts a hole
-    let segment_is_closed = curve.is_closed() && curve.point(first).distance(&curve.point(last)) < tol;
+    let segment_is_closed =
+        curve.is_closed() && curve.point(first).distance(&curve.point(last)) < tol;
     if intersections.is_empty() && segment_is_closed {
         if let Some(faces) = cut_hole(builder, face_id, curve, first, last, tol) {
             return (faces, Vec::new());
@@ -282,13 +287,10 @@ fn resolve_or_split(
     if pt.distance(&e_pt) < tol {
         return ed.end;
     }
-    let v = builder
-        .brep_mut()
-        .vertices
-        .insert(VertexData {
-            point: *pt,
-            tolerance: openrcad_foundation::tolerance::CONFUSION,
-        });
+    let v = builder.brep_mut().vertices.insert(VertexData {
+        point: *pt,
+        tolerance: openrcad_foundation::tolerance::CONFUSION,
+    });
     builder.split_edge(e_id, v, t_edge);
     v
 }

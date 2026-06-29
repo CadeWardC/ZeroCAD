@@ -617,12 +617,7 @@ fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64,
     Some((hoop, axial, surface_len, sagitta))
 }
 
-fn cylinder_edge_needs_refinement(
-    surf: &GeomSurface,
-    a: Pnt2d,
-    b: Pnt2d,
-    chord_err: f64,
-) -> bool {
+fn cylinder_edge_needs_refinement(surf: &GeomSurface, a: Pnt2d, b: Pnt2d, chord_err: f64) -> bool {
     let Some((_, _, surface_len, sagitta)) = cylinder_edge_metrics(surf, a, b) else {
         return false;
     };
@@ -708,9 +703,13 @@ fn triangle_in_trim_region(
     if !check_edge_midpoints {
         return true;
     }
-    [uv_midpoint(pa, pb), uv_midpoint(pb, pc), uv_midpoint(pc, pa)]
-        .into_iter()
-        .all(|p| point_in_trim_region(p, outer_pts, inner_pts_list))
+    [
+        uv_midpoint(pa, pb),
+        uv_midpoint(pb, pc),
+        uv_midpoint(pc, pa),
+    ]
+    .into_iter()
+    .all(|p| point_in_trim_region(p, outer_pts, inner_pts_list))
 }
 
 fn trimmed_constrained_tris(
@@ -727,14 +726,7 @@ fn trimmed_constrained_tris(
         let pa = points[t.a];
         let pb = points[t.b];
         let pc = points[t.c];
-        if !triangle_in_trim_region(
-            pa,
-            pb,
-            pc,
-            outer_pts,
-            inner_pts_list,
-            check_edge_midpoints,
-        ) {
+        if !triangle_in_trim_region(pa, pb, pc, outer_pts, inner_pts_list, check_edge_midpoints) {
             continue;
         }
         let tri_ccw = ccw(pa, pb, pc) > 0.0;
@@ -1461,8 +1453,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
             .map(|p| ((p.x() - cu).powi(2) + (p.y() - cv).powi(2)).sqrt())
             .collect();
         let mean_r = radii.iter().sum::<f64>() / n as f64;
-        let cocircular = mean_r > 1e-9
-            && radii.iter().all(|r| (r - mean_r).abs() <= 0.06 * mean_r);
+        let cocircular = mean_r > 1e-9 && radii.iter().all(|r| (r - mean_r).abs() <= 0.06 * mean_r);
         if cocircular {
             let c_id = all_points_2d.len();
             all_points_2d.push(Pnt2d::new(cu, cv));
@@ -1511,7 +1502,14 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         chord_err,
     );
 
-    mesh_from_uv_tris(&all_points_2d, surface, wants_ccw, all_points_3d, tris, face_index)
+    mesh_from_uv_tris(
+        &all_points_2d,
+        surface,
+        wants_ccw,
+        all_points_3d,
+        tris,
+        face_index,
+    )
 }
 
 /// Combine multiple TriangleMeshes into a single watertight TriangleMesh by welding coincident vertices.
@@ -1641,8 +1639,13 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
         // Process longest boundary edges first: a lens chord is longer than any
         // single sub-edge of the arc it shortcuts, so this re-fans real chords
         // before their own arc sub-edges get a chance to be mistaken for one.
-        let plen = |e: &(u32, u32)| mesh.vertices[e.0 as usize].distance(&mesh.vertices[e.1 as usize]);
-        boundary.sort_by(|x, y| plen(y).partial_cmp(&plen(x)).unwrap_or(std::cmp::Ordering::Equal));
+        let plen =
+            |e: &(u32, u32)| mesh.vertices[e.0 as usize].distance(&mesh.vertices[e.1 as usize]);
+        boundary.sort_by(|x, y| {
+            plen(y)
+                .partial_cmp(&plen(x))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut new_tris: Vec<[u32; 3]> = Vec::new();
         let mut new_fids: Vec<u32> = Vec::new();
@@ -1770,8 +1773,7 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
             walked.insert(key(prev, cur));
             loop {
                 chain.push(cur);
-                let nexts: Vec<u32> =
-                    adj[&cur].iter().copied().filter(|&w| w != prev).collect();
+                let nexts: Vec<u32> = adj[&cur].iter().copied().filter(|&w| w != prev).collect();
                 if nexts.len() != 1 {
                     break;
                 }
@@ -1801,9 +1803,7 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
                 continue;
             };
             for &ti in chord_tris {
-                if removed.contains(&ti)
-                    || mesh.face_ids.get(ti).copied().unwrap_or(0) == arc_fid
-                {
+                if removed.contains(&ti) || mesh.face_ids.get(ti).copied().unwrap_or(0) == arc_fid {
                     continue;
                 }
                 let tri = mesh.triangles[ti];
@@ -1849,9 +1849,7 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
         let mut stitched_edges: HashSet<(u32, u32)> = HashSet::new();
         for &(a0, b0) in &boundary {
             let edge_key = key(a0, b0);
-            if stitched_edges.contains(&edge_key)
-                || touched.contains(&a0)
-                || touched.contains(&b0)
+            if stitched_edges.contains(&edge_key) || touched.contains(&a0) || touched.contains(&b0)
             {
                 continue;
             }
@@ -2270,12 +2268,7 @@ mod tests {
             surface.point(0.2, 0.0),
             surface.point(-0.2, 10.0),
         ];
-        let face = Face::with_wires(
-            Some(surface),
-            None,
-            Vec::new(),
-            Orientation::Forward,
-        );
+        let face = Face::with_wires(Some(surface), None, Vec::new(), Orientation::Forward);
         let mut mesh = TriangleMesh::from_buffers_with_faces(
             pts.to_vec(),
             vec![[0, 1, 2], [1, 0, 3]],

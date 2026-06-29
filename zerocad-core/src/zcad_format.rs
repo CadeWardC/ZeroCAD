@@ -132,7 +132,9 @@ pub enum ZcadError {
     /// The file ends before a declared structure — truncated or partial write.
     Truncated,
     /// A CRC mismatch. `section` is 0 for the file header, else the section id.
-    BadChecksum { section: u16 },
+    BadChecksum {
+        section: u16,
+    },
     /// The framing version is newer than this build can read.
     UnsupportedVersion(u16),
     /// A payload failed to decode (bad CBOR, bad zstd stream, missing graph).
@@ -145,12 +147,17 @@ impl std::fmt::Display for ZcadError {
         match self {
             ZcadError::NotZcad => write!(f, "not a ZeroCAD (.zcad) file"),
             ZcadError::Truncated => write!(f, "file is truncated or incomplete"),
-            ZcadError::BadChecksum { section: 0 } => write!(f, "corrupt file header (checksum mismatch)"),
+            ZcadError::BadChecksum { section: 0 } => {
+                write!(f, "corrupt file header (checksum mismatch)")
+            }
             ZcadError::BadChecksum { section } => {
                 write!(f, "corrupt data in section {section} (checksum mismatch)")
             }
             ZcadError::UnsupportedVersion(v) => {
-                write!(f, "file format version {v} is newer than this build supports")
+                write!(
+                    f,
+                    "file format version {v} is newer than this build supports"
+                )
             }
             ZcadError::Decode(msg) => write!(f, "could not decode file: {msg}"),
             ZcadError::Io(e) => write!(f, "I/O error: {e}"),
@@ -527,15 +534,25 @@ mod tests {
         let a2 = box_cbor(1.0);
         let b = box_cbor(2.0);
         assert_eq!(graph_hash(&a), graph_hash(&a2), "same graph → same hash");
-        assert_ne!(graph_hash(&a), graph_hash(&b), "different graph → different hash");
+        assert_ne!(
+            graph_hash(&a),
+            graph_hash(&b),
+            "different graph → different hash"
+        );
     }
 
     #[test]
     fn fresh_only_when_hash_matches() {
         let g = box_cbor(1.0);
-        assert!(mesh_cache_fresh(graph_hash(&g), &g), "matching hash → cache kept");
+        assert!(
+            mesh_cache_fresh(graph_hash(&g), &g),
+            "matching hash → cache kept"
+        );
         // A cache stamped with some other graph's hash is stale → discarded.
         let stale = graph_hash(&box_cbor(2.0));
-        assert!(!mesh_cache_fresh(stale, &g), "mismatched hash → cache discarded");
+        assert!(
+            !mesh_cache_fresh(stale, &g),
+            "mismatched hash → cache discarded"
+        );
     }
 }

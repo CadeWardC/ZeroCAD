@@ -12,7 +12,10 @@ fn report(name: &str, r: &Result<openrcad_topo::Solid, RollingBallError>) {
             let hr = s.health_report();
             println!(
                 "{name}: OK faces={} watertight={} healthy={} errors={:?}",
-                s.face_count(), s.is_watertight(), hr.is_healthy(), hr.errors
+                s.face_count(),
+                s.is_watertight(),
+                hr.is_healthy(),
+                hr.errors
             );
         }
         Err(e) => println!("{name}: ERR {e:?}"),
@@ -28,7 +31,10 @@ fn fillet_one_box_edge_closed() {
     report("fillet_one_box_edge", &r);
     let s = r.expect("box edge fillet should succeed");
     assert!(s.is_watertight(), "filleted box must be watertight");
-    assert!(s.health_report().is_healthy(), "filleted box must be healthy");
+    assert!(
+        s.health_report().is_healthy(),
+        "filleted box must be healthy"
+    );
 }
 
 #[test]
@@ -40,7 +46,10 @@ fn fillet_thin_plate_edge_closed() {
     report("fillet_thin_plate_edge", &r);
     let s = r.expect("thin-plate edge fillet should succeed");
     assert!(s.is_watertight(), "filleted plate must be watertight");
-    assert!(s.health_report().is_healthy(), "filleted plate must be healthy");
+    assert!(
+        s.health_report().is_healthy(),
+        "filleted plate must be healthy"
+    );
 }
 
 #[test]
@@ -51,7 +60,11 @@ fn fillet_edge_of_union_result() {
     let a = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let b = make_box(&Pnt::new(10.0, 0.0, 0.0), 20.0, 20.0, 10.0);
     let body = boolean(&a, &b, BooleanOp::Fuse); // 30x20x10 merged box
-    println!("union body: faces={} watertight={}", body.face_count(), body.is_watertight());
+    println!(
+        "union body: faces={} watertight={}",
+        body.face_count(),
+        body.is_watertight()
+    );
     // Top-front edge of the merged box: y=0, z=10, x in [0,30].
     let edge = Edge::between_points(Pnt::new(0.0, 0.0, 10.0), Pnt::new(30.0, 0.0, 10.0));
     let r = fillet_edges(&body, std::slice::from_ref(&edge), 2.0);
@@ -140,7 +153,10 @@ fn fillet_top_edge_of_a_face_that_has_a_bored_hole() {
         body.face_count(),
         body.is_watertight()
     );
-    assert!(body.is_watertight(), "the bored body itself must be watertight");
+    assert!(
+        body.is_watertight(),
+        "the bored body itself must be watertight"
+    );
 
     // Top-front edge of the block (y=0, z=10, x in [0,40]) — on the holed top face.
     let edge = Edge::between_points(Pnt::new(0.0, 0.0, 10.0), Pnt::new(40.0, 0.0, 10.0));

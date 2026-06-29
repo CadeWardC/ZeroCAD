@@ -1527,11 +1527,7 @@ pub fn ray_face(ray_origin: &Pnt, ray_dir: &GeomVec, face: &Face, tol: f64) -> O
 /// Find trimmed intersection curves between two faces.
 ///
 /// Intersects the host surfaces and trims the resulting curves to the boundaries of both faces.
-pub fn surface_surface_curves(
-    face1: &Face,
-    face2: &Face,
-    tol: f64,
-) -> Vec<(GeomCurve, f64, f64)> {
+pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(GeomCurve, f64, f64)> {
     let s1 = match face1.surface() {
         Some(s) => s,
         None => return Vec::new(),
@@ -1546,8 +1542,16 @@ pub fn surface_surface_curves(
 
     for curve in raw_curves {
         let (c_min, c_max) = curve.bounds();
-        let c_min = if c_min.is_infinite() || c_min.is_nan() { -100.0 } else { c_min };
-        let c_max = if c_max.is_infinite() || c_max.is_nan() { 100.0 } else { c_max };
+        let c_min = if c_min.is_infinite() || c_min.is_nan() {
+            -100.0
+        } else {
+            c_min
+        };
+        let c_max = if c_max.is_infinite() || c_max.is_nan() {
+            100.0
+        } else {
+            c_max
+        };
 
         let mut split_params = vec![c_min, c_max];
 
@@ -1558,7 +1562,8 @@ pub fn surface_surface_curves(
                     if let Some(edge_curve) = edge.curve() {
                         let pts = curve_curve(edge_curve, &curve, tol);
                         for pt in pts {
-                            let t = crate::boolean::project_point_on_curve(&pt, &curve, c_min, c_max);
+                            let t =
+                                crate::boolean::project_point_on_curve(&pt, &curve, c_min, c_max);
                             if t > c_min + tol && t < c_max - tol {
                                 split_params.push(t);
                             }
@@ -1617,8 +1622,16 @@ pub fn trim_curve_to_face(
         None => return Vec::new(),
     };
 
-    let first = if first.is_infinite() || first.is_nan() { -100.0 } else { first };
-    let last = if last.is_infinite() || last.is_nan() { 100.0 } else { last };
+    let first = if first.is_infinite() || first.is_nan() {
+        -100.0
+    } else {
+        first
+    };
+    let last = if last.is_infinite() || last.is_nan() {
+        100.0
+    } else {
+        last
+    };
 
     let mut split_params = vec![first, last];
 
@@ -1663,7 +1676,6 @@ pub fn trim_curve_to_face(
 
     intervals
 }
-
 
 #[cfg(test)]
 mod tests {

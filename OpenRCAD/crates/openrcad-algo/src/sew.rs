@@ -85,10 +85,24 @@ fn rethread_loop(brep: &BRep, edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge
                 None => continue,
             };
             if es == cur_end {
-                picked = Some((i, OrientedEdge { id: oe.id, orientation: Orientation::Forward }, ee));
+                picked = Some((
+                    i,
+                    OrientedEdge {
+                        id: oe.id,
+                        orientation: Orientation::Forward,
+                    },
+                    ee,
+                ));
                 break;
             } else if ee == cur_end {
-                picked = Some((i, OrientedEdge { id: oe.id, orientation: Orientation::Reversed }, es));
+                picked = Some((
+                    i,
+                    OrientedEdge {
+                        id: oe.id,
+                        orientation: Orientation::Reversed,
+                    },
+                    es,
+                ));
                 break;
             }
         }
@@ -165,8 +179,7 @@ fn shell_is_closed(brep: &BRep, face_ids: &[FaceId]) -> bool {
                 let Some(e) = brep.edges.get(oe.id) else {
                     continue;
                 };
-                let (Some(a), Some(b)) =
-                    (brep.vertices.get(e.start), brep.vertices.get(e.end))
+                let (Some(a), Some(b)) = (brep.vertices.get(e.start), brep.vertices.get(e.end))
                 else {
                     continue;
                 };
@@ -204,8 +217,7 @@ fn signed_volume(brep: &BRep, face_ids: &[FaceId]) -> f64 {
         for i in 1..pts.len() - 1 {
             let b = pts[i];
             let c = pts[i + 1];
-            v6 += a.x() * (b.y() * c.z() - b.z() * c.y())
-                - a.y() * (b.x() * c.z() - b.z() * c.x())
+            v6 += a.x() * (b.y() * c.z() - b.z() * c.y()) - a.y() * (b.x() * c.z() - b.z() * c.x())
                 + a.z() * (b.x() * c.y() - b.y() * c.x());
         }
     }

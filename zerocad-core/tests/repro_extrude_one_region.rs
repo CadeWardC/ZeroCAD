@@ -50,11 +50,19 @@ fn mesh_stats(m: &zerocad_core::MockMesh) -> (usize, usize, usize) {
         }
         let p = |i: u32| {
             let b = i as usize * 6;
-            [m.vertices[b] as f64, m.vertices[b + 1] as f64, m.vertices[b + 2] as f64]
+            [
+                m.vertices[b] as f64,
+                m.vertices[b + 1] as f64,
+                m.vertices[b + 2] as f64,
+            ]
         };
         let vn = |i: u32| {
             let b = i as usize * 6;
-            [m.vertices[b + 3] as f64, m.vertices[b + 4] as f64, m.vertices[b + 5] as f64]
+            [
+                m.vertices[b + 3] as f64,
+                m.vertices[b + 4] as f64,
+                m.vertices[b + 5] as f64,
+            ]
         };
         let a = p(t[0]);
         let b = p(t[1]);
@@ -139,7 +147,11 @@ fn extrude_only_selected_region() {
         .expect("a rectangle region");
 
     let m = one_extrude(curves, vec![rect_idx]);
-    let min_y = m.vertices.chunks(6).map(|v| v[1]).fold(f32::INFINITY, f32::min);
+    let min_y = m
+        .vertices
+        .chunks(6)
+        .map(|v| v[1])
+        .fold(f32::INFINITY, f32::min);
     assert!(
         min_y > 19.0,
         "only the rectangle (y>=20) should extrude; geometry reached y={min_y:.1}"
@@ -175,7 +187,10 @@ fn extrude_single_nonconvex_region_has_no_disappearing_faces() {
     let m = one_extrude(curves, vec![0]);
     let (cracks, nm, inward) = mesh_stats(&m);
     println!("non-convex region 0: cracks={cracks}, nonmanifold={nm}, inward={inward}");
-    assert_eq!(inward, 0, "non-convex region must not leave inward (disappearing) faces");
+    assert_eq!(
+        inward, 0,
+        "non-convex region must not leave inward (disappearing) faces"
+    );
     assert_eq!(cracks, 0, "outer shell stays watertight (no holes)");
     assert_eq!(
         nm, 0,
@@ -193,5 +208,8 @@ fn extrude_whole_overlapping_sketch_has_no_disappearing_faces() {
     let m = one_extrude(curves, vec![]);
     let (cracks, nm, inward) = mesh_stats(&m);
     println!("whole overlapping sketch: cracks={cracks}, nonmanifold={nm}, inward={inward}");
-    assert_eq!(inward, 0, "whole-sketch extrude must not leave inward (disappearing) faces");
+    assert_eq!(
+        inward, 0,
+        "whole-sketch extrude must not leave inward (disappearing) faces"
+    );
 }

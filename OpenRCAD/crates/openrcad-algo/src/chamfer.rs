@@ -208,9 +208,8 @@ fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Soli
     faces.push(blend.chamfer_face);
 
     let result = Solid::new(sew(&faces, distance * 0.1));
-    let merged = crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(
-        &result,
-    ));
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if merged.is_watertight() && merged.health_report().is_healthy() {
         return Ok(merged);
     }
