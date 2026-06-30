@@ -299,6 +299,8 @@ struct SaveDialogState {
 /// Result delivered by a background refine evaluation: its generation tag (to
 /// discard superseded jobs) and the evaluated bodies + warnings (or an error).
 type EvalResult = (u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>);
+/// Result delivered by an asynchronous live-preview evaluation.
+type PreviewBodiesResult = (u64, Result<Vec<(String, MockMesh)>, String>);
 
 struct ZeroCadApp {
     graph: ParametricGraph,
@@ -425,6 +427,10 @@ struct ZeroCadApp {
     /// only when the depth/targets change, not on every repaint (e.g. mouse moves
     /// over the viewport while the dialog is open).
     extrude_preview_mesh_cache: Option<(u64, MockMesh)>,
+    /// In-flight exact extrude preview job. The lightweight tool mesh is shown
+    /// until this worker returns the real Cut/Join/overlap-NewBody result.
+    extrude_preview_inflight: Option<u64>,
+    extrude_preview_rx: Option<std::sync::mpsc::Receiver<PreviewBodiesResult>>,
     /// Memoized live edge fillet/chamfer preview: `(input hash, bodies)`. Like
     /// `extrude_preview_cache`, the underlying `preview_edge_mod_bodies` clones the
     /// graph and re-runs every truck boolean — far too slow to redo on every

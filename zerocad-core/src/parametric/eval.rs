@@ -227,12 +227,30 @@ impl ParametricGraph {
             if !hidden.contains(&node.id) {
                 match &node.feature {
                     FeatureType::Box { w, h, d } => {
+                        let source = SketchExtrudeSource {
+                            regions: vec![SketchExtrudeRegionSource {
+                                boundary: vec![(0.0, 0.0), (*w, 0.0), (*w, *h), (0.0, *h)],
+                                holes: Vec::new(),
+                                depth: *d,
+                                cs: CoordinateSystem::XY,
+                                rect_circle: None,
+                            }],
+                        };
+                        let solid = crate::mock_kernel::extruded_region_solid(
+                            &source.regions[0].boundary,
+                            &source.regions[0].holes,
+                            source.regions[0].depth,
+                            &source.regions[0].cs,
+                        )
+                        .unwrap_or_else(|| crate::mock_kernel::box_solid(*w, *h, *d));
                         live.push(LiveBody {
                             id: node.id.clone(),
-                            parts: vec![crate::mock_kernel::box_solid(*w, *h, *d)],
+                            parts: vec![solid],
                             pristine: Some(MockMesh::make_box(*w, *h, *d)),
-                            sketch_source: None,
+                            sketch_source: Some(source),
                             cut_tools: Vec::new(),
+                            cut_replay: None,
+                            edge_mod_cut_history_path_used: false,
                         });
                     }
                     FeatureType::Cylinder { r, h } => {
@@ -243,6 +261,8 @@ impl ParametricGraph {
                                 pristine: Some(MockMesh::make_cylinder(*r, *h, 32)),
                                 sketch_source: None,
                                 cut_tools: Vec::new(),
+                                cut_replay: None,
+                                edge_mod_cut_history_path_used: false,
                             });
                         }
                     }
@@ -288,6 +308,7 @@ impl ParametricGraph {
                         dist,
                         dist_expr,
                         scope,
+                        replay,
                         kind,
                     } => {
                         let eff_dist = match dist_expr.as_ref() {
@@ -309,6 +330,7 @@ impl ParametricGraph {
                             target,
                             edge,
                             scope,
+                            replay,
                             eff_dist,
                             *kind,
                             draft,
@@ -333,6 +355,30 @@ impl ParametricGraph {
         Ok((live, warnings))
     }
 
+    pub fn edge_mod_replay_intent_for_edge(
+        &self,
+        target: &str,
+        edge: &EdgeRef,
+        hidden: &std::collections::HashSet<String>,
+    ) -> EdgeModReplayIntent {
+        let mut intent = EdgeModReplayIntent::auto_for(target.to_string(), edge.clone());
+        if let Ok((live, _)) = self.build_live(hidden, false) {
+            if let Some(history) = live
+                .iter()
+                .find(|body| body.id == target)
+                .and_then(|body| body.cut_replay.as_ref())
+            {
+                intent.pre_cut_target = Some(history.base_body_id.clone());
+                intent.replay_cut_nodes = history
+                    .steps
+                    .iter()
+                    .map(|step| step.node_id.clone())
+                    .collect();
+            }
+        }
+        intent
+    }
+
     /// Cumulative content hash of the geometry inputs for each node in `nodes`,
     /// in order — `keys[i]` covers nodes `0..=i`. Folds `vars` (the seed, so any
     /// variable change invalidates everything), then per node its id, hidden
@@ -347,7 +393,7 @@ impl ParametricGraph {
     /// `draft` is ever made to change geometry again (e.g. a faceted draft fillet),
     /// it MUST be folded into the seed here, or a draft preview would serve a
     /// committed body's cached result (and vice versa).
-    fn eval_prefix_keys(
+    pub(crate) fn eval_prefix_keys(
         &self,
         nodes: &[NodeIndex],
         hidden: &std::collections::HashSet<String>,
@@ -448,7 +494,7 @@ impl ParametricGraph {
 
     /// Solid-producing nodes (Box / Cylinder / Extrude) in creation order — the
     /// order booleans must see (see [`evaluate_bodies_with_warnings`]).
-    fn body_nodes_in_creation_order(&self) -> Vec<NodeIndex> {
+    pub(crate) fn body_nodes_in_creation_order(&self) -> Vec<NodeIndex> {
         let mut nodes: Vec<NodeIndex> = self
             .graph
             .node_indices()
@@ -559,13 +605,15 @@ impl ParametricGraph {
         };
 
         let mut newbody_tools: Vec<KernelSolid> = Vec::new();
-        let mut newbody_cut_tools: Vec<KernelSolid> = Vec::new();
+        let mut newbody_cut_tools: Vec<CutTool> = Vec::new();
         let mut cut_tools: Vec<CutTool> = Vec::new();
         let mut join_tools: Vec<JoinTool> = Vec::new();
         let mut sketch_source = SketchExtrudeSource {
             regions: Vec::new(),
         };
         let mut newbody_mesh = MockMesh::empty();
+        let mut newbody_body_count = 0usize;
+        let mut newbody_cut_replay: Option<CutReplayHistory> = None;
 
         for (i, region) in regions.iter().enumerate() {
             if !process_region[i] {
@@ -617,8 +665,9 @@ impl ParametricGraph {
                         .or_else(|| region_solid(region, cs, depth));
                     if let Some(s) = body_tool {
                         newbody_tools.push(s);
+                        newbody_body_count += 1;
                     }
-                    if let Some((_base, cutter)) = provenance
+                    let grown_replay_cutter = provenance
                         .and_then(|provenance| {
                             rect_circle_region_base_and_cutter_from_provenance(
                                 provenance,
@@ -636,29 +685,49 @@ impl ParametricGraph {
                                 cs,
                                 CUT_WALL_GROW,
                             )
-                        })
-                    {
-                        newbody_cut_tools.push(cutter);
-                    } else if let Some((_base, cutter)) =
-                        crate::mock_kernel::rect_minus_circle_region_base_and_grown_cutter(
-                            &region.boundary,
-                            &region.holes,
-                            depth,
-                            cs,
-                            CUT_WALL_GROW,
-                        )
-                    {
-                        newbody_cut_tools.push(cutter);
-                    } else if let Some((_, cutter)) = rect_circle_exact.as_ref() {
-                        newbody_cut_tools.push(cutter.clone());
-                    }
-                    sketch_source.regions.push(SketchExtrudeRegionSource {
+                        });
+                    let expanded_replay_cutter = grown_replay_cutter
+                        .clone()
+                        .map(|(_, cutter)| cutter)
+                        .or_else(|| {
+                            crate::mock_kernel::rect_minus_circle_region_base_and_grown_cutter(
+                                &region.boundary,
+                                &region.holes,
+                                depth,
+                                cs,
+                                CUT_WALL_GROW,
+                            )
+                            .map(|(_, cutter)| cutter)
+                        });
+                    let region_source = SketchExtrudeRegionSource {
                         boundary: region.boundary.clone(),
                         holes: region.holes.clone(),
                         depth,
                         cs: *cs,
                         rect_circle: canonical_rect_circle,
-                    });
+                    };
+                    if let Some(canonical) = region_source.rect_circle.as_ref() {
+                        let replay_tool = CutTool::single_direction(
+                            Some(canonical.cutter.clone()),
+                            None,
+                            expanded_replay_cutter.clone(),
+                            None,
+                        );
+                        newbody_cut_tools.extend(cut_tool_recutter_tools(&replay_tool));
+                        newbody_cut_replay = Some(CutReplayHistory {
+                            base_body_id: node_id.to_string(),
+                            base_parts: vec![canonical.base.clone()],
+                            base_pristine: None,
+                            base_sketch_source: Some(SketchExtrudeSource {
+                                regions: vec![region_source.clone()],
+                            }),
+                            steps: vec![CutReplayStep {
+                                node_id: node_id.to_string(),
+                                tool: replay_tool,
+                            }],
+                        });
+                    }
+                    sketch_source.regions.push(region_source);
                     let mut region_mesh = crate::mock_kernel::extruded_region_display_mesh(
                         &region.boundary,
                         &region.holes,
@@ -774,6 +843,10 @@ impl ParametricGraph {
                         pristine: (!newbody_mesh.indices.is_empty()).then_some(newbody_mesh),
                         sketch_source: (!sketch_source.regions.is_empty()).then_some(sketch_source),
                         cut_tools: newbody_cut_tools,
+                        cut_replay: (newbody_body_count == 1)
+                            .then_some(())
+                            .and(newbody_cut_replay),
+                        edge_mod_cut_history_path_used: false,
                     });
                 }
             }

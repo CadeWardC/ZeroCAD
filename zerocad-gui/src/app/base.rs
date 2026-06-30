@@ -59,6 +59,8 @@ impl ZeroCadApp {
             extrude_op: None,
             extrude_preview_cache: None,
             extrude_preview_mesh_cache: None,
+            extrude_preview_inflight: None,
+            extrude_preview_rx: None,
             edge_mod_preview_cache: None,
             edge_mod_preview_mesh_cache: None,
             edge_mod_arc_cache: None,

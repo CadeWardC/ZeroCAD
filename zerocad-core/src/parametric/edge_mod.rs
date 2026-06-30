@@ -27,6 +27,20 @@ pub(crate) const EDGE_MOD_END_OVERSHOOT: f32 = 1.0;
 /// tiny numerical skin outside the pre-edge-mod body.
 pub(crate) const EDGE_MOD_CONTAINMENT_TOL: f32 = EDGE_MOD_GROW + 0.05;
 
+fn edge_mod_timing_enabled() -> bool {
+    std::env::var_os("ZEROCAD_TIMING").is_some() || std::env::var_os("ZEROCAD_PERF").is_some()
+}
+
+fn edge_mod_timing(label: impl AsRef<str>, started: std::time::Instant) {
+    if edge_mod_timing_enabled() {
+        eprintln!(
+            "[zerocad-timing] {}: {:.1?}",
+            label.as_ref(),
+            started.elapsed()
+        );
+    }
+}
+
 /// Apply a 3D fillet or chamfer to the target body.
 ///
 /// **Fillet** uses OpenRCAD's native rolling-ball blend
@@ -52,6 +66,7 @@ pub(crate) fn apply_edge_mod(
     target: &str,
     edge: &EdgeRef,
     _scope: &EdgeModScope,
+    replay: &EdgeModReplayIntent,
     dist: f32,
     kind: crate::sketch::CornerKind,
     _draft: bool,
@@ -80,7 +95,9 @@ pub(crate) fn apply_edge_mod(
     let selection = EdgeModSelection::new(&resolved_edge);
 
     match kind {
-        crate::sketch::CornerKind::Fillet => apply_fillet(mod_id, &selection, dist, body, warnings),
+        crate::sketch::CornerKind::Fillet => {
+            apply_fillet(mod_id, &selection, replay, dist, body, warnings)
+        }
         crate::sketch::CornerKind::Chamfer => {
             apply_chamfer(mod_id, &selection, dist, body, warnings)
         }
@@ -253,6 +270,7 @@ pub(crate) struct CircularBiteLocality<'a> {
 pub(crate) struct EdgeModResult {
     pub(crate) parts: Vec<KernelSolid>,
     pub(crate) pristine: Option<MockMesh>,
+    pub(crate) cut_replay: Option<CutReplayHistory>,
 }
 
 impl EdgeModResult {
@@ -260,8 +278,408 @@ impl EdgeModResult {
         Self {
             parts: vec![part],
             pristine: None,
+            cut_replay: None,
         }
     }
+}
+
+enum ReplayAttempt {
+    Applied(EdgeModResult),
+    Failed(String),
+    NotApplicable,
+}
+
+fn edge_mod_try_construction_replay(
+    body: &LiveBody,
+    selection: &EdgeModSelection,
+    replay: &EdgeModReplayIntent,
+    dist: f32,
+) -> ReplayAttempt {
+    let total_started = std::time::Instant::now();
+    if matches!(replay.mode, EdgeModReplayMode::NativeOnly) || edge_mod_native_only(selection) {
+        return ReplayAttempt::NotApplicable;
+    }
+    let has_replay_intent = replay.pre_cut_target.is_some()
+        || !replay.replay_cut_nodes.is_empty()
+        || replay.selected_span.is_some();
+    if replay.pre_cut_target.is_none()
+        && replay.replay_cut_nodes.is_empty()
+        && replay.selected_span.is_none()
+    {
+        return ReplayAttempt::NotApplicable;
+    }
+    let Some(history) = body.cut_replay.as_ref() else {
+        return ReplayAttempt::NotApplicable;
+    };
+    if history.base_parts.is_empty() || history.steps.is_empty() {
+        return ReplayAttempt::NotApplicable;
+    }
+    if let Err(reason) = edge_mod_circular_bite_replay_runout_guard(body, history, selection, dist)
+    {
+        return ReplayAttempt::Failed(reason);
+    }
+    let replay_required = has_replay_intent;
+    if let Some(target) = replay.pre_cut_target.as_deref() {
+        if target != history.base_body_id && target != body.id {
+            return ReplayAttempt::Failed(format!(
+                "saved replay target '{target}' no longer matches body '{}'",
+                body.id
+            ));
+        }
+    }
+    if !replay.replay_cut_nodes.is_empty()
+        && !replay_nodes_are_ordered_subset(&history.steps, &replay.replay_cut_nodes)
+    {
+        return ReplayAttempt::Failed(
+            "saved replay cut chain no longer matches the target body's cut history".to_string(),
+        );
+    }
+
+    let mut failures = Vec::new();
+    let mut filleted = false;
+    let mut saw_split = false;
+    for i in 0..history.base_parts.len() {
+        let mut split_options = split_pre_cut_part_options(
+            history,
+            &history.base_parts[i],
+            &selection.active_edge,
+            dist,
+        );
+        if split_options.is_empty() {
+            split_options.push(PreCutSplit {
+                parts: vec![history.base_parts[i].clone()],
+                edge: selection.active_edge.clone(),
+                split_found: false,
+            });
+        } else {
+            saw_split = true;
+        }
+
+        for split in split_options {
+            let split_parts = split.parts;
+            let Some(target_part) = split_parts.first() else {
+                continue;
+            };
+            let reference = MockMesh::from_solid(target_part);
+            let construction_selection = EdgeModSelection::new(&split.edge);
+            match edge_mod_try_native_fillet(
+                &reference,
+                target_part,
+                target_part,
+                &construction_selection,
+                dist,
+                "construction replay native",
+                &[],
+                None,
+            ) {
+                Ok(part) => {
+                    let mut replacement = split_parts;
+                    replacement[0] = part;
+                    let replacement = if split.split_found {
+                        fuse_overlapping_solids(replacement)
+                    } else {
+                        replacement
+                    };
+                    filleted = true;
+                    let mut candidate_base = history.base_parts.clone();
+                    candidate_base.splice(i..=i, replacement);
+                    match finish_construction_replay(body, selection, dist, history, candidate_base)
+                    {
+                        Ok(result) => {
+                            edge_mod_timing("edge construction replay total", total_started);
+                            return ReplayAttempt::Applied(result);
+                        }
+                        Err(reason) => failures.push(reason),
+                    }
+                }
+                Err(reason) => failures.push(reason),
+            }
+        }
+    }
+    if !filleted {
+        if !saw_split && !replay_required {
+            return ReplayAttempt::NotApplicable;
+        }
+        return ReplayAttempt::Failed(if failures.is_empty() {
+            "pre-cut selected edge could not be filleted after imprint".to_string()
+        } else {
+            format!(
+                "pre-cut selected edge could not be filleted after imprint: {}",
+                failures.join("; ")
+            )
+        });
+    }
+    ReplayAttempt::Failed(if failures.is_empty() {
+        "construction replay produced no valid replayed body".to_string()
+    } else {
+        format!(
+            "construction replay produced no valid replayed body: {}",
+            failures.join("; ")
+        )
+    })
+}
+
+fn finish_construction_replay(
+    body: &LiveBody,
+    selection: &EdgeModSelection,
+    dist: f32,
+    history: &CutReplayHistory,
+    base_parts: Vec<KernelSolid>,
+) -> Result<EdgeModResult, String> {
+    let replay_started = std::time::Instant::now();
+    let replayed = match replay_cut_history(base_parts.clone(), &history.steps) {
+        Ok(parts) => parts,
+        Err(reason) => return Err(reason),
+    };
+    edge_mod_timing("construction replay cuts", replay_started);
+    let validate_started = std::time::Instant::now();
+    let (replayed, candidate_mesh) =
+        match validate_replayed_edge_mod_body(body, selection, dist, history, &replayed) {
+            Ok(mesh) => (replayed, mesh),
+            Err(first_reason) if !body.cut_tools.is_empty() => {
+                let recut = match recut_replayed_parts_with_tools(replayed, &body.cut_tools) {
+                    Ok(parts) => parts,
+                    Err(reason) => {
+                        return Err(format!("{first_reason}; {reason}"));
+                    }
+                };
+                match validate_replayed_edge_mod_body(body, selection, dist, history, &recut) {
+                    Ok(mesh) => (recut, mesh),
+                    Err(reason) => {
+                        return Err(format!(
+                            "{first_reason}; grown recut validation failed: {reason}"
+                        ));
+                    }
+                }
+            }
+            Err(reason) => return Err(reason),
+        };
+    edge_mod_timing("construction replay validation", validate_started);
+
+    let mut next_history = history.clone();
+    next_history.base_parts = base_parts;
+    next_history.base_pristine = None;
+    Ok(EdgeModResult {
+        parts: replayed,
+        pristine: (!candidate_mesh.indices.is_empty()
+            && history.base_pristine.is_some()
+            && history.steps.is_empty())
+        .then_some(candidate_mesh),
+        cut_replay: Some(next_history),
+    })
+}
+
+struct PreCutSplit {
+    parts: Vec<KernelSolid>,
+    edge: EdgeRef,
+    split_found: bool,
+}
+
+fn split_pre_cut_part_options(
+    history: &CutReplayHistory,
+    part: &KernelSolid,
+    edge: &EdgeRef,
+    dist: f32,
+) -> Vec<PreCutSplit> {
+    let runout = 0.05_f32.min((dist * 0.05).max(0.0));
+    let mut out = Vec::new();
+    if let Some(source) = history.base_sketch_source.as_ref() {
+        for region in &source.regions {
+            if let Some(split) = imprinted_rect_base_for_edge(region, edge, runout) {
+                out.push(split);
+            }
+            if let Some(split) = split_rect_base_parts_for_edge(region, edge, runout) {
+                out.push(split);
+            }
+        }
+    }
+    out.extend(split_axis_aligned_box_for_edge(part, edge, runout));
+    out
+}
+
+fn split_axis_aligned_box_for_edge(
+    part: &KernelSolid,
+    edge: &EdgeRef,
+    runout: f32,
+) -> Vec<PreCutSplit> {
+    let mesh = MockMesh::from_solid(part);
+    let Some((lo, hi)) = mesh_position_aabb(&mesh) else {
+        return Vec::new();
+    };
+    if !mesh_is_aabb_box(&mesh, lo, hi, 0.08) {
+        return Vec::new();
+    }
+    let dx = hi[0] - lo[0];
+    let dy = hi[1] - lo[1];
+    let dz = hi[2] - lo[2];
+    let mut candidates = Vec::new();
+    if dz.abs() > 1.0e-4 {
+        candidates.push(SketchExtrudeRegionSource {
+            boundary: vec![
+                (lo[0], lo[1]),
+                (hi[0], lo[1]),
+                (hi[0], hi[1]),
+                (lo[0], hi[1]),
+            ],
+            holes: Vec::new(),
+            depth: dz,
+            cs: CoordinateSystem::new(
+                Vec3::new(lo[0], lo[1], lo[2]),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ),
+            rect_circle: None,
+        });
+    }
+    if dx.abs() > 1.0e-4 {
+        candidates.push(SketchExtrudeRegionSource {
+            boundary: vec![
+                (lo[1], lo[2]),
+                (hi[1], lo[2]),
+                (hi[1], hi[2]),
+                (lo[1], hi[2]),
+            ],
+            holes: Vec::new(),
+            depth: dx,
+            cs: CoordinateSystem::new(
+                Vec3::new(lo[0], lo[1], lo[2]),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ),
+            rect_circle: None,
+        });
+    }
+    if dy.abs() > 1.0e-4 {
+        candidates.push(SketchExtrudeRegionSource {
+            boundary: vec![
+                (lo[2], lo[0]),
+                (hi[2], lo[0]),
+                (hi[2], hi[0]),
+                (lo[2], hi[0]),
+            ],
+            holes: Vec::new(),
+            depth: dy,
+            cs: CoordinateSystem::new(
+                Vec3::new(lo[0], lo[1], lo[2]),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ),
+            rect_circle: None,
+        });
+    }
+
+    let mut out = Vec::new();
+    for region in &candidates {
+        if let Some(split) = imprinted_rect_base_for_edge(region, edge, runout) {
+            out.push(split);
+        }
+        if let Some(split) = split_rect_base_parts_for_edge(region, edge, runout) {
+            out.push(split);
+        }
+    }
+    out
+}
+
+fn validate_replayed_edge_mod_body(
+    body: &LiveBody,
+    selection: &EdgeModSelection,
+    dist: f32,
+    history: &CutReplayHistory,
+    parts: &[KernelSolid],
+) -> Result<MockMesh, String> {
+    let started = std::time::Instant::now();
+    let reference_mesh = edge_mod_reference_mesh(body);
+    let mut candidate_mesh = MockMesh::empty();
+    for part in parts {
+        candidate_mesh.append(MockMesh::from_solid(part));
+    }
+    edge_mod_timing("replayed body tessellation", started);
+    if candidate_mesh.indices.is_empty() {
+        return Err("replayed body tessellated to an empty mesh".to_string());
+    }
+    let cracks_started = std::time::Instant::now();
+    edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
+    edge_mod_timing("replayed body crack check", cracks_started);
+
+    let nonmanifold = edge_mod_render_mesh_nonmanifold_edges(&candidate_mesh);
+    if nonmanifold > 0 {
+        return Err(format!("replayed body has {nonmanifold} non-manifold edges"));
+    }
+
+    let inward = edge_mod_render_mesh_inward_triangles(&candidate_mesh);
+    if inward > 0 {
+        return Err(format!("replayed body has {inward} inward triangles"));
+    }
+
+    for (part_index, part) in parts.iter().enumerate() {
+        if let Some(original_part) = body.parts.get(part_index) {
+            if !crate::mock_kernel::preserves_cylindrical_faces(original_part, part) {
+                return Err("replayed candidate lost an analytic cylindrical face".to_string());
+            }
+        }
+    }
+
+    let bounds_started = std::time::Instant::now();
+    edge_mod_mesh_stays_inside_reference_bounds(
+        &reference_mesh,
+        &candidate_mesh,
+        EDGE_MOD_CONTAINMENT_TOL,
+    )?;
+    edge_mod_timing("replayed body bounds check", bounds_started);
+    let has_circular_bite_source = body.sketch_source.as_ref().is_some_and(|source| {
+        source
+            .regions
+            .iter()
+            .any(|region| region.rect_circle.is_some())
+    });
+    if !has_circular_bite_source {
+        let ghost_started = std::time::Instant::now();
+        let ghost_samples = replay_cut_void_ghost_sample_count(history, &candidate_mesh);
+        edge_mod_timing("replayed cut void ghost check", ghost_started);
+        if ghost_samples > 0 {
+            return Err(format!(
+                "replayed cuts left {ghost_samples} non-wall sample(s) inside removed cut volume"
+            ));
+        }
+    }
+    let locality_started = std::time::Instant::now();
+    if let Some(source) = body.sketch_source.as_ref() {
+        for region in &source.regions {
+            if region.rect_circle.is_some() {
+                edge_mod_circular_bite_locality_mesh(
+                    CircularBiteLocality {
+                        region,
+                        selection,
+                        dist,
+                        kind: crate::sketch::CornerKind::Fillet,
+                    },
+                    &candidate_mesh,
+                )?;
+            }
+        }
+    }
+    edge_mod_timing("replayed circular-bite locality check", locality_started);
+    let blend_started = std::time::Instant::now();
+    edge_mod_selected_blend_present(
+        &candidate_mesh,
+        &selection.active_edge,
+        dist,
+        crate::sketch::CornerKind::Fillet,
+    )?;
+    edge_mod_timing("replayed selected blend check", blend_started);
+    let seams_started = std::time::Instant::now();
+    let seams = edge_mod_selected_blend_lengthwise_wire_seams(
+        &candidate_mesh,
+        &selection.active_edge,
+        dist,
+    );
+    edge_mod_timing("replayed selected seam check", seams_started);
+    if seams > 0 {
+        return Err(format!(
+            "replayed fillet exposed {seams} lengthwise seam edge(s) on the selected surface"
+        ));
+    }
+    Ok(candidate_mesh)
 }
 
 pub(crate) fn edge_mod_preflight(
@@ -304,10 +722,72 @@ pub(crate) fn edge_mod_native_only(selection: &EdgeModSelection) -> bool {
 pub(crate) fn apply_fillet(
     mod_id: &str,
     selection: &EdgeModSelection,
+    replay: &EdgeModReplayIntent,
     dist: f32,
     body: &mut LiveBody,
     warnings: &mut Vec<String>,
 ) {
+    let prefer_cut_history = edge_mod_has_replayable_cut_history(body, selection, replay);
+    let mut cut_history_path_used = false;
+    let mut replay_failure: Option<String> = None;
+
+    if prefer_cut_history {
+        cut_history_path_used = true;
+        match edge_mod_try_construction_replay(body, selection, replay, dist) {
+            ReplayAttempt::Applied(result) => {
+                body.parts = result.parts;
+                body.pristine = result.pristine;
+                body.sketch_source = None;
+                body.cut_replay = result.cut_replay;
+                body.edge_mod_cut_history_path_used = true;
+                return;
+            }
+            ReplayAttempt::Failed(reason) => replay_failure = Some(reason),
+            ReplayAttempt::NotApplicable => {}
+        }
+
+        match edge_mod_try_native_cut_history_replay(body, selection, replay, dist) {
+            ReplayAttempt::Applied(result) => {
+                body.parts = result.parts;
+                body.pristine = result.pristine;
+                body.sketch_source = None;
+                body.cut_replay = result.cut_replay;
+                body.edge_mod_cut_history_path_used = true;
+                return;
+            }
+            ReplayAttempt::Failed(reason) => {
+                replay_failure = Some(match replay_failure {
+                    Some(prefix_reason) => {
+                        format!("{prefix_reason}; native cut-history replay failed ({reason})")
+                    }
+                    None => reason,
+                });
+            }
+            ReplayAttempt::NotApplicable => {}
+        }
+    } else {
+        match edge_mod_try_construction_replay(body, selection, replay, dist) {
+            ReplayAttempt::Applied(result) => {
+                body.parts = result.parts;
+                body.pristine = result.pristine;
+                body.sketch_source = None;
+                body.cut_replay = result.cut_replay;
+                body.edge_mod_cut_history_path_used = true;
+                return;
+            }
+            ReplayAttempt::Failed(reason) => {
+                cut_history_path_used = true;
+                replay_failure = Some(match replay_failure {
+                    Some(prefix_reason) => {
+                        format!("{prefix_reason}; construction replay failed ({reason})")
+                    }
+                    None => reason,
+                });
+            }
+            ReplayAttempt::NotApplicable => {}
+        }
+    }
+
     let mut applied = false;
     let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
@@ -336,10 +816,6 @@ pub(crate) fn apply_fillet(
         });
         let mut accepted: Option<EdgeModResult> = None;
         let native_only = edge_mod_native_only(selection);
-        let has_rect_circle_recipe = !native_only
-            && sketch_region
-                .and_then(|region| region.rect_circle.as_ref())
-                .is_some();
         let native_reason = if accepted.is_none() {
             match edge_mod_try_native_fillet(
                 &reference_mesh,
@@ -398,22 +874,6 @@ pub(crate) fn apply_fillet(
             }
         }
 
-        if accepted.is_none() && has_rect_circle_recipe {
-            if let Some(region) = sketch_region {
-                match edge_mod_rect_circle_precut_fallback(
-                    region,
-                    &part,
-                    selection,
-                    dist,
-                    crate::sketch::CornerKind::Fillet,
-                    &reference_mesh,
-                ) {
-                    Ok(fallback) => accepted = Some(fallback),
-                    Err(reason) => part_failures.push(reason),
-                }
-            }
-        }
-
         if let Some(result) = accepted {
             applied = true;
             if let Some(mesh) = result.pristine {
@@ -435,15 +895,202 @@ pub(crate) fn apply_fillet(
         body.pristine =
             (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
         body.sketch_source = None;
+        body.cut_replay = None;
+        body.edge_mod_cut_history_path_used = cut_history_path_used;
     } else {
         // Surface the kernel's actual reason (radius too large, edge not found on
         // an adjacent face, non-blendable wedge, …) instead of a generic guess.
-        let reason = last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
+        let native_reason =
+            last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
+        let reason = replay_failure
+            .map(|replay| {
+                format!(
+                    "construction replay failed ({replay}); native solve failed ({native_reason})"
+                )
+            })
+            .unwrap_or(native_reason);
         warnings.push(format!(
             "Fillet '{mod_id}': the edge couldn't be rounded ({reason}), so the \
              body was left unchanged."
         ));
     }
+}
+
+fn edge_mod_try_native_cut_history_replay(
+    body: &LiveBody,
+    selection: &EdgeModSelection,
+    replay: &EdgeModReplayIntent,
+    dist: f32,
+) -> ReplayAttempt {
+    let total_started = std::time::Instant::now();
+    if matches!(replay.mode, EdgeModReplayMode::NativeOnly) || edge_mod_native_only(selection) {
+        return ReplayAttempt::NotApplicable;
+    }
+    let Some(history) = body.cut_replay.as_ref() else {
+        return ReplayAttempt::NotApplicable;
+    };
+    if history.base_parts.is_empty() || history.steps.is_empty() {
+        return ReplayAttempt::NotApplicable;
+    }
+    if let Err(reason) = edge_mod_circular_bite_replay_runout_guard(body, history, selection, dist)
+    {
+        return ReplayAttempt::Failed(reason);
+    }
+    if let Some(target) = replay.pre_cut_target.as_deref() {
+        if target != history.base_body_id && target != body.id {
+            return ReplayAttempt::Failed(format!(
+                "saved replay target '{target}' no longer matches body '{}'",
+                body.id
+            ));
+        }
+    }
+    if !replay.replay_cut_nodes.is_empty()
+        && !replay_nodes_are_ordered_subset(&history.steps, &replay.replay_cut_nodes)
+    {
+        return ReplayAttempt::Failed(
+            "saved replay cut chain no longer matches the target body's cut history".to_string(),
+        );
+    }
+
+    let mut failures = Vec::new();
+    for prefix_len in 1..=history.steps.len() {
+        recut_debug(format!(
+            "trying cut-history prefix {prefix_len}/{} for selected edge",
+            history.steps.len()
+        ));
+        let replay_started = std::time::Instant::now();
+        let mut prefix_parts =
+            match replay_cut_history(history.base_parts.clone(), &history.steps[..prefix_len]) {
+                Ok(parts) => parts,
+                Err(reason) => {
+                    failures.push(format!("prefix {prefix_len} replay failed: {reason}"));
+                    continue;
+                }
+            };
+        edge_mod_timing(
+            format!("native cut-history prefix {prefix_len} replay"),
+            replay_started,
+        );
+        let mut reference_mesh = MockMesh::empty();
+        for part in &prefix_parts {
+            reference_mesh.append(MockMesh::from_solid(part));
+        }
+        if reference_mesh.indices.is_empty() {
+            failures.push(format!("prefix {prefix_len} tessellated to an empty mesh"));
+            continue;
+        }
+
+        let mut applied = false;
+        let mut prefix_failures = Vec::new();
+        let native_started = std::time::Instant::now();
+        for part in &mut prefix_parts {
+            let original = part.clone();
+            match edge_mod_try_native_fillet(
+                &reference_mesh,
+                &original,
+                &original,
+                selection,
+                dist,
+                "cut-history native",
+                &[],
+                None,
+            ) {
+                Ok(filleted) => {
+                    *part = filleted;
+                    applied = true;
+                }
+                Err(reason) => prefix_failures.push(reason),
+            }
+        }
+        edge_mod_timing(
+            format!("native cut-history prefix {prefix_len} fillet"),
+            native_started,
+        );
+        if !applied {
+            failures.push(if prefix_failures.is_empty() {
+                format!("prefix {prefix_len} native solve did not find the selected edge")
+            } else {
+                format!("prefix {prefix_len}: {}", prefix_failures.join("; "))
+            });
+            continue;
+        }
+
+        let modified_prefix_parts = prefix_parts;
+        let suffix_started = std::time::Instant::now();
+        let replayed =
+            match replay_cut_history(modified_prefix_parts.clone(), &history.steps[prefix_len..]) {
+                Ok(parts) => parts,
+                Err(reason) => {
+                    failures.push(format!(
+                        "prefix {prefix_len} suffix replay failed: {reason}"
+                    ));
+                    continue;
+                }
+            };
+        edge_mod_timing(
+            format!("native cut-history prefix {prefix_len} suffix replay"),
+            suffix_started,
+        );
+        let validate_started = std::time::Instant::now();
+        match validate_replayed_edge_mod_body(body, selection, dist, history, &replayed) {
+            Ok(_) => {
+                edge_mod_timing(
+                    format!("native cut-history prefix {prefix_len} validation"),
+                    validate_started,
+                );
+                edge_mod_timing("native cut-history replay total", total_started);
+                let cut_replay = if prefix_len < history.steps.len() {
+                    Some(CutReplayHistory {
+                        base_body_id: history.base_body_id.clone(),
+                        base_parts: modified_prefix_parts,
+                        base_pristine: None,
+                        base_sketch_source: None,
+                        steps: history.steps[prefix_len..].to_vec(),
+                    })
+                } else {
+                    None
+                };
+                return ReplayAttempt::Applied(EdgeModResult {
+                    parts: replayed,
+                    pristine: None,
+                    cut_replay,
+                });
+            }
+            Err(reason) => {
+                edge_mod_timing(
+                    format!("native cut-history prefix {prefix_len} validation"),
+                    validate_started,
+                );
+                recut_debug(format!(
+                    "prefix {prefix_len} validation failed after replay: {reason}"
+                ));
+                failures.push(format!("prefix {prefix_len} validation failed: {reason}"));
+            }
+        }
+    }
+    ReplayAttempt::Failed(if failures.is_empty() {
+        "native solve on replayed cut-history prefixes did not find the selected edge".to_string()
+    } else {
+        failures.join("; ")
+    })
+}
+
+fn edge_mod_has_replayable_cut_history(
+    body: &LiveBody,
+    selection: &EdgeModSelection,
+    replay: &EdgeModReplayIntent,
+) -> bool {
+    if matches!(replay.mode, EdgeModReplayMode::NativeOnly) || edge_mod_native_only(selection) {
+        return false;
+    }
+    let has_replay_intent = replay.pre_cut_target.is_some()
+        || !replay.replay_cut_nodes.is_empty()
+        || replay.selected_span.is_some();
+    has_replay_intent
+        && body
+            .cut_replay
+            .as_ref()
+            .is_some_and(|history| history.steps.iter().any(|step| step.tool.has_any_solid()))
 }
 
 pub(crate) fn edge_mod_try_native_fillet(
@@ -453,12 +1100,13 @@ pub(crate) fn edge_mod_try_native_fillet(
     selection: &EdgeModSelection,
     dist: f32,
     label: &str,
-    recut_tools: &[KernelSolid],
+    recut_tools: &[CutTool],
     circular_bite_locality: Option<CircularBiteLocality<'_>>,
 ) -> Result<KernelSolid, String> {
     let edge = &selection.active_edge;
     let mut failures = Vec::new();
     for (suffix, p0, p1) in [("", edge.p0, edge.p1), (" reversed", edge.p1, edge.p0)] {
+        let started = std::time::Instant::now();
         match crate::mock_kernel::fillet_edge_with_hint(
             fillet_part,
             p0,
@@ -483,6 +1131,7 @@ pub(crate) fn edge_mod_try_native_fillet(
             },
             Err(reason) => failures.push(format!("{label}{suffix} failed: {reason}")),
         }
+        edge_mod_timing(format!("native fillet {label}{suffix}"), started);
     }
     Err(failures.join("; "))
 }
@@ -517,25 +1166,6 @@ pub(crate) fn apply_chamfer(
         let mut accepted: Option<EdgeModResult> = None;
         let mut part_failures = Vec::new();
         let native_only = edge_mod_native_only(selection);
-        let prefer_rect_circle_recipe = !native_only
-            && sketch_region
-                .and_then(|region| region.rect_circle.as_ref())
-                .is_some();
-        if prefer_rect_circle_recipe {
-            if let Some(region) = sketch_region {
-                match edge_mod_rect_circle_precut_fallback(
-                    region,
-                    &part,
-                    selection,
-                    dist,
-                    crate::sketch::CornerKind::Chamfer,
-                    &reference_mesh,
-                ) {
-                    Ok(fallback) => accepted = Some(fallback),
-                    Err(reason) => part_failures.push(reason),
-                }
-            }
-        }
         let native_reason = if accepted.is_none() {
             match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
                 Ok(chamfered) => match edge_mod_accept_candidate_or_recut(
@@ -604,22 +1234,6 @@ pub(crate) fn apply_chamfer(
             }
         }
 
-        if accepted.is_none() && !native_only && !prefer_rect_circle_recipe {
-            if let Some(region) = sketch_region {
-                match edge_mod_rect_circle_precut_fallback(
-                    region,
-                    &part,
-                    selection,
-                    dist,
-                    crate::sketch::CornerKind::Chamfer,
-                    &reference_mesh,
-                ) {
-                    Ok(fallback) => accepted = Some(fallback),
-                    Err(reason) => part_failures.push(reason),
-                }
-            }
-        }
-
         if let Some(result) = accepted {
             applied = true;
             if let Some(mesh) = result.pristine {
@@ -641,6 +1255,8 @@ pub(crate) fn apply_chamfer(
         body.pristine =
             (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
         body.sketch_source = None;
+        body.cut_replay = None;
+        body.edge_mod_cut_history_path_used = false;
     } else {
         let reason = last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
         warnings.push(format!(
@@ -648,248 +1264,6 @@ pub(crate) fn apply_chamfer(
              body was left unchanged."
         ));
     }
-}
-
-pub(crate) fn edge_mod_rect_circle_precut_fallback(
-    region: &SketchExtrudeRegionSource,
-    original_part: &KernelSolid,
-    selection: &EdgeModSelection,
-    dist: f32,
-    kind: crate::sketch::CornerKind,
-    reference_mesh: &MockMesh,
-) -> Result<EdgeModResult, String> {
-    let edge = &selection.active_edge;
-    let (base, circle_cutter) = if let Some(canonical) = &region.rect_circle {
-        (canonical.base.clone(), canonical.cutter.clone())
-    } else if let Some((base, circle_cutter)) =
-        crate::mock_kernel::rect_minus_circle_region_base_and_cutter(
-            &region.boundary,
-            &region.holes,
-            region.depth,
-            &region.cs,
-        )
-    {
-        (base, circle_cutter)
-    } else {
-        return Err("pre-cut circular-bite fallback did not match this sketch region".to_string());
-    };
-    let mut circle_cutters = vec![("exact circle", circle_cutter)];
-    if let Some((_base, grown_cutter)) =
-        crate::mock_kernel::rect_minus_circle_region_base_and_grown_cutter(
-            &region.boundary,
-            &region.holes,
-            region.depth,
-            &region.cs,
-            CUT_WALL_GROW,
-        )
-    {
-        circle_cutters.push(("grown circle", grown_cutter));
-    }
-    if let Some((_base, faceted_cutter)) =
-        crate::mock_kernel::rect_minus_circle_region_base_and_faceted_cutter(
-            &region.boundary,
-            &region.holes,
-            region.depth,
-            &region.cs,
-            0.0,
-        )
-    {
-        circle_cutters.push(("faceted circle", faceted_cutter));
-    }
-    if let Some((_base, faceted_grown_cutter)) =
-        crate::mock_kernel::rect_minus_circle_region_base_and_faceted_cutter(
-            &region.boundary,
-            &region.holes,
-            region.depth,
-            &region.cs,
-            CUT_WALL_GROW,
-        )
-    {
-        circle_cutters.push(("faceted grown circle", faceted_grown_cutter));
-    }
-
-    let split_base = split_rect_base_for_edge(region, edge).unwrap_or_else(|| base.clone());
-    let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
-    let mut failures = Vec::new();
-
-    // Prefer the Fusion-style construction recipe for sketch circular bites:
-    // round/bevel the reconstructed base box edge first, then re-cut the analytic
-    // cylinder. Native edge mods on the already-cut body are kept as fallbacks
-    // because they can solve nearby cases, but they should not beat the canonical
-    // box-minus-cylinder route for an eligible rectangle+circle sketch.
-    let circular_bite_locality = Some(CircularBiteLocality {
-        region,
-        selection,
-        dist,
-        kind,
-    });
-    let try_circle_recuts =
-        |stage: &str, edge_cut_base: &KernelSolid, failures: &mut Vec<String>| {
-            for (cutter_label, cutter) in &circle_cutters {
-                match crate::mock_kernel::difference(edge_cut_base, cutter) {
-                    Some(result) => {
-                        let accepted = if cutter_label.contains("faceted") {
-                            edge_mod_accept_candidate_allow_cylinder_rebuild(
-                                reference_mesh,
-                                original_part,
-                                result,
-                            )
-                            .and_then(|candidate| {
-                                if let Some(locality) = circular_bite_locality {
-                                    edge_mod_circular_bite_locality(locality, &candidate)?;
-                                }
-                                Ok(candidate)
-                            })
-                        } else {
-                            edge_mod_accept_candidate_for_edge(
-                                reference_mesh,
-                                original_part,
-                                result,
-                                circular_bite_locality,
-                            )
-                        };
-                        match accepted {
-                            Ok(result) => return Some(EdgeModResult::single(result)),
-                            Err(reason) => failures
-                                .push(format!("{stage} {cutter_label} result rejected: {reason}")),
-                        }
-                    }
-                    None => failures.push(format!("{stage} {cutter_label} boolean failed")),
-                }
-            }
-            None
-        };
-
-    let split_base_reference = MockMesh::from_solid(&split_base);
-    if fillet {
-        // The faceted cutter is the reliable construction-aware route for a
-        // rectangle-minus-circle bite: round the base edge, then re-cut the circle.
-        // Try it before the rolling-ball solver so live previews do not stall here.
-        let base_reference = MockMesh::from_solid(&base);
-        for (label, cut_part, reference) in [
-            (
-                "pre-cut split-base cutter",
-                &split_base,
-                &split_base_reference,
-            ),
-            ("pre-cut base cutter", &base, &base_reference),
-        ] {
-            match edge_mod_fallback_cut_against_part(
-                cut_part, cut_part, edge, dist, kind, reference, label,
-            ) {
-                Ok(edge_cut_base) => {
-                    if let Some(result) = try_circle_recuts(label, &edge_cut_base, &mut failures) {
-                        return Ok(result);
-                    }
-                }
-                Err(reason) => failures.push(reason),
-            }
-        }
-        match edge_mod_fallback_cut_against_part(
-            original_part,
-            original_part,
-            edge,
-            dist,
-            kind,
-            reference_mesh,
-            "post-cut cutter ",
-        ) {
-            Ok(result) => {
-                match edge_mod_accept_candidate_for_edge(
-                    reference_mesh,
-                    original_part,
-                    result,
-                    circular_bite_locality,
-                ) {
-                    Ok(result) => return Ok(EdgeModResult::single(result)),
-                    Err(reason) => {
-                        failures.push(format!("post-cut cutter result rejected: {reason}"))
-                    }
-                }
-            }
-            Err(reason) => failures.push(reason),
-        }
-        return Err(if failures.is_empty() {
-            "pre-cut circular-bite fallback produced no candidate".to_string()
-        } else {
-            format!(
-                "pre-cut circular-bite fallback failed: {}",
-                failures.join("; ")
-            )
-        });
-    }
-
-    let native = crate::mock_kernel::chamfer_edge(&split_base, edge.p0, edge.p1, dist);
-    match native {
-        Ok(edge_cut_base) => {
-            if let Some(result) = try_circle_recuts("pre-cut native", &edge_cut_base, &mut failures)
-            {
-                return Ok(result);
-            }
-        }
-        Err(reason) => failures.push(format!("pre-cut native failed: {reason}")),
-    }
-
-    match edge_mod_fallback_cut_against_part(
-        &split_base,
-        &split_base,
-        edge,
-        dist,
-        kind,
-        &split_base_reference,
-        "pre-cut cutter ",
-    ) {
-        Ok(edge_cut_base) => {
-            if let Some(result) = try_circle_recuts("pre-cut cutter", &edge_cut_base, &mut failures)
-            {
-                return Ok(result);
-            }
-        }
-        Err(reason) => failures.push(reason),
-    }
-
-    let native_on_cut = crate::mock_kernel::chamfer_edge(original_part, edge.p0, edge.p1, dist);
-    match native_on_cut {
-        Ok(edge_modded) => {
-            if let Some(result) = try_circle_recuts("post-cut native", &edge_modded, &mut failures)
-            {
-                return Ok(result);
-            }
-        }
-        Err(reason) => failures.push(format!("post-cut native failed: {reason}")),
-    }
-
-    match edge_mod_fallback_cut_against_part(
-        original_part,
-        original_part,
-        edge,
-        dist,
-        kind,
-        reference_mesh,
-        "post-cut cutter ",
-    ) {
-        Ok(result) => {
-            match edge_mod_accept_candidate_for_edge(
-                reference_mesh,
-                original_part,
-                result,
-                circular_bite_locality,
-            ) {
-                Ok(result) => return Ok(EdgeModResult::single(result)),
-                Err(reason) => failures.push(format!("post-cut cutter result rejected: {reason}")),
-            }
-        }
-        Err(reason) => failures.push(reason),
-    }
-
-    Err(if failures.is_empty() {
-        "pre-cut circular-bite fallback produced no candidate".to_string()
-    } else {
-        format!(
-            "pre-cut circular-bite fallback failed: {}",
-            failures.join("; ")
-        )
-    })
 }
 
 pub(crate) fn split_rect_base_for_edge(
@@ -980,6 +1354,137 @@ pub(crate) fn split_rect_base_for_edge(
     crate::mock_kernel::extruded_region_solid(&profile, &[], region.depth, &region.cs)
 }
 
+fn split_rect_base_parts_for_edge(
+    region: &SketchExtrudeRegionSource,
+    edge: &EdgeRef,
+    runout: f32,
+) -> Option<PreCutSplit> {
+    let ((min_x, min_y), (max_x, max_y)) = loop_bounds_2d(&region.boundary)?;
+    let p0 = region
+        .cs
+        .project(Vec3::new(edge.p0[0], edge.p0[1], edge.p0[2]));
+    let p1 = region
+        .cs
+        .project(Vec3::new(edge.p1[0], edge.p1[1], edge.p1[2]));
+    let edge_depth = {
+        let depth_at = |world: [f32; 3], local: (f32, f32)| {
+            let on_plane = region.cs.unproject(local.0, local.1);
+            Vec3::new(world[0], world[1], world[2])
+                .sub(on_plane)
+                .dot(region.cs.n)
+        };
+        (depth_at(edge.p0, p0) + depth_at(edge.p1, p1)) * 0.5
+    };
+    let side_eps = 0.12;
+    let min_span = 1.0e-3;
+    let push_piece = |parts: &mut Vec<KernelSolid>, x0: f32, y0: f32, x1: f32, y1: f32| {
+        if x1 <= x0 + min_span || y1 <= y0 + min_span {
+            return;
+        }
+        let boundary = vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+        if let Some(part) =
+            crate::mock_kernel::extruded_region_solid(&boundary, &[], region.depth, &region.cs)
+        {
+            parts.push(part);
+        }
+    };
+    let make_edge = |along0: f32, along1: f32, fixed: f32, along_x: bool| {
+        let local_p0 = if along_x {
+            (along0, fixed)
+        } else {
+            (fixed, along0)
+        };
+        let local_p1 = if along_x {
+            (along1, fixed)
+        } else {
+            (fixed, along1)
+        };
+        let world_at = |local: (f32, f32)| {
+            let p = region
+                .cs
+                .unproject(local.0, local.1)
+                .add(region.cs.n.mul(edge_depth));
+            [p.x, p.y, p.z]
+        };
+        let mut construction = edge.clone();
+        construction.p0 = world_at(local_p0);
+        construction.p1 = world_at(local_p1);
+        construction.curve = None;
+        construction.topology = None;
+        construction
+    };
+    let interval_parts = |lo: f32,
+                          hi: f32,
+                          min_a: f32,
+                          max_a: f32,
+                          min_b: f32,
+                          max_b: f32,
+                          fixed: f32,
+                          along_x: bool| {
+        let selected_lo = lo.min(hi);
+        let selected_hi = lo.max(hi);
+        let lo = (selected_lo - runout).max(min_a).min(max_a);
+        let hi = (selected_hi + runout).max(min_a).min(max_a);
+        if hi <= lo + min_span {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if along_x {
+            push_piece(&mut parts, lo, min_b, hi, max_b);
+            push_piece(&mut parts, min_a, min_b, lo, max_b);
+            push_piece(&mut parts, hi, min_b, max_a, max_b);
+        } else {
+            push_piece(&mut parts, min_b, lo, max_b, hi);
+            push_piece(&mut parts, min_b, min_a, max_b, lo);
+            push_piece(&mut parts, min_b, hi, max_b, max_a);
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let edge_lo = if p0.0 <= p1.0 || p0.1 <= p1.1 { lo } else { hi };
+        let edge_hi = if p0.0 <= p1.0 || p0.1 <= p1.1 { hi } else { lo };
+        Some(PreCutSplit {
+            parts,
+            edge: make_edge(edge_lo, edge_hi, fixed, along_x),
+            split_found: true,
+        })
+    };
+
+    if (p0.1 - min_y).abs() <= side_eps && (p1.1 - min_y).abs() <= side_eps {
+        let lo = p0.0.min(p1.0);
+        let hi = p0.0.max(p1.0);
+        interval_parts(lo, hi, min_x, max_x, min_y, max_y, min_y, true)
+    } else if (p0.1 - max_y).abs() <= side_eps && (p1.1 - max_y).abs() <= side_eps {
+        let lo = p0.0.min(p1.0);
+        let hi = p0.0.max(p1.0);
+        interval_parts(lo, hi, min_x, max_x, min_y, max_y, max_y, true)
+    } else if (p0.0 - min_x).abs() <= side_eps && (p1.0 - min_x).abs() <= side_eps {
+        let lo = p0.1.min(p1.1);
+        let hi = p0.1.max(p1.1);
+        interval_parts(lo, hi, min_y, max_y, min_x, max_x, min_x, false)
+    } else if (p0.0 - max_x).abs() <= side_eps && (p1.0 - max_x).abs() <= side_eps {
+        let lo = p0.1.min(p1.1);
+        let hi = p0.1.max(p1.1);
+        interval_parts(lo, hi, min_y, max_y, min_x, max_x, max_x, false)
+    } else {
+        None
+    }
+}
+
+fn imprinted_rect_base_for_edge(
+    region: &SketchExtrudeRegionSource,
+    edge: &EdgeRef,
+    runout: f32,
+) -> Option<PreCutSplit> {
+    let split = split_rect_base_parts_for_edge(region, edge, runout)?;
+    let solid = split_rect_base_for_edge(region, &split.edge)?;
+    Some(PreCutSplit {
+        parts: vec![solid],
+        edge: split.edge,
+        split_found: false,
+    })
+}
+
 pub(crate) fn loop_bounds_2d(points: &[(f32, f32)]) -> Option<((f32, f32), (f32, f32))> {
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
@@ -1043,52 +1548,50 @@ pub(crate) fn edge_mod_fallback_cut_against_part(
     reference_mesh: &MockMesh,
     label_prefix: &str,
 ) -> Result<KernelSolid, String> {
+    edge_mod_fallback_cut_candidates_against_part(
+        cut_part,
+        original_part,
+        edge,
+        dist,
+        kind,
+        reference_mesh,
+        label_prefix,
+        |_label, candidate, _failures| Some(candidate),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn edge_mod_fallback_cut_candidates_against_part<T>(
+    cut_part: &KernelSolid,
+    original_part: &KernelSolid,
+    edge: &EdgeRef,
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+    reference_mesh: &MockMesh,
+    label_prefix: &str,
+    mut try_candidate: impl FnMut(&str, KernelSolid, &mut Vec<String>) -> Option<T>,
+) -> Result<T, String> {
     let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
     let robust_overshoot = EDGE_MOD_END_OVERSHOOT;
     let mut failures = Vec::new();
-    for (label, grow, end_overshoot) in [
-        ("exact cutter", 0.0, 0.0),
-        ("grown cutter", EDGE_MOD_GROW, 0.0),
-        ("overshot cutter", 0.0, robust_overshoot),
-        ("robust cutter", EDGE_MOD_GROW, robust_overshoot),
+    for (orientation, cutter_edge) in [
+        ("", edge.clone()),
+        (" reversed", reversed_edge_ref_for_cutter(edge)),
     ] {
-        let Some(cutter) = crate::mock_kernel::edge_corner_cutter(
-            edge.p0,
-            edge.p1,
-            edge.n1,
-            edge.n2,
-            dist,
-            fillet,
-            EDGE_FILLET_SEGS,
-            grow,
-            end_overshoot,
-        ) else {
-            failures.push(format!("{label} could not be built"));
-            continue;
-        };
-        let Some(result) = crate::mock_kernel::difference(cut_part, &cutter) else {
-            failures.push(format!("{label} boolean failed"));
-            continue;
-        };
-        match edge_mod_accept_candidate(reference_mesh, original_part, result) {
-            Ok(result) => return Ok(result),
-            Err(reason) => failures.push(format!("{label} rejected: {reason}")),
-        }
-    }
-
-    if fillet {
         for (label, grow, end_overshoot) in [
-            ("piecewise exact cutter", 0.0, 0.0),
-            ("piecewise grown cutter", EDGE_MOD_GROW, 0.0),
-            ("piecewise robust cutter", EDGE_MOD_GROW, robust_overshoot),
+            ("exact cutter", 0.0, 0.0),
+            ("grown cutter", EDGE_MOD_GROW, 0.0),
+            ("overshot cutter", 0.0, robust_overshoot),
+            ("robust cutter", EDGE_MOD_GROW, robust_overshoot),
         ] {
-            let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
-                edge.p0,
-                edge.p1,
-                edge.n1,
-                edge.n2,
+            let label = format!("{label_prefix}{label}{orientation}");
+            let Some(cutter) = crate::mock_kernel::edge_corner_cutter(
+                cutter_edge.p0,
+                cutter_edge.p1,
+                cutter_edge.n1,
+                cutter_edge.n2,
                 dist,
-                true,
+                fillet,
                 EDGE_FILLET_SEGS,
                 grow,
                 end_overshoot,
@@ -1096,74 +1599,114 @@ pub(crate) fn edge_mod_fallback_cut_against_part(
                 failures.push(format!("{label} could not be built"));
                 continue;
             };
-
-            let mut result = cut_part.clone();
-            let mut failed = None;
-            for cutter in pieces {
-                match crate::mock_kernel::difference(&result, &cutter) {
-                    Some(next) => result = next,
-                    None => {
-                        failed = Some(format!("{label} boolean failed"));
-                        break;
+            let Some(result) = crate::mock_kernel::difference(cut_part, &cutter) else {
+                failures.push(format!("{label} boolean failed"));
+                continue;
+            };
+            match edge_mod_accept_candidate(reference_mesh, original_part, result) {
+                Ok(result) => {
+                    if let Some(accepted) = try_candidate(&label, result, &mut failures) {
+                        return Ok(accepted);
                     }
                 }
-            }
-            if let Some(reason) = failed {
-                failures.push(reason);
-                continue;
-            }
-
-            match edge_mod_accept_candidate(reference_mesh, original_part, result) {
-                Ok(result) => return Ok(result),
                 Err(reason) => failures.push(format!("{label} rejected: {reason}")),
             }
         }
 
-        for trim in [0.05, EDGE_MOD_GROW, 0.5] {
-            let Some(trimmed) = trimmed_edge_ref(edge, trim) else {
-                failures.push(format!(
-                    "trimmed piecewise cutter {trim:.2} could not be built"
-                ));
-                continue;
-            };
-            let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
-                trimmed.p0,
-                trimmed.p1,
-                trimmed.n1,
-                trimmed.n2,
-                dist,
-                true,
-                EDGE_FILLET_SEGS,
-                EDGE_MOD_GROW,
-                0.0,
-            ) else {
-                failures.push(format!(
-                    "trimmed piecewise cutter {trim:.2} could not be built"
-                ));
-                continue;
-            };
+        if fillet {
+            for (label, grow, end_overshoot) in [
+                ("piecewise exact cutter", 0.0, 0.0),
+                ("piecewise grown cutter", EDGE_MOD_GROW, 0.0),
+                ("piecewise robust cutter", EDGE_MOD_GROW, robust_overshoot),
+            ] {
+                let label = format!("{label_prefix}{label}{orientation}");
+                let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
+                    cutter_edge.p0,
+                    cutter_edge.p1,
+                    cutter_edge.n1,
+                    cutter_edge.n2,
+                    dist,
+                    true,
+                    EDGE_FILLET_SEGS,
+                    grow,
+                    end_overshoot,
+                ) else {
+                    failures.push(format!("{label} could not be built"));
+                    continue;
+                };
 
-            let mut result = cut_part.clone();
-            let mut failed = None;
-            for cutter in pieces {
-                match crate::mock_kernel::difference(&result, &cutter) {
-                    Some(next) => result = next,
-                    None => {
-                        failed = Some(format!("trimmed piecewise cutter {trim:.2} boolean failed"));
-                        break;
+                let mut result = cut_part.clone();
+                let mut failed = None;
+                for cutter in pieces {
+                    match crate::mock_kernel::difference(&result, &cutter) {
+                        Some(next) => result = next,
+                        None => {
+                            failed = Some(format!("{label} boolean failed"));
+                            break;
+                        }
                     }
                 }
-            }
-            if let Some(reason) = failed {
-                failures.push(reason);
-                continue;
+                if let Some(reason) = failed {
+                    failures.push(reason);
+                    continue;
+                }
+
+                match edge_mod_accept_candidate(reference_mesh, original_part, result) {
+                    Ok(result) => {
+                        if let Some(accepted) = try_candidate(&label, result, &mut failures) {
+                            return Ok(accepted);
+                        }
+                    }
+                    Err(reason) => failures.push(format!("{label} rejected: {reason}")),
+                }
             }
 
-            match edge_mod_accept_candidate(reference_mesh, original_part, result) {
-                Ok(result) => return Ok(result),
-                Err(reason) => failures.push(format!(
-                    "trimmed piecewise cutter {trim:.2} rejected: {reason}"
-                )),
+            for trim in [0.05, EDGE_MOD_GROW, 0.5] {
+                let label =
+                    format!("{label_prefix}trimmed piecewise cutter {trim:.2}{orientation}");
+                let Some(trimmed) = trimmed_edge_ref(&cutter_edge, trim) else {
+                    failures.push(format!("{label} could not be built"));
+                    continue;
+                };
+                let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
+                    trimmed.p0,
+                    trimmed.p1,
+                    trimmed.n1,
+                    trimmed.n2,
+                    dist,
+                    true,
+                    EDGE_FILLET_SEGS,
+                    EDGE_MOD_GROW,
+                    0.0,
+                ) else {
+                    failures.push(format!("{label} could not be built"));
+                    continue;
+                };
+
+                let mut result = cut_part.clone();
+                let mut failed = None;
+                for cutter in pieces {
+                    match crate::mock_kernel::difference(&result, &cutter) {
+                        Some(next) => result = next,
+                        None => {
+                            failed = Some(format!("{label} boolean failed"));
+                            break;
+                        }
+                    }
+                }
+                if let Some(reason) = failed {
+                    failures.push(reason);
+                    continue;
+                }
+
+                match edge_mod_accept_candidate(reference_mesh, original_part, result) {
+                    Ok(result) => {
+                        if let Some(accepted) = try_candidate(&label, result, &mut failures) {
+                            return Ok(accepted);
+                        }
+                    }
+                    Err(reason) => failures.push(format!("{label} rejected: {reason}")),
+                }
             }
         }
     }
@@ -1171,8 +1714,14 @@ pub(crate) fn edge_mod_fallback_cut_against_part(
     Err(if failures.is_empty() {
         "no fallback candidate was produced".to_string()
     } else {
-        format!("{label_prefix}{}", failures.join("; "))
+        failures.join("; ")
     })
+}
+
+pub(crate) fn reversed_edge_ref_for_cutter(edge: &EdgeRef) -> EdgeRef {
+    let mut reversed = edge.clone();
+    std::mem::swap(&mut reversed.p0, &mut reversed.p1);
+    reversed
 }
 
 pub(crate) fn sketch_source_alternate_parts(
@@ -1267,7 +1816,7 @@ pub(crate) fn edge_mod_accept_candidate_or_recut(
     reference_mesh: &MockMesh,
     original_part: &KernelSolid,
     candidate: KernelSolid,
-    recut_tools: &[KernelSolid],
+    recut_tools: &[CutTool],
     circular_bite_locality: Option<CircularBiteLocality<'_>>,
 ) -> Result<KernelSolid, String> {
     let first_reason = match edge_mod_accept_candidate_for_edge(
@@ -1281,21 +1830,20 @@ pub(crate) fn edge_mod_accept_candidate_or_recut(
     };
 
     let mut failures = Vec::new();
-    for tool in recut_tools {
-        match crate::mock_kernel::difference(&candidate, tool) {
-            Some(recut) => {
-                match edge_mod_accept_candidate_for_edge(
-                    reference_mesh,
-                    original_part,
-                    recut,
-                    circular_bite_locality,
-                ) {
-                    Ok(recut) => return Ok(recut),
-                    Err(reason) => failures.push(format!("recut result rejected: {reason}")),
-                }
+    match recut_candidate_with_tools(candidate, recut_tools) {
+        Ok(Some(recut)) => {
+            match edge_mod_accept_candidate_for_edge(
+                reference_mesh,
+                original_part,
+                recut,
+                circular_bite_locality,
+            ) {
+                Ok(recut) => return Ok(recut),
+                Err(reason) => failures.push(format!("recut result rejected: {reason}")),
             }
-            None => failures.push("recut boolean failed".to_string()),
         }
+        Ok(None) => {}
+        Err(reason) => failures.push(format!("recut boolean failed: {reason}")),
     }
 
     if failures.is_empty() {
@@ -1342,12 +1890,158 @@ pub(crate) fn edge_mod_circular_bite_locality(
     edge_mod_circular_bite_locality_mesh(locality, &candidate_mesh)
 }
 
+fn edge_mod_circular_bite_replay_runout_guard(
+    body: &LiveBody,
+    history: &CutReplayHistory,
+    selection: &EdgeModSelection,
+    dist: f32,
+) -> Result<(), String> {
+    let check_source = |source: &SketchExtrudeSource| -> Result<(), String> {
+        for region in &source.regions {
+            let Some(limit) = circular_bite_selected_side_runout_limit(region, selection) else {
+                continue;
+            };
+            if dist > limit + 0.05 {
+                return Err(format!(
+                    "selected circular-bite side has only {limit:.3} mm of straight runout before the curved cut wall"
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(source) = body.sketch_source.as_ref() {
+        check_source(source)?;
+    }
+    if let Some(source) = history.base_sketch_source.as_ref() {
+        check_source(source)?;
+    }
+    Ok(())
+}
+
+fn circular_bite_selected_side_runout_limit(
+    region: &SketchExtrudeRegionSource,
+    selection: &EdgeModSelection,
+) -> Option<f32> {
+    let bite = circular_bite_void_from_region(region)?;
+    let edge = &selection.active_edge;
+    if !matches!(edge.curve.as_ref(), None | Some(EdgeCurveHint::Line)) {
+        return None;
+    }
+
+    let p0_world = Vec3::new(edge.p0[0], edge.p0[1], edge.p0[2]);
+    let p1_world = Vec3::new(edge.p1[0], edge.p1[1], edge.p1[2]);
+    let p0 = region.cs.project(p0_world);
+    let p1 = region.cs.project(p1_world);
+    let offset0 = p0_world
+        .sub(region.cs.unproject(p0.0, p0.1))
+        .dot(region.cs.n);
+    let offset1 = p1_world
+        .sub(region.cs.unproject(p1.0, p1.1))
+        .dot(region.cs.n);
+    let offset = (offset0 + offset1) * 0.5;
+    let cap_tol = 0.2;
+    if offset.abs() > cap_tol && (offset - region.depth).abs() > cap_tol {
+        return None;
+    }
+
+    let side_eps = 0.12;
+    let (along_min, along_max, fixed, center_fixed, center_along, fixed0, fixed1, along0, along1) =
+        match bite.side {
+            0 => (
+                bite.rect_min.1,
+                bite.rect_max.1,
+                bite.rect_min.0,
+                bite.circle_center.0,
+                bite.circle_center.1,
+                p0.0,
+                p1.0,
+                p0.1,
+                p1.1,
+            ),
+            1 => (
+                bite.rect_min.1,
+                bite.rect_max.1,
+                bite.rect_max.0,
+                bite.circle_center.0,
+                bite.circle_center.1,
+                p0.0,
+                p1.0,
+                p0.1,
+                p1.1,
+            ),
+            2 => (
+                bite.rect_min.0,
+                bite.rect_max.0,
+                bite.rect_min.1,
+                bite.circle_center.1,
+                bite.circle_center.0,
+                p0.1,
+                p1.1,
+                p0.0,
+                p1.0,
+            ),
+            _ => (
+                bite.rect_min.0,
+                bite.rect_max.0,
+                bite.rect_max.1,
+                bite.circle_center.1,
+                bite.circle_center.0,
+                p0.1,
+                p1.1,
+                p0.0,
+                p1.0,
+            ),
+        };
+    if (fixed0 - fixed).abs() > side_eps || (fixed1 - fixed).abs() > side_eps {
+        return None;
+    }
+
+    let fixed_delta = fixed - center_fixed;
+    let hit_sq = bite.circle_radius * bite.circle_radius - fixed_delta * fixed_delta;
+    if hit_sq <= 0.0 {
+        return None;
+    }
+    let hit_span = hit_sq.sqrt();
+    let hit_lo = (center_along - hit_span).clamp(along_min, along_max);
+    let hit_hi = (center_along + hit_span).clamp(along_min, along_max);
+    if hit_hi <= hit_lo + 0.15 {
+        return None;
+    }
+
+    let sel_lo = along0.min(along1);
+    let sel_hi = along0.max(along1);
+    let selected_len = sel_hi - sel_lo;
+    if selected_len <= 0.15 {
+        return None;
+    }
+
+    let match_segment = |seg_lo: f32, seg_hi: f32, circle_end: f32| {
+        if seg_hi <= seg_lo + 0.15 {
+            return None;
+        }
+        let selected_inside_segment = sel_lo >= seg_lo - side_eps && sel_hi <= seg_hi + side_eps;
+        let selected_touches_circle =
+            (sel_lo - circle_end).abs() <= side_eps || (sel_hi - circle_end).abs() <= side_eps;
+        (selected_inside_segment && selected_touches_circle).then_some(selected_len)
+    };
+
+    match_segment(along_min, hit_lo, hit_lo).or_else(|| match_segment(hit_hi, along_max, hit_hi))
+}
+
 pub(crate) fn edge_mod_circular_bite_locality_mesh(
     locality: CircularBiteLocality<'_>,
     candidate_mesh: &MockMesh,
 ) -> Result<(), String> {
     let region = locality.region;
     let selection = locality.selection;
+    let ghost_samples = edge_mod_circular_bite_void_ghost_sample_count(region, candidate_mesh);
+    if ghost_samples > 0 {
+        return Err(format!(
+            "candidate placed {ghost_samples} non-wall sample(s) inside the removed circular-bite volume"
+        ));
+    }
+
     for (p0, p1) in circular_bite_unselected_side_segments(region, selection) {
         if !mesh_wire_path_covers(candidate_mesh, p0, p1, 0.08) {
             return Err(format!(
@@ -1377,6 +2071,200 @@ pub(crate) fn edge_mod_circular_bite_locality_mesh(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CircularBiteVoid {
+    pub(crate) rect_min: (f32, f32),
+    pub(crate) rect_max: (f32, f32),
+    pub(crate) circle_center: (f32, f32),
+    pub(crate) circle_radius: f32,
+    pub(crate) side: usize,
+}
+
+pub(crate) fn edge_mod_circular_bite_void_ghost_sample_count(
+    region: &SketchExtrudeRegionSource,
+    candidate_mesh: &MockMesh,
+) -> usize {
+    let Some(bite) = circular_bite_void_from_region(region) else {
+        return 0;
+    };
+
+    let vertex6 = |vi: u32| {
+        let b = vi as usize * 6;
+        [
+            candidate_mesh.vertices[b],
+            candidate_mesh.vertices[b + 1],
+            candidate_mesh.vertices[b + 2],
+            candidate_mesh.vertices[b + 3],
+            candidate_mesh.vertices[b + 4],
+            candidate_mesh.vertices[b + 5],
+        ]
+    };
+    let mut count = 0usize;
+    for v in candidate_mesh.vertices.chunks_exact(6) {
+        let sample = [v[0], v[1], v[2], v[3], v[4], v[5]];
+        if circular_bite_void_contains_non_wall_sample(region, bite, sample) {
+            count += 1;
+        }
+    }
+    for tri in candidate_mesh.indices.chunks_exact(3) {
+        let a = vertex6(tri[0]);
+        let b = vertex6(tri[1]);
+        let c = vertex6(tri[2]);
+        let sample = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+            (a[3] + b[3] + c[3]) / 3.0,
+            (a[4] + b[4] + c[4]) / 3.0,
+            (a[5] + b[5] + c[5]) / 3.0,
+        ];
+        if circular_bite_void_contains_non_wall_sample(region, bite, sample) {
+            count += 1;
+        }
+    }
+    count
+}
+
+pub(crate) fn circular_bite_void_from_region(
+    region: &SketchExtrudeRegionSource,
+) -> Option<CircularBiteVoid> {
+    region.rect_circle.as_ref()?;
+    let (rect_min, rect_max, circle_center, circle_radius) =
+        crate::mock_kernel::rect_minus_circle_region_primitives(&region.boundary, &region.holes)?;
+    let side = circular_bite_side_for_region(
+        &region.boundary,
+        rect_min,
+        rect_max,
+        circle_center,
+        circle_radius,
+    )?;
+    Some(CircularBiteVoid {
+        rect_min,
+        rect_max,
+        circle_center,
+        circle_radius,
+        side,
+    })
+}
+
+fn circular_bite_side_for_region(
+    boundary: &[(f32, f32)],
+    rect_min: (f32, f32),
+    rect_max: (f32, f32),
+    circle_center: (f32, f32),
+    circle_radius: f32,
+) -> Option<usize> {
+    let circle_tol = (0.02 * circle_radius).max(0.12);
+    let near_circle = |p: (f32, f32)| {
+        ((p.0 - circle_center.0).hypot(p.1 - circle_center.1) - circle_radius).abs() <= circle_tol
+    };
+    let side_hits = |side: usize| {
+        boundary
+            .iter()
+            .filter(|&&p| {
+                let on_side = match side {
+                    0 => (p.0 - rect_min.0).abs() <= 0.08,
+                    1 => (p.0 - rect_max.0).abs() <= 0.08,
+                    2 => (p.1 - rect_min.1).abs() <= 0.08,
+                    _ => (p.1 - rect_max.1).abs() <= 0.08,
+                };
+                on_side && near_circle(p)
+            })
+            .count()
+    };
+    (0..4)
+        .map(|side| (side, side_hits(side)))
+        .max_by_key(|&(_, hits)| hits)
+        .and_then(|(side, hits)| (hits >= 2).then_some(side))
+}
+
+fn circular_bite_void_contains_non_wall_sample(
+    region: &SketchExtrudeRegionSource,
+    bite: CircularBiteVoid,
+    sample: [f32; 6],
+) -> bool {
+    let world = Vec3::new(sample[0], sample[1], sample[2]);
+    let local = region.cs.project(world);
+    let on_plane = region.cs.unproject(local.0, local.1);
+    let depth = world.sub(on_plane).dot(region.cs.n);
+    let depth_min = 0.0_f32.min(region.depth) - 0.05;
+    let depth_max = 0.0_f32.max(region.depth) + 0.05;
+    if depth < depth_min || depth > depth_max {
+        return false;
+    }
+
+    let side_margin = 0.10_f32.max(bite.circle_radius * 0.01);
+    if !point_inside_rect(local, bite.rect_min, bite.rect_max, side_margin)
+        || !point_on_circular_bite_material_side(local, bite, side_margin)
+    {
+        return false;
+    }
+
+    let radial = (local.0 - bite.circle_center.0).hypot(local.1 - bite.circle_center.1);
+    let empty_margin = (bite.circle_radius * 0.07).clamp(0.35, 1.0);
+    if radial >= bite.circle_radius - empty_margin {
+        return false;
+    }
+
+    let normal = Vec3::new(sample[3], sample[4], sample[5]);
+    !circular_bite_wall_chord_sample(region, bite, local, normal, radial)
+}
+
+fn point_inside_rect(
+    p: (f32, f32),
+    rect_min: (f32, f32),
+    rect_max: (f32, f32),
+    margin: f32,
+) -> bool {
+    p.0 >= rect_min.0 - margin
+        && p.0 <= rect_max.0 + margin
+        && p.1 >= rect_min.1 - margin
+        && p.1 <= rect_max.1 + margin
+}
+
+fn point_on_circular_bite_material_side(
+    p: (f32, f32),
+    bite: CircularBiteVoid,
+    margin: f32,
+) -> bool {
+    match bite.side {
+        0 => p.0 > bite.rect_min.0 + margin,
+        1 => p.0 < bite.rect_max.0 - margin,
+        2 => p.1 > bite.rect_min.1 + margin,
+        _ => p.1 < bite.rect_max.1 - margin,
+    }
+}
+
+fn circular_bite_wall_chord_sample(
+    region: &SketchExtrudeRegionSource,
+    bite: CircularBiteVoid,
+    local: (f32, f32),
+    normal: Vec3,
+    radial: f32,
+) -> bool {
+    let wall_band = (bite.circle_radius * 0.15).clamp(0.75, 2.0);
+    if radial < bite.circle_radius - wall_band || radial > bite.circle_radius + 0.25 {
+        return false;
+    }
+
+    let normal_in_plane = (normal.dot(region.cs.u), normal.dot(region.cs.v));
+    let normal_depth = normal.dot(region.cs.n).abs();
+    if normal_depth > 0.55 {
+        return false;
+    }
+    let nl = (normal_in_plane.0 * normal_in_plane.0 + normal_in_plane.1 * normal_in_plane.1).sqrt();
+    if nl <= 1.0e-5 || radial <= 1.0e-5 {
+        return false;
+    }
+    let radial_vec = (
+        local.0 - bite.circle_center.0,
+        local.1 - bite.circle_center.1,
+    );
+    let dot = (radial_vec.0 / radial) * (normal_in_plane.0 / nl)
+        + (radial_vec.1 / radial) * (normal_in_plane.1 / nl);
+    dot.abs() > 0.75
 }
 
 pub(crate) fn edge_mod_selected_blend_present(
@@ -1749,33 +2637,6 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh(
     Ok((candidate, Some(candidate_mesh)))
 }
 
-pub(crate) fn edge_mod_accept_candidate_allow_cylinder_rebuild(
-    reference_mesh: &MockMesh,
-    original_part: &KernelSolid,
-    candidate: KernelSolid,
-) -> Result<KernelSolid, String> {
-    if !edge_mod_keeps_body(original_part, &candidate) {
-        return Err("candidate expands outside the original part bounds".to_string());
-    }
-    if let Some((lo, hi)) = mesh_position_aabb(reference_mesh) {
-        if mesh_is_aabb_box(reference_mesh, lo, hi, EDGE_MOD_CONTAINMENT_TOL) {
-            return Ok(candidate);
-        }
-    }
-    let candidate_mesh = MockMesh::from_solid(&candidate);
-    if candidate_mesh.indices.is_empty() {
-        return Err("candidate tessellated to an empty mesh".to_string());
-    }
-    edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
-    edge_mod_mesh_stays_inside_reference(
-        reference_mesh,
-        &candidate_mesh,
-        EDGE_MOD_CONTAINMENT_TOL,
-        None,
-    )?;
-    Ok(candidate)
-}
-
 pub(crate) fn edge_mod_render_mesh_has_no_cracks(mesh: &MockMesh) -> Result<(), String> {
     let q = |i: usize| -> (i64, i64, i64) {
         let b = i * 6;
@@ -1846,6 +2707,47 @@ pub(crate) fn edge_mod_render_mesh_nonmanifold_edges(mesh: &MockMesh) -> usize {
         }
     }
     edges.values().filter(|&&count| count > 2).count()
+}
+
+pub(crate) fn edge_mod_render_mesh_inward_triangles(mesh: &MockMesh) -> usize {
+    let mut inward = 0;
+    let pos = |i: u32| {
+        let b = i as usize * 6;
+        [
+            mesh.vertices[b] as f64,
+            mesh.vertices[b + 1] as f64,
+            mesh.vertices[b + 2] as f64,
+        ]
+    };
+    let nrm = |i: u32| {
+        let b = i as usize * 6;
+        [
+            mesh.vertices[b + 3] as f64,
+            mesh.vertices[b + 4] as f64,
+            mesh.vertices[b + 5] as f64,
+        ]
+    };
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = pos(tri[0]);
+        let b = pos(tri[1]);
+        let c = pos(tri[2]);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let winding = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let navg = [
+            (nrm(tri[0])[0] + nrm(tri[1])[0] + nrm(tri[2])[0]) / 3.0,
+            (nrm(tri[0])[1] + nrm(tri[1])[1] + nrm(tri[2])[1]) / 3.0,
+            (nrm(tri[0])[2] + nrm(tri[1])[2] + nrm(tri[2])[2]) / 3.0,
+        ];
+        if winding[0] * navg[0] + winding[1] * navg[1] + winding[2] * navg[2] < 0.0 {
+            inward += 1;
+        }
+    }
+    inward
 }
 
 #[cfg(test)]
@@ -1921,6 +2823,52 @@ pub(crate) fn edge_mod_mesh_stays_inside_reference(
             }
             return Err(format!(
                 "candidate triangle {i} centroid at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body",
+                p[0], p[1], p[2]
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn edge_mod_mesh_stays_inside_reference_bounds(
+    reference_mesh: &MockMesh,
+    candidate_mesh: &MockMesh,
+    tol: f32,
+) -> Result<(), String> {
+    if reference_mesh.indices.is_empty() {
+        return Err("reference body could not be tessellated".to_string());
+    }
+    if candidate_mesh.indices.is_empty() {
+        return Err("candidate body could not be tessellated".to_string());
+    }
+
+    let Some((lo, hi)) = mesh_position_aabb(reference_mesh) else {
+        return Err("reference body has no render vertices".to_string());
+    };
+
+    for (i, v) in candidate_mesh.vertices.chunks_exact(6).enumerate() {
+        let p = [v[0], v[1], v[2]];
+        if !point_in_aabb(p, lo, hi, tol) {
+            return Err(format!(
+                "candidate vertex {i} at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body bounds",
+                p[0], p[1], p[2]
+            ));
+        }
+    }
+
+    for (i, tri) in candidate_mesh.indices.chunks_exact(3).enumerate() {
+        let a = mesh_vertex_pos6(candidate_mesh, tri[0]);
+        let b = mesh_vertex_pos6(candidate_mesh, tri[1]);
+        let c = mesh_vertex_pos6(candidate_mesh, tri[2]);
+        let p = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
+        if !point_in_aabb(p, lo, hi, tol) {
+            return Err(format!(
+                "candidate triangle {i} centroid at [{:.3}, {:.3}, {:.3}] is outside the pre-edge body bounds",
                 p[0], p[1], p[2]
             ));
         }

@@ -5,13 +5,10 @@
 //! crosses) it, commit the curve as edges and split the face into the resulting
 //! sub-regions.
 //!
-//! Today [`imprint_curve_on_face`] reproduces the two cases the boolean split
-//! pass has always handled — a clean two-point cross-cut, and a closed curve
-//! drilling a hole — and leaves every other topology (entry-only, weave, open
-//! interior curves) untouched. Those "partial imprint" cases are generalised in
-//! a later milestone; the function is extracted here first so the
-//! generalisation lands in one place and both call sites (booleans now, blends
-//! later) share it.
+//! [`imprint_curve_on_face`] records open curve segments as split edges and lets
+//! the boolean partition pass consume the complete per-face graph at once. This
+//! matters for curved faces where one real intersection can arrive as several
+//! trimmed pieces before it reaches both boundaries.
 
 use openrcad_foundation::Pnt;
 use openrcad_geom::{Curve, GeomCurve, Surface};
@@ -21,20 +18,23 @@ use openrcad_topo::{BRepBuilder, Face, FaceId, LoopId, Orientation};
 use crate::boolean::project_point_on_curve;
 use crate::intersect::{curve_curve, is_inside_trimming_loops, uv_of};
 
+fn imprint_tolerance(tol: f64) -> f64 {
+    tol.max(1e-4)
+}
+
 /// Imprint `curve` onto `face_id` and return the resulting sub-face ids.
 ///
-/// Handles a clean two-point cross-cut (the curve enters and exits the outer
-/// loop) by inserting a split edge and bisecting the face, and a closed curve
-/// lying fully inside the loop by drilling a hole (the face gains an inner wire
-/// and the enclosed disk becomes its own face). Any other topology currently
-/// leaves the face unchanged — returned as `vec![face_id]` — which the boolean
-/// pipeline tolerates (the face simply is not partitioned by this curve).
+/// Handles a closed curve lying fully inside the loop by drilling a hole (the
+/// face gains an inner wire and the enclosed disk becomes its own face). Open
+/// segments are returned as split edges to be partitioned together after all
+/// face-pair intersections have been imprinted.
 pub(crate) fn imprint_curve_on_face(
     builder: &mut BRepBuilder,
     face_id: FaceId,
     curve: &GeomCurve,
     first: f64,
     last: f64,
+    force_queue_clean_crosscuts: bool,
     tol: f64,
 ) -> (Vec<FaceId>, Vec<EdgeId>) {
     let face_data = match builder.brep().faces.get(face_id) {
@@ -143,18 +143,29 @@ pub(crate) fn imprint_curve_on_face(
         }
     }
 
-    // Case A: Clean 2-point cross-cut of the face.
-    // If there is exactly one inside segment, and both endpoints are boundary intersections,
-    // and the endpoints resolve to distinct vertices, we split immediately.
+    // Case A: Clean 2-point cross-cut of the face. Standalone clean cuts use
+    // the legacy immediate split path; if this face already has queued open
+    // split edges, keep this edge queued too so the complete graph partitions
+    // together instead of stranding earlier pending edges on a removed face.
     if inside_segments.len() == 1 {
         let (t_start, start_info, t_end, end_info) = inside_segments[0];
+        let start_info = start_info.or_else(|| {
+            let p = curve.point(t_start);
+            boundary_hit_for_point(builder, &face_edges, &p, tol)
+        });
+        let end_info = end_info.or_else(|| {
+            let p = curve.point(t_end);
+            boundary_hit_for_point(builder, &face_edges, &p, tol)
+        });
         if let (Some((e1_id, t1_edge, pt1)), Some((e2_id, t2_edge, pt2))) = (start_info, end_info) {
             if pt1.distance(&pt2) > tol {
                 // Check if this chord is already a boundary edge of the face
                 let mut is_boundary = false;
                 for oe in &face_edges {
                     let e_id = oe.id;
-                    let ed = &builder.brep().edges[e_id];
+                    let Some(ed) = builder.brep().edges.get(e_id) else {
+                        continue;
+                    };
                     if let Some(ec) = &ed.curve {
                         let t_mid = 0.5 * (t_start + t_end);
                         let mid_p = curve.point(t_mid);
@@ -176,9 +187,12 @@ pub(crate) fn imprint_curve_on_face(
                             last: t_end,
                             start: v1,
                             end: v2,
-                            tolerance: openrcad_foundation::tolerance::CONFUSION,
+                            tolerance: imprint_tolerance(tol),
                         };
                         let split_edge_id = builder.brep_mut().edges.insert(split_edge_data);
+                        if force_queue_clean_crosscuts {
+                            return (vec![face_id], vec![split_edge_id]);
+                        }
                         let (f1, f2) = builder.split_face(face_id, &[split_edge_id]);
                         return (vec![f1, f2], Vec::new());
                     }
@@ -191,11 +205,21 @@ pub(crate) fn imprint_curve_on_face(
     // Insert all inside segments as split edges.
     let mut split_edges = Vec::new();
     for (t_start, start_info, t_end, end_info) in inside_segments {
+        let start_info = start_info.or_else(|| {
+            let p = curve.point(t_start);
+            boundary_hit_for_point(builder, &face_edges, &p, tol)
+        });
+        let end_info = end_info.or_else(|| {
+            let p = curve.point(t_end);
+            boundary_hit_for_point(builder, &face_edges, &p, tol)
+        });
         // Check if this segment is already a boundary edge of the face
         let mut is_boundary = false;
         for oe in &face_edges {
             let e_id = oe.id;
-            let ed = &builder.brep().edges[e_id];
+            let Some(ed) = builder.brep().edges.get(e_id) else {
+                continue;
+            };
             if let Some(ec) = &ed.curve {
                 let t_mid = 0.5 * (t_start + t_end);
                 let mid_p = curve.point(t_mid);
@@ -214,41 +238,20 @@ pub(crate) fn imprint_curve_on_face(
             resolve_or_split(builder, e_id, t_edge, &pt, tol)
         } else {
             let p = curve.point(t_start);
-            let mut matched = None;
-            for (v_id, v_data) in &builder.brep().vertices {
-                if v_data.point.distance(&p) < tol {
-                    matched = Some(v_id);
-                    break;
-                }
-            }
-            matched.unwrap_or_else(|| {
-                builder.brep_mut().vertices.insert(VertexData {
-                    point: p,
-                    tolerance: openrcad_foundation::tolerance::CONFUSION,
-                })
-            })
+            resolve_after_prior_split(builder, &p, tol)
         };
 
         let v_end = if let Some((e_id, t_edge, pt)) = end_info {
             resolve_or_split(builder, e_id, t_edge, &pt, tol)
         } else {
             let p = curve.point(t_end);
-            let mut matched = None;
-            for (v_id, v_data) in &builder.brep().vertices {
-                if v_data.point.distance(&p) < tol {
-                    matched = Some(v_id);
-                    break;
-                }
-            }
-            matched.unwrap_or_else(|| {
-                builder.brep_mut().vertices.insert(VertexData {
-                    point: p,
-                    tolerance: openrcad_foundation::tolerance::CONFUSION,
-                })
-            })
+            resolve_after_prior_split(builder, &p, tol)
         };
 
         if v_start == v_end {
+            continue;
+        }
+        if pending_split_edge_exists(builder, v_start, v_end, curve, t_start, t_end, tol) {
             continue;
         }
 
@@ -258,13 +261,38 @@ pub(crate) fn imprint_curve_on_face(
             last: t_end,
             start: v_start,
             end: v_end,
-            tolerance: openrcad_foundation::tolerance::CONFUSION,
+            tolerance: imprint_tolerance(tol),
         };
         let split_edge_id = builder.brep_mut().edges.insert(split_edge_data);
         split_edges.push(split_edge_id);
     }
 
     (vec![face_id], split_edges)
+}
+
+fn pending_split_edge_exists(
+    builder: &BRepBuilder,
+    v_start: VertexId,
+    v_end: VertexId,
+    curve: &GeomCurve,
+    first: f64,
+    last: f64,
+    tol: f64,
+) -> bool {
+    let snap_tol = tol.max(1e-4);
+    let mid = curve.point(0.5 * (first + last));
+    builder.brep().edges.iter().any(|(_, edge)| {
+        let endpoints_match = (edge.start == v_start && edge.end == v_end)
+            || (edge.start == v_end && edge.end == v_start);
+        if !endpoints_match {
+            return false;
+        }
+        let Some(existing_curve) = edge.curve.as_ref() else {
+            return false;
+        };
+        let existing_mid = existing_curve.point(0.5 * (edge.first + edge.last));
+        mid.distance(&existing_mid) <= snap_tol
+    })
 }
 
 /// Return the loop vertex at `pt` on edge `e_id`: reuse an existing endpoint if
@@ -278,6 +306,9 @@ fn resolve_or_split(
     pt: &Pnt,
     tol: f64,
 ) -> VertexId {
+    if !builder.brep().edges.contains_key(e_id) {
+        return resolve_after_prior_split(builder, pt, tol);
+    }
     let ed = builder.brep().edges[e_id].clone();
     let s_pt = builder.brep().vertices[ed.start].point;
     let e_pt = builder.brep().vertices[ed.end].point;
@@ -289,10 +320,72 @@ fn resolve_or_split(
     }
     let v = builder.brep_mut().vertices.insert(VertexData {
         point: *pt,
-        tolerance: openrcad_foundation::tolerance::CONFUSION,
+        tolerance: imprint_tolerance(tol),
     });
     builder.split_edge(e_id, v, t_edge);
     v
+}
+
+fn boundary_hit_for_point(
+    builder: &BRepBuilder,
+    face_edges: &[OrientedEdge],
+    pt: &Pnt,
+    tol: f64,
+) -> Option<(EdgeId, f64, Pnt)> {
+    let snap_tol = tol.max(1e-4);
+    for oe in face_edges {
+        let Some(ed) = builder.brep().edges.get(oe.id) else {
+            continue;
+        };
+        let Some(curve) = ed.curve.as_ref() else {
+            continue;
+        };
+        let t = project_point_on_curve(pt, curve, ed.first, ed.last);
+        let q = curve.point(t);
+        if q.distance(pt) <= snap_tol {
+            return Some((oe.id, t, q));
+        }
+    }
+    None
+}
+
+/// Resolve a point after an earlier endpoint split removed the original edge id
+/// captured during intersection gathering. Find the current sub-edge that still
+/// contains `pt`, split it when needed, or finally create/reuse a coincident
+/// vertex if the point is already detached from a boundary.
+fn resolve_after_prior_split(builder: &mut BRepBuilder, pt: &Pnt, tol: f64) -> VertexId {
+    let snap_tol = tol.max(1e-4);
+    if let Some(v) = find_vertex_at(builder, pt, snap_tol) {
+        return v;
+    }
+
+    let candidate = builder
+        .brep()
+        .edges
+        .iter()
+        .filter_map(|(id, ed)| {
+            let curve = ed.curve.as_ref()?;
+            let t = project_point_on_curve(pt, curve, ed.first, ed.last);
+            (curve.point(t).distance(pt) <= snap_tol).then_some((id, t))
+        })
+        .next();
+
+    if let Some((id, t)) = candidate {
+        return resolve_or_split(builder, id, t, pt, tol);
+    }
+
+    builder.brep_mut().vertices.insert(VertexData {
+        point: *pt,
+        tolerance: imprint_tolerance(tol),
+    })
+}
+
+fn find_vertex_at(builder: &BRepBuilder, pt: &Pnt, tol: f64) -> Option<VertexId> {
+    builder
+        .brep()
+        .vertices
+        .iter()
+        .find_map(|(v_id, v_data)| (v_data.point.distance(pt) < tol).then_some(v_id))
 }
 
 /// Cut a hole bounded by the closed `curve` into `face_id`, provided the curve

@@ -149,6 +149,8 @@ pub(crate) fn apply_join(
                             *part = u;
                             body.pristine = None;
                             body.sketch_source = None;
+                            body.cut_replay = None;
+                            body.edge_mod_cut_history_path_used = false;
                             merged = true;
                             break 'bodies;
                         }
@@ -163,6 +165,8 @@ pub(crate) fn apply_join(
                         body.parts.push(fallback);
                         body.pristine = None;
                         body.sketch_source = None;
+                        body.cut_replay = None;
+                        body.edge_mod_cut_history_path_used = false;
                         merged = true;
                         break 'bodies;
                     }
@@ -188,6 +192,8 @@ pub(crate) fn apply_join(
             pristine: None,
             sketch_source: None,
             cut_tools: Vec::new(),
+            cut_replay: None,
+            edge_mod_cut_history_path_used: false,
         });
     }
 }

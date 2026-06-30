@@ -170,6 +170,7 @@ fn fillet_then_fillet_perpendicular_edge() {
             dist: 4.0,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });
@@ -199,6 +200,7 @@ fn fillet_then_fillet_perpendicular_edge() {
             dist: 4.0,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });

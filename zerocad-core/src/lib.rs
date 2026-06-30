@@ -18,8 +18,8 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, ParametricGraph, TopologyEdgeRef,
-    Variable,
+    EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode,
+    FeatureType, ParametricGraph, TopologyEdgeRef, Variable,
 };
 pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,

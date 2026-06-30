@@ -8,7 +8,9 @@
 
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
-use zerocad_core::{CornerKind, EdgeModScope, EdgeRef, FeatureNode, FeatureType, MockMesh};
+use zerocad_core::{
+    CornerKind, EdgeModReplayIntent, EdgeModScope, EdgeRef, FeatureNode, FeatureType, MockMesh,
+};
 
 use crate::ZeroCadApp;
 
@@ -133,6 +135,8 @@ pub(crate) struct EdgeModOp {
     pub(crate) target: String,
     /// The edges being rounded/beveled, captured in world space. Always non-empty.
     pub(crate) edges: Vec<EdgeRef>,
+    /// Replay intent captured at selection time, one entry per edge.
+    pub(crate) replay: Vec<EdgeModReplayIntent>,
     /// Fillet (round) or Chamfer (bevel).
     pub(crate) kind: CornerKind,
     /// Resolved size in base units (mm), kept in sync with `dist_text`.
@@ -192,6 +196,7 @@ mod tests {
         EdgeModOp {
             target: "body".to_string(),
             edges: vec![straight_box_edge()],
+            replay: vec![EdgeModReplayIntent::default()],
             kind,
             dist,
             dist_text: format!("{dist:.2}"),
@@ -290,11 +295,19 @@ impl ZeroCadApp {
             self.status_msg = "Those edges have no usable geometry to fillet/chamfer.".to_string();
             return;
         }
+        let replay = edges
+            .iter()
+            .map(|edge| {
+                self.graph
+                    .edge_mod_replay_intent_for_edge(&node_id, edge, &self.hidden_nodes)
+            })
+            .collect();
         let text = self.edge_mod_dist_text.clone();
         let dist = self.eval_dim(&text).unwrap_or(3.0).max(0.2);
         self.edge_mod_op = Some(EdgeModOp {
             target: node_id,
             edges,
+            replay,
             kind,
             dist,
             dist_text: text,
@@ -367,6 +380,19 @@ impl ZeroCadApp {
         }
     }
 
+    fn hash_replay_intent(h: &mut impl std::hash::Hasher, replay: &EdgeModReplayIntent) {
+        use std::hash::Hash;
+        (replay.mode as u8).hash(h);
+        replay.pre_cut_target.hash(h);
+        replay.replay_cut_nodes.hash(h);
+        if let Some(edge) = replay.selected_span.as_ref() {
+            1u8.hash(h);
+            Self::hash_edge_ref(h, edge);
+        } else {
+            0u8.hash(h);
+        }
+    }
+
     /// Hash of everything that determines an edge-mod's committed geometry — the
     /// exact size, kind, target body, selected edge identity, and hidden nodes.
     /// The preview worker result is only reusable when this full identity matches.
@@ -378,6 +404,9 @@ impl ZeroCadApp {
         op.target.hash(&mut h);
         for edge in &op.edges {
             Self::hash_edge_ref(&mut h, edge);
+        }
+        for replay in &op.replay {
+            Self::hash_replay_intent(&mut h, replay);
         }
         let mut hidden: Vec<&String> = hidden_nodes.iter().collect();
         hidden.sort();
@@ -403,6 +432,9 @@ impl ZeroCadApp {
         let mut prev = op.target.clone();
         for (i, edge) in op.edges.iter().enumerate() {
             let id = format!("edgemod_{tag}_{}", self.id_counter + i);
+            let replay = op.replay.get(i).cloned().unwrap_or_else(|| {
+                graph.edge_mod_replay_intent_for_edge(&op.target, edge, &self.hidden_nodes)
+            });
             graph.add_feature(FeatureNode {
                 id: id.clone(),
                 name: format!("{tag} edge mod {i}"),
@@ -412,6 +444,7 @@ impl ZeroCadApp {
                     dist,
                     dist_expr: None,
                     scope: EdgeModScope::default(),
+                    replay,
                     kind: op.kind,
                 },
             });
@@ -586,6 +619,9 @@ impl ZeroCadApp {
             for edge in &op.edges {
                 Self::hash_edge_ref(&mut h, edge);
             }
+            for replay in &op.replay {
+                Self::hash_replay_intent(&mut h, replay);
+            }
             self.id_counter.hash(&mut h);
             let mut hidden: Vec<&String> = self.hidden_nodes.iter().collect();
             hidden.sort();
@@ -666,9 +702,14 @@ impl ZeroCadApp {
         let dist = op.dist.max(0.2);
         let edge_count = op.edges.len();
         let mut prev = op.target.clone();
-        for edge in op.edges {
+        let replays = op.replay;
+        for (i, edge) in op.edges.into_iter().enumerate() {
             let id = format!("edgemod_{}", self.next_id());
             let name = self.next_edge_mod_name(op.kind);
+            let replay = replays.get(i).cloned().unwrap_or_else(|| {
+                self.graph
+                    .edge_mod_replay_intent_for_edge(&op.target, &edge, &self.hidden_nodes)
+            });
             self.graph.add_feature(FeatureNode {
                 id: id.clone(),
                 name,
@@ -678,6 +719,7 @@ impl ZeroCadApp {
                     dist,
                     dist_expr: dist_expr.clone(),
                     scope: EdgeModScope::default(),
+                    replay,
                     kind: op.kind,
                 },
             });

@@ -50,6 +50,7 @@ fn curved_circular_rim_selection_reaches_native_solver_and_fails_safely() {
             dist: 3.0,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay: Default::default(),
             kind: crate::sketch::CornerKind::Fillet,
         },
     });

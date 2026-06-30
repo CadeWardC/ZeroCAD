@@ -73,7 +73,7 @@ pub struct TopologyEdgeRef {
 /// The topology field lets an `EdgeMod` follow equivalent upstream dimension
 /// edits. If the stable identity no longer resolves, the captured world-space
 /// edge is still used as a legacy geometric fallback.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeRef {
     pub p0: [f32; 3],
     pub p1: [f32; 3],
@@ -83,6 +83,53 @@ pub struct EdgeRef {
     pub curve: Option<EdgeCurveHint>,
     #[serde(default)]
     pub topology: Option<TopologyEdgeRef>,
+}
+
+/// How an edge modifier should use saved construction history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EdgeModReplayMode {
+    /// Prefer construction replay when the target body carries replayable cut
+    /// history; fall back to native edge modification for unsupported selections.
+    #[default]
+    Auto,
+    /// Bypass construction replay. Used for native-only topology such as circular
+    /// rim edges or when a future UI exposes an explicit escape hatch.
+    NativeOnly,
+}
+
+/// Saved intent for reconstructing a fillet through earlier cuts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EdgeModReplayIntent {
+    #[serde(default)]
+    pub mode: EdgeModReplayMode,
+    #[serde(default)]
+    pub pre_cut_target: Option<String>,
+    #[serde(default)]
+    pub replay_cut_nodes: Vec<String>,
+    #[serde(default)]
+    pub selected_span: Option<EdgeRef>,
+}
+
+impl Default for EdgeModReplayIntent {
+    fn default() -> Self {
+        Self {
+            mode: EdgeModReplayMode::Auto,
+            pre_cut_target: None,
+            replay_cut_nodes: Vec::new(),
+            selected_span: None,
+        }
+    }
+}
+
+impl EdgeModReplayIntent {
+    pub fn auto_for(target: impl Into<String>, edge: EdgeRef) -> Self {
+        Self {
+            mode: EdgeModReplayMode::Auto,
+            pre_cut_target: Some(target.into()),
+            replay_cut_nodes: Vec::new(),
+            selected_span: Some(edge),
+        }
+    }
 }
 
 /// Legacy serialized edge-mod span. The current fillet/chamfer tool no longer
@@ -175,6 +222,9 @@ pub enum FeatureType {
         /// edits always use the selected edge as captured.
         #[serde(default)]
         scope: EdgeModScope,
+        /// Construction-replay intent for fillets through earlier cuts.
+        #[serde(default)]
+        replay: EdgeModReplayIntent,
         /// Whether to round (Fillet) or bevel (Chamfer) the edge.
         kind: crate::sketch::CornerKind,
     },

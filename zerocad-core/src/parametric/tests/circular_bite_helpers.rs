@@ -35,22 +35,26 @@ pub(super) fn circular_bite_graph_with_depth(
     g.add_dependency("s", "e");
 
     if let Some(kind) = edge_mod {
+        let edge = EdgeRef {
+            p0: [0.0, 35.0, depth],
+            p1: [40.0, 35.0, depth],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, 1.0, 0.0],
+            curve: None,
+            topology: None,
+        };
+        let replay =
+            g.edge_mod_replay_intent_for_edge("e", &edge, &std::collections::HashSet::new());
         g.add_feature(FeatureNode {
             id: "em".to_string(),
             name: "Edge Mod".to_string(),
             feature: FeatureType::EdgeMod {
                 target: "e".to_string(),
-                edge: EdgeRef {
-                    p0: [0.0, 35.0, depth],
-                    p1: [40.0, 35.0, depth],
-                    n1: [0.0, 0.0, 1.0],
-                    n2: [0.0, 1.0, 0.0],
-                    curve: None,
-                    topology: None,
-                },
+                edge,
                 dist: 1.5,
                 dist_expr: None,
                 scope: EdgeModScope::FullEdge,
+                replay,
                 kind,
             },
         });
@@ -81,13 +85,22 @@ pub(super) fn circular_bite_cutoff_edge() -> EdgeRef {
 }
 
 pub(super) fn gui_captured_circular_bite_cutoff_edge(depth: f32) -> EdgeRef {
+    let expected = circular_bite_cutoff_edge_at_depth(depth);
+    gui_captured_circular_bite_edge_matching(depth, &expected).unwrap_or_else(|| {
+        panic!("display mesh should expose exact cutoff-edge metadata for {expected:?}")
+    })
+}
+
+pub(super) fn gui_captured_circular_bite_edge_matching(
+    depth: f32,
+    expected: &EdgeRef,
+) -> Option<EdgeRef> {
     let g = circular_bite_graph_with_depth(None, depth);
     let bodies = g
         .evaluate_bodies(&std::collections::HashSet::new())
         .unwrap();
     let body_id = bodies[0].0.as_str();
     let mesh = &bodies[0].1;
-    let expected = circular_bite_cutoff_edge_at_depth(depth);
     let same_edge = |edge: &crate::mock_kernel::MeshEdgeRef| {
         let d = |a: [f32; 3], b: [f32; 3]| {
             ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
@@ -98,17 +111,10 @@ pub(super) fn gui_captured_circular_bite_cutoff_edge(depth: f32) -> EdgeRef {
         ) && ((d(edge.p0, expected.p0) <= 0.08 && d(edge.p1, expected.p1) <= 0.08)
             || (d(edge.p0, expected.p1) <= 0.08 && d(edge.p1, expected.p0) <= 0.08))
     };
-    let edge = mesh
-        .edge_refs
+    mesh.edge_refs
         .iter()
         .find(|edge| same_edge(edge))
-        .unwrap_or_else(|| {
-            panic!(
-                "display mesh should expose exact cutoff-edge metadata; refs={:?}",
-                mesh.edge_refs
-            )
-        });
-    gui_edge_ref_from_mesh_candidate(body_id, edge)
+        .map(|edge| gui_edge_ref_from_mesh_candidate(body_id, edge))
 }
 
 pub(super) fn gui_edge_ref_from_mesh_candidate(
@@ -154,6 +160,7 @@ pub(super) fn circular_bite_cutoff_edge_graph_at_depth_with_edge(
     edge: EdgeRef,
 ) -> ParametricGraph {
     let mut g = circular_bite_graph_with_depth(None, depth);
+    let replay = g.edge_mod_replay_intent_for_edge("e", &edge, &std::collections::HashSet::new());
     g.add_feature(FeatureNode {
         id: "em".to_string(),
         name: "Edge Mod".to_string(),
@@ -163,6 +170,7 @@ pub(super) fn circular_bite_cutoff_edge_graph_at_depth_with_edge(
             dist,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay,
             kind,
         },
     });

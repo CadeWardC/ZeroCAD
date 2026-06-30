@@ -74,3 +74,30 @@ fn eval_cache_is_invalidated_when_an_upstream_node_changes() {
         "an upstream change must invalidate the cache, not serve stale geometry"
     );
 }
+
+#[test]
+fn eval_cache_key_changes_when_edge_mod_replay_metadata_changes() {
+    let baseline = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let mut with_replay = baseline.clone();
+    let idx = with_replay.node_map["edgemod_2"];
+    if let FeatureType::EdgeMod { edge, replay, .. } = &mut with_replay.graph[idx].feature {
+        *replay = EdgeModReplayIntent {
+            mode: EdgeModReplayMode::Auto,
+            pre_cut_target: Some("box_1".to_string()),
+            replay_cut_nodes: vec!["cut_1".to_string()],
+            selected_span: Some(edge.clone()),
+        };
+    } else {
+        panic!("test fixture should contain an EdgeMod");
+    }
+
+    let hidden = std::collections::HashSet::new();
+    let vars = std::collections::HashMap::new();
+    let baseline_nodes = baseline.body_nodes_in_creation_order();
+    let replay_nodes = with_replay.body_nodes_in_creation_order();
+    assert_ne!(
+        baseline.eval_prefix_keys(&baseline_nodes, &hidden, &vars),
+        with_replay.eval_prefix_keys(&replay_nodes, &hidden, &vars),
+        "replay metadata must participate in the mesh-cache prefix hash"
+    );
+}

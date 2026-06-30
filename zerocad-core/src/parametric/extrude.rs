@@ -220,7 +220,24 @@ pub(crate) struct LiveBody {
     pub(crate) parts: Vec<KernelSolid>,
     pub(crate) pristine: Option<MockMesh>,
     pub(crate) sketch_source: Option<SketchExtrudeSource>,
-    pub(crate) cut_tools: Vec<KernelSolid>,
+    pub(crate) cut_tools: Vec<CutTool>,
+    pub(crate) cut_replay: Option<CutReplayHistory>,
+    pub(crate) edge_mod_cut_history_path_used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CutReplayHistory {
+    pub(crate) base_body_id: String,
+    pub(crate) base_parts: Vec<KernelSolid>,
+    pub(crate) base_pristine: Option<MockMesh>,
+    pub(crate) base_sketch_source: Option<SketchExtrudeSource>,
+    pub(crate) steps: Vec<CutReplayStep>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CutReplayStep {
+    pub(crate) node_id: String,
+    pub(crate) tool: CutTool,
 }
 
 #[derive(Debug, Clone)]

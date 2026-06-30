@@ -772,8 +772,18 @@ fn split_tracked(
 ) {
     let mut result = Vec::with_capacity(subfaces.len());
     for &fid in subfaces.iter() {
-        let (next_faces, new_edges) =
-            crate::imprint::imprint_curve_on_face(builder, fid, curve, first, last, tol);
+        let force_queue_clean_crosscuts = splitting_edges_map
+            .get(&fid)
+            .is_some_and(|edges| !edges.is_empty());
+        let (next_faces, new_edges) = crate::imprint::imprint_curve_on_face(
+            builder,
+            fid,
+            curve,
+            first,
+            last,
+            force_queue_clean_crosscuts,
+            tol,
+        );
         if !new_edges.is_empty() {
             splitting_edges_map
                 .entry(fid)

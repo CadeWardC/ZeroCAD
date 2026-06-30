@@ -20,6 +20,20 @@ fn quantize(p: &Pnt) -> QPoint {
     )
 }
 
+fn loops_for_faces(brep: &BRep, face_ids: &[FaceId]) -> HashSet<LoopId> {
+    let mut loops = HashSet::new();
+    for &face_id in face_ids {
+        let Some(face) = brep.faces.get(face_id) else {
+            continue;
+        };
+        if let Some(outer) = face.outer_wire {
+            loops.insert(outer);
+        }
+        loops.extend(face.inner_wires.iter().copied());
+    }
+    loops
+}
+
 /// Re-order and re-orient a loop's co-edges into a single contiguous chain, so
 /// each co-edge's traversal-end meets the next's traversal-start — the defining
 /// invariant of a B-Rep loop.
@@ -287,6 +301,7 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
     if faces.is_empty() {
         return Shell::default();
     }
+    let debug = std::env::var_os("OPENRCAD_SEW_DEBUG").is_some();
 
     // 1. Merge all faces into a single BRep.
     let mut brep = BRep::new();
@@ -305,9 +320,17 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
         face_ids.push(new_face_id);
     }
 
+    // `BRep::merge` copies the full source arena for each face. Count boundaries
+    // using only the loops of the selected faces so orphan faces do not make real
+    // shell boundaries look already paired while sewing.
+    let active_loops = loops_for_faces(&brep, &face_ids);
+
     // 2. Identify free boundaries (referenced by at most one loop) and collect boundary vertices.
     let mut edge_counts_initial = HashMap::new();
-    for (_, l_data) in &brep.loops {
+    for &loop_id in &active_loops {
+        let Some(l_data) = brep.loops.get(loop_id) else {
+            continue;
+        };
         for oe in &l_data.edges {
             *edge_counts_initial.entry(oe.id).or_insert(0) += 1;
         }
@@ -455,7 +478,10 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
 
     // 4. Count edge occurrences across loops to identify free boundary edges.
     let mut edge_counts = HashMap::new();
-    for (_, l_data) in &brep.loops {
+    for &loop_id in &active_loops {
+        let Some(l_data) = brep.loops.get(loop_id) else {
+            continue;
+        };
         for oe in &l_data.edges {
             *edge_counts.entry(oe.id).or_insert(0) += 1;
         }
@@ -481,6 +507,21 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
             let both_free = count1 <= 1 && count2 <= 1;
             let endpoints_match_same = e1.start == e2.start && e1.end == e2.end;
             let endpoints_match_opp = e1.start == e2.end && e1.end == e2.start;
+            if debug && both_free && !(endpoints_match_same || endpoints_match_opp) {
+                let a1 = brep.vertices[e1.start].point;
+                let b1 = brep.vertices[e1.end].point;
+                let a2 = brep.vertices[e2.start].point;
+                let b2 = brep.vertices[e2.end].point;
+                let same = a1.distance(&a2).max(b1.distance(&b2));
+                let opp = a1.distance(&b2).max(b1.distance(&a2));
+                let near = same.min(opp);
+                if near < 1e-2 {
+                    eprintln!(
+                        "sew near free endpoints {:?}/{:?} near={near:.8} same={same:.8} opp={opp:.8} tol={tol:.8}",
+                        e1_id, e2_id
+                    );
+                }
+            }
 
             if endpoints_match_same || endpoints_match_opp {
                 // If they are not free boundaries, only merge if they are exact duplicates in same direction.
@@ -489,6 +530,7 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
                 }
 
                 // Check curve compatibility within tolerance.
+                let mut curve_mismatch = None;
                 let curves_match = match (&e1.curve, &e2.curve) {
                     (None, None) => true,
                     (Some(c1), Some(c2)) => {
@@ -505,12 +547,24 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
                             (c2.point(e2.last), c2.point(t2_mid), c2.point(e2.first))
                         };
 
-                        p1_start.distance(&p2_start) <= tol
-                            && p1_mid.distance(&p2_mid) <= tol
-                            && p1_end.distance(&p2_end) <= tol
+                        let d_start = p1_start.distance(&p2_start);
+                        let d_mid = p1_mid.distance(&p2_mid);
+                        let d_end = p1_end.distance(&p2_end);
+                        curve_mismatch = Some((d_start, d_mid, d_end, tol));
+                        d_start <= tol && d_mid <= tol && d_end <= tol
                     }
                     _ => false,
                 };
+                if debug && both_free && !curves_match {
+                    if let Some((d_start, d_mid, d_end, curve_tol)) = curve_mismatch {
+                        if d_start.min(d_mid).min(d_end) < 1e-2 {
+                            eprintln!(
+                                "sew free curve mismatch {:?}/{:?} ds={d_start:.8} dm={d_mid:.8} de={d_end:.8} tol={curve_tol:.8}",
+                                e1_id, e2_id
+                            );
+                        }
+                    }
+                }
 
                 if curves_match {
                     let root_i = find_no_compress(i, &e_parent);

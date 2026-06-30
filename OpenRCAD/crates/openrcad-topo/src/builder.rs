@@ -6,8 +6,91 @@
 use crate::arena::{BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, VertexId};
 use crate::containment::point_in_polygon_2d;
 use crate::orientation::Orientation;
+use core::f64::consts::PI;
 use openrcad_geom::{Curve, GeomSurface, Surface};
 use std::sync::Arc;
+
+fn norm_angle(a: f64) -> f64 {
+    let t = 2.0 * PI;
+    let mut x = a % t;
+    if x < 0.0 {
+        x += t;
+    }
+    x
+}
+
+fn analytic_surface_uv(surface: &GeomSurface, pt: openrcad_foundation::Pnt) -> Option<(f64, f64)> {
+    match surface {
+        GeomSurface::Plane(plane) => {
+            let diff = pt - plane.location();
+            let u = diff.dot(&openrcad_foundation::Vec::from_dir(
+                plane.position().x_direction(),
+            ));
+            let v = diff.dot(&openrcad_foundation::Vec::from_dir(
+                plane.position().y_direction(),
+            ));
+            Some((u, v))
+        }
+        GeomSurface::Cylinder(cyl) => {
+            let pos = cyl.position();
+            let axis_pt = pos.location();
+            let axis_dir = openrcad_foundation::Vec::from_dir(pos.direction());
+            let x_dir = openrcad_foundation::Vec::from_dir(pos.x_direction());
+            let y_dir = openrcad_foundation::Vec::from_dir(pos.y_direction());
+            let diff = pt - axis_pt;
+            let v = diff.dot(&axis_dir);
+            let radial = diff - axis_dir * v;
+            let u = norm_angle(radial.dot(&y_dir).atan2(radial.dot(&x_dir)));
+            Some((u, v))
+        }
+        _ => None,
+    }
+}
+
+fn surface_debug_name(surface: &GeomSurface) -> &'static str {
+    match surface {
+        GeomSurface::Plane(_) => "plane",
+        GeomSurface::Cylinder(_) => "cylinder",
+        GeomSurface::Sphere(_) => "sphere",
+        GeomSurface::Torus(_) => "torus",
+        GeomSurface::BSpline(_) => "bspline",
+        _ => "surface",
+    }
+}
+
+fn edge_debug_line(brep: &BRep, oe: OrientedEdge) -> String {
+    let Some(edge) = brep.edges.get(oe.id) else {
+        return format!("{:?} {:?} missing", oe.id, oe.orientation);
+    };
+    let a = brep
+        .vertices
+        .get(edge.start)
+        .map(|v| v.point)
+        .unwrap_or_else(openrcad_foundation::Pnt::origin);
+    let b = brep
+        .vertices
+        .get(edge.end)
+        .map(|v| v.point)
+        .unwrap_or_else(openrcad_foundation::Pnt::origin);
+    let kind = match edge.curve.as_ref() {
+        Some(openrcad_geom::GeomCurve::Line(_)) => "line",
+        Some(openrcad_geom::GeomCurve::Circle(_)) => "circle",
+        Some(openrcad_geom::GeomCurve::BSpline(_)) => "bspline",
+        Some(_) => "curve",
+        None => "none",
+    };
+    format!(
+        "{:?} {:?} {kind} ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4})",
+        oe.id,
+        oe.orientation,
+        a.x(),
+        a.y(),
+        a.z(),
+        b.x(),
+        b.y(),
+        b.z()
+    )
+}
 
 /// Locate the `(u, v)` parameters of the point on `surface` nearest to `pt`.
 ///
@@ -409,6 +492,8 @@ impl BRepBuilder {
     /// partitioning the face into multiple regions.
     /// Distributes any inner loops (holes) of the original face to the correct new face.
     pub fn partition_face(&mut self, face_id: FaceId, splitting_edges: &[EdgeId]) -> Vec<FaceId> {
+        let debug =
+            std::env::var_os("OPENRCAD_BOOLEAN_DEBUG").is_some() && !splitting_edges.is_empty();
         let face_data = self
             .brep
             .faces
@@ -428,6 +513,26 @@ impl BRepBuilder {
             .surface
             .as_ref()
             .expect("partition_face: face has no surface");
+        if debug {
+            eprintln!(
+                "partition start face={face_id:?} surface={} outer_edges={} split_edges={}",
+                surface_debug_name(surface),
+                outer_loop.edges.len(),
+                splitting_edges.len()
+            );
+            for &e_id in splitting_edges {
+                eprintln!(
+                    "  split {}",
+                    edge_debug_line(
+                        &self.brep,
+                        OrientedEdge {
+                            id: e_id,
+                            orientation: Orientation::Forward,
+                        }
+                    )
+                );
+            }
+        }
 
         let get_edge_endpoints = |brep: &BRep, oe: OrientedEdge| {
             let e = &brep.edges[oe.id];
@@ -463,26 +568,38 @@ impl BRepBuilder {
             adjacency.entry(start).or_default().push(oe);
         }
 
-        // Helper to project 3D point to 2D parametric UV coordinates
+        let periodic = matches!(surface, openrcad_geom::GeomSurface::Cylinder(_));
+        let u_anchor = outer_loop
+            .edges
+            .first()
+            .and_then(|&oe| {
+                let (v_start, _) = get_edge_endpoints(&self.brep, oe);
+                let pt = self.brep.vertices.get(v_start)?.point;
+                Some(
+                    analytic_surface_uv(surface, pt)
+                        .unwrap_or_else(|| search_nearest_parameter(surface, pt))
+                        .0,
+                )
+            })
+            .unwrap_or(0.0);
+
+        // Helper to project 3D point to 2D parametric UV coordinates. Analytic
+        // cylinders are periodic in `u`, so align every projected point to the
+        // same angular branch as this face's outer loop before doing planar graph
+        // tracing.
         let project_point_on_surface =
             |pt: openrcad_foundation::Pnt, s: &openrcad_geom::GeomSurface| -> (f64, f64) {
-                match s {
-                    openrcad_geom::GeomSurface::Plane(plane) => {
-                        let diff = pt - plane.location();
-                        let u = diff.dot(&openrcad_foundation::Vec::from_dir(
-                            plane.position().x_direction(),
-                        ));
-                        let v = diff.dot(&openrcad_foundation::Vec::from_dir(
-                            plane.position().y_direction(),
-                        ));
-                        (u, v)
+                let (mut u, v) =
+                    analytic_surface_uv(s, pt).unwrap_or_else(|| search_nearest_parameter(s, pt));
+                if periodic {
+                    while u - u_anchor > PI {
+                        u -= 2.0 * PI;
                     }
-                    other => {
-                        // General surfaces: locate the nearest (u, v) by a bounded
-                        // Gauss-Newton search seeded from a coarse parameter sweep.
-                        search_nearest_parameter(other, pt)
+                    while u_anchor - u > PI {
+                        u += 2.0 * PI;
                     }
                 }
+                (u, v)
             };
 
         // Helper to get polar angle of outgoing tangent direction of oriented edge at its start vertex
@@ -568,6 +685,23 @@ impl BRepBuilder {
             }
 
             if !loop_edges.is_empty() {
+                if debug {
+                    let mut ids = std::collections::HashSet::new();
+                    let repeated = loop_edges.iter().filter(|oe| !ids.insert(oe.id)).count();
+                    let closed = loop_edges.last().is_some_and(|&last| {
+                        let (_, end) = get_edge_endpoints(&self.brep, last);
+                        let (start, _) = get_edge_endpoints(&self.brep, start_he);
+                        end == start
+                    });
+                    eprintln!(
+                        "  traced loop edges={} repeated_edges={} closed={closed}",
+                        loop_edges.len(),
+                        repeated
+                    );
+                    for &oe in &loop_edges {
+                        eprintln!("    {}", edge_debug_line(&self.brep, oe));
+                    }
+                }
                 new_loop_edges_list.push(loop_edges);
             }
         }
@@ -623,9 +757,17 @@ impl BRepBuilder {
                     }
                 }
                 area *= 0.5;
+                if debug {
+                    eprintln!(
+                        "  candidate loop edges={} area={area:.8} exterior={is_exterior}",
+                        loop_edges.len()
+                    );
+                }
                 if area.abs() >= 1e-5 {
                     inner_loop_edges_list.push(loop_edges);
                 }
+            } else if debug {
+                eprintln!("  candidate loop edges={} exterior=true", loop_edges.len());
             }
         }
 
@@ -783,6 +925,14 @@ impl BRepBuilder {
                     orientation: face_data.orientation,
                 };
                 let f_id = self.brep.faces.insert(face_data);
+                if debug {
+                    eprintln!(
+                        "  emitted face={f_id:?} loop_edges={} area={:.8} inners={}",
+                        inner_loop_edges_list[idx].len(),
+                        loop_areas[idx],
+                        distributed_inners[idx].len()
+                    );
+                }
                 new_face_ids.push(f_id);
             }
         }

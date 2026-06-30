@@ -2,7 +2,9 @@
 //! Respects local tolerances and handles curve-curve, curve-surface, and surface-surface cases.
 
 use openrcad_foundation::{Ax3, Dir, Pnt, Vec as GeomVec};
-use openrcad_geom::{BSplineCurve, Circle, Curve, GeomCurve, GeomSurface, Surface};
+use openrcad_geom::{
+    BSplineCurve, Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane, Surface,
+};
 use openrcad_topo::{containment::point_in_polygon_2d, Face, Orientation};
 
 use core::f64::consts::PI;
@@ -869,27 +871,132 @@ fn analytic_surface_surface(s1: &GeomSurface, s2: &GeomSurface) -> Option<Vec<Ge
     // Plane ∩ cylinder, with the plane perpendicular to the cylinder axis, is a
     // circle of the cylinder's radius. (Other orientations give ellipses/lines,
     // handled by the generic solver.)
+    if let (GeomSurface::Cylinder(c1), GeomSurface::Cylinder(c2)) = (s1, s2) {
+        return Some(cylinder_cylinder_curves(c1, c2));
+    }
+
     let (plane, cyl) = match (s1, s2) {
         (GeomSurface::Plane(p), GeomSurface::Cylinder(c)) => (p, c),
         (GeomSurface::Cylinder(c), GeomSurface::Plane(p)) => (p, c),
         _ => return None,
     };
+    Some(plane_cylinder_curves(plane, cyl))
+}
+
+fn plane_cylinder_curves(plane: &Plane, cyl: &CylindricalSurface) -> Vec<GeomCurve> {
     let axis = cyl.position();
     let w = GeomVec::from_dir(axis.direction());
     let n = GeomVec::from_dir(plane.normal());
     let align = w.dot(&n).abs();
-    if (align - 1.0).abs() > 1e-7 {
-        return None; // not perpendicular
+
+    if (align - 1.0).abs() <= 1e-7 {
+        let denom = w.dot(&n);
+        if denom.abs() < 1e-12 {
+            return Vec::new();
+        }
+        let t = (plane.location() - axis.location()).dot(&n) / denom;
+        let center = axis.location() + w * t;
+        let frame = Ax3::new_axes(center, axis.direction(), axis.x_direction());
+        return vec![GeomCurve::Circle(Circle::new(frame, cyl.radius()))];
     }
-    // Where the axis crosses the plane.
+
+    if align <= 1e-7 {
+        let signed = (axis.location() - plane.location()).dot(&n);
+        let r = cyl.radius();
+        if signed.abs() > r + 1e-9 {
+            return Vec::new();
+        }
+        let side = match w.cross(&n).normalized() {
+            Some(d) => GeomVec::from_dir(d),
+            None => return Vec::new(),
+        };
+        let base = axis.location() + n * (-signed);
+        let h2 = (r * r - signed * signed).max(0.0);
+        if h2 <= 1e-18 {
+            return vec![GeomCurve::Line(openrcad_geom::Line::from_point_dir(
+                base,
+                axis.direction(),
+            ))];
+        }
+        let h = h2.sqrt();
+        return vec![
+            GeomCurve::Line(openrcad_geom::Line::from_point_dir(
+                base + side * h,
+                axis.direction(),
+            )),
+            GeomCurve::Line(openrcad_geom::Line::from_point_dir(
+                base - side * h,
+                axis.direction(),
+            )),
+        ];
+    }
+
     let denom = w.dot(&n);
     if denom.abs() < 1e-12 {
-        return None;
+        return Vec::new();
     }
-    let t = (plane.location() - axis.location()).dot(&n) / denom;
-    let center = axis.location() + w * t;
-    let frame = Ax3::new_axes(center, axis.direction(), axis.x_direction());
-    Some(vec![GeomCurve::Circle(Circle::new(frame, cyl.radius()))])
+    let samples = 160usize;
+    let mut pts = Vec::with_capacity(samples + 1);
+    for i in 0..=samples {
+        let u = 2.0 * PI * (i as f64) / (samples as f64);
+        let radial = cyl.point(u, 0.0);
+        let v = -(radial - plane.location()).dot(&n) / denom;
+        pts.push(cyl.point(u, v));
+    }
+    vec![GeomCurve::BSpline(polyline_to_bspline(&pts))]
+}
+
+fn cylinder_cylinder_curves(c1: &CylindricalSurface, c2: &CylindricalSurface) -> Vec<GeomCurve> {
+    let w1 = GeomVec::from_dir(c1.position().direction());
+    let w2 = GeomVec::from_dir(c2.position().direction());
+    if w1.cross(&w2).magnitude() < 1e-9 {
+        return Vec::new();
+    }
+
+    let samples = 768usize;
+    let mut current: [Option<usize>; 2] = [None, None];
+    let mut branches: Vec<Vec<Pnt>> = Vec::new();
+    let max_step = (c1.radius().max(c2.radius()) * 0.35).max(0.25);
+
+    for i in 0..=samples {
+        let u = 2.0 * PI * (i as f64) / (samples as f64);
+        let base = c1.point(u, 0.0);
+        let d = base - c2.position().location();
+        let m = w1 - w2 * w1.dot(&w2);
+        let n = d - w2 * d.dot(&w2);
+        let qa = m.dot(&m);
+        let qb = 2.0 * n.dot(&m);
+        let qc = n.dot(&n) - c2.radius() * c2.radius();
+        let mut roots = solve_quadratic(qa, qb, qc);
+        roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        for slot in 0..2 {
+            let Some(&v) = roots.get(slot) else {
+                current[slot] = None;
+                continue;
+            };
+            let p = c1.point(u, v);
+            match current[slot] {
+                Some(branch_idx)
+                    if branches[branch_idx]
+                        .last()
+                        .is_some_and(|prev| prev.distance(&p) <= max_step) =>
+                {
+                    branches[branch_idx].push(p);
+                }
+                _ => {
+                    branches.push(vec![p]);
+                    current[slot] = Some(branches.len() - 1);
+                }
+            }
+        }
+    }
+
+    branches
+        .into_iter()
+        .filter(|branch| branch.len() >= 2)
+        .map(|branch| GeomCurve::BSpline(polyline_to_bspline(&branch)))
+        .collect()
 }
 
 /// Find intersection curves between two surfaces.
@@ -1539,6 +1646,11 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
 
     let raw_curves = surface_surface(s1, s2, tol);
     let mut trimmed_curves = Vec::new();
+    let debug = std::env::var_os("OPENRCAD_BOOLEAN_DEBUG").is_some()
+        && matches!(
+            (s1, s2),
+            (GeomSurface::Cylinder(_), GeomSurface::Cylinder(_))
+        );
 
     for curve in raw_curves {
         let (c_min, c_max) = curve.bounds();
@@ -1575,6 +1687,8 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
 
         add_intersections(face1);
         add_intersections(face2);
+        add_containment_transitions(&curve, c_min, c_max, face1, s1, &mut split_params, tol);
+        add_containment_transitions(&curve, c_min, c_max, face2, s2, &mut split_params, tol);
 
         // Sort and deduplicate split parameters
         split_params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1583,6 +1697,20 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
             if unique_params.iter().all(|&u| (u - t).abs() > 1e-5) {
                 unique_params.push(t);
             }
+        }
+        if debug {
+            let a = curve.point(c_min);
+            let b = curve.point(c_max);
+            eprintln!(
+                "ssi cylinder raw ({:.4},{:.4},{:.4}) -> ({:.4},{:.4},{:.4}) params={}",
+                a.x(),
+                a.y(),
+                a.z(),
+                b.x(),
+                b.y(),
+                b.z(),
+                unique_params.len()
+            );
         }
 
         // For each segment, check if its midpoint lies inside both faces
@@ -1598,12 +1726,68 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
             let (u2, v2) = uv_of(s2, &p_mid);
 
             if is_inside_trimming_loops(u1, v1, face1) && is_inside_trimming_loops(u2, v2, face2) {
+                if debug {
+                    let a = curve.point(t1);
+                    let b = curve.point(t2);
+                    eprintln!(
+                        "ssi cylinder kept ({:.4},{:.4},{:.4}) -> ({:.4},{:.4},{:.4})",
+                        a.x(),
+                        a.y(),
+                        a.z(),
+                        b.x(),
+                        b.y(),
+                        b.z()
+                    );
+                }
                 trimmed_curves.push((curve.clone(), t1, t2));
             }
         }
     }
 
     trimmed_curves
+}
+
+fn add_containment_transitions(
+    curve: &GeomCurve,
+    first: f64,
+    last: f64,
+    face: &Face,
+    surface: &GeomSurface,
+    split_params: &mut Vec<f64>,
+    tol: f64,
+) {
+    let inside_at = |t: f64| {
+        let p = curve.point(t);
+        let (u, v) = uv_of(surface, &p);
+        is_inside_trimming_loops(u, v, face)
+    };
+
+    let samples = 192usize;
+    let mut prev_t = first;
+    let mut prev_inside = inside_at(prev_t);
+    for i in 1..=samples {
+        let t = first + (last - first) * (i as f64) / (samples as f64);
+        let inside = inside_at(t);
+        if inside != prev_inside {
+            let mut lo = prev_t;
+            let mut hi = t;
+            let lo_inside = prev_inside;
+            for _ in 0..32 {
+                let mid = 0.5 * (lo + hi);
+                if inside_at(mid) == lo_inside {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let crossing = 0.5 * (lo + hi);
+            if crossing > first + tol && crossing < last - tol {
+                split_params.push(crossing);
+            }
+        }
+        prev_t = t;
+        prev_inside = inside;
+    }
 }
 
 /// Trim a curve segment to the interior of a face.
@@ -1648,6 +1832,7 @@ pub fn trim_curve_to_face(
             }
         }
     }
+    add_containment_transitions(curve, first, last, face, surface, &mut split_params, tol);
 
     // Sort and deduplicate
     split_params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

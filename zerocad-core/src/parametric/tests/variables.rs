@@ -154,6 +154,7 @@ fn topology_edge_ref_reattaches_after_sketch_dimension_edit() {
             dist: 1.0,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay: Default::default(),
             kind: crate::sketch::CornerKind::Fillet,
         },
     });

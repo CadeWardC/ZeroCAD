@@ -138,6 +138,7 @@ fn edge_mod_on_sketched_prism_applies() {
                 dist: 2.11,
                 dist_expr: None,
                 scope: EdgeModScope::FullEdge,
+                replay: Default::default(),
                 kind,
             },
         });

@@ -83,13 +83,17 @@ impl ExtrudeOp {
 }
 
 impl ZeroCadApp {
-    /// Evaluate the model as if the active extrude had already been committed.
-    /// Used for live Cut/Join previews so the viewport shows the resulting body
-    /// instead of an additive orange tool volume.
-    pub(crate) fn preview_extrude_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
+    fn clear_extrude_preview_eval(&mut self) {
+        self.extrude_preview_cache = None;
+        self.extrude_preview_mesh_cache = None;
+        self.extrude_preview_inflight = None;
+        self.extrude_preview_rx = None;
+    }
+
+    fn build_preview_extrude_graph(&self) -> Option<zerocad_core::ParametricGraph> {
         let op = self.extrude_op.as_ref()?;
         if op.depth.abs() < 0.01 {
-            return Some(self.body_meshes.clone());
+            return None;
         }
 
         let mut graph = self.graph.clone();
@@ -110,13 +114,26 @@ impl ZeroCadApp {
                     depth: op.depth,
                     region_indices,
                     mode: op.mode,
-                    // The preview uses the already-resolved live depth; the
-                    // committed node (in `build_extrude_body`) keeps the expr.
                     depth_expr: None,
                 },
             });
             graph.add_dependency(&target.sketch_id, &extrude_id);
         }
+
+        Some(graph)
+    }
+
+    /// Evaluate the model as if the active extrude had already been committed.
+    /// Used for live Cut/Join previews so the viewport shows the resulting body
+    /// instead of an additive orange tool volume.
+    #[allow(dead_code)]
+    pub(crate) fn preview_extrude_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
+        let op = self.extrude_op.as_ref()?;
+        if op.depth.abs() < 0.01 {
+            return Some(self.body_meshes.clone());
+        }
+
+        let graph = self.build_preview_extrude_graph()?;
 
         // Draft eval: this re-solves the whole model every preview frame, so any
         // already-committed fillet uses its fast faceted cutter rather than the
@@ -132,12 +149,15 @@ impl ZeroCadApp {
     /// targets actually change, so idle frames and slow drags are nearly free.
     pub(crate) fn cached_preview_extrude_bodies(&mut self) -> Option<Vec<(String, MockMesh)>> {
         use std::hash::{Hash, Hasher};
-        if self.extrude_op.is_none() {
-            self.extrude_preview_cache = None;
+        let Some(op) = self.extrude_op.as_ref() else {
+            self.clear_extrude_preview_eval();
             return None;
+        };
+        if op.depth.abs() < 0.01 {
+            return Some(self.body_meshes.clone());
         }
+
         let key = {
-            let op = self.extrude_op.as_ref().unwrap();
             let mut h = std::collections::hash_map::DefaultHasher::new();
             // Quantize depth to 0.05mm: identical/idle frames and slow drags reuse
             // the cache, and a sub-0.05mm preview lag is invisible (the commit
@@ -154,7 +174,11 @@ impl ZeroCadApp {
                 t.indices.hash(&mut h);
             }
             self.id_counter.hash(&mut h);
-            self.hidden_nodes.len().hash(&mut h);
+            let mut hidden: Vec<&String> = self.hidden_nodes.iter().collect();
+            hidden.sort();
+            for id in hidden {
+                id.hash(&mut h);
+            }
             // Include variable values so that editing a dimension variable while
             // the extrude dialog is open invalidates the cached boolean result.
             let vars = self.graph.variable_map();
@@ -166,14 +190,59 @@ impl ZeroCadApp {
             }
             h.finish()
         };
+
+        if let Some(rx) = self.extrude_preview_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((finished_key, result)) => {
+                    self.extrude_preview_rx = None;
+                    self.extrude_preview_inflight = None;
+                    match result {
+                        Ok(bodies) => self.extrude_preview_cache = Some((finished_key, bodies)),
+                        Err(err) => {
+                            log::warn!("Background extrude preview failed: {err}");
+                            self.extrude_preview_cache = None;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.extrude_preview_rx = None;
+                    self.extrude_preview_inflight = None;
+                }
+            }
+        }
+
         if let Some((cached_key, bodies)) = self.extrude_preview_cache.as_ref() {
             if *cached_key == key {
                 return Some(bodies.clone());
             }
         }
-        let bodies = self.preview_extrude_bodies();
-        self.extrude_preview_cache = bodies.as_ref().map(|b| (key, b.clone()));
-        bodies
+
+        if self
+            .extrude_preview_inflight
+            .is_some_and(|inflight| inflight != key)
+        {
+            self.extrude_preview_rx = None;
+            self.extrude_preview_inflight = None;
+        }
+        if self.extrude_preview_inflight.is_none() {
+            if let Some(graph) = self.build_preview_extrude_graph() {
+                let hidden = self.hidden_nodes.clone();
+                let ctx = self.egui_ctx.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.extrude_preview_rx = Some(rx);
+                self.extrude_preview_inflight = Some(key);
+                std::thread::spawn(move || {
+                    let result = graph.evaluate_bodies_draft(&hidden);
+                    let _ = tx.send((key, result));
+                    if let Some(ctx) = ctx {
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
+
+        None
     }
 
     /// Memoized [`ExtrudeOp::preview_mesh`] (the tool ghost volume). Rebuilt only
@@ -574,6 +643,7 @@ impl ZeroCadApp {
         self.extrude_mode = op.mode; // remember the mode too
 
         if op.depth.abs() < 0.01 {
+            self.clear_extrude_preview_eval();
             self.status_msg = "Extrude distance is zero — nothing created.".to_string();
             return;
         }
@@ -608,7 +678,8 @@ impl ZeroCadApp {
         if let Some(id) = last_id {
             self.selected_node_id = Some(id);
         }
-        self.reevaluate_geometry();
+        self.clear_extrude_preview_eval();
+        self.spawn_refine_eval();
         self.status_msg = match op.mode {
             ExtrudeMode::NewBody => {
                 format!("Extruded {} new body(ies). Source sketch hidden.", count)
@@ -631,6 +702,7 @@ impl ZeroCadApp {
     /// Discard the in-progress extrude, keeping the face selection.
     pub(crate) fn cancel_extrude_op(&mut self) {
         self.extrude_op = None;
+        self.clear_extrude_preview_eval();
         self.status_msg = "Extrude cancelled.".to_string();
     }
 }

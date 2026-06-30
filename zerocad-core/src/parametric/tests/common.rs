@@ -117,6 +117,7 @@ pub(super) fn box_with_edge_mod(dist: f32, kind: crate::sketch::CornerKind) -> P
             dist,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay: Default::default(),
             kind,
         },
     });
@@ -182,6 +183,7 @@ pub(super) fn box_with_boss_then_edge_mod(
             dist,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
+            replay: Default::default(),
             kind,
         },
     });
