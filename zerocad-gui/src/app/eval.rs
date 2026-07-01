@@ -76,8 +76,16 @@ impl ZeroCadApp {
     /// faceted-preview/arc-refine swap.
     pub(crate) fn reevaluate_geometry(&mut self) {
         // Native fillets are final geometry, not a faceted draft.
-        match self.graph.evaluate_bodies_with_warnings(&self.hidden_nodes) {
-            Ok((bodies, warnings)) => self.apply_eval_result(bodies, warnings),
+        match self.graph.evaluate_bodies_with_status(&self.hidden_nodes) {
+            Ok((bodies, warnings, statuses)) => {
+                // Record which features failed to resolve so the history tree can
+                // flag them (⚠) rather than only a global warning count.
+                self.unresolved_features = statuses
+                    .into_iter()
+                    .filter_map(|s| s.reason().map(|r| (s.feature_id.clone(), r.to_string())))
+                    .collect();
+                self.apply_eval_result(bodies, warnings);
+            }
             Err(err) => {
                 self.error_msg = Some(err);
                 self.status_msg = "Error: Model evaluation failed.".to_string();

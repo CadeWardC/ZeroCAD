@@ -597,4 +597,25 @@ impl ZeroCadApp {
         let v = n.cross(u).normalize();
         Some(CoordinateSystem::new(origin, u, v))
     }
+
+    /// The durable [`FaceRef`] for a picked body face, so a sketch placed on it can
+    /// re-derive its plane from wherever the face is after the body changes.
+    pub(crate) fn face_ref(
+        &self,
+        node_id: &str,
+        fid: u32,
+    ) -> Option<zerocad_core::parametric::FaceRef> {
+        let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == node_id)?;
+        let f = mesh.face_refs.iter().find(|f| f.face_id == fid)?;
+        Some(zerocad_core::parametric::FaceRef {
+            centroid: f.centroid,
+            normal: f.normal,
+            topology: Some(zerocad_core::parametric::TopologyFaceRef {
+                body_id: Some(node_id.to_string()),
+                topology_version: f.topology.as_ref().and_then(|t| t.topology_version),
+                face_id: f.topology.as_ref().and_then(|t| t.face_id.clone()),
+                surface_kind: f.topology.as_ref().and_then(|t| t.surface_kind.clone()),
+            }),
+        })
+    }
 }

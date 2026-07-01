@@ -17,6 +17,8 @@ impl ZeroCadApp {
             egui_ctx: None,
             error_msg: None,
             status_msg: "Welcome to ZeroCAD. Ready for modeling.".to_string(),
+            unresolved_features: std::collections::HashMap::new(),
+            active_sketch_face_ref: None,
             doc_created_unix: None,
             // Positive pitch starts the camera above the XZ ground plane,
             // looking down at it (negative would start underneath).

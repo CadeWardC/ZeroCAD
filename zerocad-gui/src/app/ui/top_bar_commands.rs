@@ -51,6 +51,17 @@ impl ZeroCadApp {
 
                     self.push_undo();
                     self.graph.add_feature(sketch_node);
+                    // A sketch placed on a body face records that face + a dependency
+                    // on the body, so on rebuild its plane is re-derived from where
+                    // the face now is (the sketch follows the body).
+                    if let Some(fref) = self.active_sketch_face_ref.take() {
+                        if let Some(body_id) =
+                            fref.topology.as_ref().and_then(|t| t.body_id.clone())
+                        {
+                            self.graph.add_dependency(&body_id, &sketch_id);
+                        }
+                        self.graph.sketch_face_refs.insert(sketch_id.clone(), fref);
+                    }
                     self.selected_node_id = Some(sketch_id);
                     self.reset_sketch_state();
                     self.status_msg =
@@ -94,11 +105,17 @@ impl ZeroCadApp {
                             None
                         };
 
-                        match face_sel.and_then(|(nid, fid)| self.face_cs(&nid, fid)) {
-                            Some(cs) => {
+                        let cs_and_ref = face_sel.and_then(|(nid, fid)| {
+                            self.face_cs(&nid, fid)
+                                .map(|cs| (cs, self.face_ref(&nid, fid)))
+                        });
+                        match cs_and_ref {
+                            Some((cs, fref)) => {
                                 log::info!("Sketching on a selected body face.");
                                 let now = ui.input(|i| i.time);
                                 self.active_sketch_on_face = true;
+                                // Remember which face, so the finished sketch follows it.
+                                self.active_sketch_face_ref = fref;
                                 self.begin_sketch_on(cs, now);
                                 self.status_msg =
                                     "Sketching on the selected face. Draw a profile, then Finish Sketch.".to_string();
@@ -106,6 +123,7 @@ impl ZeroCadApp {
                             None => {
                                 log::info!("Entering sketch plane selection mode. Viewport remains in 3D.");
                                 self.active_sketch_on_face = false;
+                                self.active_sketch_face_ref = None;
                                 self.is_plane_selection_mode = true;
                                 self.is_sketch_mode = false;
                                 self.reset_sketch_state();

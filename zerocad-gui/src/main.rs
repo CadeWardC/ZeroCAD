@@ -339,6 +339,15 @@ struct ZeroCadApp {
     egui_ctx: Option<egui::Context>,
     error_msg: Option<String>,
     status_msg: String,
+    /// Per-feature "unresolved" reasons from the last evaluation, keyed by feature
+    /// id. A feature here failed to resolve/apply (its edge/face reference didn't
+    /// reattach, its boolean couldn't run) and is flagged in the history tree with
+    /// a ⚠ marker instead of silently coming out wrong.
+    unresolved_features: std::collections::HashMap<String, String>,
+    /// When sketching on a body face, the captured reference to that face, carried
+    /// from face-pick to sketch-commit so the finished sketch stores it (and the
+    /// sketch plane then follows the body). `None` for origin-plane sketches.
+    active_sketch_face_ref: Option<zerocad_core::parametric::FaceRef>,
     /// Creation timestamp (Unix seconds) of the document currently open, carried
     /// from the loaded `.zcad` so re-saving preserves "created" rather than
     /// stamping it anew. `None` for a fresh/never-saved or legacy document.

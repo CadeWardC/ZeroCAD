@@ -263,8 +263,20 @@ impl ZeroCadApp {
         is_var_set: bool,
     ) -> RowAction {
         let mut action = RowAction::None;
+        // A feature whose reference/boolean didn't resolve on the last rebuild is
+        // flagged here so it's visible in the tree, not just a global warning.
+        let unresolved = self.unresolved_features.get(id).cloned();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+
+            if let Some(reason) = &unresolved {
+                ui.label(
+                    egui::RichText::new("⚠")
+                        .color(egui::Color32::from_rgb(220, 38, 38))
+                        .size(13.0),
+                )
+                .on_hover_text(format!("Unresolved: {reason}"));
+            }
 
             if id != "origin" {
                 let eye_color = if hidden {
