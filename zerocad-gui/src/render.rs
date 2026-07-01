@@ -10,7 +10,7 @@ use zerocad_core::{
 };
 
 use crate::geom2d::draw_sketch_geometry;
-use crate::{BodyPick, ZeroCadApp};
+use crate::{BodyPick, PendingVisualMode, ZeroCadApp};
 
 const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
 const SELECTED_BODY_BASE: (f32, f32, f32) = (50.0, 165.0, 245.0);
@@ -524,8 +524,23 @@ impl ZeroCadApp {
         // actual merged/cut result before committing.
         // A live 3D edge fillet/chamfer previews the resulting (cut) body, the
         // same way a Cut/Join extrude does — and suppresses the extrude preview.
-        let edge_mod_active = self.edge_mod_op.is_some();
-        let preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
+        let mut edge_mod_active = self.edge_mod_op.is_some();
+        let mut preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
+
+        // If there is no active operation but we have a pending visual, we can use the mode from the pending visual!
+        if !edge_mod_active && preview_mode.is_none() {
+            if let Some(pending) = &self.pending_visual {
+                match pending.mode {
+                    PendingVisualMode::Extrude(mode) => {
+                        preview_mode = Some(mode);
+                    }
+                    PendingVisualMode::EdgeMod(_) => {
+                        edge_mod_active = true;
+                    }
+                }
+            }
+        }
+
         // A New Body extrude of overlapping shapes is a boolean (box-minus-cylinder
         // etc.): the warm ghost would draw the un-booleaned split regions, so
         // (once the drag settles) suppress it and show the real evaluated body.
@@ -533,13 +548,22 @@ impl ZeroCadApp {
             && !self.extrude_depth_dragging
             && preview_mode == Some(ExtrudeMode::NewBody)
             && self.op_has_overlapping_shapes();
-        let extrude_preview_mesh = if edge_mod_active || newbody_overlap {
+        let extrude_preview_mesh = if edge_mod_active
+            || (newbody_overlap && self.cached_preview_extrude_bodies().is_some())
+        {
             None
         } else {
             // Memoized: only re-tessellated when the depth/targets change.
-            self.cached_preview_mesh()
+            self.cached_preview_mesh().or_else(|| {
+                if let Some(pending) = &self.pending_visual {
+                    if matches!(pending.mode, PendingVisualMode::Extrude(_)) {
+                        return pending.mesh.clone();
+                    }
+                }
+                None
+            })
         };
-        let preview_bodies = if edge_mod_active {
+        let mut preview_bodies = if edge_mod_active {
             // Exact edge-mod bodies arrive from the worker cache. Until then the
             // lightweight overlay mesh below gives immediate visual feedback.
             self.cached_preview_edge_mod_bodies()
@@ -562,11 +586,27 @@ impl ZeroCadApp {
                 _ => None,
             }
         };
-        let edge_mod_preview_mesh = if edge_mod_active && preview_bodies.is_none() {
-            self.cached_preview_edge_mod_mesh()
-        } else {
-            None
-        };
+
+        // Fall back to pending_visual bodies if no active preview bodies are resolved:
+        if preview_bodies.is_none() {
+            if let Some(pending) = &self.pending_visual {
+                preview_bodies = Some(pending.bodies.clone());
+            }
+        }
+
+        let edge_mod_preview_mesh =
+            if edge_mod_active && self.cached_preview_edge_mod_bodies().is_none() {
+                self.cached_preview_edge_mod_mesh().or_else(|| {
+                    if let Some(pending) = &self.pending_visual {
+                        if matches!(pending.mode, PendingVisualMode::EdgeMod(_)) {
+                            return pending.mesh.clone();
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
 
         // A Cut preview ghosts the resulting body (alpha < 255) so the pocket /
         // hole being formed shows through, like Fusion's cut preview. Everything

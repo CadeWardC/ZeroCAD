@@ -302,7 +302,19 @@ type EvalResult = (u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>);
 /// Result delivered by an asynchronous live-preview evaluation.
 type PreviewBodiesResult = (u64, Result<Vec<(String, MockMesh)>, String>);
 
+pub(crate) enum PendingVisualMode {
+    Extrude(ExtrudeMode),
+    EdgeMod(CornerKind),
+}
+
+pub(crate) struct PendingCommitVisual {
+    pub(crate) bodies: Vec<(String, MockMesh)>,
+    pub(crate) mesh: Option<MockMesh>,
+    pub(crate) mode: PendingVisualMode,
+}
+
 struct ZeroCadApp {
+    pending_visual: Option<PendingCommitVisual>,
     graph: ParametricGraph,
     selected_node_id: Option<String>,
     /// One mesh per solid body (node id + mesh), so faces/edges/points can be

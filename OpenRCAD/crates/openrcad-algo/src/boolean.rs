@@ -373,11 +373,24 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
         *sub = new_sub;
     };
 
-    for sub in obj_sub.values_mut() {
-        run_partition(&mut builder_obj, sub, &mut splitting_edges_obj);
+    // Partition in the original faces' deterministic order, NOT HashMap order.
+    // Iterating `obj_sub.values_mut()` walks the map in Rust's per-process random
+    // HashMap order, so `partition_face` allocates new FaceIds in a different
+    // order each run. That cascades through `sew` (which merges in kept-face
+    // order) and the merges into a topologically different — though still valid —
+    // result, making downstream fillet/tessellation flaky (the same body would
+    // pass or fail the ghost-material check from run to run). Walking the
+    // deterministic original face lists pins the order so the boolean is
+    // reproducible, which is what stable downstream edge/face identity needs.
+    for f in &faces_obj {
+        if let Some(sub) = obj_sub.get_mut(&f.id()) {
+            run_partition(&mut builder_obj, sub, &mut splitting_edges_obj);
+        }
     }
-    for sub in tool_sub.values_mut() {
-        run_partition(&mut builder_tool, sub, &mut splitting_edges_tool);
+    for f in &faces_tool {
+        if let Some(sub) = tool_sub.get_mut(&f.id()) {
+            run_partition(&mut builder_tool, sub, &mut splitting_edges_tool);
+        }
     }
 
     // 3. Classify all split faces
@@ -502,6 +515,13 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     // 4. Sew kept faces together
     let shell = sew(&kept_faces, tol);
     let solid = Solid::new(shell);
+
+    // 4b. Heal T-junctions: an imprint can split one face's boundary edge at a
+    //     vertex without splitting the coincident edge of a perpendicular adjacent
+    //     face (e.g. a boss footprint straddling a box edge), leaving the shell
+    //     open. Split such edges at the stray interior vertex so the coincident
+    //     edges share endpoints. A no-op (and skipped) when already watertight.
+    let solid = crate::merge::heal_tjunctions(&solid, tol);
 
     // 5. Merge coplanar faces split by the imprint (e.g. a union of two boxes
     //    keeps the shared face as several coplanar strips), then cocylindrical
@@ -772,9 +792,22 @@ fn split_tracked(
 ) {
     let mut result = Vec::with_capacity(subfaces.len());
     for &fid in subfaces.iter() {
-        let force_queue_clean_crosscuts = splitting_edges_map
-            .get(&fid)
-            .is_some_and(|edges| !edges.is_empty());
+        // A clean 2-point crosscut on a cylindrical face must be *queued* (not
+        // split immediately): immediate bisection fragments the wall, so a
+        // rect-minus-cylinder body collapses to a box (the vanishing circular
+        // bite). Queuing lets every crosscut on the cylinder partition together
+        // via the deferred `partition_face` path; `merge_cocylindrical_faces`
+        // then coalesces the wall back to one analytic cylinder.
+        let is_cylinder = builder
+            .brep()
+            .faces
+            .get(fid)
+            .and_then(|f| f.surface.as_ref())
+            .is_some_and(|s| matches!(s, GeomSurface::Cylinder(_)));
+        let force_queue_clean_crosscuts = is_cylinder
+            || splitting_edges_map
+                .get(&fid)
+                .is_some_and(|edges| !edges.is_empty());
         let (next_faces, new_edges) = crate::imprint::imprint_curve_on_face(
             builder,
             fid,

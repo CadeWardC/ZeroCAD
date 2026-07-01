@@ -28,6 +28,7 @@ impl ZeroCadApp {
                 self.selected_body.clear();
                 self.extrude_op = None;
                 self.edge_mod_op = None;
+                self.pending_visual = None;
                 self.reevaluate_geometry();
                 self.status_msg = "Undo.".to_string();
             }
@@ -52,6 +53,7 @@ impl ZeroCadApp {
                 self.selected_body.clear();
                 self.extrude_op = None;
                 self.edge_mod_op = None;
+                self.pending_visual = None;
                 self.reevaluate_geometry();
                 self.status_msg = "Redo.".to_string();
             }
@@ -69,6 +71,7 @@ impl ZeroCadApp {
         self.body_meshes = Vec::new();
         self.mesh_stats = (0, 0);
         self.selected_node_id = None;
+        self.pending_visual = None;
         self.reset_sketch_state();
         self.selected_faces.clear();
         self.selected_edges.clear();
@@ -705,6 +708,7 @@ impl ZeroCadApp {
 
         // Regenerate from the recipe (authoritative). On failure, the cached
         // bodies above remain on screen so the model is never lost.
+        self.pending_visual = None;
         self.reevaluate_geometry();
         self.status_msg = format!("Design loaded from {}", path.display());
         self.remember_project(&path);

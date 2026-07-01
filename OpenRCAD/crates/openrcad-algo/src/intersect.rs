@@ -3,7 +3,8 @@
 
 use openrcad_foundation::{Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
-    BSplineCurve, Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane, Surface,
+    BSplineCurve, Circle, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, Plane,
+    Surface,
 };
 use openrcad_topo::{containment::point_in_polygon_2d, Face, Orientation};
 
@@ -931,19 +932,27 @@ fn plane_cylinder_curves(plane: &Plane, cyl: &CylindricalSurface) -> Vec<GeomCur
         ];
     }
 
+    // Oblique plane ∩ cylinder = an exact ellipse. Emitting the analytic curve
+    // (instead of a 160-point sampled B-spline) keeps the imprinted seam exactly
+    // on both surfaces, so the cut trims watertight instead of leaving the tiny
+    // sampling error that broke the result topology (`SuspiciousEulerCharacteristic`).
+    //
+    //   center      = where the axis pierces the plane
+    //   major dir   = the axis projected into the plane (steepest tilt), |a| = r/|cosθ|
+    //   minor dir   = ⊥ to both axis and major (in-plane), |b| = r
+    // where cosθ = |w·n| is the tilt of the axis to the plane normal.
     let denom = w.dot(&n);
     if denom.abs() < 1e-12 {
         return Vec::new();
     }
-    let samples = 160usize;
-    let mut pts = Vec::with_capacity(samples + 1);
-    for i in 0..=samples {
-        let u = 2.0 * PI * (i as f64) / (samples as f64);
-        let radial = cyl.point(u, 0.0);
-        let v = -(radial - plane.location()).dot(&n) / denom;
-        pts.push(cyl.point(u, v));
-    }
-    vec![GeomCurve::BSpline(polyline_to_bspline(&pts))]
+    let center = axis.location() + w * ((plane.location() - axis.location()).dot(&n) / denom);
+    let Some(major_dir) = (w - n * denom).normalized() else {
+        return Vec::new();
+    };
+    let major = cyl.radius() / denom.abs();
+    let minor = cyl.radius();
+    let frame = Ax3::new_axes(center, plane.normal(), major_dir);
+    vec![GeomCurve::Ellipse(Ellipse::new(frame, major, minor))]
 }
 
 fn cylinder_cylinder_curves(c1: &CylindricalSurface, c2: &CylindricalSurface) -> Vec<GeomCurve> {
@@ -1667,8 +1676,10 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
 
         let mut split_params = vec![c_min, c_max];
 
-        // Find intersections between the intersection curve and the boundary edges of both faces
-        let mut add_intersections = |face: &Face| {
+        // Find exact analytic crossings of the intersection curve with both faces'
+        // boundary edges — the authoritative trim boundaries.
+        let mut edge_crossings = Vec::new();
+        let add_intersections = |face: &Face, out: &mut Vec<f64>| {
             for wire in face.wires() {
                 for edge in wire.edges() {
                     if let Some(edge_curve) = edge.curve() {
@@ -1677,7 +1688,7 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
                             let t =
                                 crate::boolean::project_point_on_curve(&pt, &curve, c_min, c_max);
                             if t > c_min + tol && t < c_max - tol {
-                                split_params.push(t);
+                                out.push(t);
                             }
                         }
                     }
@@ -1685,10 +1696,29 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
             }
         };
 
-        add_intersections(face1);
-        add_intersections(face2);
-        add_containment_transitions(&curve, c_min, c_max, face1, s1, &mut split_params, tol);
-        add_containment_transitions(&curve, c_min, c_max, face2, s2, &mut split_params, tol);
+        add_intersections(face1, &mut edge_crossings);
+        add_intersections(face2, &mut edge_crossings);
+        split_params.extend(edge_crossings.iter().copied());
+        add_containment_transitions(
+            &curve,
+            c_min,
+            c_max,
+            face1,
+            s1,
+            &mut split_params,
+            &edge_crossings,
+            tol,
+        );
+        add_containment_transitions(
+            &curve,
+            c_min,
+            c_max,
+            face2,
+            s2,
+            &mut split_params,
+            &edge_crossings,
+            tol,
+        );
 
         // Sort and deduplicate split parameters
         split_params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1747,6 +1777,7 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
     trimmed_curves
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_containment_transitions(
     curve: &GeomCurve,
     first: f64,
@@ -1754,6 +1785,7 @@ fn add_containment_transitions(
     face: &Face,
     surface: &GeomSurface,
     split_params: &mut Vec<f64>,
+    edge_crossings: &[f64],
     tol: f64,
 ) {
     let inside_at = |t: f64| {
@@ -1763,6 +1795,16 @@ fn add_containment_transitions(
     };
 
     let samples = 192usize;
+    // A sampled transition lands where `is_inside_trimming_loops` flips, which sits
+    // a boundary-margin *inside* the true crossing — so where the curve actually
+    // crosses a boundary edge, the exact analytic crossing (`edge_crossings`) is
+    // authoritative and the sampled one is a redundant, slightly-short duplicate.
+    // Adding it would shrink the trimmed interval (a coplanar chord stopping short
+    // of the cylinder rim → the face never splits → a non-manifold boss seam).
+    // So skip any sampled transition within one sample step of an exact crossing.
+    let snap = ((last - first).abs() / samples as f64).max(2.0 * tol);
+    let near_exact = |t: f64| edge_crossings.iter().any(|&c| (c - t).abs() <= snap);
+
     let mut prev_t = first;
     let mut prev_inside = inside_at(prev_t);
     for i in 1..=samples {
@@ -1781,7 +1823,7 @@ fn add_containment_transitions(
                 }
             }
             let crossing = 0.5 * (lo + hi);
-            if crossing > first + tol && crossing < last - tol {
+            if crossing > first + tol && crossing < last - tol && !near_exact(crossing) {
                 split_params.push(crossing);
             }
         }
@@ -1819,6 +1861,9 @@ pub fn trim_curve_to_face(
 
     let mut split_params = vec![first, last];
 
+    // Exact analytic crossings of the curve with the face's boundary edges. These
+    // are the authoritative trim boundaries.
+    let mut edge_crossings = Vec::new();
     for wire in face.wires() {
         for edge in wire.edges() {
             if let Some(edge_curve) = edge.curve() {
@@ -1826,13 +1871,23 @@ pub fn trim_curve_to_face(
                 for pt in pts {
                     let t = crate::boolean::project_point_on_curve(&pt, curve, first, last);
                     if t > first + tol && t < last - tol {
-                        split_params.push(t);
+                        edge_crossings.push(t);
                     }
                 }
             }
         }
     }
-    add_containment_transitions(curve, first, last, face, surface, &mut split_params, tol);
+    split_params.extend(edge_crossings.iter().copied());
+    add_containment_transitions(
+        curve,
+        first,
+        last,
+        face,
+        surface,
+        &mut split_params,
+        &edge_crossings,
+        tol,
+    );
 
     // Sort and deduplicate
     split_params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2015,6 +2070,37 @@ mod tests {
         let pt = curves[0].point(0.0);
         assert!(pt.y().abs() < 1e-2);
         assert!(pt.z().abs() < 1e-2);
+    }
+
+    #[test]
+    fn oblique_plane_cylinder_is_analytic_ellipse_on_both_surfaces() {
+        use openrcad_foundation::{Ax3, Dir};
+        use openrcad_geom::CylindricalSurface;
+        // Radius-3 cylinder about the Z axis, cut by a 45°-tilted plane through
+        // the origin → an exact ellipse (semi-minor 3, semi-major 3/cos45°).
+        let r = 3.0;
+        let cyl =
+            GeomSurface::Cylinder(CylindricalSurface::new(Ax3::new(Pnt::origin(), Dir::dz()), r));
+        let n = Dir::from_vec(&GeomVec::new(0.0, 1.0, 1.0)).unwrap();
+        let plane = GeomSurface::Plane(Plane::from_point_normal(Pnt::origin(), n));
+
+        let curves = surface_surface(&cyl, &plane, 1e-6);
+        assert_eq!(curves.len(), 1, "oblique plane∩cylinder is one curve");
+        assert!(
+            matches!(curves[0], GeomCurve::Ellipse(_)),
+            "must be analytic, got {:?}",
+            curves[0]
+        );
+        // Every sampled point lies on BOTH the cylinder (radius r about Z) and the
+        // plane — to far tighter than the old 160-sample B-spline could manage.
+        for k in 0..64 {
+            let u = 2.0 * PI * k as f64 / 64.0;
+            let p = curves[0].point(u);
+            let radial = (p.x() * p.x() + p.y() * p.y()).sqrt();
+            assert!((radial - r).abs() < 1e-9, "u={u}: off cylinder, r={radial}");
+            let on_plane = GeomVec::from_dir(n).dot(&(p - Pnt::origin()));
+            assert!(on_plane.abs() < 1e-9, "u={u}: off plane by {on_plane}");
+        }
     }
 
     #[test]

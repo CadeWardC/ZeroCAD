@@ -12,7 +12,7 @@ use zerocad_core::{
     CornerKind, EdgeModReplayIntent, EdgeModScope, EdgeRef, FeatureNode, FeatureType, MockMesh,
 };
 
-use crate::ZeroCadApp;
+use crate::{PendingCommitVisual, PendingVisualMode, ZeroCadApp};
 
 /// How long an edge-mod size must hold steady before its preview geometry is
 /// computed on a worker thread after the first instant solve (see
@@ -684,9 +684,22 @@ impl ZeroCadApp {
     /// Commit the live edge mod into history as a real `EdgeMod` feature, binding
     /// the size to a variable expression when the text references one.
     pub(crate) fn commit_edge_mod(&mut self) {
+        // Resolve preview state first to avoid borrow-check conflicts
+        let bodies = self
+            .cached_preview_edge_mod_bodies()
+            .unwrap_or_else(|| self.body_meshes.clone());
+        let mesh = self.cached_preview_edge_mod_mesh();
+
         let Some(op) = self.edge_mod_op.take() else {
             return;
         };
+
+        // Capture pending visual
+        self.pending_visual = Some(PendingCommitVisual {
+            bodies,
+            mesh,
+            mode: PendingVisualMode::EdgeMod(op.kind),
+        });
         // Key the speculative precompute before `op`'s fields are moved below.
         let arc_key = Self::edge_mod_arc_key(&op, &self.hidden_nodes);
         self.push_undo();

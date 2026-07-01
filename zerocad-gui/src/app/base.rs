@@ -6,6 +6,7 @@ impl ZeroCadApp {
         let prefs = settings::AppSettings::load();
 
         Self {
+            pending_visual: None,
             graph,
             selected_node_id: None,
             body_meshes: Vec::new(),

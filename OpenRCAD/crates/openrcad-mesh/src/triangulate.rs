@@ -228,13 +228,28 @@ fn find_crossing_edge(
     locked_edges: &HashSet<(usize, usize)>,
 ) -> Option<(usize, usize, usize, usize)> {
     let edge_map = build_edge_map(tris);
-    for (&(c, d), adj) in &edge_map {
-        if c == a || c == b || d == a || d == b || locked_edges.contains(&edge_key(c, d)) {
-            continue;
-        }
-
-        if adj.len() == 2 && segments_intersect_strict(points[a], points[b], points[c], points[d]) {
-            return Some((c, d, adj[0], adj[1]));
+    // Scan candidate edges in TRIANGLE order (a stable Vec), not HashMap order,
+    // returning the first crossing edge. Constraint recovery flips whatever this
+    // returns, so a randomly-seeded HashMap order would recover the same constrained
+    // triangulation along a different flip path — a different (still valid) mesh per
+    // process, which cascades into the crack-fix point insertions and changes
+    // vertex/triangle counts run to run (the flaky circular-bite fillet display).
+    // Triangle order is reproducible, and the early return keeps this as cheap as
+    // the original scan (a full sorted/min pass would be a real slowdown here,
+    // since this runs inside the flip loop).
+    for t in tris {
+        for (c, d) in [(t.a, t.b), (t.b, t.c), (t.c, t.a)] {
+            if c == a || c == b || d == a || d == b || locked_edges.contains(&edge_key(c, d)) {
+                continue;
+            }
+            let Some(adj) = edge_map.get(&edge_key(c, d)) else {
+                continue;
+            };
+            if adj.len() == 2
+                && segments_intersect_strict(points[a], points[b], points[c], points[d])
+            {
+                return Some((c, d, adj[0], adj[1]));
+            }
         }
     }
 

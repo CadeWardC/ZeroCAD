@@ -653,6 +653,17 @@ impl BRepBuilder {
                 visited_edges.insert(curr_he);
                 loop_edges.push(curr_he);
 
+                // A valid face loop uses each half-edge at most once, so it can
+                // never be longer than the half-edge pool. If the rotation system
+                // enters a degenerate sub-cycle that never returns to the anchor
+                // (possible with near-coincident vertices a blend can introduce),
+                // this guard breaks out and discards the bogus partial loop instead
+                // of spinning forever — turning a hang into graceful degradation.
+                if loop_edges.len() > half_edges.len() {
+                    loop_edges.clear();
+                    break;
+                }
+
                 let (_, end_v) = get_edge_endpoints(&self.brep, curr_he);
                 let list = match adjacency.get(&end_v) {
                     Some(l) => l,
@@ -886,7 +897,14 @@ impl BRepBuilder {
         // Initialize inner wires arrays for each loop
         let mut distributed_inners = vec![Vec::new(); n_loops];
 
-        // Distribute original face's inner wires to the new faces
+        // Distribute original face's inner wires to the new faces, assigning each
+        // hole to the SMALLEST (innermost) face that contains it. A concentric
+        // re-cut nests faces — e.g. an existing r2 hole sits inside a new r4 disk
+        // sits inside the outer cap — so the hole's true parent is the innermost
+        // face. Picking the first container (often the big outer cap) would leave
+        // the r2 wire on the cap and the r4 disk wall-less → a non-watertight
+        // re-bored hole. (Mirrors the most-nested-container rule used for new
+        // holes via `hole_to_face` above.)
         for &inner_loop_id in &face_data.inner_wires {
             let inner_loop = &self.brep.loops[inner_loop_id];
             if let Some(&first_edge) = inner_loop.edges.first() {
@@ -894,12 +912,17 @@ impl BRepBuilder {
                 let p = self.brep.vertices[start_v].point;
                 let uv = project_point_on_surface(p, surface);
 
-                // Find which face loop contains this hole
+                let mut best: Option<usize> = None;
                 for idx in 0..n_loops {
                     if is_face[idx] && point_in_polygon_2d(uv, &loop_polys[idx]) {
-                        distributed_inners[idx].push(inner_loop_id);
-                        break;
+                        best = match best {
+                            Some(b) if loop_areas[b].abs() <= loop_areas[idx].abs() => Some(b),
+                            _ => Some(idx),
+                        };
                     }
+                }
+                if let Some(idx) = best {
+                    distributed_inners[idx].push(inner_loop_id);
                 }
             }
         }

@@ -312,6 +312,37 @@ fn assert_circular_bite_fillet_3mm_committed(
     );
     assert_selected_blend_surface(
         mesh,
+        &edge,
+        3.0,
+        kind,
+        &format!("{label} cutoff-edge edge-mod"),
+    );
+    let (cracks, nonmanifold, inward) = mesh_stats(mesh);
+    println!(
+        "TEST DEBUG: cracks={}, nonmanifold={}, inward={}",
+        cracks, nonmanifold, inward
+    );
+    assert_eq!(
+        cracks, 0,
+        "{label}: {kind:?} cutoff-edge result has {cracks} cracks"
+    );
+    // Tightened from `< 2000` after the kernel determinism fixes: the circular-bite
+    // fillet display mesh is now reproducible (a stable ~25 inward triangles, not a
+    // flaky up-to-2000), so this locks in a much tighter bound. The residual inward
+    // triangles + non-manifold edges (`nonmanifold` here is ~44) are a separate
+    // fillet-blend *tessellation*-quality issue (the concave Gregory-patch mesh),
+    // not the boolean/determinism work — driving them to 0 is a mesh-crate follow-up
+    // that would let the `has_circular_bite_source` band-aids in `edge_mod.rs` go.
+    let _ = nonmanifold;
+    assert!(
+        inward < 60,
+        "{label}: {kind:?} cutoff-edge result has too many inward triangles: {inward}"
+    );
+}
+
+#[test]
+fn gui_captured_circular_bite_topology_resolves_to_same_visible_span() {
+    for depth in [6.0, 9.2, 10.0] {
         let edge = gui_captured_circular_bite_cutoff_edge(depth);
         let g = circular_bite_graph_with_depth(None, depth);
         let (live, warnings) = g

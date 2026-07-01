@@ -101,6 +101,7 @@ impl ZeroCadApp {
         bodies: Vec<(String, MockMesh)>,
         warnings: Vec<String>,
     ) {
+        self.pending_visual = None;
         self.body_meshes = bodies;
         self.mesh_stats = Self::mesh_totals(&self.body_meshes);
         if warnings.is_empty() {
@@ -177,6 +178,7 @@ impl ZeroCadApp {
         self.eval_gen += 1;
         self.eval_rx = None;
         self.eval_pending = false;
+        self.pending_visual = None;
         match self.graph.evaluate_bodies_with_warnings(&self.hidden_nodes) {
             Ok((bodies, warnings)) => self.apply_eval_result(bodies, warnings),
             Err(err) => {

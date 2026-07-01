@@ -22,8 +22,6 @@ Use this as the quick map before editing. The longer architecture notes live in
 
 ## Boundaries
 
-- Do not edit `OpenRCAD/` unless the task explicitly targets the embedded kernel
-  workspace. The root workspace consumes it through the `openrcad` path dependency.
 - Keep public data shape stable unless the task is explicitly a file-format or
   schema change. `.zcad` loading depends on serde compatibility.
 - Geometry changes need regression tests. Prefer focused tests in

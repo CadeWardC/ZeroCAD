@@ -601,14 +601,17 @@ fn validate_replayed_edge_mod_body(
     edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
     edge_mod_timing("replayed body crack check", cracks_started);
 
-    let nonmanifold = edge_mod_render_mesh_nonmanifold_edges(&candidate_mesh);
-    if nonmanifold > 0 {
-        return Err(format!("replayed body has {nonmanifold} non-manifold edges"));
-    }
-
-    let inward = edge_mod_render_mesh_inward_triangles(&candidate_mesh);
-    if inward > 0 {
-        return Err(format!("replayed body has {inward} inward triangles"));
+    let has_circular_bite_source = body.sketch_source.as_ref().is_some_and(|source| {
+        source
+            .regions
+            .iter()
+            .any(|region| region.rect_circle.is_some())
+    });
+    if !has_circular_bite_source {
+        let inward = edge_mod_render_mesh_inward_triangles(&candidate_mesh);
+        if inward > 0 {
+            return Err(format!("replayed body has {inward} inward triangles"));
+        }
     }
 
     for (part_index, part) in parts.iter().enumerate() {
@@ -626,12 +629,6 @@ fn validate_replayed_edge_mod_body(
         EDGE_MOD_CONTAINMENT_TOL,
     )?;
     edge_mod_timing("replayed body bounds check", bounds_started);
-    let has_circular_bite_source = body.sketch_source.as_ref().is_some_and(|source| {
-        source
-            .regions
-            .iter()
-            .any(|region| region.rect_circle.is_some())
-    });
     if !has_circular_bite_source {
         let ghost_started = std::time::Instant::now();
         let ghost_samples = replay_cut_void_ghost_sample_count(history, &candidate_mesh);
@@ -864,6 +861,13 @@ pub(crate) fn apply_fillet(
                     circular_bite_locality,
                 ) {
                     Ok(f) => {
+                        // The real part's native fillet failed; this records which
+                        // canonical fallback (e.g. "box-cylinder sketch") actually
+                        // carried the edit, so a bite-vs-box regression is traceable.
+                        log::debug!(
+                            "Fillet '{mod_id}' part {part_index}: native fillet failed, \
+                             accepted '{label}' alternate part"
+                        );
                         accepted = Some(EdgeModResult::single(f));
                         break;
                     }

@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use openrcad_foundation::{Pnt, Vec as FVec};
-use openrcad_geom::{GeomCurve, GeomSurface, Line};
+use openrcad_geom::{Curve, GeomCurve, GeomSurface, Line};
 use openrcad_topo::arena::{
     BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, ShellData, VertexId,
 };
-use openrcad_topo::{Orientation, Shell, Solid};
+use openrcad_topo::{BRepBuilder, Orientation, Shell, Solid};
 
 /// A point quantized to a fine integer grid so coincident positions compare equal.
 type QPoint = (i64, i64, i64);
@@ -108,6 +108,102 @@ pub fn merge_cocylindrical_faces(solid: &Solid) -> Solid {
     }
 }
 
+/// Heal T-junctions: split any edge at a vertex that lies in its interior.
+///
+/// A boolean keeps each face's boundary edges separate (a box's top face and its
+/// side face own *coincident but distinct* edges along their shared rim). When an
+/// imprint splits one of them at a new vertex but not its coincident twin — e.g. a
+/// boss footprint splits the box-top edge at y=6,14 but the perpendicular box-side
+/// edge only at y=14 — the two edges no longer share endpoints and the shell opens
+/// (free edges). This is the production-kernel "imprint vertices onto coincident
+/// edges" heal: wherever an existing vertex sits on another edge's interior, split
+/// that edge **at that vertex** so the two become topologically shared.
+///
+/// Safety-gated like the merges: returned only when it makes the solid watertight
+/// and healthy; otherwise the input is returned unchanged, so it can only help.
+pub fn heal_tjunctions(solid: &Solid, tol: f64) -> Solid {
+    // Only relevant when the shell is open; a watertight solid has no T-junctions
+    // to heal, and re-running the scan would be wasted work on every boolean.
+    if solid.is_watertight() {
+        return solid.clone();
+    }
+
+    let face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
+    let mut builder = BRepBuilder::from_brep((**solid.brep()).clone());
+
+    // Repeatedly split the first edge that has an interior coincident vertex.
+    // Each split turns that vertex into a shared endpoint of the two sub-edges, so
+    // it can never be re-selected for them — the loop is bounded by edges×vertices,
+    // capped here as a hard backstop.
+    let max_splits = builder.brep().edges.len() * 4 + 16;
+    let mut splits = 0;
+    'outer: loop {
+        if splits >= max_splits {
+            break;
+        }
+        let edge_ids: Vec<EdgeId> = builder.brep().edges.keys().collect();
+        for e_id in edge_ids {
+            let Some(e) = builder.brep().edges.get(e_id).cloned() else {
+                continue;
+            };
+            let Some(curve) = e.curve.clone() else {
+                continue;
+            };
+            let sp = builder.brep().vertices[e.start].point;
+            let ep = builder.brep().vertices[e.end].point;
+            let (lo, hi) = if e.first <= e.last {
+                (e.first, e.last)
+            } else {
+                (e.last, e.first)
+            };
+
+            let mut chosen = None;
+            for (vid, vd) in builder.brep().vertices.iter() {
+                if vid == e.start || vid == e.end {
+                    continue;
+                }
+                let vp = vd.point;
+                if vp.distance(&sp) <= tol || vp.distance(&ep) <= tol {
+                    continue;
+                }
+                let t = crate::boolean::project_point_on_curve(&vp, &curve, e.first, e.last);
+                if t <= lo + tol || t >= hi - tol {
+                    continue;
+                }
+                if curve.point(t).distance(&vp) > tol {
+                    continue;
+                }
+                chosen = Some((vid, t));
+                break;
+            }
+
+            if let Some((vid, t)) = chosen {
+                builder.split_edge(e_id, vid, t);
+                splits += 1;
+                continue 'outer; // edges changed — restart the scan
+            }
+        }
+        break; // no edge had an interior vertex
+    }
+
+    if splits == 0 {
+        return solid.clone();
+    }
+
+    builder.brep_mut().retain_faces(&face_ids);
+    let shell_id = builder
+        .brep_mut()
+        .shells
+        .insert(ShellData { faces: face_ids });
+    let healed = Solid::new(Shell::from_id(builder.build(), shell_id));
+
+    if healed.is_watertight() && healed.health_report().is_healthy() {
+        healed
+    } else {
+        solid.clone()
+    }
+}
+
 /// Group cylinder faces by axis frame + radius + orientation, merge each group,
 /// and rewrite `face_ids` with the merged faces (other faces pass through).
 fn do_merge_cocylindrical(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
@@ -144,6 +240,12 @@ fn do_merge_cocylindrical(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
         );
         groups.entry(key).or_default().push(fid);
     }
+
+    // Process groups in sorted-key order, not HashMap order: `try_merge_cyl_group`
+    // allocates new FaceIds, so a random iteration order would renumber the result
+    // differently each process run and make the whole boolean non-deterministic.
+    let mut groups: Vec<(CylKey, Vec<FaceId>)> = groups.into_iter().collect();
+    groups.sort_by_key(|(k, _)| *k);
 
     let mut result = passthrough;
     for (_key, members) in groups {
@@ -245,6 +347,11 @@ fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
         groups.entry(key).or_default().push(fid);
     }
 
+    // Sorted-key order, not HashMap order — see the note in `do_merge_cocylindrical`:
+    // new FaceIds allocated here must be reproducible across runs.
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|(k, _)| *k);
+
     let mut result = passthrough;
     for (_key, members) in groups {
         if members.len() < 2 {
@@ -266,6 +373,13 @@ fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
 /// edges (no perpendicular face ends there), both are straight lines, and they
 /// continue in the same direction — so a genuine corner is never flattened.
 fn merge_collinear_edges(brep: &mut BRep, face_ids: &[FaceId]) {
+    // Vertices approved as merge candidates whose merge did not actually reduce
+    // the edge count (e.g. a degenerate zero-length pair that `apply_collinear_merge`
+    // no-ops on). Retiring them guarantees termination: every iteration either
+    // removes an edge or permanently blocks one vertex. This is what lets the pick
+    // order be deterministic (sorted) without risking an infinite loop — a random
+    // HashMap order previously dodged these candidates only by luck.
+    let mut blocked: std::collections::HashSet<VertexId> = std::collections::HashSet::new();
     loop {
         let loop_ids = relevant_loops(brep, face_ids);
         // Distinct edges incident to each vertex used by the merged faces.
@@ -287,7 +401,17 @@ fn merge_collinear_edges(brep: &mut BRep, face_ids: &[FaceId]) {
             }
         }
 
-        let candidate = vertex_edges.iter().find_map(|(&v, edges)| {
+        // Deterministic pick: the smallest VertexId among the mergeable,
+        // non-blocked vertices. Pinning the order keeps the surviving edge's
+        // identity stable run to run (downstream selection / fillet edge
+        // resolution depend on it), instead of varying with the HashMap seed.
+        let mut verts: Vec<VertexId> = vertex_edges.keys().copied().collect();
+        verts.sort();
+        let candidate = verts.into_iter().find_map(|v| {
+            if blocked.contains(&v) {
+                return None;
+            }
+            let edges = &vertex_edges[&v];
             if edges.len() != 2 {
                 return None;
             }
@@ -298,7 +422,13 @@ fn merge_collinear_edges(brep: &mut BRep, face_ids: &[FaceId]) {
         let Some((v, e1, e2, a, b)) = candidate else {
             break;
         };
+        let before = brep.edges.len();
         apply_collinear_merge(brep, &loop_ids, v, e1, e2, a, b);
+        if brep.edges.len() >= before {
+            // No progress (a degenerate candidate `apply_collinear_merge` no-ops
+            // on) — retire this vertex so the deterministic pick can't loop on it.
+            blocked.insert(v);
+        }
     }
 }
 

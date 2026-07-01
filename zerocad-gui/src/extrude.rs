@@ -8,7 +8,7 @@ use zerocad_core::{
     detect_regions, CoordinateSystem, ExtrudeMode, FeatureNode, FeatureType, MockMesh, Region,
 };
 
-use crate::ZeroCadApp;
+use crate::{PendingCommitVisual, PendingVisualMode, ZeroCadApp};
 
 /// The default extrude mode for a freshly started op: a sketch on a body face
 /// pulled **outward** (depth ≥ 0, along the outward face normal) adds material
@@ -635,9 +635,30 @@ impl ZeroCadApp {
 
     /// Commit the in-progress extrude: build one body per source sketch.
     pub(crate) fn commit_extrude_op(&mut self) {
+        // Resolve preview state first to avoid borrow-check conflicts
+        let cached_bodies = self.cached_preview_extrude_bodies();
+        let bodies = cached_bodies
+            .clone()
+            .unwrap_or_else(|| self.body_meshes.clone());
+        let mesh = self.cached_preview_mesh();
+
         let Some(op) = self.extrude_op.take() else {
             return;
         };
+
+        // Capture pending visual
+        self.pending_visual = Some(PendingCommitVisual {
+            bodies: bodies.clone(),
+            mesh,
+            mode: PendingVisualMode::Extrude(op.mode),
+        });
+
+        // Copy preview cache if ready immediately to avoid any flash/refine delay
+        if let Some(cb) = cached_bodies {
+            self.body_meshes = cb;
+            self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+        }
+
         self.push_undo();
         self.extrude_depth = op.depth; // remember for next time
         self.extrude_mode = op.mode; // remember the mode too
