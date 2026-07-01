@@ -346,7 +346,16 @@ pub(crate) fn apply_cut(
                     .as_ref()
                     .and_then(cut_replay_tool_from_source)
                     .unwrap_or_else(|| tool.clone());
-                body.pristine = None;
+                // Propagate the input body's face names through the cut so a captured
+                // face survives the boolean (Phase 3). Safety-gated to the single-part
+                // common case; any shape/name mismatch falls back to `None`
+                // (re-tessellation), never a wrong name.
+                body.pristine = propagate_cut_face_names(
+                    &before_parts,
+                    before_pristine.as_ref(),
+                    &body.parts,
+                    &body.id,
+                );
                 body.sketch_source = next_source;
                 body.cut_tools.extend(cut_tool_recutter_tools(&replay_tool));
                 body.edge_mod_cut_history_path_used = false;
@@ -372,6 +381,32 @@ pub(crate) fn apply_cut(
             ));
         }
     }
+}
+
+/// Build a name-propagated pristine mesh for a cut result, or `None` to fall back
+/// to plain re-tessellation. Gated to one-part-in / one-part-out with a named input
+/// mesh — the common case — so a captured face reattaches through the cut while
+/// severing/multi-part cuts degrade safely to today's behavior.
+fn propagate_cut_face_names(
+    before_parts: &[KernelSolid],
+    before_pristine: Option<&MockMesh>,
+    after_parts: &[KernelSolid],
+    body_id: &str,
+) -> Option<MockMesh> {
+    // Propagate from a single named input body; the cut may still SEVER it into
+    // several lumps, and each lump inherits the names of the faces it continues
+    // (mesh-to-mesh matching is per-part, so multi-part output is fine).
+    if before_parts.len() != 1 || after_parts.is_empty() {
+        return None;
+    }
+    let input_mesh = before_pristine?;
+    let mut mesh = MockMesh::empty();
+    for part in after_parts {
+        mesh.append(crate::mock_kernel::propagate_face_names(
+            input_mesh, part, body_id,
+        ));
+    }
+    Some(mesh)
 }
 
 pub(crate) fn cut_tool_recutter_tools(tool: &CutTool) -> Vec<CutTool> {

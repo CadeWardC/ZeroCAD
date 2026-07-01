@@ -4,6 +4,7 @@ impl ParametricGraph {
     pub fn new() -> Self {
         let mut pg = Self {
             graph: DiGraph::new(),
+            sketch_face_refs: HashMap::new(),
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
             eval_cache: RefCell::new(EvalCache::default()),
@@ -124,6 +125,29 @@ impl ParametricGraph {
         self.evaluate_bodies_inner(hidden, false)
     }
 
+    /// Like [`evaluate_bodies_with_warnings`], but also returns a per-feature
+    /// [`FeatureStatus`] list (creation order). Each feature that raised a warning
+    /// while being applied is reported [`ResolutionState::Unresolved`] with that
+    /// message; the rest are [`ResolutionState::Resolved`]. This is the structured
+    /// form of the warning list, so a caller (the GUI history tree) can mark *which*
+    /// feature failed to reattach instead of only showing a global count.
+    pub fn evaluate_bodies_with_status(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+    ) -> Result<(Vec<(String, MockMesh)>, Vec<String>, Vec<FeatureStatus>), String> {
+        let (live, warnings) = self.build_live(hidden, false)?;
+        // `build_live` just refreshed the checkpoint cache; its final checkpoint
+        // holds the cumulative per-feature statuses.
+        let statuses = self
+            .eval_cache
+            .borrow()
+            .checkpoints
+            .last()
+            .map(|cp| cp.statuses.clone())
+            .unwrap_or_default();
+        Ok((tessellate_bodies(live), warnings, statuses))
+    }
+
     /// **Draft** evaluation for live previews (a fillet drag, an extrude
     /// preview): identical to [`evaluate_bodies_with_warnings`] except every 3D
     /// fillet uses the fast **faceted** cutter instead of the analytic-arc one.
@@ -202,7 +226,7 @@ impl ParametricGraph {
         let nodes: Vec<NodeIndex> = self.body_nodes_in_creation_order();
         let keys = self.eval_prefix_keys(&nodes, hidden, &vars);
 
-        let (mut live, mut warnings, reuse, mut checkpoints) = {
+        let (mut live, mut warnings, mut statuses, reuse, mut checkpoints) = {
             let cache = self.eval_cache.borrow();
             let cps = &cache.checkpoints;
             let mut m = 0;
@@ -211,9 +235,15 @@ impl ParametricGraph {
             }
             if m > 0 {
                 let cp = &cps[m - 1];
-                (cp.live.clone(), cp.warnings.clone(), m, cps[..m].to_vec())
+                (
+                    cp.live.clone(),
+                    cp.warnings.clone(),
+                    cp.statuses.clone(),
+                    m,
+                    cps[..m].to_vec(),
+                )
             } else {
-                (Vec::new(), Vec::new(), 0usize, Vec::new())
+                (Vec::new(), Vec::new(), Vec::new(), 0usize, Vec::new())
             }
         };
 
@@ -224,6 +254,7 @@ impl ParametricGraph {
                 continue;
             }
             let node = &self.graph[idx];
+            let warn_before = warnings.len();
             if !hidden.contains(&node.id) {
                 match &node.feature {
                     FeatureType::Box { w, h, d } => {
@@ -340,6 +371,23 @@ impl ParametricGraph {
                     }
                     _ => {}
                 }
+                // Per-feature resolution status: this node is Unresolved iff it
+                // raised a warning while being applied — each warning names its own
+                // feature and this node's dispatch is the only thing that ran since
+                // `warn_before`, so the new warnings are exactly this feature's. This
+                // is what lets the GUI flag the precise feature that failed rather
+                // than a global count, and encodes "report unresolved, don't silently
+                // mis-apply."
+                let state = if warnings.len() > warn_before {
+                    ResolutionState::Unresolved(warnings[warn_before..].join(" "))
+                } else {
+                    ResolutionState::Resolved
+                };
+                statuses.push(FeatureStatus {
+                    feature_id: node.id.clone(),
+                    feature_name: node.name.clone(),
+                    state,
+                });
             }
             // Snapshot the assembled bodies after this node so a later evaluation
             // that shares this prefix can resume from here.
@@ -347,6 +395,7 @@ impl ParametricGraph {
                 key: keys[i],
                 live: live.clone(),
                 warnings: warnings.clone(),
+                statuses: statuses.clone(),
             });
         }
 
@@ -529,14 +578,25 @@ impl ParametricGraph {
         warnings: &mut Vec<String>,
     ) {
         // Resolve the parent sketch's plane + regions.
-        let parent = self
+        let parent_idx = self
             .graph
             .neighbors_directed(idx, petgraph::Direction::Incoming)
-            .find_map(|p| sketch_cache.get(&p));
-        let Some(sketch) = parent else {
+            .find(|p| sketch_cache.contains_key(p));
+        let Some(parent_idx) = parent_idx else {
             return;
         };
-        let cs = &sketch.cs;
+        let sketch = &sketch_cache[&parent_idx];
+        // Sketch-on-face: re-derive the plane from wherever its face is now (the
+        // parent body has already been assembled into `live`), so the sketch — and
+        // everything extruded from it — follows the body. Regions are 2D and
+        // cs-independent, so only the placement `cs` changes, not the shapes.
+        let sketch_id = &self.graph[parent_idx].id;
+        let cs_owned = self
+            .sketch_face_refs
+            .get(sketch_id)
+            .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
+            .unwrap_or(sketch.cs);
+        let cs = &cs_owned;
         let regions = &sketch.regions;
         if regions.is_empty() {
             return;
@@ -742,6 +802,8 @@ impl ParametricGraph {
                         cs,
                         depth,
                     );
+                    stamp_sketch_extrude_face_refs(&mut region_mesh, node_id, i, cs, depth);
+                    crate::mock_kernel::populate_edge_adjacent_face_names(&mut region_mesh);
                     newbody_mesh.append(region_mesh);
                 }
                 ExtrudeMode::Cut => {
@@ -859,6 +921,51 @@ impl ParametricGraph {
 /// Tessellate each assembled body: reuse the analytic mesh when the body was
 /// never touched by a boolean, else extract a mesh from its kernel solid parts.
 /// Bodies that tessellate to nothing are dropped.
+/// Re-derive a sketch-on-face coordinate system from the current geometry: find
+/// the body the captured face belongs to (already assembled into `live`), resolve
+/// the face there, and build a plane from its centroid + normal. `None` if the
+/// body or face is gone (the caller then keeps the frozen placement).
+fn rederive_sketch_cs(face_ref: &FaceRef, live: &[LiveBody]) -> Option<CoordinateSystem> {
+    let body_id = face_ref.topology.as_ref()?.body_id.as_deref()?;
+    let body = live.iter().find(|b| b.id == body_id)?;
+    let resolved = resolve_face_ref_by_topology(body, face_ref)?;
+    Some(cs_from_face(resolved.centroid, resolved.normal))
+}
+
+/// A sketch-plane coordinate system for a face at `centroid` with outward
+/// `normal`. In-plane axes are chosen deterministically (Y×n, or X×n for a
+/// horizontal face), mirroring the GUI's `face_cs` so a re-derived plane matches
+/// the one first picked.
+fn cs_from_face(centroid: [f32; 3], normal: [f32; 3]) -> CoordinateSystem {
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if l > 1.0e-9 {
+            [v[0] / l, v[1] / l, v[2] / l]
+        } else {
+            v
+        }
+    };
+    let n = norm(normal);
+    let mut u = cross([0.0, 1.0, 0.0], n);
+    if (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt() < 1.0e-4 {
+        u = cross([1.0, 0.0, 0.0], n);
+    }
+    let u = norm(u);
+    let v = norm(cross(n, u));
+    CoordinateSystem::new(
+        Vec3::new(centroid[0], centroid[1], centroid[2]),
+        Vec3::new(u[0], u[1], u[2]),
+        Vec3::new(v[0], v[1], v[2]),
+    )
+}
+
 pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> {
     let mut bodies: Vec<(String, MockMesh)> = Vec::new();
     for body in live {

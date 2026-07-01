@@ -85,6 +85,36 @@ pub struct EdgeRef {
     pub topology: Option<TopologyEdgeRef>,
 }
 
+/// Optional stable topology identity for a selected/attached face — the face
+/// analogue of [`TopologyEdgeRef`]. Faces are the primary named entity in
+/// persistent topological naming (an edge is identified by the pair of faces it
+/// separates), so a sketch-on-face placement or a cut/join target pins to this.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyFaceRef {
+    #[serde(default)]
+    pub body_id: Option<String>,
+    #[serde(default)]
+    pub topology_version: Option<u64>,
+    /// The face's durable name (its "owner"), e.g.
+    /// `sketch:extrude_3:region:0:face:top`.
+    #[serde(default)]
+    pub face_id: Option<String>,
+    #[serde(default)]
+    pub surface_kind: Option<String>,
+}
+
+/// A solid face captured for reattachment: its centroid and outward normal in
+/// **world space** at selection time, plus an optional stable [`TopologyFaceRef`]
+/// name. A feature that targets a face (sketch-on-face, cut/join) resolves the
+/// name first and falls back to the captured geometry only when unnamed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FaceRef {
+    pub centroid: [f32; 3],
+    pub normal: [f32; 3],
+    #[serde(default)]
+    pub topology: Option<TopologyFaceRef>,
+}
+
 /// How an edge modifier should use saved construction history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeModReplayMode {
@@ -245,6 +275,13 @@ pub struct FeatureNode {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParametricGraph {
     pub graph: DiGraph<FeatureNode, ()>,
+    /// For a sketch placed on a body face: the durable [`FaceRef`] to that face,
+    /// keyed by sketch node id. On rebuild the sketch's plane is re-derived from
+    /// wherever the face now is (see `apply_extrude`), so a sketch-on-face follows
+    /// the body when it changes instead of staying frozen. Persisted; empty for
+    /// origin-plane sketches and legacy documents.
+    #[serde(default)]
+    pub sketch_face_refs: HashMap<String, FaceRef>,
     #[serde(skip)]
     pub(crate) node_map: HashMap<String, NodeIndex>,
     /// Memoized planar-arrangement results, keyed by a content hash of a
@@ -283,6 +320,54 @@ pub(crate) struct EvalCheckpoint {
     pub(crate) key: u64,
     pub(crate) live: Vec<LiveBody>,
     pub(crate) warnings: Vec<String>,
+    /// Per-feature resolution status accumulated up to and including this node,
+    /// in creation order. Cached alongside `warnings` so a reused prefix restores
+    /// its statuses too — see [`FeatureStatus`].
+    pub(crate) statuses: Vec<FeatureStatus>,
+}
+
+/// Whether a feature resolved its references and applied cleanly on the last
+/// evaluation — or failed to, and why.
+///
+/// This is the structured, per-feature form of the flat warning list. It exists
+/// so the GUI can flag *which* feature in the history tree is unresolved (a red
+/// marker on that node) instead of only showing a global warning count, and so a
+/// broken downstream reference is reported **loud and attributable** rather than
+/// silently applied to the wrong entity — the core reliability contract of
+/// history reattachment.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ResolutionState {
+    /// The feature resolved its target(s) and applied without complaint.
+    Resolved,
+    /// The feature could not be applied as intended; the string is the reason
+    /// (the same message surfaced in the warning list).
+    Unresolved(String),
+}
+
+/// The resolution outcome of one feature during an evaluation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FeatureStatus {
+    /// The node id of the feature this status is for.
+    pub feature_id: String,
+    /// The feature's display name, for the tree/status UI.
+    pub feature_name: String,
+    /// Whether it resolved, and why not if it did not.
+    pub state: ResolutionState,
+}
+
+impl FeatureStatus {
+    /// Whether this feature failed to resolve/apply on the last evaluation.
+    pub fn is_unresolved(&self) -> bool {
+        matches!(self.state, ResolutionState::Unresolved(_))
+    }
+
+    /// The failure reason, if the feature is unresolved.
+    pub fn reason(&self) -> Option<&str> {
+        match &self.state {
+            ResolutionState::Unresolved(r) => Some(r.as_str()),
+            ResolutionState::Resolved => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

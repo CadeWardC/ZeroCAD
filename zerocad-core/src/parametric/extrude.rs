@@ -46,6 +46,65 @@ pub(crate) fn stamp_sketch_extrude_edge_refs(
     }
 }
 
+/// Stamp durable names onto an extruded region's **faces**, the face analogue of
+/// [`stamp_sketch_extrude_edge_refs`]. Each cap becomes
+/// `sketch:{body}:region:{i}:face:{top|bottom}` and each wall
+/// `sketch:{body}:region:{i}:face:side[:occ:n]`. Faces are the primary named
+/// entity — an edge's identity derives from the pair of faces it separates — so
+/// this is what a sketch-on-face placement or a cut/join target pins to.
+pub(crate) fn stamp_sketch_extrude_face_refs(
+    mesh: &mut MockMesh,
+    body_id: &str,
+    region_index: usize,
+    cs: &CoordinateSystem,
+    depth: f32,
+) {
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for face_ref in &mut mesh.face_refs {
+        let role = sketch_extrude_face_role(face_ref.normal, cs, depth);
+        let base_id = format!("sketch:{body_id}:region:{region_index}:face:{role}");
+        let occurrence = occurrences.entry(base_id.clone()).or_insert(0);
+        let face_id = if *occurrence == 0 {
+            base_id
+        } else {
+            format!("{base_id}:occ:{occurrence}")
+        };
+        *occurrence += 1;
+        face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(face_id),
+            surface_kind: None,
+        });
+    }
+}
+
+/// Classify an extruded face as `top` (far cap), `bottom` (base), or `side`
+/// (wall) from its outward normal relative to the sketch-plane normal `cs.n`.
+pub(crate) fn sketch_extrude_face_role(
+    normal: [f32; 3],
+    cs: &CoordinateSystem,
+    depth: f32,
+) -> &'static str {
+    let n = Vec3::new(normal[0], normal[1], normal[2]);
+    let nlen = n.dot(n).sqrt();
+    if nlen <= 1.0e-6 {
+        return "side";
+    }
+    let axis = cs.n.normalize();
+    // Positive `depth` sweeps along +axis, so a face whose outward normal points
+    // the swept way is the far cap; the opposite is the base. `depth.signum()`
+    // keeps the roles stable when the sketch is extruded in the −axis direction.
+    let d = (n.dot(axis) / nlen) * depth.signum();
+    if d > 0.5 {
+        "top"
+    } else if d < -0.5 {
+        "bottom"
+    } else {
+        "side"
+    }
+}
+
 pub(crate) fn sketch_extrude_edge_role(
     p0: [f32; 3],
     p1: [f32; 3],

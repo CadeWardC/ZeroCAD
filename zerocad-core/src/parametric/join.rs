@@ -106,6 +106,14 @@ pub(crate) fn apply_join(
         let mut merged = false;
         if let Some(tbb) = tbb {
             'bodies: for body in live.iter_mut() {
+                // Snapshot the input body's named mesh before mutating any part, so a
+                // captured face can survive the join's boolean (single-part case).
+                let input_mesh = if body.parts.len() == 1 {
+                    body.pristine.clone()
+                } else {
+                    None
+                };
+                let body_id = body.id.clone();
                 for part in body.parts.iter_mut() {
                     let overlaps = crate::mock_kernel::solid_aabb(part).map_or(true, |pbb| {
                         crate::mock_kernel::aabbs_overlap(&pbb, &tbb, 0.05)
@@ -146,8 +154,13 @@ pub(crate) fn apply_join(
                             _ => true,
                         };
                         if keeps_body {
+                            // Propagate face names from the object body to the union
+                            // result (the boss's own new faces stay unnamed).
+                            let named = input_mesh
+                                .as_ref()
+                                .map(|m| crate::mock_kernel::propagate_face_names(m, &u, &body_id));
                             *part = u;
-                            body.pristine = None;
+                            body.pristine = named;
                             body.sketch_source = None;
                             body.cut_replay = None;
                             body.edge_mod_cut_history_path_used = false;

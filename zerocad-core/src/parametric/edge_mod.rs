@@ -106,7 +106,6 @@ pub(crate) fn apply_edge_mod(
 
 pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> Option<EdgeRef> {
     let requested = edge.topology.as_ref()?;
-    let requested_edge_id = requested.edge_id.as_deref()?;
     if requested
         .body_id
         .as_deref()
@@ -115,22 +114,66 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
         return None;
     }
 
-    if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| {
-        mesh.edge_refs
+    // 1. Exact edge-id match (a stable design id survives an equivalent edit).
+    if let Some(requested_edge_id) = requested.edge_id.as_deref() {
+        if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| {
+            mesh.edge_refs
+                .iter()
+                .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
+                .filter(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
+                .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+        }) {
+            return Some(resolved);
+        }
+
+        let mesh = edge_mod_reference_mesh(body);
+        if let Some(resolved) = mesh
+            .edge_refs
             .iter()
             .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
             .filter(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
             .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
-    }) {
-        return Some(resolved);
+        {
+            return Some(resolved);
+        }
     }
 
-    let mesh = edge_mod_reference_mesh(body);
-    mesh.edge_refs
-        .iter()
-        .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
-        .filter(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
-        .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+    // 2. Face-owner-pair fallback: an edge is identified by the pair of faces it
+    //    separates, and those faces survive a boolean (Phase 3/4a) even when the
+    //    edge's own id is re-derived (a sketch id becomes a `mesh:group` id after a
+    //    cut). Match on the same face-owner pair, disambiguated by geometry.
+    resolve_edge_by_face_pair(body, edge, requested)
+}
+
+fn resolve_edge_by_face_pair(
+    body: &LiveBody,
+    edge: &EdgeRef,
+    requested: &TopologyEdgeRef,
+) -> Option<EdgeRef> {
+    if requested.adjacent_face_ids.len() != 2 {
+        return None;
+    }
+    let mut want = requested.adjacent_face_ids.clone();
+    want.sort();
+    let pick = |mesh: &MockMesh| -> Option<EdgeRef> {
+        mesh.edge_refs
+            .iter()
+            .filter(|candidate| {
+                let mut got = candidate
+                    .topology
+                    .as_ref()
+                    .map(|t| t.adjacent_face_ids.clone())
+                    .unwrap_or_default();
+                got.sort();
+                got.len() == 2 && got == want
+            })
+            .find(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
+            .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+    };
+    body.pristine
+        .as_ref()
+        .and_then(pick)
+        .or_else(|| pick(&edge_mod_reference_mesh(body)))
 }
 
 pub(crate) fn topology_edge_id(edge: &crate::mock_kernel::MeshEdgeRef) -> Option<&str> {
@@ -163,6 +206,104 @@ pub(crate) fn edge_ref_from_mesh_candidate(
         curve: candidate.curve.clone(),
         topology,
     }
+}
+
+/// Resolve a captured [`FaceRef`] against a rebuilt body — the face analogue of
+/// [`resolve_edge_ref_by_topology`]. A face carrying a durable name is resolved by
+/// that name (pristine mesh first, then the tessellated reference mesh). If the
+/// name is gone we return `None` so the caller reports the feature **unresolved**
+/// rather than silently retargeting the wrong face (the "suspend, don't
+/// substitute" rule). A face with no name falls back to nearest-by-geometry.
+// Consumed by the Phase 1 reattachment tests today; wired into sketch-on-face and
+// cut/join targeting in Phase 4.
+#[allow(dead_code)]
+pub(crate) fn resolve_face_ref_by_topology(body: &LiveBody, face: &FaceRef) -> Option<FaceRef> {
+    if let Some(requested) = face.topology.as_ref() {
+        if let Some(requested_face_id) = requested.face_id.as_deref() {
+            if requested
+                .body_id
+                .as_deref()
+                .is_some_and(|body_id| body_id != body.id)
+            {
+                return None;
+            }
+            if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| {
+                mesh.face_refs
+                    .iter()
+                    .find(|c| topology_face_id(c) == Some(requested_face_id))
+                    .map(|c| face_ref_from_mesh_face(body, c, requested))
+            }) {
+                return Some(resolved);
+            }
+            let mesh = edge_mod_reference_mesh(body);
+            return mesh
+                .face_refs
+                .iter()
+                .find(|c| topology_face_id(c) == Some(requested_face_id))
+                .map(|c| face_ref_from_mesh_face(body, c, requested));
+        }
+    }
+    // Unnamed capture (legacy, or a not-yet-named boolean-result face): fall back
+    // to the nearest face pointing the same way.
+    resolve_face_ref_by_geometry(body, face)
+}
+
+#[allow(dead_code)]
+pub(crate) fn topology_face_id(face: &crate::mock_kernel::MeshFaceRef) -> Option<&str> {
+    face.topology
+        .as_ref()
+        .and_then(|topology| topology.face_id.as_deref())
+}
+
+#[allow(dead_code)]
+fn face_ref_from_mesh_face(
+    body: &LiveBody,
+    candidate: &crate::mock_kernel::MeshFaceRef,
+    requested: &TopologyFaceRef,
+) -> FaceRef {
+    let topology = candidate
+        .topology
+        .as_ref()
+        .map(|t| TopologyFaceRef {
+            body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
+            topology_version: t.topology_version,
+            face_id: t.face_id.clone(),
+            surface_kind: t.surface_kind.clone(),
+        })
+        .or_else(|| Some(requested.clone()));
+    FaceRef {
+        centroid: candidate.centroid,
+        normal: candidate.normal,
+        topology,
+    }
+}
+
+#[allow(dead_code)]
+fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<FaceRef> {
+    let pick = |mesh: &MockMesh| -> Option<FaceRef> {
+        mesh.face_refs
+            .iter()
+            .filter(|c| dot3(c.normal, face.normal) >= 0.7)
+            .min_by(|a, b| {
+                distance3(a.centroid, face.centroid)
+                    .partial_cmp(&distance3(b.centroid, face.centroid))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|c| FaceRef {
+                centroid: c.centroid,
+                normal: c.normal,
+                topology: c.topology.as_ref().map(|t| TopologyFaceRef {
+                    body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
+                    topology_version: t.topology_version,
+                    face_id: t.face_id.clone(),
+                    surface_kind: t.surface_kind.clone(),
+                }),
+            })
+    };
+    body.pristine
+        .as_ref()
+        .and_then(pick)
+        .or_else(|| pick(&edge_mod_reference_mesh(body)))
 }
 
 pub(crate) fn mesh_candidate_matches_captured_edge(
