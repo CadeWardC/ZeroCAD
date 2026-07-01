@@ -29,6 +29,7 @@ mod boolean;
 mod circle_geom;
 mod edge_ops;
 mod geom_utils;
+mod history;
 mod mesh_topology;
 mod primitives;
 mod tessellation;
@@ -42,6 +43,8 @@ pub use boolean::*;
 pub use circle_geom::*;
 pub use edge_ops::*;
 pub use geom_utils::*;
+#[allow(unused_imports)]
+pub use history::*;
 #[allow(unused_imports)]
 pub(crate) use mesh_topology::*;
 pub use primitives::*;

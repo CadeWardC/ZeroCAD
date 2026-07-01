@@ -382,6 +382,154 @@ pub(crate) fn group_edge_segments(
     group
 }
 
+/// One [`MeshFaceRef`] per distinct `face_id`, with its area-weighted centroid
+/// and outward normal computed from the triangle mesh. This is the geometric half
+/// of a face's identity; the durable *name* (`topology`) is stamped separately by
+/// whichever feature created the face. Faces are returned in ascending `face_id`
+/// order (via `BTreeMap`) so the result is deterministic.
+pub(crate) fn mesh_face_refs(
+    vertices: &[f32],
+    indices: &[u32],
+    face_ids: &[u32],
+) -> Vec<MeshFaceRef> {
+    use std::collections::BTreeMap;
+    // Per face id: (Σ area-weighted normal, Σ area-weighted centroid, Σ area).
+    let mut acc: BTreeMap<u32, ([f64; 3], [f64; 3], f64)> = BTreeMap::new();
+    let tri_count = indices.len() / 3;
+    for t in 0..tri_count {
+        let Some(&fid) = face_ids.get(t) else {
+            continue;
+        };
+        let pos = |k: usize| -> [f64; 3] {
+            let i = indices[t * 3 + k] as usize * 6;
+            [
+                vertices[i] as f64,
+                vertices[i + 1] as f64,
+                vertices[i + 2] as f64,
+            ]
+        };
+        let a = pos(0);
+        let b = pos(1);
+        let c = pos(2);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        // Cross product; its magnitude is twice the triangle area, so summing it
+        // directly gives an area-weighted (unnormalized) face normal.
+        let n = [
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        ];
+        let area = 0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let cen = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
+        let e = acc.entry(fid).or_insert(([0.0; 3], [0.0; 3], 0.0));
+        for k in 0..3 {
+            e.0[k] += n[k];
+            e.1[k] += cen[k] * area;
+        }
+        e.2 += area;
+    }
+    acc.into_iter()
+        .map(|(face_id, (nsum, csum, area))| {
+            let nlen = (nsum[0] * nsum[0] + nsum[1] * nsum[1] + nsum[2] * nsum[2]).sqrt();
+            let normal = if nlen > 0.0 {
+                [
+                    (nsum[0] / nlen) as f32,
+                    (nsum[1] / nlen) as f32,
+                    (nsum[2] / nlen) as f32,
+                ]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            let centroid = if area > 0.0 {
+                [
+                    (csum[0] / area) as f32,
+                    (csum[1] / area) as f32,
+                    (csum[2] / area) as f32,
+                ]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            MeshFaceRef {
+                face_id,
+                centroid,
+                normal,
+                topology: None,
+            }
+        })
+        .collect()
+}
+
+/// Stamp each edge with the durable **names of its two adjacent faces** (its
+/// face-owner pair). In the persistent-naming model an edge is identified by the
+/// pair of faces it separates, so once faces carry names an edge inherits a stable
+/// identity for free — one that survives a boolean even when the edge's own id is
+/// re-derived. Requires `face_refs` to be named first (planar faces only; a curved
+/// adjacency is left unpaired and falls back to the edge's own id).
+pub(crate) fn populate_edge_adjacent_face_names(mesh: &mut MockMesh) {
+    // Named planar faces as (normal, centroid, name).
+    let named: Vec<([f32; 3], [f32; 3], String)> = mesh
+        .face_refs
+        .iter()
+        .filter_map(|f| {
+            let name = f.topology.as_ref().and_then(|t| t.face_id.clone())?;
+            Some((f.normal, f.centroid, name))
+        })
+        .collect();
+    if named.is_empty() {
+        return;
+    }
+    // The face whose outward normal matches `n` and whose plane contains `mid`.
+    let find = |n: [f32; 3], mid: [f32; 3]| -> Option<String> {
+        let mut best: Option<(f32, &str)> = None;
+        for (fnrm, fc, name) in &named {
+            let ndot = n[0] * fnrm[0] + n[1] * fnrm[1] + n[2] * fnrm[2];
+            if ndot < 0.99 {
+                continue;
+            }
+            let dist = ((mid[0] - fc[0]) * fnrm[0]
+                + (mid[1] - fc[1]) * fnrm[1]
+                + (mid[2] - fc[2]) * fnrm[2])
+                .abs();
+            if dist > 1.0e-2 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(bd, _)| dist < *bd) {
+                best = Some((dist, name.as_str()));
+            }
+        }
+        best.map(|(_, name)| name.to_string())
+    };
+    for e in &mut mesh.edge_refs {
+        let mid = [
+            (e.p0[0] + e.p1[0]) * 0.5,
+            (e.p0[1] + e.p1[1]) * 0.5,
+            (e.p0[2] + e.p1[2]) * 0.5,
+        ];
+        let (Some(a), Some(b)) = (find(e.n1, mid), find(e.n2, mid)) else {
+            continue;
+        };
+        if a == b {
+            continue;
+        }
+        let mut pair = [a, b];
+        pair.sort();
+        match &mut e.topology {
+            Some(t) => t.adjacent_face_ids = pair.to_vec(),
+            None => {
+                e.topology = Some(MeshTopologyEdgeRef {
+                    adjacent_face_ids: pair.to_vec(),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
 pub(crate) fn mesh_edge_refs_from_groups(
     edge_vertices: &[f32],
     edge_indices: &[u32],

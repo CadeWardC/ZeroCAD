@@ -43,11 +43,16 @@ pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
 pub fn difference_bodies(a: &KernelSolid, b: &KernelSolid) -> Option<Vec<KernelSolid>> {
     let result = difference(a, b)?;
     let parts = result.split_disconnected();
-    Some(if parts.is_empty() {
+    let mut parts = if parts.is_empty() {
         vec![result]
     } else {
         parts
-    })
+    };
+    // Order the severed lumps by their canonical position key so the part list is
+    // deterministic and position-based across rebuilds — the basis for a downstream
+    // feature following a specific lump instead of a volatile list index.
+    parts.sort_by_key(part_key);
+    Some(parts)
 }
 
 /// Fallback for the common "rectangular pocket clean through an axis-aligned

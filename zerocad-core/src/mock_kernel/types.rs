@@ -61,6 +61,39 @@ pub struct MeshTopologyEdgeRef {
     pub adjacent_surface_kinds: Vec<String>,
 }
 
+/// Selectable/attachable face metadata aligned to a [`MockMesh::face_ids`] value.
+///
+/// The geometric half (centroid + outward normal) is always populated; the
+/// `topology` half (a durable, provenance-encoding name) is stamped by whatever
+/// feature created the face. Faces are the primary named entity in persistent
+/// topological naming — an edge's identity is derived from the pair of faces it
+/// separates — so this is what a sketch-on-face placement or a cut/join target
+/// pins to across rebuilds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MeshFaceRef {
+    /// The per-mesh integer id (matches entries in [`MockMesh::face_ids`]).
+    pub face_id: u32,
+    pub centroid: [f32; 3],
+    pub normal: [f32; 3],
+    #[serde(default)]
+    pub topology: Option<MeshTopologyFaceRef>,
+}
+
+/// Durable name + provenance for a mesh face — the face analogue of
+/// [`MeshTopologyEdgeRef`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MeshTopologyFaceRef {
+    #[serde(default)]
+    pub body_id: Option<String>,
+    #[serde(default)]
+    pub topology_version: Option<u64>,
+    /// Stable face name (its "owner"), e.g. `sketch:extrude_3:region:0:face:top`.
+    #[serde(default)]
+    pub face_id: Option<String>,
+    #[serde(default)]
+    pub surface_kind: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MockMesh {
     /// Interleaved [x, y, z, nx, ny, nz] per vertex.
@@ -94,6 +127,12 @@ pub struct MockMesh {
     /// of re-inferring it from drawn chord segments.
     #[serde(default)]
     pub edge_refs: Vec<MeshEdgeRef>,
+    /// One record per distinct [`face_ids`](Self::face_ids) value: the face's
+    /// centroid, outward normal, and (when stamped) its durable name. Populated
+    /// by the primitive constructors; carried and rebased through
+    /// [`append`](Self::append) so combined meshes keep distinct, resolvable faces.
+    #[serde(default)]
+    pub face_refs: Vec<MeshFaceRef>,
 }
 
 impl MockMesh {
@@ -107,6 +146,7 @@ impl MockMesh {
             face_ids: Vec::new(),
             edge_groups: Vec::new(),
             edge_refs: Vec::new(),
+            face_refs: Vec::new(),
         }
     }
 
@@ -162,6 +202,12 @@ impl MockMesh {
             }
             self.edge_refs.push(edge_ref);
         }
+        // Rebase face refs onto the shifted face ids so both meshes' faces stay
+        // distinct and resolvable; the durable name (topology) is unchanged.
+        for mut face_ref in other.face_refs {
+            face_ref.face_id += f_offset;
+            self.face_refs.push(face_ref);
+        }
     }
 
     /// Axis-aligned box with one corner at the origin, opposite corner at (w, h, d).
@@ -178,6 +224,7 @@ impl MockMesh {
             &edge_face_normals,
             &edge_groups,
         );
+        let face_refs = mesh_face_refs(&vertices, &indices, &face_ids);
 
         Self {
             vertices,
@@ -188,6 +235,7 @@ impl MockMesh {
             face_ids,
             edge_groups,
             edge_refs,
+            face_refs,
         }
     }
 
@@ -209,6 +257,7 @@ impl MockMesh {
             &edge_face_normals,
             &edge_groups,
         );
+        let face_refs = mesh_face_refs(&vertices, &indices, &face_ids);
 
         Self {
             vertices,
@@ -219,6 +268,7 @@ impl MockMesh {
             face_ids,
             edge_groups,
             edge_refs,
+            face_refs,
         }
     }
 
@@ -277,6 +327,7 @@ impl MockMesh {
             &edge_face_normals,
             &edge_groups,
         );
+        let face_refs = mesh_face_refs(&vertices, &indices, &face_ids);
 
         Self {
             vertices,
@@ -287,6 +338,7 @@ impl MockMesh {
             face_ids,
             edge_groups,
             edge_refs,
+            face_refs,
         }
     }
 
@@ -331,6 +383,7 @@ impl MockMesh {
             &edge_face_normals,
             &edge_groups,
         );
+        let face_refs = mesh_face_refs(&vertices, &indices, &face_ids);
         Self {
             vertices,
             indices,
@@ -340,6 +393,7 @@ impl MockMesh {
             face_ids,
             edge_groups,
             edge_refs,
+            face_refs,
         }
     }
 }
