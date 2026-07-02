@@ -115,25 +115,51 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
     }
 
     // 1. Exact edge-id match (a stable design id survives an equivalent edit).
+    //    A boolean can split one design edge into several fragments that all
+    //    carry the same id (a bite cuts the middle out of a rectangle's top
+    //    edge), so an id match alone is ambiguous — disambiguate by geometry,
+    //    never by enumeration order.
     if let Some(requested_edge_id) = requested.edge_id.as_deref() {
-        if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| {
-            mesh.edge_refs
+        let pick_by_id = |mesh: &MockMesh| -> Option<EdgeRef> {
+            let matches: Vec<&crate::mock_kernel::MeshEdgeRef> = mesh
+                .edge_refs
                 .iter()
-                .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
-                .filter(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
-                .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
-        }) {
+                .filter(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
+                .collect();
+            let span_dist = |c: &crate::mock_kernel::MeshEdgeRef| -> f32 {
+                let fwd = distance3(c.p0, edge.p0) + distance3(c.p1, edge.p1);
+                let rev = distance3(c.p0, edge.p1) + distance3(c.p1, edge.p0);
+                fwd.min(rev)
+            };
+            let best = match matches.len() {
+                0 => None,
+                1 => matches
+                    .into_iter()
+                    .find(|c| mesh_candidate_matches_captured_edge(c, edge)),
+                _ => {
+                    let geometric: Vec<&crate::mock_kernel::MeshEdgeRef> = matches
+                        .iter()
+                        .copied()
+                        .filter(|c| mesh_candidate_matches_captured_edge(c, edge))
+                        .collect();
+                    // Prefer candidates that also match geometrically; if an
+                    // edit moved every fragment (the stable-id escape hatch
+                    // exists for exactly that), fall back to the nearest.
+                    let pool = if geometric.is_empty() { matches } else { geometric };
+                    pool.into_iter().min_by(|a, b| {
+                        span_dist(a)
+                            .partial_cmp(&span_dist(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                }
+            };
+            best.map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+        };
+
+        if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| pick_by_id(mesh)) {
             return Some(resolved);
         }
-
-        let mesh = edge_mod_reference_mesh(body);
-        if let Some(resolved) = mesh
-            .edge_refs
-            .iter()
-            .find(|candidate| topology_edge_id(candidate) == Some(requested_edge_id))
-            .filter(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
-            .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
-        {
+        if let Some(resolved) = pick_by_id(&edge_mod_reference_mesh(body)) {
             return Some(resolved);
         }
     }
@@ -361,10 +387,18 @@ pub(crate) fn captured_edge_uses_stable_design_topology(
         .topology
         .as_ref()
         .and_then(|topology| topology.edge_id.as_deref());
+    // An `:occ:N` suffix is an *enumeration* disambiguator, not a durable design
+    // name: when a boolean splits one design edge into fragments that share a
+    // base id, which fragment gets which occurrence number depends on mesh
+    // build order (and changes when the tessellation changes). So an occ id
+    // must ALSO match geometrically — only unsuffixed sketch ids are trusted on
+    // identity alone.
     matches!(
         (candidate_id, requested_id),
         (Some(candidate), Some(requested))
-            if candidate == requested && requested.starts_with("sketch:")
+            if candidate == requested
+                && requested.starts_with("sketch:")
+                && !requested.contains(":occ:")
     )
 }
 
@@ -856,6 +890,296 @@ pub(crate) fn edge_mod_native_only(selection: &EdgeModSelection) -> bool {
     )
 }
 
+/// Whether a plain native fillet/chamfer on the *current* (post-cut) body is
+/// equivalent to reconstructing the edit through the saved cut history — so the
+/// far cheaper native-on-final solve can be tried first.
+///
+/// The construction-/cut-history replay path exists so an edge that a later cut
+/// *truncated* (a "cutoff" edge whose span is only part of a pre-cut base side)
+/// gets filleted on the pre-cut geometry and then re-cut, which differs from
+/// filleting the final body. `split_pre_cut_part_options` surfaces exactly that: a
+/// split whose own edge matches the selected edge but yields more than one part
+/// (the selected middle piece plus the untouched base remainder) means the
+/// selected span is a strict subset of a base side, i.e. a later cut truncated it.
+/// (It also over-generates unrelated candidate splits, so the split edge must
+/// match the selection to count as evidence.) When no such truncation is found,
+/// filleting before vs. after the cuts yields identical geometry and native-first
+/// is safe.
+///
+/// Returns `true` in that case (and trivially when there is no cut history, or the
+/// edge is a native-only curved rim). The acceptance gates remain the correctness
+/// backstop; this gate only decides *ordering*.
+fn edge_mod_native_first_safe(body: &LiveBody, selection: &EdgeModSelection, dist: f32) -> bool {
+    if edge_mod_native_only(selection) {
+        // A curved rim/arc edge never routes through cut-history replay.
+        return true;
+    }
+    let Some(history) = body.cut_replay.as_ref() else {
+        // No replayable cut history: the replay paths are NotApplicable and the
+        // native solve already runs unconditionally, so ordering cannot matter.
+        return true;
+    };
+    if history.base_parts.is_empty() || history.steps.is_empty() {
+        return true;
+    }
+    let edge = &selection.active_edge;
+    // The split may extend the span by a small runout at each end, so match the
+    // endpoints loosely (order-independent).
+    let matches_selection = |candidate: &EdgeRef| {
+        let close = |p: [f32; 3], q: [f32; 3]| {
+            (p[0] - q[0]).abs() < 0.2 && (p[1] - q[1]).abs() < 0.2 && (p[2] - q[2]).abs() < 0.2
+        };
+        (close(candidate.p0, edge.p0) && close(candidate.p1, edge.p1))
+            || (close(candidate.p0, edge.p1) && close(candidate.p1, edge.p0))
+    };
+    for base_part in &history.base_parts {
+        for split in split_pre_cut_part_options(history, base_part, edge, dist) {
+            if split.parts.len() > 1 && matches_selection(&split.edge) {
+                // The selected span is a strict subset of a pre-cut base side — a
+                // later cut truncated the edge here, so replay is authoritative.
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The result of a per-part native edge modification over a body's parts.
+struct NativeEdgeModOutcome {
+    parts: Vec<KernelSolid>,
+    /// Present only when every applied part contributed a pristine display mesh.
+    pristine: Option<MockMesh>,
+    /// At least one part was successfully modified.
+    applied: bool,
+    /// Combined failure reason of the last part that could not be modified.
+    last_err: Option<String>,
+}
+
+/// Native rolling-ball fillet of the captured edge on every part in `parts`.
+/// Parts that cannot be filleted are returned unchanged; the caller decides
+/// whether a partial result is acceptable or a replay path should run instead.
+fn edge_mod_native_fillet_all_parts(
+    mod_id: &str,
+    selection: &EdgeModSelection,
+    dist: f32,
+    parts: Vec<KernelSolid>,
+    reference_mesh: &MockMesh,
+    sketch_source: &Option<SketchExtrudeSource>,
+    recut_tools: &[CutTool],
+) -> NativeEdgeModOutcome {
+    let mut applied = false;
+    let mut last_err: Option<String> = None;
+    let mut next: Vec<KernelSolid> = Vec::with_capacity(parts.len());
+    let mut next_pristine = MockMesh::empty();
+    let mut can_use_pristine = true;
+    let native_only = edge_mod_native_only(selection);
+    for (part_index, part) in parts.into_iter().enumerate() {
+        let mut part_failures = Vec::new();
+        // No pre-size gate: the kernel's rolling-ball blend rejects a radius too
+        // large for the local geometry (a non-watertight result → `Err`), which is
+        // the correct, geometry-aware bound. The old global-AABB heuristic was both
+        // wrong (it measured the part's *thinnest* axis, not the filleted edge's
+        // adjacent-face extents, so it blocked radii the kernel handles) and
+        // asymmetric — chamfer never had it, which is why a radius would chamfer
+        // but refuse to fillet.
+        let sketch_region = sketch_source
+            .as_ref()
+            .and_then(|source| source.regions.get(part_index));
+        let circular_bite_locality = sketch_region.map(|region| CircularBiteLocality {
+            region,
+            selection,
+            dist,
+            kind: crate::sketch::CornerKind::Fillet,
+        });
+        let mut accepted: Option<EdgeModResult> = None;
+        match edge_mod_try_native_fillet(
+            reference_mesh,
+            &part,
+            &part,
+            selection,
+            dist,
+            "native",
+            recut_tools,
+            circular_bite_locality,
+        ) {
+            Ok(f) => accepted = Some(EdgeModResult::single(f)),
+            Err(reason) => part_failures.push(reason),
+        }
+
+        let alternate_parts = if accepted.is_none() && !native_only {
+            sketch_source
+                .as_ref()
+                .map(|source| sketch_source_alternate_parts(source, part_index))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if accepted.is_none() && !native_only {
+            for (label, alternate_part) in &alternate_parts {
+                match edge_mod_try_native_fillet(
+                    reference_mesh,
+                    &part,
+                    alternate_part,
+                    selection,
+                    dist,
+                    &format!("{label} native"),
+                    recut_tools,
+                    circular_bite_locality,
+                ) {
+                    Ok(f) => {
+                        // The real part's native fillet failed; this records which
+                        // canonical fallback (e.g. "box-cylinder sketch") actually
+                        // carried the edit, so a bite-vs-box regression is traceable.
+                        log::debug!(
+                            "Fillet '{mod_id}' part {part_index}: native fillet failed, \
+                             accepted '{label}' alternate part"
+                        );
+                        accepted = Some(EdgeModResult::single(f));
+                        break;
+                    }
+                    Err(reason) => {
+                        part_failures.push(reason);
+                    }
+                }
+            }
+        }
+
+        if let Some(result) = accepted {
+            applied = true;
+            if let Some(mesh) = result.pristine {
+                next_pristine.append(mesh);
+            } else {
+                can_use_pristine = false;
+            }
+            next.extend(result.parts);
+        } else {
+            can_use_pristine = false;
+            if !part_failures.is_empty() {
+                last_err = Some(part_failures.join("; "));
+            }
+            next.push(part);
+        }
+    }
+    let pristine = (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
+    NativeEdgeModOutcome {
+        parts: next,
+        pristine,
+        applied,
+        last_err,
+    }
+}
+
+/// Native selected-edge chamfer of the captured edge on every part in `parts`.
+/// Mirrors [`edge_mod_native_fillet_all_parts`].
+fn edge_mod_native_chamfer_all_parts(
+    selection: &EdgeModSelection,
+    dist: f32,
+    parts: Vec<KernelSolid>,
+    reference_mesh: &MockMesh,
+    sketch_source: &Option<SketchExtrudeSource>,
+    recut_tools: &[CutTool],
+) -> NativeEdgeModOutcome {
+    let edge = &selection.active_edge;
+    let mut applied = false;
+    let mut last_err: Option<String> = None;
+    let mut next: Vec<KernelSolid> = Vec::with_capacity(parts.len());
+    let mut next_pristine = MockMesh::empty();
+    let mut can_use_pristine = true;
+    let native_only = edge_mod_native_only(selection);
+    for (part_index, part) in parts.into_iter().enumerate() {
+        let sketch_region = sketch_source
+            .as_ref()
+            .and_then(|source| source.regions.get(part_index));
+        let circular_bite_locality = sketch_region.map(|region| CircularBiteLocality {
+            region,
+            selection,
+            dist,
+            kind: crate::sketch::CornerKind::Chamfer,
+        });
+        let mut accepted: Option<EdgeModResult> = None;
+        let mut part_failures = Vec::new();
+        match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
+            Ok(chamfered) => match edge_mod_accept_candidate_or_recut(
+                reference_mesh,
+                &part,
+                chamfered,
+                recut_tools,
+                circular_bite_locality,
+            ) {
+                Ok(chamfered) => {
+                    match edge_mod_reject_unhealthy_native_curve_result(selection, &chamfered) {
+                        Ok(()) => accepted = Some(EdgeModResult::single(chamfered)),
+                        Err(reason) => {
+                            part_failures.push(format!("native result rejected: {reason}"))
+                        }
+                    }
+                }
+                Err(reason) => part_failures.push(format!("native result rejected: {reason}")),
+            },
+            Err(reason) => part_failures.push(format!("native failed: {reason}")),
+        }
+
+        let alternate_parts = if accepted.is_none() && !native_only {
+            sketch_source
+                .as_ref()
+                .map(|source| sketch_source_alternate_parts(source, part_index))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if accepted.is_none() && !native_only {
+            for (label, alternate_part) in &alternate_parts {
+                match crate::mock_kernel::chamfer_edge(alternate_part, edge.p0, edge.p1, dist) {
+                    Ok(chamfered) => {
+                        match edge_mod_accept_candidate_or_recut(
+                            reference_mesh,
+                            &part,
+                            chamfered,
+                            recut_tools,
+                            circular_bite_locality,
+                        ) {
+                            Ok(chamfered) => {
+                                accepted = Some(EdgeModResult::single(chamfered));
+                                break;
+                            }
+                            Err(reason) => part_failures
+                                .push(format!("{label} native result rejected: {reason}")),
+                        }
+                    }
+                    Err(reason) => {
+                        part_failures.push(format!("{label} native failed: {reason}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(result) = accepted {
+            applied = true;
+            if let Some(mesh) = result.pristine {
+                next_pristine.append(mesh);
+            } else {
+                can_use_pristine = false;
+            }
+            next.extend(result.parts);
+        } else {
+            can_use_pristine = false;
+            if !part_failures.is_empty() {
+                last_err = Some(part_failures.join("; "));
+            }
+            next.push(part);
+        }
+    }
+    let pristine = (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
+    NativeEdgeModOutcome {
+        parts: next,
+        pristine,
+        applied,
+        last_err,
+    }
+}
+
 /// Native rolling-ball fillet of the captured edge on every part of `body`.
 pub(crate) fn apply_fillet(
     mod_id: &str,
@@ -865,6 +1189,33 @@ pub(crate) fn apply_fillet(
     body: &mut LiveBody,
     warnings: &mut Vec<String>,
 ) {
+    // Native-first: a plain per-part native fillet on the current body is far
+    // cheaper than construction-/cut-history replay. When the selected edge stays
+    // clear of every replayable cut void (so filleting before vs. after those cuts
+    // agree), try it first and take it only if it cleanly handles every part.
+    if edge_mod_native_first_safe(body, selection, dist) {
+        let reference_mesh = edge_mod_reference_mesh(body);
+        let sketch_source = body.sketch_source.clone();
+        let recut_tools = body.cut_tools.clone();
+        let outcome = edge_mod_native_fillet_all_parts(
+            mod_id,
+            selection,
+            dist,
+            body.parts.clone(),
+            &reference_mesh,
+            &sketch_source,
+            &recut_tools,
+        );
+        if outcome.applied && outcome.last_err.is_none() {
+            body.parts = outcome.parts;
+            body.pristine = outcome.pristine;
+            body.sketch_source = None;
+            body.cut_replay = None;
+            body.edge_mod_cut_history_path_used = false;
+            return;
+        }
+    }
+
     let prefer_cut_history = edge_mod_has_replayable_cut_history(body, selection, replay);
     let mut cut_history_path_used = false;
     let mut replay_failure: Option<String> = None;
@@ -926,127 +1277,33 @@ pub(crate) fn apply_fillet(
         }
     }
 
-    let mut applied = false;
-    let mut last_err: Option<String> = None;
-    let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
-    let mut next_pristine = MockMesh::empty();
-    let mut can_use_pristine = true;
+    // Final fallback: native per-part solve on the untouched body (accepts a
+    // partial result). Reached when native-first was skipped (a cutoff edge) or
+    // declined, and every replay path was NotApplicable or Failed.
     let reference_mesh = edge_mod_reference_mesh(body);
     let sketch_source = body.sketch_source.clone();
     let recut_tools = body.cut_tools.clone();
-    for (part_index, part) in body.parts.drain(..).enumerate() {
-        let mut part_failures = Vec::new();
-        // No pre-size gate: the kernel's rolling-ball blend rejects a radius too
-        // large for the local geometry (a non-watertight result → `Err`), which
-        // is the correct, geometry-aware bound. The old global-AABB heuristic was
-        // both wrong (it measured the part's *thinnest* axis, not the filleted
-        // edge's adjacent-face extents, so it blocked radii the kernel handles)
-        // and asymmetric — chamfer never had it, which is why a radius would
-        // chamfer but refuse to fillet.
-        let sketch_region = sketch_source
-            .as_ref()
-            .and_then(|source| source.regions.get(part_index));
-        let circular_bite_locality = sketch_region.map(|region| CircularBiteLocality {
-            region,
-            selection,
-            dist,
-            kind: crate::sketch::CornerKind::Fillet,
-        });
-        let mut accepted: Option<EdgeModResult> = None;
-        let native_only = edge_mod_native_only(selection);
-        let native_reason = if accepted.is_none() {
-            match edge_mod_try_native_fillet(
-                &reference_mesh,
-                &part,
-                &part,
-                selection,
-                dist,
-                "native",
-                &recut_tools,
-                circular_bite_locality,
-            ) {
-                Ok(f) => {
-                    accepted = Some(EdgeModResult::single(f));
-                    None
-                }
-                Err(reason) => Some(reason),
-            }
-        } else {
-            None
-        };
-        if accepted.is_none() {
-            if let Some(reason) = native_reason.clone() {
-                part_failures.push(reason);
-            }
-        }
-
-        let alternate_parts = if accepted.is_none() && !native_only {
-            sketch_source
-                .as_ref()
-                .map(|source| sketch_source_alternate_parts(source, part_index))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        if accepted.is_none() && !native_only {
-            for (label, alternate_part) in &alternate_parts {
-                match edge_mod_try_native_fillet(
-                    &reference_mesh,
-                    &part,
-                    alternate_part,
-                    selection,
-                    dist,
-                    &format!("{label} native"),
-                    &recut_tools,
-                    circular_bite_locality,
-                ) {
-                    Ok(f) => {
-                        // The real part's native fillet failed; this records which
-                        // canonical fallback (e.g. "box-cylinder sketch") actually
-                        // carried the edit, so a bite-vs-box regression is traceable.
-                        log::debug!(
-                            "Fillet '{mod_id}' part {part_index}: native fillet failed, \
-                             accepted '{label}' alternate part"
-                        );
-                        accepted = Some(EdgeModResult::single(f));
-                        break;
-                    }
-                    Err(reason) => {
-                        part_failures.push(reason);
-                    }
-                }
-            }
-        }
-
-        if let Some(result) = accepted {
-            applied = true;
-            if let Some(mesh) = result.pristine {
-                next_pristine.append(mesh);
-            } else {
-                can_use_pristine = false;
-            }
-            next.extend(result.parts);
-        } else {
-            can_use_pristine = false;
-            if !part_failures.is_empty() {
-                last_err = Some(part_failures.join("; "));
-            }
-            next.push(part);
-        }
-    }
-    body.parts = next;
-    if applied {
-        body.pristine =
-            (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
+    let outcome = edge_mod_native_fillet_all_parts(
+        mod_id,
+        selection,
+        dist,
+        std::mem::take(&mut body.parts),
+        &reference_mesh,
+        &sketch_source,
+        &recut_tools,
+    );
+    body.parts = outcome.parts;
+    if outcome.applied {
+        body.pristine = outcome.pristine;
         body.sketch_source = None;
         body.cut_replay = None;
         body.edge_mod_cut_history_path_used = cut_history_path_used;
     } else {
         // Surface the kernel's actual reason (radius too large, edge not found on
         // an adjacent face, non-blendable wedge, …) instead of a generic guess.
-        let native_reason =
-            last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
+        let native_reason = outcome
+            .last_err
+            .unwrap_or_else(|| "the edge is no longer on the body".to_string());
         let reason = replay_failure
             .map(|replay| {
                 format!(
@@ -1098,24 +1355,34 @@ fn edge_mod_try_native_cut_history_replay(
     }
 
     let mut failures = Vec::new();
+    // Incremental prefix replay: apply one cut step at a time to a running clean
+    // prefix instead of re-replaying `steps[..prefix_len]` from scratch on every
+    // iteration (O(N²) → O(N) booleans). Each fillet attempt mutates a *clone*, so
+    // `clean_prefix_parts` stays fillet-free for the next longer prefix.
+    let mut clean_prefix_parts = history.base_parts.clone();
     for prefix_len in 1..=history.steps.len() {
         recut_debug(format!(
             "trying cut-history prefix {prefix_len}/{} for selected edge",
             history.steps.len()
         ));
         let replay_started = std::time::Instant::now();
-        let mut prefix_parts =
-            match replay_cut_history(history.base_parts.clone(), &history.steps[..prefix_len]) {
-                Ok(parts) => parts,
-                Err(reason) => {
-                    failures.push(format!("prefix {prefix_len} replay failed: {reason}"));
-                    continue;
-                }
-            };
+        clean_prefix_parts = match replay_cut_history(
+            clean_prefix_parts,
+            &history.steps[prefix_len - 1..prefix_len],
+        ) {
+            Ok(parts) => parts,
+            Err(reason) => {
+                // Once one step can't replay, no longer prefix can either (each is a
+                // superset of this same chain), so stop rather than retry from scratch.
+                failures.push(format!("prefix {prefix_len} replay failed: {reason}"));
+                break;
+            }
+        };
         edge_mod_timing(
             format!("native cut-history prefix {prefix_len} replay"),
             replay_started,
         );
+        let mut prefix_parts = clean_prefix_parts.clone();
         let mut reference_mesh = MockMesh::empty();
         for part in &prefix_parts {
             reference_mesh.append(MockMesh::from_solid(part));
@@ -1289,121 +1556,29 @@ pub(crate) fn apply_chamfer(
     body: &mut LiveBody,
     warnings: &mut Vec<String>,
 ) {
-    let edge = &selection.active_edge;
-    let mut applied = false;
-    let mut last_err: Option<String> = None;
-    let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
-    let mut next_pristine = MockMesh::empty();
-    let mut can_use_pristine = true;
+    // Chamfer has no construction-/cut-history replay path (it is native-only), so
+    // this is already the equivalent of the fillet native-first fast path.
     let reference_mesh = edge_mod_reference_mesh(body);
     let sketch_source = body.sketch_source.clone();
     let recut_tools = body.cut_tools.clone();
-    for (part_index, part) in body.parts.drain(..).enumerate() {
-        let sketch_region = sketch_source
-            .as_ref()
-            .and_then(|source| source.regions.get(part_index));
-        let circular_bite_locality = sketch_region.map(|region| CircularBiteLocality {
-            region,
-            selection,
-            dist,
-            kind: crate::sketch::CornerKind::Chamfer,
-        });
-        let mut accepted: Option<EdgeModResult> = None;
-        let mut part_failures = Vec::new();
-        let native_only = edge_mod_native_only(selection);
-        let native_reason = if accepted.is_none() {
-            match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
-                Ok(chamfered) => match edge_mod_accept_candidate_or_recut(
-                    &reference_mesh,
-                    &part,
-                    chamfered,
-                    &recut_tools,
-                    circular_bite_locality,
-                ) {
-                    Ok(chamfered) => {
-                        match edge_mod_reject_unhealthy_native_curve_result(selection, &chamfered) {
-                            Ok(()) => {
-                                accepted = Some(EdgeModResult::single(chamfered));
-                                None
-                            }
-                            Err(reason) => Some(format!("native result rejected: {reason}")),
-                        }
-                    }
-                    Err(reason) => Some(format!("native result rejected: {reason}")),
-                },
-                Err(reason) => Some(format!("native failed: {reason}")),
-            }
-        } else {
-            None
-        };
-        if accepted.is_none() {
-            if let Some(reason) = native_reason.clone() {
-                part_failures.push(reason);
-            }
-        }
-
-        let alternate_parts = if accepted.is_none() && !native_only {
-            sketch_source
-                .as_ref()
-                .map(|source| sketch_source_alternate_parts(source, part_index))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        if accepted.is_none() && !native_only {
-            for (label, alternate_part) in &alternate_parts {
-                let candidate =
-                    crate::mock_kernel::chamfer_edge(alternate_part, edge.p0, edge.p1, dist);
-                match candidate {
-                    Ok(chamfered) => {
-                        match edge_mod_accept_candidate_or_recut(
-                            &reference_mesh,
-                            &part,
-                            chamfered,
-                            &recut_tools,
-                            circular_bite_locality,
-                        ) {
-                            Ok(chamfered) => {
-                                accepted = Some(EdgeModResult::single(chamfered));
-                                break;
-                            }
-                            Err(reason) => part_failures
-                                .push(format!("{label} native result rejected: {reason}")),
-                        }
-                    }
-                    Err(reason) => {
-                        part_failures.push(format!("{label} native failed: {reason}"));
-                    }
-                }
-            }
-        }
-
-        if let Some(result) = accepted {
-            applied = true;
-            if let Some(mesh) = result.pristine {
-                next_pristine.append(mesh);
-            } else {
-                can_use_pristine = false;
-            }
-            next.extend(result.parts);
-        } else {
-            can_use_pristine = false;
-            if !part_failures.is_empty() {
-                last_err = Some(part_failures.join("; "));
-            }
-            next.push(part);
-        }
-    }
-    body.parts = next;
-    if applied {
-        body.pristine =
-            (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
+    let outcome = edge_mod_native_chamfer_all_parts(
+        selection,
+        dist,
+        std::mem::take(&mut body.parts),
+        &reference_mesh,
+        &sketch_source,
+        &recut_tools,
+    );
+    body.parts = outcome.parts;
+    if outcome.applied {
+        body.pristine = outcome.pristine;
         body.sketch_source = None;
         body.cut_replay = None;
         body.edge_mod_cut_history_path_used = false;
     } else {
-        let reason = last_err.unwrap_or_else(|| "the edge is no longer on the body".to_string());
+        let reason = outcome
+            .last_err
+            .unwrap_or_else(|| "the edge is no longer on the body".to_string());
         warnings.push(format!(
             "Chamfer '{mod_id}': the edge couldn't be beveled ({reason}), so the \
              body was left unchanged."

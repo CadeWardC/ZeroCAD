@@ -191,6 +191,67 @@ fn cylinder_blind_pocket_is_smooth_and_watertight() {
 }
 
 #[test]
+fn cut_hole_rim_renders_as_a_smooth_circle() {
+    // A bored hole's rim must render as a SMOOTH circle in the *wireframe* — the
+    // analytic curved-edge sampling in `MockMesh::from_solid` — not the coarse
+    // per-facet polygon the raw tessellation feature edges used to leave. This is
+    // what lets a boolean'd body's display source (from_solid) replace the old
+    // dedicated analytic-primitive wireframe path without a visible regression.
+    let mut g = ParametricGraph::new();
+    box_base(&mut g, 40.0, 30.0, 15.0);
+    add_sketch(
+        &mut g,
+        "sketch_2",
+        top_plane(15.0),
+        circle_sketch((20.0, 15.0), 6.0),
+    );
+    add_extrude(&mut g, "extrude_3", "sketch_2", -19.46, ExtrudeMode::Cut);
+    g.add_dependency("box_1", "extrude_3");
+
+    let bodies = g.evaluate_bodies(&HashSet::new()).unwrap();
+    let m = &bodies[0].1;
+
+    // Distinct wireframe vertices on the TOP rim: z≈15, radius≈6 about (20,15). The
+    // box outline also sits at z=15 but at radius ≥14, so it filters out cleanly.
+    let mut angs: Vec<f32> = Vec::new();
+    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+    for v in m.edge_vertices.chunks_exact(3) {
+        let (x, y, z) = (v[0], v[1], v[2]);
+        if (z - 15.0).abs() > 0.15 {
+            continue;
+        }
+        let (dx, dy) = (x - 20.0, y - 15.0);
+        if (dx.hypot(dy) - 6.0).abs() > 0.5 {
+            continue;
+        }
+        if seen.insert(((x * 1e3) as i64, (y * 1e3) as i64)) {
+            angs.push(dy.atan2(dx));
+        }
+    }
+    assert!(
+        angs.len() >= 24,
+        "hole rim must sample ≥24 points (smooth analytic curve), got {} — \
+         a coarse tessellation polygon would have far fewer",
+        angs.len()
+    );
+    angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut max_gap = 0.0f32;
+    for w in angs.windows(2) {
+        max_gap = max_gap.max(w[1] - w[0]);
+    }
+    if let (Some(&first), Some(&last)) = (angs.first(), angs.last()) {
+        max_gap = max_gap.max(first + std::f32::consts::TAU - last);
+    }
+    let max_deg = max_gap.to_degrees();
+    println!("top rim points = {}, max angular gap = {max_deg:.1}°", angs.len());
+    assert!(
+        max_deg <= 12.0,
+        "hole rim must render smooth (≤12° between samples), got {max_deg:.1}° — \
+         a faceted rim would gap much wider"
+    );
+}
+
+#[test]
 fn cylinder_primitive_is_smooth() {
     // The cylinder PRIMITIVE itself (not an extruded circle) must also be smooth
     // once it participates in a boolean — here cut by a small box pocket. The cut

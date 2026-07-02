@@ -32,7 +32,11 @@ enum RenderItemContent {
         colors: [egui::Color32; 3],
     },
     PlaneSheet {
-        points: [egui::Pos2; 4],
+        /// The four quad corners in world space (CCW). The sheet is subdivided and
+        /// each cell depth-tested against the solid occlusion buffer, so a sheet
+        /// that dips behind a body is hidden there. The screen `points` are no
+        /// longer stored — every vertex is re-projected from these world corners.
+        world_corners: [[f32; 3]; 4],
         fill_color: egui::Color32,
         border_color: egui::Color32,
         label: &'static str,
@@ -343,17 +347,43 @@ impl ZeroCadApp {
             egui::Color32::from_rgb(230, 150, 50)
         };
 
+        // World-space corners of each sheet, in the same winding as the projected
+        // `*_pts`, so each cell can be re-projected and depth-tested.
+        let xy_world = [
+            [0.0, 0.0, 0.0],
+            [size, 0.0, 0.0],
+            [size, size, 0.0],
+            [0.0, size, 0.0],
+        ];
+        let xz_world = [
+            [0.0, 0.0, 0.0],
+            [size, 0.0, 0.0],
+            [size, 0.0, size],
+            [0.0, 0.0, size],
+        ];
+        let yz_world = [
+            [0.0, 0.0, 0.0],
+            [0.0, size, 0.0],
+            [0.0, size, size],
+            [0.0, 0.0, size],
+        ];
+
         let planes_to_draw = vec![
             (
                 xy_pts,
+                xy_world,
                 xy_depth,
                 SketchPlane::XY,
                 fill_xy,
                 stroke_xy,
                 "", // Clean: no text label printed inside the viewport
             ),
-            (xz_pts, xz_depth, SketchPlane::XZ, fill_xz, stroke_xz, ""),
-            (yz_pts, yz_depth, SketchPlane::YZ, fill_yz, stroke_yz, ""),
+            (
+                xz_pts, xz_world, xz_depth, SketchPlane::XZ, fill_xz, stroke_xz, "",
+            ),
+            (
+                yz_pts, yz_world, yz_depth, SketchPlane::YZ, fill_yz, stroke_yz, "",
+            ),
         ];
 
         // --- 2. GROUND REFERENCE GRID & CENTRAL AXES (when not in a planar mode) ---
@@ -795,7 +825,15 @@ impl ZeroCadApp {
         let mut zbuf = vec![f32::NEG_INFINITY; occ_w * occ_h];
         let (mut depth_min, mut depth_max) = (f32::INFINITY, f32::NEG_INFINITY);
 
-        let (selected_whole_bodies, selected_faces) = selected_material_sets(&self.selected_body);
+        let (selected_whole_bodies, mut selected_faces) =
+            selected_material_sets(&self.selected_body);
+        // While picking a sketch plane, preview the hovered planar body face as
+        // selected so the user sees which face a click will sketch on.
+        if self.is_plane_selection_mode {
+            if let Some((node, fid)) = self.hovered_sketch_face.as_ref() {
+                selected_faces.insert((node.as_str(), *fid));
+            }
+        }
 
         // A. Gather Solid Mesh Triangles (committed model + extrude preview)
         for d in &meshes {
@@ -914,11 +952,11 @@ impl ZeroCadApp {
 
         // B. Gather Origin Plane Sheets
         if self.is_plane_selection_mode {
-            for (pts, depth, plane, fill_col, border_col, label) in planes_to_draw {
+            for (_pts, world, depth, plane, fill_col, border_col, label) in planes_to_draw {
                 render_items.push(RenderItem {
                     depth,
                     content: RenderItemContent::PlaneSheet {
-                        points: pts,
+                        world_corners: world,
                         fill_color: fill_col,
                         border_color: border_col,
                         label,
@@ -949,6 +987,33 @@ impl ZeroCadApp {
         // in the depth-sorted sequence. Real model edges are drawn in section F;
         // drawing per-triangle seam outlines here exposes boolean tessellation
         // diagonals as stray construction-like lines after Join/Cut operations.
+
+        // The solid occlusion buffer is complete after section A, so define the
+        // hidden-surface test here: both the plane sheets (E) and the wireframe
+        // edges (F) use it to hide the parts that dip behind a nearer solid face.
+        // Self-occlusion guard: geometry lies ON its own faces, so only a face
+        // nearer by more than this hides it. Scaled to the model's depth span.
+        let occ_bias = ((depth_max - depth_min) * 0.01).max(0.02);
+        // Does this one cell hold a face nearer than the tested point?
+        let cell_occludes = |cx: i32, cy: i32, sd: f32| -> bool {
+            if cx < 0 || cy < 0 || cx as usize >= occ_w || cy as usize >= occ_h {
+                return false; // off-buffer ⇒ background ⇒ not occluding
+            }
+            zbuf[cy as usize * occ_w + cx as usize] > sd + occ_bias
+        };
+        // A point is hidden only if its cell AND its four orthogonal neighbours are
+        // all covered by a nearer face. The 5-cell rule keeps curved silhouettes and
+        // sheet-vs-body seams stable rather than dashing them (see section F).
+        let occluded = |sx: f32, sy: f32, sd: f32| -> bool {
+            let cx = ((sx - rect.min.x) / occ_cell) as i32;
+            let cy = ((sy - rect.min.y) / occ_cell) as i32;
+            cell_occludes(cx, cy, sd)
+                && cell_occludes(cx - 1, cy, sd)
+                && cell_occludes(cx + 1, cy, sd)
+                && cell_occludes(cx, cy - 1, sd)
+                && cell_occludes(cx, cy + 1, sd)
+        };
+
         let mut batched_mesh = egui::Mesh::default();
 
         let flush_batch = |mesh: &mut egui::Mesh, painter: &egui::Painter| {
@@ -970,7 +1035,7 @@ impl ZeroCadApp {
                     batched_mesh.add_triangle(base, base + 1, base + 2);
                 }
                 RenderItemContent::PlaneSheet {
-                    points,
+                    world_corners,
                     fill_color,
                     border_color,
                     label,
@@ -979,16 +1044,98 @@ impl ZeroCadApp {
                     // Flush accumulated triangles before the sheet so their
                     // painter's-algorithm position in the sorted list is respected.
                     flush_batch(&mut batched_mesh, &painter);
-                    painter.add(egui::Shape::convex_polygon(
-                        points.to_vec(),
-                        fill_color,
-                        egui::Stroke::new(1.8, border_color),
-                    ));
+
+                    // Subdivide the sheet into a cell grid, re-project each cell in
+                    // world space, and skip cells whose centre is hidden by a nearer
+                    // solid — so a sheet that interpenetrates a body is drawn only
+                    // where it's actually in front. A single averaged sheet depth
+                    // (the old convex polygon) could not do this.
+                    const N: usize = 12;
+                    let w = world_corners;
+                    // Bilinear world position at (u, v) in [0,1]², matching the
+                    // corner winding: u runs w0→w1 (and w3→w2), v runs w0→w3.
+                    let world_at = |u: f32, v: f32| -> (f32, f32, f32) {
+                        let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
+                            [
+                                a[0] + (b[0] - a[0]) * t,
+                                a[1] + (b[1] - a[1]) * t,
+                                a[2] + (b[2] - a[2]) * t,
+                            ]
+                        };
+                        let bottom = lerp(w[0], w[1], u);
+                        let top = lerp(w[3], w[2], u);
+                        let p = lerp(bottom, top, v);
+                        (p[0], p[1], p[2])
+                    };
+                    let proj_uv = |u: f32, v: f32| -> (f32, f32, f32) {
+                        let (x, y, z) = world_at(u, v);
+                        project_3d(x, y, z)
+                    };
+
+                    // Precompute the (N+1)² projected grid vertices.
+                    let mut grid: Vec<(f32, f32, f32)> = Vec::with_capacity((N + 1) * (N + 1));
+                    for j in 0..=N {
+                        for i in 0..=N {
+                            grid.push(proj_uv(i as f32 / N as f32, j as f32 / N as f32));
+                        }
+                    }
+                    let at = |i: usize, j: usize| grid[j * (N + 1) + i];
+
+                    // Visible cells → one mesh.
+                    let mut sheet_mesh = egui::Mesh::default();
+                    for j in 0..N {
+                        for i in 0..N {
+                            let cu = (i as f32 + 0.5) / N as f32;
+                            let cv = (j as f32 + 0.5) / N as f32;
+                            let center = proj_uv(cu, cv);
+                            if occluded(center.0, center.1, center.2) {
+                                continue;
+                            }
+                            let (a, b, c, e) =
+                                (at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
+                            let base = sheet_mesh.vertices.len() as u32;
+                            for p in [a, b, c, e] {
+                                sheet_mesh.colored_vertex(egui::pos2(p.0, p.1), fill_color);
+                            }
+                            sheet_mesh.add_triangle(base, base + 1, base + 2);
+                            sheet_mesh.add_triangle(base, base + 2, base + 3);
+                        }
+                    }
+                    if !sheet_mesh.vertices.is_empty() {
+                        painter.add(egui::Shape::mesh(sheet_mesh));
+                    }
+
+                    // Border: stroke only the unoccluded spans of the four edges.
+                    let stroke = egui::Stroke::new(1.8, border_color);
+                    let edges = [
+                        ((0.0, 0.0), (1.0, 0.0)),
+                        ((1.0, 0.0), (1.0, 1.0)),
+                        ((1.0, 1.0), (0.0, 1.0)),
+                        ((0.0, 1.0), (0.0, 0.0)),
+                    ];
+                    for ((u0, v0), (u1, v1)) in edges {
+                        let mut prev: Option<(f32, f32, f32)> = None;
+                        for s in 0..=N {
+                            let t = s as f32 / N as f32;
+                            let p = proj_uv(u0 + (u1 - u0) * t, v0 + (v1 - v0) * t);
+                            if let Some(pp) = prev {
+                                let mid =
+                                    ((pp.0 + p.0) * 0.5, (pp.1 + p.1) * 0.5, (pp.2 + p.2) * 0.5);
+                                if !occluded(mid.0, mid.1, mid.2) {
+                                    painter.line_segment(
+                                        [egui::pos2(pp.0, pp.1), egui::pos2(p.0, p.1)],
+                                        stroke,
+                                    );
+                                }
+                            }
+                            prev = Some(p);
+                        }
+                    }
+
                     if !label.is_empty() {
-                        let cx = (points[0].x + points[1].x + points[2].x + points[3].x) / 4.0;
-                        let cy = (points[0].y + points[1].y + points[2].y + points[3].y) / 4.0;
+                        let c = proj_uv(0.5, 0.5);
                         painter.text(
-                            egui::pos2(cx, cy),
+                            egui::pos2(c.0, c.1),
                             egui::Align2::CENTER_CENTER,
                             label,
                             egui::FontId::proportional(11.0),
@@ -1013,32 +1160,8 @@ impl ZeroCadApp {
         // away is dropped up front (cheap, and the only filter for translucent
         // previews, which put nothing in the buffer).
         let edge_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(45, 50, 60));
-        // Self-occlusion guard: an edge lies ON its own faces, so only a face
-        // nearer by more than this hides it. Scaled to the model's depth span.
-        let occ_bias = ((depth_max - depth_min) * 0.01).max(0.02);
-        // Does this one cell hold a face nearer than the edge point?
-        let cell_occludes = |cx: i32, cy: i32, sd: f32| -> bool {
-            if cx < 0 || cy < 0 || cx as usize >= occ_w || cy as usize >= occ_h {
-                return false; // off-buffer ⇒ background ⇒ not occluding
-            }
-            zbuf[cy as usize * occ_w + cx as usize] > sd + occ_bias
-        };
-        // A point is hidden only if its cell AND its four orthogonal neighbours are
-        // all covered by a nearer face. A ~2px occlusion cell straddling a curved
-        // silhouette captures the surface's near bulge just inside the outline, so a
-        // single-cell test reads the *visible* silhouette as "occluded" and dashes
-        // it (the reported dotted cylinder outline). Requiring the neighbourhood to
-        // agree lets the background-side neighbour keep the silhouette drawn, while a
-        // truly buried edge — covered on every side — still hides correctly.
-        let occluded = |sx: f32, sy: f32, sd: f32| -> bool {
-            let cx = ((sx - rect.min.x) / occ_cell) as i32;
-            let cy = ((sy - rect.min.y) / occ_cell) as i32;
-            cell_occludes(cx, cy, sd)
-                && cell_occludes(cx - 1, cy, sd)
-                && cell_occludes(cx + 1, cy, sd)
-                && cell_occludes(cx, cy - 1, sd)
-                && cell_occludes(cx, cy + 1, sd)
-        };
+        // `occ_bias`, `cell_occludes` and `occluded` are defined above (before
+        // section E) so the plane sheets can share this hidden-surface test.
         let faces_camera = |n: (f32, f32, f32)| -> bool {
             let rz_n = sin_y * n.0 + cos_y * n.2;
             sin_p * n.1 + cos_p * rz_n > 0.0

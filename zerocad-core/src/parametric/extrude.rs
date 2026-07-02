@@ -15,21 +15,42 @@ pub(crate) fn stamp_sketch_extrude_edge_refs(
         return;
     }
 
-    let mut occurrences: HashMap<String, usize> = HashMap::new();
-    for edge_ref in &mut mesh.edge_refs {
+    // Occurrence numbers disambiguate edges that share a base id (a boolean can
+    // split one design edge into several fragments). Assign them in GEOMETRIC
+    // order — sorted by quantized endpoints — never in enumeration order:
+    // edge_refs order varies with the per-process hash seed and with the
+    // tessellation, and an occ id that names a different fragment each run
+    // breaks captured references.
+    let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
+    let edge_sort_key = |p0: [f32; 3], p1: [f32; 3]| {
+        let a = (quant(p0[0]), quant(p0[1]), quant(p0[2]));
+        let b = (quant(p1[0]), quant(p1[1]), quant(p1[2]));
+        if a <= b { (a, b) } else { (b, a) }
+    };
+    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut base_ids: Vec<String> = Vec::with_capacity(mesh.edge_refs.len());
+    for (i, edge_ref) in mesh.edge_refs.iter().enumerate() {
         let role = sketch_extrude_edge_role(edge_ref.p0, edge_ref.p1, cs, depth);
         let fragment_id = sketch_extrude_edge_fragment_id(edge_ref, provenance, cs)
             .unwrap_or_else(|| "unknown".to_string());
         let base_id =
             format!("sketch:{body_id}:region:{region_index}:fragment:{fragment_id}:role:{role}");
-        let occurrence = occurrences.entry(base_id.clone()).or_insert(0);
-        let edge_id = if *occurrence == 0 {
-            base_id
-        } else {
-            format!("{base_id}:occ:{occurrence}")
-        };
-        *occurrence += 1;
-
+        by_base.entry(base_id.clone()).or_default().push(i);
+        base_ids.push(base_id);
+    }
+    let mut assigned: Vec<Option<String>> = vec![None; mesh.edge_refs.len()];
+    for (base_id, mut indices) in by_base {
+        indices.sort_by_key(|&i| edge_sort_key(mesh.edge_refs[i].p0, mesh.edge_refs[i].p1));
+        for (occurrence, &i) in indices.iter().enumerate() {
+            assigned[i] = Some(if occurrence == 0 {
+                base_id.clone()
+            } else {
+                format!("{base_id}:occ:{occurrence}")
+            });
+        }
+    }
+    for (i, edge_ref) in mesh.edge_refs.iter_mut().enumerate() {
+        let edge_id = assigned[i].take().unwrap_or_else(|| base_ids[i].clone());
         let curve_kind = match edge_ref.curve {
             Some(EdgeCurveHint::Circle { .. }) => Some("circle".to_string()),
             Some(EdgeCurveHint::Line) => Some("line".to_string()),
@@ -59,21 +80,35 @@ pub(crate) fn stamp_sketch_extrude_face_refs(
     cs: &CoordinateSystem,
     depth: f32,
 ) {
-    let mut occurrences: HashMap<String, usize> = HashMap::new();
-    for face_ref in &mut mesh.face_refs {
+    // Same geometric occurrence numbering as the edge stamp: side walls share
+    // one base id, and which wall is `occ:N` must not depend on the hash seed
+    // or the tessellation order. Sort by quantized centroid.
+    let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
+    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, face_ref) in mesh.face_refs.iter().enumerate() {
         let role = sketch_extrude_face_role(face_ref.normal, cs, depth);
         let base_id = format!("sketch:{body_id}:region:{region_index}:face:{role}");
-        let occurrence = occurrences.entry(base_id.clone()).or_insert(0);
-        let face_id = if *occurrence == 0 {
-            base_id
-        } else {
-            format!("{base_id}:occ:{occurrence}")
-        };
-        *occurrence += 1;
+        by_base.entry(base_id).or_default().push(i);
+    }
+    let mut assigned: Vec<Option<String>> = vec![None; mesh.face_refs.len()];
+    for (base_id, mut indices) in by_base {
+        indices.sort_by_key(|&i| {
+            let c = mesh.face_refs[i].centroid;
+            (quant(c[0]), quant(c[1]), quant(c[2]))
+        });
+        for (occurrence, &i) in indices.iter().enumerate() {
+            assigned[i] = Some(if occurrence == 0 {
+                base_id.clone()
+            } else {
+                format!("{base_id}:occ:{occurrence}")
+            });
+        }
+    }
+    for (i, face_ref) in mesh.face_refs.iter_mut().enumerate() {
         face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
             topology_version: Some(0),
-            face_id: Some(face_id),
+            face_id: assigned[i].take(),
             surface_kind: None,
         });
     }

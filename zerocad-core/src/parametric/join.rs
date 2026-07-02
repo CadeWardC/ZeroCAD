@@ -70,7 +70,9 @@ pub(crate) fn grow_loop(points: &[(f32, f32)], outward: bool) -> Vec<(f32, f32)>
 /// matters.
 pub(crate) fn overshoot_cs(cs: &CoordinateSystem, depth: f32) -> CoordinateSystem {
     let back = cs.n.mul(-depth.signum() * CUT_OVERSHOOT);
-    CoordinateSystem::new(cs.origin.add(back), cs.u, cs.v)
+    // Origin shift only — `CoordinateSystem::new` recomputes n = u × v, which
+    // flips the sweep on the left-handed ground plane (see with_origin docs).
+    cs.with_origin(cs.origin.add(back))
 }
 
 /// Depth extended by `ends` overshoot lengths along the sweep direction. Paired

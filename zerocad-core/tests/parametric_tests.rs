@@ -65,9 +65,21 @@ fn test_parametric_graph_box() {
     // OpenRCAD's flat-shaded `gpu_mesh` is unwelded: every triangle emits three
     // independent vertices carrying its face normal, so 12 triangles × 3 = 36.
     assert_eq!(mesh.vertices.len() / 6, 36);
-    // Wireframe is built analytically from 8 deduped cube corners with 12 edges.
-    assert_eq!(mesh.edge_vertices.len() / 3, 8);
+    // Wireframe: 12 cube edges over 8 distinct corners. The display now derives
+    // from the part solid (from_solid), whose wireframe stores per-segment
+    // vertices — so weld by position instead of assuming the analytic
+    // make_box buffer layout.
     assert_eq!(mesh.edge_indices.len() / 2, 12);
+    let mut corners: std::collections::HashSet<(i64, i64, i64)> = std::collections::HashSet::new();
+    for v in 0..mesh.edge_vertices.len() / 3 {
+        let f = |x: f32| (x as f64 * 1.0e4).round() as i64;
+        corners.insert((
+            f(mesh.edge_vertices[v * 3]),
+            f(mesh.edge_vertices[v * 3 + 1]),
+            f(mesh.edge_vertices[v * 3 + 2]),
+        ));
+    }
+    assert_eq!(corners.len(), 8, "a box wireframe has 8 distinct corners");
 
     // Sanity: every triangle index must be in range and triangles must be
     // non-degenerate (three distinct vertex indices per tri).

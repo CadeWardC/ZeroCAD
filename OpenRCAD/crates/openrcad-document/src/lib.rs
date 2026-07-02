@@ -590,7 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_boolean_feature_rolls_back_history() {
+    fn failed_feature_rolls_back_history() {
+        // The corner-overlap union this test once relied on as a "known
+        // partial-imprint failure" has been FIXED (see the robustness matrix's
+        // corner_overlap_union_should_be_watertight) — lock the success in.
         let mut doc = Document::new();
 
         let a_sketch = doc.add_sketch("a", SketchPlane::XY);
@@ -613,16 +616,21 @@ mod tests {
             .extrude("b", b_sketch, b_rect, 10.0, Operation::NewBody)
             .unwrap();
 
+        let fused = doc
+            .boolean("corner fuse", a, b, BooleanOp::Fuse)
+            .expect("corner-overlap union is watertight since the partial-imprint fixes");
+        assert!(doc.solid(fused).unwrap().is_watertight());
+
+        // Rollback still guards every feature kind (push_feature is shared):
+        // an oversized fillet fails and must leave the history untouched.
         let before = doc.features().len();
         let err = doc
-            .boolean("bad corner fuse", a, b, BooleanOp::Fuse)
-            .expect_err("known partial-imprint union should be rejected");
-
+            .fillet("too big", fused, 1.0e3)
+            .expect_err("oversized fillet must be rejected");
         assert!(
             matches!(
                 err,
-                DocumentError::Boolean(BooleanError::InvalidOutput { .. })
-                    | DocumentError::Boolean(BooleanError::NonWatertightOutput { .. })
+                DocumentError::Blend(_)
                     | DocumentError::UnhealthyResult { .. }
                     | DocumentError::NonWatertightResult { .. }
             ),
@@ -631,5 +639,6 @@ mod tests {
         assert_eq!(doc.features().len(), before);
         assert!(doc.solid(a).is_ok());
         assert!(doc.solid(b).is_ok());
+        assert!(doc.solid(fused).is_ok());
     }
 }

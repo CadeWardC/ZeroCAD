@@ -53,10 +53,29 @@ pub struct Circle {
     pub radius: f32,
 }
 
+/// A circular **arc** boundary fragment (currently produced by a sketch corner
+/// fillet). Stored analytically — center + radius + the two endpoints — so the
+/// extrude wire builder can sweep it to an exact cylindrical wall instead of
+/// relying on [`crate::mock_kernel`]'s sample-based arc refit (which can't segment
+/// the tangent-connected arcs of a rounded rectangle). The arc runs the short way
+/// from `start` to `end` about `center`; region detection tessellates it via
+/// [`SketchCurves`]'s flattening, so the DCEL still sees only line segments.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Arc {
+    pub center: (f32, f32),
+    pub radius: f32,
+    pub start: (f32, f32),
+    pub end: (f32, f32),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SketchCurves {
     pub segments: Vec<LineSegment>,
     pub circles: Vec<Circle>,
+    /// Analytic arc fragments (sketch fillets). `#[serde(default)]` so `.zcad`
+    /// files written before arcs existed still deserialize.
+    #[serde(default)]
+    pub arcs: Vec<Arc>,
 }
 
 impl SketchCurves {
@@ -65,7 +84,7 @@ impl SketchCurves {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.segments.is_empty() && self.circles.is_empty()
+        self.segments.is_empty() && self.circles.is_empty() && self.arcs.is_empty()
     }
 
     /// Append a rectangle as four segments around the two opposite corners.
@@ -122,12 +141,14 @@ impl SketchCurves {
         }
     }
 
-    /// Remove the most recently added primitive (LIFO across segments + circles).
-    /// Rectangles count as 4 segments — call 4× to undo one.
+    /// Remove the most recently added primitive (LIFO across circles, arcs, then
+    /// segments). Rectangles count as 4 segments — call 4× to undo one.
     pub fn pop_last(&mut self) -> bool {
-        if let Some(_) = self.circles.pop() {
+        if self.circles.pop().is_some() {
             true
-        } else if let Some(_) = self.segments.pop() {
+        } else if self.arcs.pop().is_some() {
+            true
+        } else if self.segments.pop().is_some() {
             true
         } else {
             false
@@ -431,6 +452,15 @@ fn apply_corner_mod(curves: &mut SketchCurves, at: (f32, f32), radius: f32, kind
             let cd = radius / half.sin();
             let c = (v.0 + bis.0 * cd, v.1 + bis.1 * cd);
             push_arc(curves, c, p1, p2, radius);
+            // Record the analytic arc alongside the tessellated segments so the
+            // extrude wire builder can sweep it to an exact cylindrical wall (the
+            // segments still drive 2D rendering, region detection, and provenance).
+            curves.arcs.push(Arc {
+                center: c,
+                radius,
+                start: p1,
+                end: p2,
+            });
         }
     }
 }

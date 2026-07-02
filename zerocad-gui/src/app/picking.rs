@@ -426,9 +426,50 @@ impl ZeroCadApp {
                 continue;
             }
 
-            // Vertices (corners of the wireframe).
+            // Vertices — but only *true topological endpoints*. Within one edge
+            // group (a whole fillet arc, a full rim) every interior tessellation
+            // chord point is shared by two segments; only a real B-Rep vertex is
+            // used once. A closed circle therefore offers no pickable points at
+            // all — professional CAD does not snap to phantom points along a
+            // smooth rim. Legacy meshes without grouping keep every corner.
+            let endpoint_ok: Option<std::collections::HashSet<u32>> =
+                if mesh.edge_groups.len() == mesh.edge_indices.len() / 2 {
+                    let q = |i: u32| {
+                        let b = i as usize * 3;
+                        (
+                            (mesh.edge_vertices[b] * 1.0e4).round() as i64,
+                            (mesh.edge_vertices[b + 1] * 1.0e4).round() as i64,
+                            (mesh.edge_vertices[b + 2] * 1.0e4).round() as i64,
+                        )
+                    };
+                    let mut uses: std::collections::HashMap<(u32, (i64, i64, i64)), u32> =
+                        std::collections::HashMap::new();
+                    for (s, g) in mesh.edge_groups.iter().enumerate() {
+                        for k in 0..2 {
+                            let vi = mesh.edge_indices[s * 2 + k];
+                            *uses.entry((*g, q(vi))).or_insert(0) += 1;
+                        }
+                    }
+                    let mut ok = std::collections::HashSet::new();
+                    for (s, g) in mesh.edge_groups.iter().enumerate() {
+                        for k in 0..2 {
+                            let vi = mesh.edge_indices[s * 2 + k];
+                            if uses.get(&(*g, q(vi))).copied().unwrap_or(0) == 1 {
+                                ok.insert(vi);
+                            }
+                        }
+                    }
+                    Some(ok)
+                } else {
+                    None
+                };
             let vcount = mesh.edge_vertices.len() / 3;
             for v in 0..vcount {
+                if let Some(ok) = &endpoint_ok {
+                    if !ok.contains(&(v as u32)) {
+                        continue;
+                    }
+                }
                 let p = proj(
                     mesh.edge_vertices[v * 3],
                     mesh.edge_vertices[v * 3 + 1],
@@ -555,6 +596,70 @@ impl ZeroCadApp {
         } else {
             "Face"
         }
+    }
+
+    /// Whether the body face `(node_id, fid)` is planar — every triangle of the
+    /// face shares one normal and every vertex lies on the face's centroid plane.
+    /// A sketch needs a flat plane, and co-cylindrical face-id merging means the
+    /// stored `surface_kind` can't be trusted (GUI-reconstructed refs have topology
+    /// `None`), so this decides purely from the tessellation geometry.
+    pub(crate) fn face_is_planar(&self, node_id: &str, fid: u32) -> bool {
+        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+            return false;
+        };
+        let ntris = mesh.indices.len() / 3;
+        let tri_vertex = |t: usize, k: usize| -> Vec3 {
+            let i = mesh.indices[t * 3 + k] as usize * 6;
+            Vec3::new(mesh.vertices[i], mesh.vertices[i + 1], mesh.vertices[i + 2])
+        };
+
+        // Geometric triangle normals + centroid over this face's triangles.
+        let mut normals: Vec<Vec3> = Vec::new();
+        let mut centroid = Vec3::ZERO;
+        let mut vcount = 0.0f32;
+        for t in 0..ntris {
+            if mesh.face_ids.get(t).copied() != Some(fid) {
+                continue;
+            }
+            let (a, b, c) = (tri_vertex(t, 0), tri_vertex(t, 1), tri_vertex(t, 2));
+            let n = b.sub(a).cross(c.sub(a));
+            if n.length() > 1e-9 {
+                normals.push(n.normalize());
+            }
+            for k in 0..3 {
+                centroid = centroid.add(tri_vertex(t, k));
+                vcount += 1.0;
+            }
+        }
+        if normals.is_empty() || vcount == 0.0 {
+            return false;
+        }
+        centroid = centroid.mul(1.0 / vcount);
+        let mut avg = Vec3::ZERO;
+        for n in &normals {
+            avg = avg.add(*n);
+        }
+        if avg.length() < 1e-6 {
+            return false;
+        }
+        let avg = avg.normalize();
+
+        // 1) Every triangle normal is nearly parallel to the average (~0.8°).
+        if normals.iter().any(|n| n.dot(avg) < 0.9999) {
+            return false;
+        }
+        // 2) Every face vertex lies on the centroid plane.
+        for t in 0..ntris {
+            if mesh.face_ids.get(t).copied() != Some(fid) {
+                continue;
+            }
+            for k in 0..3 {
+                if tri_vertex(t, k).sub(centroid).dot(avg).abs() > 1e-3 {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Build a sketch coordinate system from a body face: origin at the face

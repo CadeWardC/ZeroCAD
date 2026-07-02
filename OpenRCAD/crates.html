@@ -65,7 +65,7 @@
       <tr>
         <td><code>openrcad-algo</code></td>
         <td><code>TKBool</code>, <code>TKGeomAlgo</code>, <code>TKFillet</code></td>
-        <td>SAH BVH, curve/curve/surface intersection (closed-form line/circle fast paths), Euler operators, booleans (<code>fuse</code>/<code>cut</code>/<code>common</code>) with BVH-pruned classification, sewing, and <code>fillet</code>/<code>chamfer</code>/<code>shell_solid</code>.</td>
+        <td>SAH BVH, curve/curve/surface intersection (closed-form line/circle fast paths), Euler operators, booleans (<code>fuse</code>/<code>cut</code>/<code>common</code>) with BVH-pruned classification, sewing, <code>prism</code> sweeps, whole-solid <code>fillet</code>/<code>chamfer</code>/<code>shell_solid</code>, and per-edge <code>fillet_edges</code>/<code>chamfer_edges</code> (+ the <code>apply_blend_contour</code> façade) for arbitrary edges.</td>
         <td><span class="pill done">intersection · BVH · booleans tested</span> · <span class="pill wip">box/cylinder blends</span></td>
       </tr>
       <tr>

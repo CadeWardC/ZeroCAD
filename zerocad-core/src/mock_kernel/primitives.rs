@@ -51,14 +51,34 @@ pub fn extruded_region_solid(
     depth: f32,
     cs: &crate::geometry::CoordinateSystem,
 ) -> Option<KernelSolid> {
+    extruded_region_solid_with_arcs(points, holes, depth, cs, &[])
+}
+
+/// [`extruded_region_solid`] plus the EXACT arc circles the boundary contains (from
+/// analytic sketch fillet arcs) so a rounded rectangle / multi-arc profile sweeps
+/// to exact cylindrical walls instead of `loop_to_wire`'s faceted refit. Empty
+/// `arc_circles` ⇒ identical to `extruded_region_solid`.
+pub fn extruded_region_solid_with_arcs(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+    arc_circles: &[((f32, f32), f32)],
+) -> Option<KernelSolid> {
     if points.len() < 3 || depth.abs() < f32::EPSILON {
         return None;
     }
-    if let Some(solid) = rect_minus_circle_region_solid(points, holes, depth, cs) {
-        return Some(solid);
+    // The rect-minus-circle heuristic recognises a rectangle with one circular side
+    // BITE. A filleted profile has corner arcs, not a bite — and the heuristic
+    // mis-fits those arcs into one big circle (≈ the half-diagonal). So when the
+    // sketch handed us exact fillet arcs, skip it and build the exact-arc wire.
+    if arc_circles.is_empty() {
+        if let Some(solid) = rect_minus_circle_region_solid(points, holes, depth, cs) {
+            return Some(solid);
+        }
     }
-    build_extrusion_solid(points, holes, depth as f64, cs, true)
-        .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs, true))
+    build_extrusion_solid_arcs(points, holes, depth as f64, cs, true, arc_circles)
+        .or_else(|| build_extrusion_solid_arcs(points, &[], depth as f64, cs, true, arc_circles))
 }
 
 /// Boolean fallback solid for one extruded sketch region, keeping the sampled
@@ -175,11 +195,10 @@ pub fn rect_circle_base_and_cutter_from_primitives(
 
     let sign = if depth < 0.0 { -1.0 } else { 1.0 };
     let overshoot = 0.25;
-    let cut_cs = crate::geometry::CoordinateSystem::new(
-        cs.origin.add(cs.n.mul(-sign * overshoot)),
-        cs.u,
-        cs.v,
-    );
+    // Shift the origin only — `CoordinateSystem::new` would recompute n = u × v
+    // and flip the sweep on the left-handed ground plane (cutter below ground →
+    // the boolean removes nothing and the bite silently vanishes).
+    let cut_cs = cs.with_origin(cs.origin.add(cs.n.mul(-sign * overshoot)));
     let cylinder_profile = circle_loop_2d(circle_center, circle_radius + radius_grow.max(0.0));
     let cutter = circular_cylinder_tool(
         &cylinder_profile,
@@ -227,11 +246,8 @@ pub fn rect_circle_base_and_faceted_cutter_from_primitives(
 
     let sign = if depth < 0.0 { -1.0 } else { 1.0 };
     let overshoot = 0.25;
-    let cut_cs = crate::geometry::CoordinateSystem::new(
-        cs.origin.add(cs.n.mul(-sign * overshoot)),
-        cs.u,
-        cs.v,
-    );
+    // Origin shift only — see rect_circle_base_and_cutter_from_primitives.
+    let cut_cs = cs.with_origin(cs.origin.add(cs.n.mul(-sign * overshoot)));
     let cylinder_profile = circle_loop_2d(circle_center, circle_radius + radius_grow.max(0.0));
     let cutter = extruded_region_faceted_solid(
         &cylinder_profile,
@@ -382,6 +398,40 @@ pub fn extruded_region_display_mesh(
         apply_arc_display_targets(&mut mesh, &targets, cs);
     }
     mesh
+}
+
+/// Display mesh derived **directly from the body's part solid** — the single
+/// source of truth. The shaded surface and face/edge identity then always match
+/// the kernel geometry a boolean/fillet will actually operate on (no separately
+/// built display twin that can drift). Since [`MockMesh::from_solid`] now redraws
+/// curved B-Rep edges as smooth analytic polylines, a cylinder rim reads as clean
+/// here as on the old dedicated primitive path.
+///
+/// Falls back to the lightweight analytic prism/cylinder mesh
+/// ([`extruded_region_display_mesh`]) only when meshing the part yields a cracked
+/// or non-manifold render mesh (the same gate the rect-minus-circle path uses).
+pub fn display_mesh_from_part(
+    part: &KernelSolid,
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> MockMesh {
+    try_display_mesh_from_part(part)
+        .unwrap_or_else(|| extruded_region_display_mesh(points, holes, depth, cs))
+}
+
+/// Mesh a part solid for display, returning `None` when the result is cracked or
+/// non-manifold (the caller then picks its own fallback). Since [`MockMesh::from_solid`]
+/// now draws curved B-Rep edges as smooth analytic polylines, this gives a boolean
+/// result — or a box/cylinder primitive — a wireframe as clean as the dedicated
+/// analytic-mesh path, so the display can always derive from the single part solid.
+pub fn try_display_mesh_from_part(part: &KernelSolid) -> Option<MockMesh> {
+    let mesh = MockMesh::from_solid(part);
+    (!mesh.indices.is_empty()
+        && render_mesh_normals_follow_winding(&mesh)
+        && render_mesh_is_closed_manifold(&mesh))
+    .then_some(mesh)
 }
 
 pub(crate) fn build_cylinder_solid(r: f64, h: f64) -> Option<KernelSolid> {

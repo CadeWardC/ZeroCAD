@@ -46,11 +46,40 @@ fn cutout_fillet_cylinder_mesh_has_no_visual_diagonal() {
     );
 
     let faces = parts[0].shell().faces();
+    // The display mesh presents all faces of ONE analytic cylinder as one
+    // selectable face (canonical = first face of the group) — mirror that
+    // grouping here: stat only canonical cylinder faces, under their id.
+    let cyl_sig = |c: &CylindricalSurface| -> (i64, i64, i64, i64, i64, i64, i64) {
+        let q = |v: f64| (v * 1.0e4).round() as i64;
+        let p = c.position();
+        let d = p.direction();
+        let (mut dx, mut dy, mut dz) = (d.x(), d.y(), d.z());
+        let lead = if dx.abs() > 1e-9 {
+            dx
+        } else if dy.abs() > 1e-9 {
+            dy
+        } else {
+            dz
+        };
+        if lead < 0.0 {
+            dx = -dx;
+            dy = -dy;
+            dz = -dz;
+        }
+        let loc = p.location();
+        let t = loc.x() * dx + loc.y() * dy + loc.z() * dz;
+        let (fx, fy, fz) = (loc.x() - dx * t, loc.y() - dy * t, loc.z() - dz * t);
+        (q(fx), q(fy), q(fz), q(dx), q(dy), q(dz), q(c.radius()))
+    };
+    let mut seen_sigs: HashSet<(i64, i64, i64, i64, i64, i64, i64)> = HashSet::new();
     let mut checked_cylinders = 0usize;
     for (fid, face) in faces.iter().enumerate() {
         let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
             continue;
         };
+        if !seen_sigs.insert(cyl_sig(cyl)) {
+            continue; // non-canonical arc face of an already-checked cylinder
+        }
         checked_cylinders += 1;
 
         let stats = cylinder_face_stats(mesh, fid as u32, *cyl);

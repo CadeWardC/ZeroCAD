@@ -6,12 +6,230 @@ use super::*;
 pub(crate) const TESS_TOL: f64 = 0.05;
 
 /// Tessellation angular tolerance (radians) handed to `openrcad::mesh::tessellate`.
-pub(crate) const TESS_ANGLE: f64 = 0.5;
+/// ~7.5° (2π/48) — one facet per `CIRCLE_SEGS` slice, so a tessellated cylinder
+/// wall matches the analytic rim wireframe's smoothness and a 90° fillet corner
+/// gets ~12 facets. The old 0.5 rad (~28.6°) gave a fillet corner only ~3-4
+/// facets, so an analytic corner still *rendered* visibly segmented. Angular
+/// (not chordal) tolerance keeps the facet density uniform across radii.
+pub(crate) const TESS_ANGLE: f64 = 0.13;
 
 /// Build a wire from a closed 2D boundary loop (`cs`-plane coordinates),
 /// reconstructing circular arcs from co-circular runs so an extruded sketch arc
 /// becomes one smooth cylindrical wall. Returns `None` for fewer than 3 distinct
 /// points.
+/// Emit the analytic arc covering rotated vertices `[cs_v ..= ce_v]` of `rp` (on
+/// circle `circ = (cx, cy, r)` in sketch-plane coords) into `edges`, split into
+/// <=`MAX_ARC_PIECE` sub-arcs. Shared by the sample-refit [`loop_to_wire`] and the
+/// exact-arc [`loop_to_wire_with_arcs`].
+fn emit_arc_edges(
+    edges: &mut Vec<Edge>,
+    rp: &[(f64, f64)],
+    cs_v: usize,
+    ce_v: usize,
+    circ: (f64, f64, f64),
+    cs: &crate::geometry::CoordinateSystem,
+) {
+    let to_pnt = |p: (f64, f64)| -> Pnt {
+        let q = cs.unproject(p.0 as f32, p.1 as f32);
+        Pnt::new(q.x as f64, q.y as f64, q.z as f64)
+    };
+    // The arc sense below is decided from the 2D signed area in (u, v), so the
+    // axis reference must be the normal CONSISTENT with that 2D orientation:
+    // u × v. The stored `cs.n` can disagree — the ground/top plane constant is
+    // left-handed (u=X, v=Z, n=+Y but X×Z = −Y) — and using it flipped every
+    // fillet arc into a scallop on ground-plane sketches (the "inverted
+    // corners on commit" bug). Same derivation as `build_extrusion_solid`.
+    let axis_n = Dir::new(
+        (cs.u.y * cs.v.z - cs.u.z * cs.v.y) as f64,
+        (cs.u.z * cs.v.x - cs.u.x * cs.v.z) as f64,
+        (cs.u.x * cs.v.y - cs.u.y * cs.v.x) as f64,
+    );
+    let dir3d = |d: (f64, f64)| -> GeomVec {
+        GeomVec::new(
+            cs.u.x as f64 * d.0 + cs.v.x as f64 * d.1,
+            cs.u.y as f64 * d.0 + cs.v.y as f64 * d.1,
+            cs.u.z as f64 * d.0 + cs.v.z as f64 * d.1,
+        )
+    };
+    let m = rp.len();
+    let (cx, cy, r) = circ;
+    let start2d = rp[cs_v % m];
+    let end2d = rp[ce_v % m];
+
+    // Sense: signed area of the covered chain about the centre picks which way
+    // `Circle::point(t)` (CCW about +main) must turn to trace it.
+    let mut signed = 0.0;
+    for k in cs_v..ce_v {
+        let p = rp[k % m];
+        let q = rp[(k + 1) % m];
+        signed += (p.0 - cx) * (q.1 - cy) - (p.1 - cy) * (q.0 - cx);
+    }
+    let main = if signed >= 0.0 {
+        axis_n
+    } else {
+        axis_n.reversed()
+    };
+
+    let center3d = to_pnt((cx, cy));
+    let xd = dir3d((start2d.0 - cx, start2d.1 - cy));
+    let mv = GeomVec::from_dir(main);
+    let xperp = xd - mv * xd.dot(&mv);
+    let Some(xdir) = Dir::from_vec(&xperp) else {
+        // Degenerate (start coincident with centre): fall back to chords.
+        for k in cs_v..ce_v {
+            edges.push(Edge::between_points(
+                to_pnt(rp[k % m]),
+                to_pnt(rp[(k + 1) % m]),
+            ));
+        }
+        return;
+    };
+    let circle = Circle::new(Ax3::new_axes(center3d, main, xdir), r);
+    let ydir = mv.cross(&GeomVec::from_dir(xdir));
+    let ang = |p2d: (f64, f64)| -> f64 {
+        let w = dir3d((p2d.0 - cx, p2d.1 - cy));
+        w.dot(&ydir).atan2(w.dot(&GeomVec::from_dir(xdir)))
+    };
+    let t0 = ang(start2d);
+    let mut t1 = ang(end2d);
+    while t1 <= t0 + 1e-9 {
+        t1 += 2.0 * std::f64::consts::PI;
+    }
+    let span = t1 - t0;
+    let pieces = ((span / MAX_ARC_PIECE).ceil() as usize).max(1);
+    let mut prev_v = Vertex::new(to_pnt(start2d));
+    for k in 1..=pieces {
+        let ts = t0 + span * ((k - 1) as f64 / pieces as f64);
+        let te = t0 + span * (k as f64 / pieces as f64);
+        let end_v = if k == pieces {
+            Vertex::new(to_pnt(end2d))
+        } else {
+            Vertex::new(circle.point(te))
+        };
+        edges.push(Edge::new(
+            Some(GeomCurve::circle(circle)),
+            ts,
+            te,
+            prev_v.clone(),
+            end_v.clone(),
+        ));
+        prev_v = end_v;
+    }
+}
+
+/// Like [`loop_to_wire`], but given the EXACT arc circles the boundary contains
+/// (from analytic sketch fillet arcs). Each boundary point is classified by which
+/// known circle it lies on; a contiguous same-circle run becomes an exact arc edge
+/// and everything else a straight edge. Robust for MULTI-arc profiles (rounded
+/// rectangles, slots) that [`loop_to_wire`]'s sample refit can't segment — their
+/// arc↔line junctions are tangent-continuous, so it finds no sharp-corner
+/// separator and emits chords. With no arc circles (or none matching) it delegates
+/// to [`loop_to_wire`], so drawn-circle refit is unchanged.
+pub(crate) fn loop_to_wire_with_arcs(
+    loop_pts: &[(f32, f32)],
+    arc_circles: &[((f32, f32), f32)],
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<Wire> {
+    if arc_circles.is_empty() {
+        return loop_to_wire(loop_pts, cs);
+    }
+    // Dedup coincident consecutive (and wrap-around) points, matching `loop_to_wire`.
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_pts.len());
+    for &(u, v) in loop_pts {
+        let p = (u as f64, v as f64);
+        if pts
+            .last()
+            .is_none_or(|q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 1e-7)
+        {
+            pts.push(p);
+        }
+    }
+    if pts.len() >= 2 {
+        let (f, l) = (pts[0], *pts.last().unwrap());
+        if (f.0 - l.0).hypot(f.1 - l.1) <= 1e-7 {
+            pts.pop();
+        }
+    }
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+
+    // Classify each point by the nearest known arc circle it lies on (or None for a
+    // straight point). A fillet arc's endpoints lie exactly on its circle; the
+    // straight sides between fillets do not (except at the shared endpoints).
+    let classify = |p: (f64, f64)| -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        for (k, &((cx, cy), r)) in arc_circles.iter().enumerate() {
+            let d = ((p.0 - cx as f64).hypot(p.1 - cy as f64) - r as f64).abs();
+            let tol = (0.02 * r as f64).max(1.0e-2);
+            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, k));
+            }
+        }
+        best.map(|(_, k)| k)
+    };
+    let cid: Vec<Option<usize>> = pts.iter().map(|&p| classify(p)).collect();
+
+    // Rotate to a circle-transition point (its class differs from the previous
+    // point's) so an arc run never wraps the array end. A rounded rectangle's
+    // straight sides are single segments whose two endpoints both lie on
+    // (different) fillet circles, so there may be NO unclassified point — but
+    // adjacent corners are different circles, so a transition always exists. No
+    // transition at all means one circle everywhere (a full circle drawn as arcs)
+    // → sample path.
+    let Some(off) = (0..n).find(|&i| cid[i] != cid[(i + n - 1) % n]) else {
+        return loop_to_wire(loop_pts, cs);
+    };
+    let rp: Vec<(f64, f64)> = (0..n).map(|i| pts[(i + off) % n]).collect();
+    let rc: Vec<Option<usize>> = (0..n).map(|i| cid[(i + off) % n]).collect();
+
+    // Collect arc runs: maximal contiguous same-circle spans of >= 2 points.
+    let mut runs: Vec<(usize, usize, (f64, f64, f64))> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if let Some(k) = rc[i] {
+            let mut j = i;
+            while j + 1 < n && rc[j + 1] == Some(k) {
+                j += 1;
+            }
+            if j > i {
+                let ((cx, cy), r) = arc_circles[k];
+                runs.push((i, j, (cx as f64, cy as f64, r as f64)));
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if runs.is_empty() {
+        return loop_to_wire(loop_pts, cs);
+    }
+
+    let to_pnt = |p: (f64, f64)| -> Pnt {
+        let q = cs.unproject(p.0 as f32, p.1 as f32);
+        Pnt::new(q.x as f64, q.y as f64, q.z as f64)
+    };
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut cur = 0usize;
+    let mut ri = 0usize;
+    while cur < n {
+        if ri < runs.len() && runs[ri].0 == cur {
+            let (a, b, circ) = runs[ri];
+            emit_arc_edges(&mut edges, &rp, a, b, circ, cs);
+            cur = b;
+            ri += 1;
+        } else {
+            edges.push(Edge::between_points(
+                to_pnt(rp[cur % n]),
+                to_pnt(rp[(cur + 1) % n]),
+            ));
+            cur += 1;
+        }
+    }
+    (edges.len() >= 2).then(|| Wire::from_edges(edges))
+}
+
 pub(crate) fn loop_to_wire(
     loop_pts: &[(f32, f32)],
     cs: &crate::geometry::CoordinateSystem,
@@ -42,15 +260,6 @@ pub(crate) fn loop_to_wire(
         let q = cs.unproject(p.0 as f32, p.1 as f32);
         Pnt::new(q.x as f64, q.y as f64, q.z as f64)
     };
-    let axis_n = Dir::new(cs.n.x as f64, cs.n.y as f64, cs.n.z as f64);
-    // Map a 2D plane offset (du, dv) to its 3D direction vector.
-    let dir3d = |d: (f64, f64)| -> GeomVec {
-        GeomVec::new(
-            cs.u.x as f64 * d.0 + cs.v.x as f64 * d.1,
-            cs.u.y as f64 * d.0 + cs.v.y as f64 * d.1,
-            cs.u.z as f64 * d.0 + cs.v.z as f64 * d.1,
-        )
-    };
 
     // Per-vertex co-circularity: the circle through (prev, cur, next), gated so a
     // sharp polygon corner classifies as a non-arc vertex (a run separator).
@@ -67,79 +276,6 @@ pub(crate) fn loop_to_wire(
         .collect();
 
     let mut edges: Vec<Edge> = Vec::new();
-
-    // Append the arc covering rotated vertices [cs_v ..= ce_v] (ce_v may equal n,
-    // i.e. wrap to vertex 0) to `edges`, split into <=MAX_ARC_PIECE sub-arcs.
-    let emit_arc = |edges: &mut Vec<Edge>,
-                    rp: &[(f64, f64)],
-                    cs_v: usize,
-                    ce_v: usize,
-                    circ: (f64, f64, f64)| {
-        let m = rp.len();
-        let (cx, cy, r) = circ;
-        let start2d = rp[cs_v % m];
-        let end2d = rp[ce_v % m];
-
-        // Sense: signed area of the covered chain about the centre picks which
-        // way `Circle::point(t)` (CCW about +main) must turn to trace it.
-        let mut signed = 0.0;
-        for k in cs_v..ce_v {
-            let p = rp[k % m];
-            let q = rp[(k + 1) % m];
-            signed += (p.0 - cx) * (q.1 - cy) - (p.1 - cy) * (q.0 - cx);
-        }
-        let main = if signed >= 0.0 {
-            axis_n
-        } else {
-            axis_n.reversed()
-        };
-
-        let center3d = to_pnt((cx, cy));
-        let xd = dir3d((start2d.0 - cx, start2d.1 - cy));
-        let mv = GeomVec::from_dir(main);
-        let xperp = xd - mv * xd.dot(&mv);
-        let Some(xdir) = Dir::from_vec(&xperp) else {
-            // Degenerate (start coincident with centre): fall back to chords.
-            for k in cs_v..ce_v {
-                edges.push(Edge::between_points(
-                    to_pnt(rp[k % m]),
-                    to_pnt(rp[(k + 1) % m]),
-                ));
-            }
-            return;
-        };
-        let circle = Circle::new(Ax3::new_axes(center3d, main, xdir), r);
-        let ydir = mv.cross(&GeomVec::from_dir(xdir));
-        let ang = |p2d: (f64, f64)| -> f64 {
-            let w = dir3d((p2d.0 - cx, p2d.1 - cy));
-            w.dot(&ydir).atan2(w.dot(&GeomVec::from_dir(xdir)))
-        };
-        let t0 = ang(start2d);
-        let mut t1 = ang(end2d);
-        while t1 <= t0 + 1e-9 {
-            t1 += 2.0 * std::f64::consts::PI;
-        }
-        let span = t1 - t0;
-        let pieces = ((span / MAX_ARC_PIECE).ceil() as usize).max(1);
-        let mut prev_v = Vertex::new(to_pnt(start2d));
-        for k in 1..=pieces {
-            let ts = t0 + span * ((k - 1) as f64 / pieces as f64);
-            let te = t0 + span * (k as f64 / pieces as f64);
-            let end_v = if k == pieces {
-                Vertex::new(to_pnt(end2d))
-            } else {
-                Vertex::new(circle.point(te))
-            };
-            edges.push(Edge::new(
-                Some(GeomCurve::circle(circle)),
-                ts,
-                te,
-                prev_v.clone(),
-                end_v.clone(),
-            ));
-            prev_v = end_v;
-        }
-    };
 
     // Pick a rotation start at a non-arc (corner) vertex so arc runs never wrap
     // the array boundary. With no corner the loop is a full circle (or an
@@ -181,7 +317,7 @@ pub(crate) fn loop_to_wire(
             while cur < n {
                 if ri < runs.len() && runs[ri].0 == cur {
                     let (a, b, circ) = runs[ri];
-                    emit_arc(&mut edges, &rp, a, b, circ);
+                    emit_arc_edges(&mut edges, &rp, a, b, circ, cs);
                     cur = b;
                     ri += 1;
                 } else {
@@ -207,7 +343,7 @@ pub(crate) fn loop_to_wire(
             let is_circle = arc_vert.iter().flatten().all(|c| same_circle(*c, avg));
             if is_circle {
                 let circ = circumcircle_2d(pts[0], pts[n / 3], pts[2 * n / 3]).unwrap_or(avg);
-                emit_arc(&mut edges, &pts, 0, n, circ);
+                emit_arc_edges(&mut edges, &pts, 0, n, circ, cs);
             } else {
                 for i in 0..n {
                     edges.push(Edge::between_points(
@@ -254,6 +390,22 @@ pub(crate) fn build_extrusion_solid(
     cs: &crate::geometry::CoordinateSystem,
     reconstruct_arcs: bool,
 ) -> Option<KernelSolid> {
+    build_extrusion_solid_arcs(points, holes, depth, cs, reconstruct_arcs, &[])
+}
+
+/// [`build_extrusion_solid`] plus the EXACT arc circles the boundary contains (from
+/// analytic sketch fillet arcs). When `reconstruct_arcs`, the wire builder uses
+/// them ([`loop_to_wire_with_arcs`]) to sweep each fillet to an exact cylindrical
+/// wall — robust for rounded rectangles / multi-arc profiles the sample refit
+/// can't segment. `arc_circles` empty ⇒ identical to `build_extrusion_solid`.
+pub(crate) fn build_extrusion_solid_arcs(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f64,
+    cs: &crate::geometry::CoordinateSystem,
+    reconstruct_arcs: bool,
+    arc_circles: &[((f32, f32), f32)],
+) -> Option<KernelSolid> {
     if points.len() < 3 || depth.abs() < f64::EPSILON {
         return None;
     }
@@ -268,7 +420,7 @@ pub(crate) fn build_extrusion_solid(
     // circle/line regions when the cap boundary contains only straight chords.
     let make_wire = |loop_pts: &[(f32, f32)]| -> Option<Wire> {
         if reconstruct_arcs {
-            loop_to_wire(loop_pts, cs)
+            loop_to_wire_with_arcs(loop_pts, arc_circles, cs)
         } else {
             loop_to_polyline_wire(loop_pts, cs)
         }
@@ -969,6 +1121,190 @@ pub(crate) fn add_missing_straight_brep_edges(
         let f1 = faces.get(1).copied().unwrap_or(f0);
         edge_pairs.push(canonical_surface_pair(f0, f1, surface_group));
     }
+}
+
+/// Draw each **curved** B-Rep edge (a cylinder rim, a fillet-blend boundary, a
+/// drawn arc) as a *smooth* analytic polyline sampled from its exact curve — the
+/// resolution-independent rim `build_oriented_cylinder_wireframe` gives an analytic
+/// primitive, but derived straight from any boolean/solid B-Rep. Returns the set of
+/// canonical surface pairs it drew, so the caller can drop the coarse tessellation
+/// chords along those same edges (otherwise a rim renders twice: smooth + faceted).
+///
+/// The per-sample hidden-line normals are computed **analytically** on the curved
+/// side (a cylinder's outward radial at that point, oriented to the face's meshed
+/// normal) so the back half of a rim hides just as it does for the primitive path;
+/// the planar side keeps its constant face normal.
+pub(crate) fn add_analytic_curved_brep_edges(
+    solid: &KernelSolid,
+    vertices: &[f32],
+    indices: &[u32],
+    face_ids: &[u32],
+    surface_group: &[u32],
+    edge_vertices: &mut Vec<f32>,
+    edge_indices: &mut Vec<u32>,
+    edge_face_normals: &mut Vec<f32>,
+    edge_pairs: &mut Vec<(u32, u32)>,
+) -> HashSet<(u32, u32)> {
+    // Average (smoothed) outward normal per B-rep face id, from the triangle mesh —
+    // used to orient the analytic radial and as the planar side's constant normal.
+    let mut face_normal: HashMap<u32, [f32; 3]> = HashMap::new();
+    let mut face_count: HashMap<u32, u32> = HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        let b = tri[0] as usize * 6;
+        let n = [vertices[b + 3], vertices[b + 4], vertices[b + 5]];
+        let s = face_normal.entry(fid).or_insert([0.0, 0.0, 0.0]);
+        s[0] += n[0];
+        s[1] += n[1];
+        s[2] += n[2];
+        *face_count.entry(fid).or_insert(0) += 1;
+    }
+    for (fid, n) in face_normal.iter_mut() {
+        let c = face_count.get(fid).copied().unwrap_or(1) as f32;
+        n[0] /= c;
+        n[1] /= c;
+        n[2] /= c;
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if l > 1.0e-6 {
+            n[0] /= l;
+            n[1] /= l;
+            n[2] /= l;
+        }
+    }
+
+    let key = |a: [f32; 3], b: [f32; 3]| {
+        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        let ka = (q(a[0]), q(a[1]), q(a[2]));
+        let kb = (q(b[0]), q(b[1]), q(b[2]));
+        if ka <= kb {
+            (ka, kb)
+        } else {
+            (kb, ka)
+        }
+    };
+
+    // A curved edge is shared by its two adjacent faces; collect its finely-sampled
+    // polyline once (keyed by endpoints so the two faces' copies merge) plus the
+    // face ids it borders.
+    #[allow(clippy::type_complexity)]
+    let mut curved: HashMap<((i64, i64, i64), (i64, i64, i64)), (Vec<[f32; 3]>, Vec<u32>)> =
+        HashMap::new();
+    for (fid, face) in solid.shell().faces().iter().enumerate() {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                if edge_is_straight(&edge) {
+                    continue;
+                }
+                let a = edge.start().point();
+                let b = edge.end().point();
+                let pa = [a.x() as f32, a.y() as f32, a.z() as f32];
+                let pb = [b.x() as f32, b.y() as f32, b.z() as f32];
+                let rec = curved
+                    .entry(key(pa, pb))
+                    .or_insert_with(|| (sample_curved_edge_polyline(&edge), Vec::new()));
+                if !rec.1.contains(&(fid as u32)) {
+                    rec.1.push(fid as u32);
+                }
+            }
+        }
+    }
+
+    let mut drawn: HashSet<(u32, u32)> = HashSet::new();
+    for (_k, (samples, faces)) in curved {
+        if faces.len() < 2 || samples.len() < 2 {
+            continue;
+        }
+        // A same-surface curved seam (should not arise for a rim) is a construction
+        // artifact — skip it, mirroring `mesh_feature_edges`.
+        if faces.len() == 2 {
+            let g0 = surface_group.get(faces[0] as usize);
+            let g1 = surface_group.get(faces[1] as usize);
+            if g0.is_some() && g0 == g1 {
+                continue;
+            }
+        }
+        let f0 = faces[0];
+        let f1 = faces[1];
+        let pair = canonical_surface_pair(f0, f1, surface_group);
+        drawn.insert(pair);
+        for w in samples.windows(2) {
+            let p = w[0];
+            let q = w[1];
+            let mid = [
+                (p[0] + q[0]) * 0.5,
+                (p[1] + q[1]) * 0.5,
+                (p[2] + q[2]) * 0.5,
+            ];
+            let n0 = curved_edge_side_normal(solid, f0, mid, &face_normal);
+            let n1 = curved_edge_side_normal(solid, f1, mid, &face_normal);
+            let base = (edge_vertices.len() / 3) as u32;
+            edge_vertices.extend_from_slice(&p);
+            edge_vertices.extend_from_slice(&q);
+            edge_indices.push(base);
+            edge_indices.push(base + 1);
+            edge_face_normals.extend_from_slice(&n0);
+            edge_face_normals.extend_from_slice(&n1);
+            edge_pairs.push(pair);
+        }
+    }
+    drawn
+}
+
+/// Sample a curved edge's exact curve into a smooth polyline (uniform in the
+/// curve parameter — for a circle that is uniform in angle). Density matches the
+/// primitive rim (`CYL_WIRE_SEGS` per full turn) scaled by the arc's span.
+fn sample_curved_edge_polyline(edge: &Edge) -> Vec<[f32; 3]> {
+    let Some(curve) = edge.curve() else {
+        return Vec::new();
+    };
+    let a = edge.first();
+    let b = edge.last();
+    let span = (b - a).abs();
+    let full = std::f64::consts::TAU;
+    let segs = (((span / full) * CYL_WIRE_SEGS as f64).ceil() as usize).clamp(2, 256);
+    (0..=segs)
+        .map(|i| {
+            let t = a + (b - a) * (i as f64 / segs as f64);
+            let p = curve.point(t);
+            [p.x() as f32, p.y() as f32, p.z() as f32]
+        })
+        .collect()
+}
+
+/// Outward normal of face `fid` at `point` for hidden-line removal: a cylinder's
+/// local radial (oriented to the face's meshed normal, so a bore points inward and
+/// a boss outward), otherwise the face's constant meshed normal.
+fn curved_edge_side_normal(
+    solid: &KernelSolid,
+    fid: u32,
+    point: [f32; 3],
+    face_normal: &HashMap<u32, [f32; 3]>,
+) -> [f32; 3] {
+    let base = face_normal.get(&fid).copied().unwrap_or([0.0, 0.0, 1.0]);
+    let shell = solid.shell();
+    let faces = shell.faces();
+    let Some(face) = faces.get(fid as usize) else {
+        return base;
+    };
+    if let Some(GeomSurface::Cylinder(cyl)) = face.surface() {
+        let pos = cyl.position();
+        let o = pos.location();
+        let d = pos.direction();
+        let (ox, oy, oz) = (o.x() as f32, o.y() as f32, o.z() as f32);
+        let (dx, dy, dz) = (d.x() as f32, d.y() as f32, d.z() as f32);
+        let rel = [point[0] - ox, point[1] - oy, point[2] - oz];
+        let t = rel[0] * dx + rel[1] * dy + rel[2] * dz;
+        let radial = [rel[0] - dx * t, rel[1] - dy * t, rel[2] - dz * t];
+        let l = (radial[0] * radial[0] + radial[1] * radial[1] + radial[2] * radial[2]).sqrt();
+        if l > 1.0e-6 {
+            let mut r = [radial[0] / l, radial[1] / l, radial[2] / l];
+            if r[0] * base[0] + r[1] * base[1] + r[2] * base[2] < 0.0 {
+                r = [-r[0], -r[1], -r[2]];
+            }
+            return r;
+        }
+    }
+    base
 }
 
 pub(crate) fn edge_is_straight(edge: &Edge) -> bool {

@@ -93,9 +93,22 @@ impl ZeroCadApp {
                         // Perform frame-perfect hover checking immediately
                         let hover_pos = response.hover_pos();
                         self.hovered_plane = None;
+                        self.hovered_sketch_face = None;
                         if self.is_plane_selection_mode {
                             if let Some(pos) = hover_pos {
-                                if is_point_in_quad(pos, &xy_pts) {
+                                // A planar body face under the cursor takes priority over
+                                // the origin plane quads — sketch directly on the solid.
+                                let face_hit = self
+                                    .pick_body_element(pos, &project_3d, sin_p, cos_p, sin_y, cos_y)
+                                    .and_then(|(node, pick)| match pick {
+                                        BodyPick::Face(fid) if self.face_is_planar(&node, fid) => {
+                                            Some((node, fid))
+                                        }
+                                        _ => None,
+                                    });
+                                if let Some((node, fid)) = face_hit {
+                                    self.hovered_sketch_face = Some((node, fid));
+                                } else if is_point_in_quad(pos, &xy_pts) {
                                     self.hovered_plane = Some(SketchPlane::XY);
                                 } else if is_point_in_quad(pos, &xz_pts) {
                                     self.hovered_plane = Some(SketchPlane::XZ);
@@ -104,7 +117,7 @@ impl ZeroCadApp {
                                 }
                             }
 
-                            if self.hovered_plane.is_some() {
+                            if self.hovered_plane.is_some() || self.hovered_sketch_face.is_some() {
                                 egui::show_tooltip_at_pointer(ctx, egui::Id::new("plane_select_tooltip"), |ui| {
                                     ui.style_mut().visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
                                     ui.style_mut().visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 200));
@@ -233,7 +246,22 @@ impl ZeroCadApp {
 
                         // Plane selection click interaction
                         if self.is_plane_selection_mode && response.clicked() {
-                            if let Some(plane) = self.hovered_plane {
+                            if let Some((node, fid)) = self.hovered_sketch_face.clone() {
+                                // Sketch directly on the clicked planar body face — the
+                                // same path as pre-selecting a face and pressing Draw
+                                // Sketch (top_bar_commands): frame from `face_cs`, durable
+                                // `face_ref` so the sketch follows the face, then begin.
+                                if let Some(cs) = self.face_cs(&node, fid) {
+                                    log::info!("Sketching on clicked body face {fid} of {node}.");
+                                    let fref = self.face_ref(&node, fid);
+                                    let now = ctx.input(|i| i.time);
+                                    self.active_sketch_on_face = true;
+                                    self.active_sketch_face_ref = fref;
+                                    self.hovered_sketch_face = None;
+                                    self.begin_sketch_on(cs, now);
+                                    self.status_msg = "Sketching on the selected face. Draw a profile, then Finish Sketch.".to_string();
+                                }
+                            } else if let Some(plane) = self.hovered_plane {
                                 log::info!("User selected plane sheet: {:?}", plane);
 
                                 // Save current camera state before pivoting

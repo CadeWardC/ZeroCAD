@@ -125,6 +125,17 @@ impl CoordinateSystem {
         Self { origin, u, v, n }
     }
 
+    /// The same plane frame relocated to `origin`, KEEPING the stored axes.
+    ///
+    /// Never rebuild a shifted frame with [`CoordinateSystem::new`]: that
+    /// recomputes `n = u × v`, and the ground/top plane constant ([`Self::XZ`])
+    /// is LEFT-handed (stored `n = +Y` but `u × v = −Y`) — the recompute flips
+    /// the sweep direction, placing extruded tools on the wrong side of the
+    /// plane (a cutter that misses the body entirely).
+    pub fn with_origin(&self, origin: Vec3) -> Self {
+        Self { origin, ..*self }
+    }
+
     /// Project a 3D global coordinate onto this 2D local plane coordinate.
     pub fn project(&self, point_3d: Vec3) -> (f32, f32) {
         let diff = point_3d.sub(self.origin);

@@ -54,6 +54,7 @@ impl ZeroCadApp {
             sketch_temp_start: None,
             sketch_points: Vec::new(),
             hovered_plane: None,
+            hovered_sketch_face: None,
             selected_faces: HashSet::new(),
             selected_edges: HashSet::new(),
             selected_body: HashSet::new(),

@@ -56,7 +56,52 @@ pub fn in_circumcircle(p: Pnt2d, a: Pnt2d, b: Pnt2d, c: Pnt2d) -> bool {
     }
 }
 
-/// Bowyer-Watson algorithm for 2D Delaunay triangulation.
+/// A triangle node in the incremental Bowyer-Watson store: CCW vertices plus
+/// neighbour adjacency. Edge `e` is `(v[e], v[(e+1)%3])`; `nbr[e]` is the
+/// triangle across that edge (`None` on the super-triangle hull).
+#[derive(Clone, Copy)]
+struct DtNode {
+    v: [usize; 3],
+    nbr: [Option<usize>; 3],
+    alive: bool,
+}
+
+/// Walk from `start` toward `p` across neighbour links (Lawson's oriented
+/// walk). Triangles are CCW, so `p` strictly right of a directed edge means
+/// the containing triangle lies across that edge. Returns a triangle whose
+/// interior (or boundary) holds `p`, falling back to `start` if the walk
+/// exceeds its step cap (degenerate geometry — the caller re-checks with the
+/// circumcircle test anyway).
+fn dt_locate(nodes: &[DtNode], pts: &[Pnt2d], start: usize, p: Pnt2d) -> usize {
+    let mut cur = start;
+    for _ in 0..nodes.len() + 3 {
+        let t = &nodes[cur];
+        let mut moved = false;
+        for e in 0..3 {
+            let a = pts[t.v[e]];
+            let b = pts[t.v[(e + 1) % 3]];
+            if ccw(a, b, p) < -1e-14 {
+                if let Some(n) = t.nbr[e] {
+                    cur = n;
+                    moved = true;
+                    break;
+                }
+            }
+        }
+        if !moved {
+            return cur;
+        }
+    }
+    cur
+}
+
+/// Bowyer-Watson 2D Delaunay triangulation — incremental insertion with
+/// neighbour adjacency and an oriented point-location walk, so each insertion
+/// touches only its local cavity instead of scanning every triangle (the naive
+/// full-scan version made large trimmed-cylinder faces quadratic: ~90 ms per
+/// call at ~2700 points, re-run each refinement round). Points are inserted in
+/// input order and cavities are traversed in sorted index order, so the result
+/// is deterministic.
 pub fn delaunay_triangulate(points: &[Pnt2d]) -> Vec<Tri> {
     if points.len() < 3 {
         return Vec::new();
@@ -79,82 +124,142 @@ pub fn delaunay_triangulate(points: &[Pnt2d]) -> Vec<Tri> {
     let mid_x = 0.5 * (x_min + x_max);
     let mid_y = 0.5 * (y_min + y_max);
 
-    // Super-triangle enclosing all points
+    // Super-triangle enclosing all points (CCW: bottom-left, bottom-right, top).
     let sp0 = Pnt2d::new(mid_x - 20.0 * dmax - 1.0, mid_y - 20.0 * dmax - 1.0);
-    let sp1 = Pnt2d::new(mid_x, mid_y + 20.0 * dmax + 1.0);
-    let sp2 = Pnt2d::new(mid_x + 20.0 * dmax + 1.0, mid_y - 20.0 * dmax - 1.0);
+    let sp1 = Pnt2d::new(mid_x + 20.0 * dmax + 1.0, mid_y - 20.0 * dmax - 1.0);
+    let sp2 = Pnt2d::new(mid_x, mid_y + 20.0 * dmax + 1.0);
 
     let mut all_points = points.to_vec();
     let s0_idx = all_points.len();
     all_points.push(sp0);
-    let s1_idx = all_points.len();
     all_points.push(sp1);
-    let s2_idx = all_points.len();
     all_points.push(sp2);
 
-    let mut triangles = vec![Tri {
-        a: s0_idx,
-        b: s1_idx,
-        c: s2_idx,
+    let mut nodes: Vec<DtNode> = vec![DtNode {
+        v: [s0_idx, s0_idx + 1, s0_idx + 2],
+        nbr: [None; 3],
+        alive: true,
     }];
+    let mut last_alive = 0usize;
+
+    let mut cavity: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut in_cavity: HashSet<usize> = HashSet::new();
 
     for i in 0..points.len() {
         let p = all_points[i];
-        let mut bad_triangles = Vec::new();
 
-        for (t_idx, &t) in triangles.iter().enumerate() {
-            if in_circumcircle(p, all_points[t.a], all_points[t.b], all_points[t.c]) {
-                bad_triangles.push(t_idx);
+        // Seed the cavity at the triangle containing `p`; if the walk's answer
+        // fails the circumcircle test (p duplicates an existing vertex, or the
+        // walk hit a degenerate cycle), scan for any violated triangle before
+        // giving up on the point (matching the old full-scan behaviour).
+        let mut seed = dt_locate(&nodes, &all_points, last_alive, p);
+        let bad = |t: &DtNode| {
+            in_circumcircle(
+                p,
+                all_points[t.v[0]],
+                all_points[t.v[1]],
+                all_points[t.v[2]],
+            )
+        };
+        if !nodes[seed].alive || !bad(&nodes[seed]) {
+            match nodes
+                .iter()
+                .position(|t| t.alive && bad(t))
+            {
+                Some(s) => seed = s,
+                None => continue, // duplicate point: no triangle violated
             }
         }
 
-        let mut polygon = Vec::new();
-        for &t_idx in &bad_triangles {
-            let t = triangles[t_idx];
-            let edges = [(t.a, t.b), (t.b, t.c), (t.c, t.a)];
-            for &(edge_start, edge_end) in &edges {
-                let mut shared = false;
-                for &other_idx in &bad_triangles {
-                    if other_idx == t_idx {
-                        continue;
+        // Grow the cavity: every connected triangle whose circumcircle holds p.
+        cavity.clear();
+        stack.clear();
+        in_cavity.clear();
+        stack.push(seed);
+        in_cavity.insert(seed);
+        while let Some(t_idx) = stack.pop() {
+            cavity.push(t_idx);
+            for e in 0..3 {
+                if let Some(n) = nodes[t_idx].nbr[e] {
+                    if nodes[n].alive && !in_cavity.contains(&n) && bad(&nodes[n]) {
+                        in_cavity.insert(n);
+                        stack.push(n);
                     }
-                    let ot = triangles[other_idx];
-                    let ot_edges = [
-                        (ot.a, ot.b),
-                        (ot.b, ot.a),
-                        (ot.b, ot.c),
-                        (ot.c, ot.b),
-                        (ot.c, ot.a),
-                        (ot.a, ot.c),
-                    ];
-                    if ot_edges.contains(&(edge_start, edge_end)) {
-                        shared = true;
-                        break;
-                    }
-                }
-                if !shared {
-                    polygon.push((edge_start, edge_end));
                 }
             }
         }
+        // Deterministic boundary order regardless of BFS traversal order.
+        cavity.sort_unstable();
 
-        bad_triangles.sort_unstable();
-        for &t_idx in bad_triangles.iter().rev() {
-            triangles.remove(t_idx);
+        // Boundary edges of the cavity: edge whose neighbour is outside. The
+        // cavity is star-shaped around p and triangles are CCW, so each
+        // boundary edge (a, b) keeps p to its left → fan triangle (a, b, p)
+        // is CCW by construction.
+        let mut fan: Vec<usize> = Vec::new();
+        let mut open_edges: HashMap<usize, (usize, usize)> = HashMap::new();
+        for &t_idx in &cavity {
+            let t = nodes[t_idx];
+            for e in 0..3 {
+                let outside = match t.nbr[e] {
+                    Some(n) => !in_cavity.contains(&n),
+                    None => true,
+                };
+                if !outside {
+                    continue;
+                }
+                let a = t.v[e];
+                let b = t.v[(e + 1) % 3];
+                let new_idx = nodes.len();
+                nodes.push(DtNode {
+                    v: [a, b, i],
+                    nbr: [t.nbr[e], None, None],
+                    alive: true,
+                });
+                // Re-point the outside neighbour at the new fan triangle.
+                if let Some(out) = t.nbr[e] {
+                    let key = edge_key(a, b);
+                    for oe in 0..3 {
+                        let ov = nodes[out].v;
+                        if edge_key(ov[oe], ov[(oe + 1) % 3]) == key {
+                            nodes[out].nbr[oe] = Some(new_idx);
+                            break;
+                        }
+                    }
+                }
+                // Wire fan siblings: edge 1 is (b, i), edge 2 is (i, a). Two
+                // fan triangles meet along the spoke through a shared hull
+                // vertex; key each open spoke by that vertex.
+                for (edge_slot, hull_v) in [(1usize, b), (2usize, a)] {
+                    if let Some((other_idx, other_slot)) = open_edges.remove(&hull_v) {
+                        nodes[new_idx].nbr[edge_slot] = Some(other_idx);
+                        nodes[other_idx].nbr[other_slot] = Some(new_idx);
+                    } else {
+                        open_edges.insert(hull_v, (new_idx, edge_slot));
+                    }
+                }
+                fan.push(new_idx);
+            }
         }
-
-        for &(edge_start, edge_end) in &polygon {
-            triangles.push(Tri {
-                a: edge_start,
-                b: edge_end,
-                c: i,
-            });
+        for &t_idx in &cavity {
+            nodes[t_idx].alive = false;
+        }
+        if let Some(&f) = fan.last() {
+            last_alive = f;
         }
     }
 
-    triangles.retain(|t| t.a < points.len() && t.b < points.len() && t.c < points.len());
-
-    triangles
+    nodes
+        .iter()
+        .filter(|t| {
+            t.alive && t.v[0] < points.len() && t.v[1] < points.len() && t.v[2] < points.len()
+        })
+        .map(|t| Tri {
+            a: t.v[0],
+            b: t.v[1],
+            c: t.v[2],
+        })
+        .collect()
 }
 
 fn edge_key(a: usize, b: usize) -> (usize, usize) {
@@ -492,6 +597,31 @@ pub fn sample_interior_points(
     v_max: f64,
     chord_err: f64,
 ) -> Vec<Pnt2d> {
+    sample_interior_points_budget(
+        surf,
+        u_min,
+        u_max,
+        v_min,
+        v_max,
+        chord_err,
+        std::f64::consts::PI,
+    )
+}
+
+/// [`sample_interior_points`] with an angular budget: cylinder hoop density is
+/// capped at `angle_err` radians per facet so small-radius rounds shade as
+/// smoothly as large ones. Axial (ruled) spacing stays on the chordal budget —
+/// straight directions gain nothing from angular refinement.
+pub fn sample_interior_points_budget(
+    surf: &GeomSurface,
+    u_min: f64,
+    u_max: f64,
+    v_min: f64,
+    v_max: f64,
+    chord_err: f64,
+    angle_err: f64,
+) -> Vec<Pnt2d> {
+    let angle_err = sanitize_angle(angle_err);
     let mut points = Vec::new();
 
     // Cylinder and cone are RULED along v (straight lines), so interior samples add
@@ -511,15 +641,16 @@ pub fn sample_interior_points(
             u_inset = 0.05;
             let r = cyl.radius();
             let err = chord_err.max(CONFUSION);
-            let theta = cylinder_step_angle(r, err);
+            let theta = cylinder_step_angle(r, err).min(angle_err);
             let span = u_max - u_min;
             let nu = f64::max(2.0, (span / theta).ceil()) as usize;
             // A cylinder is ruled in v, but a single mid-v support row lets
             // constrained Delaunay bridge trimmed walls with long corner chords.
-            // Use the angular chord budget as a target physical edge length for
-            // axial support too, so tall trimmed cylinders get local triangles
-            // without changing their B-Rep topology or boundary samples.
-            let target_len = f64::max(r * theta, err);
+            // Use the *chordal* budget as a target physical edge length for
+            // axial support (straight directions gain nothing from the angular
+            // cap), so tall trimmed cylinders get local triangles without
+            // changing their B-Rep topology or boundary samples.
+            let target_len = f64::max(r * cylinder_step_angle(r, err), err);
             let v_span = (v_max - v_min).abs();
             let nv = f64::max(2.0, (v_span / target_len).ceil()) as usize;
             (nu, nv)
@@ -632,6 +763,11 @@ fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64,
     Some((hoop, axial, surface_len, sagitta))
 }
 
+// The angular budget deliberately does NOT feed this predicate: shading density
+// comes from the boundary/interior *sampling* (discretize_edge_curve_budget +
+// sample_interior_points_budget); enforcing an angular cap on every mesh edge
+// makes the midpoint-insert/re-Delaunay loop thrash on borderline diagonals and
+// quadruples the wall for no visual gain (normals are analytic per vertex).
 fn cylinder_edge_needs_refinement(surf: &GeomSurface, a: Pnt2d, b: Pnt2d, chord_err: f64) -> bool {
     let Some((_, _, surface_len, sagitta)) = cylinder_edge_metrics(surf, a, b) else {
         return false;
@@ -758,6 +894,7 @@ fn trimmed_constrained_tris(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refine_cylinder_tris(
     surface: &GeomSurface,
     points_2d: &mut Vec<Pnt2d>,
@@ -768,6 +905,12 @@ fn refine_cylinder_tris(
     inner_pts_list: &[Vec<Pnt2d>],
     wants_ccw: bool,
     chord_err: f64,
+    // When the face's boundary polylines are shared with its neighbours
+    // (shared-edge discretization), constraint edges must never be split —
+    // inserting a boundary midpoint on the curved surface would move this
+    // face's boundary off the neighbour's and re-open the crack the shared
+    // pass exists to prevent.
+    allow_constraint_split: bool,
 ) -> Vec<Tri> {
     const MAX_ITERS: usize = 16;
     const MAX_POINTS: usize = 20_000;
@@ -800,12 +943,16 @@ fn refine_cylinder_tris(
                 if !seen_edges.insert(key) {
                     continue;
                 }
+                let is_constraint = constraint_edges.contains(&key);
+                if is_constraint && !allow_constraint_split {
+                    continue;
+                }
                 let pa = points_2d[a];
                 let pb = points_2d[b];
                 if cylinder_edge_needs_refinement(surface, pa, pb, chord_err) {
                     let mid = uv_midpoint(pa, pb);
                     if point_in_trim_region(mid, outer_pts, inner_pts_list) {
-                        candidates.push((a, b, constraint_edges.contains(&key), mid));
+                        candidates.push((a, b, is_constraint, mid));
                     }
                 }
             }
@@ -925,8 +1072,7 @@ pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face]
             break;
         }
 
-        let mut edge_tris: HashMap<(PointKey3d, PointKey3d), Vec<(usize, u32, u32)>> =
-            HashMap::new();
+        let mut edge_tris: EdgeTriUses = HashMap::new();
         for (ti, tri) in mesh.triangles.iter().enumerate() {
             for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
                 let ka = point_key_3d(mesh.vertices[a as usize]);
@@ -1049,6 +1195,9 @@ fn face_has_miter_seam(face: &Face) -> bool {
 
 type PointKey3d = (i64, i64, i64);
 
+/// Triangles using each welded (undirected) mesh edge: `(tri index, a, b)`.
+type EdgeTriUses = HashMap<(PointKey3d, PointKey3d), Vec<(usize, u32, u32)>>;
+
 fn point_key_3d(p: Pnt) -> PointKey3d {
     (
         (p.x() * 1e9).round() as i64,
@@ -1129,17 +1278,53 @@ fn refine_surface_edge_params(
 
 /// Discretize an edge's curve to satisfy the chordal error budget.
 pub fn discretize_edge_curve(curve: &GeomCurve, first: f64, last: f64, chord_err: f64) -> Vec<f64> {
+    discretize_edge_curve_budget(curve, first, last, chord_err, std::f64::consts::PI)
+}
+
+/// Angular tolerances at or below this (or non-finite) mean "no angular cap".
+fn sanitize_angle(angle_err: f64) -> f64 {
+    if angle_err.is_finite() && angle_err > 1.0e-3 {
+        angle_err
+    } else {
+        std::f64::consts::PI
+    }
+}
+
+/// Discretize an edge's curve to satisfy both the chordal error budget and an
+/// angular budget (max tangent turn per segment, radians). The angular budget
+/// makes curved-edge density resolution-independent: a 0.5 mm fillet arc gets
+/// the same facets-per-degree as a 20 mm bore rim, so small rounds never render
+/// segmented just because their chordal sagitta happens to fit the tolerance.
+pub fn discretize_edge_curve_budget(
+    curve: &GeomCurve,
+    first: f64,
+    last: f64,
+    chord_err: f64,
+    angle_err: f64,
+) -> Vec<f64> {
     let mut params = vec![first, last];
+    let angle_err = sanitize_angle(angle_err);
+
+    fn tangent_turn(curve: &GeomCurve, t0: f64, t1: f64) -> f64 {
+        let (_, d0) = curve.d1(t0);
+        let (_, d1) = curve.d1(t1);
+        let (m0, m1) = (d0.magnitude(), d1.magnitude());
+        if m0 <= CONFUSION || m1 <= CONFUSION {
+            return 0.0;
+        }
+        (d0.dot(&d1) / (m0 * m1)).clamp(-1.0, 1.0).acos()
+    }
 
     fn subdivide(
         curve: &GeomCurve,
         t0: f64,
         t1: f64,
         chord_err: f64,
+        angle_err: f64,
         depth: usize,
         params: &mut Vec<f64>,
     ) {
-        if depth > 8 {
+        if depth > 10 {
             return;
         }
         let tm = 0.5 * (t0 + t1);
@@ -1159,17 +1344,130 @@ pub fn discretize_edge_curve(curve: &GeomCurve, first: f64, last: f64, chord_err
             pm.distance(&p0)
         };
 
-        if dev > chord_err {
-            subdivide(curve, t0, tm, chord_err, depth + 1, params);
+        if dev > chord_err || tangent_turn(curve, t0, t1) > angle_err {
+            subdivide(curve, t0, tm, chord_err, angle_err, depth + 1, params);
             params.push(tm);
-            subdivide(curve, tm, t1, chord_err, depth + 1, params);
+            subdivide(curve, tm, t1, chord_err, angle_err, depth + 1, params);
         }
     }
 
-    subdivide(curve, first, last, chord_err, 0, &mut params);
+    subdivide(curve, first, last, chord_err, angle_err, 0, &mut params);
     params.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     params
+}
+
+/// Canonical geometric key for a boundary edge, independent of which face (or
+/// which arena edge — the boolean can leave coincident-but-distinct edges) is
+/// looking at it: sorted quantized endpoints plus the curve midpoint. The
+/// midpoint distinguishes the two arcs that can join one vertex pair.
+pub type SharedEdgeKey = ((i64, i64, i64), (i64, i64, i64), (i64, i64, i64));
+
+fn shared_key_point(p: Pnt) -> (i64, i64, i64) {
+    (
+        (p.x() * 1e6).round() as i64,
+        (p.y() * 1e6).round() as i64,
+        (p.z() * 1e6).round() as i64,
+    )
+}
+
+fn shared_edge_key(edge: &openrcad_topo::Edge) -> Option<SharedEdgeKey> {
+    let curve = edge.curve()?;
+    let p0 = edge.start().point();
+    let p1 = edge.end().point();
+    // Collapsed/closed edges take the pole path in the face tessellator, not
+    // the curve-discretization path, so they are never shared.
+    if p0.distance(&p1) <= 1e-5 {
+        return None;
+    }
+    let pm = curve.point(0.5 * (edge.first() + edge.last()));
+    let (k0, k1) = (shared_key_point(p0), shared_key_point(p1));
+    let km = shared_key_point(pm);
+    Some(if k0 <= k1 { (k0, k1, km) } else { (k1, k0, km) })
+}
+
+/// Discretize every boundary edge of the shell ONCE, at the maximum density any
+/// adjacent face requires, so both faces of a shared edge consume the *same*
+/// boundary polyline (stored canonically: from the smaller endpoint key).
+///
+/// This is the "edges first, faces second" meshing order production kernels
+/// use: per-face tessellations then agree exactly along shared boundaries, so
+/// the combined mesh is crack-free by construction instead of relying on
+/// post-hoc lens stitching (which fans, and whose fans the cylinder refinement
+/// pass used to amplify into non-manifold soup on tangent seams).
+pub fn shared_edge_polylines(
+    faces: &[Face],
+    chord_err: f64,
+    angle_err: f64,
+) -> HashMap<SharedEdgeKey, Vec<Pnt>> {
+    let mut map: HashMap<SharedEdgeKey, Vec<Pnt>> = HashMap::new();
+    for face in faces {
+        let surface = match face.surface() {
+            Some(s) => s,
+            None => continue,
+        };
+        for wire in &face.wires() {
+            for edge in wire.edges().iter() {
+                let (key, curve) = match (shared_edge_key(edge), edge.curve()) {
+                    (Some(k), Some(c)) => (k, c),
+                    _ => continue,
+                };
+                // Miter seams (elliptical tangent edges between two blend faces)
+                // keep chordal-only density: they are interior tangent edges, so
+                // extra angular density buys no visual smoothness — it only
+                // tapers the stub-corner wedge thinner than the seam-support
+                // offsets reach, resurrecting the coincident double-membrane.
+                let edge_angle = if matches!(curve, GeomCurve::Ellipse(_)) {
+                    std::f64::consts::PI
+                } else {
+                    angle_err
+                };
+                let params = discretize_edge_curve_budget(
+                    curve,
+                    edge.first(),
+                    edge.last(),
+                    chord_err,
+                    edge_angle,
+                );
+                let params = refine_surface_edge_params(surface, curve, &params, chord_err);
+                let mut pts: Vec<Pnt> = params.iter().map(|&t| curve.point(t)).collect();
+                if pts.len() < 2 {
+                    continue;
+                }
+                // Snap the polyline's ends to the edge's topological vertex
+                // points — the one representation every adjacent edge and face
+                // agrees on bit-exactly. A curve evaluation can land ~1e-7 off
+                // the vertex (f32-sourced sketch geometry): inside B-Rep
+                // tolerance but outside combine()'s 1e-9 weld, which would
+                // leave hairline index-level cracks at every shared corner.
+                let n = pts.len();
+                let (vs, ve) = (edge.start().point(), edge.end().point());
+                if pts[0].distance(&vs) <= pts[0].distance(&ve) {
+                    pts[0] = vs;
+                    pts[n - 1] = ve;
+                } else {
+                    pts[0] = ve;
+                    pts[n - 1] = vs;
+                }
+                let k_first = shared_key_point(pts[0]);
+                let k_last = shared_key_point(*pts.last().unwrap());
+                if k_first > k_last {
+                    pts.reverse();
+                }
+                match map.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if pts.len() > e.get().len() {
+                            e.insert(pts);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(pts);
+                    }
+                }
+            }
+        }
+    }
+    map
 }
 
 /// Tessellates a single Face into a TriangleMesh locally.
@@ -1177,6 +1475,22 @@ pub fn discretize_edge_curve(curve: &GeomCurve, first: f64, last: f64, chord_err
 /// `face_index` is recorded as the source-face id of every emitted triangle, so
 /// the combined mesh can map triangles back to their originating face (picking).
 pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> TriangleMesh {
+    tessellate_face_budget(face, chord_err, std::f64::consts::PI, face_index, None)
+}
+
+/// [`tessellate_face_local`] with an angular budget and (optionally) the
+/// solid-wide shared boundary polylines from [`shared_edge_polylines`]. When a
+/// boundary edge has a shared polyline, its samples are consumed verbatim so
+/// both adjacent faces agree exactly along the edge; boundary constraints are
+/// then also pinned (never split by the cylinder refinement), keeping that
+/// agreement intact.
+pub fn tessellate_face_budget(
+    face: &Face,
+    chord_err: f64,
+    angle_err: f64,
+    face_index: u32,
+    shared: Option<&HashMap<SharedEdgeKey, Vec<Pnt>>>,
+) -> TriangleMesh {
     let surface = match face.surface() {
         Some(s) => s,
         None => return TriangleMesh::new(),
@@ -1271,18 +1585,61 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
             };
 
             let on_seam = matches!(curve, GeomCurve::Ellipse(_));
-            let params = discretize_edge_curve(curve, edge.first(), edge.last(), chord_err);
-            let params = refine_surface_edge_params(surface, curve, &params, chord_err);
             let is_reversed = !edge.orientation().is_forward();
 
-            let params_directed: Vec<f64> = if is_reversed {
-                params.into_iter().rev().collect()
+            // Shared solid-wide polyline for this edge when available (both
+            // adjacent faces then sample identical boundary points); otherwise
+            // discretize locally as before.
+            let shared_pts = shared.and_then(|m| shared_edge_key(edge).and_then(|k| m.get(&k)));
+            let pts_directed: Vec<Pnt> = if let Some(sp) = shared_pts {
+                let t_start = if is_reversed { edge.last() } else { edge.first() };
+                let start_pt = curve.point(t_start);
+                if sp[0].distance(&start_pt) <= sp[sp.len() - 1].distance(&start_pt) {
+                    sp.clone()
+                } else {
+                    sp.iter().rev().copied().collect()
+                }
             } else {
-                params
+                // Same miter-seam exemption as the shared pass: elliptical
+                // tangent seams keep chordal-only density.
+                let edge_angle = if on_seam {
+                    std::f64::consts::PI
+                } else {
+                    angle_err
+                };
+                let params = discretize_edge_curve_budget(
+                    curve,
+                    edge.first(),
+                    edge.last(),
+                    chord_err,
+                    edge_angle,
+                );
+                let params = refine_surface_edge_params(surface, curve, &params, chord_err);
+                let params_directed: Vec<f64> = if is_reversed {
+                    params.into_iter().rev().collect()
+                } else {
+                    params
+                };
+                let mut pts: Vec<Pnt> =
+                    params_directed.iter().map(|&t| curve.point(t)).collect();
+                // Same vertex snap as the shared pass: adjacent faces meet
+                // bit-exactly at topological vertices even without a shared
+                // polyline (see shared_edge_polylines).
+                if pts.len() >= 2 {
+                    let n = pts.len();
+                    let (vs, ve) = (edge.start().point(), edge.end().point());
+                    if pts[0].distance(&vs) <= pts[0].distance(&ve) {
+                        pts[0] = vs;
+                        pts[n - 1] = ve;
+                    } else {
+                        pts[0] = ve;
+                        pts[n - 1] = vs;
+                    }
+                }
+                pts
             };
 
-            for &t in &params_directed {
-                let p3d = curve.point(t);
+            for &p3d in &pts_directed {
                 let (mut u, mut v) = project_point(surface, p3d, prev_hint);
 
                 // Periodic Seam coordinate unwrapping
@@ -1360,7 +1717,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
     }
 
     let interior_candidates =
-        sample_interior_points(surface, u_min, u_max, v_min, v_max, chord_err);
+        sample_interior_points_budget(surface, u_min, u_max, v_min, v_max, chord_err, angle_err);
 
     // Filter interior points inside loops
     let outer_pts: Vec<Pnt2d> = loops_2d[0].iter().map(|&idx| all_points_2d[idx]).collect();
@@ -1429,12 +1786,21 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         // crack against the flat neighbour). Verified to leave zero non-manifold and
         // zero crack edges across a wide range of box aspect ratios and radii.
         for s in &seam_uv {
-            let p2d = Pnt2d::new(s.x() + 0.04 * (cu - s.x()), s.y() + 0.04 * (cv - s.y()));
-            if !is_point_in_polygon(p2d, &outer_pts)
-                || inner_pts_list.iter().any(|h| is_point_in_polygon(p2d, h))
-            {
+            // Shrink the offset until the support point lands inside the region:
+            // near the seam's stub-vertex corner the (u, v) wedge tapers so thin
+            // that the 0.04 point falls outside and used to be skipped — leaving
+            // the apex triangle unsupported, so both tangent faces fanned the
+            // identical flat triangle there (a residual double-membrane).
+            let Some(p2d) = [0.04, 0.02, 0.01, 0.005, 0.002]
+                .iter()
+                .map(|f| Pnt2d::new(s.x() + f * (cu - s.x()), s.y() + f * (cv - s.y())))
+                .find(|p| {
+                    is_point_in_polygon(*p, &outer_pts)
+                        && !inner_pts_list.iter().any(|h| is_point_in_polygon(*p, h))
+                })
+            else {
                 continue;
-            }
+            };
             let key = ((p2d.x() * 1e8) as i64, (p2d.y() * 1e8) as i64);
             point_map.entry(key).or_insert_with(|| {
                 let id = all_points_2d.len();
@@ -1515,6 +1881,7 @@ pub fn tessellate_face_local(face: &Face, chord_err: f64, face_index: u32) -> Tr
         &inner_pts_list,
         wants_ccw,
         chord_err,
+        shared.is_none(),
     );
 
     mesh_from_uv_tris(
@@ -1716,6 +2083,29 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
                 .map(|w| mesh.vertices[w[0] as usize].distance(&mesh.vertices[w[1] as usize]))
                 .sum();
             if arc_len > 8.0 * chord {
+                continue;
+            }
+            // A real tessellation lens is THIN: the arc a face chorded deviates
+            // from that chord by at most a few chordal tolerances. A large
+            // deviation means this "chord" spans a genuine boundary concavity
+            // (e.g. a circular bite eating into the face) — filling it would
+            // membrane over the void (seen as fillet-validation ghost material).
+            let pa = mesh.vertices[a as usize];
+            let pb = mesh.vertices[b as usize];
+            let ab = [pb.x() - pa.x(), pb.y() - pa.y(), pb.z() - pa.z()];
+            let ab_len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let mut max_dev = 0.0_f64;
+            if ab_len2 > 1e-18 {
+                for &v in &path[1..path.len() - 1] {
+                    let p = mesh.vertices[v as usize];
+                    let ap = [p.x() - pa.x(), p.y() - pa.y(), p.z() - pa.z()];
+                    let t = ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab_len2)
+                        .clamp(0.0, 1.0);
+                    let d = [ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]];
+                    max_dev = max_dev.max((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
+                }
+            }
+            if max_dev > (0.02 * chord).max(0.2) {
                 continue;
             }
             // Fill the planar lens (chord + arc) by fanning from the chord endpoint
@@ -2182,6 +2572,7 @@ mod tests {
             &inner_pts_list,
             true,
             0.05,
+            true,
         );
         points_2d
     }

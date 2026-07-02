@@ -274,10 +274,15 @@ impl ParametricGraph {
                             &source.regions[0].cs,
                         )
                         .unwrap_or_else(|| crate::mock_kernel::box_solid(*w, *h, *d));
+                        // Derive the display from the part (single source of truth) so a
+                        // primitive box matches a sketched-extruded rectangle exactly;
+                        // the analytic make_box mesh is only the cracked-mesh fallback.
+                        let pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
+                            .unwrap_or_else(|| MockMesh::make_box(*w, *h, *d));
                         live.push(LiveBody {
                             id: node.id.clone(),
                             parts: vec![solid],
-                            pristine: Some(MockMesh::make_box(*w, *h, *d)),
+                            pristine: Some(pristine),
                             sketch_source: Some(source),
                             cut_tools: Vec::new(),
                             cut_replay: None,
@@ -286,10 +291,14 @@ impl ParametricGraph {
                     }
                     FeatureType::Cylinder { r, h } => {
                         if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
+                            // Display derives from the part (single source of truth); the
+                            // analytic make_cylinder mesh is the cracked-mesh fallback.
+                            let pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
+                                .unwrap_or_else(|| MockMesh::make_cylinder(*r, *h, 32));
                             live.push(LiveBody {
                                 id: node.id.clone(),
                                 parts: vec![solid],
-                                pristine: Some(MockMesh::make_cylinder(*r, *h, 32)),
+                                pristine: Some(pristine),
                                 sketch_source: None,
                                 cut_tools: Vec::new(),
                                 cut_replay: None,
@@ -654,8 +663,24 @@ impl ParametricGraph {
         // Build solid tool(s) per selected region (empty selector = all regions).
         // New body also accumulates an analytic mesh so pristine bodies keep
         // their nice hidden-line wireframes.
+        //
+        // The sketch's analytic fillet arcs (center+radius) are handed to the wire
+        // builder so a rounded profile sweeps to EXACT cylindrical walls, instead of
+        // `loop_to_wire`'s sample refit that facets a multi-arc rounded rectangle.
+        let arc_circles: Vec<((f32, f32), f32)> = sketch
+            .curves
+            .arcs
+            .iter()
+            .map(|a| (a.center, a.radius))
+            .collect();
         let region_solid = |r: &Region, cs: &CoordinateSystem, d: f32| {
-            crate::mock_kernel::extruded_region_solid(&r.boundary, &r.holes, d, cs)
+            crate::mock_kernel::extruded_region_solid_with_arcs(
+                &r.boundary,
+                &r.holes,
+                d,
+                cs,
+                &arc_circles,
+            )
         };
         // The smooth native-cylinder tool for a circular, hole-free region (None
         // otherwise). Tried before the faceted prism so a round boss/pocket reads
@@ -685,29 +710,38 @@ impl ParametricGraph {
             let provenance = sketch.provenance.get(i);
             match mode {
                 ExtrudeMode::NewBody => {
-                    let source_rect_circle_exact = provenance
-                        .and_then(|provenance| {
-                            rect_circle_region_base_and_cutter_from_provenance(
-                                provenance, region, depth, cs, 0.0,
-                            )
-                        })
-                        .or_else(|| {
-                            rect_circle_region_base_and_cutter_from_sketch(
-                                &sketch.curves,
-                                region,
-                                depth,
-                                cs,
-                                0.0,
-                            )
-                        });
-                    let rect_circle_exact = source_rect_circle_exact.clone().or_else(|| {
-                        crate::mock_kernel::rect_minus_circle_region_base_and_cutter(
-                            &region.boundary,
-                            &region.holes,
-                            depth,
-                            cs,
-                        )
-                    });
+                    // A filleted profile (analytic corner arcs) is NOT a rectangle
+                    // with a circular bite; the rect-minus-circle recognisers mis-fit
+                    // its corner arcs into one big circle (≈ the half-diagonal), so
+                    // skip them when the sketch handed us fillet arcs and let the
+                    // exact-arc `region_solid` build the rounded body.
+                    let rect_circle_exact = if arc_circles.is_empty() {
+                        provenance
+                            .and_then(|provenance| {
+                                rect_circle_region_base_and_cutter_from_provenance(
+                                    provenance, region, depth, cs, 0.0,
+                                )
+                            })
+                            .or_else(|| {
+                                rect_circle_region_base_and_cutter_from_sketch(
+                                    &sketch.curves,
+                                    region,
+                                    depth,
+                                    cs,
+                                    0.0,
+                                )
+                            })
+                            .or_else(|| {
+                                crate::mock_kernel::rect_minus_circle_region_base_and_cutter(
+                                    &region.boundary,
+                                    &region.holes,
+                                    depth,
+                                    cs,
+                                )
+                            })
+                    } else {
+                        None
+                    };
                     let canonical_rect_circle = rect_circle_exact.as_ref().map(|(base, cutter)| {
                         RectCircleCanonicalSource {
                             base: base.clone(),
@@ -723,6 +757,9 @@ impl ParametricGraph {
                         .and_then(|canonical| canonical.body.clone())
                         .or_else(|| cyl_tool(region, cs, depth))
                         .or_else(|| region_solid(region, cs, depth));
+                    // Keep the part so the display mesh derives directly from it
+                    // (single source of truth) instead of an independently rebuilt twin.
+                    let region_part = body_tool.clone();
                     if let Some(s) = body_tool {
                         newbody_tools.push(s);
                         newbody_body_count += 1;
@@ -788,12 +825,21 @@ impl ParametricGraph {
                         });
                     }
                     sketch_source.regions.push(region_source);
-                    let mut region_mesh = crate::mock_kernel::extruded_region_display_mesh(
-                        &region.boundary,
-                        &region.holes,
-                        depth,
-                        cs,
-                    );
+                    let mut region_mesh = match region_part.as_ref() {
+                        Some(part) => crate::mock_kernel::display_mesh_from_part(
+                            part,
+                            &region.boundary,
+                            &region.holes,
+                            depth,
+                            cs,
+                        ),
+                        None => crate::mock_kernel::extruded_region_display_mesh(
+                            &region.boundary,
+                            &region.holes,
+                            depth,
+                            cs,
+                        ),
+                    };
                     stamp_sketch_extrude_edge_refs(
                         &mut region_mesh,
                         node_id,
@@ -1007,6 +1053,20 @@ pub(crate) fn hash_curves(c: &SketchCurves) -> u64 {
     h.write_usize(c.circles.len());
     for circle in &c.circles {
         for v in [circle.center.0, circle.center.1, circle.radius] {
+            h.write_u32(v.to_bits());
+        }
+    }
+    h.write_usize(c.arcs.len());
+    for arc in &c.arcs {
+        for v in [
+            arc.center.0,
+            arc.center.1,
+            arc.radius,
+            arc.start.0,
+            arc.start.1,
+            arc.end.0,
+            arc.end.1,
+        ] {
             h.write_u32(v.to_bits());
         }
     }

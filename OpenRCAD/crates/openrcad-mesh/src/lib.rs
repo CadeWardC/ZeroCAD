@@ -195,9 +195,17 @@ impl TriangleMesh {
 }
 
 /// Tessellate `solid` into a triangle mesh within `chord_err` (max surface
-/// deviation) and `_angle_err` (radians; max normal deviation).
-pub fn tessellate(solid: &openrcad_topo::Solid, chord_err: f64, _angle_err: f64) -> TriangleMesh {
+/// deviation) and `angle_err` (radians; max tangent turn per curved-edge
+/// segment — keeps small fillets as smooth as large bores).
+///
+/// Boundary edges are discretized ONCE, shared by both adjacent faces
+/// ([`triangulate::shared_edge_polylines`]) — the "edges first, faces second"
+/// meshing order production kernels use — so per-face tessellations agree
+/// exactly along shared boundaries and the combined mesh has no cracks to
+/// stitch by construction.
+pub fn tessellate(solid: &openrcad_topo::Solid, chord_err: f64, angle_err: f64) -> TriangleMesh {
     let faces = solid.shell().faces();
+    let shared = triangulate::shared_edge_polylines(&faces, chord_err, angle_err);
 
     // Faces tessellate independently, so this parallelises cleanly across the
     // shell. The `parallel` feature (on by default) maps each face on a rayon
@@ -206,19 +214,23 @@ pub fn tessellate(solid: &openrcad_topo::Solid, chord_err: f64, _angle_err: f64)
     let meshes: Vec<TriangleMesh> = faces
         .par_iter()
         .enumerate()
-        .map(|(i, face)| triangulate::tessellate_face_local(face, chord_err, i as u32))
+        .map(|(i, face)| {
+            triangulate::tessellate_face_budget(face, chord_err, angle_err, i as u32, Some(&shared))
+        })
         .collect();
     #[cfg(not(feature = "parallel"))]
     let meshes: Vec<TriangleMesh> = faces
         .iter()
         .enumerate()
-        .map(|(i, face)| triangulate::tessellate_face_local(face, chord_err, i as u32))
+        .map(|(i, face)| {
+            triangulate::tessellate_face_budget(face, chord_err, angle_err, i as u32, Some(&shared))
+        })
         .collect();
 
     let mut combined = triangulate::combine(&meshes);
-    // Stitch lens cracks where two faces sampled a shared boundary differently
-    // (e.g. a fillet end cap chorded on the cylinder side, arced on the planar
-    // side) so the render/STL mesh is gap-free, not just the B-Rep.
+    // Safety net for boundaries the shared-edge pass could not cover (edges
+    // whose geometric keys did not match across faces): stitch lens cracks
+    // where two faces sampled a shared boundary differently.
     triangulate::stitch_boundary_lenses(&mut combined);
     triangulate::refine_cylinder_mesh_edges(&mut combined, &faces, chord_err);
     combined

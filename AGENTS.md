@@ -11,9 +11,14 @@ Use this as the quick map before editing. The longer architecture notes live in
   - `eval.rs` orchestrates evaluation.
   - `extrude.rs`, `join.rs`, `cut.rs`, and `edge_mod.rs` own operation logic.
 - Kernel/tessellation behavior: `zerocad-core/src/mock_kernel/`
-  - `mod.rs` is the map.
+  - `mod.rs` is the map. This is a thin façade over the **OpenRCAD** B-Rep kernel
+    (`openrcad`, a path dep on the sibling `OpenRCAD/` workspace); actual geometry
+    work on the kernel itself happens in `OpenRCAD/`.
   - `types.rs` owns `MockMesh` and selectable edge metadata.
   - `tessellation.rs` and `mesh_topology.rs` are the main display-mesh paths.
+  - `history.rs` owns face naming, boolean face history, and part identity.
+- Document format: `zerocad-core/src/zcad_format.rs` owns the binary `.zcad`
+  container (read/write); `parametric/types.rs` owns the `ParametricGraph` it stores.
 - GUI behavior: `zerocad-gui/src/app/`
   - `update.rs` is frame orchestration only.
   - `ui/viewport.rs` owns viewport input, picking, and overlays.

@@ -420,6 +420,11 @@ struct ZeroCadApp {
     /// 3-point tools hold up to two. Cleared when the shape finalizes or cancels.
     sketch_points: Vec<(f32, f32)>,
     hovered_plane: Option<SketchPlane>,
+    /// In plane-selection mode, the planar body face `(node_id, face_id)` under
+    /// the cursor. A hovered face takes priority over the origin plane quads and,
+    /// when clicked, starts a sketch on that face (the same path as pre-selecting
+    /// a face and pressing Draw Sketch).
+    hovered_sketch_face: Option<(String, u32)>,
 
     /// Faces of finished sketches the user has selected (in 3D) for extrusion,
     /// keyed by `(sketch_id, region_index)`. Selection persists until extruded

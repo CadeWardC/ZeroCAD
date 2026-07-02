@@ -614,7 +614,7 @@ fn solid_surface_intrudes_into_cut_once(
             if face
                 .and_then(|face| face.surface())
                 .is_some_and(|surface| match surface {
-                    GeomSurface::Cylinder(cyl) => cylinders_same_surface(&cyl, &guard.cyl),
+                    GeomSurface::Cylinder(cyl) => cylinders_same_surface(cyl, &guard.cyl),
                     _ => false,
                 })
             {
@@ -2869,12 +2869,25 @@ fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
         let v = moved - center;
         v.dot(&y).atan2(v.dot(&x))
     };
+    // `source()`/`target()` honour the wire orientation but `first()`/`last()`
+    // are RAW storage — on a Reversed edge they belong to the opposite vertices.
+    // Pair them consistently, or the kept end anchors to the WRONG parameter and
+    // the trimmed arc comes out param/vertex-inconsistent (its stored end vertex
+    // and its end parameter name different points). Downstream, discretization
+    // walks the bogus param range — a stub arc nowhere near the stored endpoints
+    // — leaving a chord across the true arc: mesh cracks, phantom membranes over
+    // a circular bite, and the fillet validator rejecting every candidate.
+    let (source_param, target_param) = if edge.orientation().is_forward() {
+        (edge.first(), edge.last())
+    } else {
+        (edge.last(), edge.first())
+    };
     let keep_is_source =
         keep.distance(&edge.source().point()) <= keep.distance(&edge.target().point());
     let keep_param = if keep_is_source {
-        edge.first()
+        source_param
     } else {
-        edge.last()
+        target_param
     };
     // Unwrap the moved endpoint's angle onto the same branch as the kept end so the
     // sub-arc travels the original short way around, not the reflex complement.
@@ -2890,7 +2903,7 @@ fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
     if keep_is_source {
         Edge::new(
             curve,
-            edge.first(),
+            keep_param,
             moved_param,
             edge.source(),
             Vertex::new(moved),
@@ -2899,7 +2912,7 @@ fn shorten_edge_keep_curve(edge: &Edge, keep: Pnt, moved: Pnt) -> Edge {
         Edge::new(
             curve,
             moved_param,
-            edge.last(),
+            keep_param,
             Vertex::new(moved),
             edge.target(),
         )

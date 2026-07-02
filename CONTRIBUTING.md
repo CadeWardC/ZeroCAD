@@ -17,10 +17,16 @@ the architectural map and this guide does not repeat it.
 ## Build, run, test
 
 ```bash
-cargo run --release          # release is strongly recommended — the truck solver is CPU-heavy
+cargo run --release          # release is strongly recommended — the geometry kernel is CPU-heavy
 cargo test --workspace       # full test suite
 cargo test -p zerocad-core   # geometry engine only (no GUI/system deps)
 ```
+
+The geometry is built by **[OpenRCAD](OpenRCAD/)**, a pure-Rust B-Rep kernel that
+lives in this tree as its own cargo workspace and is consumed through the
+`openrcad` façade crate. It is excluded from the ZeroCAD workspace, so
+`cargo test --workspace` does not build it directly; work on the kernel from
+inside `OpenRCAD/`.
 
 ## Code style
 
@@ -46,10 +52,10 @@ The README has the authoritative checklists; the short version:
 
 - **A new geometry/feature type** → follow *"Adding a new feature type — the
   checklist"* in the README, and **read *"Non-obvious invariants — read before
-  touching geometry"* first.** Orientation, winding handedness, the 0.1 mm
-  coplanarity overshoot, and the fragility of the `truck` boolean solver will
-  bite you otherwise. Never call `truck_shapeops` directly — go through the
-  guarded `mock_kernel::union` / `difference` wrappers.
+  touching geometry"* first.** Orientation, winding handedness, and the 0.1 mm
+  coplanarity fallback will bite you otherwise. Never call `openrcad::algo::boolean*`
+  directly — go through the guarded `mock_kernel::union` / `difference` wrappers,
+  which reject a failed/non-watertight result and silence the panic hook.
 - **Geometry changes need a regression test** in
   `zerocad-core/tests/realistic_modes.rs` that asserts the geometry actually
   *changed* (e.g. new hole-wall triangles), not merely that triangle counts

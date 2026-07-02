@@ -347,7 +347,29 @@ impl MockMesh {
     /// extracted from the solid's B-Rep edges, and hidden-line normals are left
     /// empty (the renderer then shows every edge).
     pub fn from_solid(solid: &KernelSolid) -> Self {
-        let (vertices, indices, face_ids) = solid_to_flat_mesh(solid, true, false);
+        let (vertices, indices, mut face_ids) = solid_to_flat_mesh(solid, true, false);
+        // Faces on one analytic cylinder also SELECT as one face: remap each
+        // triangle's face id to its surface group's canonical (first) face —
+        // the same identity the wireframe already uses to suppress the
+        // construction seams. The kernel bores a full hole as 3 arc faces
+        // (`cut_hole`'s thirds); professional CAD presents that as ONE
+        // cylindrical wall, not three arbitrary slices.
+        {
+            let surface_group = cylinder_surface_groups(solid);
+            let mut canonical: HashMap<u32, u32> = HashMap::new();
+            for (fi, &g) in surface_group.iter().enumerate() {
+                canonical.entry(g).or_insert(fi as u32);
+            }
+            for fid in &mut face_ids {
+                if let Some(c) = surface_group
+                    .get(*fid as usize)
+                    .and_then(|g| canonical.get(g))
+                {
+                    *fid = *c;
+                }
+            }
+        }
+        let face_ids = face_ids;
         // Derive the wireframe from the tessellation's *feature* edges (borders
         // between two distinct faces), not the raw B-Rep edge list. This gives
         // every edge its two adjacent face normals — so the renderer's
@@ -360,6 +382,61 @@ impl MockMesh {
         let surface_group = cylinder_surface_groups(solid);
         let (mut edge_vertices, mut edge_indices, mut edge_face_normals, mut edge_pairs) =
             mesh_feature_edges(&vertices, &indices, &face_ids, &surface_group);
+        // Redraw curved B-Rep edges (rims, fillet boundaries, arcs) as *smooth*
+        // analytic polylines instead of the coarse per-facet chords the tessellation
+        // leaves — so a boolean'd cylinder rim reads as clean as a primitive's. The
+        // coarse chords for those same surface pairs are then dropped (below) to avoid
+        // double-drawing.
+        let mut arc_ev: Vec<f32> = Vec::new();
+        let mut arc_ei: Vec<u32> = Vec::new();
+        let mut arc_efn: Vec<f32> = Vec::new();
+        let mut arc_pairs: Vec<(u32, u32)> = Vec::new();
+        let analytic_pairs = add_analytic_curved_brep_edges(
+            solid,
+            &vertices,
+            &indices,
+            &face_ids,
+            &surface_group,
+            &mut arc_ev,
+            &mut arc_ei,
+            &mut arc_efn,
+            &mut arc_pairs,
+        );
+        if !analytic_pairs.is_empty() {
+            // Drop the coarse tessellation chords for any surface pair we redrew
+            // analytically. Each feature-edge segment owns two consecutive vertices,
+            // so keep-filtering is a straight rebuild.
+            let mut kv: Vec<f32> = Vec::new();
+            let mut ki: Vec<u32> = Vec::new();
+            let mut kn: Vec<f32> = Vec::new();
+            let mut kp: Vec<(u32, u32)> = Vec::new();
+            for (s, &pair) in edge_pairs.iter().enumerate() {
+                if analytic_pairs.contains(&pair) {
+                    continue;
+                }
+                let i0 = edge_indices[2 * s] as usize;
+                let i1 = edge_indices[2 * s + 1] as usize;
+                let base = (kv.len() / 3) as u32;
+                kv.extend_from_slice(&edge_vertices[i0 * 3..i0 * 3 + 3]);
+                kv.extend_from_slice(&edge_vertices[i1 * 3..i1 * 3 + 3]);
+                ki.push(base);
+                ki.push(base + 1);
+                kn.extend_from_slice(&edge_face_normals[6 * s..6 * s + 6]);
+                kp.push(pair);
+            }
+            edge_vertices = kv;
+            edge_indices = ki;
+            edge_face_normals = kn;
+            edge_pairs = kp;
+        }
+        // Append the analytic curved edges, reindexing onto the kept vertices.
+        let base = (edge_vertices.len() / 3) as u32;
+        edge_vertices.extend_from_slice(&arc_ev);
+        for idx in &arc_ei {
+            edge_indices.push(base + idx);
+        }
+        edge_face_normals.extend_from_slice(&arc_efn);
+        edge_pairs.extend_from_slice(&arc_pairs);
         add_missing_straight_brep_edges(
             solid,
             &vertices,

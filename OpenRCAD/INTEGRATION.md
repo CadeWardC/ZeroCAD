@@ -182,6 +182,57 @@ the result satisfies the Euler characteristic `V − E + F = 2`.
 | `chamfer` | ruled bevel faces + triangular corners | 45° conical frustums |
 | `shell_solid` | offset-surface cavity + planar rims | offset-surface cavity + planar rims |
 
+### Per-edge blends (any solid, including boolean results)
+
+The whole-solid builders above recognise only a box or cylinder. To blend an
+**arbitrary** solid — including a boolean result — select the edges and use the
+per-edge rolling-ball API. It handles planar–planar, planar–cylindrical, and
+planar–analytic edge adjacency, and rejects an over-large radius with a typed
+error rather than emitting a degenerate solid.
+
+```rust
+use openrcad::algo::{fillet_edges, chamfer_edges};
+
+// Pick the edges you want (e.g. the four vertical edges of a box).
+let edges: Vec<_> = solid.edges().into_iter().filter(is_vertical).collect();
+
+let rounded  = fillet_edges(&solid, &edges, 2.0)?;   // -> Result<Solid, RollingBallError>
+let beveled  = chamfer_edges(&solid, &edges, 2.0)?;  // -> Result<Solid, ChamferError>
+```
+
+For a **contour** of edges that should be treated as one logical blend (e.g. a run
+of co-circular fragments left by a boolean), the thin `apply_blend_contour` façade
+routes the request to the right specialized solver based on kind and spine hint:
+
+```rust
+use openrcad::algo::{apply_blend_contour, BlendContour, BlendKind, BlendCurveHint, BlendLaw};
+
+let contour = BlendContour {
+    edges,                                // ordered edges forming the contour
+    kind: BlendKind::Fillet,              // or BlendKind::Chamfer
+    law: BlendLaw::Constant(2.0),         // Variable laws are not implemented yet
+    hint: Some(BlendCurveHint::Circle),   // co-circular → one logical arc contour
+};
+let blended = apply_blend_contour(&solid, &contour)?; // -> Result<Solid, BlendContourError>
+```
+
+`BlendContourError` distinguishes an empty contour, an unsupported variable law,
+and an underlying fillet/chamfer failure.
+
+### Sweep a profile into a solid (`prism`)
+
+`prism(&face, vector)` extrudes a planar face along a vector into a solid;
+`sweep_prism` is the lower-level form. Straight profile edges become planar
+laterals, axially-aligned circular arcs become cylindrical laterals, and other
+curves become ruled laterals. It reports `SweepError::{DegenerateVector,
+MissingOuterWire, OpenWire}`.
+
+```rust
+use openrcad::{algo::prism, foundation::Vec as GeomVec};
+
+let solid = prism(&profile_face, &GeomVec::new(0.0, 0.0, 10.0))?;
+```
+
 ---
 
 ## 7. Tessellate for rendering
@@ -283,7 +334,9 @@ Know these before you wire OpenRCAD into a production path:
   partial-imprint goal-tests now pass and are un-`#[ignore]`d in
   `crates/openrcad-algo/tests/robustness.rs`). The remaining edge case: a cut that
   *severs* a body is returned as a single solid (Euler=4) rather than split into
-  separate bodies.
+  separate bodies — call `boolean_bodies` / `boolean_checked_bodies`, or
+  `Solid::split_disconnected()` on the result, to get one `Solid` per connected
+  component.
 - **Intersection subdivision** can be deep on tangential NURBS configurations;
   prefer analytic primitives (line/circle pairs take a closed-form fast path).
 - **STL is write-only**; STEP is read + write.
@@ -305,9 +358,14 @@ make_wedge(dx, dy, dz, ltx) -> Solid
 
 // Algorithms
 boolean(&object, &tool, BooleanOp::{Fuse|Cut|Common}) -> Solid
-fillet(&solid, radius) -> Result<Solid, BlendError>
-chamfer(&solid, distance) -> Result<Solid, BlendError>
+boolean_bodies(&object, &tool, BooleanOp) -> Vec<Solid>   // one per connected component
+fillet(&solid, radius) -> Result<Solid, BlendError>        // whole box/cylinder
+chamfer(&solid, distance) -> Result<Solid, BlendError>     // whole box/cylinder
 shell_solid(&solid, thickness, &open_faces) -> Result<Solid, BlendError>
+fillet_edges(&solid, &edges, radius) -> Result<Solid, RollingBallError>   // any solid
+chamfer_edges(&solid, &edges, distance) -> Result<Solid, ChamferError>    // any solid
+apply_blend_contour(&solid, &BlendContour) -> Result<Solid, BlendContourError>
+prism(&face, &vector) -> Result<Solid, SweepError>         // extrude a profile
 
 // Mesh & exchange
 tessellate(&solid, chord_err, angle_err) -> TriangleMesh
