@@ -27,6 +27,9 @@ fn sketch_dimension_follows_a_variable() {
         id: "sketch_2".to_string(),
         name: "Sketch".to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves: SketchCurves::new(),
             shapes: vec![SketchShape::Rectangle {
@@ -45,6 +48,7 @@ fn sketch_dimension_follows_a_variable() {
         id: "extrude_3".to_string(),
         name: "Extrude".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 5.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
@@ -99,6 +103,9 @@ fn topology_edge_ref_reattaches_after_sketch_dimension_edit() {
         id: "sketch_2".to_string(),
         name: "Sketch".to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves: SketchCurves::new(),
             shapes: vec![SketchShape::Rectangle {
@@ -213,6 +220,7 @@ fn extrude_depth_follows_a_variable() {
         id: "extrude_3".to_string(),
         name: "Extrude".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 5.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,

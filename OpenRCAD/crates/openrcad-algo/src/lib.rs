@@ -31,7 +31,10 @@ pub enum BooleanOp {
 }
 
 pub mod boolean;
-pub use boolean::{BooleanError, BooleanInput};
+pub use boolean::{
+    boolean_checked_with_history, boolean_with_history, BooleanError, BooleanFaceHistory,
+    BooleanFaceSource, BooleanInput,
+};
 pub mod contour;
 pub use contour::{
     apply_blend_contour, BlendContour, BlendContourError, BlendCurveHint, BlendKind, BlendLaw,
@@ -138,9 +141,9 @@ pub fn shell_solid(
 pub mod sew;
 pub use prism::{prism, sweep_prism, SweepError};
 pub use rolling_ball::{
-    chamfer_circular_edge_chain, fillet_circular_edge_chain, fillet_edges, fillet_planar_edge,
-    rolling_ball_between_planar_faces, rolling_ball_fillet_edge, RollingBallBlend,
-    RollingBallError,
+    chamfer_circular_edge_chain, edge_material_wedge_is_concave, fillet_circular_edge_chain,
+    fillet_edges, fillet_planar_edge, rolling_ball_between_planar_faces, rolling_ball_fillet_edge,
+    RollingBallBlend, RollingBallError,
 };
 
 /// Sew a collection of faces into a single shell, joining edges within `tol`

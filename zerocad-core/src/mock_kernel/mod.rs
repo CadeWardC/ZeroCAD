@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use openrcad::algo::{
     apply_blend_contour, boolean_checked, prism, BlendContour, BlendCurveHint, BlendKind, BooleanOp,
 };
+pub use openrcad::algo::{BooleanFaceHistory, BooleanFaceSource};
 use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
 use openrcad::mesh::tessellate;

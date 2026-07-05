@@ -444,6 +444,9 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
         id: "s".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::new(
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
@@ -459,6 +462,7 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
         id: "e".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,
@@ -545,6 +549,9 @@ fn sketch_extrude_edge_mod(
         id: "s".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::new(
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
@@ -560,6 +567,7 @@ fn sketch_extrude_edge_mod(
         id: "e".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,
@@ -773,6 +781,9 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
         id: "s".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::new(
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
@@ -788,6 +799,7 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
         id: "e".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,

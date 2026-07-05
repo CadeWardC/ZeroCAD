@@ -59,6 +59,9 @@ fn add_circle_cut(g: &mut ParametricGraph, depth: f32) {
         id: "sketch_3".into(),
         name: "Circle Cut Sketch".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::new(
                 Vec3::new(0.0, 0.0, BOX_D),
                 Vec3::new(1.0, 0.0, 0.0),
@@ -74,6 +77,7 @@ fn add_circle_cut(g: &mut ParametricGraph, depth: f32) {
         id: "extrude_4".into(),
         name: "Circle Cut".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth,
             region_indices: vec![],
             mode: ExtrudeMode::Cut,

@@ -30,6 +30,9 @@ fn add_shape_sketch(g: &mut ParametricGraph, id: &str, shapes: Vec<SketchShape>)
         id: id.to_string(),
         name: id.to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves: SketchCurves::new(),
             shapes,
@@ -51,6 +54,7 @@ fn add_extrude_sel(
         id: id.to_string(),
         name: id.to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth,
             region_indices,
             mode,

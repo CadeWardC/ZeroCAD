@@ -192,26 +192,7 @@ impl ZeroCadApp {
                     }
 
                     if let Some(del_id) = id_to_delete {
-                        // Resolve the id to its current graph index, then remove.
-                        let mut target = None;
-                        for idx in self.graph.graph.node_indices() {
-                            if self.graph.graph[idx].id == del_id {
-                                target = Some(idx);
-                                break;
-                            }
-                        }
-                        if let Some(idx) = target {
-                            self.push_undo();
-                            self.graph.graph.remove_node(idx);
-                            if self.selected_node_id.as_deref() == Some(del_id.as_str()) {
-                                self.selected_node_id = None;
-                            }
-                            self.selected_faces.retain(|(sid, _)| sid != &del_id);
-                            self.selected_edges.retain(|(sid, _)| sid != &del_id);
-                            self.selected_body.retain(|(nid, _)| nid != &del_id);
-                            self.hidden_nodes.remove(&del_id);
-                            self.reevaluate_geometry();
-                        }
+                        self.delete_node_by_id(&del_id);
                     }
 
                     // Create a new, empty variable set and select it so the user

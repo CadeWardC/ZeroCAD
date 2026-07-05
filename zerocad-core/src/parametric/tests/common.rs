@@ -16,6 +16,7 @@ pub(super) fn add_extrude(
         id: id.to_string(),
         name: id.to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth,
             region_indices: vec![],
             mode,
@@ -30,6 +31,9 @@ pub(super) fn add_sketch(g: &mut ParametricGraph, id: &str, curves: SketchCurves
         id: id.to_string(),
         name: id.to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves,
             shapes: vec![],
@@ -135,6 +139,9 @@ pub(super) fn add_sketch_cs(
         id: id.to_string(),
         name: id.to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs,
             curves,
             shapes: vec![],

@@ -215,6 +215,25 @@ pub enum FeatureType {
         /// documents saved before this field existed.
         #[serde(default)]
         on_face: bool,
+        /// Durable id per entry of `shapes` (parallel Vec). Identity is the id,
+        /// never the Vec position: deleting a shape must not re-key references
+        /// downstream of its neighbours. Empty for legacy documents — they get
+        /// positional backfill (`entity_ids[i] == i`) via
+        /// [`crate::sketch::effective_shape_ids`], which reproduces the old
+        /// grammar exactly.
+        #[serde(default)]
+        entity_ids: Vec<crate::sketch::EntityId>,
+        /// Next unallocated [`crate::sketch::EntityId`] for this sketch.
+        /// Monotonic; ids are never reused after a delete.
+        #[serde(default)]
+        next_entity_id: u32,
+        /// Constraint-solver model (shared points + entities + constraints).
+        /// `None` = legacy sketch: geometry comes from `shapes`/`curves`
+        /// exactly as before this field existed. Serde-visible in full — the
+        /// eval prefix cache hashes the serialized feature, so a hidden field
+        /// here would reuse stale meshes after a constraint edit.
+        #[serde(default)]
+        solver: Option<crate::sketch::SketchSolverModel>,
     },
     /// Extrude one or more detected regions of the parent sketch by `depth`.
     /// `region_indices` selects which regions to extrude — empty means "all".
@@ -225,6 +244,13 @@ pub enum FeatureType {
         region_indices: Vec<usize>,
         #[serde(default)]
         mode: ExtrudeMode,
+        /// For Cut/Join: the node id of the body this boolean applies to.
+        /// `None` (legacy and the default) keeps the historical behavior of
+        /// hitting every AABB-overlapping body; `Some` restricts the boolean to
+        /// that one body and reports Unresolved (fail-loud) when the body no
+        /// longer exists instead of silently cutting whatever else is nearby.
+        #[serde(default)]
+        target: Option<String>,
         /// Optional expression (over the document's variables) that drives the
         /// depth. When set, it is re-evaluated against the current variables on
         /// every build, so editing a variable updates the extrude. `depth` then
@@ -381,4 +407,9 @@ pub(crate) struct SketchEval {
     /// legacy sketches (no `shapes`) or sketches with sketch fillets/chamfers
     /// (`corner_mods`), which fall back to the per-region extrude path.
     pub(crate) shape_loops: Vec<ShapeLoop>,
+    /// When the sketch's constraint model failed to re-solve against the
+    /// current variables (over-constrained/conflicting), the reason. The
+    /// geometry baked is the last-valid stored positions; the extrude that
+    /// consumes this sketch surfaces the reason as a fail-loud warning.
+    pub(crate) solve_failure: Option<String>,
 }

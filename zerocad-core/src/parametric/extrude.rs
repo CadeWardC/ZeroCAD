@@ -114,6 +114,59 @@ pub(crate) fn stamp_sketch_extrude_face_refs(
     }
 }
 
+/// Stamp durable PRIMITIVE names onto a box body's faces:
+/// `box_{node}:face:{+x|-x|+y|-y|+z|-z}` by dominant outward normal. Primitive
+/// faces were the last unnamed creation path — without these a fillet or a
+/// sketch placed on a primitive box could only reattach geometrically.
+pub(crate) fn stamp_box_face_refs(mesh: &mut MockMesh, body_id: &str) {
+    for face_ref in mesh.face_refs.iter_mut() {
+        let n = face_ref.normal;
+        let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
+        let role = if ax >= ay && ax >= az {
+            if n[0] >= 0.0 { "+x" } else { "-x" }
+        } else if ay >= az {
+            if n[1] >= 0.0 { "+y" } else { "-y" }
+        } else if n[2] >= 0.0 {
+            "+z"
+        } else {
+            "-z"
+        };
+        face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(format!("box_{body_id}:face:{role}")),
+            surface_kind: Some("plane".to_string()),
+        });
+    }
+}
+
+/// Stamp durable PRIMITIVE names onto a cylinder body's faces:
+/// `cyl_{node}:face:{lateral|top|bottom}`. The cylinder primitive stands along
+/// +Y with its base at the origin; the wall's area-weighted average normal is
+/// near zero (it wraps all the way around), so anything that isn't clearly a
+/// ±Y cap is the lateral. The mesh's cylinder-arc canonicalization has already
+/// collapsed the wall to one face id, so the lateral is a single face ref.
+pub(crate) fn stamp_cylinder_face_refs(mesh: &mut MockMesh, body_id: &str) {
+    for face_ref in mesh.face_refs.iter_mut() {
+        let n = Vec3::new(face_ref.normal[0], face_ref.normal[1], face_ref.normal[2]);
+        let len = n.dot(n).sqrt();
+        let ny = if len > 1.0e-6 { n.y / len } else { 0.0 };
+        let (role, kind) = if ny > 0.7 {
+            ("top", "plane")
+        } else if ny < -0.7 {
+            ("bottom", "plane")
+        } else {
+            ("lateral", "cylinder")
+        };
+        face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(format!("cyl_{body_id}:face:{role}")),
+            surface_kind: Some(kind.to_string()),
+        });
+    }
+}
+
 /// Classify an extruded face as `top` (far cap), `bottom` (base), or `side`
 /// (wall) from its outward normal relative to the sketch-plane normal `cs.n`.
 pub(crate) fn sketch_extrude_face_role(

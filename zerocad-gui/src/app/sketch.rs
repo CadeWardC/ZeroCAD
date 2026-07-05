@@ -17,6 +17,14 @@ impl ZeroCadApp {
         self.pending_corners.clear();
         self.detected_regions.clear();
         self.selected_region_indices.clear();
+        self.editing_sketch_id = None;
+        self.sketch_solver_model = None;
+        self.sketch_entity_ids.clear();
+        self.sketch_next_entity_id = 0;
+        self.sketch_drag_point = None;
+        self.sketch_selected_ids.clear();
+        self.sketch_selected_constraint = None;
+        self.sketch_conflict_constraint = None;
         self.cancel_in_progress_shape();
     }
 
@@ -31,9 +39,37 @@ impl ZeroCadApp {
         let vars = self.graph.variable_map();
         let mut mods = self.sketch_corner_mods.clone();
         mods.extend(self.pending_corner_mods());
-        self.sketch_curves =
-            zerocad_core::effective_curves(&SketchCurves::new(), &self.sketch_shapes, &mods, &vars);
+        // A solver model (Edit Sketch session) is the source of truth for the
+        // live geometry; a fresh drawing session bakes from the shape list.
+        self.sketch_curves = zerocad_core::effective_curves_solved(
+            &SketchCurves::new(),
+            &self.sketch_shapes,
+            &mods,
+            self.sketch_solver_model.as_ref(),
+            &vars,
+        );
         self.recompute_sketch_regions();
+    }
+
+    /// Re-solve the live sketch's constraint model in place (drag frames, a
+    /// constraint edit) and rebuild the displayed curves from the result. The
+    /// solve is warm-started from the current positions, so an under-constrained
+    /// sketch moves minimally. On a failed solve the model keeps its current
+    /// (last-valid) positions — the geometry degrades, never blanks.
+    pub(crate) fn solve_live_sketch(&mut self) {
+        let vars = self.graph.variable_map();
+        if let Some(model) = &mut self.sketch_solver_model {
+            let report = zerocad_core::sketch::solve_model(model, &vars);
+            if report.outcome == zerocad_core::sketch::SolveOutcome::Converged {
+                zerocad_core::sketch::solve::apply_solution(model, &report);
+                self.sketch_conflict_constraint = None;
+            } else {
+                // Cache the culprit for the red badge/list highlight; geometry
+                // keeps its last-valid positions.
+                self.sketch_conflict_constraint = report.conflicting;
+            }
+        }
+        self.rebuild_active_sketch_curves();
     }
 
     /// Build the current radius/setback `Dimension` from the toolbar text (a

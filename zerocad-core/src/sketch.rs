@@ -28,6 +28,17 @@
 
 use std::collections::HashMap;
 
+/// Sketch entity identity + the constraint-solver data model (shared points,
+/// entities, constraints). Lives in its own file; re-exported here so callers
+/// keep one `crate::sketch::` namespace.
+pub mod constraints;
+pub mod linalg;
+pub mod solve;
+pub use constraints::{
+    effective_shape_ids, Constraint, EntityId, SketchEntity, SketchPoint, SketchSolverModel,
+};
+pub use solve::{solve_model, SolveOutcome, SolveReport};
+
 /// Vertex coordinate snap tolerance (in sketch plane units / mm).
 const VERTEX_TOL: f64 = 1e-3;
 /// Cross-product epsilon for "parallel" classification.
@@ -333,6 +344,47 @@ pub fn effective_curves(
     corner_mods: &[CornerMod],
     vars: &HashMap<String, f64>,
 ) -> SketchCurves {
+    effective_curves_solved(curves, shapes, corner_mods, None, vars)
+}
+
+/// [`effective_curves`] with the constraint-solver model. When `solver` is
+/// present (and non-empty) it is the source of truth: entities bake to curves
+/// in stored (id) order — the same `SketchCurves` every downstream consumer
+/// already reads, so regions/extrude/booleans are untouched by the solver's
+/// existence.
+///
+/// Evaluation stays **pure**: the stored point positions are trusted as-is
+/// (they are the last committed solve) unless a dimensional constraint is
+/// variable-bound — then the model is re-solved against the current variables
+/// so editing a variable moves the geometry, and the result is used without
+/// mutating the document. A failed re-solve bakes the stored last-valid
+/// positions — a bad constraint edit degrades the sketch, never blanks it.
+pub fn effective_curves_solved(
+    curves: &SketchCurves,
+    shapes: &[SketchShape],
+    corner_mods: &[CornerMod],
+    solver: Option<&SketchSolverModel>,
+    vars: &HashMap<String, f64>,
+) -> SketchCurves {
+    if let Some(model) = solver.filter(|m| !m.is_empty()) {
+        let mut c = if solve::has_variable_bound_constraint(model) {
+            let report = solve::solve_model(model, vars);
+            if report.outcome == SolveOutcome::Converged {
+                let mut solved = model.clone();
+                solve::apply_solution(&mut solved, &report);
+                constraints::bake_entities_to_curves(&solved)
+            } else {
+                constraints::bake_entities_to_curves(model)
+            }
+        } else {
+            constraints::bake_entities_to_curves(model)
+        };
+        for m in corner_mods {
+            let r = m.radius.resolve(vars);
+            apply_corner_mod(&mut c, m.at, r, m.kind);
+        }
+        return c;
+    }
     let mut c = if shapes.is_empty() {
         curves.clone()
     } else {
@@ -559,7 +611,8 @@ pub fn detect_regions_with_provenance(
     shapes: &[SketchShape],
 ) -> Vec<RegionWithProvenance> {
     let regions = detect_regions(curves);
-    let provenance = build_region_provenance(curves, shapes, &regions);
+    let ids = EntityId::sequence(shapes.len());
+    let provenance = build_region_provenance(curves, shapes, &ids, &regions);
     regions
         .into_iter()
         .zip(provenance)
@@ -570,9 +623,10 @@ pub fn detect_regions_with_provenance(
 pub fn build_region_provenance(
     curves: &SketchCurves,
     shapes: &[SketchShape],
+    entity_ids: &[EntityId],
     regions: &[Region],
 ) -> Vec<RegionProvenance> {
-    let fragments = sketch_provenance_fragments(curves, shapes);
+    let fragments = sketch_provenance_fragments(curves, shapes, entity_ids);
     regions
         .iter()
         .map(|_| RegionProvenance {
@@ -581,18 +635,31 @@ pub fn build_region_provenance(
         .collect()
 }
 
+/// Provenance fragments key their `shape_id` by the shape's durable
+/// [`EntityId`] — never the `shapes` Vec position — so deleting one shape does
+/// not re-key every reference captured against its neighbours. Legacy sketches
+/// (no stored ids) backfill positionally, which reproduces the pre-id grammar
+/// exactly.
 fn sketch_provenance_fragments(
     curves: &SketchCurves,
     shapes: &[SketchShape],
+    entity_ids: &[EntityId],
 ) -> Vec<RegionProvenanceFragment> {
+    let ids = effective_shape_ids(shapes.len(), entity_ids);
+    let id_at = |pos: usize| ids.get(pos).map(|id| id.0 as usize);
     let mut fragments = Vec::new();
     let rectangle_shape_id = shapes
         .iter()
-        .position(|shape| matches!(shape, SketchShape::Rectangle { .. }));
+        .position(|shape| matches!(shape, SketchShape::Rectangle { .. }))
+        .and_then(id_at);
     let circle_shape_ids: Vec<usize> = shapes
         .iter()
         .enumerate()
-        .filter_map(|(i, shape)| matches!(shape, SketchShape::Circle { .. }).then_some(i))
+        .filter_map(|(i, shape)| {
+            matches!(shape, SketchShape::Circle { .. })
+                .then(|| id_at(i))
+                .flatten()
+        })
         .collect();
     if let Some((rect_min, rect_max)) = rectangle_bounds_from_segments(&curves.segments) {
         for edge_index in 0..4 {
@@ -615,7 +682,8 @@ fn sketch_provenance_fragments(
         fragments.push(RegionProvenanceFragment::RawPolyline {
             shape_id: shapes
                 .iter()
-                .position(|shape| matches!(shape, SketchShape::Raw { .. })),
+                .position(|shape| matches!(shape, SketchShape::Raw { .. }))
+                .and_then(id_at),
         });
     }
     fragments

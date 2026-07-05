@@ -16,12 +16,14 @@ mod edge_mod;
 mod eval;
 mod extrude;
 mod join;
+pub mod topo_name;
 mod types;
 
 #[allow(unused_imports)]
 pub(crate) use cut::*;
 #[allow(unused_imports)]
 pub(crate) use edge_mod::*;
+pub use edge_mod::edge_wedge_is_concave_mesh;
 #[allow(unused_imports)]
 pub(crate) use eval::*;
 #[allow(unused_imports)]

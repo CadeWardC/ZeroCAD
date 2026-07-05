@@ -369,6 +369,113 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Drag-to-solve: in an Edit Sketch session (solver model
+                        // present) with no drawing tool armed, dragging a solver
+                        // point moves it and re-solves the constraints live —
+                        // an under-constrained sketch follows the cursor
+                        // minimally, a dimensioned one snaps back onto its
+                        // constraint set. The 2D solve is microseconds, so it
+                        // runs every drag frame; the expensive downstream
+                        // rebuild happens once, at Finish Sketch.
+                        if self.is_sketch_mode
+                            && self.active_tool.is_none()
+                            && self.sketch_solver_model.is_some()
+                            && !self.camera_anim_active
+                        {
+                            const POINT_GRAB_PX: f32 = 9.0;
+                            let cs = self.active_sketch_cs;
+                            // Local projection capturing only Copy values (same
+                            // pattern as the pick path below) so no `self`
+                            // borrow lives across the mutations here.
+                            let is_persp = self.is_perspective;
+                            let to_screen = move |p: (f64, f64)| -> egui::Pos2 {
+                                let w = cs.unproject(p.0 as f32, p.1 as f32);
+                                let (x, y, z) = (w.x, w.y, w.z);
+                                let rx = cos_y * x - sin_y * z;
+                                let rz = sin_y * x + cos_y * z;
+                                let ry = cos_p * y - sin_p * rz;
+                                let final_z = sin_p * y + cos_p * rz;
+                                if is_persp {
+                                    let dist = 1200.0;
+                                    let factor = dist / (dist - final_z.min(dist * 0.85));
+                                    egui::pos2(
+                                        center_x + rx * view_scale * factor,
+                                        center_y - ry * view_scale * factor,
+                                    )
+                                } else {
+                                    egui::pos2(center_x + rx * view_scale, center_y - ry * view_scale)
+                                }
+                            };
+                            if response.drag_started_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    self.sketch_drag_point = self
+                                        .sketch_solver_model
+                                        .as_ref()
+                                        .and_then(|model| {
+                                            model
+                                                .points
+                                                .iter()
+                                                .map(|p| (p.id, to_screen(p.pos).distance(pos)))
+                                                .filter(|(_, d)| *d <= POINT_GRAB_PX)
+                                                .min_by(|a, b| {
+                                                    a.1.partial_cmp(&b.1)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                })
+                                                .map(|(id, _)| id)
+                                        });
+                                }
+                            }
+                            if let Some(drag_id) = self.sketch_drag_point {
+                                if response.dragged_by(egui::PointerButton::Primary) {
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        let (u, v) = self.screen_to_sketch(pos, rect, &cs);
+                                        if let Some(model) = &mut self.sketch_solver_model {
+                                            if let Some(p) =
+                                                model.points.iter_mut().find(|p| p.id == drag_id)
+                                            {
+                                                p.pos = (u as f64, v as f64);
+                                            }
+                                        }
+                                        self.solve_live_sketch();
+                                    }
+                                }
+                                if response.drag_released_by(egui::PointerButton::Primary) {
+                                    self.sketch_drag_point = None;
+                                    self.solve_live_sketch();
+                                    self.status_msg =
+                                        "Point moved — Finish Sketch commits the edit.".to_string();
+                                }
+                            }
+                            // Click-selection of solver points/entities: drives
+                            // which constraint-palette buttons are applicable.
+                            // Plain click replaces the selection; Shift extends.
+                            if response.clicked() && self.sketch_drag_point.is_none() {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let hit = self.sketch_solver_model.as_ref().and_then(|model| {
+                                        pick_solver_element(model, pos, &to_screen, POINT_GRAB_PX)
+                                    });
+                                    match hit {
+                                        Some(id) => {
+                                            if !shift {
+                                                self.sketch_selected_ids.clear();
+                                            }
+                                            if let Some(k) = self
+                                                .sketch_selected_ids
+                                                .iter()
+                                                .position(|&s| s == id)
+                                            {
+                                                self.sketch_selected_ids.remove(k);
+                                            } else {
+                                                self.sketch_selected_ids.push(id);
+                                            }
+                                        }
+                                        None if !shift => self.sketch_selected_ids.clear(),
+                                        None => {}
+                                    }
+                                }
+                            }
+                        }
+
                         // 3D selection: click picks a body face/edge/vertex (or a finished
                         // sketch's face/edge); double-click selects the whole body/sketch.
                         // Works in normal 3D view, and while sketching when no drawing
@@ -421,10 +528,10 @@ impl ZeroCadApp {
                                     if self.hidden_nodes.contains(&node.id) {
                                         continue; // can't pick a hidden sketch
                                     }
-                                    if let FeatureType::Sketch { cs, curves, shapes, corner_mods, .. } = &node.feature {
+                                    if let FeatureType::Sketch { cs, curves, shapes, corner_mods, solver, .. } = &node.feature {
                                         let cs = *cs;
                                         // Pick against the variable-resolved geometry.
-                                        let eff = zerocad_core::effective_curves(curves, shapes, corner_mods, &var_map);
+                                        let eff = zerocad_core::effective_curves_solved(curves, shapes, corner_mods, solver.as_ref(), &var_map);
                                         let curves = &eff;
                                         let to_scr = |u: f32, v: f32| -> egui::Pos2 {
                                             let w = cs.unproject(u, v);
@@ -696,5 +803,59 @@ impl ZeroCadApp {
         self.show_edge_mod_dialog(ctx);
         self.drag_corner_radius_handle(ctx);
         self.show_corner_radius_box(ctx);
+
+        // Constraint palette + list for the active Edit Sketch session.
+        self.show_constraints_panel(ctx);
     }
+}
+
+/// Hit-test the solver model's points, then lines, then circles at `pos`
+/// (screen space). Points win over entities so a shared corner is grabbable.
+pub(crate) fn pick_solver_element(
+    model: &zerocad_core::sketch::SketchSolverModel,
+    pos: egui::Pos2,
+    to_screen: &dyn Fn((f64, f64)) -> egui::Pos2,
+    tol_px: f32,
+) -> Option<zerocad_core::sketch::EntityId> {
+    use zerocad_core::sketch::SketchEntity;
+    if let Some((id, _)) = model
+        .points
+        .iter()
+        .map(|p| (p.id, to_screen(p.pos).distance(pos)))
+        .filter(|(_, d)| *d <= tol_px)
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        return Some(id);
+    }
+    let point_pos = |id| model.point(id).map(|p| p.pos);
+    let seg_dist = |a: egui::Pos2, b: egui::Pos2| -> f32 {
+        let ab = b - a;
+        let len2 = ab.length_sq();
+        if len2 <= f32::EPSILON {
+            return a.distance(pos);
+        }
+        let t = ((pos - a).dot(ab) / len2).clamp(0.0, 1.0);
+        (a + ab * t).distance(pos)
+    };
+    model
+        .entities
+        .iter()
+        .filter_map(|e| {
+            let d = match e {
+                SketchEntity::Line { p0, p1, .. } => {
+                    seg_dist(to_screen(point_pos(*p0)?), to_screen(point_pos(*p1)?))
+                }
+                SketchEntity::Circle { center, radius, .. }
+                | SketchEntity::Arc { center, radius, .. } => {
+                    let c2 = point_pos(*center)?;
+                    let c = to_screen(c2);
+                    // Screen-space radius from a second projected sample.
+                    let rim = to_screen((c2.0 + *radius, c2.1));
+                    (c.distance(pos) - c.distance(rim)).abs()
+                }
+            };
+            (d <= tol_px).then_some((e.id(), d))
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, _)| id)
 }

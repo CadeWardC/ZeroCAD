@@ -36,6 +36,9 @@ fn filleted_rect(radius: f64, corners: &[(f32, f32)]) -> (usize, Vec<f64>, bool,
         id: "sketch_1".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::new(
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
@@ -51,6 +54,7 @@ fn filleted_rect(radius: f64, corners: &[(f32, f32)]) -> (usize, Vec<f64>, bool,
         id: "extrude_2".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
@@ -129,6 +133,9 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
         id: "sketch_1".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::new(
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
@@ -144,6 +151,7 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
         id: "extrude_2".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,

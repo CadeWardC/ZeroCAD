@@ -182,7 +182,8 @@ fn resolve_edge_by_face_pair(
     let mut want = requested.adjacent_face_ids.clone();
     want.sort();
     let pick = |mesh: &MockMesh| -> Option<EdgeRef> {
-        mesh.edge_refs
+        let matches: Vec<&crate::mock_kernel::MeshEdgeRef> = mesh
+            .edge_refs
             .iter()
             .filter(|candidate| {
                 let mut got = candidate
@@ -193,8 +194,36 @@ fn resolve_edge_by_face_pair(
                 got.sort();
                 got.len() == 2 && got == want
             })
-            .find(|candidate| mesh_candidate_matches_captured_edge(candidate, edge))
-            .map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
+            .collect();
+        // Identity-first, mirroring the exact-id path above: a UNIQUE face-owner
+        // pair IS the edge (an edit may have moved it arbitrarily far — a box
+        // resize relocates the +x/+y edge by the growth amount, and geometry
+        // gates must not veto identity). Only a pair collision (a bite splits an
+        // edge into fragments sharing both owners) needs geometry to pick the
+        // fragment, falling to the nearest span when everything moved.
+        let span_dist = |c: &crate::mock_kernel::MeshEdgeRef| -> f32 {
+            let fwd = distance3(c.p0, edge.p0) + distance3(c.p1, edge.p1);
+            let rev = distance3(c.p0, edge.p1) + distance3(c.p1, edge.p0);
+            fwd.min(rev)
+        };
+        let best = match matches.len() {
+            0 => None,
+            1 => Some(matches[0]),
+            _ => {
+                let geometric: Vec<&crate::mock_kernel::MeshEdgeRef> = matches
+                    .iter()
+                    .copied()
+                    .filter(|c| mesh_candidate_matches_captured_edge(c, edge))
+                    .collect();
+                let pool = if geometric.is_empty() { matches } else { geometric };
+                pool.into_iter().min_by(|a, b| {
+                    span_dist(a)
+                        .partial_cmp(&span_dist(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            }
+        };
+        best.map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
     };
     body.pristine
         .as_ref()
@@ -253,20 +282,28 @@ pub(crate) fn resolve_face_ref_by_topology(body: &LiveBody, face: &FaceRef) -> O
             {
                 return None;
             }
-            if let Some(resolved) = body.pristine.as_ref().and_then(|mesh| {
+            // A severing cut can leave SEVERAL faces with the same name — one
+            // per lump (both halves of a slotted bar keep `:face:bottom`).
+            // Identity narrows to the name; the LUMP is position-based (the
+            // same principle as `part_key`): pick the candidate nearest the
+            // captured centroid so the reference follows its own lump instead
+            // of whichever match enumerates first.
+            let pick = |mesh: &MockMesh| -> Option<FaceRef> {
                 mesh.face_refs
                     .iter()
-                    .find(|c| topology_face_id(c) == Some(requested_face_id))
+                    .filter(|c| topology_face_id(c) == Some(requested_face_id))
+                    .min_by(|a, b| {
+                        let d = |c: &crate::mock_kernel::MeshFaceRef| {
+                            distance3(c.centroid, face.centroid)
+                        };
+                        d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|c| face_ref_from_mesh_face(body, c, requested))
-            }) {
+            };
+            if let Some(resolved) = body.pristine.as_ref().and_then(pick) {
                 return Some(resolved);
             }
-            let mesh = edge_mod_reference_mesh(body);
-            return mesh
-                .face_refs
-                .iter()
-                .find(|c| topology_face_id(c) == Some(requested_face_id))
-                .map(|c| face_ref_from_mesh_face(body, c, requested));
+            return pick(&edge_mod_reference_mesh(body));
         }
     }
     // Unnamed capture (legacy, or a not-yet-named boolean-result face): fall back
@@ -1099,6 +1136,7 @@ fn edge_mod_native_chamfer_all_parts(
         });
         let mut accepted: Option<EdgeModResult> = None;
         let mut part_failures = Vec::new();
+        let additive = edge_mod_concave_allowance(&part, edge, dist);
         match crate::mock_kernel::chamfer_edge_with_hint(
             &part,
             edge.p0,
@@ -1112,6 +1150,7 @@ fn edge_mod_native_chamfer_all_parts(
                 chamfered,
                 recut_tools,
                 circular_bite_locality,
+                additive,
             ) {
                 Ok(chamfered) => {
                     match edge_mod_reject_unhealthy_native_curve_result(selection, &chamfered) {
@@ -1145,6 +1184,7 @@ fn edge_mod_native_chamfer_all_parts(
                             chamfered,
                             recut_tools,
                             circular_bite_locality,
+                            additive,
                         ) {
                             Ok(chamfered) => {
                                 accepted = Some(EdgeModResult::single(chamfered));
@@ -1522,6 +1562,7 @@ pub(crate) fn edge_mod_try_native_fillet(
     circular_bite_locality: Option<CircularBiteLocality<'_>>,
 ) -> Result<KernelSolid, String> {
     let edge = &selection.active_edge;
+    let additive = edge_mod_concave_allowance(original_part, edge, dist);
     let mut failures = Vec::new();
     for (suffix, p0, p1) in [("", edge.p0, edge.p1), (" reversed", edge.p1, edge.p0)] {
         let started = std::time::Instant::now();
@@ -1538,6 +1579,7 @@ pub(crate) fn edge_mod_try_native_fillet(
                 f,
                 recut_tools,
                 circular_bite_locality,
+                additive,
             ) {
                 Ok(f) => match edge_mod_reject_unhealthy_native_curve_result(selection, &f) {
                     Ok(()) => return Ok(f),
@@ -2144,12 +2186,14 @@ pub(crate) fn edge_mod_accept_candidate_or_recut(
     candidate: KernelSolid,
     recut_tools: &[CutTool],
     circular_bite_locality: Option<CircularBiteLocality<'_>>,
+    additive: Option<ConcaveBlendAllowance>,
 ) -> Result<KernelSolid, String> {
     let first_reason = match edge_mod_accept_candidate_for_edge(
         reference_mesh,
         original_part,
         candidate.clone(),
         circular_bite_locality,
+        additive,
     ) {
         Ok(candidate) => return Ok(candidate),
         Err(reason) => reason,
@@ -2178,6 +2222,7 @@ pub(crate) fn edge_mod_accept_candidate_or_recut(
                 original_part,
                 recut,
                 circular_bite_locality,
+                additive,
             ) {
                 Ok(recut) => return Ok(recut),
                 Err(reason) => failures.push(format!("recut result rejected: {reason}")),
@@ -2202,9 +2247,10 @@ pub(crate) fn edge_mod_accept_candidate_for_edge(
     original_part: &KernelSolid,
     candidate: KernelSolid,
     circular_bite_locality: Option<CircularBiteLocality<'_>>,
+    additive: Option<ConcaveBlendAllowance>,
 ) -> Result<KernelSolid, String> {
     let (candidate, candidate_mesh) =
-        edge_mod_accept_candidate_with_mesh(reference_mesh, original_part, candidate)?;
+        edge_mod_accept_candidate_with_mesh_gated(reference_mesh, original_part, candidate, additive)?;
     if let Some(locality) = circular_bite_locality {
         if let Some(candidate_mesh) = candidate_mesh.as_ref() {
             edge_mod_circular_bite_locality_mesh(locality, candidate_mesh)?;
@@ -2657,82 +2703,114 @@ pub(crate) fn edge_mod_selected_blend_present(
     let span_slack = (dist * 0.08).clamp(0.08, 0.5);
     let min_offset = (dist * 0.04).max(0.025);
     let max_offset = dist + EDGE_MOD_GROW + 0.30;
-    let mut samples = 0usize;
-    let mut span_hits = 0usize;
-    let mut offset_hits = 0usize;
-    let mut normal_hits = 0usize;
-    let mut min_s = f32::INFINITY;
-    let mut max_s = f32::NEG_INFINITY;
-    let mut normal_bins = std::collections::HashSet::new();
-
-    for tri in candidate_mesh.indices.chunks_exact(3) {
-        let a = mesh_vertex_pos6(candidate_mesh, tri[0]);
-        let b = mesh_vertex_pos6(candidate_mesh, tri[1]);
-        let c = mesh_vertex_pos6(candidate_mesh, tri[2]);
-        let p = mul3(add3(add3(a, b), c), 1.0 / 3.0);
-        let rel = sub3(p, edge.p0);
-        let s = dot3(rel, t);
-        if s < -span_slack || s > len + span_slack {
-            continue;
-        }
-        span_hits += 1;
-
-        let u = dot3(rel, f1);
-        let v = dot3(rel, f2);
-        if u < min_offset || v < min_offset || u > max_offset || v > max_offset {
-            continue;
-        }
-        offset_hits += 1;
-
-        let na = mesh_vertex_normal6(candidate_mesh, tri[0]);
-        let nb = mesh_vertex_normal6(candidate_mesh, tri[1]);
-        let nc = mesh_vertex_normal6(candidate_mesh, tri[2]);
-        let normal_raw = mul3(add3(add3(na, nb), nc), 1.0 / 3.0);
-        let face_normal_raw = cross3(sub3(b, a), sub3(c, a));
-        let expected = normalize3(add3(n1, n2));
-        let face_normal = if dot3(face_normal_raw, expected) < 0.0 {
-            mul3(face_normal_raw, -1.0)
-        } else {
-            face_normal_raw
-        };
-        let Some(bin) = [normal_raw, face_normal]
-            .into_iter()
-            .find_map(|normal| edge_mod_blend_normal_bin(normal, n1, n2))
-        else {
-            continue;
-        };
-        normal_hits += 1;
-
-        samples += 1;
-        min_s = min_s.min(s);
-        max_s = max_s.max(s);
-        normal_bins.insert(bin);
-    }
-
     let required_samples = match kind {
         crate::sketch::CornerKind::Fillet => 3,
         crate::sketch::CornerKind::Chamfer => 1,
     };
-    if samples < required_samples {
+    let required_span = (len * 0.25).clamp(0.20, len * 0.75);
+
+    // Result of scanning the candidate mesh with one offset-frame orientation.
+    struct BlendScan {
+        samples: usize,
+        span_hits: usize,
+        offset_hits: usize,
+        normal_hits: usize,
+        min_s: f32,
+        max_s: f32,
+        normal_bins: std::collections::HashSet<i32>,
+    }
+
+    // A convex blend's band lies on the INWARD side of both faces (`f1`,`f2`
+    // point into material); a concave (inner-corner, additive) blend's band
+    // lies on the OUTWARD side, so its triangles sit at negative `u`,`v` in the
+    // convex frame and get culled by the offset gate. Scan both orientations and
+    // keep whichever finds the band — a convex candidate has no material on the
+    // outward side and a concave one has none on the inward side, so the two
+    // frames never cross-accept.
+    let scan = |sign: f32| -> BlendScan {
+        let f1 = mul3(f1, sign);
+        let f2 = mul3(f2, sign);
+        let mut out = BlendScan {
+            samples: 0,
+            span_hits: 0,
+            offset_hits: 0,
+            normal_hits: 0,
+            min_s: f32::INFINITY,
+            max_s: f32::NEG_INFINITY,
+            normal_bins: std::collections::HashSet::new(),
+        };
+        for tri in candidate_mesh.indices.chunks_exact(3) {
+            let a = mesh_vertex_pos6(candidate_mesh, tri[0]);
+            let b = mesh_vertex_pos6(candidate_mesh, tri[1]);
+            let c = mesh_vertex_pos6(candidate_mesh, tri[2]);
+            let p = mul3(add3(add3(a, b), c), 1.0 / 3.0);
+            let rel = sub3(p, edge.p0);
+            let s = dot3(rel, t);
+            if s < -span_slack || s > len + span_slack {
+                continue;
+            }
+            out.span_hits += 1;
+
+            let u = dot3(rel, f1);
+            let v = dot3(rel, f2);
+            if u < min_offset || v < min_offset || u > max_offset || v > max_offset {
+                continue;
+            }
+            out.offset_hits += 1;
+
+            let na = mesh_vertex_normal6(candidate_mesh, tri[0]);
+            let nb = mesh_vertex_normal6(candidate_mesh, tri[1]);
+            let nc = mesh_vertex_normal6(candidate_mesh, tri[2]);
+            let normal_raw = mul3(add3(add3(na, nb), nc), 1.0 / 3.0);
+            let face_normal_raw = cross3(sub3(b, a), sub3(c, a));
+            let expected = normalize3(add3(n1, n2));
+            let face_normal = if dot3(face_normal_raw, expected) < 0.0 {
+                mul3(face_normal_raw, -1.0)
+            } else {
+                face_normal_raw
+            };
+            let Some(bin) = [normal_raw, face_normal]
+                .into_iter()
+                .find_map(|normal| edge_mod_blend_normal_bin(normal, n1, n2))
+            else {
+                continue;
+            };
+            out.normal_hits += 1;
+
+            out.samples += 1;
+            out.min_s = out.min_s.min(s);
+            out.max_s = out.max_s.max(s);
+            out.normal_bins.insert(bin);
+        }
+        out
+    };
+
+    // Prefer the orientation that actually satisfies the acceptance thresholds.
+    let convex = scan(1.0);
+    let convex_ok = convex.samples >= required_samples
+        && convex.max_s - convex.min_s >= required_span
+        && (!matches!(kind, crate::sketch::CornerKind::Fillet) || convex.normal_bins.len() >= 2);
+    let scan = if convex_ok { convex } else { scan(-1.0) };
+
+    if scan.samples < required_samples {
         return Err(format!(
-            "candidate did not create a {kind:?} surface on the selected circular-bite edge \
-             (span hits {span_hits}, offset hits {offset_hits}, normal hits {normal_hits})"
+            "candidate did not create a {kind:?} surface on the selected edge \
+             (span hits {}, offset hits {}, normal hits {})",
+            scan.span_hits, scan.offset_hits, scan.normal_hits
         ));
     }
 
-    let required_span = (len * 0.25).clamp(0.20, len * 0.75);
-    if max_s - min_s < required_span {
+    if scan.max_s - scan.min_s < required_span {
         return Err(format!(
             "candidate {kind:?} surface covered only {:.2}mm of the selected {:.2}mm edge",
-            max_s - min_s,
+            scan.max_s - scan.min_s,
             len
         ));
     }
 
-    if matches!(kind, crate::sketch::CornerKind::Fillet) && normal_bins.len() < 2 {
+    if matches!(kind, crate::sketch::CornerKind::Fillet) && scan.normal_bins.len() < 2 {
         return Err(
-            "candidate fillet surface on the selected circular-bite edge did not have rounded normals"
-                .to_string(),
+            "candidate fillet surface on the selected edge did not have rounded normals".to_string(),
         );
     }
 
@@ -3083,10 +3161,97 @@ pub(crate) fn edge_mod_accept_candidate(
         .map(|(candidate, _)| candidate)
 }
 
+/// Permission for a fillet/chamfer candidate to ADD material: granted only
+/// when the selected straight edge's material wedge is reflex (a concave
+/// inner corner), where the blend fills the corner void instead of carving
+/// the corner off. The added geometry must stay within `reach` of the
+/// `p0..p1` segment — anything further afield is a fabricated result, not
+/// the corner wedge.
+#[derive(Clone, Copy)]
+pub(crate) struct ConcaveBlendAllowance {
+    pub p0: [f32; 3],
+    pub p1: [f32; 3],
+    pub reach: f32,
+}
+
+/// Build the additive allowance for a selection, or `None` when the edge is
+/// not a straight concave edge (the ordinary subtractive gates then apply).
+pub(crate) fn edge_mod_concave_allowance(
+    part: &KernelSolid,
+    edge: &EdgeRef,
+    dist: f32,
+) -> Option<ConcaveBlendAllowance> {
+    if !matches!(edge.curve.as_ref(), None | Some(EdgeCurveHint::Line)) {
+        return None;
+    }
+    crate::mock_kernel::edge_wedge_is_concave(part, edge.p0, edge.p1).then_some(
+        ConcaveBlendAllowance {
+            p0: edge.p0,
+            p1: edge.p1,
+            // The wedge's farthest point from the edge is the contact line at
+            // dist/tan(θ_void/2); ×4 covers void wedges down to ~28°.
+            reach: (dist * 4.0).max(1.0),
+        },
+    )
+}
+
+fn point_segment_distance_f32(p: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if len2 <= f32::EPSILON {
+        0.0
+    } else {
+        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2).clamp(0.0, 1.0)
+    };
+    let d = [
+        p[0] - (a[0] + ab[0] * t),
+        p[1] - (a[1] + ab[1] * t),
+        p[2] - (a[2] + ab[2] * t),
+    ];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+/// Additive counterpart of `edge_mod_mesh_stays_inside_reference`: the
+/// candidate may leave the reference *solid* (a concave blend fills former
+/// void) but must stay within the reference bounds, and every point that
+/// escaped the reference solid must be local to the blended edge.
+fn edge_mod_additive_mesh_is_local(
+    reference_mesh: &MockMesh,
+    candidate_mesh: &MockMesh,
+    allow: &ConcaveBlendAllowance,
+    tol: f32,
+) -> Result<(), String> {
+    for (i, v) in candidate_mesh.vertices.chunks_exact(6).enumerate() {
+        let p = [v[0], v[1], v[2]];
+        if point_inside_triangle_mesh(reference_mesh, p, tol) {
+            continue;
+        }
+        let d = point_segment_distance_f32(p, allow.p0, allow.p1);
+        if d > allow.reach + tol {
+            return Err(format!(
+                "candidate vertex {i} at [{:.3}, {:.3}, {:.3}] adds material {d:.3} from the \
+                 concave edge (allowed {:.3})",
+                p[0], p[1], p[2], allow.reach
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn edge_mod_accept_candidate_with_mesh(
     reference_mesh: &MockMesh,
     original_part: &KernelSolid,
     candidate: KernelSolid,
+) -> Result<(KernelSolid, Option<MockMesh>), String> {
+    edge_mod_accept_candidate_with_mesh_gated(reference_mesh, original_part, candidate, None)
+}
+
+pub(crate) fn edge_mod_accept_candidate_with_mesh_gated(
+    reference_mesh: &MockMesh,
+    original_part: &KernelSolid,
+    candidate: KernelSolid,
+    additive: Option<ConcaveBlendAllowance>,
 ) -> Result<(KernelSolid, Option<MockMesh>), String> {
     if !edge_mod_keeps_body(original_part, &candidate) {
         return Err("candidate expands outside the original part bounds".to_string());
@@ -3122,12 +3287,29 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh(
         }
     }
     edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
-    edge_mod_mesh_stays_inside_reference(
-        reference_mesh,
-        &candidate_mesh,
-        EDGE_MOD_CONTAINMENT_TOL,
-        Some(&preserved_cylinder_faces),
-    )?;
+    if let Some(allow) = additive.as_ref() {
+        // Concave blend: material is ADDED in the corner void, so strict
+        // containment in the reference solid cannot hold. Gate on the
+        // reference bounds plus locality of everything that escaped.
+        edge_mod_mesh_stays_inside_reference_bounds(
+            reference_mesh,
+            &candidate_mesh,
+            EDGE_MOD_CONTAINMENT_TOL,
+        )?;
+        edge_mod_additive_mesh_is_local(
+            reference_mesh,
+            &candidate_mesh,
+            allow,
+            EDGE_MOD_CONTAINMENT_TOL,
+        )?;
+    } else {
+        edge_mod_mesh_stays_inside_reference(
+            reference_mesh,
+            &candidate_mesh,
+            EDGE_MOD_CONTAINMENT_TOL,
+            Some(&preserved_cylinder_faces),
+        )?;
+    }
     Ok((candidate, Some(candidate_mesh)))
 }
 
@@ -3431,6 +3613,44 @@ pub(crate) fn point_inside_triangle_mesh(mesh: &MockMesh, p: [f32; 3], tol: f32)
     hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     hits.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-4);
     hits.len() % 2 == 1
+}
+
+/// Concavity of a straight edge from the body's display mesh alone — the GUI
+/// holds the `MockMesh`, not the `KernelSolid`, so this mirrors the kernel's
+/// `planar_edge_material_wedge_is_concave` on tessellated geometry. Probes just
+/// off the edge midpoint along ±normalize(n1 − n2); when BOTH samples land
+/// inside the solid the wedge between the two faces is filled — a reflex
+/// (inner-corner) edge whose blend ADDS material. Returns `None` when the two
+/// samples disagree (an ordinary edge) or the frame is degenerate.
+pub fn edge_wedge_is_concave_mesh(
+    mesh: &MockMesh,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    n1: [f32; 3],
+    n2: [f32; 3],
+) -> Option<bool> {
+    let mid = [
+        (p0[0] + p1[0]) * 0.5,
+        (p0[1] + p1[1]) * 0.5,
+        (p0[2] + p1[2]) * 0.5,
+    ];
+    let d = sub3(n1, n2);
+    if length_sq3(d) <= 1.0e-9 {
+        return None;
+    }
+    let dir = normalize3(d);
+    let edge_len = length_sq3(sub3(p1, p0)).sqrt();
+    let eps = (0.05 * edge_len).clamp(1.0e-3, 0.5);
+    // The mesh is a chorded approximation, so the inside test needs a surface
+    // tolerance comparable to the tessellation gap.
+    let tol = 0.02;
+    let plus = point_inside_triangle_mesh(mesh, add3(mid, mul3(dir, eps)), tol);
+    let minus = point_inside_triangle_mesh(mesh, sub3(mid, mul3(dir, eps)), tol);
+    match (plus, minus) {
+        (true, true) => Some(true),
+        (false, false) => Some(false),
+        _ => None,
+    }
 }
 
 pub(crate) fn mesh_vertex_pos6(mesh: &MockMesh, vi: u32) -> [f32; 3] {

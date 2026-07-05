@@ -18,14 +18,14 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode,
-    FeatureType, ParametricGraph, TopologyEdgeRef, Variable,
+    edge_wedge_is_concave_mesh, EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef,
+    ExtrudeMode, FeatureNode, FeatureType, ParametricGraph, TopologyEdgeRef, Variable,
 };
 pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,
-    overlap_clusters, shape_loops, shapes_overlap, Circle, CornerKind, CornerMod, Dimension,
-    LineSegment, Region, RegionProvenance, RegionProvenanceFragment, RegionWithProvenance,
-    ShapeLoop, SketchCurves, SketchShape,
+    effective_curves_solved, overlap_clusters, shape_loops, shapes_overlap, Circle, CornerKind,
+    CornerMod, Dimension, LineSegment, Region, RegionProvenance, RegionProvenanceFragment,
+    RegionWithProvenance, ShapeLoop, SketchCurves, SketchShape,
 };
 pub use stl::{meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};

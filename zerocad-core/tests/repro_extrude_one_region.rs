@@ -94,6 +94,9 @@ fn one_extrude(curves: SketchCurves, region_indices: Vec<usize>) -> zerocad_core
         id: "sketch_1".into(),
         name: "sketch_1".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: top_plane(0.0),
             curves,
             shapes: vec![],
@@ -105,6 +108,7 @@ fn one_extrude(curves: SketchCurves, region_indices: Vec<usize>) -> zerocad_core
         id: "extrude_2".into(),
         name: "extrude_2".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 15.0,
             region_indices,
             mode: ExtrudeMode::NewBody,

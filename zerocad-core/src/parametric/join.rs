@@ -93,6 +93,7 @@ pub(crate) fn apply_join(
     live: &mut Vec<LiveBody>,
     extrude_id: &str,
     tools: Vec<JoinTool>,
+    boolean_target: Option<&str>,
     warnings: &mut Vec<String>,
 ) {
     let mut orphans: Vec<KernelSolid> = Vec::new();
@@ -108,6 +109,10 @@ pub(crate) fn apply_join(
         let mut merged = false;
         if let Some(tbb) = tbb {
             'bodies: for body in live.iter_mut() {
+                // Named targeting: only the pinned body may receive the boss.
+                if boolean_target.is_some_and(|t| t != body.id) {
+                    continue;
+                }
                 // Snapshot the input body's named mesh before mutating any part, so a
                 // captured face can survive the join's boolean (single-part case).
                 let input_mesh = if body.parts.len() == 1 {
@@ -115,6 +120,20 @@ pub(crate) fn apply_join(
                 } else {
                     None
                 };
+                // Exact-history plumbing: input face names per shell position +
+                // owner classes for the kernel's owner-aware coplanar merge (a
+                // flush boss must not merge its top into the base's top and
+                // erase the identity).
+                let input_names: Option<Vec<Option<String>>> =
+                    match (&input_mesh, &body.parts[..]) {
+                        (Some(mesh), [part]) => {
+                            Some(crate::mock_kernel::input_shell_face_names(mesh, part))
+                        }
+                        _ => None,
+                    };
+                let owner_classes: Option<Vec<Option<u64>>> = input_names
+                    .as_ref()
+                    .map(|names| crate::mock_kernel::owner_classes_from_names(names));
                 let body_id = body.id.clone();
                 for part in body.parts.iter_mut() {
                     let overlaps = crate::mock_kernel::solid_aabb(part).map_or(true, |pbb| {
@@ -124,22 +143,27 @@ pub(crate) fn apply_join(
                         continue;
                     }
                     // Smooth analytic cylinder first (round boss), then the faceted
-                    // prism variants as robustness fallbacks.
+                    // prism variants as robustness fallbacks. With a named input,
+                    // run through the history-emitting kernel entry so the union
+                    // gets exact face provenance + owner-aware merging.
+                    let try_union = |t: &KernelSolid| -> Option<(
+                        KernelSolid,
+                        Option<crate::mock_kernel::BooleanFaceHistory>,
+                    )> {
+                        if owner_classes.is_some() {
+                            crate::mock_kernel::union_with_history(part, t, owner_classes.as_deref())
+                                .map(|(u, h)| (u, Some(h)))
+                        } else {
+                            crate::mock_kernel::union(part, t).map(|u| (u, None))
+                        }
+                    };
                     let unioned = tool
                         .smooth
                         .as_ref()
-                        .and_then(|t| crate::mock_kernel::union(part, t))
-                        .or_else(|| {
-                            tool.exact
-                                .as_ref()
-                                .and_then(|t| crate::mock_kernel::union(part, t))
-                        })
-                        .or_else(|| {
-                            tool.dipped
-                                .as_ref()
-                                .and_then(|t| crate::mock_kernel::union(part, t))
-                        });
-                    if let Some(u) = unioned {
+                        .and_then(&try_union)
+                        .or_else(|| tool.exact.as_ref().and_then(&try_union))
+                        .or_else(|| tool.dipped.as_ref().and_then(&try_union));
+                    if let Some((u, history)) = unioned {
                         // A join must never destroy existing material: `a ∪ b`
                         // always contains `a`. truck can still hand back a
                         // degenerate solid (e.g. an inverted tool that subtracts
@@ -157,10 +181,25 @@ pub(crate) fn apply_join(
                         };
                         if keeps_body {
                             // Propagate face names from the object body to the union
-                            // result (the boss's own new faces stay unnamed).
-                            let named = input_mesh
-                                .as_ref()
-                                .map(|m| crate::mock_kernel::propagate_face_names(m, &u, &body_id));
+                            // result. With an exact kernel history the boss's own new
+                            // faces ALSO get durable generated names
+                            // (`join:{node}:tool-face:{i}`); the matcher path leaves
+                            // them unnamed.
+                            let named = match (&history, &input_names, &input_mesh) {
+                                (Some(history), Some(names), Some(m)) => {
+                                    Some(crate::mock_kernel::propagate_face_names_via_history(
+                                        m,
+                                        names,
+                                        &u,
+                                        history,
+                                        &body_id,
+                                        &format!("join:{extrude_id}"),
+                                    ))
+                                }
+                                _ => input_mesh.as_ref().map(|m| {
+                                    crate::mock_kernel::propagate_face_names(m, &u, &body_id)
+                                }),
+                            };
                             *part = u;
                             body.pristine = named;
                             body.sketch_source = None;

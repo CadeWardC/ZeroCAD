@@ -169,6 +169,9 @@ fn test_parametric_graph_sketch_extrude() {
         id: "sketch_1".to_string(),
         name: "Sketch 1".to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XZ,
             curves,
             shapes: vec![],
@@ -180,6 +183,7 @@ fn test_parametric_graph_sketch_extrude() {
         id: "extrude_1".to_string(),
         name: "Extrude 1".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 15.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
@@ -212,6 +216,9 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
         id: "s".to_string(),
         name: "S".to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves,
             shapes: vec![],
@@ -223,6 +230,7 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
         id: "e".to_string(),
         name: "E".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 5.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
@@ -240,6 +248,9 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
         id: "s2".to_string(),
         name: "S2".to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves: single,
             shapes: vec![],
@@ -251,6 +262,7 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
         id: "e2".to_string(),
         name: "E2".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 5.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,

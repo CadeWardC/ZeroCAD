@@ -25,6 +25,74 @@ impl ZeroCadApp {
         self.selected_body.clear();
     }
 
+    /// Re-enter a committed sketch for editing: load its geometry (and its
+    /// constraint model — legacy shape sketches are promoted to the entity
+    /// model on entry) into the live sketch state, and remember the node id so
+    /// Finish updates it **in place**. Keeping the id is what preserves
+    /// `sketch_face_refs`, dependency edges, and every downstream captured
+    /// reference through the edit.
+    pub(crate) fn edit_sketch(&mut self, node_id: &str, now: f64) {
+        let Some(idx) = self
+            .graph
+            .graph
+            .node_indices()
+            .find(|&i| self.graph.graph[i].id == node_id)
+        else {
+            return;
+        };
+        let vars = self.graph.variable_map();
+        let (cs, shapes, corner_mods, on_face, entity_ids, next_id, solver) =
+            match &self.graph.graph[idx].feature {
+                FeatureType::Sketch {
+                    cs,
+                    shapes,
+                    corner_mods,
+                    on_face,
+                    entity_ids,
+                    next_entity_id,
+                    solver,
+                    ..
+                } => (
+                    *cs,
+                    shapes.clone(),
+                    corner_mods.clone(),
+                    *on_face,
+                    entity_ids.clone(),
+                    *next_entity_id,
+                    solver.clone(),
+                ),
+                _ => return,
+            };
+
+        self.begin_sketch_on(cs, now); // clears sketch state; set ours after
+        self.active_sketch_on_face = on_face;
+        self.active_sketch_face_ref = self.graph.sketch_face_refs.get(node_id).cloned();
+        self.editing_sketch_id = Some(node_id.to_string());
+        self.sketch_shapes = shapes.clone();
+        self.sketch_entity_ids =
+            zerocad_core::sketch::effective_shape_ids(shapes.len(), &entity_ids);
+        self.sketch_corner_mods = corner_mods;
+        // Editing means constraints: promote a legacy shapes sketch to the
+        // entity model (geometry-lossless, provenance preserved via
+        // `derived_from`); an already-promoted sketch loads as-is.
+        let (model, next) = match solver.filter(|m| !m.is_empty()) {
+            Some(model) => (model, next_id),
+            None => zerocad_core::sketch::constraints::promote_shapes_to_entities(
+                &shapes,
+                &entity_ids,
+                &vars,
+                next_id,
+            ),
+        };
+        self.sketch_solver_model = Some(model);
+        self.sketch_next_entity_id = next;
+        self.rebuild_active_sketch_curves();
+        self.status_msg = format!(
+            "Editing sketch {node_id}: drag points to move constrained geometry; \
+             Finish Sketch commits in place."
+        );
+    }
+
     /// Camera (pitch, yaw) that looks straight at a plane with outward normal
     /// `n` (the normal points toward the camera). Reproduces the XY/XZ/YZ locks
     /// for axis-aligned normals and works for any orientation.
@@ -297,16 +365,99 @@ impl ZeroCadApp {
 
     /// Commit the in-progress shape: append its parametric record to the sketch,
     /// then rebuild the live curves from the shape list. Clears the drawing state.
+    ///
+    /// In an Edit Sketch session (constraint model active) the new shape is
+    /// promoted into the model immediately — with its structural constraints
+    /// (a rectangle arrives horizontal/vertical, dimensioned, and anchored) —
+    /// so it participates in drag-to-solve like everything else.
     pub(crate) fn finalize_shape(&mut self, last: (f32, f32)) {
         if self.sketch_points.is_empty() {
             return;
         }
+        let mut inferred_total = 0usize;
         if let Some(shape) = self.shape_record_from_points(last) {
+            if self.sketch_solver_model.is_some() {
+                let vars = self.graph.variable_map();
+                let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);
+                let (addition, next) =
+                    zerocad_core::sketch::constraints::promote_shapes_to_entities(
+                        std::slice::from_ref(&shape),
+                        &[shape_id],
+                        &vars,
+                        self.sketch_next_entity_id + 1,
+                    );
+                let mut next = next;
+                if let Some(model) = &mut self.sketch_solver_model {
+                    // Constraint INFERENCE: the click coordinates were already
+                    // snapped, so structural relationships are read off exactly.
+                    // A new point landing on an existing point becomes a
+                    // persisted Coincident (endpoint snap → real constraint,
+                    // not a lucky coordinate), and an axis-aligned drawn line
+                    // gets Horizontal/Vertical.
+                    use zerocad_core::sketch::{Constraint, EntityId, SketchEntity};
+                    let mut alloc = || {
+                        let id = EntityId(next);
+                        next += 1;
+                        id
+                    };
+                    let mut inferred: Vec<Constraint> = Vec::new();
+                    for new_p in &addition.points {
+                        if let Some(existing) = model
+                            .points
+                            .iter()
+                            .find(|p| p.pos.0 == new_p.pos.0 && p.pos.1 == new_p.pos.1)
+                        {
+                            inferred.push(Constraint::Coincident {
+                                id: alloc(),
+                                a: existing.id,
+                                b: new_p.id,
+                            });
+                        }
+                    }
+                    // Rectangle promotion carries its own H/V; infer only for a
+                    // bare drawn Line.
+                    if matches!(shape, SketchShape::Line { .. }) {
+                        for e in &addition.entities {
+                            if let SketchEntity::Line { id, p0, p1, .. } = e {
+                                let a = addition.points.iter().find(|p| p.id == *p0);
+                                let b = addition.points.iter().find(|p| p.id == *p1);
+                                if let (Some(a), Some(b)) = (a, b) {
+                                    if (a.pos.1 - b.pos.1).abs() < 1.0e-9 {
+                                        inferred.push(Constraint::Horizontal {
+                                            id: alloc(),
+                                            line: *id,
+                                        });
+                                    } else if (a.pos.0 - b.pos.0).abs() < 1.0e-9 {
+                                        inferred.push(Constraint::Vertical {
+                                            id: alloc(),
+                                            line: *id,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let inferred_count = inferred.len();
+                    model.points.extend(addition.points);
+                    model.entities.extend(addition.entities);
+                    model.constraints.extend(addition.constraints);
+                    model.constraints.extend(inferred);
+                    inferred_total = inferred_count;
+                }
+                self.sketch_entity_ids.push(shape_id);
+                self.sketch_next_entity_id = next;
+            }
             self.sketch_shapes.push(shape);
         }
         self.rebuild_active_sketch_curves();
         self.cancel_in_progress_shape();
-        self.status_msg = "Shape added — click to start another.".to_string();
+        self.status_msg = if inferred_total > 0 {
+            format!(
+                "Shape added ({inferred_total} constraint(s) inferred) — click to start another."
+            )
+        } else {
+            "Shape added — click to start another.".to_string()
+        };
     }
 
     /// Total `(vertices, triangles)` across a body-mesh list. Vertices are 6

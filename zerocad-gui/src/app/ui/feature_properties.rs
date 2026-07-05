@@ -27,6 +27,7 @@ impl ZeroCadApp {
                 // Deferred action: extruding needs `&mut self`, but
                 // `node` holds a mutable borrow of the graph below.
                 let mut extrude_request: Option<String> = None;
+                let mut edit_sketch_request: Option<String> = None;
                 let mut modified = false;
 
                 // Capture palette + unit + the variable map before
@@ -155,6 +156,7 @@ impl ZeroCadApp {
                                     curves,
                                     shapes,
                                     corner_mods,
+                                    solver,
                                     ..
                                 } => {
                                     ui.horizontal(|ui| {
@@ -169,10 +171,11 @@ impl ZeroCadApp {
                                     ui.add_space(4.0);
                                     // Resolve against the current variables so the counts
                                     // (and any extrude below) reflect variable-driven dims.
-                                    let eff = zerocad_core::effective_curves(
+                                    let eff = zerocad_core::effective_curves_solved(
                                         curves,
                                         shapes,
                                         corner_mods,
+                                        solver.as_ref(),
                                         &var_map,
                                     );
                                     ui.label(
@@ -237,12 +240,70 @@ impl ZeroCadApp {
                                     if has_faces && extrude_btn.clicked() {
                                         extrude_request = Some(node.id.clone());
                                     }
+                                    ui.add_space(4.0);
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("✏ Edit Sketch").size(12.0),
+                                        )
+                                        .on_hover_text(
+                                            "Re-open this sketch: drag points, geometry \
+                                             re-solves against its constraints; Finish \
+                                             commits in place (downstream features follow).",
+                                        )
+                                        .clicked()
+                                    {
+                                        edit_sketch_request = Some(node.id.clone());
+                                    }
+                                    // Constraint status: DOF / fully constrained /
+                                    // conflict, from the solver model when present.
+                                    if let Some(model) = solver.as_ref().filter(|m| !m.is_empty())
+                                    {
+                                        let report =
+                                            zerocad_core::sketch::solve_model(model, &var_map);
+                                        let (text, color) = match report.outcome {
+                                            zerocad_core::sketch::SolveOutcome::Conflicting => (
+                                                match report.conflicting {
+                                                    Some(id) => format!(
+                                                        "⚠ Over-constrained (conflict: {})",
+                                                        id.0
+                                                    ),
+                                                    None => "⚠ Over-constrained".to_string(),
+                                                },
+                                                egui::Color32::from_rgb(220, 38, 38),
+                                            ),
+                                            zerocad_core::sketch::SolveOutcome::DidNotConverge => (
+                                                "⚠ Constraints did not converge".to_string(),
+                                                egui::Color32::from_rgb(220, 38, 38),
+                                            ),
+                                            zerocad_core::sketch::SolveOutcome::Converged => {
+                                                if report.dof == 0 {
+                                                    (
+                                                        "● Fully constrained".to_string(),
+                                                        egui::Color32::from_rgb(22, 163, 74),
+                                                    )
+                                                } else {
+                                                    (
+                                                        format!(
+                                                            "◐ {} DOF remaining",
+                                                            report.dof
+                                                        ),
+                                                        egui::Color32::from_rgb(37, 99, 235),
+                                                    )
+                                                }
+                                            }
+                                        };
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new(text).size(11.0).color(color),
+                                        );
+                                    }
                                 }
                                 FeatureType::Extrude {
                                     depth,
                                     region_indices,
                                     mode,
                                     depth_expr,
+                                    ..
                                 } => {
                                     ui.horizontal(|ui| {
                                         ui.label(
@@ -545,6 +606,10 @@ impl ZeroCadApp {
 
                 if let Some(sketch_id) = extrude_request {
                     self.begin_extrude_whole_sketch(&sketch_id);
+                }
+                if let Some(sketch_id) = edit_sketch_request {
+                    let now = ui.input(|i| i.time);
+                    self.edit_sketch(&sketch_id, now);
                 }
             }
         } else {

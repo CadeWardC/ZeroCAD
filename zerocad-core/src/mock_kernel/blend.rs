@@ -16,6 +16,18 @@ pub fn fillet_edge(
     fillet_edge_with_hint(solid, p0, p1, None, radius)
 }
 
+/// True when the straight edge `p0..p1` of `solid` is a CONCAVE (reflex
+/// material) edge — an inner pocket corner. Blending such an edge ADDS a
+/// wedge of material, so the caller must swap the subtractive containment
+/// gate for the additive one. False for convex edges and whenever the probe
+/// is inconclusive (unlocatable edge, curved faces).
+pub fn edge_wedge_is_concave(solid: &KernelSolid, p0: [f32; 3], p1: [f32; 3]) -> bool {
+    let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
+    let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
+    let e = Edge::between_points(a, b);
+    openrcad::algo::edge_material_wedge_is_concave(solid, &e) == Some(true)
+}
+
 pub fn fillet_edge_with_hint(
     solid: &KernelSolid,
     p0: [f32; 3],

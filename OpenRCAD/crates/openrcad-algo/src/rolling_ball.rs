@@ -123,6 +123,12 @@ pub struct RollingBallBlend {
     pub end_arc: Edge,
     /// Fillet radius.
     pub radius: f64,
+    /// True when the spine's material wedge is reflex (an inner corner, e.g.
+    /// the vertical edge of a rectangular pocket). A concave blend ADDS
+    /// material — the ball rides in the void wedge — so the convex corner
+    /// closures (miter/sphere/cut runout) don't apply; endpoints terminate
+    /// with the flat cap trim only.
+    pub concave: bool,
 }
 
 /// Apply a selected-edge rolling-ball fillet to a simple planar solid.
@@ -342,16 +348,23 @@ fn fillet_planar_edge_inner(
     // against it (the cut stays a clean vertical cylinder). This is not a sphere
     // path, so it runs regardless of `use_sphere`, and takes priority over the
     // miter/sphere closures.
-    let start_cut = try_corner_cut(
-        solid,
-        &mut blend,
-        start,
-        &start_caps,
-        radius,
-        &mut faces,
-        &mut skipped_faces,
-    )?;
-    let start_tangent_wall = if start_cut {
+    //
+    // A CONCAVE spine blend adds material in the void wedge; every smart corner
+    // closure below encodes the subtractive geometry (ball center inside the
+    // material), so a concave blend skips them all and terminates with the flat
+    // cap trim, which is side-agnostic wire surgery.
+    let convex = !blend.concave;
+    let start_cut = convex
+        && try_corner_cut(
+            solid,
+            &mut blend,
+            start,
+            &start_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
+    let start_tangent_wall = if start_cut || !convex {
         false
     } else {
         try_tangent_curved_wall_runout(
@@ -366,7 +379,8 @@ fn fillet_planar_edge_inner(
     };
     let start_mitered = start_cut
         || start_tangent_wall
-        || (use_sphere
+        || (convex
+            && use_sphere
             && (try_corner_sphere_two_caps(
                 solid,
                 &blend,
@@ -391,16 +405,17 @@ fn fillet_planar_edge_inner(
                 &mut faces,
                 &mut skipped_faces,
             )));
-    let end_cut = try_corner_cut(
-        solid,
-        &mut blend,
-        end,
-        &end_caps,
-        radius,
-        &mut faces,
-        &mut skipped_faces,
-    )?;
-    let end_tangent_wall = if end_cut {
+    let end_cut = convex
+        && try_corner_cut(
+            solid,
+            &mut blend,
+            end,
+            &end_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
+    let end_tangent_wall = if end_cut || !convex {
         false
     } else {
         try_tangent_curved_wall_runout(
@@ -415,7 +430,8 @@ fn fillet_planar_edge_inner(
     };
     let end_mitered = end_cut
         || end_tangent_wall
-        || (use_sphere
+        || (convex
+            && use_sphere
             && (try_corner_sphere_two_caps(
                 solid,
                 &blend,
@@ -449,7 +465,7 @@ fn fillet_planar_edge_inner(
             &start_caps,
             &blend.start_arc,
             radius,
-            use_sphere,
+            use_sphere && convex,
             &mut faces,
             &mut skipped_faces,
         )?;
@@ -462,7 +478,7 @@ fn fillet_planar_edge_inner(
             &end_caps,
             &blend.end_arc,
             radius,
-            use_sphere,
+            use_sphere && convex,
             &mut faces,
             &mut skipped_faces,
         )?;
@@ -3468,11 +3484,17 @@ pub fn rolling_ball_fillet_edge(
 
     if both_planar {
         // `sew` canonicalizes every sewn shell so each planar face's stored normal
-        // agrees with its winding and the shell faces outward, so the face's stored
-        // orientation is trustworthy here (no solid-interior re-derivation needed).
-        let n_a = planar_outward_normal(&adjacent[0])?;
-        let n_b = planar_outward_normal(&adjacent[1])?;
-        planar_blend(edge, &adjacent[0], &adjacent[1], n_a, n_b, radius)
+        // agrees with its winding and the shell faces outward — but boolean CUT
+        // results can retain tool-derived faces (pocket walls) whose effective
+        // normal points INTO the material; the watertight/health gates don't see
+        // orientation, so cross-check against the solid itself.
+        let n_a = planar_outward_normal_checked(solid, &adjacent[0])?;
+        let n_b = planar_outward_normal_checked(solid, &adjacent[1])?;
+        if planar_edge_material_wedge_is_concave(solid, edge, n_a, n_b) == Some(true) {
+            planar_blend_concave(edge, &adjacent[0], &adjacent[1], n_a, n_b, radius)
+        } else {
+            planar_blend(edge, &adjacent[0], &adjacent[1], n_a, n_b, radius)
+        }
     } else {
         rolling_ball_between_curved_faces(solid, edge, &adjacent[0], &adjacent[1], radius)
     }
@@ -3647,6 +3669,7 @@ pub fn rolling_ball_between_curved_faces(
                 start_arc: arc_start,
                 end_arc: arc_end,
                 radius,
+                concave: false,
             });
         }
     }
@@ -3808,6 +3831,7 @@ fn rolling_ball_plane_perp_cylinder(
         start_arc: arc_start,
         end_arc: arc_end,
         radius,
+        concave: false,
     })
 }
 
@@ -3900,7 +3924,157 @@ fn planar_blend(
         start_arc: arc_start,
         end_arc: arc_end,
         radius,
+        concave: false,
     })
+}
+
+/// Rolling-ball blend for a CONCAVE (reflex-material) planar edge — the inner
+/// vertical corner of a pocket. The exact mirror of [`planar_blend`]: the ball
+/// rides in the *void* wedge, tangent to both planes from their outward sides,
+/// and the blend ADDS the material between the band and the corner. Center on
+/// the outward bisector, contacts at the feet of the perpendiculars
+/// (`center − n·r`), band = same cylinder with the material on the far side of
+/// the tube (sew's winding propagation + global outward pass orient it).
+fn planar_blend_concave(
+    edge: &Edge,
+    face_a: &Face,
+    face_b: &Face,
+    n_a: Dir,
+    n_b: Dir,
+    radius: f64,
+) -> Result<RollingBallBlend, RollingBallError> {
+    if !radius.is_finite() || radius <= tolerance::CONFUSION {
+        return Err(RollingBallError::InvalidRadius { radius });
+    }
+
+    let p0 = edge.source().point();
+    let p1 = edge.target().point();
+    let spine_vec = p1 - p0;
+    let spine_dir = spine_vec
+        .normalized()
+        .ok_or(RollingBallError::DegenerateSpine)?;
+
+    let out_a = GeomVec::from_dir(n_a);
+    let out_b = GeomVec::from_dir(n_b);
+    let bisector = out_a + out_b;
+    let bisector_dir = bisector
+        .normalized()
+        .ok_or(RollingBallError::InvalidDihedral)?;
+    let sin_half =
+        out_a.cross(&out_b).magnitude() / bisector.magnitude().max(tolerance::CONFUSION);
+    if sin_half <= tolerance::CONFUSION {
+        return Err(RollingBallError::InvalidDihedral);
+    }
+
+    let center_offset = GeomVec::from_dir(bisector_dir) * (radius / sin_half);
+    let c0 = p0 + center_offset;
+    let c1 = p1 + center_offset;
+
+    // The center sits at distance `radius` on the OUTWARD side of each plane,
+    // so the tangency foot is reached by walking back along the normal.
+    let contact_offset_a = center_offset - GeomVec::from_dir(n_a) * radius;
+    let contact_offset_b = center_offset - GeomVec::from_dir(n_b) * radius;
+    let a0 = p0 + contact_offset_a;
+    let a1 = p1 + contact_offset_a;
+    let b0 = p0 + contact_offset_b;
+    let b1 = p1 + contact_offset_b;
+
+    let contact_a = Edge::between_points(a0, a1);
+    let contact_b = Edge::between_points(b0, b1);
+    let centerline = Edge::between_points(c0, c1);
+    // Contact directions seen from the center are the REVERSED normals here
+    // (`b0 − c0 = −n_b·r`), so the arc frames start on those.
+    let arc_start = contact_arc(c0, spine_dir, n_b.reversed(), radius, b0, a0)?;
+    let arc_end = contact_arc(c1, spine_dir, n_a.reversed(), radius, a1, b1)?;
+
+    let wire = Wire::from_edges([
+        contact_a.clone(),
+        arc_end.clone(),
+        contact_b.clone().reversed(),
+        arc_start.clone(),
+    ]);
+    let surface = GeomSurface::cylinder(CylindricalSurface::new(
+        Ax3::new_axes(c0, spine_dir, n_a.reversed()),
+        radius,
+    ));
+    let blend_face = Face::new(Some(surface), wire);
+
+    Ok(RollingBallBlend {
+        spine: edge.clone(),
+        face_a: face_a.clone(),
+        face_b: face_b.clone(),
+        contact_a,
+        contact_b,
+        centerline,
+        blend_face,
+        start_arc: arc_start,
+        end_arc: arc_end,
+        radius,
+        concave: true,
+    })
+}
+
+/// Classify the material wedge at a straight planar edge: `Some(true)` for a
+/// reflex/concave wedge (inner pocket corner), `Some(false)` for the ordinary
+/// convex wedge, `None` when the probes disagree (degenerate or too thin to
+/// trust — callers should fall back to the convex path).
+///
+/// The discriminator: `û = normalize(n_a − n_b)` lies in the cross-section
+/// plane perpendicular to the wedge bisector. For a material wedge of angle θ
+/// the probes `mid ± ε·û` are BOTH inside the material iff θ > π and both in
+/// the void iff θ < π (independent of the A/B labelling, which only flips the
+/// sign of û).
+pub(crate) fn planar_edge_material_wedge_is_concave(
+    solid: &Solid,
+    edge: &Edge,
+    n_a: Dir,
+    n_b: Dir,
+) -> Option<bool> {
+    let p0 = edge.source().point();
+    let p1 = edge.target().point();
+    let edge_len = p0.distance(&p1);
+    if edge_len <= 10.0 * tolerance::CONFUSION {
+        return None;
+    }
+    let mid = Pnt::new(
+        0.5 * (p0.x() + p1.x()),
+        0.5 * (p0.y() + p1.y()),
+        0.5 * (p0.z() + p1.z()),
+    );
+    let u = (GeomVec::from_dir(n_a) - GeomVec::from_dir(n_b)).normalized()?;
+    let eps = (0.05 * edge_len).clamp(1.0e-4, 0.5);
+    let probe = |sign: f64| {
+        let p = mid + GeomVec::from_dir(u) * (sign * eps);
+        crate::boolean::point_in_solid(&p, solid)
+    };
+    match (probe(1.0), probe(-1.0)) {
+        (true, true) => Some(true),
+        (false, false) => Some(false),
+        _ => None,
+    }
+}
+
+/// Public form of the concavity probe for a straight edge located by its
+/// endpoints: resolves the edge's two adjacent faces in `solid` and, when both
+/// are planar, classifies the material wedge. `None` when the edge can't be
+/// resolved, a face is curved, or the probes are inconclusive.
+pub fn edge_material_wedge_is_concave(solid: &Solid, edge: &Edge) -> Option<bool> {
+    // Snap the request onto the body first: GUI-captured endpoints carry f32
+    // quantization (~1e-6) that the raw adjacency tolerance rejects — the same
+    // reason `fillet_edges` relocates before blending.
+    let edge = relocate_edge(solid, edge).unwrap_or_else(|| edge.clone());
+    let adjacent = adjacent_faces(solid, &edge);
+    if adjacent.len() != 2 {
+        return None;
+    }
+    let both_planar = matches!(adjacent[0].surface(), Some(GeomSurface::Plane(_)))
+        && matches!(adjacent[1].surface(), Some(GeomSurface::Plane(_)));
+    if !both_planar {
+        return None;
+    }
+    let n_a = planar_outward_normal(&adjacent[0]).ok()?;
+    let n_b = planar_outward_normal(&adjacent[1]).ok()?;
+    planar_edge_material_wedge_is_concave(solid, &edge, n_a, n_b)
 }
 
 pub(crate) fn adjacent_faces(solid: &Solid, edge: &Edge) -> Vec<Face> {
@@ -4556,10 +4730,47 @@ pub(crate) fn trim_face_at_corner(
     arc: &Edge,
 ) -> Result<Face, RollingBallError> {
     ensure_trimmable_face(face)?;
-    let edges = face
+    let outer = face
         .outer_wire()
-        .ok_or(RollingBallError::UnsupportedTrimTopology)?
-        .edges();
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+
+    // The corner usually sits on the outer loop (a box top losing its corner
+    // region to a convex fillet). For a CONCAVE blend on a pocket edge, the
+    // face at the pocket opening (the rim) holds the corner on an INNER wire
+    // instead — the same splice shrinks the hole there, i.e. the face GAINS
+    // the cross-section region the added material now caps.
+    if let Ok(new_outer) = splice_arc_at_wire_corner(&outer, corner, contact_a, contact_b, arc) {
+        return rebuild_face(face, new_outer);
+    }
+    let inners = face.inner_wires();
+    for (k, inner) in inners.iter().enumerate() {
+        if let Ok(new_inner) = splice_arc_at_wire_corner(inner, corner, contact_a, contact_b, arc) {
+            let mut new_inners = inners.clone();
+            new_inners[k] = new_inner;
+            return Ok(Face::with_wires(
+                face.surface().cloned(),
+                Some(outer),
+                new_inners,
+                face.orientation(),
+            ));
+        }
+    }
+    Err(RollingBallError::UnsupportedTrimTopology)
+}
+
+/// Replace a wire's `corner` vertex with `arc`: shorten the two loop edges
+/// meeting at the corner back to the blend's contact feet and thread the arc
+/// between them. Pure wire surgery — agnostic to which side of the arc the
+/// face keeps, so it serves both convex (region removed) and concave (region
+/// gained) endpoint trims.
+fn splice_arc_at_wire_corner(
+    wire: &Wire,
+    corner: Pnt,
+    contact_a: Pnt,
+    contact_b: Pnt,
+    arc: &Edge,
+) -> Result<Wire, RollingBallError> {
+    let edges = wire.edges();
     let n = edges.len();
     if n < 3 {
         return Err(RollingBallError::UnsupportedTrimTopology);
@@ -4608,7 +4819,7 @@ pub(crate) fn trim_face_at_corner(
         }
     }
 
-    rebuild_face(face, Wire::from_edges(new_edges))
+    Ok(Wire::from_edges(new_edges))
 }
 
 fn ensure_trimmable_face(face: &Face) -> Result<(), RollingBallError> {
@@ -4781,6 +4992,53 @@ fn point_segment_distance(point: Pnt, a: Pnt, b: Pnt) -> f64 {
     point.distance(&(a + ab * t))
 }
 
+/// [`planar_outward_normal`] cross-checked against the solid: probe just off
+/// the face interior on both sides. If material sits on the stored-outward
+/// side and void on the stored-inward side, the stored orientation is
+/// inverted (a boolean CUT can keep tool faces this way — watertightness and
+/// loop-contiguity checks don't inspect orientation) — flip it. Ambiguous
+/// probes (thin walls, a centroid that misses a holed face) keep the stored
+/// normal.
+pub(crate) fn planar_outward_normal_checked(
+    solid: &Solid,
+    face: &Face,
+) -> Result<Dir, RollingBallError> {
+    let n = planar_outward_normal(face)?;
+    let Some(wire) = face.outer_wire() else {
+        return Ok(n);
+    };
+    let mut acc = GeomVec::new(0.0, 0.0, 0.0);
+    let mut count = 0usize;
+    let mut bb_lo = [f64::INFINITY; 3];
+    let mut bb_hi = [f64::NEG_INFINITY; 3];
+    for edge in wire.edges() {
+        let p = edge.source().point();
+        acc += p - Pnt::origin();
+        count += 1;
+        for (k, v) in [p.x(), p.y(), p.z()].into_iter().enumerate() {
+            bb_lo[k] = bb_lo[k].min(v);
+            bb_hi[k] = bb_hi[k].max(v);
+        }
+    }
+    if count == 0 {
+        return Ok(n);
+    }
+    let centroid = Pnt::origin() + acc * (1.0 / count as f64);
+    let diag = ((bb_hi[0] - bb_lo[0]).powi(2)
+        + (bb_hi[1] - bb_lo[1]).powi(2)
+        + (bb_hi[2] - bb_lo[2]).powi(2))
+    .sqrt();
+    let eps = (diag * 1.0e-3).clamp(1.0e-5, 0.05);
+    let outward_probe = centroid + GeomVec::from_dir(n) * eps;
+    let inward_probe = centroid - GeomVec::from_dir(n) * eps;
+    let outward_material = crate::boolean::point_in_solid(&outward_probe, solid);
+    let inward_material = crate::boolean::point_in_solid(&inward_probe, solid);
+    if outward_material && !inward_material {
+        return Ok(n.reversed());
+    }
+    Ok(n)
+}
+
 pub(crate) fn planar_outward_normal(face: &Face) -> Result<Dir, RollingBallError> {
     let normal = match face.surface() {
         Some(GeomSurface::Plane(plane)) => plane.normal(),
@@ -4863,6 +5121,28 @@ mod tests {
         assert_eq!(clamp_ordered(2.12, 2.14, 2.09), 2.12);
         assert_eq!(clamp_ordered(2.00, 2.14, 2.09), 2.09);
         assert_eq!(clamp_ordered(2.20, 2.14, 2.09), 2.14);
+    }
+
+    #[test]
+    fn concave_probe_classifies_pocket_and_box_edges() {
+        // Pocketed block: inner vertical edge is concave, outer box edge convex.
+        let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+        let tool = make_box(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 6.0);
+        let body = crate::boolean::boolean(&block, &tool, crate::BooleanOp::Cut);
+
+        let pocket_edge =
+            Edge::between_points(Pnt::new(5.0, 5.0, 4.0), Pnt::new(5.0, 5.0, 10.0));
+        assert_eq!(
+            edge_material_wedge_is_concave(&body, &pocket_edge),
+            Some(true)
+        );
+
+        let outer_edge =
+            Edge::between_points(Pnt::new(0.0, 0.0, 0.0), Pnt::new(0.0, 0.0, 10.0));
+        assert_eq!(
+            edge_material_wedge_is_concave(&body, &outer_edge),
+            Some(false)
+        );
     }
 
     #[test]

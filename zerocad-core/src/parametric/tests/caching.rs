@@ -76,6 +76,39 @@ fn eval_cache_is_invalidated_when_an_upstream_node_changes() {
 }
 
 #[test]
+fn eval_cache_key_changes_when_a_sketch_constraint_changes() {
+    // The solver model lives INSIDE the serde-hashed Sketch feature, so any
+    // constraint add/edit must change the prefix key — a `#[serde(skip)]`
+    // regression here would rebuild downstream bodies from a stale mesh.
+    let mut baseline = ParametricGraph::new();
+    add_sketch(&mut baseline, "sketch_1", rect_sketch((0.0, 0.0), (20.0, 12.0)));
+    add_extrude(&mut baseline, "extrude_2", "sketch_1", 8.0, ExtrudeMode::NewBody);
+
+    let mut with_constraint = baseline.clone();
+    let idx = with_constraint.node_map["sketch_1"];
+    if let FeatureType::Sketch { solver, .. } = &mut with_constraint.graph[idx].feature {
+        use crate::sketch::{Constraint, EntityId, SketchPoint, SketchSolverModel};
+        *solver = Some(SketchSolverModel {
+            points: vec![SketchPoint { id: EntityId(0), pos: (0.0, 0.0) }],
+            entities: vec![],
+            constraints: vec![Constraint::Fixed { id: EntityId(1), p: EntityId(0) }],
+        });
+    } else {
+        panic!("test fixture should contain a Sketch");
+    }
+
+    let hidden = std::collections::HashSet::new();
+    let vars = std::collections::HashMap::new();
+    let baseline_nodes = baseline.body_nodes_in_creation_order();
+    let constraint_nodes = with_constraint.body_nodes_in_creation_order();
+    assert_ne!(
+        baseline.eval_prefix_keys(&baseline_nodes, &hidden, &vars),
+        with_constraint.eval_prefix_keys(&constraint_nodes, &hidden, &vars),
+        "the solver model must participate in the mesh-cache prefix hash"
+    );
+}
+
+#[test]
 fn eval_cache_key_changes_when_edge_mod_replay_metadata_changes() {
     let baseline = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
     let mut with_replay = baseline.clone();

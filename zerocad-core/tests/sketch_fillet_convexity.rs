@@ -52,6 +52,9 @@ fn rounded_rect_graph_on(
         id: "sketch_1".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs,
             curves,
             shapes: vec![],
@@ -63,6 +66,7 @@ fn rounded_rect_graph_on(
         id: "extrude_2".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,

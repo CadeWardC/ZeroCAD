@@ -63,7 +63,12 @@ fn push_preview_edge(mesh: &mut MockMesh, a: [f32; 3], b: [f32; 3]) {
     mesh.edge_indices.extend_from_slice(&[i, i + 1]);
 }
 
-fn edge_mod_edge_preview_mesh(edge: &EdgeRef, dist: f32, kind: CornerKind) -> Option<MockMesh> {
+fn edge_mod_edge_preview_mesh(
+    edge: &EdgeRef,
+    dist: f32,
+    kind: CornerKind,
+    concave: bool,
+) -> Option<MockMesh> {
     if matches!(edge.curve, Some(EdgeCurveHint::Circle { .. })) {
         return edge_mod_circular_edge_preview_mesh(edge, dist, kind);
     }
@@ -74,19 +79,28 @@ fn edge_mod_edge_preview_mesh(edge: &EdgeRef, dist: f32, kind: CornerKind) -> Op
     let n1 = v_norm(edge.n1)?;
     let n2 = v_norm(edge.n2)?;
     let dist = dist.max(0.05);
+    // A convex blend carves the corner off, so its band sits on the INWARD side
+    // of both faces (offsets along −n). A concave (inner-corner) blend ADDS a
+    // wedge in the void, so the band sits on the OUTWARD side (offsets along +n)
+    // and the fillet arc faces the corner — the exact mirror.
+    let s = if concave { 1.0 } else { -1.0 };
     let mut rails: Vec<([f32; 3], [f32; 3])> = Vec::new();
     match kind {
         CornerKind::Chamfer => {
-            let normal = v_norm(v_add(n1, n2)).unwrap_or(n1);
-            rails.push((v_scale(n1, -dist), normal));
-            rails.push((v_scale(n2, -dist), normal));
+            let normal = v_norm(v_scale(v_add(n1, n2), s)).unwrap_or(n1);
+            rails.push((v_scale(n1, s * dist), normal));
+            rails.push((v_scale(n2, s * dist), normal));
         }
         CornerKind::Fillet => {
-            let center_offset = v_add(v_scale(n1, -dist), v_scale(n2, -dist));
+            let center_offset = v_add(v_scale(n1, s * dist), v_scale(n2, s * dist));
             for i in 0..=EDGE_MOD_PREVIEW_FILLET_SEGS {
                 let theta =
                     i as f32 / EDGE_MOD_PREVIEW_FILLET_SEGS as f32 * std::f32::consts::FRAC_PI_2;
+                // Sweep the profile from face to face; on the concave side the arc
+                // bows back toward the corner (dir negated), so the ribbon hugs
+                // the added material instead of the removed wedge.
                 let dir = v_norm(v_add(v_scale(n2, theta.cos()), v_scale(n1, theta.sin())))?;
+                let dir = v_scale(dir, -s);
                 rails.push((v_add(center_offset, v_scale(dir, dist)), dir));
             }
         }
@@ -295,6 +309,10 @@ pub(crate) struct EdgeModOp {
     pub(crate) target: String,
     /// The edges being rounded/beveled, captured in world space. Always non-empty.
     pub(crate) edges: Vec<EdgeRef>,
+    /// Whether each edge is concave (inner-corner, ADDS material), one entry per
+    /// edge, captured at selection time from the body mesh. Drives the preview
+    /// ribbon to the correct (outward) side; convex edges stay `false`.
+    pub(crate) concave: Vec<bool>,
     /// Replay intent captured at selection time, one entry per edge.
     pub(crate) replay: Vec<EdgeModReplayIntent>,
     /// Fillet (round) or Chamfer (bevel).
@@ -328,8 +346,9 @@ impl EdgeModOp {
     /// committed B-Rep still comes from the worker-computed edge-mod graph.
     pub(crate) fn immediate_preview_mesh(&self) -> MockMesh {
         let mut mesh = MockMesh::empty();
-        for edge in &self.edges {
-            if let Some(edge_mesh) = edge_mod_edge_preview_mesh(edge, self.dist, self.kind) {
+        for (i, edge) in self.edges.iter().enumerate() {
+            let concave = self.concave.get(i).copied().unwrap_or(false);
+            if let Some(edge_mesh) = edge_mod_edge_preview_mesh(edge, self.dist, self.kind, concave) {
                 mesh.append(edge_mesh);
             }
         }
@@ -356,6 +375,7 @@ mod tests {
         EdgeModOp {
             target: "body".to_string(),
             edges: vec![straight_box_edge()],
+            concave: vec![false],
             replay: vec![EdgeModReplayIntent::default()],
             kind,
             dist,
@@ -394,8 +414,9 @@ mod tests {
     fn circular_edge_preview_mesh_sweeps_the_arc_and_respects_direction() {
         for kind in [CornerKind::Fillet, CornerKind::Chamfer] {
             for reversed in [false, true] {
-                let mesh = edge_mod_edge_preview_mesh(&bite_arc_edge(false, reversed), 3.0, kind)
-                    .expect("circular selections must get an immediate preview");
+                let mesh =
+                    edge_mod_edge_preview_mesh(&bite_arc_edge(false, reversed), 3.0, kind, false)
+                        .expect("circular selections must get an immediate preview");
                 assert!(!mesh.indices.is_empty(), "{kind:?} ribbon has triangles");
                 assert!(
                     !mesh.edge_indices.is_empty(),
@@ -422,10 +443,12 @@ mod tests {
 
     #[test]
     fn closed_rim_preview_mesh_wraps_without_end_fans() {
-        let open = edge_mod_edge_preview_mesh(&bite_arc_edge(false, false), 3.0, CornerKind::Fillet)
-            .expect("open preview");
-        let closed = edge_mod_edge_preview_mesh(&bite_arc_edge(true, false), 3.0, CornerKind::Fillet)
-            .expect("closed preview");
+        let open =
+            edge_mod_edge_preview_mesh(&bite_arc_edge(false, false), 3.0, CornerKind::Fillet, false)
+                .expect("open preview");
+        let closed =
+            edge_mod_edge_preview_mesh(&bite_arc_edge(true, false), 3.0, CornerKind::Fillet, false)
+                .expect("closed preview");
         // The closed rim sweeps the full circle: more triangles, and no
         // end-profile wire fans beyond the two boundary rails.
         assert!(closed.indices.len() > open.indices.len());
@@ -443,6 +466,46 @@ mod tests {
             max_z = max_z.max(v[2]);
         }
         (min_y, max_y, min_z, max_z)
+    }
+
+    /// A concave (inner pocket corner) edge at (5,5), z 4..10, with outward wall
+    /// normals +x/+y. The blend ADDS material in the corner void, so the preview
+    /// ribbon must sit on the +x/+y side (into the pocket), the mirror of a
+    /// convex edge whose ribbon would carve toward −x/−y.
+    #[test]
+    fn concave_edge_preview_mesh_mirrors_to_the_corner_void() {
+        let edge = EdgeRef {
+            p0: [5.0, 5.0, 4.0],
+            p1: [5.0, 5.0, 10.0],
+            n1: [1.0, 0.0, 0.0],
+            n2: [0.0, 1.0, 0.0],
+            curve: None,
+            topology: None,
+        };
+        for kind in [CornerKind::Fillet, CornerKind::Chamfer] {
+            let concave = edge_mod_edge_preview_mesh(&edge, 2.0, kind, true)
+                .unwrap_or_else(|| panic!("{kind:?} concave preview"));
+            let convex = edge_mod_edge_preview_mesh(&edge, 2.0, kind, false)
+                .unwrap_or_else(|| panic!("{kind:?} convex preview"));
+            // Every concave ribbon vertex lies in the corner void (x ≥ 5, y ≥ 5);
+            // every convex one carves the other way (x ≤ 5, y ≤ 5).
+            for v in concave.vertices.chunks_exact(6) {
+                assert!(
+                    v[0] >= 5.0 - 1.0e-4 && v[1] >= 5.0 - 1.0e-4,
+                    "{kind:?} concave ribbon must stay in the corner void, got [{}, {}]",
+                    v[0],
+                    v[1]
+                );
+            }
+            for v in convex.vertices.chunks_exact(6) {
+                assert!(
+                    v[0] <= 5.0 + 1.0e-4 && v[1] <= 5.0 + 1.0e-4,
+                    "{kind:?} convex ribbon must carve inward, got [{}, {}]",
+                    v[0],
+                    v[1]
+                );
+            }
+        }
     }
 
     #[test]
@@ -529,11 +592,31 @@ impl ZeroCadApp {
                     .edge_mod_replay_intent_for_edge(&node_id, edge, &self.hidden_nodes)
             })
             .collect();
+        // Classify each edge's wedge from the body's display mesh so the preview
+        // ribbon draws on the correct side (concave edges add material outward).
+        let body_mesh = self
+            .body_meshes
+            .iter()
+            .find(|(id, _)| *id == node_id)
+            .map(|(_, mesh)| mesh);
+        let concave: Vec<bool> = edges
+            .iter()
+            .map(|edge| {
+                body_mesh
+                    .and_then(|mesh| {
+                        zerocad_core::edge_wedge_is_concave_mesh(
+                            mesh, edge.p0, edge.p1, edge.n1, edge.n2,
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
         let text = self.edge_mod_dist_text.clone();
         let dist = self.eval_dim(&text).unwrap_or(3.0).max(0.2);
         self.edge_mod_op = Some(EdgeModOp {
             target: node_id,
             edges,
+            concave,
             replay,
             kind,
             dist,

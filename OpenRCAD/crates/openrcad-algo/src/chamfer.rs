@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use crate::blend::{chamfer_cylinder, detect_cylinder, BlendError};
 use crate::rolling_ball::{
     adjacent_faces, endpoint_cap_faces, farthest_endpoint, is_concave_cut_cylinder,
-    line_meets_cylinder, nearest_endpoint, orient_edge_between, planar_outward_normal,
-    polyline_edge, relocate_edge, same_face, trim_face_along_spine, trim_face_at_corner,
-    RollingBallError,
+    line_meets_cylinder, nearest_endpoint, orient_edge_between,
+    planar_edge_material_wedge_is_concave, planar_outward_normal_checked, polyline_edge,
+    relocate_edge, same_face, trim_face_along_spine, trim_face_at_corner, RollingBallError,
 };
 use crate::sew::sew;
 
@@ -163,7 +163,14 @@ fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Soli
         return Err(ChamferError::UnsupportedSurfacePair);
     }
 
-    let mut blend = planar_chamfer(edge, &adjacent[0], &adjacent[1], distance)?;
+    // A reflex/concave wedge (inner pocket corner) bevels by ADDING material
+    // across the void: the offset lines walk the other way along each face.
+    // Solid-checked normals: boolean CUT tool faces can carry an inverted
+    // stored orientation, which would mirror the offsets into the material.
+    let n_a = planar_outward_normal_checked(solid, &adjacent[0])?;
+    let n_b = planar_outward_normal_checked(solid, &adjacent[1])?;
+    let concave = planar_edge_material_wedge_is_concave(solid, edge, n_a, n_b) == Some(true);
+    let mut blend = planar_chamfer(edge, &adjacent[0], &adjacent[1], n_a, n_b, distance, concave)?;
     let start = edge.source().point();
     let end = edge.target().point();
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
@@ -223,7 +230,10 @@ fn planar_chamfer(
     edge: &Edge,
     face_a: &Face,
     face_b: &Face,
+    n_a: Dir,
+    n_b: Dir,
     distance: f64,
+    concave: bool,
 ) -> Result<ChamferBlend, ChamferError> {
     let p0 = edge.source().point();
     let p1 = edge.target().point();
@@ -232,18 +242,26 @@ fn planar_chamfer(
         return Err(ChamferError::DegenerateSpine);
     }
 
-    let n_a = planar_outward_normal(face_a)?;
-    let n_b = planar_outward_normal(face_b)?;
     let n_a_vec = GeomVec::from_dir(n_a);
     let n_b_vec = GeomVec::from_dir(n_b);
     if n_a_vec.cross(&n_b_vec).magnitude() <= tolerance::CONFUSION {
         return Err(ChamferError::InvalidDihedral);
     }
 
-    let offset_dir_a = project_onto_plane(-n_b_vec, n_a_vec)
+    // Convex: each contact line walks into the face's material side (away from
+    // the other face's outward normal). Concave (reflex material wedge): the
+    // faces flank the void the other way round, so the walk direction flips —
+    // the bevel plane then spans the void corner and the chamfer ADDS the
+    // wedge of material between it and the edge.
+    let (toward_a, toward_b) = if concave {
+        (n_b_vec, n_a_vec)
+    } else {
+        (-n_b_vec, -n_a_vec)
+    };
+    let offset_dir_a = project_onto_plane(toward_a, n_a_vec)
         .normalized()
         .ok_or(ChamferError::InvalidDihedral)?;
-    let offset_dir_b = project_onto_plane(-n_a_vec, n_b_vec)
+    let offset_dir_b = project_onto_plane(toward_b, n_b_vec)
         .normalized()
         .ok_or(ChamferError::InvalidDihedral)?;
 

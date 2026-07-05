@@ -1,12 +1,47 @@
 use crate::*;
 
+/// One undo/redo entry: the parametric history plus the visibility set. The
+/// visibility set has to travel with the graph — an extrude auto-hides its
+/// sketch, so undoing the extrude must also reveal the sketch again.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UndoSnapshot {
+    graph: zerocad_core::ParametricGraph,
+    #[serde(default)]
+    hidden_nodes: HashSet<String>,
+}
+
 impl ZeroCadApp {
+    fn snapshot_string(&self) -> Option<String> {
+        let snap = UndoSnapshot {
+            graph: self.graph.clone(),
+            hidden_nodes: self.hidden_nodes.clone(),
+        };
+        serde_json::to_string(&snap).ok()
+    }
+
+    /// Restore a snapshot: swap in the graph (rebuilding its skipped id→index
+    /// map so later features can still resolve their parents) and the
+    /// visibility set, then clear all selection/op state that may reference
+    /// nodes that no longer exist.
+    fn restore_snapshot(&mut self, snap: UndoSnapshot) {
+        self.graph = snap.graph;
+        self.graph.rebuild_node_map();
+        self.hidden_nodes = snap.hidden_nodes;
+        self.selected_node_id = None;
+        self.selected_faces.clear();
+        self.selected_body.clear();
+        self.extrude_op = None;
+        self.edge_mod_op = None;
+        self.pending_visual = None;
+        self.reevaluate_geometry();
+    }
+
     /// Recalculates the geometry after a parametric history change (skipping
     /// hidden bodies).
     /// Snapshot the current `ParametricGraph` onto the undo stack (capped at 50)
     /// and clear the redo stack. Call before any destructive graph mutation.
     pub(crate) fn push_undo(&mut self) {
-        if let Ok(snap) = serde_json::to_string(&self.graph) {
+        if let Some(snap) = self.snapshot_string() {
             if self.undo_stack.len() >= 50 {
                 self.undo_stack.remove(0);
             }
@@ -18,18 +53,11 @@ impl ZeroCadApp {
     /// Restore the previous graph snapshot (Ctrl+Z).
     pub(crate) fn undo(&mut self) {
         if let Some(snap) = self.undo_stack.pop() {
-            if let Ok(current) = serde_json::to_string(&self.graph) {
+            if let Some(current) = self.snapshot_string() {
                 self.redo_stack.push(current);
             }
-            if let Ok(graph) = serde_json::from_str::<zerocad_core::ParametricGraph>(&snap) {
-                self.graph = graph;
-                self.selected_node_id = None;
-                self.selected_faces.clear();
-                self.selected_body.clear();
-                self.extrude_op = None;
-                self.edge_mod_op = None;
-                self.pending_visual = None;
-                self.reevaluate_geometry();
+            if let Ok(snap) = serde_json::from_str::<UndoSnapshot>(&snap) {
+                self.restore_snapshot(snap);
                 self.status_msg = "Undo.".to_string();
             }
         } else {
@@ -40,21 +68,14 @@ impl ZeroCadApp {
     /// Reapply the previously undone change (Ctrl+Y / Ctrl+Shift+Z).
     pub(crate) fn redo(&mut self) {
         if let Some(snap) = self.redo_stack.pop() {
-            if let Ok(current) = serde_json::to_string(&self.graph) {
+            if let Some(current) = self.snapshot_string() {
                 if self.undo_stack.len() >= 50 {
                     self.undo_stack.remove(0);
                 }
                 self.undo_stack.push(current);
             }
-            if let Ok(graph) = serde_json::from_str::<zerocad_core::ParametricGraph>(&snap) {
-                self.graph = graph;
-                self.selected_node_id = None;
-                self.selected_faces.clear();
-                self.selected_body.clear();
-                self.extrude_op = None;
-                self.edge_mod_op = None;
-                self.pending_visual = None;
-                self.reevaluate_geometry();
+            if let Ok(snap) = serde_json::from_str::<UndoSnapshot>(&snap) {
+                self.restore_snapshot(snap);
                 self.status_msg = "Redo.".to_string();
             }
         } else {
@@ -751,21 +772,39 @@ impl ZeroCadApp {
             self.status_msg = "Nothing selected to delete.".to_string();
             return;
         };
-        let target = self
+        if self.delete_node_by_id(&del_id) {
+            self.status_msg = "Deleted selection.".to_string();
+        }
+    }
+
+    /// Delete a node by id (undoable): removes it from the graph (via
+    /// `remove_feature`, which keeps the id→index map consistent), clears any
+    /// selection state that referenced it, and reveals a sketch that was
+    /// hidden only because the deleted feature consumed it — deleting a body
+    /// should hand the user back its source sketch.
+    pub(crate) fn delete_node_by_id(&mut self, del_id: &str) -> bool {
+        let exists = self
             .graph
             .graph
             .node_indices()
-            .find(|idx| self.graph.graph[*idx].id == del_id);
-        if let Some(idx) = target {
-            self.push_undo();
-            self.graph.graph.remove_node(idx);
-            self.selected_node_id = None;
-            self.selected_faces.retain(|(sid, _)| sid != &del_id);
-            self.selected_edges.retain(|(sid, _)| sid != &del_id);
-            self.selected_body.retain(|(nid, _)| nid != &del_id);
-            self.hidden_nodes.remove(&del_id);
-            self.reevaluate_geometry();
-            self.status_msg = "Deleted selection.".to_string();
+            .any(|idx| self.graph.graph[idx].id == del_id);
+        if !exists {
+            return false;
         }
+        self.push_undo();
+        let reveal = self.graph.sole_sketch_parents(del_id);
+        self.graph.remove_feature(del_id);
+        for sketch_id in reveal {
+            self.hidden_nodes.remove(&sketch_id);
+        }
+        if self.selected_node_id.as_deref() == Some(del_id) {
+            self.selected_node_id = None;
+        }
+        self.selected_faces.retain(|(sid, _)| sid != del_id);
+        self.selected_edges.retain(|(sid, _)| sid != del_id);
+        self.selected_body.retain(|(nid, _)| nid != del_id);
+        self.hidden_nodes.remove(del_id);
+        self.reevaluate_geometry();
+        true
     }
 }

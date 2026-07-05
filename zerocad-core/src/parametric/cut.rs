@@ -84,6 +84,15 @@ pub(crate) fn directional_cut(cs: &CoordinateSystem, depth: f32) -> (CoordinateS
 /// expanded (and their axis-aligned fallbacks). `None` if the tool's AABB misses
 /// the part or the solver couldn't subtract it. All use the body-splitting
 /// difference, so a cut that severs the part yields separate parts.
+/// A successful one-direction cut: the severed parts, plus — when the general
+/// boolean produced them — the kernel's exact face history and the pre-split
+/// combined result its face indices refer to. Axis-aligned fallback paths
+/// rebuild geometry without a boolean, so they carry no trace.
+pub(crate) struct CutOutcome {
+    pub(crate) parts: Vec<KernelSolid>,
+    pub(crate) trace: Option<(KernelSolid, crate::mock_kernel::BooleanFaceHistory)>,
+}
+
 pub(crate) fn cut_part_one_dir(
     part: &KernelSolid,
     pbb: Option<&([f32; 3], [f32; 3])>,
@@ -91,67 +100,78 @@ pub(crate) fn cut_part_one_dir(
     exact: &Option<KernelSolid>,
     expanded: &Option<KernelSolid>,
     tbb: Option<&([f32; 3], [f32; 3])>,
-) -> Option<Vec<KernelSolid>> {
+    obj_classes: Option<&[Option<u64>]>,
+) -> Option<CutOutcome> {
     let tbb = tbb?;
     let overlaps = pbb.is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, tbb, 0.05));
     if !overlaps {
         return None;
     }
     let changed_difference = |label: &str, tool: &KernelSolid| {
-        let parts = crate::mock_kernel::difference_bodies(part, tool)?;
+        let (parts, combined, history) =
+            crate::mock_kernel::difference_bodies_with_history(part, tool, obj_classes)?;
         if cut_parts_changed(part, &parts) {
             recut_debug(format!("cut variant '{label}' changed part"));
-            Some(parts)
+            Some(CutOutcome {
+                parts,
+                trace: Some((combined, history)),
+            })
         } else {
             recut_debug(format!("cut variant '{label}' made no geometry change"));
             None
         }
     };
-    if let Some(parts) = smooth
+    if let Some(outcome) = smooth
         .as_ref()
         .and_then(|tool| changed_difference("smooth", tool))
     {
-        return Some(parts);
+        return Some(outcome);
     }
-    if let Some(parts) = exact
+    if let Some(outcome) = exact
         .as_ref()
         .and_then(|tool| changed_difference("exact", tool))
     {
-        return Some(parts);
+        return Some(outcome);
     }
-    if let Some(parts) = expanded
+    if let Some(outcome) = expanded
         .as_ref()
         .and_then(|tool| changed_difference("expanded", tool))
     {
-        return Some(parts);
+        return Some(outcome);
     }
     if let Some(part) = exact
         .as_ref()
         .and_then(|tool| crate::mock_kernel::axis_aligned_through_cut(part, tool))
     {
         recut_debug("cut variant 'exact axis-aligned through' changed part");
-        return Some(vec![part]);
+        return Some(CutOutcome {
+            parts: vec![part],
+            trace: None,
+        });
     }
     if let Some(part) = expanded
         .as_ref()
         .and_then(|tool| crate::mock_kernel::axis_aligned_through_cut(part, tool))
     {
         recut_debug("cut variant 'expanded axis-aligned through' changed part");
-        return Some(vec![part]);
+        return Some(CutOutcome {
+            parts: vec![part],
+            trace: None,
+        });
     }
     if let Some(parts) = exact
         .as_ref()
         .and_then(|tool| crate::mock_kernel::axis_aligned_cut_parts(part, tool))
     {
         recut_debug("cut variant 'exact axis-aligned parts' changed part");
-        return Some(parts);
+        return Some(CutOutcome { parts, trace: None });
     }
     if let Some(parts) = expanded
         .as_ref()
         .and_then(|tool| crate::mock_kernel::axis_aligned_cut_parts(part, tool))
     {
         recut_debug("cut variant 'expanded axis-aligned parts' changed part");
-        return Some(parts);
+        return Some(CutOutcome { parts, trace: None });
     }
     recut_debug("all cut variants failed or missed");
     None
@@ -240,8 +260,19 @@ pub(crate) fn cut_part_with_tool(part: &KernelSolid, tool: &CutTool) -> Option<V
     } else {
         (fwd, rev)
     };
-    cut_part_one_dir(part, pbb.as_ref(), first.0, first.1, first.2, first.3)
-        .or_else(|| cut_part_one_dir(part, pbb.as_ref(), second.0, second.1, second.2, second.3))
+    cut_part_one_dir(part, pbb.as_ref(), first.0, first.1, first.2, first.3, None)
+        .or_else(|| {
+            cut_part_one_dir(
+                part,
+                pbb.as_ref(),
+                second.0,
+                second.1,
+                second.2,
+                second.3,
+                None,
+            )
+        })
+        .map(|outcome| outcome.parts)
 }
 
 /// Apply a Cut extrude: subtract each tool from every body part whose AABB it
@@ -255,6 +286,7 @@ pub(crate) fn apply_cut(
     live: &mut [LiveBody],
     extrude_id: &str,
     tools: Vec<CutTool>,
+    boolean_target: Option<&str>,
     warnings: &mut Vec<String>,
 ) {
     for tool in &tools {
@@ -268,9 +300,26 @@ pub(crate) fn apply_cut(
         // meant to remove.
         let mut failed_on_overlap = false;
         for body in live.iter_mut() {
+            // Named targeting: only the pinned body is cut (legacy `None`
+            // keeps the historical every-overlapping-body behavior).
+            if boolean_target.is_some_and(|t| t != body.id) {
+                continue;
+            }
             let before_parts = body.parts.clone();
             let before_pristine = body.pristine.clone();
             let before_sketch_source = body.sketch_source.clone();
+            // Exact-history plumbing for the single-part common case: the input
+            // body's face names per shell-face position, and the derived owner
+            // classes the kernel's owner-aware merge respects.
+            let input_names: Option<Vec<Option<String>>> = match (&before_pristine, &before_parts[..])
+            {
+                (Some(mesh), [part]) => Some(crate::mock_kernel::input_shell_face_names(mesh, part)),
+                _ => None,
+            };
+            let owner_classes: Option<Vec<Option<u64>>> = input_names
+                .as_ref()
+                .map(|names| crate::mock_kernel::owner_classes_from_names(names));
+            let mut cut_trace: Option<(KernelSolid, crate::mock_kernel::BooleanFaceHistory)> = None;
             let mut changed = false;
             let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
             for part in body.parts.drain(..) {
@@ -307,22 +356,31 @@ pub(crate) fn apply_cut(
                 } else {
                     (fwd, rev)
                 };
-                let cut_parts =
-                    cut_part_one_dir(&part, pbb.as_ref(), first.0, first.1, first.2, first.3)
-                        .or_else(|| {
-                            cut_part_one_dir(
-                                &part,
-                                pbb.as_ref(),
-                                second.0,
-                                second.1,
-                                second.2,
-                                second.3,
-                            )
-                        });
+                let cut_parts = cut_part_one_dir(
+                    &part,
+                    pbb.as_ref(),
+                    first.0,
+                    first.1,
+                    first.2,
+                    first.3,
+                    owner_classes.as_deref(),
+                )
+                .or_else(|| {
+                    cut_part_one_dir(
+                        &part,
+                        pbb.as_ref(),
+                        second.0,
+                        second.1,
+                        second.2,
+                        second.3,
+                        owner_classes.as_deref(),
+                    )
+                });
                 match cut_parts {
-                    Some(parts) => {
+                    Some(outcome) => {
                         changed = true;
-                        next.extend(parts);
+                        cut_trace = outcome.trace;
+                        next.extend(outcome.parts);
                     }
                     None => {
                         // Only a genuine solver failure (the tool overlapped this
@@ -347,15 +405,32 @@ pub(crate) fn apply_cut(
                     .and_then(cut_replay_tool_from_source)
                     .unwrap_or_else(|| tool.clone());
                 // Propagate the input body's face names through the cut so a captured
-                // face survives the boolean (Phase 3). Safety-gated to the single-part
-                // common case; any shape/name mismatch falls back to `None`
-                // (re-tessellation), never a wrong name.
-                body.pristine = propagate_cut_face_names(
-                    &before_parts,
-                    before_pristine.as_ref(),
-                    &body.parts,
-                    &body.id,
-                );
+                // face survives the boolean (Phase 3). When the kernel emitted an
+                // exact history (general-boolean path, single named input part),
+                // names ride the history — MODIFIED faces inherit their owner and
+                // the cut's GENERATED walls get durable `cut:{node}:tool-face:{i}`
+                // names. Otherwise the geometric matcher covers it; any mismatch
+                // falls back to `None` (re-tessellation), never a wrong name.
+                body.pristine = match (&cut_trace, &input_names) {
+                    (Some((combined, history)), Some(names))
+                        if before_parts.len() == 1 && before_pristine.is_some() =>
+                    {
+                        Some(crate::mock_kernel::propagate_face_names_via_history(
+                            before_pristine.as_ref().unwrap(),
+                            names,
+                            combined,
+                            history,
+                            &body.id,
+                            &format!("cut:{extrude_id}"),
+                        ))
+                    }
+                    _ => propagate_cut_face_names(
+                        &before_parts,
+                        before_pristine.as_ref(),
+                        &body.parts,
+                        &body.id,
+                    ),
+                };
                 body.sketch_source = next_source;
                 body.cut_tools.extend(cut_tool_recutter_tools(&replay_tool));
                 body.edge_mod_cut_history_path_used = false;

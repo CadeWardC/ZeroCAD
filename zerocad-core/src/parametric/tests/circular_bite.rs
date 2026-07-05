@@ -36,6 +36,7 @@ fn rect_with_circular_hole_newbody_renders() {
             id: "e".to_string(),
             name: "e".to_string(),
             feature: FeatureType::Extrude {
+                target: None,
                 depth: 11.62,
                 region_indices: sel.clone(),
                 mode: ExtrudeMode::NewBody,

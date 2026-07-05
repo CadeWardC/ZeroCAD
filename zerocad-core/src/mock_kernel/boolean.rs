@@ -26,6 +26,44 @@ pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
     quiet_panic(|| boolean_checked(a, b, BooleanOp::Cut).ok())
 }
 
+/// Boolean union with the kernel's exact face history (see
+/// [`openrcad::algo::BooleanFaceHistory`]). `obj_classes` are per-shell-face
+/// owner classes of `a` — coplanar merge respects them (owner-aware merge).
+pub fn union_with_history(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    obj_classes: Option<&[Option<u64>]>,
+) -> Option<(KernelSolid, openrcad::algo::BooleanFaceHistory)> {
+    quiet_panic(|| {
+        openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Fuse, obj_classes, None).ok()
+    })
+}
+
+/// [`difference_bodies`] plus the kernel's exact face history. Returns the
+/// severed parts (canonically ordered), the **combined pre-split result** the
+/// history's face indices refer to, and the history itself.
+pub fn difference_bodies_with_history(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    obj_classes: Option<&[Option<u64>]>,
+) -> Option<(
+    Vec<KernelSolid>,
+    KernelSolid,
+    openrcad::algo::BooleanFaceHistory,
+)> {
+    let (result, history) = quiet_panic(|| {
+        openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Cut, obj_classes, None).ok()
+    })?;
+    let parts = result.split_disconnected();
+    let mut parts = if parts.is_empty() {
+        vec![result.clone()]
+    } else {
+        parts
+    };
+    parts.sort_by_key(part_key);
+    Some((parts, result, history))
+}
+
 /// Boolean difference (`a − b`) that returns **one solid per connected
 /// component** instead of a single shell.
 ///

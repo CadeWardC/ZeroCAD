@@ -370,8 +370,9 @@ pub fn read_zcad(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
     // Legacy plain-JSON `.zcad` files start with `{` (after optional whitespace).
     if let Some(&b) = bytes.iter().find(|b| !b.is_ascii_whitespace()) {
         if b == b'{' {
-            let graph: ParametricGraph =
+            let mut graph: ParametricGraph =
                 serde_json::from_slice(bytes).map_err(|e| ZcadError::Decode(e.to_string()))?;
+            graph.rebuild_node_map();
             return Ok(LoadedZcad {
                 graph,
                 metadata: ZcadMetadata::default(),
@@ -487,7 +488,11 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
         }
     }
 
-    let graph = graph.ok_or_else(|| ZcadError::Decode("file has no graph section".into()))?;
+    let mut graph =
+        graph.ok_or_else(|| ZcadError::Decode("file has no graph section".into()))?;
+    // node_map is #[serde(skip)]; without this, features added after a load
+    // can't resolve their parents (add_dependency would no-op).
+    graph.rebuild_node_map();
 
     // Keep the mesh cache only if it matches the graph we actually loaded.
     let mesh_cache = match (mesh_payload, &graph_bytes) {

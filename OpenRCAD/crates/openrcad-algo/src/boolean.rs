@@ -9,6 +9,43 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::bvh::Bvh;
 use crate::sew::sew;
 
+/// Which input face a boolean-result face came from. `usize` is the face's
+/// position in the operand's `shell().faces()` — the one face key that is
+/// stable across the kernel boundary (tessellation assigns mesh face ids by
+/// the same enumeration).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BooleanFaceSource {
+    /// Position of the source face in the object's shell.
+    Object(usize),
+    /// Position of the source face in the tool's shell.
+    Tool(usize),
+}
+
+/// Exact face correspondence emitted by the boolean pipeline itself (OCCT
+/// `Modified`/`Generated` semantics, resolved to final result faces):
+/// `face_source[i]` names the input face that result face `i` (position in the
+/// result's `shell().faces()`) descends from. An `Object`-sourced face is a
+/// *Modified* survivor/split of that object face; in a Cut, a `Tool`-sourced
+/// face is a wall *Generated* by that tool face. An input face that appears in
+/// no entry was *Deleted*. `None` means the pipeline could not attribute the
+/// face (the caller should fall back to geometric matching, never guess).
+///
+/// Unlike a post-hoc surface-signature matcher, this correspondence is derived
+/// from the split bookkeeping the boolean already performs internally
+/// (`obj_sub`/`tool_sub` parent→child maps), so two same-plane faces with
+/// different owners resolve by their true imprint boundaries.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct BooleanFaceHistory {
+    pub face_source: Vec<Option<BooleanFaceSource>>,
+}
+
+impl BooleanFaceHistory {
+    /// Source of result face at shell position `i`.
+    pub fn source_of(&self, i: usize) -> Option<BooleanFaceSource> {
+        self.face_source.get(i).copied().flatten()
+    }
+}
+
 /// Which operand failed preflight validation for a boolean operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BooleanInput {
@@ -130,6 +167,55 @@ pub fn boolean_checked_bodies(
 
 /// Apply `op` between `object` and `tool`.
 pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
+    boolean_impl(object, tool, op, None, None, false).0
+}
+
+/// [`boolean`] plus the exact face correspondence ([`BooleanFaceHistory`]).
+///
+/// `obj_classes` / `tool_classes` optionally give each input face (by shell
+/// position) an **owner class**: the coplanar/cocylindrical merge passes then
+/// refuse to combine result faces descending from different classes, so a
+/// caller's face identities survive the merge (the Bidarra owner-aware-merge
+/// rule). `None` classes ⇒ merges behave exactly as [`boolean`].
+pub fn boolean_with_history(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+) -> (Solid, BooleanFaceHistory) {
+    let (solid, history) = boolean_impl(object, tool, op, obj_classes, tool_classes, true);
+    (solid, history.unwrap_or_default())
+}
+
+/// Checked variant of [`boolean_with_history`] — same validation as
+/// [`boolean_checked`].
+pub fn boolean_checked_with_history(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
+    validate_operand(BooleanInput::Object, object)?;
+    validate_operand(BooleanInput::Tool, tool)?;
+
+    let (result, history) = catch_unwind(AssertUnwindSafe(|| {
+        boolean_with_history(object, tool, op, obj_classes, tool_classes)
+    }))
+    .map_err(|_| BooleanError::Panicked)?;
+    let result = validate_output(result)?;
+    Ok((result, history))
+}
+
+fn boolean_impl(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    want_history: bool,
+) -> (Solid, Option<BooleanFaceHistory>) {
     let tol = 1e-5;
 
     // 0. Fuzzy pre-snap: nudge the tool so a near-coincident, overlapping planar
@@ -395,6 +481,32 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
 
     // 3. Classify all split faces
     let mut kept_faces = Vec::new();
+    // Parallel to `kept_faces`: which INPUT face (by shell position) each kept
+    // split face descends from — read straight from the split bookkeeping
+    // (`obj_sub`/`tool_sub`), so it is exact, not matched.
+    let mut kept_sources: Vec<Option<BooleanFaceSource>> = Vec::new();
+    let origin_obj: std::collections::HashMap<FaceId, usize> = faces_obj
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, f)| {
+            obj_sub
+                .get(&f.id())
+                .into_iter()
+                .flatten()
+                .map(move |&child| (child, idx))
+        })
+        .collect();
+    let origin_tool: std::collections::HashMap<FaceId, usize> = faces_tool
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, f)| {
+            tool_sub
+                .get(&f.id())
+                .into_iter()
+                .flatten()
+                .map(move |&child| (child, idx))
+        })
+        .collect();
 
     let brep_obj = builder_obj.build(); // seals into Arc<BRep>
     let brep_tool = builder_tool.build();
@@ -452,6 +564,7 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
         if coplanar_same {
             match op {
                 BooleanOp::Fuse | BooleanOp::Common => {
+                    kept_sources.push(origin_obj.get(&f_id).copied().map(BooleanFaceSource::Object));
                     kept_faces.push(face);
                 }
                 BooleanOp::Cut => {}
@@ -466,6 +579,7 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
                 BooleanOp::Common => inside,
             };
             if keep {
+                kept_sources.push(origin_obj.get(&f_id).copied().map(BooleanFaceSource::Object));
                 kept_faces.push(face);
             }
         }
@@ -501,6 +615,7 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
                 BooleanOp::Common => inside,
             };
             if keep {
+                kept_sources.push(origin_tool.get(&f_id).copied().map(BooleanFaceSource::Tool));
                 if op == BooleanOp::Cut {
                     let reversed_face =
                         Face::from_id(brep_tool.clone(), f_id, f_data.orientation.reversed());
@@ -523,13 +638,112 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     //     edges share endpoints. A no-op (and skipped) when already watertight.
     let solid = crate::merge::heal_tjunctions(&solid, tol);
 
+    // History/owner plumbing. `sew`/`heal`/`merge` each re-key FaceIds, so
+    // origins are not threaded through them — they are *resolved*: every stage's
+    // faces are geometric subsets of the kept split faces, so sampling a point
+    // on a face and asking which kept face's trimming loops contain it recovers
+    // the exact origin (imprint boundaries decide coplanar ties, not
+    // signatures).
+    let has_classes = obj_classes.is_some() || tool_classes.is_some();
+    let class_map = if has_classes {
+        let origins = resolve_face_origins(&solid, &kept_faces, &kept_sources, tol);
+        let mut map: std::collections::HashMap<FaceId, u64> = std::collections::HashMap::new();
+        for (face, origin) in solid.shell().faces().iter().zip(&origins) {
+            // Tag the side into the class key so an object class value can
+            // never collide with an equal tool class value.
+            let class = match origin {
+                Some(BooleanFaceSource::Object(i)) => obj_classes
+                    .and_then(|c| c.get(*i).copied().flatten())
+                    .map(|cl| (cl << 1) | 0),
+                Some(BooleanFaceSource::Tool(i)) => tool_classes
+                    .and_then(|c| c.get(*i).copied().flatten())
+                    .map(|cl| (cl << 1) | 1),
+                None => None,
+            };
+            if let Some(class) = class {
+                map.insert(face.id(), class);
+            }
+        }
+        Some(map)
+    } else {
+        None
+    };
+
     // 5. Merge coplanar faces split by the imprint (e.g. a union of two boxes
     //    keeps the shared face as several coplanar strips), then cocylindrical
     //    faces split by it (a corner cut whose arc crosses a `make_cylinder` rim
     //    seam leaves the concave wall as two faces). Each is a no-op fallback
-    //    unless it produces a watertight, healthy, smaller solid.
-    let solid = crate::merge::merge_coplanar_faces(&solid);
-    crate::merge::merge_cocylindrical_faces(&solid)
+    //    unless it produces a watertight, healthy, smaller solid. When owner
+    //    classes are supplied, faces of different owners are never merged (the
+    //    merge would erase the identity the history just preserved).
+    let solid = crate::merge::merge_coplanar_faces_classed(&solid, class_map.as_ref());
+    let solid = crate::merge::merge_cocylindrical_faces_classed(&solid, class_map.as_ref());
+
+    let history = want_history
+        .then(|| resolve_face_origins(&solid, &kept_faces, &kept_sources, tol))
+        .map(|face_source| BooleanFaceHistory { face_source });
+    (solid, history)
+}
+
+/// For each face of `solid` (in shell order), the kept split face it descends
+/// from: same supporting surface (the sample point projects onto it within
+/// tolerance, outward normals aligned) *and* the sample point inside the kept
+/// face's trimming loops. Containment against the true imprint boundaries is
+/// what disambiguates coplanar candidates exactly.
+fn resolve_face_origins(
+    solid: &Solid,
+    kept_faces: &[Face],
+    kept_sources: &[Option<BooleanFaceSource>],
+    tol: f64,
+) -> Vec<Option<BooleanFaceSource>> {
+    let surf_tol = (tol * 10.0).max(1e-6);
+    solid
+        .shell()
+        .faces()
+        .iter()
+        .map(|face| {
+            let pos = point_on_face(face);
+            let n_face = effective_normal_at(face, &pos)?;
+            kept_faces
+                .iter()
+                .zip(kept_sources)
+                .find_map(|(kept, source)| {
+                    let surf = kept.surface()?;
+                    let (u, v) = crate::intersect::search_nearest_parameter(surf, &pos, (0.0, 0.0));
+                    if surf.point(u, v).distance(&pos) > surf_tol {
+                        return None;
+                    }
+                    let n_kept = effective_normal_uv(kept, u, v)?;
+                    if n_face.dot(&n_kept) < 0.5 {
+                        return None;
+                    }
+                    if !crate::intersect::is_inside_trimming_loops(u, v, kept) {
+                        return None;
+                    }
+                    *source
+                })
+        })
+        .collect()
+}
+
+/// Outward normal of `face` at the surface point nearest `pos` (dU × dV with
+/// the face's orientation applied). `None` for a degenerate parameterization.
+fn effective_normal_at(face: &Face, pos: &Pnt) -> Option<Dir> {
+    let surf = face.surface()?;
+    let (u, v) = crate::intersect::search_nearest_parameter(surf, pos, (0.0, 0.0));
+    effective_normal_uv(face, u, v)
+}
+
+fn effective_normal_uv(face: &Face, u: f64, v: f64) -> Option<Dir> {
+    let surf = face.surface()?;
+    let (_, du, dv) = surf.d1(u, v);
+    let n = du.cross(&dv);
+    let n = n.normalized()?;
+    let mut dir = Dir::new(n.x(), n.y(), n.z());
+    if face.orientation() == openrcad_topo::Orientation::Reversed {
+        dir = dir.reversed();
+    }
+    Some(dir)
 }
 
 fn validate_operand(input: BooleanInput, solid: &Solid) -> Result<(), BooleanError> {
@@ -1262,6 +1476,148 @@ mod tests {
     use openrcad_foundation::Pnt;
     use openrcad_primitives::make_box;
     use openrcad_topo::Shell;
+
+    /// Shell position of the input/result face whose plane has |normal·axis|≈1
+    /// and passes through `coord` on `axis`.
+    fn plane_face_pos(solid: &Solid, axis: usize, coord: f64) -> Option<usize> {
+        solid.shell().faces().iter().position(|f| {
+            let Some(GeomSurface::Plane(p)) = f.surface() else {
+                return false;
+            };
+            let n = p.normal();
+            if [n.x(), n.y(), n.z()][axis].abs() < 0.99 {
+                return false;
+            }
+            let loc = p.location();
+            (([loc.x(), loc.y(), loc.z()][axis]) - coord).abs() < 1e-6
+        })
+    }
+
+    #[test]
+    fn history_traces_union_faces_to_their_operands() {
+        // obj [0,10]^3 ∪ tool [5,15]x[0,10]x[0,10] → one [0,15] box.
+        let obj = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let (result, hist) = boolean_with_history(&obj, &tool, BooleanOp::Fuse, None, None);
+
+        assert_eq!(
+            hist.face_source.len(),
+            result.shell().faces().len(),
+            "one history entry per result face"
+        );
+        let x0 = plane_face_pos(&result, 0, 0.0).expect("x=0 face");
+        let x15 = plane_face_pos(&result, 0, 15.0).expect("x=15 face");
+        let obj_x0 = plane_face_pos(&obj, 0, 0.0).expect("object x=0 input face");
+        let tool_x15 = plane_face_pos(&tool, 0, 15.0).expect("tool x=15 input face");
+        assert_eq!(
+            hist.source_of(x0),
+            Some(BooleanFaceSource::Object(obj_x0)),
+            "x=0 face must trace to the object's own x=0 input face"
+        );
+        assert_eq!(
+            hist.source_of(x15),
+            Some(BooleanFaceSource::Tool(tool_x15)),
+            "x=15 face must trace to the tool's x=15 input face"
+        );
+        assert!(
+            hist.face_source.iter().all(|s| s.is_some()),
+            "every union face should be attributed, got {:?}",
+            hist.face_source
+        );
+    }
+
+    #[test]
+    fn history_traces_cut_pocket_walls_to_the_tool() {
+        // Square pillar punched through the box in Z: 4 generated hole walls.
+        let obj = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(3.0, 3.0, -1.0), 4.0, 4.0, 12.0);
+        let (result, hist) = boolean_with_history(&obj, &tool, BooleanOp::Cut, None, None);
+
+        let tool_walls = hist
+            .face_source
+            .iter()
+            .filter(|s| matches!(s, Some(BooleanFaceSource::Tool(_))))
+            .count();
+        assert!(
+            tool_walls >= 4,
+            "the 4 generated hole walls must trace to the tool, got {:?}",
+            hist.face_source
+        );
+        // Modified: the box top survives (with a hole) and keeps its identity.
+        let top = plane_face_pos(&result, 2, 10.0).expect("result keeps a z=10 top");
+        let obj_top = plane_face_pos(&obj, 2, 10.0).expect("object z=10 input face");
+        assert_eq!(
+            hist.source_of(top),
+            Some(BooleanFaceSource::Object(obj_top)),
+            "the holed top face is a MODIFIED image of the object's top"
+        );
+        // Determinism: the correspondence is identical across rebuilds.
+        let (_, hist2) = boolean_with_history(&obj, &tool, BooleanOp::Cut, None, None);
+        assert_eq!(hist.face_source, hist2.face_source);
+    }
+
+    #[test]
+    fn owner_classes_block_cross_owner_coplanar_merge() {
+        // Two boxes side by side, tops coplanar at z=10. Unclassed, the merge
+        // unifies the tops into ONE face; with distinct owner classes on every
+        // face of each operand, the two tops must stay separate faces (each
+        // attributed to its own operand) — the Bidarra owner-aware-merge rule.
+        let obj = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+
+        let unclassed = boolean(&obj, &tool, BooleanOp::Fuse);
+        let unclassed_tops = unclassed
+            .shell()
+            .faces()
+            .iter()
+            .filter(|f| match f.surface() {
+                Some(GeomSurface::Plane(p)) => {
+                    p.normal().z().abs() > 0.99 && (p.location().z() - 10.0).abs() < 1e-6
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(unclassed_tops, 1, "legacy merge unifies the coplanar tops");
+
+        let obj_classes: Vec<Option<u64>> =
+            (0..obj.shell().faces().len() as u64).map(Some).collect();
+        let tool_classes: Vec<Option<u64>> =
+            (0..tool.shell().faces().len() as u64).map(Some).collect();
+        let (classed, hist) = boolean_with_history(
+            &obj,
+            &tool,
+            BooleanOp::Fuse,
+            Some(&obj_classes),
+            Some(&tool_classes),
+        );
+        let classed_tops: Vec<usize> = classed
+            .shell()
+            .faces()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| match f.surface() {
+                Some(GeomSurface::Plane(p)) => (p.normal().z().abs() > 0.99
+                    && (p.location().z() - 10.0).abs() < 1e-6)
+                    .then_some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            classed_tops.len(),
+            2,
+            "owner-aware merge must keep the two differently-owned tops distinct"
+        );
+        let sides: Vec<_> = classed_tops.iter().map(|&i| hist.source_of(i)).collect();
+        assert!(
+            sides
+                .iter()
+                .any(|s| matches!(s, Some(BooleanFaceSource::Object(_))))
+                && sides
+                    .iter()
+                    .any(|s| matches!(s, Some(BooleanFaceSource::Tool(_)))),
+            "one top from each operand, got {sides:?}"
+        );
+    }
 
     #[test]
     fn ordered_curve_bounds_accept_reversed_and_nonfinite_limits() {

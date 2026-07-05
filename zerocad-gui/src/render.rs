@@ -1329,6 +1329,7 @@ impl ZeroCadApp {
                 curves,
                 shapes,
                 corner_mods,
+                solver,
                 ..
             } = &node.feature
             {
@@ -1340,7 +1341,13 @@ impl ZeroCadApp {
                 };
 
                 // Draw the variable-resolved geometry of the sketch.
-                let eff = zerocad_core::effective_curves(curves, shapes, corner_mods, &var_map);
+                let eff = zerocad_core::effective_curves_solved(
+                    curves,
+                    shapes,
+                    corner_mods,
+                    solver.as_ref(),
+                    &var_map,
+                );
                 let curves = &eff;
                 let regions = detect_regions(curves);
                 let selected = if cut_preview_sources.contains(&node.id) {
@@ -1376,6 +1383,18 @@ impl ZeroCadApp {
                 &to_screen,
                 true,
             );
+
+            // Constraint badges + selection markers for an Edit Sketch session:
+            // each constraint draws its glyph at its anchor (line midpoint /
+            // point / between the two points), red when it is the reported
+            // conflict; selected points/entities get a highlight ring so the
+            // palette's applicability is legible.
+            if let Some(model) = &self.sketch_solver_model {
+                let conflict = self.sketch_conflict_constraint;
+                self.draw_constraint_badges(&painter, model, conflict, &|p: (f64, f64)| {
+                    to_screen((p.0 as f32, p.1 as f32))
+                });
+            }
 
             // Markers on the corners staged (but not yet committed) for the
             // Fillet/Chamfer tool. The geometry already previews rounded/beveled;

@@ -111,6 +111,7 @@ impl ZeroCadApp {
                 id: extrude_id.clone(),
                 name: format!("Preview Extrude {}", i + 1),
                 feature: FeatureType::Extrude {
+                    target: None,
                     depth: op.depth,
                     region_indices,
                     mode: op.mode,
@@ -471,10 +472,25 @@ impl ZeroCadApp {
             depth_expr,
         );
 
+        // Cut/Join from a face-attached sketch defaults to targeting THAT body
+        // (the one the sketch sits on) — the boolean then can't leak onto a
+        // bystander body that later drifts into the tool's path, and a deleted
+        // target fails loud instead of cutting something else.
+        let target = if matches!(mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
+            self.graph
+                .sketch_face_refs
+                .get(sketch_id)
+                .and_then(|fref| fref.topology.as_ref())
+                .and_then(|t| t.body_id.clone())
+        } else {
+            None
+        };
+
         let extrude_node = FeatureNode {
             id: extrude_id.clone(),
             name: feature_name,
             feature: FeatureType::Extrude {
+                target,
                 depth,
                 region_indices,
                 mode,
@@ -499,10 +515,18 @@ impl ZeroCadApp {
                     shapes,
                     corner_mods,
                     on_face,
+                    solver,
+                    ..
                 } = &node.feature
                 {
                     // Resolve variable-driven dimensions before detecting faces.
-                    let eff = zerocad_core::effective_curves(curves, shapes, corner_mods, &var_map);
+                    let eff = zerocad_core::effective_curves_solved(
+                        curves,
+                        shapes,
+                        corner_mods,
+                        solver.as_ref(),
+                        &var_map,
+                    );
                     return Some((*cs, detect_regions(&eff), *on_face));
                 }
             }

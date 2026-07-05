@@ -43,11 +43,23 @@ fn quantize(p: &Pnt) -> QPoint {
 /// Returns a solid with the merge applied when it is watertight, healthy, and has
 /// strictly fewer faces; otherwise returns `solid` unchanged.
 pub fn merge_coplanar_faces(solid: &Solid) -> Solid {
+    merge_coplanar_faces_classed(solid, None)
+}
+
+/// [`merge_coplanar_faces`] with **owner classes**: faces carrying different
+/// classes are never merged even when coplanar (the Bidarra owner-aware-merge
+/// rule — merging across owners would erase the face identity the boolean
+/// history propagates). Faces absent from the map form one wildcard group per
+/// plane, preserving legacy behavior for unclassed geometry.
+pub fn merge_coplanar_faces_classed(
+    solid: &Solid,
+    classes: Option<&HashMap<FaceId, u64>>,
+) -> Solid {
     let mut brep = (**solid.brep()).clone();
     let mut face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
     let original_count = face_ids.len();
 
-    do_merge(&mut brep, &mut face_ids);
+    do_merge(&mut brep, &mut face_ids, classes);
 
     if face_ids.len() >= original_count {
         return solid.clone();
@@ -83,11 +95,20 @@ pub fn merge_coplanar_faces(solid: &Solid) -> Solid {
 /// fewer faces; otherwise returns `solid` unchanged — so it can only ever improve a
 /// boolean result.
 pub fn merge_cocylindrical_faces(solid: &Solid) -> Solid {
+    merge_cocylindrical_faces_classed(solid, None)
+}
+
+/// [`merge_cocylindrical_faces`] with owner classes — see
+/// [`merge_coplanar_faces_classed`].
+pub fn merge_cocylindrical_faces_classed(
+    solid: &Solid,
+    classes: Option<&HashMap<FaceId, u64>>,
+) -> Solid {
     let mut brep = (**solid.brep()).clone();
     let mut face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
     let original_count = face_ids.len();
 
-    do_merge_cocylindrical(&mut brep, &mut face_ids);
+    do_merge_cocylindrical(&mut brep, &mut face_ids, classes);
 
     if face_ids.len() >= original_count {
         return solid.clone();
@@ -206,10 +227,14 @@ pub fn heal_tjunctions(solid: &Solid, tol: f64) -> Solid {
 
 /// Group cylinder faces by axis frame + radius + orientation, merge each group,
 /// and rewrite `face_ids` with the merged faces (other faces pass through).
-fn do_merge_cocylindrical(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
+fn do_merge_cocylindrical(
+    brep: &mut BRep,
+    face_ids: &mut Vec<FaceId>,
+    classes: Option<&HashMap<FaceId, u64>>,
+) {
     let qf = |x: f64| (x * 1.0e6).round() as i64;
-    // (axis location, axis direction, radius, orientation side).
-    type CylKey = (i64, i64, i64, i64, i64, i64, i64, u8);
+    // (axis location, axis direction, radius, orientation side, owner class).
+    type CylKey = (i64, i64, i64, i64, i64, i64, i64, u8, Option<u64>);
     let mut groups: HashMap<CylKey, Vec<FaceId>> = HashMap::new();
     let mut passthrough: Vec<FaceId> = Vec::new();
 
@@ -237,6 +262,7 @@ fn do_merge_cocylindrical(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
             qf(dir.z()),
             qf(cyl.radius()),
             side,
+            classes.and_then(|m| m.get(&fid)).copied(),
         );
         groups.entry(key).or_default().push(fid);
     }
@@ -324,10 +350,15 @@ fn try_merge_cyl_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId
 
 /// Group planar faces by support plane + outward side, merge each group, and
 /// rewrite `face_ids` with the merged faces (curved/lone faces pass through).
-fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
-    // Key a face by its effective outward normal and signed plane offset.
+fn do_merge(
+    brep: &mut BRep,
+    face_ids: &mut Vec<FaceId>,
+    classes: Option<&HashMap<FaceId, u64>>,
+) {
+    // Key a face by its effective outward normal, signed plane offset, and
+    // owner class (different owners must never merge; None = wildcard group).
     let qf = |x: f64| (x * 1.0e6).round() as i64;
-    let mut groups: HashMap<(i64, i64, i64, i64), Vec<FaceId>> = HashMap::new();
+    let mut groups: HashMap<(i64, i64, i64, i64, Option<u64>), Vec<FaceId>> = HashMap::new();
     let mut passthrough: Vec<FaceId> = Vec::new();
 
     for &fid in face_ids.iter() {
@@ -343,7 +374,13 @@ fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>) {
             n = n.reversed();
         }
         let off = FVec::from_dir(n).dot(&(plane.location() - Pnt::origin()));
-        let key = (qf(n.x()), qf(n.y()), qf(n.z()), qf(off));
+        let key = (
+            qf(n.x()),
+            qf(n.y()),
+            qf(n.z()),
+            qf(off),
+            classes.and_then(|m| m.get(&fid)).copied(),
+        );
         groups.entry(key).or_default().push(fid);
     }
 

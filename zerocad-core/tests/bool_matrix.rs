@@ -16,6 +16,9 @@ fn sk(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, c: SketchCurves) 
         id: id.into(),
         name: id.into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs,
             curves: c,
             shapes: vec![],
@@ -29,6 +32,7 @@ fn ex(g: &mut ParametricGraph, id: &str, s: &str, d: f32, m: ExtrudeMode) {
         id: id.into(),
         name: id.into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: d,
             region_indices: vec![],
             mode: m,

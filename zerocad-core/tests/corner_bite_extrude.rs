@@ -49,6 +49,9 @@ fn corner_bite_graph_on(
         id: "sketch_1".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs,
             curves: c,
             shapes: vec![],
@@ -60,6 +63,7 @@ fn corner_bite_graph_on(
         id: "extrude_2".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,

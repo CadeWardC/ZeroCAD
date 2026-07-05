@@ -149,6 +149,9 @@ fn cutout_fillet_repro_graph() -> ParametricGraph {
         id: "sketch_2".into(),
         name: "Cut circle".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: top_plane(15.0),
             curves: cut,
             shapes: vec![],
@@ -160,6 +163,7 @@ fn cutout_fillet_repro_graph() -> ParametricGraph {
         id: "extrude_3".into(),
         name: "Through cut".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: -20.0,
             region_indices: vec![],
             mode: ExtrudeMode::Cut,

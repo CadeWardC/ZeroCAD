@@ -34,11 +34,67 @@ impl ParametricGraph {
 
     /// Establish a directional dependency (e.g. Extrude depends on Sketch)
     pub fn add_dependency(&mut self, parent_id: &str, child_id: &str) {
-        if let (Some(&parent_idx), Some(&child_idx)) =
-            (self.node_map.get(parent_id), self.node_map.get(child_id))
+        if let (Some(parent_idx), Some(child_idx)) =
+            (self.resolve_node(parent_id), self.resolve_node(child_id))
         {
             self.graph.add_edge(parent_idx, child_idx, ());
         }
+    }
+
+    /// Rebuild the id → `NodeIndex` lookup from the live graph. The map is
+    /// `#[serde(skip)]`, so a deserialized graph (undo/redo snapshot, `.zcad`
+    /// load) starts with it empty, and petgraph's `remove_node` swap-moves the
+    /// last node's index — both leave stale entries that would silently break
+    /// `add_dependency` for later features (an extrude that can't find its
+    /// sketch builds no body).
+    pub fn rebuild_node_map(&mut self) {
+        self.node_map.clear();
+        for idx in self.graph.node_indices() {
+            self.node_map.insert(self.graph[idx].id.clone(), idx);
+        }
+    }
+
+    /// Resolve a feature id to its current index, self-healing a missing or
+    /// stale `node_map` entry (see [`Self::rebuild_node_map`]).
+    fn resolve_node(&mut self, id: &str) -> Option<NodeIndex> {
+        if let Some(&idx) = self.node_map.get(id) {
+            if self.graph.node_weight(idx).map(|n| n.id.as_str()) == Some(id) {
+                return Some(idx);
+            }
+        }
+        self.rebuild_node_map();
+        self.node_map.get(id).copied()
+    }
+
+    /// Remove a feature node by id, keeping `node_map` consistent (petgraph
+    /// swap-removes, which changes another node's index). Returns whether the
+    /// node existed.
+    pub fn remove_feature(&mut self, id: &str) -> bool {
+        let Some(idx) = self.resolve_node(id) else {
+            return false;
+        };
+        self.graph.remove_node(idx);
+        self.rebuild_node_map();
+        true
+    }
+
+    /// Ids of `id`'s direct parents that are sketches and feed **only** `id`.
+    /// When the GUI deletes a body it uses this to reveal the sketch that was
+    /// auto-hidden when the body consumed it.
+    pub fn sole_sketch_parents(&self, id: &str) -> Vec<String> {
+        let Some(idx) = self.graph.node_indices().find(|i| self.graph[*i].id == id) else {
+            return Vec::new();
+        };
+        self.graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .filter(|p| matches!(self.graph[*p].feature, FeatureType::Sketch { .. }))
+            .filter(|p| {
+                self.graph
+                    .neighbors_directed(*p, petgraph::Direction::Outgoing)
+                    .all(|c| c == idx)
+            })
+            .map(|p| self.graph[p].id.clone())
+            .collect()
     }
 
     /// Clear all nodes except base Origin
@@ -277,8 +333,10 @@ impl ParametricGraph {
                         // Derive the display from the part (single source of truth) so a
                         // primitive box matches a sketched-extruded rectangle exactly;
                         // the analytic make_box mesh is only the cracked-mesh fallback.
-                        let pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
+                        let mut pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
                             .unwrap_or_else(|| MockMesh::make_box(*w, *h, *d));
+                        stamp_box_face_refs(&mut pristine, &node.id);
+                        crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
                         live.push(LiveBody {
                             id: node.id.clone(),
                             parts: vec![solid],
@@ -293,8 +351,11 @@ impl ParametricGraph {
                         if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
                             // Display derives from the part (single source of truth); the
                             // analytic make_cylinder mesh is the cracked-mesh fallback.
-                            let pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
-                                .unwrap_or_else(|| MockMesh::make_cylinder(*r, *h, 32));
+                            let mut pristine =
+                                crate::mock_kernel::try_display_mesh_from_part(&solid)
+                                    .unwrap_or_else(|| MockMesh::make_cylinder(*r, *h, 32));
+                            stamp_cylinder_face_refs(&mut pristine, &node.id);
+                            crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
                             live.push(LiveBody {
                                 id: node.id.clone(),
                                 parts: vec![solid],
@@ -311,6 +372,7 @@ impl ParametricGraph {
                         region_indices,
                         mode,
                         depth_expr,
+                        target,
                     } => {
                         // An expression that still resolves drives the depth; a
                         // missing/broken variable falls back to the stored value and
@@ -337,6 +399,7 @@ impl ParametricGraph {
                             eff_depth,
                             region_indices,
                             *mode,
+                            target.as_deref(),
                             &sketch_cache,
                             &mut live,
                             &mut warnings,
@@ -498,15 +561,53 @@ impl ParametricGraph {
                 curves,
                 shapes,
                 corner_mods,
+                entity_ids,
+                solver,
                 ..
             } = &self.graph[idx].feature
             {
                 // A parametric sketch is rebuilt from its shapes against the
-                // current variables; the region-cache key (a hash of the
-                // resolved curves) then changes whenever a variable does.
-                let effective = crate::sketch::effective_curves(curves, shapes, corner_mods, vars);
+                // current variables (or from its solver model when present);
+                // the region-cache key (a hash of the resolved curves) then
+                // changes whenever a variable does.
+                let effective = crate::sketch::effective_curves_solved(
+                    curves,
+                    shapes,
+                    corner_mods,
+                    solver.as_ref(),
+                    vars,
+                );
+                // Fail-loud: a variable-driven constraint model that no longer
+                // solves keeps its last-valid geometry, and the failure reason
+                // rides along so the consuming extrude can report it.
+                let solve_failure = solver
+                    .as_ref()
+                    .filter(|m| !m.is_empty() && crate::sketch::solve::has_variable_bound_constraint(m))
+                    .and_then(|m| {
+                        let report = crate::sketch::solve_model(m, vars);
+                        match report.outcome {
+                            crate::sketch::SolveOutcome::Converged => None,
+                            crate::sketch::SolveOutcome::DidNotConverge => Some(
+                                "its constraints did not converge; keeping the last valid geometry"
+                                    .to_string(),
+                            ),
+                            crate::sketch::SolveOutcome::Conflicting => Some(match report
+                                .conflicting
+                            {
+                                Some(id) => format!(
+                                    "its constraints conflict (constraint {}); keeping the last \
+                                     valid geometry",
+                                    id.0
+                                ),
+                                None => "its constraints conflict; keeping the last valid \
+                                         geometry"
+                                    .to_string(),
+                            }),
+                        }
+                    });
                 let regions = self.cached_regions(&effective);
-                let provenance = build_region_provenance(&effective, shapes, &regions);
+                let provenance =
+                    build_region_provenance(&effective, shapes, entity_ids, &regions);
                 // Whole-shape outlines drive the overlapping-shapes-as-boolean
                 // path. Sketch fillets/chamfers (`corner_mods`) reshape the
                 // displayed geometry, which the raw shape outlines wouldn't
@@ -524,6 +625,7 @@ impl ParametricGraph {
                         provenance,
                         curves: effective,
                         shape_loops,
+                        solve_failure,
                     },
                 );
             }
@@ -582,6 +684,7 @@ impl ParametricGraph {
         depth: f32,
         region_indices: &[usize],
         mode: ExtrudeMode,
+        boolean_target: Option<&str>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
@@ -600,6 +703,15 @@ impl ParametricGraph {
         // everything extruded from it — follows the body. Regions are 2D and
         // cs-independent, so only the placement `cs` changes, not the shapes.
         let sketch_id = &self.graph[parent_idx].id;
+        // Fail-loud: the parent sketch's constraint model no longer solves.
+        // Its geometry is the last-valid bake (never blank), and this extrude —
+        // the body node consuming it — carries the attributed warning so the
+        // feature tree marks the failure instead of silently building stale.
+        if let Some(reason) = &sketch.solve_failure {
+            warnings.push(format!(
+                "Extrude '{node_id}': its sketch '{sketch_id}' {reason}."
+            ));
+        }
         let cs_owned = self
             .sketch_face_refs
             .get(sketch_id)
@@ -958,8 +1070,26 @@ impl ParametricGraph {
                     });
                 }
             }
-            ExtrudeMode::Join => apply_join(live, node_id, join_tools, warnings),
-            ExtrudeMode::Cut => apply_cut(live, node_id, cut_tools, warnings),
+            ExtrudeMode::Join | ExtrudeMode::Cut => {
+                // Named targeting: when the feature pins a target body, the
+                // boolean applies to that body ONLY. A missing target is a
+                // fail-loud no-op — never "hit whatever else overlaps".
+                if let Some(target_id) = boolean_target {
+                    if !live.iter().any(|b| b.id == target_id) {
+                        warnings.push(format!(
+                            "{} '{node_id}': its target body '{target_id}' no longer \
+                             exists, so it had no effect.",
+                            if mode == ExtrudeMode::Cut { "Cut" } else { "Join" },
+                        ));
+                        return;
+                    }
+                }
+                if mode == ExtrudeMode::Join {
+                    apply_join(live, node_id, join_tools, boolean_target, warnings);
+                } else {
+                    apply_cut(live, node_id, cut_tools, boolean_target, warnings);
+                }
+            }
         }
     }
 }

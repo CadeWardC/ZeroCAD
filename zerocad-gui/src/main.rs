@@ -411,6 +411,37 @@ struct ZeroCadApp {
     /// sensible default mode (face → Join/Cut by direction, plane → New Body).
     active_sketch_on_face: bool,
     active_tool: Option<SketchTool>,
+    /// When the active sketch session is EDITING an existing committed sketch
+    /// (via "Edit Sketch"), the node id to update in place at Finish. `None`
+    /// for a fresh sketch, which commits as a new node. In-place update keeps
+    /// the node id, so `sketch_face_refs` and dependency edges — and every
+    /// captured reference downstream — survive the edit.
+    editing_sketch_id: Option<String>,
+    /// The constraint-solver model of the active sketch (shared points +
+    /// entities + constraints). `Some` when editing a committed sketch (legacy
+    /// shapes are promoted on entry) — the source of truth for the live
+    /// geometry; drag-to-solve mutates it and Finish persists it.
+    sketch_solver_model: Option<zerocad_core::sketch::SketchSolverModel>,
+    /// Durable per-shape ids of the active sketch (parallel to
+    /// `sketch_shapes`). Loaded from the node on Edit Sketch; new shapes drawn
+    /// during the session get fresh ids at commit. NEVER resequenced — a
+    /// surviving shape keeps its id through the edit.
+    sketch_entity_ids: Vec<zerocad_core::sketch::EntityId>,
+    /// Next unallocated entity id for the active sketch's model.
+    sketch_next_entity_id: u32,
+    /// The solver point currently being dragged (latched on press near a
+    /// point, cleared on release) — drag-to-solve state.
+    sketch_drag_point: Option<zerocad_core::sketch::EntityId>,
+    /// Selected solver points/entities in an Edit Sketch session (click to
+    /// select, Shift-click to extend). Drives which constraint-palette buttons
+    /// are applicable.
+    sketch_selected_ids: Vec<zerocad_core::sketch::EntityId>,
+    /// Constraint selected in the constraints panel (for delete / highlight).
+    sketch_selected_constraint: Option<zerocad_core::sketch::EntityId>,
+    /// The conflicting constraint reported by the last live solve (None when
+    /// the model solves clean) — drives the red badge + list highlight without
+    /// re-solving in the render path.
+    sketch_conflict_constraint: Option<zerocad_core::sketch::EntityId>,
     /// First click of any 2-click tool (line/rect/circle). When `None`, the
     /// next click sets the starting point; when `Some(pt)` it completes the shape.
     /// Mirrors `sketch_points[0]` (kept for the dim dialog + preview anchor).

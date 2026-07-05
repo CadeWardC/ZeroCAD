@@ -26,6 +26,7 @@ pub(super) fn circular_bite_graph_with_depth(
         id: "e".to_string(),
         name: "e".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth,
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,

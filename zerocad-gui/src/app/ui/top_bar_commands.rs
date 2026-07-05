@@ -26,6 +26,62 @@ impl ZeroCadApp {
                 // the sketch never silently drops them.
                 self.commit_pending_corners();
                 self.recompute_sketch_regions();
+                // Editing an existing sketch: update the node IN PLACE (same id
+                // → sketch_face_refs, dependency edges, and every downstream
+                // captured reference survive), then rebuild.
+                if let Some(editing_id) = self.editing_sketch_id.clone() {
+                    if !self.sketch_curves.is_empty() {
+                        self.push_undo();
+                        for idx in self.graph.graph.node_indices() {
+                            if self.graph.graph[idx].id != editing_id {
+                                continue;
+                            }
+                            if let FeatureType::Sketch {
+                                curves,
+                                shapes,
+                                corner_mods,
+                                entity_ids,
+                                next_entity_id,
+                                solver,
+                                ..
+                            } = &mut self.graph.graph[idx].feature
+                            {
+                                *curves = self.sketch_curves.clone();
+                                *shapes = self.sketch_shapes.clone();
+                                *corner_mods = self.sketch_corner_mods.clone();
+                                // Surviving shapes keep their durable ids; any
+                                // shape drawn during this edit session gets a
+                                // fresh one (ids are never reused).
+                                let mut ids = self.sketch_entity_ids.clone();
+                                let mut next = self.sketch_next_entity_id;
+                                while ids.len() < self.sketch_shapes.len() {
+                                    ids.push(zerocad_core::sketch::EntityId(next));
+                                    next += 1;
+                                }
+                                ids.truncate(self.sketch_shapes.len());
+                                *entity_ids = ids;
+                                *next_entity_id = next;
+                                *solver = self.sketch_solver_model.clone();
+                            }
+                            break;
+                        }
+                        self.selected_node_id = Some(editing_id);
+                        self.reset_sketch_state();
+                        self.restore_camera(ctx);
+                        self.is_sketch_mode = false;
+                        self.is_plane_selection_mode = false;
+                        self.reevaluate_geometry();
+                        self.status_msg = "Sketch updated.".to_string();
+                        return;
+                    } else {
+                        self.status_msg = "Empty sketch edit discarded.".to_string();
+                        self.reset_sketch_state();
+                        self.restore_camera(ctx);
+                        self.is_sketch_mode = false;
+                        self.is_plane_selection_mode = false;
+                        return;
+                    }
+                }
                 if !self.sketch_curves.is_empty() {
                     let sketch_id = format!("sketch_{}", self.next_id());
                     let sketch_name = self.next_sketch_name();
@@ -46,6 +102,13 @@ impl ZeroCadApp {
                             shapes: self.sketch_shapes.clone(),
                             corner_mods: self.sketch_corner_mods.clone(),
                             on_face: self.active_sketch_on_face,
+                            // New sketches allocate real per-shape ids at commit;
+                            // identity is the id, never the Vec position.
+                            entity_ids: zerocad_core::sketch::EntityId::sequence(
+                                self.sketch_shapes.len(),
+                            ),
+                            next_entity_id: self.sketch_shapes.len() as u32,
+                            solver: None,
                         },
                     };
 

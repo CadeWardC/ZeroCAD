@@ -122,6 +122,9 @@ fn round_trip_overlapping_boolean_extrude() {
         id: "s".to_string(),
         name: "Sketch".to_string(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: CoordinateSystem::XY,
             curves: SketchCurves::new(),
             shapes,
@@ -133,6 +136,7 @@ fn round_trip_overlapping_boolean_extrude() {
         id: "e".to_string(),
         name: "Extrude".to_string(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: 10.0,
             region_indices: base,
             mode: ExtrudeMode::NewBody,

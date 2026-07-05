@@ -52,6 +52,9 @@ fn sketched_rect(w: f32, h: f32, d: f32) -> ParametricGraph {
         id: "sketch_1".into(),
         name: "S".into(),
         feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
             cs: xy(),
             curves: c,
             shapes: vec![],
@@ -63,6 +66,7 @@ fn sketched_rect(w: f32, h: f32, d: f32) -> ParametricGraph {
         id: "extrude_2".into(),
         name: "E".into(),
         feature: FeatureType::Extrude {
+            target: None,
             depth: d,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,

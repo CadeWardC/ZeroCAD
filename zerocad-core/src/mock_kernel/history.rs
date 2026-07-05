@@ -216,14 +216,21 @@ pub fn propagate_face_names(
 }
 
 /// The name of the input face this `(centroid, normal)` continues: same outward
-/// direction and the centroid lying on the input face's plane. Ties break to the
-/// closest plane.
+/// direction and the centroid lying on the input face's plane.
+///
+/// Two *coplanar* named input faces (a flush boss top beside the base's top, a
+/// severed face's two halves) are indistinguishable by plane alone — the old
+/// closest-plane tie could hand a result face the *neighbour's* owner, exactly
+/// the wrong-entity substitution the naming work exists to prevent. So when
+/// more than one candidate shares the plane, the tie breaks to the input face
+/// whose actual triangle footprint is closest to (ideally contains) the result
+/// face's centroid.
 fn matching_input_face_name(
     input_mesh: &MockMesh,
     centroid: [f32; 3],
     normal: [f32; 3],
 ) -> Option<String> {
-    let mut best: Option<(f32, String)> = None;
+    let mut candidates: Vec<(f32, u32, String)> = Vec::new();
     for i in &input_mesh.face_refs {
         let Some(name) = i.topology.as_ref().and_then(|t| t.face_id.clone()) else {
             continue;
@@ -239,11 +246,197 @@ fn matching_input_face_name(
         if dist > 1.0e-2 {
             continue;
         }
-        if best.as_ref().is_none_or(|(bd, _)| dist < *bd) {
-            best = Some((dist, name));
+        candidates.push((dist, i.face_id, name));
+    }
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates.remove(0).2),
+        _ => {
+            // Coplanar ambiguity: prefer the face whose triangles the centroid
+            // actually lies in/near, then the closest plane as the final tie.
+            candidates
+                .into_iter()
+                .map(|(plane_dist, mesh_face_id, name)| {
+                    let footprint =
+                        distance_to_mesh_face_triangles(input_mesh, mesh_face_id, centroid);
+                    (footprint, plane_dist, name)
+                })
+                .min_by(|a, b| {
+                    (a.0, a.1)
+                        .partial_cmp(&(b.0, b.1))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(_, _, name)| name)
         }
     }
-    best.map(|(_, name)| name)
+}
+
+/// Smallest distance from `p` to any triangle of the input-mesh face
+/// `mesh_face_id` — 0 when the point lies inside the face's footprint.
+fn distance_to_mesh_face_triangles(mesh: &MockMesh, mesh_face_id: u32, p: [f32; 3]) -> f32 {
+    let mut best = f32::INFINITY;
+    let tri_count = mesh.indices.len() / 3;
+    for t in 0..tri_count {
+        if mesh.face_ids.get(t) != Some(&mesh_face_id) {
+            continue;
+        }
+        let v = |k: usize| -> [f32; 3] {
+            let i = mesh.indices[t * 3 + k] as usize * 6;
+            [mesh.vertices[i], mesh.vertices[i + 1], mesh.vertices[i + 2]]
+        };
+        best = best.min(point_triangle_distance(p, v(0), v(1), v(2)));
+        if best == 0.0 {
+            return 0.0;
+        }
+    }
+    best
+}
+
+/// Euclidean distance from a point to a triangle (Ericson, *Real-Time
+/// Collision Detection* §5.1.5 closest-point construction).
+fn point_triangle_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    let closest = if d1 <= 0.0 && d2 <= 0.0 {
+        a
+    } else {
+        let bp = sub(p, b);
+        let d3 = dot(ab, bp);
+        let d4 = dot(ac, bp);
+        if d3 >= 0.0 && d4 <= d3 {
+            b
+        } else {
+            let vc = d1 * d4 - d3 * d2;
+            if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+                let t = d1 / (d1 - d3);
+                [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]]
+            } else {
+                let cp = sub(p, c);
+                let d5 = dot(ab, cp);
+                let d6 = dot(ac, cp);
+                if d6 >= 0.0 && d5 <= d6 {
+                    c
+                } else {
+                    let vb = d5 * d2 - d1 * d6;
+                    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+                        let t = d2 / (d2 - d6);
+                        [a[0] + t * ac[0], a[1] + t * ac[1], a[2] + t * ac[2]]
+                    } else {
+                        let va = d3 * d6 - d5 * d4;
+                        if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+                            let t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                            let bc = sub(c, b);
+                            [b[0] + t * bc[0], b[1] + t * bc[1], b[2] + t * bc[2]]
+                        } else {
+                            let denom = 1.0 / (va + vb + vc);
+                            let v = vb * denom;
+                            let w = vc * denom;
+                            [
+                                a[0] + ab[0] * v + ac[0] * w,
+                                a[1] + ab[1] * v + ac[1] * w,
+                                a[2] + ab[2] * v + ac[2] * w,
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let d = sub(p, closest);
+    dot(d, d).sqrt()
+}
+
+/// The durable face name for each **shell face position** of `solid`, read off
+/// its named display mesh. Names live on the mesh's canonical face ids (a
+/// cylinder's arc-thirds share one id), so every shell face of a group reports
+/// the group's name. Faces the matcher can't attribute stay `None`.
+pub fn input_shell_face_names(input_mesh: &MockMesh, solid: &KernelSolid) -> Vec<Option<String>> {
+    let mesh = MockMesh::from_solid(solid);
+    let by_canonical: std::collections::HashMap<u32, Option<String>> = mesh
+        .face_refs
+        .iter()
+        .map(|fr| {
+            (
+                fr.face_id,
+                matching_input_face_name(input_mesh, fr.centroid, fr.normal),
+            )
+        })
+        .collect();
+    let groups = crate::mock_kernel::cylinder_surface_groups(solid);
+    let mut canonical: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for (fi, &g) in groups.iter().enumerate() {
+        canonical.entry(g).or_insert(fi as u32);
+    }
+    (0..solid.shell().faces().len())
+        .map(|i| {
+            groups
+                .get(i)
+                .and_then(|g| canonical.get(g))
+                .and_then(|c| by_canonical.get(c).cloned().flatten())
+        })
+        .collect()
+}
+
+/// Owner classes for the kernel's owner-aware merge: same name ⇒ same class,
+/// unnamed ⇒ `None` (wildcard, merges as legacy geometry always has).
+pub fn owner_classes_from_names(names: &[Option<String>]) -> Vec<Option<u64>> {
+    use std::hash::{Hash, Hasher};
+    names
+        .iter()
+        .map(|n| {
+            n.as_ref().map(|name| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                name.hash(&mut h);
+                h.finish()
+            })
+        })
+        .collect()
+}
+
+/// Name a boolean result using the kernel's **exact** face history: a face
+/// tracing to object input face `i` inherits `input_names[i]` (MODIFIED); a
+/// face tracing to tool face `i` gets the durable generated name
+/// `{generated_prefix}:tool-face:{i}` (GENERATED — e.g. a cut's bore wall,
+/// which the geometric matcher must leave unnamed). Faces the history could
+/// not attribute fall back to the geometric matcher; still-unnamed faces stay
+/// unnamed — never a guessed identity.
+pub fn propagate_face_names_via_history(
+    input_mesh: &MockMesh,
+    input_names: &[Option<String>],
+    result_solid: &KernelSolid,
+    history: &openrcad::algo::BooleanFaceHistory,
+    body_id: &str,
+    generated_prefix: &str,
+) -> MockMesh {
+    use openrcad::algo::BooleanFaceSource;
+    let mut mesh = MockMesh::from_solid(result_solid);
+    for face_ref in &mut mesh.face_refs {
+        // The mesh's canonical face id IS a result shell-face position.
+        let shell_idx = face_ref.face_id as usize;
+        let name = match history.source_of(shell_idx) {
+            Some(BooleanFaceSource::Object(i)) => input_names.get(i).cloned().flatten(),
+            Some(BooleanFaceSource::Tool(i)) => {
+                Some(format!("{generated_prefix}:tool-face:{i}"))
+            }
+            None => None,
+        }
+        .or_else(|| matching_input_face_name(input_mesh, face_ref.centroid, face_ref.normal));
+        if let Some(name) = name {
+            face_ref.topology = Some(MeshTopologyFaceRef {
+                body_id: Some(body_id.to_string()),
+                topology_version: Some(0),
+                face_id: Some(name),
+                surface_kind: None,
+            });
+        }
+    }
+    populate_edge_adjacent_face_names(&mut mesh);
+    mesh
 }
 
 /// A canonical, position-based identity for a body **part** (one connected lump):
@@ -342,6 +535,52 @@ mod tests {
         assert!(
             obj_faces >= 5,
             "the box's outer faces must trace to the object, got {obj_faces}"
+        );
+    }
+
+    /// One flat quad (two triangles) at `z = 0` with normal +Z, spanning
+    /// `x ∈ [x0, x1] × y ∈ [0, 10]`, appended to `mesh` as face `fid` named
+    /// `name`.
+    fn push_named_quad(mesh: &mut MockMesh, fid: u32, name: &str, x0: f32, x1: f32) {
+        let base = (mesh.vertices.len() / 6) as u32;
+        for (x, y) in [(x0, 0.0), (x1, 0.0), (x1, 10.0), (x0, 10.0)] {
+            mesh.vertices
+                .extend_from_slice(&[x, y, 0.0, 0.0, 0.0, 1.0]);
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        mesh.face_ids.extend_from_slice(&[fid, fid]);
+        mesh.face_refs.push(MeshFaceRef {
+            face_id: fid,
+            centroid: [(x0 + x1) * 0.5, 5.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            topology: Some(MeshTopologyFaceRef {
+                body_id: Some("b".to_string()),
+                topology_version: Some(0),
+                face_id: Some(name.to_string()),
+                surface_kind: None,
+            }),
+        });
+    }
+
+    #[test]
+    fn coplanar_faces_disambiguate_by_footprint_not_plane() {
+        // Two same-plane, same-normal named faces side by side — the flush-boss /
+        // severed-face configuration where plane+normal matching alone cannot
+        // tell the owners apart. The centroid's containing footprint must win.
+        let mut input = MockMesh::empty();
+        push_named_quad(&mut input, 0, "owner:left", 0.0, 10.0);
+        push_named_quad(&mut input, 1, "owner:right", 10.0, 20.0);
+
+        assert_eq!(
+            matching_input_face_name(&input, [5.0, 5.0, 0.0], [0.0, 0.0, 1.0]).as_deref(),
+            Some("owner:left"),
+            "a centroid inside the left face must inherit the LEFT owner"
+        );
+        assert_eq!(
+            matching_input_face_name(&input, [15.0, 5.0, 0.0], [0.0, 0.0, 1.0]).as_deref(),
+            Some("owner:right"),
+            "a centroid inside the right face must inherit the RIGHT owner"
         );
     }
 

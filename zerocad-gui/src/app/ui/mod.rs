@@ -1,3 +1,4 @@
+mod constraints_panel;
 mod extrude_panel;
 mod feature_properties;
 mod feature_tree;
