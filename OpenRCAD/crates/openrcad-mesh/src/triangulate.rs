@@ -499,6 +499,35 @@ pub fn project_point(surf: &GeomSurface, pt: Pnt, hint: Option<(f64, f64)>) -> (
             }
             return (u, v);
         }
+        GeomSurface::Torus(tor) => {
+            // P = C + (R + r·cos v)·e_r(u) + r·sin v·Z, so u is the angle about
+            // the main axis and v the tube angle measured from the outer equator
+            // (radial distance ρ − R, axial height z).
+            let diff = pt - tor.position().location();
+            let dx = diff.dot(&GeomVec::from_dir(tor.position().x_direction()));
+            let dy = diff.dot(&GeomVec::from_dir(tor.position().y_direction()));
+            let dz = diff.dot(&GeomVec::from_dir(tor.position().direction()));
+            let rho = dx.hypot(dy);
+            if rho < CONFUSION {
+                // On the axis: u is undefined (and v nearly so) — fall back to
+                // the caller's hint like the sphere/cone poles do.
+                return hint.unwrap_or((0.0, 0.0));
+            }
+            let mut u = dy.atan2(dx);
+            if u < 0.0 {
+                u += 2.0 * std::f64::consts::PI;
+            }
+            let radial = rho - tor.major_radius();
+            if radial.abs() < CONFUSION && dz.abs() < CONFUSION {
+                // On the tube-centre circle: v is undefined.
+                return (u, hint.map(|h| h.1).unwrap_or(0.0));
+            }
+            let mut v = dz.atan2(radial);
+            if v < 0.0 {
+                v += 2.0 * std::f64::consts::PI;
+            }
+            return (u, v);
+        }
         _ => {}
     }
 

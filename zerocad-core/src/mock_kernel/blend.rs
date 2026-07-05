@@ -104,7 +104,10 @@ pub(crate) fn circle_matches_hint(
         + (c.z() - center[2] as f64).powi(2))
     .sqrt();
     let r = radius as f64;
-    if dc > (0.002 * r).max(1.0e-3) || (circle.radius() - r).abs() > (0.002 * r).max(1.0e-3) {
+    // 1% of radius: the GUI's circle-fit hint residual bound (picking.rs) is ~1%,
+    // so a tighter 0.2% gate rejected legitimate matches on committed bodies. The
+    // axis gate below still keeps distinct coaxial circles apart.
+    if dc > (0.01 * r).max(1.0e-3) || (circle.radius() - r).abs() > (0.01 * r).max(1.0e-3) {
         return false;
     }
     let a = GeomVec::from_dir(circle.axis());
@@ -186,6 +189,32 @@ pub fn chamfer_edge(
     p1: [f32; 3],
     distance: f32,
 ) -> Result<KernelSolid, String> {
+    chamfer_edge_with_hint(solid, p0, p1, None, distance)
+}
+
+/// Bevel the edge from `p0` to `p1`, routing a circular-rim selection (a `Circle`
+/// hint) through the analytic cone-frustum chain solver — the chamfer analogue of
+/// [`fillet_edge_with_hint`].
+pub fn chamfer_edge_with_hint(
+    solid: &KernelSolid,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    curve: Option<&EdgeCurveHint>,
+    distance: f32,
+) -> Result<KernelSolid, String> {
+    if let Some(hint @ EdgeCurveHint::Circle { .. }) = curve {
+        let chain = circle_edge_requests(solid, hint).ok_or_else(|| {
+            "curved circular-rim chamfer could not be matched to the body topology".to_string()
+        })?;
+        let contour = BlendContour::constant(
+            chain,
+            BlendKind::Chamfer,
+            distance as f64,
+            Some(BlendCurveHint::Circle),
+        );
+        return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
+    }
+
     let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
     let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
     let e = Edge::between_points(a, b);

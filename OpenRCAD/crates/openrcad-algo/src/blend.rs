@@ -171,7 +171,7 @@ fn cap_face(circle: Circle, plane_pt: Pnt, normal: Dir) -> Face {
 }
 
 /// A quarter-circle arc of radius `r` about `centre`, from `p1` to `p2`.
-fn quarter_arc(centre: Pnt, r: f64, p1: Pnt, p2: Pnt) -> Edge {
+pub(crate) fn quarter_arc(centre: Pnt, r: f64, p1: Pnt, p2: Pnt) -> Edge {
     let d1 = (p1 - centre) / r;
     let d2 = (p2 - centre) / r;
     let main = d1.cross(&d2);

@@ -138,7 +138,7 @@ pub fn shell_solid(
 pub mod sew;
 pub use prism::{prism, sweep_prism, SweepError};
 pub use rolling_ball::{
-    fillet_circular_edge_chain, fillet_edges, fillet_planar_edge,
+    chamfer_circular_edge_chain, fillet_circular_edge_chain, fillet_edges, fillet_planar_edge,
     rolling_ball_between_planar_faces, rolling_ball_fillet_edge, RollingBallBlend,
     RollingBallError,
 };

@@ -323,6 +323,31 @@ pub(crate) fn rect_minus_circle_region_primitives(
         return None;
     }
 
+    // A genuine rect-minus-circle MATERIAL boundary keeps at least two of the
+    // rectangle's corners as vertices well clear of the circle (a mid-side bite
+    // keeps all four, a corner bite keeps three). A plain circle profile — whose
+    // tangent points against its own bounding box can otherwise satisfy the
+    // side-hit test below — keeps none, and must NOT be mistaken for a bite: it
+    // would fabricate a bite "void" covering the entire body.
+    let corners = [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ];
+    let corner_hits = corners
+        .iter()
+        .filter(|corner| {
+            points
+                .iter()
+                .any(|p| (p.0 - corner.0).abs() <= 0.08 && (p.1 - corner.1).abs() <= 0.08)
+                && !near_circle(**corner)
+        })
+        .count();
+    if corner_hits < 2 {
+        return None;
+    }
+
     // Require the circular run to enter and leave through the same rectangle
     // side. Rounded rectangle corners touch two different sides and should keep
     // the normal arc-reconstructed extrusion path.

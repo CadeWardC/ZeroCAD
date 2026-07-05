@@ -15,26 +15,28 @@ use super::*;
 /// boolean "stray lines": a degenerate zero-area fin face produces no triangle,
 /// so it contributes no edge, and back edges now get proper hidden-line removal
 /// instead of x-raying through the body.
-/// Group B-rep faces that lie on the *same* analytic cylinder, returning one
-/// group id per face in `solid.shell().faces()` order (which matches the mesh's
-/// `face_id`s). The kernel emits a cylindrical wall — a bored hole, a round boss
-/// — as 3 arc-faces (thirds), and the straight longitudinal seams between them
-/// are a construction artifact, not design edges: drawn, they make a hole read
-/// as a notched/faceted circle. Faces sharing a group are recognised as one
-/// surface so those seams can be suppressed. Every non-cylinder face (and each
-/// distinct cylinder) gets its own id, so only true co-cylindrical faces match.
+/// Group B-rep faces that lie on the *same* analytic surface (cylinder, torus,
+/// or cone), returning one group id per face in `solid.shell().faces()` order
+/// (which matches the mesh's `face_id`s). The kernel emits a cylindrical wall —
+/// a bored hole, a round boss — as 3 arc-faces (thirds), and a circular-rim
+/// fillet/chamfer band as one torus/cone sector per rim fragment; the seams
+/// between those sectors are construction artifacts, not design edges: drawn,
+/// they make a hole read as a notched circle and a rim fillet read as a
+/// segmented band. Faces sharing a group are recognised as one surface so those
+/// seams can be suppressed (and the whole band selects as one face). Every
+/// other face (and each distinct surface) gets its own id, so only true
+/// same-surface faces match.
 pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
-    // Quantized (axis-foot xyz, axis-dir xyz, radius) — a cylinder's identity.
-    type CylSig = (i64, i64, i64, i64, i64, i64, i64);
+    // Quantized surface identity. Cylinder: (axis-foot xyz, axis-dir xyz,
+    // radius, 0). Torus: (centre xyz, axis-dir xyz, major radius, minor
+    // radius). Cone: (apex xyz, axis-dir xyz, tan(semi-angle), 0). A leading
+    // tag keeps the kinds from ever colliding.
+    type SurfSig = (u8, i64, i64, i64, i64, i64, i64, i64, i64);
     let q = |v: f64| (v * 1.0e4).round() as i64;
-    // A cylinder's identity is its axis *line* + radius, independent of which
-    // generator/location names the axis. Canonicalize the axis point to the foot
-    // of the perpendicular from the origin, and the direction to a fixed sign.
-    let sig = |s: &CylindricalSurface| -> CylSig {
-        let p = s.position();
-        let d = p.direction();
-        let (mut dx, mut dy, mut dz) = (d.x(), d.y(), d.z());
-        // Sign-normalize the direction so +axis and -axis hash the same.
+    // Sign-normalize a direction so +axis and -axis hash the same; returns the
+    // (possibly flipped) components and whether it flipped.
+    let canon_dir = |d: openrcad::foundation::Dir| -> (f64, f64, f64, bool) {
+        let (dx, dy, dz) = (d.x(), d.y(), d.z());
         let lead = if dx.abs() > 1e-9 {
             dx
         } else if dy.abs() > 1e-9 {
@@ -43,28 +45,92 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
             dz
         };
         if lead < 0.0 {
-            dx = -dx;
-            dy = -dy;
-            dz = -dz;
+            (-dx, -dy, -dz, true)
+        } else {
+            (dx, dy, dz, false)
         }
+    };
+    // A cylinder's identity is its axis *line* + radius, independent of which
+    // generator/location names the axis. Canonicalize the axis point to the foot
+    // of the perpendicular from the origin, and the direction to a fixed sign.
+    let cyl_sig = |s: &CylindricalSurface| -> SurfSig {
+        let p = s.position();
+        let (dx, dy, dz, _) = canon_dir(p.direction());
         let loc = p.location();
         let t = loc.x() * dx + loc.y() * dy + loc.z() * dz; // (loc·d)
         let (fx, fy, fz) = (loc.x() - dx * t, loc.y() - dy * t, loc.z() - dz * t);
-        (q(fx), q(fy), q(fz), q(dx), q(dy), q(dz), q(s.radius()))
+        (0, q(fx), q(fy), q(fz), q(dx), q(dy), q(dz), q(s.radius()), 0)
+    };
+    // A torus is symmetric under flipping its axis, so its identity is centre +
+    // axis line + both radii; the centre already lies on the axis.
+    let torus_sig = |s: &openrcad::geom::ToroidalSurface| -> SurfSig {
+        let p = s.position();
+        let (dx, dy, dz, _) = canon_dir(p.direction());
+        let c = p.location();
+        (
+            1,
+            q(c.x()),
+            q(c.y()),
+            q(c.z()),
+            q(dx),
+            q(dy),
+            q(dz),
+            q(s.major_radius()),
+            q(s.minor_radius()),
+        )
+    };
+    // A cone's identity is its apex + axis line + slope. Flipping the axis
+    // negates the semi-angle (widening in +Z becomes narrowing), so negate the
+    // slope when the direction was sign-flipped.
+    let cone_sig = |s: &openrcad::geom::ConicalSurface| -> Option<SurfSig> {
+        let p = s.position();
+        let slope = s.semi_angle().tan();
+        if slope.abs() <= 1.0e-9 {
+            return None; // degenerate (a cylinder in disguise); don't group.
+        }
+        let (dx, dy, dz, flipped) = canon_dir(p.direction());
+        let slope = if flipped { -slope } else { slope };
+        // r(v) = ref_radius + v·tanα = 0 → apex at v = −ref_radius/tanα along
+        // the ORIGINAL direction.
+        let v = -s.ref_radius() / s.semi_angle().tan();
+        let d0 = p.direction();
+        let loc = p.location();
+        let apex = (
+            loc.x() + d0.x() * v,
+            loc.y() + d0.y() * v,
+            loc.z() + d0.z() * v,
+        );
+        Some((
+            2,
+            q(apex.0),
+            q(apex.1),
+            q(apex.2),
+            q(dx),
+            q(dy),
+            q(dz),
+            q(slope),
+            0,
+        ))
     };
 
     let mut groups = Vec::with_capacity(solid.shell().faces().len());
-    let mut seen: HashMap<CylSig, u32> = HashMap::new();
+    let mut seen: HashMap<SurfSig, u32> = HashMap::new();
     let mut next = 0u32;
     for face in solid.shell().faces() {
-        let id = match face.surface() {
-            Some(GeomSurface::Cylinder(c)) => *seen.entry(sig(c)).or_insert_with(|| {
+        let sig = match face.surface() {
+            Some(GeomSurface::Cylinder(c)) => Some(cyl_sig(c)),
+            Some(GeomSurface::Torus(t)) => Some(torus_sig(t)),
+            Some(GeomSurface::Cone(c)) => cone_sig(c),
+            _ => None,
+        };
+        let id = match sig {
+            Some(sig) => *seen.entry(sig).or_insert_with(|| {
                 let g = next;
                 next += 1;
                 g
             }),
-            // Non-cylinder: a fresh, unshareable id.
-            _ => {
+            // Ungroupable: a fresh, unshareable id.
+            None => {
                 let g = next;
                 next += 1;
                 g

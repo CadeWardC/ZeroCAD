@@ -8,8 +8,8 @@ use core::fmt;
 
 use openrcad_foundation::{tolerance, Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
-    Circle, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, GregorySurface, Plane,
-    SphericalSurface, Surface, ToroidalSurface,
+    Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface,
+    GregorySurface, Plane, SphericalSurface, Surface, ToroidalSurface,
 };
 use openrcad_mesh::tessellate;
 use openrcad_primitives::make_cylinder;
@@ -383,6 +383,13 @@ fn fillet_planar_edge_inner(
                 radius,
                 &mut faces,
                 &mut skipped_faces,
+            ) || try_corner_circular_band_miter(
+                &mut blend,
+                start,
+                &start_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
             )));
     let end_cut = try_corner_cut(
         solid,
@@ -419,6 +426,13 @@ fn fillet_planar_edge_inner(
                 &mut skipped_faces,
             ) || try_corner_miter(
                 solid,
+                &mut blend,
+                end,
+                &end_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            ) || try_corner_circular_band_miter(
                 &mut blend,
                 end,
                 &end_caps,
@@ -694,6 +708,25 @@ fn handle_corner_endpoint(
                 faces.extend(cs.new_faces);
                 skipped.extend(cs.skip_ids);
                 return Ok(());
+            }
+        }
+        // The flat trim splices the blend's end arc into the cap's wire, which
+        // is only sound when the arc actually lies in the cap (true for a
+        // straight spine meeting a perpendicular planar cap). A circular-spine
+        // blend's end arc lives in the spine's RADIAL plane instead — trimming
+        // a planar cap with it bulges the solid through the cap, and the result
+        // can still sew watertight, so the acceptance gate won't catch it.
+        if let Some(GeomSurface::Plane(pl)) = cap.surface() {
+            let n = GeomVec::from_dir(pl.normal());
+            let p0 = pl.position().location();
+            let off = |p: Pnt| (p - p0).dot(&n).abs();
+            let mid = arc
+                .curve()
+                .map(|c| c.point(0.5 * (arc.first() + arc.last())))
+                .unwrap_or_else(|| arc.start().point());
+            let tol = corner_tol(radius);
+            if off(arc.start().point()) > tol || off(arc.end().point()) > tol || off(mid) > tol {
+                return Err(RollingBallError::UnsupportedTrimTopology);
             }
         }
         let trimmed = trim_face_at_corner(cap, corner, ca, cb, arc)?;
@@ -1407,11 +1440,12 @@ fn try_corner_cut(
     };
     let blend_cyl = match blend.blend_face.surface() {
         Some(GeomSurface::Cylinder(c)) => *c,
-        _ => {
-            return Err(RollingBallError::BlendSurfaceBuild(
-                "cut trim requires a cylindrical blend",
-            ))
-        }
+        // A non-cylindrical blend (e.g. a torus rim fillet) has no analytic
+        // cylinder∩cylinder flush-trim yet. Decline the flush-trim rather than
+        // abort the whole fillet (`?` at the call sites): the caller then falls
+        // back to `handle_corner_endpoint`'s planar-cap trim. Cylindrical blends
+        // are unaffected.
+        _ => return Ok(false),
     };
 
     // Which end of each contact runs into the cut.
@@ -1783,6 +1817,181 @@ fn extend_contact_corner(contact: &Edge, corner: Pnt, new_pt: Pnt) -> Edge {
     }
 }
 
+/// Miter a new STRAIGHT fillet into the toroidal band of an earlier same-radius
+/// CIRCULAR-rim fillet ending at this corner — the reverse order of
+/// `blend_open_circular_chain`'s band-cylinder miter, producing the identical
+/// seam. The straight edge was shortened by the earlier fillet, so its corner
+/// vertex IS the torus band's old flush-end vertex; the new blend's contacts
+/// are extended past it (into the region the earlier fillet vacated) to the
+/// band∩band intersection seam, the corner end arc is replaced by that seam,
+/// and the torus band is retracted to it. Returns `false` (caller falls back)
+/// for any unsupported configuration.
+fn try_corner_circular_band_miter(
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> bool {
+    if caps.len() != 1 {
+        return false;
+    }
+    let cap = &caps[0];
+    let Some(GeomSurface::Torus(tor)) = cap.surface() else {
+        return false;
+    };
+    let tor = *tor;
+    if (tor.minor_radius() - radius).abs() > corner_tol(radius) {
+        return false;
+    }
+    let Some(GeomSurface::Cylinder(bcyl)) = blend.blend_face.surface() else {
+        return false;
+    };
+    let bcyl = *bcyl;
+
+    let (Ok(n_a), Ok(n_b)) = (
+        planar_outward_normal(&blend.face_a),
+        planar_outward_normal(&blend.face_b),
+    ) else {
+        return false;
+    };
+
+    // Which of the blend's two support planes is the one the torus band is
+    // tangent to (its tube-centre circle sits `radius` below it, along its own
+    // axis)? That plane is the shared "top"; the other is the side wall.
+    let m = GeomVec::from_dir(tor.position().direction());
+    let ctr = tor.position().location();
+    let plane_origin = |f: &Face| match f.surface() {
+        Some(GeomSurface::Plane(pl)) => Some(pl.position().location()),
+        _ => None,
+    };
+    let is_top = |n: Dir, f: &Face| -> bool {
+        if GeomVec::from_dir(n).dot(&m).abs() < 0.999 {
+            return false;
+        }
+        let Some(p0) = plane_origin(f) else {
+            return false;
+        };
+        ((ctr - p0).dot(&GeomVec::from_dir(n)) + radius).abs() <= corner_tol(radius)
+    };
+    let a_is_top = is_top(n_a, &blend.face_a);
+    let b_is_top = is_top(n_b, &blend.face_b);
+    if a_is_top == b_is_top {
+        return false;
+    }
+    let (n_top, n_side) = if a_is_top { (n_a, n_b) } else { (n_b, n_a) };
+
+    // Signed distance to the torus tube-centre circle, minus the tube radius:
+    // zero exactly on the band surface.
+    let rr = tor.major_radius();
+    let g_tor = |p: Pnt| -> f64 {
+        let v = p - ctr;
+        let h = v.dot(&m);
+        let rho = (v - m * h).magnitude();
+        ((rho - rr).powi(2) + h * h).sqrt() - radius
+    };
+
+    // Profile rails of the new straight band: the blend cylinder's axis line,
+    // offset `radius` along the arc of directions from `n_top` to `n_side`.
+    let na = GeomVec::from_dir(n_top);
+    let nb = GeomVec::from_dir(n_side);
+    let th = na.dot(&nb).clamp(-1.0, 1.0).acos();
+    if th < 0.3 || th.sin() < 1e-6 {
+        return false;
+    }
+    let u_at = |f: f64| (na * ((1.0 - f) * th).sin() + nb * (f * th).sin()) * (1.0 / th.sin());
+    let ap = bcyl.position().location();
+    let ad = GeomVec::from_dir(bcyl.position().direction());
+    let rail_pt = |f: f64, t: f64| ap + ad * t + u_at(f) * radius;
+
+    // Marching direction: beyond the (shortened) edge's corner end.
+    let far = farthest_endpoint(&blend.spine, corner);
+    let t_corner = (corner - ap).dot(&ad);
+    let t_far = (far - ap).dot(&ad);
+    let side_sign = if t_corner >= t_far { 1.0 } else { -1.0 };
+
+    // Station 0 lies in the shared top plane, where the two bands are TANGENT:
+    // the crossing is the minimum of the distance, not a sign change.
+    let (w_lo, w_hi) = (
+        t_corner - side_sign * 0.6 * radius,
+        t_corner + side_sign * 2.5 * radius,
+    );
+    let t_a = minimize_scalar(|t| g_tor(rail_pt(0.0, t)).abs(), w_lo.min(w_hi), w_lo.max(w_hi));
+    if g_tor(rail_pt(0.0, t_a)).abs() > 1e-4 * radius.max(1.0) {
+        return false;
+    }
+
+    let steps = ((radius * 2.0 / 0.05).ceil() as usize).clamp(24, 160);
+    let mut pts = vec![rail_pt(0.0, t_a)];
+    let mut prev_t = t_a;
+    for k in 1..=steps {
+        let f = k as f64 / steps as f64;
+        let Some(t) = directional_root(
+            |t| g_tor(rail_pt(f, t)),
+            prev_t,
+            side_sign,
+            0.6 * radius,
+        ) else {
+            return false;
+        };
+        if (t - prev_t).abs() > 0.4 * radius {
+            return false;
+        }
+        prev_t = t;
+        pts.push(rail_pt(f, t));
+    }
+    let a_pt = pts[0];
+    let b_pt = *pts.last().expect("seam has points");
+    if a_pt.distance(&corner) > 3.0 * radius || b_pt.distance(&corner) > 3.0 * radius {
+        return false;
+    }
+    let seam = polyline_edge(&pts);
+
+    // Retract the torus band to the seam: its old flush-end section (running
+    // from this corner to the wall-contact point, which the seam also ends at)
+    // is dropped, its top contact circle shortened to the seam's top endpoint.
+    let Ok(retracted_cap) = miter_retract_band_at_end(cap, corner, a_pt, b_pt, &seam) else {
+        return false;
+    };
+
+    // Extend the new blend's contacts out to the seam endpoints.
+    if a_is_top {
+        blend.contact_a = extend_contact_corner(&blend.contact_a, corner, a_pt);
+        blend.contact_b = extend_contact_corner(&blend.contact_b, corner, b_pt);
+    } else {
+        blend.contact_a = extend_contact_corner(&blend.contact_a, corner, b_pt);
+        blend.contact_b = extend_contact_corner(&blend.contact_b, corner, a_pt);
+    }
+
+    // Swap the corner-side end arc for the seam, keeping the blend_face wire
+    // [contact_a, end_arc, contact_b.reversed(), start_arc] contiguous.
+    let corner_is_source = corner.distance(&blend.spine.source().point())
+        <= corner.distance(&blend.spine.target().point());
+    if corner_is_source {
+        let b0 = blend.contact_b.source().point();
+        let a0 = blend.contact_a.source().point();
+        blend.start_arc = orient_edge_between(&seam, b0, a0);
+    } else {
+        let a1 = blend.contact_a.target().point();
+        let b1 = blend.contact_b.target().point();
+        blend.end_arc = orient_edge_between(&seam, a1, b1);
+    }
+    blend.blend_face = Face::new(
+        blend.blend_face.surface().cloned(),
+        Wire::from_edges([
+            blend.contact_a.clone(),
+            blend.end_arc.clone(),
+            blend.contact_b.clone().reversed(),
+            blend.start_arc.clone(),
+        ]),
+    );
+
+    faces.push(retracted_cap);
+    skipped.insert(cap.id());
+    true
+}
+
 /// Whether `a` and `b` share at least one (undirected) boundary edge.
 fn faces_share_edge(a: &Face, b: &Face) -> bool {
     let b_edges: Vec<Edge> = b.wires().into_iter().flat_map(|w| w.edges()).collect();
@@ -2040,6 +2249,21 @@ pub fn fillet_circular_edge_chain(
         return Err(RollingBallError::SpineNotOnFace);
     }
 
+    // A rim that wraps a full circle (a plain cylinder top, a bored hole) has no
+    // free endpoints, so the open-chain endpoint closers below don't apply. Build
+    // it as a seamless torus band of trimmed supports instead. On failure the
+    // caller's routing falls back to the per-edge fillet.
+    if spine_wraps_full_circle(spine, chain_edges) {
+        return fillet_closed_circular_rim(solid, chain_edges, spine, radius);
+    }
+
+    // Open chain (the "bite arc"): prefer the analytic torus band with flush
+    // end trims; fall back to the legacy rolling-ball open path for whatever
+    // configuration it declines.
+    if let Ok(result) = blend_open_circular_chain(solid, chain_edges, spine, radius, false) {
+        return Ok(result);
+    }
+
     let (plane_face, cyl_faces) = circular_chain_support_faces(solid, chain_edges)?;
     let mut blend =
         rolling_ball_between_curved_faces(solid, spine, &plane_face, &cyl_faces[0], radius)?;
@@ -2145,6 +2369,1019 @@ pub fn fillet_circular_edge_chain(
         }
     }
     Err(RollingBallError::InvalidTopology)
+}
+
+/// Whether the spine/chain closes a full circle (a 360° rim, no free endpoints).
+fn spine_wraps_full_circle(spine: &Edge, chain_edges: &[Edge]) -> bool {
+    // Every fragment must be circular for this to be a rim.
+    if !chain_edges
+        .iter()
+        .all(|e| matches!(e.curve(), Some(GeomCurve::Circle(_))))
+    {
+        return false;
+    }
+    let closed_endpoints = spine.source().point().distance(&spine.target().point())
+        <= 100.0 * tolerance::CONFUSION;
+    // A single full-circle edge (source == target) also wraps.
+    let full_span = (spine.last() - spine.first()).abs() >= core::f64::consts::TAU - 1e-4;
+    closed_endpoints || full_span
+}
+
+/// Recovered geometry shared by the closed-rim fillet and chamfer builders.
+struct ClosedRimGeom {
+    plane_face: Face,
+    cyl_faces: Vec<Face>,
+    spine_r: f64,
+    cax: Dir,
+    cxr: Dir,
+    n_plane: Dir,
+    concave: bool,
+    /// Radius of the plane contact ring: `spine_r ± dist`.
+    major_radius: f64,
+    /// Plane contact ring (on the cap) and wall contact ring (offset into solid).
+    c_plane: Circle,
+    c_cyl: Circle,
+    /// Common center of the wall-contact ring (and the torus tube axis): the cap
+    /// center pushed `dist` into the solid along `-n_plane`.
+    contact_center: Pnt,
+}
+
+/// Recover the geometry of a closed circular rim for a cap-fillet/chamfer of size
+/// `dist`, validating the cap-fillet configuration (plane normal ∥ wall axis) and
+/// rejecting an oversize value.
+fn recover_closed_rim_geom(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    dist: f64,
+) -> Result<ClosedRimGeom, RollingBallError> {
+    if !dist.is_finite() || dist <= tolerance::CONFUSION {
+        return Err(RollingBallError::InvalidRadius { radius: dist });
+    }
+    let Some(GeomCurve::Circle(circle)) = spine.curve() else {
+        return Err(RollingBallError::UnsolvableAdjacency {
+            reason: AdjacencyReason::NotPlaneOrAnalytic,
+        });
+    };
+    let circle = *circle;
+
+    let (plane_face, cyl_faces) = circular_chain_support_faces(solid, chain_edges)?;
+
+    let center = circle.center();
+    let spine_r = circle.radius();
+    let cax = circle.axis();
+    let cxr = circle.position().x_direction();
+    let n_plane = face_outward_normal_at(&plane_face, spine.source().point())?;
+
+    // Cap configuration only: the plane normal must be parallel to the wall axis
+    // (the ball/bevel rolls around the rim → a torus/cone of revolution).
+    let axis_dir = match cyl_faces[0].surface() {
+        Some(GeomSurface::Cylinder(c)) => c.position().direction(),
+        _ => {
+            return Err(RollingBallError::UnsolvableAdjacency {
+                reason: AdjacencyReason::NotPlaneOrAnalytic,
+            })
+        }
+    };
+    if !n_plane.is_parallel(&axis_dir, 1e-4) {
+        return Err(RollingBallError::UnsolvableAdjacency {
+            reason: AdjacencyReason::UnsupportedSurfacePair,
+        });
+    }
+
+    let concave = is_concave_cut_cylinder(solid, &cyl_faces[0]);
+    let major_radius = if concave {
+        spine_r + dist
+    } else {
+        spine_r - dist
+    };
+    if major_radius <= tolerance::CONFUSION {
+        return Err(RollingBallError::InvalidRadius { radius: dist });
+    }
+
+    let contact_center = center - GeomVec::from_dir(n_plane) * dist;
+    let c_plane = Circle::new(Ax3::new_axes(center, cax, cxr), major_radius);
+    let c_cyl = Circle::new(Ax3::new_axes(contact_center, cax, cxr), spine_r);
+
+    Ok(ClosedRimGeom {
+        plane_face,
+        cyl_faces,
+        spine_r,
+        cax,
+        cxr,
+        n_plane,
+        concave,
+        major_radius,
+        c_plane,
+        c_cyl,
+        contact_center,
+    })
+}
+
+/// Assemble a closed-rim blend: keep every non-support face, splice in the band
+/// faces, and replace the plane cap + wall supports with versions trimmed back to
+/// the contact rings. Safety-gated by [`accept_subtractive_blend_result`].
+fn assemble_closed_rim(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    geom: &ClosedRimGeom,
+    dist: f64,
+    mut band_faces: Vec<Face>,
+) -> Result<Solid, RollingBallError> {
+    use core::f64::consts::TAU;
+
+    // Full-circle contact edges drive the spine→contact param mapping.
+    let c_plane_edge = Edge::new(
+        Some(GeomCurve::circle(geom.c_plane)),
+        0.0,
+        TAU,
+        Vertex::new(geom.c_plane.point(0.0)),
+        Vertex::new(geom.c_plane.point(TAU)),
+    );
+    let c_cyl_edge = Edge::new(
+        Some(GeomCurve::circle(geom.c_cyl)),
+        0.0,
+        TAU,
+        Vertex::new(geom.c_cyl.point(0.0)),
+        Vertex::new(geom.c_cyl.point(TAU)),
+    );
+
+    // Trim the plane cap: replace the rim loop with the plane-contact ring.
+    let trimmed_cap = trim_cap_closed_loop(&geom.plane_face, spine, &c_plane_edge, chain_edges)?;
+    // Trim each wall face: shorten its top arc to the wall-contact ring.
+    let mut trimmed_walls = Vec::new();
+    for cyl in &geom.cyl_faces {
+        trimmed_walls.push(trim_face_along_spine_segments(
+            cyl,
+            chain_edges,
+            spine,
+            &c_cyl_edge,
+        )?);
+    }
+
+    // Keep every other face untouched.
+    for face in solid.shell().faces() {
+        if same_face(&face, &geom.plane_face)
+            || geom.cyl_faces.iter().any(|cyl| same_face(&face, cyl))
+        {
+            continue;
+        }
+        band_faces.push(face);
+    }
+    band_faces.push(trimmed_cap);
+    band_faces.extend(trimmed_walls);
+
+    let result = Solid::new(sew(&band_faces, dist * 0.1));
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
+    if let Some(accepted) = accept_subtractive_blend_result(&merged, &[]) {
+        return Ok(accepted);
+    }
+    if let Some(accepted) = accept_subtractive_blend_result(&result, &[]) {
+        return Ok(accepted);
+    }
+    Err(RollingBallError::InvalidTopology)
+}
+
+/// Fillet a closed circular rim (a plain cylinder top, a bored hole): a seamless
+/// toroidal band between the trimmed cap and wall supports.
+fn fillet_closed_circular_rim(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    radius: f64,
+) -> Result<Solid, RollingBallError> {
+    // The band construction needs the rim split into ≥2 fragments so each band
+    // face has distinct start/end seams (a single full-circle edge would make a
+    // degenerate wire). The make_cylinder rims that reach here are already 3 arcs.
+    if chain_edges.len() < 2 {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, radius)?;
+    let torus_surf = GeomSurface::torus(ToroidalSurface::new(
+        Ax3::new_axes(geom.contact_center, geom.cax, geom.cxr),
+        geom.major_radius,
+        radius,
+    ));
+
+    // One toroidal band face per rim fragment. Adjacent fragments share an
+    // identical quarter-arc seam at their common param, so `sew` welds them.
+    let mut faces: Vec<Face> = Vec::new();
+    for arc in chain_edges {
+        let (u0, u1) = spine_param_span(spine, arc)?;
+        let plane_arc = closed_rim_arc(&geom.c_plane, u0, u1);
+        let cyl_arc = closed_rim_arc(&geom.c_cyl, u0, u1);
+        let tube0 = geom.contact_center + radial(geom.cax, geom.cxr, u0) * geom.major_radius;
+        let tube1 = geom.contact_center + radial(geom.cax, geom.cxr, u1) * geom.major_radius;
+        let seam0 = crate::blend::quarter_arc(
+            tube0,
+            radius,
+            geom.c_plane.point(u0),
+            geom.c_cyl.point(u0),
+        );
+        let seam1 = crate::blend::quarter_arc(
+            tube1,
+            radius,
+            geom.c_plane.point(u1),
+            geom.c_cyl.point(u1),
+        );
+        let wire = Wire::from_edges([plane_arc, seam1, cyl_arc.reversed(), seam0.reversed()]);
+        faces.push(Face::new(Some(torus_surf.clone()), wire));
+    }
+
+    assemble_closed_rim(solid, chain_edges, spine, &geom, radius, faces)
+}
+
+/// Chamfer a closed circular rim: a seamless conical (45°) frustum band between
+/// the trimmed cap and wall supports, with straight seams.
+fn chamfer_closed_circular_rim(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    dist: f64,
+) -> Result<Solid, RollingBallError> {
+    use core::f64::consts::FRAC_PI_2;
+
+    // Same ≥2-fragments constraint as the closed-rim fillet (distinct seams).
+    if chain_edges.len() < 2 {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist)?;
+
+    // The cone passes through both contact rings: reference radius `spine_r` at the
+    // wall contact, growing/shrinking to `major_radius` at the cap over axial
+    // distance `dist` → a ±45° half-angle. The sign accounts for both the cut
+    // concavity and whether the spine-circle axis agrees with the outward normal.
+    let sign = if geom.n_plane.dot(&geom.cax) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let concave_sign = if geom.concave { 1.0 } else { -1.0 };
+    let semi_angle = concave_sign * sign * (FRAC_PI_2 / 2.0);
+    let cone_surf = GeomSurface::cone(ConicalSurface::new(
+        Ax3::new_axes(geom.contact_center, geom.cax, geom.cxr),
+        geom.spine_r,
+        semi_angle,
+    ));
+
+    let mut faces: Vec<Face> = Vec::new();
+    for arc in chain_edges {
+        let (u0, u1) = spine_param_span(spine, arc)?;
+        let plane_arc = closed_rim_arc(&geom.c_plane, u0, u1);
+        let cyl_arc = closed_rim_arc(&geom.c_cyl, u0, u1);
+        // Straight seams (a chamfer bevel is a ruled cone, not a rolled torus).
+        let seam0 = Edge::between_points(geom.c_plane.point(u0), geom.c_cyl.point(u0));
+        let seam1 = Edge::between_points(geom.c_plane.point(u1), geom.c_cyl.point(u1));
+        let wire = Wire::from_edges([plane_arc, seam1, cyl_arc.reversed(), seam0.reversed()]);
+        faces.push(Face::new(Some(cone_surf.clone()), wire));
+    }
+
+    assemble_closed_rim(solid, chain_edges, spine, &geom, dist, faces)
+}
+
+/// An arc edge of `circle` between spine params `u0`..`u1` (source → target).
+fn closed_rim_arc(circle: &Circle, u0: f64, u1: f64) -> Edge {
+    Edge::new(
+        Some(GeomCurve::circle(*circle)),
+        u0,
+        u1,
+        Vertex::new(circle.point(u0)),
+        Vertex::new(circle.point(u1)),
+    )
+}
+
+/// Sample points along an edge's curve (plus its vertices) — enough to bound a
+/// circular arc's bulge for a bounds check.
+fn edge_sample_points(edge: &Edge) -> Vec<Pnt> {
+    let mut pts = vec![edge.start().point(), edge.end().point()];
+    if let Some(curve) = edge.curve() {
+        let (t0, t1) = (edge.first(), edge.last());
+        for k in 1..8 {
+            let t = t0 + (t1 - t0) * (k as f64) / 8.0;
+            pts.push(curve.point(t));
+        }
+    }
+    pts
+}
+
+/// Approximate axis-aligned bounds of a solid from its edges' sampled points.
+fn approx_solid_bounds(solid: &Solid) -> (Pnt, Pnt) {
+    let mut lo = Pnt::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut hi = Pnt::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for face in solid.shell().faces() {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                for p in edge_sample_points(&edge) {
+                    lo = Pnt::new(lo.x().min(p.x()), lo.y().min(p.y()), lo.z().min(p.z()));
+                    hi = Pnt::new(hi.x().max(p.x()), hi.y().max(p.y()), hi.z().max(p.z()));
+                }
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// Golden-section minimum of `g` over `[lo, hi]`.
+fn minimize_scalar(g: impl Fn(f64) -> f64, lo: f64, hi: f64) -> f64 {
+    let phi = (5.0f64.sqrt() - 1.0) / 2.0;
+    let (mut a, mut b) = (lo.min(hi), lo.max(hi));
+    let mut c = b - phi * (b - a);
+    let mut d = a + phi * (b - a);
+    let (mut gc, mut gd) = (g(c), g(d));
+    for _ in 0..90 {
+        if gc <= gd {
+            b = d;
+            d = c;
+            gd = gc;
+            c = b - phi * (b - a);
+            gc = g(c);
+        } else {
+            a = c;
+            c = d;
+            gc = gd;
+            d = a + phi * (b - a);
+            gd = g(d);
+        }
+        if b - a <= 1e-12 {
+            break;
+        }
+    }
+    0.5 * (a + b)
+}
+
+/// Nearest root of `g` starting at `start`, preferring the `dir` (+1/-1)
+/// direction: scan up to `ahead` forward (and a small `0.05` backtrack window)
+/// for a sign change, then bisect it. Used to march a band∩band miter seam,
+/// whose stations each have TWO crossings near the tangent end — the seam
+/// branch continues in a consistent direction, the other walks back under the
+/// chain.
+fn directional_root(g: impl Fn(f64) -> f64, start: f64, dir: f64, ahead: f64) -> Option<f64> {
+    let scan = |x0: f64, x1: f64, n: usize| -> Option<(f64, f64)> {
+        let mut px = x0;
+        let mut pg = g(x0);
+        for i in 1..=n {
+            let x = x0 + (x1 - x0) * (i as f64) / (n as f64);
+            let gx = g(x);
+            if pg == 0.0 {
+                return Some((px, px));
+            }
+            if gx == 0.0 {
+                return Some((x, x));
+            }
+            if gx.signum() != pg.signum() {
+                return Some((px, x));
+            }
+            px = x;
+            pg = gx;
+        }
+        None
+    };
+    let bracket = scan(start, start + dir * ahead, 240)
+        .or_else(|| scan(start, start - dir * 0.05, 40))?;
+    let (mut a, mut b) = bracket;
+    if a == b {
+        return Some(a);
+    }
+    let (mut ga, _) = (g(a), g(b));
+    for _ in 0..80 {
+        let m = 0.5 * (a + b);
+        let gm = g(m);
+        if gm == 0.0 || (b - a).abs() <= 1e-13 {
+            return Some(m);
+        }
+        if gm.signum() == ga.signum() {
+            a = m;
+            ga = gm;
+        } else {
+            b = m;
+        }
+    }
+    Some(0.5 * (a + b))
+}
+
+/// Retract an existing fillet-band face whose end at `old_end` is being mitered
+/// against a newly built band: the boundary edge running from `old_end` to (≈)
+/// `b_shared` — the band's old end-trim section, now entirely inside the strip
+/// the new blend removes — is dropped; the band's other `old_end`-incident
+/// boundary edge (its contact curve) is shortened along its own curve to
+/// `a_new`; and the mutual `seam` (from `a_new` to `b_shared`) is spliced in.
+fn miter_retract_band_at_end(
+    face: &Face,
+    old_end: Pnt,
+    a_new: Pnt,
+    b_shared: Pnt,
+    seam: &Edge,
+) -> Result<Face, RollingBallError> {
+    let tol = 10.0 * tolerance::CONFUSION;
+    // The old end trim spans the full blend cross-section; its far endpoint must
+    // land on `b_shared` for the retraction to be sound. Allow the small drift a
+    // chorded flush section accumulates.
+    let end_tol = 1e-3 * (old_end.distance(&b_shared)).max(1.0);
+    let edges = face
+        .outer_wire()
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?
+        .edges();
+    let n = edges.len();
+    if n < 3 {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+    let Some(next_idx) = edges
+        .iter()
+        .position(|e| e.source().point().distance(&old_end) <= tol)
+    else {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    };
+    let prev_idx = (next_idx + n - 1) % n;
+    if edges[prev_idx].target().point().distance(&old_end) > tol {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    // Which incident edge is the old end trim (drop), which the contact (retract)?
+    let next_is_drop = edges[next_idx].target().point().distance(&b_shared) <= end_tol;
+    let prev_is_drop = edges[prev_idx].source().point().distance(&b_shared) <= end_tol;
+    if next_is_drop == prev_is_drop {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let mut new_edges = Vec::with_capacity(n + 1);
+    for offset in 0..n {
+        let i = (prev_idx + offset) % n;
+        if i == prev_idx {
+            if prev_is_drop {
+                // [.., drop, contact ..] → [.., seam(b→a), contact' ..]
+                new_edges.push(orient_edge_between(seam, b_shared, a_new));
+            } else {
+                new_edges.push(move_edge_endpoint_keep_curve(
+                    &edges[prev_idx],
+                    old_end,
+                    a_new,
+                ));
+                new_edges.push(orient_edge_between(seam, a_new, b_shared));
+            }
+        } else if i == next_idx {
+            if next_is_drop {
+                // The drop edge is replaced by the seam already pushed above.
+            } else {
+                new_edges.push(move_edge_endpoint_keep_curve(
+                    &edges[next_idx],
+                    old_end,
+                    a_new,
+                ));
+            }
+        } else {
+            new_edges.push(edges[i].clone());
+        }
+    }
+    new_edges.retain(|e| e.source().point().distance(&e.target().point()) > tolerance::CONFUSION);
+    rebuild_face(face, Wire::from_edges(new_edges))
+}
+
+/// Blend an OPEN co-circular chain — the "bite arc": rim fragments covering
+/// part of a circle whose free ends run out onto planar faces (e.g. the front
+/// face of a box a cylindrical bite was cut out of). Built exactly like the
+/// closed rim — an analytic band (torus for a fillet, 45° cone for a chamfer)
+/// between the contact rings, with cap/wall supports trimmed to them — except
+/// at the two free ends, where the band is trimmed FLUSH against the end-cap
+/// plane: each contact ring stops where it crosses that plane, the band is
+/// closed by the band∩plane section (a chorded polyline lying on both
+/// surfaces), and the cap face is re-trimmed to the same section. Nothing
+/// bulges through the cap, and every neighbour pair shares identical edge
+/// geometry, so the sewn result is watertight and tessellates crack-free.
+fn blend_open_circular_chain(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    dist: f64,
+    chamfer: bool,
+) -> Result<Solid, RollingBallError> {
+    use core::f64::consts::{FRAC_PI_2, PI, TAU};
+
+    if chain_edges.is_empty() {
+        return Err(RollingBallError::SpineNotOnFace);
+    }
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist)?;
+
+    let (t_lo, t_hi) = (
+        spine.first().min(spine.last()),
+        spine.first().max(spine.last()),
+    );
+    // Free-end corners at the spine's param extremes (the canonical spine from
+    // `circular_spine_from_chain` is ascending: source at `first`).
+    let (corner_lo, corner_hi) = if spine.first() <= spine.last() {
+        (spine.source().point(), spine.target().point())
+    } else {
+        (spine.target().point(), spine.source().point())
+    };
+
+    // Exactly one cap face at each free end: a planar wall (→ flush trim), or —
+    // fillets only — the cylindrical band of an earlier same-radius straight
+    // fillet tangent to the same support plane (→ miter: the two bands flow
+    // into each other along their intersection seam).
+    let n_plane_v = GeomVec::from_dir(geom.n_plane);
+    let plane_p0 = match geom.plane_face.surface() {
+        Some(GeomSurface::Plane(pl)) => pl.position().location(),
+        _ => return Err(RollingBallError::UnsupportedTrimTopology),
+    };
+    let cap_at = |corner: Pnt| -> Result<(Face, Option<CylindricalSurface>), RollingBallError> {
+        let caps: Vec<Face> = solid
+            .shell()
+            .faces()
+            .into_iter()
+            .filter(|f| {
+                !same_face(f, &geom.plane_face)
+                    && !geom.cyl_faces.iter().any(|c| same_face(f, c))
+                    && face_contains_point(f, corner)
+            })
+            .collect();
+        if caps.len() != 1 {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        match caps[0].surface() {
+            Some(GeomSurface::Plane(_)) => Ok((caps[0].clone(), None)),
+            Some(GeomSurface::Cylinder(c)) if !chamfer => {
+                // An earlier fillet's band: same radius, axis parallel to the
+                // support plane at offset `dist` below it.
+                let axis_off = (c.position().location() - plane_p0).dot(&n_plane_v);
+                let axis_tilt = GeomVec::from_dir(c.position().direction())
+                    .dot(&n_plane_v)
+                    .abs();
+                if (c.radius() - dist).abs() <= corner_tol(dist)
+                    && axis_tilt < 1e-3
+                    && (axis_off + dist).abs() <= corner_tol(dist)
+                {
+                    Ok((caps[0].clone(), Some(*c)))
+                } else {
+                    Err(RollingBallError::UnsupportedTrimTopology)
+                }
+            }
+            _ => Err(RollingBallError::UnsupportedTrimTopology),
+        }
+    };
+    let (cap_lo, miter_lo) = cap_at(corner_lo)?;
+    let (cap_hi, miter_hi) = cap_at(corner_hi)?;
+
+    // Ring frame (shared by both contact rings) and the cap-ring axial offset.
+    let xv = GeomVec::from_dir(geom.c_plane.position().x_direction());
+    let yv = GeomVec::from_dir(geom.c_plane.position().y_direction());
+    let caxv = GeomVec::from_dir(geom.cax);
+    let s_plane = if geom.n_plane.dot(&geom.cax) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+
+    struct FlushEnd {
+        cap: Face,
+        corner: Pnt,
+        /// Cap-ring param where the blend stops (flush with the cap plane).
+        ua: f64,
+        /// Wall-ring param where the blend stops.
+        ub: f64,
+        /// The band∩cap section from `c_plane(ua)` to `c_cyl(ub)`.
+        trim: Edge,
+        /// Set when the "cap" is an earlier fillet's band cylinder: the end is a
+        /// MITER (the trim is the band∩band seam, and the old band is retracted
+        /// to it) rather than a flush planar cut.
+        miter: bool,
+    }
+
+    let resolve_end = |cap: &Face, corner: Pnt, near: f64| -> Result<FlushEnd, RollingBallError> {
+        let Some(GeomSurface::Plane(pl)) = cap.surface() else {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        };
+        let n = GeomVec::from_dir(pl.normal());
+        let p0 = pl.position().location();
+
+        // Where the horizontal circle of radius `rho` at axial offset `h` (from
+        // `contact_center`) crosses the cap plane: `a·cos u + b·sin u + c = 0`,
+        // taking the branch nearest `seed`.
+        let solve_u = |rho: f64, h: f64, seed: f64| -> Option<f64> {
+            let a = rho * xv.dot(&n);
+            let b = rho * yv.dot(&n);
+            let c = (geom.contact_center + caxv * h - p0).dot(&n);
+            let hyp = a.hypot(b);
+            if hyp <= tolerance::CONFUSION || (c / hyp).abs() > 1.0 + 1.0e-9 {
+                return None;
+            }
+            let phi = b.atan2(a);
+            let d = (-c / hyp).clamp(-1.0, 1.0).acos();
+            let mut best: Option<f64> = None;
+            for cand in [phi + d, phi - d] {
+                for k in -2..=2 {
+                    let t = cand + f64::from(k) * TAU;
+                    if best.map_or(true, |bb| (t - seed).abs() < (bb - seed).abs()) {
+                        best = Some(t);
+                    }
+                }
+            }
+            best
+        };
+
+        let h_plane = s_plane * dist;
+        let ua = solve_u(geom.major_radius, h_plane, near)
+            .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+        let ub =
+            solve_u(geom.spine_r, 0.0, near).ok_or(RollingBallError::UnsupportedTrimTopology)?;
+        // Both crossings must sit inside the chain's own span: the blend runs
+        // OUT of the solid at this free end, never past the far one.
+        if ua < t_lo - 1.0e-6 || ua > t_hi + 1.0e-6 || ub < t_lo - 1.0e-6 || ub > t_hi + 1.0e-6 {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+
+        // Chord the band∩plane section from the cap-ring crossing down to the
+        // wall-ring crossing, densely enough to read as smooth (like the
+        // cylinder∩cylinder trim, ≈0.05 chords).
+        let steps = ((dist * 2.0 / 0.05).ceil() as usize).clamp(24, 160);
+        let mut pts = Vec::with_capacity(steps + 1);
+        pts.push(geom.c_plane.point(ua));
+        let mut seed = ua;
+        let v_p = s_plane * FRAC_PI_2;
+        let v_c = if geom.concave { s_plane * PI } else { 0.0 };
+        for k in 1..steps {
+            let f = k as f64 / steps as f64;
+            let (rho, h) = if chamfer {
+                (
+                    geom.major_radius + f * (geom.spine_r - geom.major_radius),
+                    (1.0 - f) * h_plane,
+                )
+            } else {
+                let v = v_p + f * (v_c - v_p);
+                (geom.major_radius + dist * v.cos(), dist * v.sin())
+            };
+            let u = solve_u(rho, h, seed).ok_or(RollingBallError::UnsupportedTrimTopology)?;
+            seed = u;
+            pts.push(geom.contact_center + caxv * h + (xv * u.cos() + yv * u.sin()) * rho);
+        }
+        // A wrong branch anywhere would land the section far from the wall-ring
+        // crossing; require the sampled sweep to arrive there.
+        if (seed - ub).abs() > 0.5 {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        pts.push(geom.c_cyl.point(ub));
+        Ok(FlushEnd {
+            cap: cap.clone(),
+            corner,
+            ua,
+            ub,
+            trim: polyline_edge(&pts),
+            miter: false,
+        })
+    };
+
+    // Miter this free end against an earlier same-radius straight fillet's band
+    // cylinder: march the band∩band intersection seam from the shared support
+    // plane (where the two bands are TANGENT — the crossing there is the
+    // minimum of the distance, not a sign change) down to the wall contact.
+    // `side` is +1 at the chain's high-param end, -1 at the low end: the seam
+    // extends BEYOND the chain into the region the earlier fillet vacated, and
+    // each station's root is taken on that side (the complementary root walks
+    // back under the chain).
+    let resolve_end_miter = |cap: &Face,
+                             cyl: &CylindricalSurface,
+                             corner: Pnt,
+                             near: f64,
+                             side: f64|
+     -> Result<FlushEnd, RollingBallError> {
+        let axis_pt = cyl.position().location();
+        let axis_dir = cyl.position().direction();
+        let r = cyl.radius();
+        let ring_pt = |rho: f64, h: f64, u: f64| {
+            geom.contact_center + caxv * h + (xv * u.cos() + yv * u.sin()) * rho
+        };
+        let g = |rho: f64, h: f64, u: f64| point_line_distance(ring_pt(rho, h, u), axis_pt, axis_dir) - r;
+
+        let steps = ((dist * 2.0 / 0.05).ceil() as usize).clamp(24, 160);
+        let h_plane = s_plane * dist;
+        let v_p = s_plane * FRAC_PI_2;
+        let v_c = if geom.concave { s_plane * PI } else { 0.0 };
+        let station = |k: usize| -> (f64, f64) {
+            let f = k as f64 / steps as f64;
+            let v = v_p + f * (v_c - v_p);
+            (geom.major_radius + dist * v.cos(), dist * v.sin())
+        };
+
+        let (rho0, h0) = (geom.major_radius, h_plane);
+        let ua = minimize_scalar(|u| g(rho0, h0, u).abs(), near - 0.7, near + 0.7);
+        if g(rho0, h0, ua).abs() > 1e-4 * dist.max(1.0) {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        let mut pts = vec![ring_pt(rho0, h0, ua)];
+        let mut prev_u = ua;
+        for k in 1..=steps {
+            let (rho, h) = station(k);
+            let u = directional_root(|u| g(rho, h, u), prev_u, side, 0.35)
+                .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+            if (u - prev_u).abs() > 0.3 {
+                return Err(RollingBallError::UnsupportedTrimTopology);
+            }
+            prev_u = u;
+            pts.push(ring_pt(rho, h, u));
+        }
+        let ub = prev_u;
+        if (ua - near).abs() > 0.7 || (ub - near).abs() > 0.7 {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        Ok(FlushEnd {
+            cap: cap.clone(),
+            corner,
+            ua,
+            ub,
+            trim: polyline_edge(&pts),
+            miter: true,
+        })
+    };
+
+    let end_lo = match &miter_lo {
+        Some(cyl) => resolve_end_miter(&cap_lo, cyl, corner_lo, t_lo, -1.0)?,
+        None => resolve_end(&cap_lo, corner_lo, t_lo)?,
+    };
+    let end_hi = match &miter_hi {
+        Some(cyl) => resolve_end_miter(&cap_hi, cyl, corner_hi, t_hi, 1.0)?,
+        None => resolve_end(&cap_hi, corner_hi, t_hi)?,
+    };
+    if end_lo.ua >= end_hi.ua - 1.0e-6 || end_lo.ub >= end_hi.ub - 1.0e-6 {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    // Fragment spans, ascending; interior junctions carry the shared seams.
+    let mut spans: Vec<(f64, f64)> = chain_edges
+        .iter()
+        .map(|e| {
+            let (a, b) = spine_param_span(spine, e)?;
+            Ok((a.min(b), a.max(b)))
+        })
+        .collect::<Result<_, RollingBallError>>()?;
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let junctions: Vec<f64> = spans.iter().skip(1).map(|s| s.0).collect();
+    if junctions.iter().any(|&j| {
+        j <= end_lo.ua.max(end_lo.ub) + 1.0e-6 || j >= end_hi.ua.min(end_hi.ub) - 1.0e-6
+    }) {
+        // An end trim swallowing a whole fragment is out of scope.
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let band_surf = if chamfer {
+        let concave_sign = if geom.concave { 1.0 } else { -1.0 };
+        let semi_angle = concave_sign * s_plane * (FRAC_PI_2 / 2.0);
+        GeomSurface::cone(ConicalSurface::new(
+            Ax3::new_axes(geom.contact_center, geom.cax, geom.cxr),
+            geom.spine_r,
+            semi_angle,
+        ))
+    } else {
+        GeomSurface::torus(ToroidalSurface::new(
+            Ax3::new_axes(geom.contact_center, geom.cax, geom.cxr),
+            geom.major_radius,
+            dist,
+        ))
+    };
+
+    // Seams between adjacent band fragments — one edge value shared by both.
+    let seam_at = |u: f64| -> Edge {
+        let p_pl = geom.c_plane.point(u);
+        let p_cy = geom.c_cyl.point(u);
+        if chamfer {
+            Edge::between_points(p_pl, p_cy)
+        } else {
+            let tube = geom.contact_center + radial(geom.cax, geom.cxr, u) * geom.major_radius;
+            crate::blend::quarter_arc(tube, dist, p_pl, p_cy)
+        }
+    };
+    let seams: Vec<Edge> = junctions.iter().map(|&j| seam_at(j)).collect();
+
+    let n_frag = spans.len();
+    let mut faces: Vec<Face> = Vec::with_capacity(n_frag + solid.shell().faces().len());
+    for k in 0..n_frag {
+        let pa0 = if k == 0 { end_lo.ua } else { junctions[k - 1] };
+        let pa1 = if k == n_frag - 1 { end_hi.ua } else { junctions[k] };
+        let pb0 = if k == 0 { end_lo.ub } else { junctions[k - 1] };
+        let pb1 = if k == n_frag - 1 { end_hi.ub } else { junctions[k] };
+        if pa1 - pa0 <= 1.0e-9 || pb1 - pb0 <= 1.0e-9 {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        let plane_arc = closed_rim_arc(&geom.c_plane, pa0, pa1);
+        let cyl_arc = closed_rim_arc(&geom.c_cyl, pb0, pb1);
+        let start_edge = if k == 0 {
+            orient_edge_between(
+                &end_lo.trim,
+                geom.c_plane.point(pa0),
+                geom.c_cyl.point(pb0),
+            )
+        } else {
+            seams[k - 1].clone()
+        };
+        let end_edge = if k == n_frag - 1 {
+            orient_edge_between(
+                &end_hi.trim,
+                geom.c_plane.point(pa1),
+                geom.c_cyl.point(pb1),
+            )
+        } else {
+            seams[k].clone()
+        };
+        let wire = Wire::from_edges([
+            plane_arc,
+            end_edge,
+            cyl_arc.reversed(),
+            start_edge.reversed(),
+        ]);
+        faces.push(Face::new(Some(band_surf.clone()), wire));
+    }
+
+    // Supports trimmed to the contact rings, clamped to the flush end params.
+    let c_plane_edge = Edge::new(
+        Some(GeomCurve::circle(geom.c_plane)),
+        0.0,
+        TAU,
+        Vertex::new(geom.c_plane.point(0.0)),
+        Vertex::new(geom.c_plane.point(TAU)),
+    );
+    let c_cyl_edge = Edge::new(
+        Some(GeomCurve::circle(geom.c_cyl)),
+        0.0,
+        TAU,
+        Vertex::new(geom.c_cyl.point(0.0)),
+        Vertex::new(geom.c_cyl.point(TAU)),
+    );
+    let trimmed_cap_support = trim_face_along_spine_segments_clamped(
+        &geom.plane_face,
+        chain_edges,
+        spine,
+        &c_plane_edge,
+        (end_lo.ua, end_hi.ua),
+    )?;
+    let mut trimmed_walls = Vec::new();
+    for cyl in &geom.cyl_faces {
+        trimmed_walls.push(trim_face_along_spine_segments_clamped(
+            cyl,
+            chain_edges,
+            spine,
+            &c_cyl_edge,
+            (end_lo.ub, end_hi.ub),
+        )?);
+    }
+
+    // End caps re-trimmed to the flush sections (both ends can land on the
+    // SAME face — a bite whose two ends run out the same box side). A miter end
+    // instead RETRACTS the earlier fillet's band to the mutual seam.
+    let trim_cap = |cap: &Face, end: &FlushEnd| -> Result<Face, RollingBallError> {
+        if end.miter {
+            miter_retract_band_at_end(
+                cap,
+                end.corner,
+                geom.c_plane.point(end.ua),
+                geom.c_cyl.point(end.ub),
+                &end.trim,
+            )
+        } else {
+            trim_face_at_corner(
+                cap,
+                end.corner,
+                geom.c_plane.point(end.ua),
+                geom.c_cyl.point(end.ub),
+                &end.trim,
+            )
+        }
+    };
+    let mut trimmed_caps: Vec<Face> = Vec::new();
+    if same_face(&end_lo.cap, &end_hi.cap) {
+        let once = trim_cap(&end_lo.cap, &end_lo)?;
+        trimmed_caps.push(trim_cap(&once, &end_hi)?);
+    } else {
+        trimmed_caps.push(trim_cap(&end_lo.cap, &end_lo)?);
+        trimmed_caps.push(trim_cap(&end_hi.cap, &end_hi)?);
+    }
+
+    for face in solid.shell().faces() {
+        if same_face(&face, &geom.plane_face)
+            || geom.cyl_faces.iter().any(|c| same_face(&face, c))
+            || same_face(&face, &end_lo.cap)
+            || same_face(&face, &end_hi.cap)
+        {
+            continue;
+        }
+        faces.push(face);
+    }
+    faces.push(trimmed_cap_support);
+    faces.extend(trimmed_walls);
+    faces.extend(trimmed_caps);
+
+    // A blend only REMOVES material, so the rebuilt body must stay inside the
+    // input's bounds. An oversize distance puts the contact rings off their
+    // supports (below the wall, outside the cap) yet the spliced wires can
+    // still close and sew "watertight" — the bounds are what actually give it
+    // away.
+    let (in_lo, in_hi) = approx_solid_bounds(solid);
+    let tol = 1.0e-6;
+    let grew = faces.iter().any(|f| {
+        f.wires().iter().any(|w| {
+            w.edges().iter().any(|e| {
+                edge_sample_points(e).into_iter().any(|p| {
+                    p.x() < in_lo.x() - tol
+                        || p.y() < in_lo.y() - tol
+                        || p.z() < in_lo.z() - tol
+                        || p.x() > in_hi.x() + tol
+                        || p.y() > in_hi.y() + tol
+                        || p.z() > in_hi.z() + tol
+                })
+            })
+        })
+    });
+    if grew {
+        return Err(RollingBallError::InvalidRadius { radius: dist });
+    }
+
+    let result = Solid::new(sew(&faces, dist * 0.1));
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
+    if let Some(accepted) = accept_subtractive_blend_result(&merged, &[]) {
+        return Ok(accepted);
+    }
+    if let Some(accepted) = accept_subtractive_blend_result(&result, &[]) {
+        return Ok(accepted);
+    }
+    Err(RollingBallError::InvalidTopology)
+}
+
+/// Chamfer a closed circular rim; the analogue of [`fillet_circular_edge_chain`]
+/// for a constant-distance bevel. Only the closed-rim configuration is built here
+/// (a plain cylinder top, a bored hole); an open arc chain returns `Err` so the
+/// caller falls back to the per-edge chamfer.
+pub fn chamfer_circular_edge_chain(
+    solid: &Solid,
+    chain_edges: &[Edge],
+    spine: &Edge,
+    dist: f64,
+) -> Result<Solid, RollingBallError> {
+    if chain_edges.is_empty() {
+        return Err(RollingBallError::SpineNotOnFace);
+    }
+    if spine_wraps_full_circle(spine, chain_edges) {
+        chamfer_closed_circular_rim(solid, chain_edges, spine, dist)
+    } else {
+        // Open chain (the "bite arc"): a cone band with flush end trims.
+        blend_open_circular_chain(solid, chain_edges, spine, dist, true)
+    }
+}
+
+/// Replace the closed rim loop of `cap` (its outer wire, or a matching inner hole
+/// wire) with the contact ring, mapping each rim fragment to `contact` by param.
+fn trim_cap_closed_loop(
+    cap: &Face,
+    spine: &Edge,
+    contact: &Edge,
+    chain_edges: &[Edge],
+) -> Result<Face, RollingBallError> {
+    ensure_trimmable_face(cap)?;
+    let loop_matches = |wire: &Wire| -> bool {
+        let edges = wire.edges();
+        edges.len() == chain_edges.len()
+            && edges.iter().all(|e| {
+                chain_edges
+                    .iter()
+                    .any(|spine_edge| same_undirected_edge(e, spine_edge))
+            })
+    };
+    let remap = |wire: &Wire| -> Result<Wire, RollingBallError> {
+        let mut new_edges = Vec::new();
+        for e in wire.edges() {
+            new_edges.push(contact_subedge_for_spine_edge(spine, contact, &e)?);
+        }
+        Ok(Wire::from_edges(new_edges))
+    };
+
+    if let Some(outer) = cap.outer_wire() {
+        if loop_matches(&outer) {
+            let new_outer = remap(&outer)?;
+            return Ok(Face::with_wires(
+                cap.surface().cloned(),
+                Some(new_outer),
+                cap.inner_wires(),
+                cap.orientation(),
+            ));
+        }
+    }
+    let mut new_inners = Vec::new();
+    let mut found = false;
+    for inner in cap.inner_wires() {
+        if !found && loop_matches(&inner) {
+            new_inners.push(remap(&inner)?);
+            found = true;
+        } else {
+            new_inners.push(inner);
+        }
+    }
+    if found {
+        return Ok(Face::with_wires(
+            cap.surface().cloned(),
+            cap.outer_wire(),
+            new_inners,
+            cap.orientation(),
+        ));
+    }
+    Err(RollingBallError::SpineNotOnFace)
 }
 
 fn circular_chain_support_faces(
@@ -3158,6 +4395,28 @@ fn trim_face_along_spine_segments(
     spine: &Edge,
     contact: &Edge,
 ) -> Result<Face, RollingBallError> {
+    trim_face_along_spine_segments_clamped(
+        face,
+        spine_edges,
+        spine,
+        contact,
+        (f64::NEG_INFINITY, f64::INFINITY),
+    )
+}
+
+/// [`trim_face_along_spine_segments`] with the contact run clamped to the spine
+/// param range `clamp` — the open-chain flush termination: the outer contact
+/// sub-arcs stop at the cap-plane crossings instead of the rim's own corners,
+/// and the adjacent boundary edges shorten to those crossing points (which lie
+/// ON their curves, e.g. a box's front-top edge), instead of being dragged off
+/// their lines to the un-clamped ring ends.
+fn trim_face_along_spine_segments_clamped(
+    face: &Face,
+    spine_edges: &[Edge],
+    spine: &Edge,
+    contact: &Edge,
+    clamp: (f64, f64),
+) -> Result<Face, RollingBallError> {
     ensure_trimmable_face(face)?;
     let edges = face
         .outer_wire()
@@ -3214,13 +4473,70 @@ fn trim_face_along_spine_segments(
 
     let run_start_point = edges[run_start].source().point();
     let run_end_point = edges[run_end].target().point();
-    let contact_start = contact_point_for_spine_point(spine, contact, run_start_point)?;
-    let contact_end = contact_point_for_spine_point(spine, contact, run_end_point)?;
+    // A finite clamp bound is FORCED at the run's outer endpoints, not merely
+    // clamped toward: at a flush end the crossing param lies inside the chain
+    // span (clamp and force agree), while at a MITER end the band extends
+    // BEYOND the chain into the region the earlier fillet vacated — the run
+    // endpoint must be pushed OUT to the seam param, and the adjacent boundary
+    // edge (the earlier band's contact curve) shortened to that same point.
+    let forced_contact_param = |p: Pnt| -> Result<f64, RollingBallError> {
+        let t = spine_parameter_for_point(spine, p)?;
+        Ok(match (clamp.0.is_finite(), clamp.1.is_finite()) {
+            (true, true) => {
+                if (t - clamp.0).abs() <= (t - clamp.1).abs() {
+                    clamp.0
+                } else {
+                    clamp.1
+                }
+            }
+            (true, false) => t.max(clamp.0),
+            (false, true) => t.min(clamp.1),
+            (false, false) => t,
+        })
+    };
+    let clamped_contact_point = |p: Pnt| -> Result<Pnt, RollingBallError> {
+        let Some(curve) = contact.curve() else {
+            return Ok(contact_point_for_spine_vertex(spine, contact, p));
+        };
+        Ok(curve.point(forced_contact_param(p)?))
+    };
+    let contact_start = clamped_contact_point(run_start_point)?;
+    let contact_end = clamped_contact_point(run_end_point)?;
+
+    // The chain's param extremes: the fragments owning them get their outer end
+    // forced to the corresponding finite clamp bound (a miter extension).
+    let mut frag_spans: std::collections::HashMap<usize, (f64, f64)> =
+        std::collections::HashMap::new();
+    let mut chain_lo = f64::INFINITY;
+    let mut chain_hi = f64::NEG_INFINITY;
+    for &i in &selected {
+        let (o0, o1) = spine_param_span(spine, &edges[i])?;
+        chain_lo = chain_lo.min(o0.min(o1));
+        chain_hi = chain_hi.max(o0.max(o1));
+        frag_spans.insert(i, (o0, o1));
+    }
 
     let mut new_edges = Vec::with_capacity(n);
     for (i, edge) in edges.iter().enumerate() {
         if selected.contains(&i) {
-            new_edges.push(contact_subedge_for_spine_edge(spine, contact, edge)?);
+            let (o0, o1) = frag_spans[&i];
+            let asc = o1 >= o0;
+            let (flo, fhi) = (o0.min(o1), o0.max(o1));
+            let mut lo = flo.max(clamp.0);
+            let mut hi = fhi.min(clamp.1);
+            if clamp.0.is_finite() && flo <= chain_lo + 1.0e-9 && clamp.0 < hi {
+                lo = clamp.0;
+            }
+            if clamp.1.is_finite() && fhi >= chain_hi - 1.0e-9 && clamp.1 > lo {
+                hi = clamp.1;
+            }
+            // Interval collapsed or inverted: the fragment is entirely outside
+            // the clamp range — drop it.
+            if hi - lo <= 1.0e-9 {
+                continue;
+            }
+            let (t0, t1) = if asc { (lo, hi) } else { (hi, lo) };
+            new_edges.push(edge_on_contact_between_params(contact, t0, t1)?);
         } else {
             let moved_start = move_edge_endpoint_keep_curve(edge, run_start_point, contact_start);
             let moved = move_edge_endpoint_keep_curve(&moved_start, run_end_point, contact_end);
@@ -3337,26 +4653,52 @@ pub(crate) fn contact_point_for_spine_vertex(spine: &Edge, contact: &Edge, point
     }
 }
 
-fn contact_point_for_spine_point(
-    spine: &Edge,
-    contact: &Edge,
-    point: Pnt,
-) -> Result<Pnt, RollingBallError> {
-    let Some(curve) = contact.curve() else {
-        return Ok(contact_point_for_spine_vertex(spine, contact, point));
-    };
-    let t = spine_parameter_for_point(spine, point)?;
-    Ok(curve.point(t))
-}
-
 fn contact_subedge_for_spine_edge(
     spine: &Edge,
     contact: &Edge,
     edge: &Edge,
 ) -> Result<Edge, RollingBallError> {
-    let t0 = spine_parameter_for_point(spine, edge.source().point())?;
-    let t1 = spine_parameter_for_point(spine, edge.target().point())?;
+    let (t0, t1) = spine_param_span(spine, edge)?;
     edge_on_contact_between_params(contact, t0, t1)
+}
+
+/// Map a rim fragment onto the spine's angular frame: `(t0, t1)` such that the
+/// param interval traverses the SAME arc as `edge` (source → target, through the
+/// fragment's own midpoint). Snapping each endpoint independently is ambiguous
+/// at the 0/TAU seam: a fragment ending there can snap to the wrong branch,
+/// handing every param-interval consumer (curve discretization, shared-edge
+/// keys) the COMPLEMENTARY arc even though the endpoints — and therefore `sew`
+/// and the watertightness check — still line up.
+fn spine_param_span(spine: &Edge, edge: &Edge) -> Result<(f64, f64), RollingBallError> {
+    use core::f64::consts::{PI, TAU};
+
+    let t0 = spine_parameter_for_point(spine, edge.source().point())?;
+    let mut t1 = spine_parameter_for_point(spine, edge.target().point())?;
+    if let Some(curve) = edge.curve() {
+        // A circle's param IS its angle, so the fragment's angular extent is its
+        // raw param span, independent of the spine's frame.
+        let span = (edge.last() - edge.first()).abs();
+        if span <= tolerance::CONFUSION {
+            return Ok((t0, t1));
+        }
+        if span >= TAU - tolerance::ANGULAR {
+            // Full circle: direction is immaterial, but the interval must span
+            // TAU (endpoint-snapping would collapse it to zero).
+            return Ok((t0, t0 + TAU));
+        }
+        let mid = curve.point(0.5 * (edge.first() + edge.last()));
+        let mut tm = spine_parameter_for_point(spine, mid)?;
+        // Nearest representative of the midpoint angle to t0; the true offset is
+        // span/2 < PI, so this branch choice is exact.
+        while tm - t0 > PI {
+            tm -= TAU;
+        }
+        while t0 - tm > PI {
+            tm += TAU;
+        }
+        t1 = if tm >= t0 { t0 + span } else { t0 - span };
+    }
+    Ok((t0, t1))
 }
 
 fn edge_on_contact_between_params(

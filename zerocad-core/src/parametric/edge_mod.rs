@@ -1099,7 +1099,13 @@ fn edge_mod_native_chamfer_all_parts(
         });
         let mut accepted: Option<EdgeModResult> = None;
         let mut part_failures = Vec::new();
-        match crate::mock_kernel::chamfer_edge(&part, edge.p0, edge.p1, dist) {
+        match crate::mock_kernel::chamfer_edge_with_hint(
+            &part,
+            edge.p0,
+            edge.p1,
+            edge.curve.as_ref(),
+            dist,
+        ) {
             Ok(chamfered) => match edge_mod_accept_candidate_or_recut(
                 reference_mesh,
                 &part,
@@ -2149,6 +2155,21 @@ pub(crate) fn edge_mod_accept_candidate_or_recut(
         Err(reason) => reason,
     };
 
+    // The analytic recut exists to trim a straight-edge blend candidate back
+    // into replayed cut voids. A candidate carrying a curved-rim band (torus /
+    // cone) never needs it — the circular-chain solver already trims flush
+    // against its supports — and feeding those surfaces to the boolean engine
+    // can stall in surface-intersection marching rather than fail.
+    let has_curved_band = candidate.shell().faces().iter().any(|f| {
+        matches!(
+            f.surface(),
+            Some(openrcad::geom::GeomSurface::Torus(_)) | Some(openrcad::geom::GeomSurface::Cone(_))
+        )
+    });
+    if has_curved_band {
+        return Err(first_reason);
+    }
+
     let mut failures = Vec::new();
     match recut_candidate_with_tools(candidate, recut_tools) {
         Ok(Some(recut)) => {
@@ -2593,6 +2614,9 @@ pub(crate) fn edge_mod_selected_blend_present(
     dist: f32,
     kind: crate::sketch::CornerKind,
 ) -> Result<(), String> {
+    if matches!(edge.curve.as_ref(), Some(EdgeCurveHint::Circle { .. })) {
+        return edge_mod_selected_blend_present_circular(candidate_mesh, edge, dist, kind);
+    }
     if !matches!(edge.curve.as_ref(), None | Some(EdgeCurveHint::Line)) {
         return Err(
             "candidate selected-edge locality validation is only implemented for straight edges"
@@ -2712,6 +2736,142 @@ pub(crate) fn edge_mod_selected_blend_present(
         );
     }
 
+    Ok(())
+}
+
+/// Circular analogue of the straight-edge presence check: the blend band around
+/// a circular rim (a bite arc, a rim fragment) lives within `dist` of the rim
+/// circle, offset into the material off BOTH support faces, inside the selected
+/// angular span, with normals sweeping between the cap and the wall.
+fn edge_mod_selected_blend_present_circular(
+    candidate_mesh: &MockMesh,
+    edge: &EdgeRef,
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+) -> Result<(), String> {
+    let Some(EdgeCurveHint::Circle {
+        center,
+        axis,
+        x_dir,
+        radius,
+        start,
+        end,
+        closed,
+    }) = edge.curve
+    else {
+        return Err("circular presence check called without a circle hint".to_string());
+    };
+    let tau = std::f32::consts::TAU;
+    let axis_n = normalize3(axis);
+    if length_sq3(axis_n) <= 0.25 || radius <= 1.0e-4 {
+        return Err("circular presence check got a degenerate rim frame".to_string());
+    }
+    // Orthonormal in-plane frame for angles, matching the hint's convention.
+    let x_raw = sub3(x_dir, mul3(axis_n, dot3(x_dir, axis_n)));
+    if length_sq3(x_raw) <= 1.0e-6 {
+        return Err("circular presence check got a degenerate x direction".to_string());
+    }
+    let x_hat = normalize3(x_raw);
+    let y_hat = cross3(axis_n, x_hat);
+    // The hint's arc may run in either direction (`end` below `start`), exactly
+    // like the kernel's `angle_in_span`: a negative raw span means the arc goes
+    // clockwise from `start`. Normalize to "angular distance from `start` along
+    // the arc's own direction" so both encodings measure the same fragment.
+    let raw_span = end - start;
+    let forward = raw_span >= 0.0;
+    let span = if closed {
+        tau
+    } else {
+        let mut s = raw_span.abs().rem_euclid(tau);
+        if s <= 1.0e-3 {
+            s = tau;
+        }
+        s
+    };
+    let rel_angle = |theta: f32| -> f32 {
+        if forward {
+            (theta - start).rem_euclid(tau)
+        } else {
+            (start - theta).rem_euclid(tau)
+        }
+    };
+    let ang_slack = ((dist * 0.08).clamp(0.08, 0.5) / radius).max(0.02);
+
+    let min_offset = (dist * 0.04).max(0.025);
+    let max_offset = dist + EDGE_MOD_GROW + 0.30;
+    let mut samples = 0usize;
+    let mut min_ang = f32::INFINITY;
+    let mut max_ang = f32::NEG_INFINITY;
+    let mut normal_bins = std::collections::HashSet::new();
+
+    for tri in candidate_mesh.indices.chunks_exact(3) {
+        let a = mesh_vertex_pos6(candidate_mesh, tri[0]);
+        let b = mesh_vertex_pos6(candidate_mesh, tri[1]);
+        let c = mesh_vertex_pos6(candidate_mesh, tri[2]);
+        let p = mul3(add3(add3(a, b), c), 1.0 / 3.0);
+        let rel = sub3(p, center);
+        let z = dot3(rel, axis_n);
+        let radial = sub3(rel, mul3(axis_n, z));
+        let rho = length_sq3(radial).sqrt();
+        // Offset off BOTH supports (like the straight check's u/v): past the
+        // wall radially AND below/above the cap axially — the supports
+        // themselves sit at zero on one of the two and are excluded.
+        let u = (rho - radius).abs();
+        let v = z.abs();
+        if u < min_offset || v < min_offset || u > max_offset || v > max_offset {
+            continue;
+        }
+
+        // Inside the selected arc's angular span (with wrap tolerance).
+        let theta = dot3(rel, y_hat).atan2(dot3(rel, x_hat));
+        let rel_ang = rel_angle(theta);
+        if !closed && rel_ang > span + ang_slack && rel_ang < tau - ang_slack {
+            continue;
+        }
+
+        // Blend-surface normal: sweeps between the cap normal (|n·axis| = 1)
+        // and the wall normal (|n·axis| = 0). Bin the axis component so a
+        // fillet must show a genuinely rounded sweep.
+        let na = mesh_vertex_normal6(candidate_mesh, tri[0]);
+        let nb = mesh_vertex_normal6(candidate_mesh, tri[1]);
+        let nc = mesh_vertex_normal6(candidate_mesh, tri[2]);
+        let normal = normalize3(mul3(add3(add3(na, nb), nc), 1.0 / 3.0));
+        if length_sq3(normal) <= 0.25 {
+            continue;
+        }
+        let axial = dot3(normal, axis_n).abs().clamp(0.0, 1.0);
+
+        samples += 1;
+        let clamped = rel_ang.min(span);
+        min_ang = min_ang.min(clamped);
+        max_ang = max_ang.max(clamped);
+        normal_bins.insert((axial * 3.999) as i32);
+    }
+
+    let required_samples = match kind {
+        crate::sketch::CornerKind::Fillet => 3,
+        crate::sketch::CornerKind::Chamfer => 1,
+    };
+    if samples < required_samples {
+        return Err(format!(
+            "candidate did not create a {kind:?} band on the selected circular edge \
+             ({samples} band samples)"
+        ));
+    }
+    let required_span = (span * 0.25).clamp(0.1, span * 0.75);
+    if max_ang - min_ang < required_span {
+        return Err(format!(
+            "candidate {kind:?} band covered only {:.2} rad of the selected {:.2} rad arc",
+            max_ang - min_ang,
+            span
+        ));
+    }
+    if matches!(kind, crate::sketch::CornerKind::Fillet) && normal_bins.len() < 2 {
+        return Err(
+            "candidate fillet band on the selected circular edge did not have rounded normals"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -2945,8 +3105,22 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh(
     if candidate_mesh.indices.is_empty() {
         return Err("candidate tessellated to an empty mesh".to_string());
     }
-    let preserved_cylinder_faces =
+    let mut preserved_cylinder_faces =
         crate::mock_kernel::preserved_cylindrical_face_ids(original_part, &candidate);
+    // Analytic blend bands (torus fillet / cone chamfer around a circular rim)
+    // are subtractive by construction and bounds-guarded in the kernel, but
+    // their chorded triangles can sag inside the reference mesh's own chorded
+    // wall by more than the containment tolerance on coarse hoops — exempt them
+    // exactly like preserved cylindrical walls.
+    for (i, face) in candidate.shell().faces().iter().enumerate() {
+        if matches!(
+            face.surface(),
+            Some(openrcad::geom::GeomSurface::Torus(_))
+                | Some(openrcad::geom::GeomSurface::Cone(_))
+        ) {
+            preserved_cylinder_faces.insert(i as u32);
+        }
+    }
     edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
     edge_mod_mesh_stays_inside_reference(
         reference_mesh,

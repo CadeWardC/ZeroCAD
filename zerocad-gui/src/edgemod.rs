@@ -30,6 +30,18 @@ fn v_scale(v: [f32; 3], s: f32) -> [f32; 3] {
     [v[0] * s, v[1] * s, v[2] * s]
 }
 
+fn v_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn v_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
 fn v_len(v: [f32; 3]) -> f32 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
@@ -52,6 +64,9 @@ fn push_preview_edge(mesh: &mut MockMesh, a: [f32; 3], b: [f32; 3]) {
 }
 
 fn edge_mod_edge_preview_mesh(edge: &EdgeRef, dist: f32, kind: CornerKind) -> Option<MockMesh> {
+    if matches!(edge.curve, Some(EdgeCurveHint::Circle { .. })) {
+        return edge_mod_circular_edge_preview_mesh(edge, dist, kind);
+    }
     if !matches!(edge.curve, None | Some(EdgeCurveHint::Line)) {
         return None;
     }
@@ -117,6 +132,151 @@ fn edge_mod_edge_preview_mesh(edge: &EdgeRef, dist: f32, kind: CornerKind) -> Op
             v_add(edge.p1, window[0].0),
             v_add(edge.p1, window[1].0),
         );
+    }
+
+    Some(mesh)
+}
+
+/// Circular analogue of [`edge_mod_edge_preview_mesh`]: sweep the same blend
+/// profile (a quarter-arc of rails for a fillet, two rails for a chamfer)
+/// AROUND the selected rim arc instead of along a straight edge, so a bite arc
+/// or a cylinder/bored-hole rim gets the same immediate visual feedback while
+/// the size is being edited.
+fn edge_mod_circular_edge_preview_mesh(
+    edge: &EdgeRef,
+    dist: f32,
+    kind: CornerKind,
+) -> Option<MockMesh> {
+    let Some(EdgeCurveHint::Circle {
+        center,
+        axis,
+        x_dir,
+        radius,
+        start,
+        end,
+        closed,
+    }) = edge.curve.clone()
+    else {
+        return None;
+    };
+    let tau = std::f32::consts::TAU;
+    let a = v_norm(axis)?;
+    let x = v_norm(v_add(x_dir, v_scale(a, -v_dot(x_dir, a))))?;
+    let y = v_cross(a, x);
+    // The hint's arc may run in either direction (`end` below `start`).
+    let raw = end - start;
+    let span = if closed {
+        tau
+    } else {
+        let s = raw.abs().rem_euclid(tau);
+        if s <= 1.0e-3 {
+            tau
+        } else {
+            s
+        }
+    };
+    let dir_sign = if raw < 0.0 { -1.0 } else { 1.0 };
+    let dist = dist.max(0.05);
+    let n1 = v_norm(edge.n1)?;
+
+    let radial_at = |theta: f32| -> [f32; 3] {
+        v_add(v_scale(x, theta.cos()), v_scale(y, theta.sin()))
+    };
+    // `edge.n2` is the wall normal captured at one (unknown) point of the arc:
+    // its radial sign is read where it aligns best with the local radial
+    // direction (that's the capture angle), so a concave bite wall (normal
+    // toward the axis) and a convex rim (normal outward) both offset inward
+    // into their own material.
+    let n2 = v_norm(edge.n2)?;
+    let segs = ((span * radius / 1.5) as usize).clamp(8, 96);
+    let mut best = (0.0f32, 1.0f32);
+    for k in 0..=segs {
+        let theta = start + dir_sign * span * (k as f32 / segs as f32);
+        let d = v_dot(n2, radial_at(theta));
+        if d.abs() > best.0 {
+            best = (d.abs(), d.signum());
+        }
+    }
+    let wall_sign = best.1;
+
+    // Blend profile rails per arc sample: offsets from the rim point plus the
+    // rail's shading normal, exactly like the straight-edge version.
+    let rails_at = |theta: f32| -> Option<Vec<([f32; 3], [f32; 3])>> {
+        let n2_loc = v_scale(radial_at(theta), wall_sign);
+        let mut rails = Vec::new();
+        match kind {
+            CornerKind::Chamfer => {
+                let normal = v_norm(v_add(n1, n2_loc)).unwrap_or(n1);
+                rails.push((v_scale(n1, -dist), normal));
+                rails.push((v_scale(n2_loc, -dist), normal));
+            }
+            CornerKind::Fillet => {
+                let center_offset = v_add(v_scale(n1, -dist), v_scale(n2_loc, -dist));
+                for i in 0..=EDGE_MOD_PREVIEW_FILLET_SEGS {
+                    let phi = i as f32 / EDGE_MOD_PREVIEW_FILLET_SEGS as f32
+                        * std::f32::consts::FRAC_PI_2;
+                    let dir = v_norm(v_add(
+                        v_scale(n2_loc, phi.cos()),
+                        v_scale(n1, phi.sin()),
+                    ))?;
+                    rails.push((v_add(center_offset, v_scale(dir, dist)), dir));
+                }
+            }
+        }
+        (rails.len() >= 2).then_some(rails)
+    };
+
+    let point_at = |theta: f32| -> [f32; 3] { v_add(center, v_scale(radial_at(theta), radius)) };
+
+    let mut mesh = MockMesh::empty();
+    let n_rails = match kind {
+        CornerKind::Chamfer => 2,
+        CornerKind::Fillet => EDGE_MOD_PREVIEW_FILLET_SEGS + 1,
+    };
+    // Vertices: sample-major grid, `n_rails` per arc sample.
+    let mut ring_points = Vec::with_capacity(segs + 1);
+    for k in 0..=segs {
+        let theta = start + dir_sign * span * (k as f32 / segs as f32);
+        let p = point_at(theta);
+        ring_points.push((theta, p));
+        for (offset, normal) in rails_at(theta)? {
+            push_preview_vertex(&mut mesh, v_add(p, offset), normal);
+        }
+    }
+    for k in 0..segs {
+        for r in 0..n_rails - 1 {
+            let a0 = (k * n_rails + r) as u32;
+            let a1 = a0 + 1;
+            let b0 = a0 + n_rails as u32;
+            let b1 = b0 + 1;
+            mesh.indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+            mesh.face_ids.push(r as u32 + 1);
+            mesh.face_ids.push(r as u32 + 1);
+        }
+    }
+
+    // Wire feedback: the two boundary rails swept along the arc, plus the
+    // profile fan at both free ends of an open arc.
+    let boundary_rails: Vec<usize> = match kind {
+        CornerKind::Chamfer => vec![0, 1],
+        CornerKind::Fillet => vec![0, n_rails - 1],
+    };
+    for &r in &boundary_rails {
+        for k in 0..segs {
+            let (t0, p0) = ring_points[k];
+            let (t1, p1) = ring_points[k + 1];
+            let o0 = rails_at(t0)?[r].0;
+            let o1 = rails_at(t1)?[r].0;
+            push_preview_edge(&mut mesh, v_add(p0, o0), v_add(p1, o1));
+        }
+    }
+    if !closed {
+        for (theta, p) in [*ring_points.first()?, *ring_points.last()?] {
+            let rails = rails_at(theta)?;
+            for w in rails.windows(2) {
+                push_preview_edge(&mut mesh, v_add(p, w[0].0), v_add(p, w[1].0));
+            }
+        }
     }
 
     Some(mesh)
@@ -202,6 +362,73 @@ mod tests {
             dist_text: format!("{dist:.2}"),
             focus_request: false,
         }
+    }
+
+    /// A concave bite arc on a body's top face (z = 10): rim circle about +Z,
+    /// wall normal pointing toward the axis, spanning 90°..270°.
+    fn bite_arc_edge(closed: bool, reversed: bool) -> EdgeRef {
+        let (start, end) = if reversed {
+            (3.0 * std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2)
+        } else {
+            (std::f32::consts::FRAC_PI_2, 3.0 * std::f32::consts::FRAC_PI_2)
+        };
+        EdgeRef {
+            p0: [20.0, 22.0, 10.0],
+            p1: [20.0, -6.0, 10.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, 1.0, 0.0], // at 90°, pointing back toward the axis (concave)
+            curve: Some(EdgeCurveHint::Circle {
+                center: [20.0, 8.0, 10.0],
+                axis: [0.0, 0.0, 1.0],
+                x_dir: [1.0, 0.0, 0.0],
+                radius: 14.0,
+                start,
+                end,
+                closed,
+            }),
+            topology: None,
+        }
+    }
+
+    #[test]
+    fn circular_edge_preview_mesh_sweeps_the_arc_and_respects_direction() {
+        for kind in [CornerKind::Fillet, CornerKind::Chamfer] {
+            for reversed in [false, true] {
+                let mesh = edge_mod_edge_preview_mesh(&bite_arc_edge(false, reversed), 3.0, kind)
+                    .expect("circular selections must get an immediate preview");
+                assert!(!mesh.indices.is_empty(), "{kind:?} ribbon has triangles");
+                assert!(
+                    !mesh.edge_indices.is_empty(),
+                    "{kind:?} ribbon has wire feedback"
+                );
+                // Every vertex stays within the blend's reach of the rim circle
+                // (on-arc, offset at most ~dist·√2 from the rim), regardless of
+                // which direction the hint encodes the arc.
+                for v in mesh.vertices.chunks_exact(6) {
+                    let (dx, dy, dz) = (v[0] - 20.0, v[1] - 8.0, v[2] - 10.0);
+                    let rho = dx.hypot(dy);
+                    let d_rim = (rho - 14.0).hypot(dz);
+                    assert!(
+                        d_rim <= 3.0 * 1.5 + 1.0e-3,
+                        "{kind:?} ribbon vertex strayed {d_rim} from the rim"
+                    );
+                    // Concave wall: the profile offsets outward (away from the
+                    // axis) and down into the material, never up above the cap.
+                    assert!(v[2] <= 10.0 + 1.0e-3, "{kind:?} ribbon rose above the cap");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closed_rim_preview_mesh_wraps_without_end_fans() {
+        let open = edge_mod_edge_preview_mesh(&bite_arc_edge(false, false), 3.0, CornerKind::Fillet)
+            .expect("open preview");
+        let closed = edge_mod_edge_preview_mesh(&bite_arc_edge(true, false), 3.0, CornerKind::Fillet)
+            .expect("closed preview");
+        // The closed rim sweeps the full circle: more triangles, and no
+        // end-profile wire fans beyond the two boundary rails.
+        assert!(closed.indices.len() > open.indices.len());
     }
 
     fn y_z_bounds(mesh: &MockMesh) -> (f32, f32, f32, f32) {
