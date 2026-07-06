@@ -490,6 +490,42 @@ impl ParametricGraph {
                             &mut warnings,
                         );
                     }
+                    FeatureType::Loft {
+                        sections,
+                        mode,
+                        target,
+                    } => {
+                        self.apply_loft(
+                            &node.id,
+                            sections,
+                            *mode,
+                            target.as_deref(),
+                            &sketch_cache,
+                            &datums,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::Sweep {
+                        profile_sketch,
+                        profile_region,
+                        path_sketch,
+                        mode,
+                        target,
+                    } => {
+                        self.apply_sweep(
+                            &node.id,
+                            profile_sketch,
+                            *profile_region,
+                            path_sketch,
+                            *mode,
+                            target.as_deref(),
+                            &sketch_cache,
+                            &datums,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
                     FeatureType::Shell {
                         target,
                         thickness,
@@ -854,6 +890,8 @@ impl ParametricGraph {
                         | FeatureType::Pattern { .. }
                         | FeatureType::Hole { .. }
                         | FeatureType::Shell { .. }
+                        | FeatureType::Loft { .. }
+                        | FeatureType::Sweep { .. }
                 )
             })
             .collect();
@@ -1482,10 +1520,245 @@ impl ParametricGraph {
     }
 }
 
+impl ParametricGraph {
+    /// The effective placement plane of a sketch: a datum attachment first
+    /// (re-derived from the datum's current resolution), then a face attachment
+    /// (re-derived from the body), else the sketch's saved plane. Shared by
+    /// extrude/revolve/loft/sweep.
+    fn effective_sketch_cs(
+        &self,
+        sketch_id: &str,
+        saved: CoordinateSystem,
+        datums: &HashMap<String, DatumValue>,
+        live: &[LiveBody],
+    ) -> CoordinateSystem {
+        let datum_cs = self
+            .sketch_datum_refs
+            .get(sketch_id)
+            .and_then(|datum_id| match datums.get(datum_id) {
+                Some(DatumValue::Plane(cs)) => Some(*cs),
+                _ => None,
+            });
+        datum_cs
+            .or_else(|| {
+                self.sketch_face_refs
+                    .get(sketch_id)
+                    .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
+            })
+            .unwrap_or(saved)
+    }
+
+    /// Look up a cached sketch evaluation by its node id.
+    fn sketch_eval_by_id<'a>(
+        &self,
+        cache: &'a HashMap<NodeIndex, SketchEval>,
+        id: &str,
+    ) -> Option<&'a SketchEval> {
+        self.node_map.get(id).and_then(|idx| cache.get(idx))
+    }
+
+    /// Evaluate one Loft node: skin a solid through the ordered section
+    /// profiles. NewBody pushes the lofted solid; Join/Cut apply it as a
+    /// boolean tool against the target body.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_loft(
+        &self,
+        node_id: &str,
+        sections: &[(String, usize)],
+        mode: ExtrudeMode,
+        boolean_target: Option<&str>,
+        sketch_cache: &HashMap<NodeIndex, SketchEval>,
+        datums: &HashMap<String, DatumValue>,
+        live: &mut Vec<LiveBody>,
+        warnings: &mut Vec<String>,
+    ) {
+        if sections.len() < 2 {
+            warnings.push(format!(
+                "Loft '{node_id}': needs at least two section profiles."
+            ));
+            return;
+        }
+        let mut resolved: Vec<(CoordinateSystem, Vec<(f32, f32)>)> = Vec::new();
+        for (sketch_id, region_index) in sections {
+            let Some(sketch) = self.sketch_eval_by_id(sketch_cache, sketch_id) else {
+                warnings.push(format!(
+                    "Loft '{node_id}': section sketch '{sketch_id}' not found."
+                ));
+                return;
+            };
+            let Some(region) = sketch.regions.get(*region_index) else {
+                warnings.push(format!(
+                    "Loft '{node_id}': sketch '{sketch_id}' has no region {region_index}."
+                ));
+                return;
+            };
+            let cs = self.effective_sketch_cs(sketch_id, sketch.cs, datums, live);
+            resolved.push((cs, region.boundary.clone()));
+        }
+        let Some(solid) = crate::mock_kernel::lofted_solid(&resolved) else {
+            warnings.push(format!(
+                "Loft '{node_id}': the sections could not be skinned into a solid \
+                 (check they're ordered and similarly shaped)."
+            ));
+            return;
+        };
+        self.assemble_generated_body(node_id, solid, mode, boolean_target, live, warnings, |m| {
+            stamp_generated_face_refs(m, node_id, "loft")
+        });
+    }
+
+    /// Evaluate one Sweep node: transport the profile along the path via RMF.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_sweep(
+        &self,
+        node_id: &str,
+        profile_sketch: &str,
+        profile_region: usize,
+        path_sketch: &str,
+        mode: ExtrudeMode,
+        boolean_target: Option<&str>,
+        sketch_cache: &HashMap<NodeIndex, SketchEval>,
+        datums: &HashMap<String, DatumValue>,
+        live: &mut Vec<LiveBody>,
+        warnings: &mut Vec<String>,
+    ) {
+        let Some(profile) = self.sketch_eval_by_id(sketch_cache, profile_sketch) else {
+            warnings.push(format!(
+                "Sweep '{node_id}': profile sketch '{profile_sketch}' not found."
+            ));
+            return;
+        };
+        let Some(region) = profile.regions.get(profile_region) else {
+            warnings.push(format!(
+                "Sweep '{node_id}': profile sketch has no region {profile_region}."
+            ));
+            return;
+        };
+        let profile_cs = self.effective_sketch_cs(profile_sketch, profile.cs, datums, live);
+        let Some(path) = self.sketch_eval_by_id(sketch_cache, path_sketch) else {
+            warnings.push(format!(
+                "Sweep '{node_id}': path sketch '{path_sketch}' not found."
+            ));
+            return;
+        };
+        let path_cs = self.effective_sketch_cs(path_sketch, path.cs, datums, live);
+        let Some(path_2d) = path.curves.path_polyline(1e-3) else {
+            warnings.push(format!(
+                "Sweep '{node_id}': the path sketch must be a single open chain of \
+                 lines/arcs (no branches, loops, or gaps)."
+            ));
+            return;
+        };
+        let path_3d: Vec<Vec3> = path_2d.iter().map(|&(u, v)| path_cs.unproject(u, v)).collect();
+        let Some(solid) =
+            crate::mock_kernel::swept_solid(&profile_cs, &region.boundary, &path_3d)
+        else {
+            warnings.push(format!(
+                "Sweep '{node_id}': the profile could not be swept along the path \
+                 (it may self-intersect on a tight bend)."
+            ));
+            return;
+        };
+        self.assemble_generated_body(node_id, solid, mode, boolean_target, live, warnings, |m| {
+            stamp_generated_face_refs(m, node_id, "sweep")
+        });
+    }
+
+    /// Shared tail for loft/sweep: put a freshly generated solid into `live`
+    /// as a NewBody, or apply it as a Join/Cut boolean tool against the target.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_generated_body(
+        &self,
+        node_id: &str,
+        solid: KernelSolid,
+        mode: ExtrudeMode,
+        boolean_target: Option<&str>,
+        live: &mut Vec<LiveBody>,
+        warnings: &mut Vec<String>,
+        stamp: impl Fn(&mut MockMesh),
+    ) {
+        match mode {
+            ExtrudeMode::NewBody => {
+                let mut mesh = MockMesh::from_solid(&solid);
+                if mesh.indices.is_empty() {
+                    warnings.push(format!("Feature '{node_id}': result tessellated empty."));
+                    return;
+                }
+                stamp(&mut mesh);
+                crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+                live.push(LiveBody {
+                    id: node_id.to_string(),
+                    parts: vec![solid],
+                    pristine: Some(mesh),
+                    sketch_source: None,
+                    cut_tools: Vec::new(),
+                    cut_replay: None,
+                    edge_mod_cut_history_path_used: false,
+                });
+            }
+            ExtrudeMode::Join | ExtrudeMode::Cut => {
+                if let Some(target_id) = boolean_target {
+                    if !live.iter().any(|b| b.id == target_id) {
+                        warnings.push(format!(
+                            "Feature '{node_id}': its target body '{target_id}' no longer exists."
+                        ));
+                        return;
+                    }
+                }
+                if mode == ExtrudeMode::Join {
+                    apply_join(
+                        live,
+                        node_id,
+                        vec![JoinTool {
+                            smooth: None,
+                            exact: Some(solid),
+                            dipped: None,
+                        }],
+                        boolean_target,
+                        warnings,
+                    );
+                } else {
+                    apply_cut(
+                        live,
+                        node_id,
+                        vec![CutTool::single_direction(None, Some(solid), None, None)],
+                        boolean_target,
+                        warnings,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Stamp a generated body's faces `{kind}:{node}:face:{k}` in quantized-
+/// centroid order (stable across runs).
+fn stamp_generated_face_refs(mesh: &mut MockMesh, body_id: &str, kind: &str) {
+    let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
+    let mut order: Vec<usize> = (0..mesh.face_refs.len())
+        .filter(|&i| mesh.face_refs[i].topology.is_none())
+        .collect();
+    order.sort_by_key(|&i| {
+        let c = mesh.face_refs[i].centroid;
+        (quant(c[0]), quant(c[1]), quant(c[2]))
+    });
+    for (k, &i) in order.iter().enumerate() {
+        mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(format!("{kind}:{body_id}:face:{k}")),
+            surface_kind: None,
+        });
+    }
+}
+
 /// Evaluate one Shell node: hollow the target body in place. Open faces are
 /// resolved geometrically (captured centroid+normal → nearest matching kernel
 /// face); the shelled solid replaces the body's parts and its display mesh is
 /// re-derived from the result.
+// `&mut Vec<LiveBody>` (not a slice) matches every sibling `apply_*` helper's
+// signature — a uniform body-list handle across the evaluator.
+#[allow(clippy::ptr_arg)]
 fn apply_shell(
     node_id: &str,
     target: &str,
@@ -1547,7 +1820,8 @@ fn apply_shell(
 /// cutters (with the standard `CUT_OVERSHOOT` so end caps never sit coplanar
 /// with body faces) and apply them through the guarded cut pipeline against
 /// the target body only.
-#[allow(clippy::too_many_arguments)]
+// `&mut Vec<LiveBody>` matches every sibling `apply_*` helper (see `apply_shell`).
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
 fn apply_hole(
     node_id: &str,
     target: &str,
@@ -1599,8 +1873,12 @@ fn apply_hole(
     // The HEAD cutter (counterbore/countersink) is applied FIRST: it starts at
     // the surface, so it cuts virgin material cleanly, and the bore then
     // drills through its flat/conical bottom. The other order asks the solver
-    // to subtract a wide cylinder around an existing COAXIAL bore wall (no
-    // wall-wall intersection curve), which it rejects.
+    // to subtract a wide cylinder whose flat bottom meets an existing narrow
+    // coaxial bore wall in a full circle — the periodic-face band-partition the
+    // boolean engine can't yet do (pinned by the ignored kernel test
+    // `blind_counterbore_over_through_bore` in boolean_robustness_matrix.rs).
+    // Head-before-bore is also the natural machining order, so this is a
+    // correct model, not merely a dodge.
     let mut cut_tools: Vec<CutTool> = Vec::new();
     match kind {
         HoleKind::Simple => {}

@@ -100,7 +100,7 @@ pub fn revolve(
     if axis_dir.dot(&n).abs() > 1e-6 {
         return Err(RevolveError::AxisNotInProfilePlane);
     }
-    let off = (axis_point - plane_point(&plane)).dot(&GeomVec::from_dir(n));
+    let off = (axis_point - plane_point(plane)).dot(&GeomVec::from_dir(n));
     if off.abs() > tolerance::CONFUSION * 100.0 {
         return Err(RevolveError::AxisNotInProfilePlane);
     }
@@ -144,10 +144,12 @@ pub fn revolve(
     let sweep_vel = GeomVec::from_dir(axis_dir).cross(&radial);
     let along = sweep_vel.dot(&GeomVec::from_dir(n_wind)) >= 0.0;
 
-    // Angular stations: ≤ π per lateral face so no loop needs a seam. A FULL
-    // turn uses THREE 120° segments (matching `make_cylinder`'s thirds): two
-    // half-turn arcs would share BOTH endpoints, which the endpoint-quantized
-    // manifold validator merges into one false non-manifold edge.
+    // Angular stations: ≤ π per lateral face so no loop needs an internal seam.
+    // A FULL turn uses THREE 120° segments — matching `make_cylinder`'s thirds
+    // so a revolved cylinder tessellates identically to a primitive one. (Two
+    // half-turn arcs would be topologically valid now that arena edge identity
+    // includes the arc span — see `edge_midpoints_match` — but thirds keep the
+    // mesh density uniform with the rest of the kernel's round geometry.)
     let stations: Vec<f64> = if full {
         vec![0.0, TAU / 3.0, 2.0 * TAU / 3.0, TAU]
     } else if angle > PI + 1e-9 {
@@ -339,12 +341,30 @@ fn lateral_face(edge: &Edge, axis: &Ax1, t0: f64, t1: f64, surface: GeomSurface)
 /// Does `wire`'s winding normal agree with `surface`'s intrinsic normal
 /// (∂u × ∂v)? Sampled: Newell over points along each edge's curve (in loop
 /// order), against the surface normal at `center` (a point ON the surface in
-/// the middle of the patch). Shared by revolve and the loft/sweep skinner —
-/// any face whose loop winds CW in its surface's uv renders inside-out (see
-/// the module docs).
+/// the middle of the patch). Shared by revolve and the loft/sweep skinner.
+///
+/// INVARIANT (curved-face winding): every curved face handed to `sew` MUST
+/// already wind CCW in its surface's own uv — i.e. this returns `true`, else
+/// the wire is reversed at construction. This is a CONSTRUCTION-time
+/// responsibility that CANNOT be moved into `sew`'s post-hoc
+/// `canonicalize_shell_orientation`, for two independent reasons:
+///
+///  1. Tessellation winds triangles from `orientation ⊗ intrinsic_normal`
+///     (`orient_triangle_to_surface`, it ignores the loop entirely), while
+///     `signed_volume` and boolean face-classification use
+///     `orientation ⊗ loop_winding`. These agree only when
+///     `intrinsic == loop_winding`. Flipping a face's *orientation flag* flips
+///     BOTH effective normals, so it can never reconcile a face where they
+///     disagree — only reversing the *wire* (changing `loop_winding`) can, and
+///     a plane's stored normal can't stand in because a curved surface's normal
+///     sense is intrinsic to its parameterisation.
+///  2. `sew`'s step-7 BFS establishes cross-edge winding consistency over the
+///     assembled loops; reversing a wire *after* that would desync the very
+///     consistency the BFS built. So the reversal has to happen before sew.
+///
+/// Any new curved-surface op (revolve, skin, future sweeps/blends) must call
+/// this before sewing. Do not "centralise" it into sew.
 pub(crate) fn loop_agrees_with_surface(wire: &Wire, surface: &GeomSurface, center: Pnt) -> bool {
-    use openrcad_geom::Surface as _;
-
     const SAMPLES: usize = 6;
     let mut pts: Vec<Pnt> = Vec::new();
     for edge in wire.edges() {
@@ -614,13 +634,13 @@ mod tests {
             .faces()
             .iter()
             .any(|f| matches!(f.surface(), Some(GeomSurface::Cone(_)))));
-        // The cone tessellator currently samples u sparsely near the apex, so
-        // the inscribed mesh under-fills the analytic cone by ~13% — a mesh
-        // refinement gap, not a revolve defect (the surface IS the exact
-        // cone). Tighten this bound when cone tessellation gains u-refinement.
+        // The cone lateral is an exact analytic ConicalSurface, and the cone
+        // tessellator now gives it a full ruled grid + ruled-edge refinement
+        // (was a sparse single mid-ring that under-filled ~13%), so the mesh
+        // matches the analytic volume to <1%, like cylinders and tori.
         let exact = PI * 4.0 * 4.0 / 3.0;
         let v = volume(&solid);
-        assert!((v - exact).abs() / exact < 0.15, "cone volume {v} vs {exact}");
+        assert!((v - exact).abs() / exact < 0.01, "cone volume {v} vs {exact}");
     }
 
     #[test]

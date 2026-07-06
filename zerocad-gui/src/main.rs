@@ -15,6 +15,7 @@ mod extrude;
 mod geom2d;
 mod icons;
 mod hole_ui;
+mod loft_sweep_ui;
 mod pattern_ui;
 mod render;
 mod revolve_ui;
@@ -28,6 +29,7 @@ use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
 use hole_ui::HoleOp;
+use loft_sweep_ui::SweepOp;
 use pattern_ui::PatternOp;
 use revolve_ui::RevolveOp;
 use shell_ui::ShellOp;
@@ -532,6 +534,8 @@ struct ZeroCadApp {
     hole_op: Option<HoleOp>,
     /// The in-progress Shell tool dialog, `None` when idle.
     shell_op: Option<ShellOp>,
+    /// The in-progress Sweep tool dialog (profile chosen, picking path).
+    sweep_op: Option<SweepOp>,
     /// Memoized live Cut/Join preview: `(input hash, evaluated bodies)`. The
     /// preview re-runs the whole parametric model (truck booleans), which is far
     /// too slow to redo every frame, so it's cached and only recomputed when the

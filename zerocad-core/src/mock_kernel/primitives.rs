@@ -197,6 +197,187 @@ pub fn transformed_solid(solid: &KernelSolid, t: &Trsf, is_reflection: bool) -> 
     Solid::new(openrcad::algo::sew::sew(&faces, 1e-6))
 }
 
+/// Resample a closed 2D polygon to exactly `n` points equally spaced by arc
+/// length, starting at the original first vertex. Keeps corresponding indices
+/// roughly aligned across sections/frames so a skin doesn't shear.
+fn resample_ring_2d(pts: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
+    let m = pts.len();
+    if m < 2 || n < 3 {
+        return pts.to_vec();
+    }
+    // Cumulative perimeter length at each original vertex (closed).
+    let mut cum = vec![0.0f32; m + 1];
+    for i in 0..m {
+        let a = pts[i];
+        let b = pts[(i + 1) % m];
+        cum[i + 1] = cum[i] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    }
+    let total = cum[m];
+    if total <= f32::EPSILON {
+        return pts.to_vec();
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut seg = 0usize;
+    for k in 0..n {
+        let target = total * k as f32 / n as f32;
+        while seg < m && cum[seg + 1] < target {
+            seg += 1;
+        }
+        let s = seg.min(m - 1);
+        let seg_len = cum[s + 1] - cum[s];
+        let t = if seg_len > f32::EPSILON {
+            (target - cum[s]) / seg_len
+        } else {
+            0.0
+        };
+        let a = pts[s];
+        let b = pts[(s + 1) % m];
+        out.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+    }
+    out
+}
+
+/// Loft a solid through `sections` (each: a sketch-plane frame + its outer
+/// boundary in that plane's (u, v)). Sections are resampled to a common vertex
+/// count, unprojected to 3D rings, and skinned. Holes are not lofted in v1
+/// (only the outer boundary of each section is used). `None` when there are
+/// fewer than two sections or the skin fails to close.
+pub fn lofted_solid(
+    sections: &[(crate::geometry::CoordinateSystem, Vec<(f32, f32)>)],
+) -> Option<KernelSolid> {
+    if sections.len() < 2 {
+        return None;
+    }
+    // Common sampling: the densest section's count, bounded so a coarse
+    // triangle doesn't force a fine section down to 3 points and vice-versa.
+    let target_n = sections
+        .iter()
+        .map(|(_, b)| b.len())
+        .max()
+        .unwrap_or(0)
+        .clamp(3, 256);
+    let mut rings: Vec<Vec<Pnt>> = Vec::with_capacity(sections.len());
+    for (cs, boundary) in sections {
+        if boundary.len() < 3 {
+            return None;
+        }
+        let resampled = resample_ring_2d(boundary, target_n);
+        let ring: Vec<Pnt> = resampled
+            .iter()
+            .map(|&(u, v)| {
+                let p = cs.unproject(u, v);
+                Pnt::new(p.x as f64, p.y as f64, p.z as f64)
+            })
+            .collect();
+        rings.push(ring);
+    }
+    match skin_polygon_rings(&rings) {
+        Ok(solid) => Some(solid),
+        Err(e) => {
+            log::warn!("loft failed: {e}");
+            None
+        }
+    }
+}
+
+/// Sweep `profile` (a sketch-plane frame + its outer boundary in (u, v)) along
+/// `path_points` (an ordered 3D polyline) using rotation-minimizing frames
+/// (double-reflection method), so the profile is transported without twist.
+/// The profile is placed perpendicular to the path at its start (its drawn
+/// orientation about the tangent is preserved as closely as possible). `None`
+/// when the path is too short or the skin fails to close.
+pub fn swept_solid(
+    profile_cs: &crate::geometry::CoordinateSystem,
+    profile_boundary: &[(f32, f32)],
+    path_points: &[crate::geometry::Vec3],
+) -> Option<KernelSolid> {
+    use crate::geometry::Vec3;
+    // Drop consecutive duplicate path points.
+    let mut path: Vec<Vec3> = Vec::with_capacity(path_points.len());
+    for &p in path_points {
+        if path.last().map(|q: &Vec3| q.sub(p).length() > 1e-6).unwrap_or(true) {
+            path.push(p);
+        }
+    }
+    if path.len() < 2 || profile_boundary.len() < 3 {
+        return None;
+    }
+
+    // Tangents by central difference (forward/back at the ends).
+    let m = path.len();
+    let tangent = |i: usize| -> Vec3 {
+        let a = if i == 0 { path[0] } else { path[i - 1] };
+        let b = if i + 1 < m { path[i + 1] } else { path[m - 1] };
+        b.sub(a).normalize()
+    };
+
+    // Initial frame perpendicular to t0. Preserve the profile's drawn "right"
+    // axis (u) by projecting it into the plane ⊥ t0; fall back to v if u is
+    // parallel to the tangent.
+    let t0 = tangent(0);
+    let mut r = profile_cs.u.sub(t0.mul(profile_cs.u.dot(t0))).normalize();
+    if r.length() < 1e-4 {
+        r = profile_cs.v.sub(t0.mul(profile_cs.v.dot(t0))).normalize();
+    }
+    if r.length() < 1e-4 {
+        return None;
+    }
+    let mut s = t0.cross(r).normalize();
+    let mut t = t0;
+
+    let profile_point = |o: Vec3, r: Vec3, s: Vec3, uv: (f32, f32)| -> Pnt {
+        let w = o.add(r.mul(uv.0)).add(s.mul(uv.1));
+        Pnt::new(w.x as f64, w.y as f64, w.z as f64)
+    };
+
+    let mut rings: Vec<Vec<Pnt>> = Vec::with_capacity(m);
+    rings.push(
+        profile_boundary
+            .iter()
+            .map(|&uv| profile_point(path[0], r, s, uv))
+            .collect(),
+    );
+    for i in 1..m {
+        // Double-reflection RMF transport of (r) from frame i-1 to i.
+        let v1 = path[i].sub(path[i - 1]);
+        let c1 = v1.dot(v1);
+        let (r_l, t_l) = if c1 > 1e-12 {
+            let r_l = r.sub(v1.mul(2.0 / c1 * v1.dot(r)));
+            let t_l = t.sub(v1.mul(2.0 / c1 * v1.dot(t)));
+            (r_l, t_l)
+        } else {
+            (r, t)
+        };
+        let t_next = tangent(i);
+        let v2 = t_next.sub(t_l);
+        let c2 = v2.dot(v2);
+        let r_next = if c2 > 1e-12 {
+            r_l.sub(v2.mul(2.0 / c2 * v2.dot(r_l)))
+        } else {
+            r_l
+        }
+        .normalize();
+        let s_next = t_next.cross(r_next).normalize();
+        r = r_next;
+        s = s_next;
+        t = t_next;
+        rings.push(
+            profile_boundary
+                .iter()
+                .map(|&uv| profile_point(path[i], r, s, uv))
+                .collect(),
+        );
+    }
+
+    match skin_polygon_rings(&rings) {
+        Ok(solid) => Some(solid),
+        Err(e) => {
+            log::warn!("sweep failed: {e}");
+            None
+        }
+    }
+}
+
 /// Solid of revolution for one sketch region, about a world-space axis lying in
 /// the sketch plane. Arc runs in the boundary are refit to true circles (like
 /// [`extruded_region_solid_with_arcs`]) so revolved arcs become analytic tori/

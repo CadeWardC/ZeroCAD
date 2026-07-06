@@ -45,9 +45,19 @@ impl ZeroCadApp {
                                 mode: ExtrudeMode::NewBody,
                                 ..
                             }
+                            | FeatureType::Loft {
+                                mode: ExtrudeMode::NewBody,
+                                ..
+                            }
+                            | FeatureType::Sweep {
+                                mode: ExtrudeMode::NewBody,
+                                ..
+                            }
                             | FeatureType::Pattern { .. } => bodies.push(entry),
                             FeatureType::Extrude { .. }
                             | FeatureType::Revolve { .. }
+                            | FeatureType::Loft { .. }
+                            | FeatureType::Sweep { .. }
                             | FeatureType::Hole { .. }
                             | FeatureType::Shell { .. }
                             | FeatureType::EdgeMod { .. } => operations.push(entry),

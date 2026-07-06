@@ -244,4 +244,41 @@ mod tests {
         );
         assert!((mp.centroid[2] - h / 2.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn tessellated_cone_is_robust_across_aspect_ratios() {
+        use openrcad_foundation::{Ax2, Dir};
+        // The cone fix (dense ruled grid) must hold its <2% accuracy AND a bounded
+        // vertex count across extreme aspect ratios — not just the one revolve
+        // test's shape. Cases: normal frustum, tall+thin, flat+wide, near-apex.
+        for &(r1, r2, h) in &[
+            (2.0, 0.5, 4.0),
+            (1.0, 0.2, 40.0),
+            (40.0, 8.0, 1.0),
+            (5.0, 0.02, 5.0),
+        ] {
+            let solid = openrcad_primitives::make_cone(
+                &Ax2::new(Pnt::origin(), Dir::new(0.0, 0.0, 1.0)),
+                r1,
+                r2,
+                h,
+            );
+            let mesh = crate::tessellate(&solid, 0.005, 0.1);
+            let mp = mass_properties(&mesh).expect("closed cone");
+            // Frustum volume: π·h/3·(r1² + r1·r2 + r2²).
+            let exact = std::f64::consts::PI * h / 3.0 * (r1 * r1 + r1 * r2 + r2 * r2);
+            assert!(
+                (mp.volume - exact).abs() / exact < 0.02,
+                "cone r1={r1} r2={r2} h={h}: volume {} vs analytic {exact}",
+                mp.volume
+            );
+            // No pathological vertex blowup (the grid must not over-generate
+            // axial rows on extreme aspect ratios).
+            assert!(
+                mesh.vertices.len() < 40_000,
+                "cone r1={r1} r2={r2} h={h}: {} verts — grid blew up",
+                mesh.vertices.len()
+            );
+        }
+    }
 }

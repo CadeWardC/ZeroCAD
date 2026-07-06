@@ -119,6 +119,22 @@ pub struct BRep {
     pub solids: SlotMap<SolidId, SolidData>,
 }
 
+/// Do two edges with equal curves and shared endpoints also cover the same
+/// span? Compares a curve-midpoint sample so two sub-arcs of one circle (which
+/// share a curve AND both endpoints but sweep different ranges) are recognised
+/// as distinct. Curve-less degenerate edges carry no span, so equal endpoints
+/// already imply the same edge.
+fn edge_midpoints_match(a: &EdgeData, b: &EdgeData) -> bool {
+    match (&a.curve, &b.curve) {
+        (Some(ca), Some(cb)) => {
+            let ma = ca.point(0.5 * (a.first + a.last));
+            let mb = cb.point(0.5 * (b.first + b.last));
+            ma.distance(&mb) <= openrcad_foundation::tolerance::CONFUSION * 10.0
+        }
+        _ => true,
+    }
+}
+
 impl BRep {
     /// Create an empty B-Rep arena.
     #[inline]
@@ -163,7 +179,19 @@ impl BRep {
                 let endpoints_match = (self_e_data.start == new_start
                     && self_e_data.end == new_end)
                     || (self_e_data.start == new_end && self_e_data.end == new_start);
-                if endpoints_match && self_e_data.curve == e_data.curve {
+                // Curve equality + shared endpoints is not enough to call two
+                // edges the same: the TWO arcs of one circle (e.g. two
+                // semicircles, or the thirds of a cylinder rim) share a curve
+                // AND both endpoints but cover different spans. Merging them
+                // loses one arc's parameter range and collapses distinct
+                // boundary edges into one — a false non-manifold downstream.
+                // A midpoint sample distinguishes co-endpoint sub-arcs; for
+                // lines (and identical arcs) the midpoints coincide, so this is
+                // a no-op there.
+                if endpoints_match
+                    && self_e_data.curve == e_data.curve
+                    && edge_midpoints_match(self_e_data, e_data)
+                {
                     matched = Some(self_e_id);
                     break;
                 }

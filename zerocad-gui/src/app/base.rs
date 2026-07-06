@@ -77,6 +77,7 @@ impl ZeroCadApp {
             pattern_op: None,
             hole_op: None,
             shell_op: None,
+            sweep_op: None,
             extrude_preview_cache: None,
             extrude_preview_mesh_cache: None,
             extrude_preview_inflight: None,

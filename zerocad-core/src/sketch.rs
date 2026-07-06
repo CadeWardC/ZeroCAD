@@ -112,6 +112,102 @@ impl SketchCurves {
         self.segments.push(LineSegment { a, b });
     }
 
+    /// Chain the segments and arcs into one ordered OPEN polyline (2D sketch
+    /// coordinates), for use as a sweep path. Curves are joined end-to-end by
+    /// matching endpoints within `tol`; the walk starts at a degree-1 endpoint
+    /// (an open chain has exactly two). Arcs are sampled along their minor arc.
+    /// Returns `None` when the curves don't form a single simple chain (a
+    /// branch, a closed loop with no free end, or a disjoint set). Circles are
+    /// ignored (a closed path needs no free end and isn't a v1 sweep path).
+    pub fn path_polyline(&self, tol: f32) -> Option<Vec<(f32, f32)>> {
+        #[derive(Clone)]
+        enum Seg {
+            Line((f32, f32), (f32, f32)),
+            Arc(Arc),
+        }
+        let mut segs: Vec<Seg> = Vec::new();
+        for l in &self.segments {
+            segs.push(Seg::Line(l.a, l.b));
+        }
+        for a in &self.arcs {
+            segs.push(Seg::Arc(*a));
+        }
+        if segs.is_empty() {
+            return None;
+        }
+        let ends = |s: &Seg| -> ((f32, f32), (f32, f32)) {
+            match s {
+                Seg::Line(a, b) => (*a, *b),
+                Seg::Arc(a) => (a.start, a.end),
+            }
+        };
+        let near = |a: (f32, f32), b: (f32, f32)| {
+            ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() <= tol
+        };
+
+        // Endpoint degree: find the two free ends of an open chain.
+        let mut endpoints: Vec<(f32, f32)> = Vec::new();
+        for s in &segs {
+            let (a, b) = ends(s);
+            endpoints.push(a);
+            endpoints.push(b);
+        }
+        let degree = |p: (f32, f32), eps: &[(f32, f32)]| {
+            eps.iter().filter(|&&q| near(p, q)).count()
+        };
+        let start = endpoints.iter().copied().find(|&p| degree(p, &endpoints) == 1);
+        // Closed loops (every endpoint degree 2) have no free end → not a v1
+        // open path.
+        let start = start?;
+
+        let mut used = vec![false; segs.len()];
+        let mut chain_pts: Vec<(f32, f32)> = Vec::new();
+        let mut cursor = start;
+        chain_pts.push(cursor);
+        for _ in 0..segs.len() {
+            let Some(next_i) = (0..segs.len()).find(|&i| {
+                !used[i] && {
+                    let (a, b) = ends(&segs[i]);
+                    near(a, cursor) || near(b, cursor)
+                }
+            }) else {
+                break;
+            };
+            used[next_i] = true;
+            let (a, b) = ends(&segs[next_i]);
+            let (from, to) = if near(a, cursor) { (a, b) } else { (b, a) };
+            match &segs[next_i] {
+                Seg::Line(_, _) => chain_pts.push(to),
+                Seg::Arc(arc) => {
+                    // Sample the arc from `from` to `to` the short way.
+                    let ang = |p: (f32, f32)| (p.1 - arc.center.1).atan2(p.0 - arc.center.0);
+                    let a0 = ang(from);
+                    let mut a1 = ang(to);
+                    while a1 - a0 > std::f32::consts::PI {
+                        a1 -= std::f32::consts::TAU;
+                    }
+                    while a1 - a0 < -std::f32::consts::PI {
+                        a1 += std::f32::consts::TAU;
+                    }
+                    let steps = 12;
+                    for k in 1..=steps {
+                        let t = a0 + (a1 - a0) * (k as f32 / steps as f32);
+                        chain_pts.push((
+                            arc.center.0 + arc.radius * t.cos(),
+                            arc.center.1 + arc.radius * t.sin(),
+                        ));
+                    }
+                }
+            }
+            cursor = to;
+        }
+        // Every curve must have been consumed (a single simple chain).
+        if used.iter().any(|&u| !u) || chain_pts.len() < 2 {
+            return None;
+        }
+        Some(chain_pts)
+    }
+
     pub fn add_circle(&mut self, center: (f32, f32), radius: f32) {
         if radius > 0.0 {
             self.circles.push(Circle { center, radius });

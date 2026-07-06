@@ -708,18 +708,28 @@ pub fn sample_interior_points_budget(
             (nu, nv)
         }
         GeomSurface::Cone(cone) => {
-            u_inset = 0.25;
+            // A cone is ruled like a cylinder — give it the SAME grid, not a
+            // single inset ring. The old `(n, 0)` with `u_inset=0.25` left a
+            // sparse mid-height ring clustered into each face's centre, so its
+            // Delaunay wove long facets that chorded ~13% inward off the
+            // surface near the wide base. A full-u ring (small inset) plus
+            // axial support rows fixes it; the ruled-edge refinement above then
+            // splits any remaining inward chords.
+            u_inset = 0.05;
             let r1 = cone.radius_at(v_min).abs();
             let r2 = cone.radius_at(v_max).abs();
             let r = f64::max(r1, r2);
-            let theta = if r > CONFUSION {
-                2.0 * (2.0 * chord_err / r).sqrt()
-            } else {
-                std::f64::consts::PI / 2.0
-            };
+            let err = chord_err.max(CONFUSION);
+            let theta = cylinder_step_angle(r, err).min(angle_err);
             let span = u_max - u_min;
-            let n = f64::max(2.0, (span / theta).ceil()) as usize;
-            (n, 0)
+            let nu = f64::max(2.0, (span / theta).ceil()) as usize;
+            // Axial support rows sized to the max-radius hoop step (straight
+            // generators gain nothing from the angular cap, so use the chordal
+            // budget as a target physical edge length).
+            let target_len = f64::max(r * cylinder_step_angle(r, err), err);
+            let v_span = (v_max - v_min).abs();
+            let nv = f64::max(2.0, (v_span / target_len).ceil()) as usize;
+            (nu, nv)
         }
         GeomSurface::Torus(tor) => {
             // Curvature in u scales with (R + r); in v with the tube radius r.
@@ -769,31 +779,50 @@ fn cylinder_step_angle(radius: f64, chord_err: f64) -> f64 {
     }
 }
 
-fn cylinder_uv_target_len(surf: &GeomSurface, chord_err: f64) -> Option<f64> {
-    let GeomSurface::Cylinder(cyl) = surf else {
-        return None;
-    };
-    let err = chord_err.max(CONFUSION);
-    let theta = cylinder_step_angle(cyl.radius(), err);
-    Some(f64::max(cyl.radius() * theta, err))
-}
-
-fn surface_uv_segment_len(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> f64 {
+/// The hoop radius of a ruled round surface at axial parameter `v`: constant
+/// for a cylinder, `radius_at(v)` for a cone (which shrinks toward the apex).
+/// `None` for surfaces that aren't ruled-round, so the ruled-edge refinement
+/// leaves them alone.
+fn ruled_hoop_radius(surf: &GeomSurface, v: f64) -> Option<f64> {
     match surf {
-        GeomSurface::Cylinder(cyl) => {
-            let du = (b.x() - a.x()).abs() * cyl.radius();
-            let dv = (b.y() - a.y()).abs();
-            du.hypot(dv)
-        }
-        _ => a.distance(&b),
+        GeomSurface::Cylinder(cyl) => Some(cyl.radius().abs()),
+        GeomSurface::Cone(cone) => Some(cone.radius_at(v).abs()),
+        _ => None,
     }
 }
 
-fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64, f64, f64, f64)> {
-    let GeomSurface::Cylinder(cyl) = surf else {
-        return None;
+fn cylinder_uv_target_len(surf: &GeomSurface, chord_err: f64) -> Option<f64> {
+    // A representative radius for the whole face: the cylinder's radius, or the
+    // cone's reference radius (its scale near v=0). Per-edge decisions below
+    // refine this with the LOCAL radius, so this only sets the global cap.
+    let r = match surf {
+        GeomSurface::Cylinder(cyl) => cyl.radius().abs(),
+        GeomSurface::Cone(cone) => cone.ref_radius().abs().max(CONFUSION),
+        _ => return None,
     };
-    let r = cyl.radius().abs();
+    let err = chord_err.max(CONFUSION);
+    let theta = cylinder_step_angle(r, err);
+    Some(f64::max(r * theta, err))
+}
+
+fn surface_uv_segment_len(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> f64 {
+    let mid_v = 0.5 * (a.y() + b.y());
+    match ruled_hoop_radius(surf, mid_v) {
+        Some(r) => {
+            let du = (b.x() - a.x()).abs() * r;
+            let dv = (b.y() - a.y()).abs();
+            du.hypot(dv)
+        }
+        None => a.distance(&b),
+    }
+}
+
+/// `(hoop, axial, surface_len, sagitta, local_radius)` for a ruled-round edge,
+/// using the LOCAL radius at the edge's mid-v (so a cone's base edges — larger
+/// radius — get finer refinement than its apex edges).
+fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64, f64, f64, f64, f64)> {
+    let mid_v = 0.5 * (a.y() + b.y());
+    let r = ruled_hoop_radius(surf, mid_v)?;
     let du = shortest_angle_delta(a.x(), b.x());
     let hoop = du * r;
     let axial = (a.y() - b.y()).abs();
@@ -803,7 +832,7 @@ fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64,
     } else {
         0.0
     };
-    Some((hoop, axial, surface_len, sagitta))
+    Some((hoop, axial, surface_len, sagitta, r))
 }
 
 // The angular budget deliberately does NOT feed this predicate: shading density
@@ -812,13 +841,14 @@ fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64,
 // makes the midpoint-insert/re-Delaunay loop thrash on borderline diagonals and
 // quadruples the wall for no visual gain (normals are analytic per vertex).
 fn cylinder_edge_needs_refinement(surf: &GeomSurface, a: Pnt2d, b: Pnt2d, chord_err: f64) -> bool {
-    let Some((_, _, surface_len, sagitta)) = cylinder_edge_metrics(surf, a, b) else {
+    let Some((_, _, surface_len, sagitta, r)) = cylinder_edge_metrics(surf, a, b) else {
         return false;
     };
-    let Some(target_len) = cylinder_uv_target_len(surf, chord_err) else {
-        return false;
-    };
-    sagitta > chord_err.max(CONFUSION) || surface_len > target_len
+    // Target hoop length from the LOCAL radius, so a cone splits its wide base
+    // facets (which chord inward off the surface) while leaving the apex sparse.
+    let err = chord_err.max(CONFUSION);
+    let target_len = f64::max(r * cylinder_step_angle(r, err), err);
+    sagitta > err || surface_len > target_len
 }
 
 fn uv_midpoint(a: Pnt2d, b: Pnt2d) -> Pnt2d {
@@ -983,6 +1013,11 @@ fn refine_cylinder_tris(
     const MAX_ITERS: usize = 16;
     const MAX_POINTS: usize = 20_000;
 
+    // Only cylinders get the iterative interior midpoint-refinement pass —
+    // cones get their accuracy from a dense ruled grid (below) instead, which
+    // is far cheaper than re-Delaunay-ing a growing point set (a cone's
+    // apex-ward facets have a vanishing target length that would drive the
+    // iterative pass to explode the vertex count).
     let check_edge_midpoints = matches!(surface, GeomSurface::Cylinder(_));
     let mut constraints = constraints.to_vec();
     let mut tris = trimmed_constrained_tris(
@@ -1180,6 +1215,8 @@ pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face]
             let Some(face) = faces.get(fid as usize) else {
                 continue;
             };
+            // Only cylinder walls get post-hoc mesh-edge refinement; cones rely
+            // on their dense ruled grid (see `sample_interior_points_budget`).
             let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
                 continue;
             };

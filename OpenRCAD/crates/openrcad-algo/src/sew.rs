@@ -251,8 +251,16 @@ fn signed_volume(brep: &BRep, face_ids: &[FaceId]) -> f64 {
 ///    stored plane normal to agree with its loop winding's Newell normal. A plane
 ///    normal is independent of the winding and can be flipped without changing the
 ///    face's geometry, so this only touches the *stored normal*, never the
-///    orientation flag — leaving step 7's winding consistency intact. (Curved
-///    surfaces carry an intrinsic normal sense and are handled by step 2 alone.)
+///    orientation flag — leaving step 7's winding consistency intact.
+///
+///    CURVED faces are deliberately NOT reconciled here: a curved surface's
+///    normal sense is intrinsic to its parameterisation (unlike a plane's, it
+///    can't just be re-pointed), and flipping the orientation flag flips both
+///    the tessellation normal and the volume/classification normal together, so
+///    it can't fix a face whose loop winds against its intrinsic normal. That
+///    agreement is instead a CONSTRUCTION-time invariant every op upholds before
+///    sewing — see `revolve::loop_agrees_with_surface` for the full rationale.
+///    Step 2 below (the global outward flip) then orients the whole shell.
 /// 2. **Global outward pass.** If the shell is closed and its signed volume is
 ///    negative, flip every face's orientation flag so the shell faces outward.
 ///    Flipping all flags together preserves both the per-face agreement and the

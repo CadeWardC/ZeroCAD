@@ -275,6 +275,29 @@ impl ZeroCadApp {
                                         }
                                     });
                                 }
+                                FeatureType::Loft { sections, mode, .. } => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Loft through {} sections ({:?}).",
+                                            sections.len(),
+                                            mode
+                                        ))
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                }
+                                FeatureType::Sweep {
+                                    path_sketch, mode, ..
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Sweep along '{path_sketch}' ({:?}).",
+                                            mode
+                                        ))
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                }
                                 FeatureType::Shell { thickness, .. } => {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Thickness").size(12.0));

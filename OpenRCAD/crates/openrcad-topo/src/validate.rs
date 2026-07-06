@@ -22,6 +22,7 @@
 //! in tests and debug builds.
 
 use openrcad_foundation::{tolerance, Pnt};
+use openrcad_geom::Curve;
 
 use crate::arena::{BRep, EdgeId, FaceId, LoopId, OrientedEdge, ShellId, VertexId};
 use crate::orientation::Orientation;
@@ -323,9 +324,26 @@ impl Solid {
         for face in self.shell().faces() {
             for wire in face.wires() {
                 for edge in wire.edges() {
-                    let a = q(&edge.start().point());
-                    let b = q(&edge.end().point());
-                    let key = if a <= b { (a, b) } else { (b, a) };
+                    let start = edge.start().point();
+                    let end = edge.end().point();
+                    let a = q(&start);
+                    let b = q(&end);
+                    // A third key sample at the edge's MIDPOINT distinguishes the
+                    // two arcs of one circle that share both endpoints (e.g. two
+                    // semicircles): endpoint-only keying merges them into one
+                    // "edge" used 4× and falsely reports non-manifold. Sample the
+                    // curve at its mid-parameter when present, else the chord
+                    // midpoint (a straight edge — its own midpoint is unambiguous).
+                    let mid = match edge.curve() {
+                        Some(c) => c.point(0.5 * (edge.first() + edge.last())),
+                        None => Pnt::new(
+                            0.5 * (start.x() + end.x()),
+                            0.5 * (start.y() + end.y()),
+                            0.5 * (start.z() + end.z()),
+                        ),
+                    };
+                    let m = q(&mid);
+                    let key = if a <= b { (a, b, m) } else { (b, a, m) };
                     *counts.entry(key).or_insert(0) += 1;
                 }
             }
@@ -362,8 +380,10 @@ impl Solid {
 
 /// A point quantized to the manifold-check integer grid.
 type QuantPoint = (i64, i64, i64);
-/// An undirected boundary edge keyed by its two quantized endpoints (sorted).
-type EdgeKey = (QuantPoint, QuantPoint);
+/// An undirected boundary edge keyed by its two quantized endpoints (sorted)
+/// plus a quantized midpoint sample — the midpoint separates co-endpoint arcs
+/// of one circle that would otherwise collide on endpoints alone.
+type EdgeKey = (QuantPoint, QuantPoint, QuantPoint);
 
 /// How a solid's boundary edges are shared between faces (see
 /// [`Solid::manifold_report`]).
@@ -423,6 +443,42 @@ mod tests {
         let s = Solid::new(Shell::from_faces([square_face(0.0), square_face(0.0)]));
         let m = s.manifold_report();
         assert_eq!(m.total_edges, 4);
+        assert_eq!(m.free_edges, 0);
+        assert_eq!(m.nonmanifold_edges, 0);
+        assert!(s.is_watertight());
+    }
+
+    #[test]
+    fn two_semicircle_arcs_of_one_circle_are_distinct_edges() {
+        // A disc bounded by TWO semicircle arcs (0→π, π→2π) of one circle, paired
+        // with its coincident opposite twin. The two arcs share BOTH endpoints,
+        // so endpoint-only keying merged them into one edge used 4× → false
+        // non-manifold. The midpoint sample separates them: 2 edges, each used
+        // twice → watertight. This is what let revolve drop the full-turn-thirds
+        // workaround (a full circle needs only two half-arcs, not three thirds).
+        use crate::vertex::Vertex;
+        use openrcad_geom::{Circle, GeomCurve};
+        use openrcad_foundation::{Ax3, Dir};
+        let circle = Circle::new(Ax3::new(Pnt::origin(), Dir::dz()), 2.0);
+        let pi = std::f64::consts::PI;
+        let arc = |t0: f64, t1: f64| {
+            Edge::new(
+                Some(GeomCurve::circle(circle)),
+                t0,
+                t1,
+                Vertex::new(circle.point(t0)),
+                Vertex::new(circle.point(t1)),
+            )
+        };
+        let disc = || {
+            Face::new(
+                None,
+                Wire::from_edges([arc(0.0, pi), arc(pi, 2.0 * pi)]),
+            )
+        };
+        let s = Solid::new(Shell::from_faces([disc(), disc()]));
+        let m = s.manifold_report();
+        assert_eq!(m.total_edges, 2, "two semicircles must be two distinct edges; got {m:?}");
         assert_eq!(m.free_edges, 0);
         assert_eq!(m.nonmanifold_edges, 0);
         assert!(s.is_watertight());

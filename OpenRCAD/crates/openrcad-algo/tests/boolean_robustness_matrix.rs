@@ -228,6 +228,37 @@ fn coaxial_recut_existing_hole() {
     assert_sound("re-cut coaxial hole", boolean_checked(&drilled, &big, BooleanOp::Cut));
 }
 
+#[test]
+#[ignore = "engulfed-fragment removal on a periodic wall. Diagnosis (2026-07-05): \
+            the drilled block's bore wall is 3 cylinder thirds; the counterbore's \
+            flat bottom (z=7) correctly imprints the r=2 circle as its inner \
+            annulus, but the bore-wall thirds ABOVE z=7 (r=2, engulfed by the r=4 \
+            counterbore volume) are NOT classified out — so each of the 3 arcs at \
+            z=7 is shared 3x (cap annulus + lower wall + un-removed upper fragment) \
+            → Euler 4, 3 non-manifold edges. Fixing it robustly is a split+classify \
+            interaction in the boolean core (high blast radius on fillet/blend \
+            tests). ZeroCAD's Hole feature avoids it by cutting the head BEFORE the \
+            bore (also the natural machining order); see apply_hole's ordering note."]
+fn blind_counterbore_over_through_bore() {
+    // A block with a narrow through-bore, then a WIDE BLIND counterbore cut
+    // from the top: its flat bottom sits inside the block. That bottom cap
+    // plane meets the narrow bore wall in a full circle — the periodic-face
+    // band-partition case (a closed curve wrapping a cylindrical face, splitting
+    // it into two annular bands). ZeroCAD's Hole feature avoids this by cutting
+    // the counterbore head BEFORE the bore, but the boolean engine should be
+    // robust to either order.
+    let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    let bore = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 2.0, 12.0);
+    let drilled = boolean_checked(&block, &bore, BooleanOp::Cut).expect("initial bore");
+    // Ø8 counterbore, z = 7 .. 11 (bottom cap at z=7 inside; top pokes out the
+    // z=10 face for a clean entry).
+    let cbore = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 7.0), Dir::dz()), 4.0, 4.0);
+    assert_sound(
+        "blind counterbore over through-bore",
+        boolean_checked(&drilled, &cbore, BooleanOp::Cut),
+    );
+}
+
 // ===========================================================================
 // Group D — Coplanar
 // ===========================================================================

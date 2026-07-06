@@ -260,6 +260,44 @@ impl ZeroCadApp {
                 }
             }
 
+            // SWEEP: one selected profile face, swept along a path sketch.
+            if self.sweep_op.is_none() {
+                if let Some((profile_sketch, profile_region)) = self.sweep_profile_candidate() {
+                    let sweep_btn = icons::Icon::Extrude.labeled_button(
+                        ui,
+                        "Sweep",
+                        egui::Color32::from_rgb(241, 245, 249),
+                        egui::Color32::from_rgb(226, 232, 240),
+                        self.pal().text_strong,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    );
+                    if sweep_btn
+                        .on_hover_text("Sweep the selected profile along a path sketch")
+                        .clicked()
+                    {
+                        self.begin_sweep(profile_sketch, profile_region);
+                    }
+                }
+            }
+
+            // LOFT: two or more selected sketch faces across sketches.
+            if let Some(sections) = self.loft_sections() {
+                let loft_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    &format!("Loft ({})", sections.len()),
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if loft_btn
+                    .on_hover_text("Loft through the selected section profiles (creation order)")
+                    .clicked()
+                {
+                    self.commit_loft(sections);
+                }
+            }
+
             if sel > 0 {
                 let clear_sel_btn = ui.add(
                     egui::Button::new(

@@ -845,6 +845,7 @@ impl ZeroCadApp {
         self.show_pattern_dialog(ctx);
         self.show_hole_dialog(ctx);
         self.show_shell_dialog(ctx);
+        self.show_sweep_dialog(ctx);
 
         // 3D fillet/chamfer: the drag manipulator on the edge, the inline size
         // box, and the inline 2D corner-radius box (anchored on the staged

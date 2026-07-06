@@ -318,6 +318,32 @@ pub enum FeatureType {
         #[serde(default)]
         target: Option<String>,
     },
+    /// Loft a solid through two or more sketch section profiles (in order).
+    /// Each entry is `(sketch_node_id, region_index)`; the loft node depends on
+    /// every section sketch. v1 lofts only the outer boundary of each section
+    /// (holes ignored) with a ruled/planar skin.
+    Loft {
+        /// Ordered `(sketch_id, region_index)` sections.
+        sections: Vec<(String, usize)>,
+        #[serde(default)]
+        mode: ExtrudeMode,
+        #[serde(default)]
+        target: Option<String>,
+    },
+    /// Sweep a profile region along a path sketch's open chain (rotation-
+    /// minimizing frames — no twist). v1: the profile is placed perpendicular
+    /// to the path start; the path must be a single open chain of lines/arcs.
+    Sweep {
+        /// The profile: `(sketch_id, region_index)`.
+        profile_sketch: String,
+        profile_region: usize,
+        /// The path: a sketch id whose curves form one open chain.
+        path_sketch: String,
+        #[serde(default)]
+        mode: ExtrudeMode,
+        #[serde(default)]
+        target: Option<String>,
+    },
     /// Hollow out an existing body to a constant wall `thickness`, removing
     /// `open_faces` (at least one). Kernel support: boxes, cylinders, and any
     /// planar-faced solid with straight edges (extruded profiles); curved

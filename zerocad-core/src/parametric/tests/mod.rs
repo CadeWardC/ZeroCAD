@@ -14,6 +14,7 @@ mod extrude_modes;
 mod fillet_chamfer;
 mod hole_feature;
 mod import;
+mod loft_sweep;
 mod node_map_resync;
 mod pattern_feature;
 mod reattachment_matrix;
