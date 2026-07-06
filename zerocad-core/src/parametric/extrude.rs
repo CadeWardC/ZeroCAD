@@ -140,6 +140,71 @@ pub(crate) fn stamp_box_face_refs(mesh: &mut MockMesh, body_id: &str) {
     }
 }
 
+/// Stamp durable names onto a STEP-imported body's faces:
+/// `import:{node}:face:{k}` with `k` assigned in quantized-centroid order, so
+/// the same file yields the same names every load (mesh face order can vary
+/// with the per-process hash seed; geometry cannot).
+pub(crate) fn stamp_import_face_refs(mesh: &mut MockMesh, body_id: &str) {
+    let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
+    let mut order: Vec<usize> = (0..mesh.face_refs.len()).collect();
+    order.sort_by_key(|&i| {
+        let c = mesh.face_refs[i].centroid;
+        (quant(c[0]), quant(c[1]), quant(c[2]))
+    });
+    for (k, &i) in order.iter().enumerate() {
+        mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(format!("import:{body_id}:face:{k}")),
+            surface_kind: None,
+        });
+    }
+}
+
+/// Stamp durable names onto a revolved body's faces:
+/// `revolve:{node}:region:{i}:face:{k}` with `k` in quantized-centroid order
+/// (stable across runs — see [`stamp_import_face_refs`]).
+pub(crate) fn stamp_revolve_face_refs(mesh: &mut MockMesh, body_id: &str, region_index: usize) {
+    let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
+    let unstamped: Vec<usize> = (0..mesh.face_refs.len())
+        .filter(|&i| mesh.face_refs[i].topology.is_none())
+        .collect();
+    let mut order = unstamped;
+    order.sort_by_key(|&i| {
+        let c = mesh.face_refs[i].centroid;
+        (quant(c[0]), quant(c[1]), quant(c[2]))
+    });
+    for (k, &i) in order.iter().enumerate() {
+        mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(format!("revolve:{body_id}:region:{region_index}:face:{k}")),
+            surface_kind: None,
+        });
+    }
+}
+
+/// Stamp durable names onto a pattern instance's faces:
+/// `pattern:{node}:inst:{k}:face:{j}` in quantized-centroid order per instance.
+pub(crate) fn stamp_pattern_face_refs(mesh: &mut MockMesh, body_id: &str, instance: usize) {
+    let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
+    let mut order: Vec<usize> = (0..mesh.face_refs.len())
+        .filter(|&i| mesh.face_refs[i].topology.is_none())
+        .collect();
+    order.sort_by_key(|&i| {
+        let c = mesh.face_refs[i].centroid;
+        (quant(c[0]), quant(c[1]), quant(c[2]))
+    });
+    for (j, &i) in order.iter().enumerate() {
+        mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            topology_version: Some(0),
+            face_id: Some(format!("pattern:{body_id}:inst:{instance}:face:{j}")),
+            surface_kind: None,
+        });
+    }
+}
+
 /// Stamp durable PRIMITIVE names onto a cylinder body's faces:
 /// `cyl_{node}:face:{lateral|top|bottom}`. The cylinder primitive stands along
 /// +Y with its base at the origin; the wall's area-weighted average normal is

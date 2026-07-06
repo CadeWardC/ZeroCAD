@@ -1,4 +1,5 @@
 use crate::*;
+use zerocad_core::{DatumAxisDef, DatumPlaneDef, DatumPointDef};
 
 impl ZeroCadApp {
     pub(crate) fn draw_selected_feature_properties(&mut self, ui: &mut egui::Ui) {
@@ -118,6 +119,309 @@ impl ZeroCadApp {
                                             }
                                             ui.end_row();
                                         });
+                                }
+                                FeatureType::Import { step_data, label } => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "📦 Imported STEP body \"{}\" ({:.1} KB embedded).",
+                                            label,
+                                            step_data.len() as f64 / 1024.0
+                                        ))
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "The STEP file's contents are embedded in this \
+                                             design, so it opens anywhere without the original \
+                                             file.",
+                                        )
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                    );
+                                }
+                                FeatureType::DatumPlane { def } => {
+                                    match def {
+                                        DatumPlaneDef::Offset { distance, .. } => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Offset").size(12.0),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(distance)
+                                                            .speed(0.5)
+                                                            .suffix(current_unit.suffix()),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                        DatumPlaneDef::Angle { angle_deg, .. } => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Angle").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(angle_deg)
+                                                            .speed(1.0)
+                                                            .suffix("°"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                        DatumPlaneDef::ThreePoints { a, b, c } => {
+                                            for (label, p) in
+                                                [("A", a), ("B", b), ("C", c)]
+                                            {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(label).size(12.0),
+                                                    );
+                                                    for coord in p.iter_mut() {
+                                                        if ui
+                                                            .add(
+                                                                egui::DragValue::new(coord)
+                                                                    .speed(0.5),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            modified = true;
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        DatumPlaneDef::MidPlane { .. } => {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Mid-plane between two planes.",
+                                                )
+                                                .size(11.5)
+                                                .color(pal.text_muted),
+                                            );
+                                        }
+                                    }
+                                }
+                                FeatureType::DatumAxis { def } => match def {
+                                    DatumAxisDef::TwoPoints { a, b } => {
+                                        for (label, p) in [("From", a), ("To", b)] {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(label).size(12.0));
+                                                for coord in p.iter_mut() {
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(coord).speed(0.5),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        modified = true;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    DatumAxisDef::PlaneIntersection { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Intersection line of two planes.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                    }
+                                },
+                                FeatureType::DatumPoint { def } => match def {
+                                    DatumPointDef::Coords { p } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Position").size(12.0));
+                                            for coord in p.iter_mut() {
+                                                if ui
+                                                    .add(egui::DragValue::new(coord).speed(0.5))
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            }
+                                        });
+                                    }
+                                },
+                                FeatureType::Revolve {
+                                    angle_deg, mode, ..
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Mode: {:?}", mode))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Angle").size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(angle_deg)
+                                                    .speed(1.0)
+                                                    .clamp_range(0.1..=360.0)
+                                                    .suffix("°"),
+                                            )
+                                            .changed()
+                                        {
+                                            modified = true;
+                                        }
+                                    });
+                                }
+                                FeatureType::Shell { thickness, .. } => {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Thickness").size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(thickness)
+                                                    .speed(0.1)
+                                                    .clamp_range(0.1..=100.0)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            modified = true;
+                                        }
+                                    });
+                                }
+                                FeatureType::Hole {
+                                    position,
+                                    diameter,
+                                    depth,
+                                    ..
+                                } => {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Diameter").size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(diameter)
+                                                    .speed(0.2)
+                                                    .clamp_range(0.1..=500.0)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            modified = true;
+                                        }
+                                    });
+                                    if let Some(d) = depth {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Depth").size(12.0));
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(d)
+                                                        .speed(0.2)
+                                                        .clamp_range(0.1..=1000.0)
+                                                        .suffix(current_unit.suffix()),
+                                                )
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Position").size(12.0));
+                                        for coord in position.iter_mut() {
+                                            if ui
+                                                .add(egui::DragValue::new(coord).speed(0.5))
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        }
+                                    });
+                                }
+                                FeatureType::Pattern { source, kind } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Source: {source}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.add_space(4.0);
+                                    match kind {
+                                        zerocad_core::PatternKind::Linear {
+                                            spacing, count, ..
+                                        } => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Spacing").size(12.0),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(spacing)
+                                                            .speed(0.5)
+                                                            .suffix(current_unit.suffix()),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Count").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(count)
+                                                            .speed(0.1)
+                                                            .clamp_range(2..=200),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                        zerocad_core::PatternKind::Circular {
+                                            count,
+                                            total_angle_deg,
+                                            ..
+                                        } => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Count").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(count)
+                                                            .speed(0.1)
+                                                            .clamp_range(2..=200),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Total angle").size(12.0),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(total_angle_deg)
+                                                            .speed(1.0)
+                                                            .clamp_range(1.0..=360.0)
+                                                            .suffix("°"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                        zerocad_core::PatternKind::Mirror { .. } => {
+                                            ui.label(
+                                                egui::RichText::new("Mirrored copy of the source.")
+                                                    .size(11.5)
+                                                    .color(pal.text_muted),
+                                            );
+                                        }
+                                    }
                                 }
                                 FeatureType::Cylinder { r, h } => {
                                     ui.label(
@@ -610,6 +914,73 @@ impl ZeroCadApp {
                 if let Some(sketch_id) = edit_sketch_request {
                     let now = ui.input(|i| i.time);
                     self.edit_sketch(&sketch_id, now);
+                }
+
+                // Measure: physical properties of the selected body's mesh.
+                // Computed on demand from the already-tessellated buffers, so
+                // it's exact for what's on screen.
+                let measured = self
+                    .selected_node_id
+                    .as_ref()
+                    .and_then(|id| self.body_meshes.iter().find(|(mid, _)| mid == id))
+                    .and_then(|(_, mesh)| mesh.mass_properties());
+                if let Some(mp) = measured {
+                    ui.add_space(10.0);
+                    egui::Frame::none()
+                        .fill(egui::Color32::WHITE)
+                        .rounding(8.0)
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(226, 232, 240),
+                        ))
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Measure")
+                                    .strong()
+                                    .size(12.5)
+                                    .color(self.pal().text_strong),
+                            );
+                            ui.add_space(4.0);
+                            let muted = self.pal().text_muted;
+                            let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(k).size(11.5).color(muted));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(egui::RichText::new(v).monospace().size(11.5));
+                                        },
+                                    );
+                                });
+                            };
+                            row(ui, "Volume", format!("{:.3} mm³", mp.volume));
+                            row(ui, "Surface area", format!("{:.3} mm²", mp.surface_area));
+                            row(
+                                ui,
+                                "Centroid",
+                                format!(
+                                    "({:.2}, {:.2}, {:.2})",
+                                    mp.centroid[0], mp.centroid[1], mp.centroid[2]
+                                ),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Density (g/cm³)")
+                                        .size(11.5)
+                                        .color(self.pal().text_muted),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.measure_density)
+                                        .speed(0.05)
+                                        .clamp_range(0.0..=30.0),
+                                );
+                            });
+                            // mm³ → cm³ is ÷1000; g/cm³ × cm³ = grams.
+                            let grams = mp.volume / 1000.0 * self.measure_density as f64;
+                            row(ui, "Mass", format!("{grams:.2} g"));
+                        });
                 }
             }
         } else {

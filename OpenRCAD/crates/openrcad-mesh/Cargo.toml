@@ -25,3 +25,6 @@ openrcad-geom2d.workspace = true
 openrcad-topo.workspace = true
 serde.workspace = true
 rayon = { version = "1.8", optional = true }
+
+[dev-dependencies]
+openrcad-primitives.workspace = true

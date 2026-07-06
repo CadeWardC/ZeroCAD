@@ -22,6 +22,7 @@ impl ZeroCadApp {
         self.sketch_entity_ids.clear();
         self.sketch_next_entity_id = 0;
         self.sketch_drag_point = None;
+        self.line_chain_start = None;
         self.sketch_selected_ids.clear();
         self.sketch_selected_constraint = None;
         self.sketch_conflict_constraint = None;

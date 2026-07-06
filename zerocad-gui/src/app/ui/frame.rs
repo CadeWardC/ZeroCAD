@@ -65,10 +65,13 @@ impl ZeroCadApp {
                 // Discarded the staged corners, keep the tool armed.
                 self.status_msg = "Staged corners discarded.".to_string();
             } else if !self.sketch_points.is_empty() {
-                // Abort the in-progress (multi-point) shape, keep the tool armed.
+                // Abort the in-progress (multi-point) shape or Line chain, keep
+                // the tool armed. Committed segments are kept.
+                self.line_chain_start = None;
                 self.cancel_in_progress_shape();
                 self.status_msg = "Shape cancelled.".to_string();
             } else if self.active_tool.is_some() {
+                self.line_chain_start = None;
                 self.active_tool = None;
                 self.status_msg = "Tool deselected — select faces, edges, or points.".to_string();
                 log::info!("Escape: switched to Select mode");

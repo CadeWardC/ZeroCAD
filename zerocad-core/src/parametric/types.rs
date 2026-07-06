@@ -289,6 +289,209 @@ pub enum FeatureType {
     VariableSet {
         variables: Vec<Variable>,
     },
+    /// A body imported from a STEP file. The file's text is embedded so the
+    /// `.zcad` document stays self-contained (no dangling path references) and
+    /// the eval prefix cache hashes the actual geometry source.
+    Import {
+        /// The raw STEP (AP242) file contents.
+        step_data: String,
+        /// Display label, defaulting to the imported file's stem.
+        label: String,
+    },
+    /// Revolve one or more detected regions of the parent sketch about an axis
+    /// lying in the sketch plane. The revolve analogue of [`Self::Extrude`]:
+    /// `region_indices` empty means "all", `mode` picks new-body / join / cut.
+    Revolve {
+        /// Revolution axis: a base axis, datum axis, or explicit segment.
+        axis: AxisBase,
+        /// Sweep angle in degrees, in `(0, 360]`.
+        angle_deg: f32,
+        /// Optional expression (over the document's variables) driving the
+        /// angle; `angle_deg` holds the last resolved value.
+        #[serde(default)]
+        angle_expr: Option<String>,
+        region_indices: Vec<usize>,
+        #[serde(default)]
+        mode: ExtrudeMode,
+        /// For Cut/Join: the node id of the body the boolean applies to (see
+        /// [`Self::Extrude::target`]).
+        #[serde(default)]
+        target: Option<String>,
+    },
+    /// Hollow out an existing body to a constant wall `thickness`, removing
+    /// `open_faces` (at least one). Kernel support: boxes, cylinders, and any
+    /// planar-faced solid with straight edges (extruded profiles); curved
+    /// general shells report Unresolved rather than guessing.
+    Shell {
+        /// Node id of the body being hollowed.
+        target: String,
+        /// Wall thickness (mm), measured inward.
+        thickness: f32,
+        #[serde(default)]
+        thickness_expr: Option<String>,
+        /// The faces to remove (captured centroid+normal; resolved
+        /// geometrically against the body at build time).
+        open_faces: Vec<FaceRef>,
+    },
+    /// A drilled hole in an existing body: a cylinder cut, optionally with a
+    /// counterbore or countersink, composed from the same guarded-boolean cut
+    /// machinery as a Cut extrude. Placed at a point on a face, drilling along
+    /// the inward face normal.
+    Hole {
+        /// Node id of the body being drilled.
+        target: String,
+        /// World-space point on the face where the hole starts.
+        position: [f32; 3],
+        /// Drilling direction (unit, INTO the material).
+        direction: [f32; 3],
+        /// Bore diameter (mm).
+        diameter: f32,
+        #[serde(default)]
+        diameter_expr: Option<String>,
+        /// Bore depth along `direction`; `None` = through-all.
+        #[serde(default)]
+        depth: Option<f32>,
+        #[serde(default)]
+        kind: HoleKind,
+    },
+    /// Replicate an existing BODY node's solids: linear/circular arrays and
+    /// mirrors. v1 patterns whole bodies (the instances land as one new body);
+    /// feature-level patterns (replicating a cut/hole across a face) build on
+    /// this later.
+    Pattern {
+        /// Node id of the body being replicated.
+        source: String,
+        kind: PatternKind,
+    },
+    /// A reference plane (datum). Carries no geometry of its own — it resolves
+    /// to a [`crate::geometry::CoordinateSystem`] during evaluation and exists
+    /// so sketches (and later revolve axes, mirrors, …) can attach to a
+    /// construction plane that isn't one of the three base planes.
+    DatumPlane { def: DatumPlaneDef },
+    /// A reference axis (datum), resolving to an origin + direction.
+    DatumAxis { def: DatumAxisDef },
+    /// A reference point (datum), resolving to a 3D position.
+    DatumPoint { def: DatumPointDef },
+}
+
+/// A plane input to a datum definition: one of the three base planes or a
+/// previously created datum plane (by node id). Datums may chain; cycles are
+/// caught by the graph's toposort.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PlaneBase {
+    XY,
+    XZ,
+    YZ,
+    Datum(String),
+}
+
+/// An axis input to a datum definition.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AxisBase {
+    X,
+    Y,
+    Z,
+    /// A previously created datum axis (by node id).
+    Datum(String),
+    /// An explicit segment.
+    TwoPoints { a: [f32; 3], b: [f32; 3] },
+}
+
+/// How a [`FeatureType::DatumPlane`] is constructed. All inputs are resolvable
+/// without live body geometry (base planes, other datums, explicit points), so
+/// datums evaluate in a pure pre-pass before the body loop.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DatumPlaneDef {
+    /// `base` translated `distance` along its stored normal (handedness kept:
+    /// the offset follows `cs.n`, never a recomputed `u × v`).
+    Offset {
+        base: PlaneBase,
+        distance: f32,
+        #[serde(default)]
+        distance_expr: Option<String>,
+    },
+    /// `base` rotated `angle_deg` about `axis` (Rodrigues rotation of the
+    /// frame's axes; the origin orbits the axis line).
+    Angle {
+        base: PlaneBase,
+        axis: AxisBase,
+        angle_deg: f32,
+        #[serde(default)]
+        angle_expr: Option<String>,
+    },
+    /// The plane through three points: origin `a`, `u` toward `b`, `v` the
+    /// component of `c − a` orthogonal to `u`.
+    ThreePoints {
+        a: [f32; 3],
+        b: [f32; 3],
+        c: [f32; 3],
+    },
+    /// Halfway between two (parallel) planes: `a`'s axes at the midpoint of
+    /// the two origins projected along `a`'s normal.
+    MidPlane { a: PlaneBase, b: PlaneBase },
+}
+
+/// How a [`FeatureType::DatumAxis`] is constructed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DatumAxisDef {
+    TwoPoints { a: [f32; 3], b: [f32; 3] },
+    /// The intersection line of two non-parallel planes.
+    PlaneIntersection { a: PlaneBase, b: PlaneBase },
+}
+
+/// How a [`FeatureType::DatumPoint`] is constructed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DatumPointDef {
+    Coords { p: [f32; 3] },
+}
+
+/// The head style of a [`FeatureType::Hole`].
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum HoleKind {
+    /// A plain cylindrical bore.
+    #[default]
+    Simple,
+    /// A flat-bottomed enlargement at the surface (socket-head cap screws).
+    Counterbore { diameter: f32, depth: f32 },
+    /// A conical enlargement at the surface (flat-head screws). `angle_deg`
+    /// is the full included angle (82° / 90° are the common standards).
+    Countersink { diameter: f32, angle_deg: f32 },
+}
+
+/// How a [`FeatureType::Pattern`] replicates its source body.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PatternKind {
+    /// `count` TOTAL instances (including the original) stepped `spacing`
+    /// along `dir`.
+    Linear {
+        dir: AxisBase,
+        spacing: f32,
+        #[serde(default)]
+        spacing_expr: Option<String>,
+        count: u32,
+    },
+    /// `count` TOTAL instances equally spaced through `total_angle_deg` about
+    /// `axis` (360 = a full ring; the step is angle/count so instance 0 and a
+    /// would-be instance at 360° don't coincide).
+    Circular {
+        axis: AxisBase,
+        count: u32,
+        total_angle_deg: f32,
+    },
+    /// One mirrored copy across `plane`.
+    Mirror { plane: PlaneBase },
+}
+
+/// A resolved datum: what a datum feature node evaluates to. Never serialized —
+/// recomputed from the graph on every build.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatumValue {
+    Plane(crate::geometry::CoordinateSystem),
+    Axis {
+        origin: crate::geometry::Vec3,
+        dir: crate::geometry::Vec3,
+    },
+    Point(crate::geometry::Vec3),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -308,6 +511,12 @@ pub struct ParametricGraph {
     /// origin-plane sketches and legacy documents.
     #[serde(default)]
     pub sketch_face_refs: HashMap<String, FaceRef>,
+    /// For a sketch placed on a datum plane: the datum node id, keyed by sketch
+    /// node id. On rebuild the sketch's plane is re-derived from the datum's
+    /// current resolution (so editing the datum moves everything sketched on
+    /// it). Persisted; empty for origin-plane and face-attached sketches.
+    #[serde(default)]
+    pub sketch_datum_refs: HashMap<String, String>,
     #[serde(skip)]
     pub(crate) node_map: HashMap<String, NodeIndex>,
     /// Memoized planar-arrangement results, keyed by a content hash of a

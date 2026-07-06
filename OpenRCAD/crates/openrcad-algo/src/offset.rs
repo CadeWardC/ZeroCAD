@@ -21,7 +21,237 @@ pub fn shell_solid(
     if let Some(cyl) = detect_cylinder(solid) {
         return shell_cylinder(&cyl, thickness, open_faces);
     }
-    Err(BlendError::UnsupportedShape)
+    shell_planar_general(solid, thickness, open_faces)
+}
+
+/// General shell for arbitrary PLANAR-faced solids with straight edges (any
+/// extruded profile, wedges, chamfered blocks — everything the box/cylinder
+/// recognisers above don't match). Each face's plane is offset inward by
+/// `thickness`; every vertex is re-solved as the intersection of its three
+/// adjacent offset planes; the inner shell reuses the outer topology with the
+/// remapped vertices; removed faces get rim quads bridging outer → inner.
+///
+/// Limits (fail-loud with [`BlendError::UnsupportedShape`]): curved faces or
+/// curved edges, vertices with ≠ 3 distinct adjacent face planes, and
+/// thickness large enough to invert a vertex (offset planes meeting on the
+/// wrong side). `open_faces` must name at least one face — a fully closed
+/// hollow (a void) needs two-shell solids, which the arena represents but
+/// this path does not emit yet.
+fn shell_planar_general(
+    solid: &Solid,
+    thickness: f64,
+    open_faces: &[Face],
+) -> Result<Solid, BlendError> {
+    if open_faces.is_empty() {
+        return Err(BlendError::UnsupportedShape);
+    }
+    let faces = solid.shell().faces();
+    let quant = |p: &Pnt| {
+        (
+            (p.x() * 1.0e6).round() as i64,
+            (p.y() * 1.0e6).round() as i64,
+            (p.z() * 1.0e6).round() as i64,
+        )
+    };
+
+    // Effective OUTWARD plane per face (normal ⊗ orientation), keyed by index.
+    let mut planes: Vec<(Pnt, Dir)> = Vec::with_capacity(faces.len());
+    for face in &faces {
+        let Some(GeomSurface::Plane(pl)) = face.surface() else {
+            return Err(BlendError::UnsupportedShape);
+        };
+        let mut n = pl.normal();
+        if face.orientation() == openrcad_topo::Orientation::Reversed {
+            n = n.reversed();
+        }
+        // Anchor the plane at an actual boundary point (the stored plane
+        // location may sit anywhere).
+        let anchor = face
+            .outer_wire()
+            .and_then(|w| w.edges().first().map(|e| e.source().point()))
+            .ok_or(BlendError::UnsupportedShape)?;
+        planes.push((anchor, n));
+    }
+
+    // Vertex → set of adjacent face indices (by quantized position).
+    let mut vertex_faces: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (fi, face) in faces.iter().enumerate() {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                if edge.curve().is_some()
+                    && !matches!(edge.curve(), Some(GeomCurve::Line(_)))
+                {
+                    return Err(BlendError::UnsupportedShape);
+                }
+                for p in [edge.source().point(), edge.target().point()] {
+                    let entry = vertex_faces.entry(quant(&p)).or_default();
+                    if !entry.contains(&fi) {
+                        entry.push(fi);
+                    }
+                }
+            }
+        }
+    }
+
+    // Offset every vertex: intersection of its three adjacent offset planes.
+    // (Coplanar duplicates — split faces on one plane — collapse first.)
+    let mut offset_of: HashMap<(i64, i64, i64), Pnt> = HashMap::new();
+    for (key, fis) in &vertex_faces {
+        let mut distinct: Vec<usize> = Vec::new();
+        for &fi in fis {
+            let (_, n) = planes[fi];
+            let dup = distinct.iter().any(|&fj| {
+                let (pj, nj) = planes[fj];
+                n.dot(&nj).abs() > 1.0 - 1e-9
+                    && ((planes[fi].0 - pj).dot(&GeomVec::from_dir(nj))).abs() < 1e-6
+            });
+            if !dup {
+                distinct.push(fi);
+            }
+        }
+        if distinct.len() != 3 {
+            return Err(BlendError::UnsupportedShape);
+        }
+        let mut rows = [[0.0f64; 3]; 3];
+        let mut rhs = [0.0f64; 3];
+        for (r, &fi) in distinct.iter().enumerate() {
+            let (p, n) = planes[fi];
+            rows[r] = [n.x(), n.y(), n.z()];
+            // Inward offset: the plane moves −thickness along its OUTWARD normal.
+            rhs[r] = n.x() * p.x() + n.y() * p.y() + n.z() * p.z() - thickness;
+        }
+        let det = det3(&rows);
+        if det.abs() < 1e-12 {
+            return Err(BlendError::UnsupportedShape);
+        }
+        let x = solve3(&rows, &rhs, det);
+        offset_of.insert(*key, Pnt::new(x[0], x[1], x[2]));
+    }
+
+    // Guard against inversion: every offset vertex must have moved less than
+    // a few thicknesses (a vertex shooting far away means the offset planes
+    // meet on the wrong side — thickness ≥ the local feature size).
+    for (key, off) in &offset_of {
+        let orig = Pnt::new(
+            key.0 as f64 / 1.0e6,
+            key.1 as f64 / 1.0e6,
+            key.2 as f64 / 1.0e6,
+        );
+        if orig.distance(off) > thickness.abs() * 10.0 {
+            return Err(BlendError::ParameterTooLarge {
+                requested: thickness,
+                max: orig.distance(off) / 10.0,
+            });
+        }
+    }
+
+    let is_open = |fi: usize| -> bool {
+        open_faces.iter().any(|of| {
+            let a = of
+                .outer_wire()
+                .and_then(|w| w.edges().first().map(|e| e.source().point()));
+            let b = faces[fi]
+                .outer_wire()
+                .and_then(|w| w.edges().first().map(|e| e.source().point()));
+            // Same face iff same plane and same anchor vertex (faces come from
+            // this very solid, so anchor identity is exact).
+            match (a, b) {
+                (Some(a), Some(b)) => quant(&a) == quant(&b),
+                _ => false,
+            }
+        })
+    };
+
+    let remap_wire = |wire: &Wire| -> Option<Wire> {
+        let mut edges = Vec::new();
+        for edge in wire.edges() {
+            let a = *offset_of.get(&quant(&edge.source().point()))?;
+            let b = *offset_of.get(&quant(&edge.target().point()))?;
+            edges.push(Edge::between_points(a, b));
+        }
+        Some(Wire::from_edges(edges))
+    };
+
+    let mut result: Vec<Face> = Vec::new();
+    for (fi, face) in faces.iter().enumerate() {
+        if is_open(fi) {
+            // Rim: one quad per boundary edge of the opening, bridging the
+            // outer edge to its inner (offset) twin.
+            if let Some(wire) = face.outer_wire() {
+                for edge in wire.edges() {
+                    let p0 = edge.source().point();
+                    let p1 = edge.target().point();
+                    let (Some(&q0), Some(&q1)) = (
+                        offset_of.get(&quant(&p0)),
+                        offset_of.get(&quant(&p1)),
+                    ) else {
+                        return Err(BlendError::UnsupportedShape);
+                    };
+                    let n = ((p1 - p0).cross(&(q0 - p0))).normalized();
+                    let Some(n) = n else { continue };
+                    result.push(Face::new(
+                        Some(GeomSurface::plane(Plane::from_point_normal(p0, n))),
+                        Wire::from_edges([
+                            Edge::between_points(p0, p1),
+                            Edge::between_points(p1, q1),
+                            Edge::between_points(q1, q0),
+                            Edge::between_points(q0, p0),
+                        ]),
+                    ));
+                }
+            }
+            continue;
+        }
+        // Outer face kept verbatim; inner face is its offset twin. Windings
+        // stay as-built — sew's planar canonicalization + global outward pass
+        // orient the closed result.
+        result.push(face.clone());
+        let (anchor, n) = planes[fi];
+        let inner_anchor = anchor + GeomVec::from_dir(n) * (-thickness);
+        let outer = face.outer_wire().and_then(|w| remap_wire(&w));
+        let inners: Vec<Wire> = face
+            .inner_wires()
+            .into_iter()
+            .filter_map(|w| remap_wire(&w))
+            .collect();
+        let Some(outer) = outer else {
+            return Err(BlendError::UnsupportedShape);
+        };
+        result.push(Face::with_wires(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                inner_anchor,
+                n.reversed(),
+            ))),
+            Some(outer),
+            inners,
+            openrcad_topo::Orientation::Forward,
+        ));
+    }
+
+    let shelled = Solid::new(sew(&result, tolerance::CONFUSION * 10.0));
+    if !shelled.is_watertight() {
+        return Err(BlendError::UnsupportedShape);
+    }
+    Ok(shelled)
+}
+
+fn det3(m: &[[f64; 3]; 3]) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+/// Cramer's rule for the 3×3 system `m·x = b` with precomputed determinant.
+fn solve3(m: &[[f64; 3]; 3], b: &[f64; 3], det: f64) -> [f64; 3] {
+    let mut x = [0.0f64; 3];
+    for c in 0..3 {
+        let mut mc = *m;
+        for r in 0..3 {
+            mc[r][c] = b[r];
+        }
+        x[c] = det3(&mc) / det;
+    }
+    x
 }
 
 struct LocalFrame {
@@ -403,6 +633,83 @@ mod tests {
     use super::*;
     use openrcad_foundation::Pnt;
     use openrcad_primitives::make_box;
+
+    /// A right-triangle prism (legs `a`, height `h`) built through `prism` —
+    /// NOT the box/cylinder recognisers' territory, so it exercises the
+    /// general planar shell path.
+    fn triangle_prism(a: f64, h: f64) -> Solid {
+        use openrcad_geom::Plane as GPlane;
+        let face = Face::new(
+            Some(GeomSurface::plane(GPlane::from_point_normal(
+                Pnt::origin(),
+                Dir::dz(),
+            ))),
+            Wire::from_edges([
+                Edge::between_points(Pnt::origin(), Pnt::new(a, 0.0, 0.0)),
+                Edge::between_points(Pnt::new(a, 0.0, 0.0), Pnt::new(0.0, a, 0.0)),
+                Edge::between_points(Pnt::new(0.0, a, 0.0), Pnt::origin()),
+            ]),
+        );
+        crate::prism::prism(&face, GeomVec::new(0.0, 0.0, h)).unwrap()
+    }
+
+    #[test]
+    fn general_shell_triangle_prism_open_top() {
+        let a = 10.0f64;
+        let h = 10.0f64;
+        let t = 1.0f64;
+        let solid = triangle_prism(a, h);
+        // The top face: plane z = h with outward +z normal.
+        let faces = solid.shell().faces();
+        let top: Vec<Face> = faces
+            .iter()
+            .filter(|f| {
+                f.outer_wire()
+                    .and_then(|w| w.edges().first().map(|e| e.source().point().z()))
+                    .map(|z| (z - h).abs() < 1e-6)
+                    .unwrap_or(false)
+                    && matches!(f.surface(), Some(GeomSurface::Plane(p)) if p.normal().z().abs() > 0.9)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(top.len(), 1, "expected exactly one top cap");
+
+        let cup = shell_solid(&solid, t, &top).expect("general shell");
+        assert!(cup.is_watertight(), "shelled prism not watertight");
+
+        // Expected material volume. The inner triangle is the outer inset by t
+        // per edge: legs shrink to a − t·(2 + √2). The void is a prism of the
+        // inner triangle from z=t to h−t, topped by a linear transition to the
+        // full outer triangle at z=h (the slanted rim quads). The transition's
+        // cross-section area is quadratic in z, so Simpson integrates exactly.
+        let s2 = 2.0f64.sqrt();
+        let leg_inner = a - t * (2.0 + s2);
+        let area = |leg: f64| leg * leg / 2.0;
+        let a_outer = area(a);
+        let a_inner = area(leg_inner);
+        let a_mid = area((a + leg_inner) / 2.0);
+        let transition = t / 6.0 * (a_inner + 4.0 * a_mid + a_outer);
+        let void = a_inner * (h - 2.0 * t) + transition;
+        let expected = a_outer * h - void;
+
+        let mesh = openrcad_mesh::tessellate(&cup, 0.002, 0.05);
+        let mp = openrcad_mesh::mass_properties(&mesh).expect("closed shelled mesh");
+        assert!(
+            (mp.volume - expected).abs() / expected < 0.01,
+            "shelled volume {} vs expected {expected}",
+            mp.volume
+        );
+    }
+
+    #[test]
+    fn general_shell_rejects_closed_hollow_and_curved() {
+        let solid = triangle_prism(10.0, 10.0);
+        // No open faces → not supported (needs two-shell voids).
+        assert!(matches!(
+            shell_solid(&solid, 1.0, &[]),
+            Err(BlendError::UnsupportedShape)
+        ));
+    }
 
     #[test]
     fn test_solid_shelling() {

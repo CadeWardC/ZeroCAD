@@ -118,3 +118,51 @@ fn edge_mod_oversized_leaves_body_unchanged_and_warns() {
         "oversized fillet must leave the body unchanged"
     );
 }
+
+/// Direct repro of the sharp-corner locality rejection: a ~22° wedge prism's
+/// sharp vertical edge, filleted at the kernel, must pass
+/// `edge_mod_selected_blend_present`. Two latent 90°-era assumptions rejected
+/// it: the offset-frame gate refused any wedge sharper than 30° ("could not
+/// build an edge-local frame"), and `max_offset` capped the band search at
+/// ~`dist` when a sharp wedge's band legitimately sits `dist/tan(θ/2)` from
+/// the edge along the faces.
+#[test]
+fn sharp_wedge_fillet_passes_selected_blend_presence_check() {
+    use openrcad::algo::fillet_edges;
+    use openrcad::foundation::{Dir, Pnt, Vec as GeomVec};
+    use openrcad::geom::{GeomSurface, Plane};
+    use openrcad::topo::{Edge, Face, Wire};
+
+    // Triangle (10,0)-(-30,-8)-(-30,8) extruded to z=6: ~22.6° corner at (10,0).
+    let tri = Face::new(
+        Some(GeomSurface::plane(Plane::from_point_normal(
+            Pnt::origin(),
+            Dir::dz(),
+        ))),
+        Wire::from_edges([
+            Edge::between_points(Pnt::new(10.0, 0.0, 0.0), Pnt::new(-30.0, -8.0, 0.0)),
+            Edge::between_points(Pnt::new(-30.0, -8.0, 0.0), Pnt::new(-30.0, 8.0, 0.0)),
+            Edge::between_points(Pnt::new(-30.0, 8.0, 0.0), Pnt::new(10.0, 0.0, 0.0)),
+        ]),
+    );
+    let body = openrcad::algo::prism(&tri, GeomVec::new(0.0, 0.0, 6.0))
+        .expect("sharp wedge should extrude");
+    let edge = Edge::between_points(Pnt::new(10.0, 0.0, 0.0), Pnt::new(10.0, 0.0, 6.0));
+    let filleted = fillet_edges(&body, std::slice::from_ref(&edge), 2.52)
+        .expect("sharp corner fillet should succeed at the kernel");
+    let mesh = MockMesh::from_solid(&filleted);
+
+    // The GUI's EdgeRef: outward normals of the two slanted faces, which span
+    // ~157° (sin² ≈ 0.15 — under the old 0.25 frame gate).
+    let l = (40.0f32 * 40.0 + 8.0 * 8.0).sqrt();
+    let edge_ref = EdgeRef {
+        p0: [10.0, 0.0, 0.0],
+        p1: [10.0, 0.0, 6.0],
+        n1: [8.0 / l, -40.0 / l, 0.0],
+        n2: [8.0 / l, 40.0 / l, 0.0],
+        curve: None,
+        topology: None,
+    };
+    edge_mod_selected_blend_present(&mesh, &edge_ref, 2.52, crate::sketch::CornerKind::Fillet)
+        .expect("sharp-wedge fillet band must satisfy the selected-blend presence check");
+}

@@ -342,6 +342,39 @@ impl MockMesh {
         }
     }
 
+    /// Volume / surface area / centroid / inertia of this mesh (unit density),
+    /// or `None` when it's empty or encloses no volume. Vertices are welded by
+    /// quantized position first — the divergence-theorem integrals need shared
+    /// vertices, while the render buffers keep them split per face.
+    pub fn mass_properties(&self) -> Option<openrcad::mesh::MassProperties> {
+        use openrcad::foundation::Pnt;
+        let quant = |v: f32| (v as f64 * 1.0e5).round() as i64;
+        let mut tri = openrcad::mesh::TriangleMesh::new();
+        let mut index_of: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        let mut remap: Vec<u32> = Vec::with_capacity(self.vertices.len() / 6);
+        for v in self.vertices.chunks(6) {
+            let key = (quant(v[0]), quant(v[1]), quant(v[2]));
+            let id = *index_of.entry(key).or_insert_with(|| {
+                tri.vertices
+                    .push(Pnt::new(v[0] as f64, v[1] as f64, v[2] as f64));
+                (tri.vertices.len() - 1) as u32
+            });
+            remap.push(id);
+        }
+        for t in self.indices.chunks(3) {
+            let (Some(&a), Some(&b), Some(&c)) = (t.first(), t.get(1), t.get(2)) else {
+                continue;
+            };
+            let map = |i: u32| remap.get(i as usize).copied();
+            if let (Some(a), Some(b), Some(c)) = (map(a), map(b), map(c)) {
+                if a != b && b != c && a != c {
+                    tri.triangles.push([a, b, c]);
+                }
+            }
+        }
+        openrcad::mesh::mass_properties(&tri)
+    }
+
     /// Tessellate an arbitrary kernel solid (typically a boolean result) into a
     /// renderable mesh. Unlike the analytic constructors above, the wireframe is
     /// extracted from the solid's B-Rep edges, and hidden-line normals are left

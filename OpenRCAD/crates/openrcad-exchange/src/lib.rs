@@ -8,10 +8,12 @@
 pub mod step_reader;
 pub mod step_writer;
 pub mod stl;
+pub mod threemf;
 
-pub use step_reader::read_step;
+pub use step_reader::{read_step, read_step_str};
 pub use step_writer::write_step;
 pub use stl::{write_stl_ascii, write_stl_binary};
+pub use threemf::{to_3mf_bytes, write_3mf};
 
 #[cfg(test)]
 mod tests {
@@ -69,5 +71,21 @@ mod tests {
     fn step_sphere_roundtrip() {
         let s = make_sphere(&Pnt::origin(), 2.5);
         check_roundtrip(&s, "sphere");
+    }
+
+    #[test]
+    fn read_step_str_matches_read_step() {
+        let s = make_box(&Pnt::origin(), 2.0, 3.0, 4.0);
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("openrcad_test_read_str.stp");
+        let path_str = path.to_str().unwrap();
+        write_step(&s, path_str).expect("write");
+        let via_path = read_step(path_str).expect("read via path");
+        let content = std::fs::read_to_string(&path).expect("read text");
+        let _ = std::fs::remove_file(&path);
+        let via_str = read_step_str(&content).expect("read via str");
+        assert_eq!(via_path.face_count(), via_str.face_count());
+        assert_eq!(via_path.edge_count(), via_str.edge_count());
+        assert_eq!(via_path.vertex_count(), via_str.vertex_count());
     }
 }

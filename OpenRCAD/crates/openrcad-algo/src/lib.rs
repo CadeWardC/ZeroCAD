@@ -138,8 +138,12 @@ pub fn shell_solid(
     offset::shell_solid(solid, thickness, open_faces)
 }
 
+pub mod revolve;
 pub mod sew;
+pub mod skin;
 pub use prism::{prism, sweep_prism, SweepError};
+pub use revolve::{revolve, RevolveError};
+pub use skin::{skin_polygon_rings, SkinError};
 pub use rolling_ball::{
     chamfer_circular_edge_chain, edge_material_wedge_is_concave, fillet_circular_edge_chain,
     fillet_edges, fillet_planar_edge, rolling_ball_between_planar_faces, rolling_ball_fillet_edge,

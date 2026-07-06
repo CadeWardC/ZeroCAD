@@ -10,7 +10,7 @@ use zerocad_core::{
 };
 
 use crate::geom2d::draw_sketch_geometry;
-use crate::{BodyPick, PendingVisualMode, ZeroCadApp};
+use crate::{BodyPick, PendingVisualMode, SnapKind, ZeroCadApp};
 
 const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
 const SELECTED_BODY_BASE: (f32, f32, f32) = (50.0, 165.0, 245.0);
@@ -39,8 +39,9 @@ enum RenderItemContent {
         world_corners: [[f32; 3]; 4],
         fill_color: egui::Color32,
         border_color: egui::Color32,
-        label: &'static str,
-        plane: SketchPlane,
+        label: String,
+        /// Whether this sheet is the hover target (label drawn darker).
+        hovered: bool,
     },
 }
 
@@ -386,6 +387,23 @@ impl ZeroCadApp {
             ),
         ];
 
+        // Datum plane sheets: always visible reference geometry (violet), lit up
+        // like the origin sheets while picking a sketch plane. World corners come
+        // from the shared helper so hover hit-testing (viewport) and drawing agree.
+        let datum_sheets: Vec<(String, String, [[f32; 3]; 4], f32)> = self
+            .resolved_datum_planes()
+            .into_iter()
+            .map(|(id, name, cs)| {
+                let w = Self::datum_plane_world_corners(&cs);
+                let depth = w
+                    .iter()
+                    .map(|c| project_3d(c[0], c[1], c[2]).2)
+                    .sum::<f32>()
+                    / 4.0;
+                (id, name, w, depth)
+            })
+            .collect();
+
         // --- 2. GROUND REFERENCE GRID & CENTRAL AXES (when not in a planar mode) ---
         if !self.is_planar_view() {
             // Floor grid lies flat on the XZ plane (y = 0), drawn as a disc that
@@ -457,6 +475,61 @@ impl ZeroCadApp {
                 [egui::pos2(pz1.0, pz1.1), egui::pos2(pz2.0, pz2.1)],
                 egui::Stroke::new(1.8, egui::Color32::from_rgba_unmultiplied(50, 50, 220, 190)),
             ); // Z-Blue
+        }
+
+        // Datum axes and points — persistent reference geometry, drawn as a
+        // violet line (axis) / ring marker (point) with a name label.
+        for (id, name, value) in self.resolved_datum_axes_points() {
+            let hidden = self.hidden_nodes.contains(&id);
+            if hidden {
+                continue;
+            }
+            let violet = egui::Color32::from_rgba_unmultiplied(140, 90, 230, 200);
+            match value {
+                zerocad_core::DatumValue::Axis { origin, dir } => {
+                    let half = 40.0;
+                    let a = origin.sub(dir.mul(half));
+                    let b = origin.add(dir.mul(half));
+                    let pa = project_3d(a.x, a.y, a.z);
+                    let pb = project_3d(b.x, b.y, b.z);
+                    // Dash the line manually (egui has no dashed stroke here).
+                    const DASHES: usize = 24;
+                    for s in 0..DASHES {
+                        if s % 2 == 1 {
+                            continue;
+                        }
+                        let t0 = s as f32 / DASHES as f32;
+                        let t1 = (s + 1) as f32 / DASHES as f32;
+                        let lerp = |t: f32| {
+                            egui::pos2(pa.0 + (pb.0 - pa.0) * t, pa.1 + (pb.1 - pa.1) * t)
+                        };
+                        painter.line_segment([lerp(t0), lerp(t1)], egui::Stroke::new(1.6, violet));
+                    }
+                    painter.text(
+                        egui::pos2(pb.0, pb.1),
+                        egui::Align2::LEFT_BOTTOM,
+                        name,
+                        egui::FontId::proportional(10.5),
+                        violet,
+                    );
+                }
+                zerocad_core::DatumValue::Point(p) => {
+                    let pp = project_3d(p.x, p.y, p.z);
+                    painter.circle_stroke(
+                        egui::pos2(pp.0, pp.1),
+                        4.0,
+                        egui::Stroke::new(1.6, violet),
+                    );
+                    painter.text(
+                        egui::pos2(pp.0 + 6.0, pp.1),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(10.5),
+                        violet,
+                    );
+                }
+                zerocad_core::DatumValue::Plane(_) => {}
+            }
         }
 
         // --- 3. 3D PROJECTED ACTIVE PLANE GRID (drawn behind solid parts) ---
@@ -959,11 +1032,37 @@ impl ZeroCadApp {
                         world_corners: world,
                         fill_color: fill_col,
                         border_color: border_col,
-                        label,
-                        plane,
+                        label: label.to_string(),
+                        hovered: self.hovered_plane == Some(plane),
                     },
                 });
             }
+        }
+        // B2. Datum plane sheets — always drawn (they're persistent reference
+        // geometry the user created), brighter while hovered in plane selection.
+        for (id, name, world, depth) in &datum_sheets {
+            let hovered = self.hovered_datum_plane.as_deref() == Some(id.as_str());
+            let (fill, border) = if hovered {
+                (
+                    egui::Color32::from_rgba_unmultiplied(150, 120, 240, 120),
+                    egui::Color32::from_rgb(110, 70, 220),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgba_unmultiplied(170, 130, 240, 28),
+                    egui::Color32::from_rgba_unmultiplied(150, 100, 230, 150),
+                )
+            };
+            render_items.push(RenderItem {
+                depth: *depth,
+                content: RenderItemContent::PlaneSheet {
+                    world_corners: *world,
+                    fill_color: fill,
+                    border_color: border,
+                    label: name.clone(),
+                    hovered,
+                },
+            });
         }
         // Outside plane-selection we no longer draw the big origin sheets; the
         // minimal origin (axis lines + corner triad) is enough and keeps bodies
@@ -1039,7 +1138,7 @@ impl ZeroCadApp {
                     fill_color,
                     border_color,
                     label,
-                    plane,
+                    hovered,
                 } => {
                     // Flush accumulated triangles before the sheet so their
                     // painter's-algorithm position in the sorted list is respected.
@@ -1139,7 +1238,7 @@ impl ZeroCadApp {
                             egui::Align2::CENTER_CENTER,
                             label,
                             egui::FontId::proportional(11.0),
-                            if self.hovered_plane == Some(plane) {
+                            if hovered {
                                 egui::Color32::BLACK
                             } else {
                                 egui::Color32::from_rgb(80, 80, 80)
@@ -1477,6 +1576,52 @@ impl ZeroCadApp {
                             }
                             prev_pt = Some(pt_screen);
                         }
+                    }
+                }
+            }
+
+            // Snap glyph: mark what the live cursor locked onto so the snap is
+            // visible and trustworthy. A corner/endpoint gets a thin orange
+            // ring; a midpoint or a centre gets a thin orange X. On-line and
+            // grid snaps stay unmarked. Only shown while a draw/corner tool is
+            // armed — i.e. the cursor is actively placing a point.
+            if self.active_tool.is_some() {
+                let orange = egui::Color32::from_rgb(255, 140, 0);
+                // Close-loop cue: when a continuous-Line chain is open and the
+                // cursor has snapped back onto its start, emphasize that point
+                // (a filled disc + white ring) — a click there closes the loop
+                // and creates a face. This overrides the plain ring at that spot.
+                let close_cue = match (self.line_chain_start, current_cursor_snap) {
+                    (Some(cs), Some(cur)) => {
+                        let d2 = (cur.0 - cs.0).powi(2) + (cur.1 - cs.1).powi(2);
+                        (d2 < 1.0e-6).then(|| to_screen(cs))
+                    }
+                    _ => None,
+                };
+                if let Some(cp) = close_cue {
+                    painter.circle_filled(cp, 6.0, orange);
+                    painter.circle_stroke(cp, 6.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                } else if let (Some(cur), Some(kind)) =
+                    (current_cursor_snap, self.cursor_snap_kind)
+                {
+                    let p = to_screen(cur);
+                    let stroke = egui::Stroke::new(1.0, orange);
+                    match kind {
+                        SnapKind::Endpoint => {
+                            painter.circle_stroke(p, 5.0, stroke);
+                        }
+                        SnapKind::Midpoint | SnapKind::Center => {
+                            let r = 4.5;
+                            painter.line_segment(
+                                [egui::pos2(p.x - r, p.y - r), egui::pos2(p.x + r, p.y + r)],
+                                stroke,
+                            );
+                            painter.line_segment(
+                                [egui::pos2(p.x - r, p.y + r), egui::pos2(p.x + r, p.y - r)],
+                                stroke,
+                            );
+                        }
+                        SnapKind::OnLine | SnapKind::Grid => {}
                     }
                 }
             }

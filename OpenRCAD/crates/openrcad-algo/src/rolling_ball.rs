@@ -327,6 +327,34 @@ fn fillet_planar_edge_inner(
 
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
     let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+    if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+        let kind = |f: &Face| match f.surface() {
+            Some(GeomSurface::Plane(p)) => {
+                let n = p.normal();
+                let l = p.position().location();
+                format!(
+                    "Plane(n=({:.2},{:.2},{:.2}) p=({:.1},{:.1},{:.1}))",
+                    n.x(),
+                    n.y(),
+                    n.z(),
+                    l.x(),
+                    l.y(),
+                    l.z()
+                )
+            }
+            Some(GeomSurface::Cylinder(_)) => "Cyl".to_string(),
+            Some(GeomSurface::Torus(_)) => "Torus".to_string(),
+            _ => "Other".to_string(),
+        };
+        eprintln!(
+            "fillet dbg: concave={} start={:?} end={:?} start_caps={:?} end_caps={:?} use_sphere={use_sphere}",
+            blend.concave,
+            (start.x(), start.y(), start.z()),
+            (end.x(), end.y(), end.z()),
+            start_caps.iter().map(kind).collect::<Vec<_>>(),
+            end_caps.iter().map(kind).collect::<Vec<_>>()
+        );
+    }
     let cut_guards = cut_cylinder_guards(solid, &start_caps, &end_caps);
 
     let mut faces = Vec::new();
@@ -405,6 +433,17 @@ fn fillet_planar_edge_inner(
                 &mut faces,
                 &mut skipped_faces,
             )));
+    // Oblique planar cap (any non-perpendicular angle): flush ellipse trim.
+    // Side-agnostic wire surgery, so it serves convex and concave blends alike.
+    let start_mitered = start_mitered
+        || try_oblique_planar_cap(
+            &mut blend,
+            start,
+            &start_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
     let end_cut = convex
         && try_corner_cut(
             solid,
@@ -456,6 +495,15 @@ fn fillet_planar_edge_inner(
                 &mut faces,
                 &mut skipped_faces,
             )));
+    let end_mitered = end_mitered
+        || try_oblique_planar_cap(
+            &mut blend,
+            end,
+            &end_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?;
 
     if !start_mitered {
         handle_corner_endpoint(
@@ -486,6 +534,25 @@ fn fillet_planar_edge_inner(
 
     let trimmed_a = trim_face_along_spine(&blend.face_a, &blend.spine, &blend.contact_a)?;
     let trimmed_b = trim_face_along_spine(&blend.face_b, &blend.spine, &blend.contact_b)?;
+    if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+        for (name, f) in [("trimmed_a", &trimmed_a), ("trimmed_b", &trimmed_b)] {
+            let pts: Vec<String> = f
+                .outer_wire()
+                .map(|w| w.edges())
+                .unwrap_or_default()
+                .iter()
+                .map(|e| {
+                    let a = e.source().point();
+                    let b = e.target().point();
+                    format!(
+                        "[{:.2},{:.2},{:.2}]->[{:.2},{:.2},{:.2}]",
+                        a.x(), a.y(), a.z(), b.x(), b.y(), b.z()
+                    )
+                })
+                .collect();
+            eprintln!("trim dbg {name}: {}", pts.join(" "));
+        }
+    }
 
     for face in solid.shell().faces() {
         if same_face(&face, &blend.face_a)
@@ -506,6 +573,31 @@ fn fillet_planar_edge_inner(
     // non-watertight / degenerate shell. Surface that as an error rather than
     // returning a broken solid the application would cache.
     let result = Solid::new(sew(&faces, radius * 0.1));
+    if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+        eprintln!(
+            "fillet dbg: result watertight={} healthy={} errors={:?}",
+            result.is_watertight(),
+            result.health_report().is_healthy(),
+            result.health_report().errors
+        );
+        for (fi, face) in result.shell().faces().iter().enumerate() {
+            for wire in face.wires() {
+                let edges = wire.edges();
+                let n = edges.len();
+                for i in 0..n {
+                    let t = edges[i].target().point();
+                    let s = edges[(i + 1) % n].source().point();
+                    if t.distance(&s) > 1.0e-4 {
+                        eprintln!(
+                            "  gap dbg: face {fi} edge {i}->{}: [{:.3},{:.3},{:.3}] != [{:.3},{:.3},{:.3}]",
+                            (i + 1) % n,
+                            t.x(), t.y(), t.z(), s.x(), s.y(), s.z()
+                        );
+                    }
+                }
+            }
+        }
+    }
     let merged =
         crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if cut_guards.is_empty() {
@@ -750,6 +842,55 @@ fn handle_corner_endpoint(
         skipped.insert(cap.id());
         Ok(())
     } else {
+        // Several caps at this endpoint. When they are pieces of ONE plane that
+        // a boolean imprint left split (e.g. a fused boss's bottom disc sitting
+        // coplanar with the base face, sharing a chord edge), merge them and run
+        // the ordinary flat trim on the union — the corner vertex then owns both
+        // of its loop edges in a single wire. The Gregory patch below is for
+        // genuinely distinct cap planes at an n-valent vertex.
+        let dbg = std::env::var("ORC_DEBUG_FILLET").is_ok();
+        if let Some(merged) = merged_coplanar_cap(caps) {
+            if dbg {
+                eprintln!(
+                    "corner dbg: merged cap with {} outer edges",
+                    merged.outer_wire().map_or(0, |w| w.edges().len())
+                );
+            }
+            let in_plane = match merged.surface() {
+                Some(GeomSurface::Plane(pl)) => {
+                    let n = GeomVec::from_dir(pl.normal());
+                    let p0 = pl.position().location();
+                    let off = |p: Pnt| (p - p0).dot(&n).abs();
+                    let mid = arc
+                        .curve()
+                        .map(|c| c.point(0.5 * (arc.first() + arc.last())))
+                        .unwrap_or_else(|| arc.start().point());
+                    let tol = corner_tol(radius);
+                    off(arc.start().point()) <= tol
+                        && off(arc.end().point()) <= tol
+                        && off(mid) <= tol
+                }
+                _ => false,
+            };
+            if in_plane {
+                match trim_face_at_corner(&merged, corner, ca, cb, arc) {
+                    Ok(trimmed) => {
+                        faces.push(trimmed);
+                        skipped.extend(caps.iter().map(|cap| cap.id()));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if dbg {
+                            eprintln!("corner dbg: merged-cap trim failed: {e}");
+                        }
+                    }
+                }
+            } else if dbg {
+                eprintln!("corner dbg: merged cap rejected — arc not in cap plane");
+            }
+        } else if dbg {
+            eprintln!("corner dbg: caps did not merge (n={})", caps.len());
+        }
         let patch = make_gregory_corner_patch(corner, ca, cb, radius);
         faces.push(patch);
         for cap in caps {
@@ -760,6 +901,129 @@ fn handle_corner_endpoint(
         }
         Ok(())
     }
+}
+
+/// Merge endpoint cap faces that are all pieces of ONE coplanar, same-facing
+/// plane into a single face: their outer wires are unioned with the shared
+/// (undirected-equal) seam edges cancelled and the remainder rethreaded into
+/// one loop. Inner (hole) wires are carried through. `None` when the caps are
+/// not one coplanar family or the union does not chain into a single loop.
+fn merged_coplanar_cap(caps: &[Face]) -> Option<Face> {
+    if caps.len() < 2 {
+        return None;
+    }
+    let tol = 10.0 * tolerance::CONFUSION;
+    let plane_of = |cap: &Face| -> Option<Plane> {
+        match cap.surface() {
+            Some(GeomSurface::Plane(p)) => Some(*p),
+            _ => None,
+        }
+    };
+    let effective_normal = |cap: &Face| -> Option<GeomVec> {
+        let n = GeomVec::from_dir(plane_of(cap)?.normal());
+        Some(if cap.orientation() == Orientation::Reversed {
+            n * -1.0
+        } else {
+            n
+        })
+    };
+    // Same geometric plane for every cap. The stored normals may disagree in
+    // SIGN: a boolean can leave one coplanar sliver with a flipped effective
+    // normal (e.g. a fused boss's under-disc plug), and such a piece is exactly
+    // the one whose edges all cancel below. The consistently-facing MAJORITY
+    // group decides the merged face's surface, orientation, and seed winding.
+    let p0 = plane_of(&caps[0])?;
+    let n0 = effective_normal(&caps[0])?;
+    for cap in &caps[1..] {
+        let p = plane_of(cap)?;
+        let n = effective_normal(cap)?;
+        if n.dot(&n0).abs() < 0.999_999 {
+            return None;
+        }
+        if (p.position().location() - p0.position().location())
+            .dot(&n0)
+            .abs()
+            > tol
+        {
+            return None;
+        }
+    }
+    let agrees_with_first: Vec<bool> = caps
+        .iter()
+        .map(|cap| effective_normal(cap).is_some_and(|n| n.dot(&n0) > 0.0))
+        .collect();
+    let majority_agrees =
+        2 * agrees_with_first.iter().filter(|&&a| a).count() >= caps.len();
+
+    let mut pool: Vec<Edge> = Vec::new();
+    let mut pool_cap: Vec<usize> = Vec::new();
+    for (ci, cap) in caps.iter().enumerate() {
+        let edges = cap.outer_wire()?.edges();
+        pool_cap.extend(std::iter::repeat(ci).take(edges.len()));
+        pool.extend(edges);
+    }
+    // Cancel the shared seam edges (each appears once per abutting face).
+    let mut removed = vec![false; pool.len()];
+    for i in 0..pool.len() {
+        if removed[i] {
+            continue;
+        }
+        for j in (i + 1)..pool.len() {
+            if removed[j] {
+                continue;
+            }
+            if same_undirected_edge(&pool[i], &pool[j]) {
+                removed[i] = true;
+                removed[j] = true;
+                break;
+            }
+        }
+    }
+    let mut pool: Vec<(Edge, usize)> = pool
+        .into_iter()
+        .zip(pool_cap)
+        .zip(removed)
+        .filter_map(|(entry, r)| (!r).then_some(entry))
+        .collect();
+    if pool.len() < 3 {
+        return None;
+    }
+
+    // Rethread into one closed loop. Each majority-facing cap's retained edges
+    // are already wound for the union (a face keeps its own winding along its
+    // surviving boundary), so seed with one of THOSE to fix the loop direction —
+    // a flipped sliver's edges would seed the loop inside-out.
+    let seed_idx = pool
+        .iter()
+        .position(|(_, ci)| agrees_with_first[*ci] == majority_agrees)?;
+    let seed_cap = pool[seed_idx].1;
+    let mut loop_edges = vec![pool.remove(seed_idx).0];
+    let mut pool: Vec<Edge> = pool.into_iter().map(|(e, _)| e).collect();
+    while !pool.is_empty() {
+        let end = loop_edges.last().expect("seeded").target().point();
+        let next = pool.iter().position(|e| {
+            e.source().point().distance(&end) <= tol || e.target().point().distance(&end) <= tol
+        })?;
+        let edge = pool.remove(next);
+        if edge.source().point().distance(&end) <= tol {
+            loop_edges.push(edge);
+        } else {
+            loop_edges.push(edge.reversed());
+        }
+    }
+    let first = loop_edges.first().expect("seeded").source().point();
+    let last = loop_edges.last().expect("seeded").target().point();
+    if first.distance(&last) > tol {
+        return None;
+    }
+
+    let inners: Vec<Wire> = caps.iter().flat_map(|cap| cap.inner_wires()).collect();
+    Some(Face::with_wires(
+        caps[seed_cap].surface().cloned(),
+        Some(Wire::from_edges(loop_edges)),
+        inners,
+        caps[seed_cap].orientation(),
+    ))
 }
 
 /// Position tolerance for corner-blend cross-checks, scaled to the fillet radius.
@@ -1302,7 +1566,17 @@ fn try_tangent_curved_wall_runout(
     {
         return Ok(false);
     }
-    if !wall_is_tangent_to_selected_side(cap, &wall_cyl, blend, corner)? {
+    // Two supported wall relations:
+    // - TANGENT: an extruded sketch arc tangent to one of the blend's side
+    //   faces (the original runout case).
+    // - CROSSING: the wall rises straight through the blend's path — e.g. a
+    //   boss standing on the filleted edge's face; the blend dives into the
+    //   wall and is trimmed flush against it. Both share the same analytic
+    //   construction (contact lines extended to the wall, cyl∩cyl trim curve);
+    //   they differ only in how the wall is recognized.
+    if !wall_is_tangent_to_selected_side(cap, &wall_cyl, blend, corner)?
+        && !wall_crosses_blend_at_corner(cap, &wall_cyl, corner)
+    {
         return Ok(false);
     }
 
@@ -1360,6 +1634,15 @@ fn try_tangent_curved_wall_runout(
     blend.contact_a = new_a;
     blend.contact_b = new_b;
     blend.blend_face = new_blend_face;
+    // Persist the trim as this end's cap arc: when the OTHER endpoint is also
+    // flush-trimmed, its rebuild re-reads this end's arc from the blend, and a
+    // stale perpendicular arc would resurrect pre-extension contact endpoints
+    // (a non-contiguous blend loop).
+    if is_end {
+        blend.end_arc = trim;
+    } else {
+        blend.start_arc = trim;
+    }
     faces.push(trimmed_cap);
     skipped.insert(cap.id());
     Ok(true)
@@ -1385,6 +1668,21 @@ fn cap_edges_at_corner(face: &Face, corner: Pnt) -> Result<(Edge, Edge), Rolling
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
     Ok((edges[prev_idx].clone(), edges[next_idx].clone()))
+}
+
+/// True when the endpoint `corner` sits ON the wall cylinder's surface and the
+/// wall face actually owns it — the selected edge runs INTO the wall, so the
+/// blend must terminate flush against it (the crossing counterpart of
+/// [`wall_is_tangent_to_selected_side`]).
+fn wall_crosses_blend_at_corner(cap: &Face, wall_cyl: &CylindricalSurface, corner: Pnt) -> bool {
+    let axis_pt = wall_cyl.position().location();
+    let axis = GeomVec::from_dir(wall_cyl.position().direction());
+    let v = corner - axis_pt;
+    let radial = v - axis * v.dot(&axis);
+    if (radial.magnitude() - wall_cyl.radius()).abs() > 1.0e-4 * wall_cyl.radius().max(1.0) {
+        return false;
+    }
+    face_contains_point(cap, corner)
 }
 
 fn wall_is_tangent_to_selected_side(
@@ -1512,6 +1810,179 @@ fn try_corner_cut(
     blend.contact_a = new_a;
     blend.contact_b = new_b;
     blend.blend_face = new_blend_face;
+    // Persist the trim as this end's cap arc (see try_tangent_curved_wall_runout).
+    if is_end {
+        blend.end_arc = trim;
+    } else {
+        blend.start_arc = trim;
+    }
+    faces.push(trimmed_cap);
+    skipped.insert(cap.id());
+    Ok(true)
+}
+
+/// Trim the blend flush against a single planar cap that meets the filleted
+/// edge at an OBLIQUE angle (any angle other than perpendicular) — e.g. the
+/// end face of a line-drawn triangle prism. The flat corner trim only handles
+/// perpendicular caps (the blend's circular end arc lies in the cap plane);
+/// here the true termination curve is the ELLIPSE where the blend cylinder
+/// crosses the cap plane. The blend's straight contacts are extended/shortened
+/// to their cap-plane crossings, the end arc is replaced by the ellipse arc
+/// between them, and the cap face is re-trimmed to share that same edge.
+/// Returns `Ok(false)` for any unsupported configuration (perpendicular caps,
+/// non-cylindrical blends, a cap parallel to the spine).
+#[allow(clippy::too_many_arguments)]
+fn try_oblique_planar_cap(
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    _radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> Result<bool, RollingBallError> {
+    if caps.len() != 1 {
+        return Ok(false);
+    }
+    let cap = &caps[0];
+    let Some(GeomSurface::Plane(pl)) = cap.surface() else {
+        return Ok(false);
+    };
+    let pl = *pl;
+    let Some(GeomSurface::Cylinder(blend_cyl)) = blend.blend_face.surface() else {
+        return Ok(false);
+    };
+    let blend_cyl = *blend_cyl;
+
+    let m = GeomVec::from_dir(pl.normal());
+    let q0 = pl.position().location();
+    let d = GeomVec::from_dir(blend_cyl.position().direction());
+    let cos_phi = d.dot(&m);
+    // Perpendicular cap: the existing flat trim already handles it (the end
+    // arc IS the plane section). Near-parallel cap: no bounded crossing.
+    if cos_phi.abs() > 0.999 || cos_phi.abs() < 1.0e-3 {
+        return Ok(false);
+    }
+
+    let a_corner = nearest_endpoint(&blend.contact_a, corner);
+    let b_corner = nearest_endpoint(&blend.contact_b, corner);
+    let a_far = farthest_endpoint(&blend.contact_a, corner);
+    let b_far = farthest_endpoint(&blend.contact_b, corner);
+    let toward = |far: Pnt, near: Pnt| (near - far).normalized();
+    let (Some(a_dir), Some(b_dir)) = (toward(a_far, a_corner), toward(b_far, b_corner)) else {
+        return Err(RollingBallError::DegenerateSpine);
+    };
+    let cross = |far: Pnt, dir: GeomVec| -> Option<Pnt> {
+        let denom = dir.dot(&m);
+        if denom.abs() < 1.0e-9 {
+            return None;
+        }
+        let t = (q0 - far).dot(&m) / denom;
+        (t > tolerance::CONFUSION).then(|| far + dir * t)
+    };
+    let (Some(pa), Some(pb)) = (
+        cross(a_far, GeomVec::from_dir(a_dir)),
+        cross(b_far, GeomVec::from_dir(b_dir)),
+    ) else {
+        return Ok(false);
+    };
+    if pa.distance(&pb) <= tolerance::CONFUSION {
+        return Ok(false);
+    }
+
+    // Ellipse: the blend cylinder's section by the cap plane. Center at the
+    // axis crossing, major axis along the spine's in-plane projection with
+    // semi-major r/|cos φ|, semi-minor r along the mutual perpendicular.
+    let c_far = farthest_endpoint(&blend.centerline, corner);
+    let c_near = nearest_endpoint(&blend.centerline, corner);
+    let Some(c_dir) = toward(c_far, c_near) else {
+        return Err(RollingBallError::DegenerateSpine);
+    };
+    let Some(e_center) = cross(c_far, GeomVec::from_dir(c_dir)) else {
+        return Ok(false);
+    };
+    let Some(x_dir) = (d - m * cos_phi).normalized() else {
+        return Ok(false);
+    };
+    let x_vec = GeomVec::from_dir(x_dir);
+    let y_vec = m.cross(&x_vec);
+    let a_r = blend.radius / cos_phi.abs();
+    let b_r = blend.radius;
+    let param_of = |p: Pnt| -> f64 {
+        let v = p - e_center;
+        (v.dot(&y_vec) / b_r).atan2(v.dot(&x_vec) / a_r)
+    };
+    let ta = param_of(pa);
+    let tb = param_of(pb);
+
+    // Two candidate arcs join the crossings; keep the one on the blend band's
+    // own side, referenced by the original (perpendicular) end arc's midpoint
+    // direction about the blend axis.
+    let old_arc = if corner.distance(&blend.spine.source().point())
+        <= corner.distance(&blend.spine.target().point())
+    {
+        &blend.start_arc
+    } else {
+        &blend.end_arc
+    };
+    let ref_mid = old_arc
+        .curve()
+        .map(|c| c.point(0.5 * (old_arc.first() + old_arc.last())))
+        .unwrap_or_else(|| old_arc.start().point());
+    let axis_pt = blend_cyl.position().location();
+    let radial_of = |p: Pnt| -> Option<GeomVec> {
+        let v = p - axis_pt;
+        (v - d * v.dot(&d)).normalized().map(GeomVec::from_dir)
+    };
+    let Some(ref_dir) = radial_of(ref_mid) else {
+        return Ok(false);
+    };
+    use core::f64::consts::TAU;
+    let ccw_span = {
+        let mut s = tb - ta;
+        while s <= 0.0 {
+            s += TAU;
+        }
+        s
+    };
+    let m_dir = Dir::new(m.x(), m.y(), m.z());
+    let ell = Ellipse::new(Ax3::new_axes(e_center, m_dir, x_dir), a_r, b_r);
+    let score = |t_mid: f64| -> f64 {
+        let p = ell.point(t_mid);
+        radial_of(p).map_or(f64::NEG_INFINITY, |r| r.dot(&ref_dir))
+    };
+    let ccw_mid = ta + 0.5 * ccw_span;
+    let cw_mid = ta - 0.5 * (TAU - ccw_span);
+    let t_end = if score(ccw_mid) >= score(cw_mid) {
+        ta + ccw_span
+    } else {
+        ta - (TAU - ccw_span)
+    };
+    let trim = Edge::new(
+        Some(GeomCurve::ellipse(ell)),
+        ta,
+        t_end,
+        Vertex::new(pa),
+        Vertex::new(pb),
+    );
+
+    let Ok(trimmed_cap) = trim_face_at_corner(cap, corner, pa, pb, &trim) else {
+        return Ok(false);
+    };
+
+    let new_a = rebuild_contact(&blend.contact_a, a_far, pa);
+    let new_b = rebuild_contact(&blend.contact_b, b_far, pb);
+    let is_end = new_a.end().point().distance(&pa) <= new_a.start().point().distance(&pa);
+    let new_blend_face = build_blend_face_with_trim(blend, &new_a, &new_b, &trim, is_end);
+
+    blend.contact_a = new_a;
+    blend.contact_b = new_b;
+    blend.blend_face = new_blend_face;
+    // Persist the trim as this end's cap arc (see try_tangent_curved_wall_runout).
+    if is_end {
+        blend.end_arc = trim;
+    } else {
+        blend.start_arc = trim;
+    }
     faces.push(trimmed_cap);
     skipped.insert(cap.id());
     Ok(true)
@@ -3675,10 +4146,28 @@ pub fn rolling_ball_between_curved_faces(
     }
 
     // Longitudinal fillet: the plane normal is perpendicular to the axis, so the
-    // shared edge is a straight generator of the cylinder wall. Convex
-    // closed-form solve → a cylindrical blend face with straight-line contacts.
+    // shared edge is a straight generator of the cylinder wall. Closed-form
+    // solve → a cylindrical blend face with straight-line contacts. The same
+    // tangency solve serves both wedge signs (the ball rides in the void wedge
+    // either way); what differs is the topology bookkeeping, so classify the
+    // material wedge here: a boss standing on a wall makes a REFLEX (concave)
+    // crease whose fillet ADDS material — the convex corner closures must not
+    // run on it.
     if !n_plane.is_parallel(&axis_dir, 1e-4) {
-        return rolling_ball_plane_perp_cylinder(edge, plane_face, cyl_face, is_a_plane, radius);
+        let mut blend =
+            rolling_ball_plane_perp_cylinder(edge, plane_face, cyl_face, is_a_plane, radius)?;
+        let p1 = edge.target().point();
+        let mid = Pnt::new(
+            0.5 * (p0.x() + p1.x()),
+            0.5 * (p0.y() + p1.y()),
+            0.5 * (p0.z() + p1.z()),
+        );
+        if let Ok(n_cyl) = face_outward_normal_at(cyl_face, mid) {
+            if planar_edge_material_wedge_is_concave(solid, edge, n_plane, n_cyl) == Some(true) {
+                blend.concave = true;
+            }
+        }
+        return Ok(blend);
     }
 
     Err(RollingBallError::UnsolvableAdjacency {
@@ -3878,8 +4367,14 @@ fn planar_blend(
     let bisector_dir = bisector
         .normalized()
         .ok_or(RollingBallError::InvalidDihedral)?;
-    let sin_half =
-        inward_a.cross(&inward_b).magnitude() / bisector.magnitude().max(tolerance::CONFUSION);
+    // The ball center sits at radius / sin(θ/2) from the edge, where θ is the
+    // material wedge angle between the two faces. The unit inward normals span
+    // φ = π − θ, so |n̂a + n̂b| = 2·cos(φ/2) = 2·sin(θ/2) — i.e. sin(θ/2) is
+    // half the bisector length. (The previous |n̂a × n̂b| / |n̂a + n̂b| evaluated
+    // to sin(φ/2) = cos(θ/2), which only coincides with sin(θ/2) at θ = 90°, so
+    // every box test passed while non-right wedges placed the center too close
+    // to the corner and the blend bulged outside the body.)
+    let sin_half = (bisector.magnitude() * 0.5).max(tolerance::CONFUSION);
     if sin_half <= tolerance::CONFUSION {
         return Err(RollingBallError::InvalidDihedral);
     }
@@ -3960,8 +4455,12 @@ fn planar_blend_concave(
     let bisector_dir = bisector
         .normalized()
         .ok_or(RollingBallError::InvalidDihedral)?;
-    let sin_half =
-        out_a.cross(&out_b).magnitude() / bisector.magnitude().max(tolerance::CONFUSION);
+    // The ball rides the VOID wedge here, so the center sits at
+    // radius / sin(θ_void/2). The outward normals point into the void and span
+    // φ = π − θ_void, so |n̂a + n̂b| = 2·sin(θ_void/2) — same identity as the
+    // convex path (see planar_blend); the previous cross/sum form evaluated to
+    // cos(θ_void/2), correct only at θ_void = 90° (the usual pocket corner).
+    let sin_half = (bisector.magnitude() * 0.5).max(tolerance::CONFUSION);
     if sin_half <= tolerance::CONFUSION {
         return Err(RollingBallError::InvalidDihedral);
     }
@@ -4067,13 +4566,26 @@ pub fn edge_material_wedge_is_concave(solid: &Solid, edge: &Edge) -> Option<bool
     if adjacent.len() != 2 {
         return None;
     }
-    let both_planar = matches!(adjacent[0].surface(), Some(GeomSurface::Plane(_)))
-        && matches!(adjacent[1].surface(), Some(GeomSurface::Plane(_)));
-    if !both_planar {
-        return None;
-    }
-    let n_a = planar_outward_normal(&adjacent[0]).ok()?;
-    let n_b = planar_outward_normal(&adjacent[1]).ok()?;
+    // Outward normal of each adjacent face AT the edge midpoint. Planes and
+    // cylinder walls are supported — the latter covers the boss-on-wall crease
+    // (a straight generator edge between a plane and a cylinder), whose fillet
+    // ADDS material exactly like a planar pocket corner.
+    let p0 = edge.source().point();
+    let p1 = edge.target().point();
+    let mid = Pnt::new(
+        0.5 * (p0.x() + p1.x()),
+        0.5 * (p0.y() + p1.y()),
+        0.5 * (p0.z() + p1.z()),
+    );
+    let normal_at = |face: &Face| -> Option<Dir> {
+        match face.surface() {
+            Some(GeomSurface::Plane(_)) => planar_outward_normal(face).ok(),
+            Some(GeomSurface::Cylinder(_)) => face_outward_normal_at(face, mid).ok(),
+            _ => None,
+        }
+    };
+    let n_a = normal_at(&adjacent[0])?;
+    let n_b = normal_at(&adjacent[1])?;
     planar_edge_material_wedge_is_concave(solid, &edge, n_a, n_b)
 }
 
@@ -4426,16 +4938,28 @@ pub(crate) fn trim_face_along_spine(
     let prev = &edges[prev_idx];
     let next = &edges[next_idx];
 
-    let len_prev = prev.source().point().distance(&prev.target().point());
-    let dist_start_to_prev_start = contact_start.distance(&prev.source().point());
-    if dist_start_to_prev_start > len_prev * 0.99 {
-        contact_start_clamped = prev.source().point();
+    // Overflow clamping is a straight-line span test, so it only applies to
+    // STRAIGHT neighbours. A circular neighbour legitimately EXTENDS past the
+    // old corner along its own circle (e.g. a concave boss-crease blend whose
+    // contact foot sits on the wall's rim arc beyond the seam vertex) — the
+    // chord-distance heuristic misreads that as overflow and snaps the contact
+    // to the arc's far end, collapsing the trim.
+    let is_straight = |e: &Edge| matches!(e.curve(), Some(GeomCurve::Line(_)) | None);
+
+    if is_straight(prev) {
+        let len_prev = prev.source().point().distance(&prev.target().point());
+        let dist_start_to_prev_start = contact_start.distance(&prev.source().point());
+        if dist_start_to_prev_start > len_prev * 0.99 {
+            contact_start_clamped = prev.source().point();
+        }
     }
 
-    let len_next = next.source().point().distance(&next.target().point());
-    let dist_end_to_next_end = contact_end.distance(&next.target().point());
-    if dist_end_to_next_end > len_next * 0.99 {
-        contact_end_clamped = next.target().point();
+    if is_straight(next) {
+        let len_next = next.source().point().distance(&next.target().point());
+        let dist_end_to_next_end = contact_end.distance(&next.target().point());
+        if dist_end_to_next_end > len_next * 0.99 {
+            contact_end_clamped = next.target().point();
+        }
     }
 
     let oriented_contact = orient_edge_between(contact, contact_start_clamped, contact_end_clamped);
@@ -5069,6 +5593,20 @@ fn contact_arc(
     let end_v = (end - center)
         .normalized()
         .ok_or(RollingBallError::InvalidDihedral)?;
+    // The edge's params are 0..angle measured FROM `start`, so the circle's
+    // x-direction must be the start contact's radial direction — otherwise the
+    // stored parameter range names a different portion of the circle than the
+    // stored vertices (param/vertex-inconsistent edge), and discretization
+    // draws the wrong arc. Callers pass an xdir that usually equals `start_v`
+    // (planar blends), but the plane⊥cylinder solver's does not — derive it.
+    let xdir = {
+        let a = GeomVec::from_dir(axis);
+        let sv = GeomVec::from_dir(start_v);
+        match (sv - a * sv.dot(&a)).normalized() {
+            Some(perp) => Dir::new(perp.x(), perp.y(), perp.z()),
+            None => xdir,
+        }
+    };
     // A rolling-ball blend always sweeps the minor (convex) arc between its two
     // contact points. `angle_about_axis` returns a value in [0, TAU) measured in
     // one fixed rotational sense, so callers that feed `start`/`end` in opposite

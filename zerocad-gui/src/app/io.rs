@@ -765,6 +765,95 @@ impl ZeroCadApp {
         }
     }
 
+    /// Prompt for a path and write all current bodies as a 3MF package (one
+    /// object per body, so multi-part designs slice as separate parts). Like
+    /// STL this is export-only; the editable document stays the `.zcad`.
+    pub(crate) fn export_3mf(&mut self) {
+        if self.body_meshes.is_empty() {
+            self.status_msg = "Nothing to export — the model has no solid bodies.".to_string();
+            return;
+        }
+        if self.eval_pending {
+            self.reevaluate_geometry_blocking();
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export 3MF")
+            .add_filter("3MF model", &["3mf"])
+            .save_file()
+        else {
+            return;
+        };
+        // Use each body's display name (falling back to its node id) so the
+        // slicer's object list reads like the feature tree.
+        let names: Vec<(String, usize)> = self
+            .body_meshes
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                let name = self
+                    .graph
+                    .graph
+                    .node_indices()
+                    .find(|&n| self.graph.graph[n].id == *id)
+                    .map(|n| self.graph.graph[n].name.clone())
+                    .unwrap_or_else(|| id.clone());
+                (name, i)
+            })
+            .collect();
+        let bytes = zerocad_core::meshes_to_3mf(
+            names
+                .iter()
+                .map(|(name, i)| (name.as_str(), &self.body_meshes[*i].1)),
+        );
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                log::info!("Exported 3MF to {:?}", path);
+                self.status_msg = format!(
+                    "Exported {} bodies to {}",
+                    self.body_meshes.len(),
+                    path.display()
+                );
+            }
+            Err(e) => self.status_msg = format!("3MF export failed: {e}"),
+        }
+    }
+
+    /// Prompt for a STEP file and add it to the design as an Import feature
+    /// (undoable). The file's text is embedded in the feature so the `.zcad`
+    /// stays self-contained; evaluation parses it into a body like any other
+    /// feature node.
+    pub(crate) fn import_step(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import STEP")
+            .add_filter("STEP model", &["step", "stp"])
+            .pick_file()
+        else {
+            return;
+        };
+        let step_data = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_msg = format!("STEP import failed: {e}");
+                return;
+            }
+        };
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported")
+            .to_string();
+        self.push_undo();
+        let id = format!("import_{}", self.next_id());
+        self.graph.add_feature(FeatureNode {
+            id: id.clone(),
+            name: label.clone(),
+            feature: FeatureType::Import { step_data, label },
+        });
+        self.selected_node_id = Some(id);
+        self.reevaluate_geometry();
+        self.status_msg = format!("Imported {}", path.display());
+    }
+
     /// Delete the currently selected browser node (sketch/body/variable set), if
     /// any (undoable). Mirrors the per-row delete button in the document browser.
     pub(crate) fn delete_selected_node(&mut self) {

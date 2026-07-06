@@ -79,9 +79,15 @@ impl ZeroCadApp {
                         {
                             let is_active = self.active_tool == Some(SketchTool::Line);
                             let btn = draw_tool_btn(ui, is_active, "Line", Some(icons::Icon::Line));
-                            if btn.on_hover_text("Draw individual line segments (L)").clicked() {
+                            if btn
+                                .on_hover_text(
+                                    "Draw connected lines — chain segments and click the start to close a loop into a face (L)",
+                                )
+                                .clicked()
+                            {
                                 self.active_tool = Some(SketchTool::Line);
                                 self.cancel_in_progress_shape();
+                                self.line_chain_start = None;
                                 self.clear_pending_corners();
                                 log::info!("Switched to Line tool");
                             }
@@ -136,6 +142,7 @@ impl ZeroCadApp {
                                 } else {
                                     self.active_tool = Some(family.default_mode());
                                     self.cancel_in_progress_shape();
+                                    self.line_chain_start = None;
                                     self.clear_pending_corners();
                                     ui.memory_mut(|m| m.close_popup());
                                 }
@@ -156,6 +163,7 @@ impl ZeroCadApp {
                                     if row.clicked() {
                                         self.active_tool = Some(mode);
                                         self.cancel_in_progress_shape();
+                                        self.line_chain_start = None;
                                         self.clear_pending_corners();
                                         ui.memory_mut(|m| m.close_popup());
                                         log::info!("Switched to {:?}", mode);

@@ -90,9 +90,25 @@ impl ZeroCadApp {
                             egui::pos2(yz_c[3].0, yz_c[3].1),
                         ];
 
+                        // Datum plane sheets, projected for hover/click hit-tests (the
+                        // same world corners the renderer draws).
+                        let datum_quads: Vec<(String, CoordinateSystem, [egui::Pos2; 4])> = self
+                            .resolved_datum_planes()
+                            .into_iter()
+                            .map(|(id, _name, cs)| {
+                                let w = Self::datum_plane_world_corners(&cs);
+                                let p = |c: [f32; 3]| {
+                                    let pr = project_3d(c[0], c[1], c[2]);
+                                    egui::pos2(pr.0, pr.1)
+                                };
+                                (id, cs, [p(w[0]), p(w[1]), p(w[2]), p(w[3])])
+                            })
+                            .collect();
+
                         // Perform frame-perfect hover checking immediately
                         let hover_pos = response.hover_pos();
                         self.hovered_plane = None;
+                        self.hovered_datum_plane = None;
                         self.hovered_sketch_face = None;
                         if self.is_plane_selection_mode {
                             if let Some(pos) = hover_pos {
@@ -106,8 +122,14 @@ impl ZeroCadApp {
                                         }
                                         _ => None,
                                     });
+                                let datum_hit = datum_quads
+                                    .iter()
+                                    .find(|(_, _, pts)| is_point_in_quad(pos, pts))
+                                    .map(|(id, _, _)| id.clone());
                                 if let Some((node, fid)) = face_hit {
                                     self.hovered_sketch_face = Some((node, fid));
+                                } else if let Some(id) = datum_hit {
+                                    self.hovered_datum_plane = Some(id);
                                 } else if is_point_in_quad(pos, &xy_pts) {
                                     self.hovered_plane = Some(SketchPlane::XY);
                                 } else if is_point_in_quad(pos, &xz_pts) {
@@ -117,7 +139,10 @@ impl ZeroCadApp {
                                 }
                             }
 
-                            if self.hovered_plane.is_some() || self.hovered_sketch_face.is_some() {
+                            if self.hovered_plane.is_some()
+                                || self.hovered_datum_plane.is_some()
+                                || self.hovered_sketch_face.is_some()
+                            {
                                 egui::show_tooltip_at_pointer(ctx, egui::Id::new("plane_select_tooltip"), |ui| {
                                     ui.style_mut().visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
                                     ui.style_mut().visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 200));
@@ -257,9 +282,23 @@ impl ZeroCadApp {
                                     let now = ctx.input(|i| i.time);
                                     self.active_sketch_on_face = true;
                                     self.active_sketch_face_ref = fref;
+                                    self.active_sketch_datum_ref = None;
                                     self.hovered_sketch_face = None;
                                     self.begin_sketch_on(cs, now);
                                     self.status_msg = "Sketching on the selected face. Draw a profile, then Finish Sketch.".to_string();
+                                }
+                            } else if let Some(datum_id) = self.hovered_datum_plane.clone() {
+                                if let Some((_, cs, _)) =
+                                    datum_quads.iter().find(|(id, _, _)| *id == datum_id)
+                                {
+                                    log::info!("Sketching on datum plane {datum_id}.");
+                                    let now = ctx.input(|i| i.time);
+                                    self.active_sketch_on_face = false;
+                                    self.active_sketch_face_ref = None;
+                                    self.active_sketch_datum_ref = Some(datum_id);
+                                    self.hovered_datum_plane = None;
+                                    self.begin_sketch_on(*cs, now);
+                                    self.status_msg = "Sketching on the datum plane. Draw a profile, then Finish Sketch.".to_string();
                                 }
                             } else if let Some(plane) = self.hovered_plane {
                                 log::info!("User selected plane sheet: {:?}", plane);
@@ -288,6 +327,8 @@ impl ZeroCadApp {
 
                                 self.active_sketch_cs = cs;
                                 self.active_sketch_on_face = false;
+                                self.active_sketch_face_ref = None;
+                                self.active_sketch_datum_ref = None;
                                 self.is_plane_selection_mode = false;
                                 self.is_sketch_mode = true;
                                 self.reset_sketch_state();
@@ -720,12 +761,17 @@ impl ZeroCadApp {
                             }
                         }
 
-                        // Compute cursor snap preview coordinates
+                        // Compute cursor snap preview coordinates, capturing what
+                        // the cursor snapped onto so the viewport can draw the
+                        // matching snap glyph (endpoint ring / midpoint-centre X).
                         let current_cursor_snap = if let Some(pos) = hover_pos {
                             let scale = rect.width().min(rect.height()) / (self.camera_zoom * 5.0);
                             let raw = self.screen_to_sketch(pos, rect, &self.active_sketch_cs);
-                            Some(self.snap_sketch_point(raw, scale, shift))
+                            let (snapped, kind) = self.snap_sketch_point_kind(raw, scale, shift);
+                            self.cursor_snap_kind = kind;
+                            Some(snapped)
                         } else {
+                            self.cursor_snap_kind = None;
                             None
                         };
 
@@ -795,6 +841,10 @@ impl ZeroCadApp {
         // Inline extrude distance box overlay (Fusion-style, mirrors the sketch
         // dimension dialog). Drawn on top of the viewport while extruding.
         self.show_extrude_dialog(ctx);
+        self.show_revolve_dialog(ctx);
+        self.show_pattern_dialog(ctx);
+        self.show_hole_dialog(ctx);
+        self.show_shell_dialog(ctx);
 
         // 3D fillet/chamfer: the drag manipulator on the edge, the inline size
         // box, and the inline 2D corner-radius box (anchored on the staged

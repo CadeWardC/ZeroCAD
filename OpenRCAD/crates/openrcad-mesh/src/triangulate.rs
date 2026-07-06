@@ -325,26 +325,32 @@ fn build_edge_map(tris: &[Tri]) -> HashMap<(usize, usize), Vec<usize>> {
     edge_map
 }
 
-fn find_crossing_edge(
+fn find_crossing_edges(
     tris: &[Tri],
     points: &[Pnt2d],
     a: usize,
     b: usize,
     locked_edges: &HashSet<(usize, usize)>,
-) -> Option<(usize, usize, usize, usize)> {
+) -> Vec<(usize, usize, usize, usize)> {
     let edge_map = build_edge_map(tris);
-    // Scan candidate edges in TRIANGLE order (a stable Vec), not HashMap order,
-    // returning the first crossing edge. Constraint recovery flips whatever this
-    // returns, so a randomly-seeded HashMap order would recover the same constrained
-    // triangulation along a different flip path — a different (still valid) mesh per
-    // process, which cascades into the crack-fix point insertions and changes
-    // vertex/triangle counts run to run (the flaky circular-bite fillet display).
-    // Triangle order is reproducible, and the early return keeps this as cheap as
-    // the original scan (a full sorted/min pass would be a real slowdown here,
-    // since this runs inside the flip loop).
+    // Scan candidate edges in TRIANGLE order (a stable Vec), not HashMap order.
+    // Constraint recovery flips what this returns, so a randomly-seeded HashMap
+    // order would recover the same constrained triangulation along a different
+    // flip path — a different (still valid) mesh per process, which cascades
+    // into the crack-fix point insertions and changes vertex/triangle counts
+    // run to run (the flaky circular-bite fillet display). Triangle order is
+    // reproducible. ALL crossing edges are returned (deduplicated), because the
+    // first one is frequently unflippable near sliver/collinear configurations
+    // (a non-convex quad) — the caller must be able to flip a later crossing
+    // first and come back, or recovery wedges and leaves a boundary hole.
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
     for t in tris {
         for (c, d) in [(t.a, t.b), (t.b, t.c), (t.c, t.a)] {
             if c == a || c == b || d == a || d == b || locked_edges.contains(&edge_key(c, d)) {
+                continue;
+            }
+            if !seen.insert(edge_key(c, d)) {
                 continue;
             }
             let Some(adj) = edge_map.get(&edge_key(c, d)) else {
@@ -353,12 +359,11 @@ fn find_crossing_edge(
             if adj.len() == 2
                 && segments_intersect_strict(points[a], points[b], points[c], points[d])
             {
-                return Some((c, d, adj[0], adj[1]));
+                out.push((c, d, adj[0], adj[1]));
             }
         }
     }
-
-    None
+    out
 }
 
 fn flip_edge(tris: &mut [Tri], points: &[Pnt2d], edge: (usize, usize, usize, usize)) -> bool {
@@ -411,15 +416,24 @@ fn recover_constrained_edges(
                 break;
             }
 
-            let Some(crossing) = find_crossing_edge(&tris, points, a, b, &locked_edges) else {
-                break;
-            };
-
-            if !flip_edge(&mut tris, points, crossing) {
+            let crossings = find_crossing_edges(&tris, points, a, b, &locked_edges);
+            if crossings.is_empty() {
                 break;
             }
-
-            flips += 1;
+            // Flip the first flippable crossing. The first crossing alone is
+            // not enough: near slivers it is often a non-convex quad, and
+            // flipping a later crossing first un-wedges it on the next pass.
+            let mut flipped = false;
+            for crossing in crossings {
+                if flip_edge(&mut tris, points, crossing) {
+                    flipped = true;
+                    flips += 1;
+                    break;
+                }
+            }
+            if !flipped {
+                break;
+            }
         }
 
         if mesh_has_edge(&tris, a, b) {
@@ -900,13 +914,38 @@ fn trimmed_constrained_tris(
     wants_ccw: bool,
     check_edge_midpoints: bool,
 ) -> Vec<Tri> {
+    let dbg = std::env::var("ORC_DEBUG_TRI").is_ok();
     let tris = recover_constrained_edges(delaunay_triangulate(points), points, constraints);
+    if dbg {
+        for &(a, b) in constraints {
+            if a != b && !mesh_has_edge(&tris, a, b) {
+                eprintln!(
+                    "tri dbg: UNRECOVERED constraint ({:.4},{:.4})-({:.4},{:.4})",
+                    points[a].x(),
+                    points[a].y(),
+                    points[b].x(),
+                    points[b].y()
+                );
+            }
+        }
+    }
     let mut out = Vec::new();
     for t in tris {
         let pa = points[t.a];
         let pb = points[t.b];
         let pc = points[t.c];
         if !triangle_in_trim_region(pa, pb, pc, outer_pts, inner_pts_list, check_edge_midpoints) {
+            if dbg {
+                eprintln!(
+                    "tri dbg: CULLED ({:.4},{:.4}) ({:.4},{:.4}) ({:.4},{:.4})",
+                    pa.x(),
+                    pa.y(),
+                    pb.x(),
+                    pb.y(),
+                    pc.x(),
+                    pc.y()
+                );
+            }
             continue;
         }
         let tri_ccw = ccw(pa, pb, pc) > 0.0;

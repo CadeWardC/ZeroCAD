@@ -18,8 +18,9 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    edge_wedge_is_concave_mesh, EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef,
-    ExtrudeMode, FeatureNode, FeatureType, ParametricGraph, TopologyEdgeRef, Variable,
+    edge_wedge_is_concave_mesh, AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue,
+    EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode,
+    FeatureType, HoleKind, ParametricGraph, PatternKind, PlaneBase, TopologyEdgeRef, Variable,
 };
 pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,
@@ -27,6 +28,6 @@ pub use sketch::{
     CornerMod, Dimension, LineSegment, Region, RegionProvenance, RegionProvenanceFragment,
     RegionWithProvenance, ShapeLoop, SketchCurves, SketchShape,
 };
-pub use stl::{meshes_to_binary_stl, write_binary_stl};
+pub use stl::{meshes_to_3mf, meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};
 pub use zcad_format::{read_zcad, write_zcad, LoadedZcad, ZcadDocument, ZcadError, ZcadMetadata};

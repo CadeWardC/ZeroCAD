@@ -243,9 +243,18 @@ impl ZeroCadApp {
         }
 
         if escape {
+            // End a continuous-Line chain (the dialog is re-opened on every
+            // re-seed, so a mid-chain Escape lands here). Committed segments are
+            // kept; only the rubber-band is dropped.
+            let was_chaining = self.line_chain_start.is_some();
+            self.line_chain_start = None;
             self.cancel_in_progress_shape();
             self.autocomplete = None;
-            self.status_msg = "Shape cancelled.".to_string();
+            self.status_msg = if was_chaining {
+                "Line chain ended.".to_string()
+            } else {
+                "Shape cancelled.".to_string()
+            };
         }
     }
 }

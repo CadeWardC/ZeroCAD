@@ -146,36 +146,61 @@ impl ZeroCadApp {
         (rel.dot(cs.u), rel.dot(cs.v))
     }
 
-    /// Snap a raw sketch-plane point. With Shift held, returns it unchanged
-    /// (free placement). Otherwise it prefers, in order: a nearby endpoint /
-    /// circle-centre / segment-midpoint, then the nearest point on a segment,
-    /// then a fine 0.2-unit grid. `scale` is screen-pixels-per-unit so the snap
-    /// radius stays a constant on-screen distance.
+    /// Snap a raw sketch-plane point, returning only the snapped position.
+    /// Thin wrapper over [`snap_sketch_point_kind`] for callers that don't need
+    /// to know which feature was hit (e.g. committing a click).
     pub(crate) fn snap_sketch_point(&self, raw: (f32, f32), scale: f32, shift: bool) -> (f32, f32) {
+        self.snap_sketch_point_kind(raw, scale, shift).0
+    }
+
+    /// Snap a raw sketch-plane point and report *what* it snapped onto. With
+    /// Shift held, returns it unchanged with no snap kind (free placement).
+    /// Otherwise it prefers, in order: a nearby endpoint / circle-centre /
+    /// segment-midpoint (each distinguished so the viewport can draw its glyph),
+    /// then the nearest point on a segment, then a fine 0.2-unit grid. `scale`
+    /// is screen-pixels-per-unit so the snap radius stays a constant on-screen
+    /// distance.
+    pub(crate) fn snap_sketch_point_kind(
+        &self,
+        raw: (f32, f32),
+        scale: f32,
+        shift: bool,
+    ) -> ((f32, f32), Option<SnapKind>) {
         if shift {
-            return raw;
+            return (raw, None);
         }
         let tol = 9.0 / scale.max(1e-4); // ~9 px in world units
         let dist2 = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2);
 
-        // 1. Snap points: endpoints, midpoints, circle centres.
-        let mut best_pt: Option<((f32, f32), f32)> = None;
-        let mut consider = |p: (f32, f32)| {
+        // 1. Snap points: endpoints, midpoints, circle centres. The closest one
+        // wins, and it carries the kind so the caller draws the matching glyph.
+        let mut best_pt: Option<((f32, f32), SnapKind, f32)> = None;
+        let mut consider = |p: (f32, f32), kind: SnapKind| {
             let d = dist2(p, raw);
-            if d < tol * tol && best_pt.map_or(true, |(_, bd)| d < bd) {
-                best_pt = Some((p, d));
+            if d < tol * tol && best_pt.map_or(true, |(_, _, bd)| d < bd) {
+                best_pt = Some((p, kind, d));
             }
         };
         for s in &self.sketch_curves.segments {
-            consider(s.a);
-            consider(s.b);
-            consider(((s.a.0 + s.b.0) * 0.5, (s.a.1 + s.b.1) * 0.5));
+            consider(s.a, SnapKind::Endpoint);
+            consider(s.b, SnapKind::Endpoint);
+            consider(
+                ((s.a.0 + s.b.0) * 0.5, (s.a.1 + s.b.1) * 0.5),
+                SnapKind::Midpoint,
+            );
         }
         for c in &self.sketch_curves.circles {
-            consider(c.center);
+            consider(c.center, SnapKind::Center);
         }
-        if let Some((p, _)) = best_pt {
-            return p;
+        // Fillet arcs: their endpoints act as the new corners where the arc meets
+        // the straight edges, and their centre is a genuine centre to snap onto.
+        for a in &self.sketch_curves.arcs {
+            consider(a.start, SnapKind::Endpoint);
+            consider(a.end, SnapKind::Endpoint);
+            consider(a.center, SnapKind::Center);
+        }
+        if let Some((p, kind, _)) = best_pt {
+            return (p, Some(kind));
         }
 
         // 2. Snap to the nearest point on a segment.
@@ -188,11 +213,14 @@ impl ZeroCadApp {
             }
         }
         if let Some((p, _)) = best_line {
-            return p;
+            return (p, Some(SnapKind::OnLine));
         }
 
         // 3. Fine grid snap (0.2 units).
-        ((raw.0 * 5.0).round() / 5.0, (raw.1 * 5.0).round() / 5.0)
+        (
+            ((raw.0 * 5.0).round() / 5.0, (raw.1 * 5.0).round() / 5.0),
+            Some(SnapKind::Grid),
+        )
     }
 
     /// Refresh the live (unlocked, untyped) dimension fields from the current
@@ -374,8 +402,40 @@ impl ZeroCadApp {
         if self.sketch_points.is_empty() {
             return;
         }
+        // Continuous-Line chaining bookkeeping (see the chaining block below).
+        let seg_start = self.sketch_points.first().copied();
+        let is_line = matches!(self.active_tool, Some(SketchTool::Line));
+        // Closing the loop = the snapped placement landed back on the chain's
+        // start. Test the SNAPPED point `last` (exact), NOT the rebuilt endpoint:
+        // the inline dims are quantized to 2 decimals (update_dim_live), so the
+        // rebuilt endpoint can sit ~0.05 mm off and miss the tolerance.
+        let is_closing = is_line
+            && self.line_chain_start.map_or(false, |cs| {
+                (last.0 - cs.0).powi(2) + (last.1 - cs.1).powi(2) < 1.0e-4
+            });
+        // When closing, drop the quantized inline dims so the closing segment is
+        // rebuilt at full precision from the snapped endpoints — otherwise its
+        // endpoint lands > VERTEX_TOL (1e-3 mm) from the start and detect_regions
+        // won't merge the loop into a face.
+        if is_closing {
+            self.dim_input = None;
+        }
+        let mut line_endpoint: Option<(f32, f32)> = None;
         let mut inferred_total = 0usize;
         if let Some(shape) = self.shape_record_from_points(last) {
+            // Continuous-Line: resolve the committed segment — reject a
+            // degenerate (zero-length) one so a stray/duplicate click can't
+            // inject a zero-length line or a false loop close, and capture the
+            // true endpoint (for a typed-dimension segment it differs from `last`).
+            if is_line {
+                if let Some(s) = shape.build(&self.graph.variable_map()).segments.last() {
+                    let len2 = (s.b.0 - s.a.0).powi(2) + (s.b.1 - s.a.1).powi(2);
+                    if len2 < 1.0e-8 {
+                        return;
+                    }
+                    line_endpoint = Some(s.b);
+                }
+            }
             if self.sketch_solver_model.is_some() {
                 let vars = self.graph.variable_map();
                 let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);
@@ -451,6 +511,36 @@ impl ZeroCadApp {
         }
         self.rebuild_active_sketch_curves();
         self.cancel_in_progress_shape();
+
+        // Continuous Line: instead of a one-shot reset, chain the next segment
+        // from this endpoint — or, if the endpoint lands back on the chain's
+        // start, close the loop (the region/face already formed in the rebuild
+        // above). Every other tool keeps the one-shot "Shape added" behavior.
+        if is_line {
+            if is_closing {
+                // The loop just closed; the face formed in the rebuild above.
+                self.line_chain_start = None;
+                self.status_msg = "Loop closed — face created.".to_string();
+            } else if let (Some(seg_start), Some(endpoint)) = (seg_start, line_endpoint) {
+                // First segment of a chain records its start for close detection.
+                self.line_chain_start.get_or_insert(seg_start);
+                // Re-seed: the next click continues the chain from this endpoint,
+                // and the inline Length/Angle dialog re-opens anchored at it.
+                self.sketch_points = vec![endpoint];
+                self.sketch_temp_start = Some(endpoint);
+                self.dim_input = Some(DimInput {
+                    fields: dim_fields_for(SketchTool::Line),
+                    focus_request: Some(0),
+                    active_field: 0,
+                    select_all: true,
+                });
+                self.status_msg =
+                    "Segment added — click the next point, or click the start to close (Esc to finish)."
+                        .to_string();
+            }
+            return;
+        }
+
         self.status_msg = if inferred_total > 0 {
             format!(
                 "Shape added ({inferred_total} constraint(s) inferred) — click to start another."

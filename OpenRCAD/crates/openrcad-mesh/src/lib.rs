@@ -9,7 +9,10 @@
 //! each face independently before welding coincident mesh vertices into one
 //! render/export mesh.
 
+pub mod properties;
 pub mod triangulate;
+
+pub use properties::{mass_properties, MassProperties};
 
 use openrcad_foundation::{BndBox, Pnt, Trsf};
 #[cfg(feature = "parallel")]

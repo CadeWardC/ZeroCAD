@@ -14,8 +14,12 @@ mod expr;
 mod extrude;
 mod geom2d;
 mod icons;
+mod hole_ui;
+mod pattern_ui;
 mod render;
+mod revolve_ui;
 mod settings;
+mod shell_ui;
 mod shortcuts;
 mod sketch_ui;
 mod theme;
@@ -23,6 +27,10 @@ mod thumbnail;
 use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
+use hole_ui::HoleOp;
+use pattern_ui::PatternOp;
+use revolve_ui::RevolveOp;
+use shell_ui::ShellOp;
 use geom2d::{circumcircle, dist_point_to_segment, is_point_in_quad, project_point_on_segment};
 use shortcuts::{Keymap, ShortcutAction};
 use sketch_ui::{dim_fields_for, DimInput};
@@ -77,6 +85,24 @@ pub enum SketchTool {
     Fillet,
     /// Bevel a sketch corner (click the corner). Not a draw tool.
     Chamfer,
+}
+
+/// What kind of existing geometry the live cursor snapped onto while sketching.
+/// Drives the on-screen snap glyph (an endpoint ring, a midpoint/centre cross)
+/// so the user can see *why* the point locked where it did. `OnLine`/`Grid`
+/// snaps are silent — they get no glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapKind {
+    /// A segment endpoint / shared corner.
+    Endpoint,
+    /// The midpoint of a straight segment.
+    Midpoint,
+    /// A circle (or arc) centre.
+    Center,
+    /// The nearest point along a segment.
+    OnLine,
+    /// The background placement grid.
+    Grid,
 }
 
 /// The toolbar button a [`SketchTool`] lives under. Switching buttons is by
@@ -231,6 +257,16 @@ pub enum BodyPick {
     Whole,
 }
 
+/// What the Datum toolbar menu creates (see `app::datum::create_datum`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatumKind {
+    OffsetPlane(zerocad_core::PlaneBase),
+    AnglePlane,
+    ThreePointPlane,
+    Axis,
+    Point,
+}
+
 /// What the user did on a feature-tree row this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowAction {
@@ -348,6 +384,10 @@ struct ZeroCadApp {
     /// from face-pick to sketch-commit so the finished sketch stores it (and the
     /// sketch plane then follows the body). `None` for origin-plane sketches.
     active_sketch_face_ref: Option<zerocad_core::parametric::FaceRef>,
+    /// When sketching on a datum plane, that datum's node id, carried from
+    /// plane-pick to sketch-commit so the finished sketch records the
+    /// attachment (and follows the datum when it's edited). `None` otherwise.
+    active_sketch_datum_ref: Option<String>,
     /// Creation timestamp (Unix seconds) of the document currently open, carried
     /// from the loaded `.zcad` so re-saving preserves "created" rather than
     /// stamping it anew. `None` for a fresh/never-saved or legacy document.
@@ -450,7 +490,17 @@ struct ZeroCadApp {
     /// (which the next click / cursor supplies). 2-point tools hold one entry;
     /// 3-point tools hold up to two. Cleared when the shape finalizes or cancels.
     sketch_points: Vec<(f32, f32)>,
+    /// Start vertex of the current continuous-Line chain. `Some` while a Line
+    /// chain is being drawn (≥1 segment committed), so the next segment re-seeds
+    /// from each endpoint and a click back on the start closes the loop into a
+    /// face. `None` for every other tool and between chains.
+    line_chain_start: Option<(f32, f32)>,
     hovered_plane: Option<SketchPlane>,
+    /// The datum plane under the cursor during plane selection (node id).
+    hovered_datum_plane: Option<String>,
+    /// Material density (g/cm³) for the Measure panel's mass line. A display
+    /// preference, not part of the document.
+    measure_density: f32,
     /// In plane-selection mode, the planar body face `(node_id, face_id)` under
     /// the cursor. A hovered face takes priority over the origin plane quads and,
     /// when clicked, starts a sketch on that face (the same path as pre-selecting
@@ -474,6 +524,14 @@ struct ZeroCadApp {
     extrude_mode: ExtrudeMode,
     /// Active (uncommitted) extrude operation with its live preview, if any.
     extrude_op: Option<ExtrudeOp>,
+    /// The in-progress Revolve tool (axis/angle/mode dialog), `None` when idle.
+    revolve_op: Option<RevolveOp>,
+    /// The in-progress Pattern/Mirror tool dialog, `None` when idle.
+    pattern_op: Option<PatternOp>,
+    /// The in-progress Hole tool dialog, `None` when idle.
+    hole_op: Option<HoleOp>,
+    /// The in-progress Shell tool dialog, `None` when idle.
+    shell_op: Option<ShellOp>,
     /// Memoized live Cut/Join preview: `(input hash, evaluated bodies)`. The
     /// preview re-runs the whole parametric model (truck booleans), which is far
     /// too slow to redo every frame, so it's cached and only recomputed when the
@@ -556,6 +614,10 @@ struct ZeroCadApp {
     dim_anchor: Option<egui::Pos2>,
     /// Last cursor position in sketch-plane coordinates (for live dims / finalize).
     last_cursor: Option<(f32, f32)>,
+    /// The geometry feature the live cursor snapped onto this frame — drives the
+    /// snap glyph drawn over the viewport. `None` when nothing snapped or when
+    /// snapping is suppressed (Shift held).
+    cursor_snap_kind: Option<SnapKind>,
     /// Screen-space positions for inline dimension labels (Fusion 360 style).
     dim_screen_positions: Vec<egui::Pos2>,
 

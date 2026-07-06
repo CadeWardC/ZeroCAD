@@ -453,6 +453,56 @@ pub(crate) fn build_extrusion_solid_arcs(
     prism(&face, sweep).ok()
 }
 
+/// Build a solid of revolution for one sketch region: the same arc-refitting
+/// profile face as [`build_extrusion_solid_arcs`], swept about `axis` (world
+/// space, which must lie in the sketch plane) by `angle` radians via the
+/// kernel's `revolve`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_revolution_solid(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    cs: &crate::geometry::CoordinateSystem,
+    axis_origin: Vec3,
+    axis_dir: Vec3,
+    angle: f64,
+    arc_circles: &[((f32, f32), f32)],
+) -> Option<KernelSolid> {
+    if points.len() < 3 || angle.abs() < 1e-9 {
+        return None;
+    }
+    let make_wire = |loop_pts: &[(f32, f32)]| -> Option<Wire> {
+        loop_to_wire_with_arcs(loop_pts, arc_circles, cs)
+    };
+    let outer = make_wire(points)?;
+    let inners: Vec<Wire> = holes.iter().filter_map(|h| make_wire(h)).collect();
+    let to_pnt = |u: f32, v: f32| -> Pnt {
+        let p = cs.unproject(u, v);
+        Pnt::new(p.x as f64, p.y as f64, p.z as f64)
+    };
+    let pts3: Vec<Pnt> = points.iter().map(|(u, v)| to_pnt(*u, *v)).collect();
+    let normal = newell_normal(&pts3)?;
+    let plane = GeomSurface::plane(Plane::from_point_normal(pts3[0], normal));
+    let face = if inners.is_empty() {
+        Face::new(Some(plane), outer)
+    } else {
+        Face::with_wires(Some(plane), Some(outer), inners, Orientation::Forward)
+    };
+    let apnt = Pnt::new(
+        axis_origin.x as f64,
+        axis_origin.y as f64,
+        axis_origin.z as f64,
+    );
+    let adir = GeomVec::new(axis_dir.x as f64, axis_dir.y as f64, axis_dir.z as f64)
+        .normalized()?;
+    match revolve(&face, apnt, adir, angle) {
+        Ok(solid) => Some(solid),
+        Err(e) => {
+            log::warn!("revolve failed: {e}");
+            None
+        }
+    }
+}
+
 /// Unit normal of a planar 3D loop via Newell's method — robust to the loop's
 /// winding and to which axis it spans. `None` for a degenerate (collinear or
 /// zero-area) loop.

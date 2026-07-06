@@ -1,4 +1,5 @@
 mod base;
+mod datum;
 mod editing;
 mod eval;
 mod io;

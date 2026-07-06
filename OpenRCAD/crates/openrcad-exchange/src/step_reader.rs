@@ -1522,7 +1522,15 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
 /// Read a STEP file at `path` into a [`Solid`] (AP242 B-Rep).
 pub fn read_step(path: &str) -> io::Result<Solid> {
     let content = fs::read_to_string(path)?;
-    let stripped = strip_comments(&content);
+    read_step_str(&content)
+}
+
+/// Parse STEP file text into a [`Solid`] (AP242 B-Rep).
+///
+/// Same semantics as [`read_step`], but takes the file contents directly so
+/// callers that embed STEP data (e.g. a document format) avoid the filesystem.
+pub fn read_step_str(content: &str) -> io::Result<Solid> {
+    let stripped = strip_comments(content);
 
     let data_start = stripped
         .find("DATA;")

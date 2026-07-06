@@ -125,6 +125,15 @@ impl ZeroCadApp {
                         }
                         self.graph.sketch_face_refs.insert(sketch_id.clone(), fref);
                     }
+                    // A sketch placed on a datum plane records the datum + a
+                    // dependency, so its plane re-derives from the datum's current
+                    // resolution on every rebuild (editing the datum moves it).
+                    if let Some(datum_id) = self.active_sketch_datum_ref.take() {
+                        self.graph.add_dependency(&datum_id, &sketch_id);
+                        self.graph
+                            .sketch_datum_refs
+                            .insert(sketch_id.clone(), datum_id);
+                    }
                     self.selected_node_id = Some(sketch_id);
                     self.reset_sketch_state();
                     self.status_msg =
@@ -231,6 +240,26 @@ impl ZeroCadApp {
                     .on_hover_text("Select one or more 3D faces first");
             }
 
+            // REVOLVE: same sketch-face selection as Extrude, spun about an axis.
+            if extrude_enabled && self.revolve_op.is_none() {
+                let revolve_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Revolve",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if revolve_btn
+                    .on_hover_text(
+                        "Revolve the selected sketch face(s) about an axis in the sketch plane",
+                    )
+                    .clicked()
+                {
+                    self.begin_revolve_from_selection();
+                }
+            }
+
             if sel > 0 {
                 let clear_sel_btn = ui.add(
                     egui::Button::new(
@@ -312,6 +341,138 @@ impl ZeroCadApp {
                     .size(10.0)
                     .color(self.pal().text_faint),
             );
+        }
+
+        // HOLE: drill into the selected body face.
+        if !active_sketching
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.hole_op.is_none()
+        {
+            if let Some((node, fid)) = self.hole_face_candidate() {
+                ui.separator();
+                let hole_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Hole",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if hole_btn
+                    .on_hover_text(
+                        "Drill a hole into the selected face (simple, counterbore, or countersink)",
+                    )
+                    .clicked()
+                {
+                    self.begin_hole(node, fid);
+                }
+            }
+        }
+
+        // SHELL: hollow the selected body, removing the selected face(s).
+        if !active_sketching
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.shell_op.is_none()
+        {
+            if let Some((target, fids)) = self.shell_candidate() {
+                let shell_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Shell",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if shell_btn
+                    .on_hover_text("Hollow the body, removing the selected face(s)")
+                    .clicked()
+                {
+                    self.begin_shell(target, fids);
+                }
+            }
+        }
+
+        // PATTERN / MIRROR: replicate the selected body.
+        if !active_sketching
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.pattern_op.is_none()
+        {
+            if let Some(source) = self.pattern_source_candidate() {
+                ui.separator();
+                let pattern_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Pattern",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if pattern_btn
+                    .on_hover_text("Linear/circular array or mirror of the selected body")
+                    .clicked()
+                {
+                    self.begin_pattern(source);
+                }
+            }
+        }
+
+        // DATUM: construction geometry (reference planes / axes / points).
+        // Created with defaults, then tuned in the Properties panel; a datum
+        // plane becomes a sketchable target in the plane picker.
+        if !active_sketching && self.extrude_op.is_none() && self.edge_mod_op.is_none() {
+            ui.separator();
+            let datum_btn_id = ui.make_persistent_id("datum_menu_dropdown");
+            let datum_btn = icons::Icon::Sketch.labeled_button(
+                ui,
+                "Datum  ▾",
+                egui::Color32::from_rgb(241, 245, 249),
+                egui::Color32::from_rgb(226, 232, 240),
+                self.pal().text_strong,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+            );
+            let datum_btn = datum_btn.on_hover_text("Create a reference plane, axis, or point");
+            if datum_btn.clicked() {
+                ui.memory_mut(|mem| mem.toggle_popup(datum_btn_id));
+            }
+            egui::popup_below_widget::<()>(ui, datum_btn_id, &datum_btn, |ui| {
+                ui.set_min_width(190.0);
+                ui.style_mut().spacing.button_padding = egui::vec2(14.0, 5.0);
+                ui.label(
+                    egui::RichText::new("Offset plane from…")
+                        .size(10.5)
+                        .color(self.pal().text_faint),
+                );
+                for (label, base) in [
+                    ("XY Plane", zerocad_core::PlaneBase::XY),
+                    ("XZ Plane (ground)", zerocad_core::PlaneBase::XZ),
+                    ("YZ Plane", zerocad_core::PlaneBase::YZ),
+                ] {
+                    if ui.button(label).clicked() {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.create_datum(DatumKind::OffsetPlane(base));
+                    }
+                }
+                ui.separator();
+                if ui.button("Angle Plane").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.create_datum(DatumKind::AnglePlane);
+                }
+                if ui.button("3-Point Plane").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.create_datum(DatumKind::ThreePointPlane);
+                }
+                if ui.button("Axis (2 points)").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.create_datum(DatumKind::Axis);
+                }
+                if ui.button("Point").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.create_datum(DatumKind::Point);
+                }
+            });
         }
 
         if self.is_plane_selection_mode {

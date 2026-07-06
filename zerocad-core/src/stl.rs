@@ -88,6 +88,51 @@ pub fn write_binary_stl<'a, W: Write>(
     w.write_all(&meshes_to_binary_stl(meshes))
 }
 
+/// Build a 3MF package from named meshes — one 3MF `<object>` per mesh, so
+/// multi-body designs stay separate parts in the slicer (unlike STL's single
+/// merged soup). Vertices are welded by quantized position, as 3MF indexes a
+/// shared vertex table.
+pub fn meshes_to_3mf<'a>(meshes: impl IntoIterator<Item = (&'a str, &'a MockMesh)>) -> Vec<u8> {
+    use openrcad::foundation::Pnt;
+    use openrcad::mesh::TriangleMesh;
+
+    let quant = |v: f32| (v as f64 * 1.0e5).round() as i64;
+    let mut owned: Vec<(String, TriangleMesh)> = Vec::new();
+    for (name, mesh) in meshes {
+        let mut tri = TriangleMesh::new();
+        let mut index_of: std::collections::HashMap<(i64, i64, i64), u32> =
+            std::collections::HashMap::new();
+        let mut remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len() / 6);
+        for v in mesh.vertices.chunks(6) {
+            let key = (quant(v[0]), quant(v[1]), quant(v[2]));
+            let id = *index_of.entry(key).or_insert_with(|| {
+                tri.vertices
+                    .push(Pnt::new(v[0] as f64, v[1] as f64, v[2] as f64));
+                (tri.vertices.len() - 1) as u32
+            });
+            remap.push(id);
+        }
+        for t in mesh.indices.chunks(3) {
+            let (Some(&a), Some(&b), Some(&c)) = (t.first(), t.get(1), t.get(2)) else {
+                continue;
+            };
+            let map = |i: u32| remap.get(i as usize).copied();
+            if let (Some(a), Some(b), Some(c)) = (map(a), map(b), map(c)) {
+                // A weld can collapse a sliver triangle to a degenerate one.
+                if a != b && b != c && a != c {
+                    tri.triangles.push([a, b, c]);
+                }
+            }
+        }
+        if !tri.triangles.is_empty() {
+            owned.push((name.to_string(), tri));
+        }
+    }
+    let refs: Vec<(String, &TriangleMesh)> =
+        owned.iter().map(|(n, m)| (n.clone(), m)).collect();
+    openrcad::exchange::to_3mf_bytes(&refs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

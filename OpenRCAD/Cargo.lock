@@ -1309,6 +1309,7 @@ dependencies = [
  "openrcad-foundation",
  "openrcad-geom",
  "openrcad-geom2d",
+ "openrcad-primitives",
  "openrcad-topo",
  "rayon",
  "serde",

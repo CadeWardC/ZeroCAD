@@ -5,6 +5,7 @@ impl ParametricGraph {
         let mut pg = Self {
             graph: DiGraph::new(),
             sketch_face_refs: HashMap::new(),
+            sketch_datum_refs: HashMap::new(),
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
             eval_cache: RefCell::new(EvalCache::default()),
@@ -273,6 +274,12 @@ impl ParametricGraph {
         // depth and sketch dimensions alike) sees the current variable values.
         let vars = self.variable_map();
         let sketch_cache = self.sketch_region_cache(&vars);
+        // Datums resolve in a pure pre-pass (their inputs never include live
+        // bodies). Their warnings stay OUT of the checkpointed `warnings` —
+        // they are re-derived fresh each build and appended at return, so a
+        // reused prefix can't double-report them.
+        let mut datum_warnings = Vec::new();
+        let datums = self.resolve_datums(&vars, &mut datum_warnings);
 
         // Body-eval nodes in creation order, with a cumulative content hash after
         // each one (see [`eval_prefix_keys`]). An edit that touches only a trailing
@@ -367,6 +374,36 @@ impl ParametricGraph {
                             });
                         }
                     }
+                    FeatureType::Import { step_data, label } => {
+                        match openrcad::exchange::read_step_str(step_data) {
+                            Ok(solid) => {
+                                let mut pristine = MockMesh::from_solid(&solid);
+                                if pristine.indices.is_empty() {
+                                    warnings.push(format!(
+                                        "Import '{}' ({}): STEP body tessellated empty.",
+                                        node.id, label
+                                    ));
+                                }
+                                stamp_import_face_refs(&mut pristine, &node.id);
+                                crate::mock_kernel::populate_edge_adjacent_face_names(
+                                    &mut pristine,
+                                );
+                                live.push(LiveBody {
+                                    id: node.id.clone(),
+                                    parts: vec![solid],
+                                    pristine: Some(pristine),
+                                    sketch_source: None,
+                                    cut_tools: Vec::new(),
+                                    cut_replay: None,
+                                    edge_mod_cut_history_path_used: false,
+                                });
+                            }
+                            Err(e) => warnings.push(format!(
+                                "Import '{}' ({}): failed to parse STEP data: {}.",
+                                node.id, label, e
+                            )),
+                        }
+                    }
                     FeatureType::Extrude {
                         depth,
                         region_indices,
@@ -401,6 +438,118 @@ impl ParametricGraph {
                             *mode,
                             target.as_deref(),
                             &sketch_cache,
+                            &datums,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::Revolve {
+                        axis,
+                        angle_deg,
+                        angle_expr,
+                        region_indices,
+                        mode,
+                        target,
+                    } => {
+                        let eff_angle = match angle_expr.as_ref() {
+                            Some(e) => match crate::expr::eval(e, &vars) {
+                                Ok(v) => v as f32,
+                                Err(_) => {
+                                    warnings.push(format!(
+                                        "Revolve '{}': angle expression \"{}\" no longer \
+                                         evaluates; using last value {:.3}.",
+                                        node.id, e, angle_deg
+                                    ));
+                                    *angle_deg
+                                }
+                            },
+                            None => *angle_deg,
+                        };
+                        self.apply_revolve(
+                            idx,
+                            &node.id,
+                            axis,
+                            eff_angle,
+                            region_indices,
+                            *mode,
+                            target.as_deref(),
+                            &sketch_cache,
+                            &datums,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::Pattern { source, kind } => {
+                        apply_pattern(
+                            &node.id,
+                            source,
+                            kind,
+                            &vars,
+                            &datums,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::Shell {
+                        target,
+                        thickness,
+                        thickness_expr,
+                        open_faces,
+                    } => {
+                        let eff_thickness = match thickness_expr.as_ref() {
+                            Some(e) => match crate::expr::eval(e, &vars) {
+                                Ok(v) => v as f32,
+                                Err(_) => {
+                                    warnings.push(format!(
+                                        "Shell '{}': thickness expression \"{}\" no longer \
+                                         evaluates; using last value {:.3}.",
+                                        node.id, e, thickness
+                                    ));
+                                    *thickness
+                                }
+                            },
+                            None => *thickness,
+                        };
+                        apply_shell(
+                            &node.id,
+                            target,
+                            eff_thickness,
+                            open_faces,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::Hole {
+                        target,
+                        position,
+                        direction,
+                        diameter,
+                        diameter_expr,
+                        depth,
+                        kind,
+                    } => {
+                        let eff_diameter = match diameter_expr.as_ref() {
+                            Some(e) => match crate::expr::eval(e, &vars) {
+                                Ok(v) => v as f32,
+                                Err(_) => {
+                                    warnings.push(format!(
+                                        "Hole '{}': diameter expression \"{}\" no longer \
+                                         evaluates; using last value {:.3}.",
+                                        node.id, e, diameter
+                                    ));
+                                    *diameter
+                                }
+                            },
+                            None => *diameter,
+                        };
+                        apply_hole(
+                            &node.id,
+                            target,
+                            *position,
+                            *direction,
+                            eff_diameter,
+                            *depth,
+                            kind,
                             &mut live,
                             &mut warnings,
                         );
@@ -473,6 +622,10 @@ impl ParametricGraph {
 
         *self.eval_cache.borrow_mut() = EvalCache { checkpoints };
 
+        if !datum_warnings.is_empty() {
+            datum_warnings.extend(warnings);
+            warnings = datum_warnings;
+        }
         Ok((live, warnings))
     }
 
@@ -527,6 +680,37 @@ impl ParametricGraph {
             h.write(k.as_bytes());
             h.write_u8(0xff);
             h.write_u64(v.to_bits());
+        }
+        // Datums fold into the SEED (like variables): they resolve in a
+        // pre-pass and any consumer anywhere downstream reads them, so one
+        // coarse rule — any datum edit invalidates every checkpoint — is what
+        // keeps prefix reuse sound without per-consumer dependency tracking.
+        // The sketch→datum attachment map folds too (re-attaching a sketch to
+        // a different datum changes geometry without touching any feature).
+        let mut datum_nodes: Vec<NodeIndex> = self
+            .graph
+            .node_indices()
+            .filter(|&i| {
+                matches!(
+                    self.graph[i].feature,
+                    FeatureType::DatumPlane { .. }
+                        | FeatureType::DatumAxis { .. }
+                        | FeatureType::DatumPoint { .. }
+                )
+            })
+            .collect();
+        datum_nodes.sort_by_key(|&i| creation_key(&self.graph[i].id));
+        for idx in datum_nodes {
+            let node = &self.graph[idx];
+            h.write(node.id.as_bytes());
+            fold_feature(&mut h, &node.feature);
+        }
+        let mut datum_refs: Vec<(&String, &String)> = self.sketch_datum_refs.iter().collect();
+        datum_refs.sort();
+        for (sketch_id, datum_id) in datum_refs {
+            h.write(sketch_id.as_bytes());
+            h.write_u8(0xfe);
+            h.write(datum_id.as_bytes());
         }
 
         let mut keys = Vec::with_capacity(nodes.len());
@@ -665,6 +849,11 @@ impl ParametricGraph {
                         | FeatureType::Cylinder { .. }
                         | FeatureType::Extrude { .. }
                         | FeatureType::EdgeMod { .. }
+                        | FeatureType::Import { .. }
+                        | FeatureType::Revolve { .. }
+                        | FeatureType::Pattern { .. }
+                        | FeatureType::Hole { .. }
+                        | FeatureType::Shell { .. }
                 )
             })
             .collect();
@@ -686,6 +875,7 @@ impl ParametricGraph {
         mode: ExtrudeMode,
         boolean_target: Option<&str>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
+        datums: &HashMap<String, DatumValue>,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
     ) {
@@ -712,10 +902,29 @@ impl ParametricGraph {
                 "Extrude '{node_id}': its sketch '{sketch_id}' {reason}."
             ));
         }
-        let cs_owned = self
-            .sketch_face_refs
-            .get(sketch_id)
-            .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
+        // Plane priority: a datum attachment re-derives from the datum's current
+        // resolution (editing the datum moves everything sketched on it); a face
+        // attachment re-derives from wherever the face is now; otherwise the
+        // sketch's saved plane. A datum that no longer resolves fails loud and
+        // falls back to the saved plane snapshot.
+        let datum_cs = self.sketch_datum_refs.get(sketch_id).and_then(|datum_id| {
+            match datums.get(datum_id) {
+                Some(DatumValue::Plane(cs)) => Some(*cs),
+                _ => {
+                    warnings.push(format!(
+                        "Extrude '{node_id}': sketch '{sketch_id}' is attached to datum plane \
+                         '{datum_id}', which did not resolve; using the sketch's saved plane."
+                    ));
+                    None
+                }
+            }
+        });
+        let cs_owned = datum_cs
+            .or_else(|| {
+                self.sketch_face_refs
+                    .get(sketch_id)
+                    .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
+            })
             .unwrap_or(sketch.cs);
         let cs = &cs_owned;
         let regions = &sketch.regions;
@@ -1091,6 +1300,521 @@ impl ParametricGraph {
                 }
             }
         }
+    }
+}
+
+impl ParametricGraph {
+    /// Evaluate one Revolve node: resolve the parent sketch and the axis, build
+    /// a solid of revolution per selected region, then assemble by mode. The
+    /// revolve analogue of [`apply_extrude`], deliberately leaner — no
+    /// rect-circle canonical forms or cut-replay history (those are extrude
+    /// tricks for prismatic pockets); the kernel solid IS the analytic result.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_revolve(
+        &self,
+        idx: NodeIndex,
+        node_id: &str,
+        axis: &AxisBase,
+        angle_deg: f32,
+        region_indices: &[usize],
+        mode: ExtrudeMode,
+        boolean_target: Option<&str>,
+        sketch_cache: &HashMap<NodeIndex, SketchEval>,
+        datums: &HashMap<String, DatumValue>,
+        live: &mut Vec<LiveBody>,
+        warnings: &mut Vec<String>,
+    ) {
+        let parent_idx = self
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .find(|p| sketch_cache.contains_key(p));
+        let Some(parent_idx) = parent_idx else {
+            warnings.push(format!("Revolve '{node_id}': no parent sketch."));
+            return;
+        };
+        let sketch = &sketch_cache[&parent_idx];
+        let sketch_id = &self.graph[parent_idx].id;
+        if let Some(reason) = &sketch.solve_failure {
+            warnings.push(format!(
+                "Revolve '{node_id}': its sketch '{sketch_id}' {reason}."
+            ));
+        }
+        // Same plane priority as extrude: datum attachment, face attachment,
+        // saved plane.
+        let datum_cs = self.sketch_datum_refs.get(sketch_id).and_then(|datum_id| {
+            match datums.get(datum_id) {
+                Some(DatumValue::Plane(cs)) => Some(*cs),
+                _ => None,
+            }
+        });
+        let cs_owned = datum_cs
+            .or_else(|| {
+                self.sketch_face_refs
+                    .get(sketch_id)
+                    .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
+            })
+            .unwrap_or(sketch.cs);
+        let cs = &cs_owned;
+        let regions = &sketch.regions;
+        if regions.is_empty() {
+            return;
+        }
+
+        // Resolve the axis to world space.
+        let axis_world: Option<(Vec3, Vec3)> = match axis {
+            AxisBase::X => Some((Vec3::ZERO, Vec3::X)),
+            AxisBase::Y => Some((Vec3::ZERO, Vec3::Y)),
+            AxisBase::Z => Some((Vec3::ZERO, Vec3::Z)),
+            AxisBase::Datum(id) => match datums.get(id) {
+                Some(DatumValue::Axis { origin, dir }) => Some((*origin, *dir)),
+                _ => None,
+            },
+            AxisBase::TwoPoints { a, b } => {
+                let av = Vec3::new(a[0], a[1], a[2]);
+                let bv = Vec3::new(b[0], b[1], b[2]);
+                let d = bv.sub(av).normalize();
+                (d != Vec3::ZERO).then_some((av, d))
+            }
+        };
+        let Some((axis_origin, axis_dir)) = axis_world else {
+            warnings.push(format!(
+                "Revolve '{node_id}': its axis could not be resolved."
+            ));
+            return;
+        };
+        if !(angle_deg > 0.0 && angle_deg <= 360.0 + 1e-3) {
+            warnings.push(format!(
+                "Revolve '{node_id}': angle {angle_deg}° is outside (0, 360]."
+            ));
+            return;
+        }
+        let angle_rad = (angle_deg as f64).to_radians().min(std::f64::consts::TAU);
+
+        let arc_circles: Vec<((f32, f32), f32)> = sketch
+            .curves
+            .arcs
+            .iter()
+            .map(|a| (a.center, a.radius))
+            .collect();
+        let take_all = region_indices.is_empty();
+
+        let mut newbody_parts: Vec<KernelSolid> = Vec::new();
+        let mut newbody_mesh = MockMesh::empty();
+        let mut cut_tools: Vec<CutTool> = Vec::new();
+        let mut join_tools: Vec<JoinTool> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
+            if !(take_all || region_indices.contains(&i)) {
+                continue;
+            }
+            let solid = crate::mock_kernel::revolved_region_solid(
+                &region.boundary,
+                &region.holes,
+                cs,
+                axis_origin,
+                axis_dir,
+                angle_rad,
+                &arc_circles,
+            );
+            let Some(solid) = solid else {
+                warnings.push(format!(
+                    "Revolve '{node_id}': region {i} could not be revolved (the profile \
+                     must lie on one side of the axis, and the axis in the sketch plane)."
+                ));
+                continue;
+            };
+            match mode {
+                ExtrudeMode::NewBody => {
+                    let mut mesh = MockMesh::from_solid(&solid);
+                    stamp_revolve_face_refs(&mut mesh, node_id, i);
+                    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+                    newbody_mesh.append(mesh);
+                    newbody_parts.push(solid);
+                }
+                ExtrudeMode::Cut => {
+                    cut_tools.push(CutTool::single_direction(None, Some(solid), None, None));
+                }
+                ExtrudeMode::Join => {
+                    join_tools.push(JoinTool {
+                        smooth: None,
+                        exact: Some(solid),
+                        dipped: None,
+                    });
+                }
+            }
+        }
+
+        match mode {
+            ExtrudeMode::NewBody => {
+                if !newbody_parts.is_empty() {
+                    live.push(LiveBody {
+                        id: node_id.to_string(),
+                        parts: newbody_parts,
+                        pristine: (!newbody_mesh.indices.is_empty()).then_some(newbody_mesh),
+                        sketch_source: None,
+                        cut_tools: Vec::new(),
+                        cut_replay: None,
+                        edge_mod_cut_history_path_used: false,
+                    });
+                }
+            }
+            ExtrudeMode::Join | ExtrudeMode::Cut => {
+                if let Some(target_id) = boolean_target {
+                    if !live.iter().any(|b| b.id == target_id) {
+                        warnings.push(format!(
+                            "{} '{node_id}': its target body '{target_id}' no longer \
+                             exists, so it had no effect.",
+                            if mode == ExtrudeMode::Cut {
+                                "Revolve cut"
+                            } else {
+                                "Revolve join"
+                            },
+                        ));
+                        return;
+                    }
+                }
+                if mode == ExtrudeMode::Join {
+                    apply_join(live, node_id, join_tools, boolean_target, warnings);
+                } else {
+                    apply_cut(live, node_id, cut_tools, boolean_target, warnings);
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate one Shell node: hollow the target body in place. Open faces are
+/// resolved geometrically (captured centroid+normal → nearest matching kernel
+/// face); the shelled solid replaces the body's parts and its display mesh is
+/// re-derived from the result.
+fn apply_shell(
+    node_id: &str,
+    target: &str,
+    thickness: f32,
+    open_faces: &[FaceRef],
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(body_idx) = live.iter().position(|b| b.id == target) else {
+        warnings.push(format!(
+            "Shell '{node_id}': its target body '{target}' no longer exists."
+        ));
+        return;
+    };
+    if thickness <= 0.0 {
+        warnings.push(format!("Shell '{node_id}': thickness must be positive."));
+        return;
+    }
+    if open_faces.is_empty() {
+        warnings.push(format!(
+            "Shell '{node_id}': select at least one face to remove."
+        ));
+        return;
+    }
+    let body = &live[body_idx];
+    let mut new_parts: Vec<KernelSolid> = Vec::new();
+    for part in &body.parts {
+        let kernel_open: Vec<_> = open_faces
+            .iter()
+            .flat_map(|fref| {
+                crate::mock_kernel::kernel_faces_matching(part, fref.centroid, fref.normal)
+            })
+            .collect();
+        if kernel_open.is_empty() {
+            // This part doesn't own any of the removed faces (multi-part body)
+            // — shell doesn't apply to it; keep it unchanged.
+            new_parts.push(part.clone());
+            continue;
+        }
+        match openrcad::algo::shell_solid(part, thickness as f64, &kernel_open) {
+            Ok(shelled) => new_parts.push(shelled),
+            Err(e) => {
+                warnings.push(format!(
+                    "Shell '{node_id}': the kernel couldn't hollow this body ({e:?}). \
+                     Supported: boxes, cylinders, and straight-edged planar solids."
+                ));
+                return;
+            }
+        }
+    }
+    let body = &mut live[body_idx];
+    body.parts = new_parts;
+    // The analytic mesh no longer matches; re-derive display from the parts.
+    body.pristine = None;
+    body.cut_replay = None;
+}
+
+/// Evaluate one Hole node: compose the drill from analytic cylinder/cone
+/// cutters (with the standard `CUT_OVERSHOOT` so end caps never sit coplanar
+/// with body faces) and apply them through the guarded cut pipeline against
+/// the target body only.
+#[allow(clippy::too_many_arguments)]
+fn apply_hole(
+    node_id: &str,
+    target: &str,
+    position: [f32; 3],
+    direction: [f32; 3],
+    diameter: f32,
+    depth: Option<f32>,
+    kind: &HoleKind,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(body) = live.iter().find(|b| b.id == target) else {
+        warnings.push(format!(
+            "Hole '{node_id}': its target body '{target}' no longer exists."
+        ));
+        return;
+    };
+    let pos = Vec3::new(position[0], position[1], position[2]);
+    let dir = Vec3::new(direction[0], direction[1], direction[2]).normalize();
+    if dir == Vec3::ZERO || diameter <= 0.0 {
+        warnings.push(format!(
+            "Hole '{node_id}': needs a non-zero direction and a positive diameter."
+        ));
+        return;
+    }
+    // Through-all length: comfortably past the target's bounding diagonal.
+    let diag = body
+        .parts
+        .iter()
+        .filter_map(|p| p.bounding_box().corners())
+        .map(|(lo, hi)| {
+            let dx = hi.x() - lo.x();
+            let dy = hi.y() - lo.y();
+            let dz = hi.z() - lo.z();
+            (dx * dx + dy * dy + dz * dz).sqrt() as f32
+        })
+        .fold(0.0f32, f32::max);
+    let overshoot = CUT_OVERSHOOT;
+    let start = pos.sub(dir.mul(overshoot));
+    let bore_len = match depth {
+        Some(d) if d > 0.0 => d + 2.0 * overshoot,
+        Some(_) => {
+            warnings.push(format!("Hole '{node_id}': depth must be positive."));
+            return;
+        }
+        None => diag.max(1.0) + 2.0 * overshoot,
+    };
+
+    // The HEAD cutter (counterbore/countersink) is applied FIRST: it starts at
+    // the surface, so it cuts virgin material cleanly, and the bore then
+    // drills through its flat/conical bottom. The other order asks the solver
+    // to subtract a wide cylinder around an existing COAXIAL bore wall (no
+    // wall-wall intersection curve), which it rejects.
+    let mut cut_tools: Vec<CutTool> = Vec::new();
+    match kind {
+        HoleKind::Simple => {}
+        HoleKind::Counterbore {
+            diameter: cb_d,
+            depth: cb_depth,
+        } => {
+            if *cb_d > diameter && *cb_depth > 0.0 {
+                if let Some(tool) = crate::mock_kernel::cylinder_tool_at(
+                    start,
+                    dir,
+                    *cb_d as f64 / 2.0,
+                    (*cb_depth + overshoot) as f64,
+                ) {
+                    cut_tools.push(CutTool::single_direction(Some(tool), None, None, None));
+                }
+            } else {
+                warnings.push(format!(
+                    "Hole '{node_id}': counterbore needs diameter > bore and depth > 0."
+                ));
+            }
+        }
+        HoleKind::Countersink {
+            diameter: cs_d,
+            angle_deg,
+        } => {
+            if *cs_d > diameter && *angle_deg > 0.0 && *angle_deg < 180.0 {
+                let half = (*angle_deg as f64 / 2.0).to_radians();
+                let cs_depth = ((*cs_d - diameter) as f64 / 2.0) / half.tan();
+                // Slope the overshoot extension so the cone stays the same cone.
+                let k = ((*cs_d - diameter) as f64 / 2.0) / cs_depth;
+                let r1 = *cs_d as f64 / 2.0 + overshoot as f64 * k;
+                if let Some(tool) = crate::mock_kernel::cone_tool_at(
+                    start,
+                    dir,
+                    r1,
+                    diameter as f64 / 2.0,
+                    cs_depth + overshoot as f64,
+                ) {
+                    cut_tools.push(CutTool::single_direction(None, Some(tool), None, None));
+                }
+            } else {
+                warnings.push(format!(
+                    "Hole '{node_id}': countersink needs diameter > bore and angle in (0, 180)."
+                ));
+            }
+        }
+    }
+    let bore = crate::mock_kernel::cylinder_tool_at(
+        start,
+        dir,
+        diameter as f64 / 2.0,
+        bore_len as f64,
+    );
+    match bore {
+        Some(tool) => cut_tools.push(CutTool::single_direction(Some(tool), None, None, None)),
+        None => {
+            warnings.push(format!("Hole '{node_id}': bore cutter failed to build."));
+            return;
+        }
+    }
+    apply_cut(live, node_id, cut_tools, Some(target), warnings);
+}
+
+/// Evaluate one Pattern node: replicate the source BODY's solids by the
+/// pattern's transforms. All instances land in ONE new live body (id = the
+/// pattern node), so the whole array selects/hides/deletes as a unit; the
+/// source body is left untouched.
+fn apply_pattern(
+    node_id: &str,
+    source: &str,
+    kind: &PatternKind,
+    vars: &HashMap<String, f64>,
+    datums: &HashMap<String, DatumValue>,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(src) = live.iter().find(|b| b.id == source) else {
+        warnings.push(format!(
+            "Pattern '{node_id}': its source body '{source}' no longer exists."
+        ));
+        return;
+    };
+    let parts = src.parts.clone();
+    if parts.is_empty() {
+        warnings.push(format!(
+            "Pattern '{node_id}': source body '{source}' has no solid geometry."
+        ));
+        return;
+    }
+
+    use openrcad::foundation::{Ax1, Ax2, Dir, Pnt, Trsf, Vec as GeomVec};
+    let to_pnt = |v: Vec3| Pnt::new(v.x as f64, v.y as f64, v.z as f64);
+    let to_dir = |v: Vec3| Dir::new(v.x as f64, v.y as f64, v.z as f64);
+
+    // Instance transforms, EXCLUDING the identity instance 0 (that's the
+    // source body itself). `(transform, is_reflection)`.
+    let transforms: Vec<(Trsf, bool)> = match kind {
+        PatternKind::Linear {
+            dir,
+            spacing,
+            spacing_expr,
+            count,
+        } => {
+            let Some((_, d)) = super::datum::resolve_axis_base_world(dir, datums) else {
+                warnings.push(format!(
+                    "Pattern '{node_id}': its direction could not be resolved."
+                ));
+                return;
+            };
+            let step = match spacing_expr.as_ref() {
+                Some(e) => match crate::expr::eval(e, vars) {
+                    Ok(v) => v as f32,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "Pattern '{node_id}': spacing expression \"{e}\" no longer \
+                             evaluates; using last value {spacing:.3}."
+                        ));
+                        *spacing
+                    }
+                },
+                None => *spacing,
+            };
+            if *count < 2 || step.abs() < 1e-6 {
+                warnings.push(format!(
+                    "Pattern '{node_id}': needs count ≥ 2 and a non-zero spacing."
+                ));
+                return;
+            }
+            (1..*count)
+                .map(|k| {
+                    let offset = GeomVec::new(
+                        d.x as f64 * step as f64 * k as f64,
+                        d.y as f64 * step as f64 * k as f64,
+                        d.z as f64 * step as f64 * k as f64,
+                    );
+                    (Trsf::translation(offset), false)
+                })
+                .collect()
+        }
+        PatternKind::Circular {
+            axis,
+            count,
+            total_angle_deg,
+        } => {
+            let Some((origin, d)) = super::datum::resolve_axis_base_world(axis, datums) else {
+                warnings.push(format!(
+                    "Pattern '{node_id}': its axis could not be resolved."
+                ));
+                return;
+            };
+            if *count < 2 {
+                warnings.push(format!("Pattern '{node_id}': needs count ≥ 2."));
+                return;
+            }
+            let total = (*total_angle_deg as f64).to_radians();
+            // Full ring: step = total/count (an instance AT 360° would coincide
+            // with instance 0). Partial arc: step = total/(count-1) so the last
+            // instance lands exactly at the requested angle.
+            let full = (*total_angle_deg - 360.0).abs() < 1e-3;
+            let step = if full {
+                total / *count as f64
+            } else {
+                total / (*count as f64 - 1.0)
+            };
+            let ax = Ax1::new(to_pnt(origin), to_dir(d));
+            (1..*count)
+                .map(|k| (Trsf::rotation(&ax, step * k as f64), false))
+                .collect()
+        }
+        PatternKind::Mirror { plane } => {
+            let Some(cs) = super::datum::resolve_plane_base_world(plane, datums) else {
+                warnings.push(format!(
+                    "Pattern '{node_id}': its mirror plane could not be resolved."
+                ));
+                return;
+            };
+            let frame = Ax2::new(to_pnt(cs.origin), to_dir(cs.n));
+            vec![(Trsf::mirror_plane(&frame), true)]
+        }
+    };
+    if transforms.is_empty() {
+        return;
+    }
+
+    let mut new_parts: Vec<KernelSolid> = Vec::new();
+    let mut mesh = MockMesh::empty();
+    for (k, (t, is_reflection)) in transforms.iter().enumerate() {
+        for part in &parts {
+            let s = crate::mock_kernel::transformed_solid(part, t, *is_reflection);
+            let mut m = MockMesh::from_solid(&s);
+            if m.indices.is_empty() {
+                warnings.push(format!(
+                    "Pattern '{node_id}': instance {} tessellated empty.",
+                    k + 1
+                ));
+                continue;
+            }
+            stamp_pattern_face_refs(&mut m, node_id, k + 1);
+            crate::mock_kernel::populate_edge_adjacent_face_names(&mut m);
+            mesh.append(m);
+            new_parts.push(s);
+        }
+    }
+    if !new_parts.is_empty() {
+        live.push(LiveBody {
+            id: node_id.to_string(),
+            parts: new_parts,
+            pristine: (!mesh.indices.is_empty()).then_some(mesh),
+            sketch_source: None,
+            cut_tools: Vec::new(),
+            cut_replay: None,
+            edge_mod_cut_history_path_used: false,
+        });
     }
 }
 

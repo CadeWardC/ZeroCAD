@@ -81,6 +81,147 @@ pub fn extruded_region_solid_with_arcs(
         .or_else(|| build_extrusion_solid_arcs(points, &[], depth as f64, cs, true, arc_circles))
 }
 
+/// Find the kernel faces of `solid` geometrically matching a captured face
+/// (world centroid + outward normal): plane contains the centroid, normal
+/// parallel, boundary near it. Used to resolve GUI face selections (which are
+/// mesh-level) to B-Rep faces for kernel ops like shell.
+pub fn kernel_faces_matching(
+    solid: &KernelSolid,
+    centroid: [f32; 3],
+    normal: [f32; 3],
+) -> Vec<Face> {
+    let c = Pnt::new(centroid[0] as f64, centroid[1] as f64, centroid[2] as f64);
+    let n = GeomVec::new(normal[0] as f64, normal[1] as f64, normal[2] as f64);
+    let mut best: Vec<(f64, Face)> = Vec::new();
+    for face in solid.shell().faces() {
+        let Some(GeomSurface::Plane(pl)) = face.surface() else {
+            continue;
+        };
+        let mut fnormal = GeomVec::from_dir(pl.normal());
+        if face.orientation() == Orientation::Reversed {
+            fnormal = -fnormal;
+        }
+        let align = fnormal.dot(&n) / (fnormal.magnitude() * n.magnitude()).max(1e-12);
+        if align < 0.99 {
+            continue;
+        }
+        let anchor = face
+            .outer_wire()
+            .and_then(|w| w.edges().first().map(|e| e.source().point()));
+        let Some(anchor) = anchor else { continue };
+        let plane_dist = ((c - anchor).dot(&fnormal.normalized().map(GeomVec::from_dir).unwrap_or(fnormal))).abs();
+        if plane_dist > 0.1 {
+            continue;
+        }
+        // Nearness of the boundary's vertex average to the centroid, as the
+        // tie-break between coplanar faces.
+        let pts: Vec<Pnt> = face
+            .outer_wire()
+            .map(|w| w.edges().iter().map(|e| e.source().point()).collect())
+            .unwrap_or_default();
+        if pts.is_empty() {
+            continue;
+        }
+        let k = pts.len() as f64;
+        let avg = Pnt::new(
+            pts.iter().map(|p| p.x()).sum::<f64>() / k,
+            pts.iter().map(|p| p.y()).sum::<f64>() / k,
+            pts.iter().map(|p| p.z()).sum::<f64>() / k,
+        );
+        best.push((avg.distance(&c), face.clone()));
+    }
+    best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    best.into_iter().take(1).map(|(_, f)| f).collect()
+}
+
+/// An analytic cylinder solid at an arbitrary position/direction — the drill
+/// bit for hole features. `None` on degenerate inputs.
+pub fn cylinder_tool_at(
+    origin: crate::geometry::Vec3,
+    dir: crate::geometry::Vec3,
+    radius: f64,
+    length: f64,
+) -> Option<KernelSolid> {
+    if radius <= 0.0 || length <= 0.0 {
+        return None;
+    }
+    let d = dir.normalize();
+    if d == crate::geometry::Vec3::ZERO {
+        return None;
+    }
+    let axis = Ax2::new(
+        Pnt::new(origin.x as f64, origin.y as f64, origin.z as f64),
+        Dir::new(d.x as f64, d.y as f64, d.z as f64),
+    );
+    Some(make_cylinder(&axis, radius, length))
+}
+
+/// An analytic cone-frustum solid (base radius `r1` at `origin`, `r2` after
+/// `length` along `dir`) — the countersink cutter. `None` on degenerate inputs.
+pub fn cone_tool_at(
+    origin: crate::geometry::Vec3,
+    dir: crate::geometry::Vec3,
+    r1: f64,
+    r2: f64,
+    length: f64,
+) -> Option<KernelSolid> {
+    if r1 <= 0.0 || length <= 0.0 {
+        return None;
+    }
+    let d = dir.normalize();
+    if d == crate::geometry::Vec3::ZERO {
+        return None;
+    }
+    let axis = Ax2::new(
+        Pnt::new(origin.x as f64, origin.y as f64, origin.z as f64),
+        Dir::new(d.x as f64, d.y as f64, d.z as f64),
+    );
+    Some(openrcad::primitives::make_cone(&axis, r1, r2, length))
+}
+
+/// Transform a kernel solid. Rigid motions (translation/rotation) map the
+/// B-Rep directly. A REFLECTION flips handedness — every loop then winds
+/// backward relative to its transformed surface — so the mirrored faces are
+/// re-sewn: `sew`'s winding-consistency BFS plus its global signed-volume
+/// outward pass restores a well-oriented shell.
+pub fn transformed_solid(solid: &KernelSolid, t: &Trsf, is_reflection: bool) -> KernelSolid {
+    if !is_reflection {
+        return solid.transformed(t);
+    }
+    let faces: Vec<Face> = solid
+        .shell()
+        .faces()
+        .iter()
+        .map(|f| f.transformed(t))
+        .collect();
+    Solid::new(openrcad::algo::sew::sew(&faces, 1e-6))
+}
+
+/// Solid of revolution for one sketch region, about a world-space axis lying in
+/// the sketch plane. Arc runs in the boundary are refit to true circles (like
+/// [`extruded_region_solid_with_arcs`]) so revolved arcs become analytic tori/
+/// spheres and straight runs cylinders/cones/planes. `None` when the profile
+/// crosses the axis, the axis is out of plane, or the angle is degenerate.
+pub fn revolved_region_solid(
+    points: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    cs: &crate::geometry::CoordinateSystem,
+    axis_origin: crate::geometry::Vec3,
+    axis_dir: crate::geometry::Vec3,
+    angle_rad: f64,
+    arc_circles: &[((f32, f32), f32)],
+) -> Option<KernelSolid> {
+    build_revolution_solid(
+        points,
+        holes,
+        cs,
+        axis_origin,
+        axis_dir,
+        angle_rad,
+        arc_circles,
+    )
+}
+
 /// Boolean fallback solid for one extruded sketch region, keeping the sampled
 /// sketch polyline instead of reconstructing arcs into analytic cylinders.
 ///

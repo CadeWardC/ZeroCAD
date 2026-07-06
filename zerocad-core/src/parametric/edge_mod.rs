@@ -810,7 +810,10 @@ fn validate_replayed_edge_mod_body(
         return Err("replayed body tessellated to an empty mesh".to_string());
     }
     let cracks_started = std::time::Instant::now();
-    edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
+    edge_mod_render_mesh_adds_no_cracks(
+        &candidate_mesh,
+        mock_mesh_crack_edge_count(&reference_mesh),
+    )?;
     edge_mod_timing("replayed body crack check", cracks_started);
 
     let has_circular_bite_source = body.sketch_source.as_ref().is_some_and(|source| {
@@ -2691,7 +2694,12 @@ pub(crate) fn edge_mod_selected_blend_present(
     let inward_on_face2 = mul3(n1, -1.0);
     let f1_raw = sub3(inward_on_face1, mul3(n1, dot3(inward_on_face1, n1)));
     let f2_raw = sub3(inward_on_face2, mul3(n2, dot3(inward_on_face2, n2)));
-    if length_sq3(f1_raw) <= 0.25 || length_sq3(f2_raw) <= 0.25 {
+    // |f_raw|² = sin²(angle between the normals): only genuinely (anti)parallel
+    // normals make the projected in-face direction unusable — the parallel
+    // check above already rejects those. (An earlier 0.25 gate here refused any
+    // wedge sharper than 30° or blunter than 150°, failing sharp-corner
+    // fillets with "could not build an edge-local frame".)
+    if length_sq3(f1_raw) <= 1.0e-6 || length_sq3(f2_raw) <= 1.0e-6 {
         return Err(
             "candidate selected-edge locality validation could not build an edge-local frame"
                 .to_string(),
@@ -2702,7 +2710,14 @@ pub(crate) fn edge_mod_selected_blend_present(
 
     let span_slack = (dist * 0.08).clamp(0.08, 0.5);
     let min_offset = (dist * 0.04).max(0.025);
-    let max_offset = dist + EDGE_MOD_GROW + 0.30;
+    // The blend band's tangency feet sit dist/tan(θ/2) along each face (θ =
+    // the material wedge angle, cos θ = −n1·n2) — `dist` alone is the 90°
+    // special case, and a sharp wedge's band lies entirely beyond it.
+    let cos_theta = (-dot3(n1, n2)).clamp(-1.0, 1.0);
+    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+    let tan_half = (sin_theta / (1.0 + cos_theta).max(1.0e-4)).max(1.0e-3);
+    let reach = (dist / tan_half).max(dist);
+    let max_offset = reach + EDGE_MOD_GROW + 0.30;
     let required_samples = match kind {
         crate::sketch::CornerKind::Fillet => 3,
         crate::sketch::CornerKind::Chamfer => 1,
@@ -2970,7 +2985,14 @@ pub(crate) fn edge_mod_selected_blend_lengthwise_wire_seams(
     let inward1 = normalize3(mul3(edge.n1, -1.0));
     let inward2 = normalize3(mul3(edge.n2, -1.0));
     let min_offset = (dist * 0.03).max(0.06);
-    let max_offset = dist + EDGE_MOD_GROW + 0.35;
+    // Same wedge-angle reach as edge_mod_selected_blend_present: the band ends
+    // dist/tan(θ/2) along each face, not `dist` (the 90° special case).
+    let n1n = normalize3(edge.n1);
+    let n2n = normalize3(edge.n2);
+    let cos_theta = (-dot3(n1n, n2n)).clamp(-1.0, 1.0);
+    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+    let tan_half = (sin_theta / (1.0 + cos_theta).max(1.0e-4)).max(1.0e-3);
+    let max_offset = (dist / tan_half).max(dist) + EDGE_MOD_GROW + 0.35;
 
     (0..mesh.edge_indices.len() / 2)
         .filter(|&e| {
@@ -3286,7 +3308,10 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh_gated(
             preserved_cylinder_faces.insert(i as u32);
         }
     }
-    edge_mod_render_mesh_has_no_cracks(&candidate_mesh)?;
+    edge_mod_render_mesh_adds_no_cracks(
+        &candidate_mesh,
+        mock_mesh_crack_edge_count(reference_mesh),
+    )?;
     if let Some(allow) = additive.as_ref() {
         // Concave blend: material is ADDED in the corner void, so strict
         // containment in the reference solid cannot hold. Gate on the
@@ -3313,7 +3338,25 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh_gated(
     Ok((candidate, Some(candidate_mesh)))
 }
 
-pub(crate) fn edge_mod_render_mesh_has_no_cracks(mesh: &MockMesh) -> Result<(), String> {
+/// Reject a candidate whose render mesh has more crack (single-triangle) edges
+/// than `allowed`. Callers pass the REFERENCE mesh's own crack count: a body
+/// whose pre-fillet tessellation already carries a boolean sliver must stay
+/// filletable — the gate exists to catch cracks the blend itself introduces.
+pub(crate) fn edge_mod_render_mesh_adds_no_cracks(
+    mesh: &MockMesh,
+    allowed: usize,
+) -> Result<(), String> {
+    let cracks = mock_mesh_crack_edge_count(mesh);
+    if cracks <= allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "candidate render mesh has {cracks} crack edges (reference has {allowed})"
+        ))
+    }
+}
+
+pub(crate) fn mock_mesh_crack_edge_count(mesh: &MockMesh) -> usize {
     let q = |i: usize| -> (i64, i64, i64) {
         let b = i * 6;
         let quant = |v: f32| (v as f64 * 10_000.0).round() as i64;
@@ -3332,13 +3375,7 @@ pub(crate) fn edge_mod_render_mesh_has_no_cracks(mesh: &MockMesh) -> Result<(), 
             *edges.entry(key).or_insert(0) += 1;
         }
     }
-
-    let cracks = edges.values().filter(|&&count| count == 1).count();
-    if cracks == 0 {
-        Ok(())
-    } else {
-        Err(format!("candidate render mesh has {cracks} crack edges"))
-    }
+    edges.values().filter(|&&count| count == 1).count()
 }
 
 pub(crate) fn edge_mod_reject_unhealthy_native_curve_result(
@@ -3868,20 +3905,41 @@ pub(crate) fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> b
         crate::mock_kernel::solid_aabb(result),
     ) {
         (Some(p), Some(r)) => {
-            let vol = |b: &([f32; 3], [f32; 3])| {
-                ((b.1[0] - b.0[0]) * (b.1[1] - b.0[1]) * (b.1[2] - b.0[2])).abs()
-            };
-            let pv = vol(&p);
-            // Must keep the bulk of the part (corner removal is small).
-            let keeps_bulk = pv <= 1.0e-6 || vol(&r) >= pv * 0.5;
             // Must not extend past the part — a subtraction can only remove. The
             // slack covers the cutter's own end-overshoot/grow and tessellation
             // noise; real garbage flares out far more than this.
             const SLACK: f32 = 0.3;
             let within = (0..3).all(|k| r.0[k] >= p.0[k] - SLACK && r.1[k] <= p.1[k] + SLACK);
-            keeps_bulk && within
+            if !within {
+                return false;
+            }
+            // Must keep the bulk of the part. TRUE enclosed volume, not AABB
+            // volume: a large-radius fillet on a SHARP sliver corner legitimately
+            // shortens the part's AABB by half while removing little material —
+            // the old AABB-volume proxy rejected exactly those fillets. A coarse
+            // tessellation is plenty accurate for a 50% ratio test.
+            let pv = solid_volume_estimate(part);
+            pv <= 1.0e-6 || solid_volume_estimate(result) >= pv * 0.5
         }
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Enclosed volume of `solid` from a coarse tessellation via the divergence
+/// theorem (⅙·Σ p0·(p1×p2) over triangles, absolute value — winding-agnostic).
+/// Accuracy is bounded by the chord error, which is far tighter than the 50%
+/// bulk gate this feeds.
+fn solid_volume_estimate(solid: &KernelSolid) -> f64 {
+    let mesh = openrcad::mesh::tessellate(solid, 0.5, std::f64::consts::PI);
+    let mut vol6 = 0.0f64;
+    for tri in &mesh.triangles {
+        let a = mesh.vertices[tri[0] as usize];
+        let b = mesh.vertices[tri[1] as usize];
+        let c = mesh.vertices[tri[2] as usize];
+        vol6 += a.x() * (b.y() * c.z() - b.z() * c.y())
+            + a.y() * (b.z() * c.x() - b.x() * c.z())
+            + a.z() * (b.x() * c.y() - b.y() * c.x());
+    }
+    (vol6 / 6.0).abs()
 }

@@ -54,11 +54,27 @@ impl ZeroCadApp {
             ui.separator();
 
             if icons::Icon::Download
+                .menu_button(ui, "Import STEP")
+                .clicked()
+            {
+                ui.memory_mut(|mem| mem.close_popup());
+                self.import_step();
+            }
+
+            if icons::Icon::Download
                 .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
                 .clicked()
             {
                 ui.memory_mut(|mem| mem.close_popup());
                 self.export_stl();
+            }
+
+            if icons::Icon::Download
+                .menu_button(ui, "Export 3MF")
+                .clicked()
+            {
+                ui.memory_mut(|mem| mem.close_popup());
+                self.export_3mf();
             }
 
             ui.separator();

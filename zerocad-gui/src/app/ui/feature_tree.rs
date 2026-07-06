@@ -26,6 +26,7 @@ impl ZeroCadApp {
                     let mut sketches: Vec<(String, String)> = Vec::new();
                     let mut bodies: Vec<(String, String)> = Vec::new();
                     let mut operations: Vec<(String, String)> = Vec::new();
+                    let mut datums: Vec<(String, String)> = Vec::new();
                     let mut variable_sets: Vec<(String, String)> = Vec::new();
                     for idx in self.graph.graph.node_indices() {
                         let node = &self.graph.graph[idx];
@@ -35,13 +36,24 @@ impl ZeroCadApp {
                             FeatureType::Sketch { .. } => sketches.push(entry),
                             FeatureType::Box { .. }
                             | FeatureType::Cylinder { .. }
+                            | FeatureType::Import { .. }
                             | FeatureType::Extrude {
                                 mode: ExtrudeMode::NewBody,
                                 ..
-                            } => bodies.push(entry),
-                            FeatureType::Extrude { .. } | FeatureType::EdgeMod { .. } => {
-                                operations.push(entry)
                             }
+                            | FeatureType::Revolve {
+                                mode: ExtrudeMode::NewBody,
+                                ..
+                            }
+                            | FeatureType::Pattern { .. } => bodies.push(entry),
+                            FeatureType::Extrude { .. }
+                            | FeatureType::Revolve { .. }
+                            | FeatureType::Hole { .. }
+                            | FeatureType::Shell { .. }
+                            | FeatureType::EdgeMod { .. } => operations.push(entry),
+                            FeatureType::DatumPlane { .. }
+                            | FeatureType::DatumAxis { .. }
+                            | FeatureType::DatumPoint { .. } => datums.push(entry),
                             FeatureType::VariableSet { .. } => variable_sets.push(entry),
                         }
                     }
@@ -136,6 +148,29 @@ impl ZeroCadApp {
                                     }
                                 }
                             });
+
+                            if !datums.is_empty() {
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new(format!("Datums ({})", datums.len()))
+                                        .font(egui::FontId::proportional(12.5))
+                                        .strong()
+                                        .color(self.pal().text_body),
+                                )
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for (id, name) in &datums {
+                                        let hidden = self.hidden_nodes.contains(id);
+                                        match self.feature_tree_row(ui, id, name, hidden, false) {
+                                            RowAction::Delete => id_to_delete = Some(id.clone()),
+                                            RowAction::ToggleVisibility => {
+                                                id_to_toggle = Some(id.clone())
+                                            }
+                                            RowAction::None => {}
+                                            RowAction::AddVariable => {}
+                                        }
+                                    }
+                                });
+                            }
 
                             // Variable Sets: a section title with a "+" on the right
                             // to create a new set. Each set lives below as a row whose

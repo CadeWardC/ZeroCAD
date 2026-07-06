@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::hash::Hasher;
 
 mod cut;
+mod datum;
 mod edge_mod;
 mod eval;
 mod extrude;

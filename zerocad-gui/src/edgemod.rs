@@ -84,21 +84,36 @@ fn edge_mod_edge_preview_mesh(
     // wedge in the void, so the band sits on the OUTWARD side (offsets along +n)
     // and the fillet arc faces the corner — the exact mirror.
     let s = if concave { 1.0 } else { -1.0 };
+    // cos of the angle between the face normals; the wedge trig below must use
+    // the real angle — the old ±n·dist offsets were the 90°-only special case,
+    // which floated the ribbon off the body at sharp/blunt corners.
+    let c = v_dot(n1, n2);
     let mut rails: Vec<([f32; 3], [f32; 3])> = Vec::new();
     match kind {
         CornerKind::Chamfer => {
+            // Feet sit ON each face at `dist` along it from the edge: the
+            // in-face, edge-perpendicular direction of face i is the other
+            // face's normal projected onto face i, (−n_j + n_i·c)/sinθ.
+            let sin_theta = (1.0 - c * c).max(1.0e-6).sqrt();
+            let t1 = v_scale(v_add(v_scale(n2, -1.0), v_scale(n1, c)), 1.0 / sin_theta);
+            let t2 = v_scale(v_add(v_scale(n1, -1.0), v_scale(n2, c)), 1.0 / sin_theta);
             let normal = v_norm(v_scale(v_add(n1, n2), s)).unwrap_or(n1);
-            rails.push((v_scale(n1, s * dist), normal));
-            rails.push((v_scale(n2, s * dist), normal));
+            rails.push((v_scale(t1, -s * dist), normal));
+            rails.push((v_scale(t2, -s * dist), normal));
         }
         CornerKind::Fillet => {
-            let center_offset = v_add(v_scale(n1, s * dist), v_scale(n2, s * dist));
+            // Rolling-ball center: r/sin(θ/2) along the bisector, which is
+            // (n1+n2)·r/(1 + n1·n2) — reduces to (n1+n2)·r at 90°.
+            let center_offset = v_scale(v_add(n1, n2), s * dist / (1.0 + c).max(1.0e-3));
             for i in 0..=EDGE_MOD_PREVIEW_FILLET_SEGS {
                 let theta =
                     i as f32 / EDGE_MOD_PREVIEW_FILLET_SEGS as f32 * std::f32::consts::FRAC_PI_2;
                 // Sweep the profile from face to face; on the concave side the arc
                 // bows back toward the corner (dir negated), so the ribbon hugs
-                // the added material instead of the removed wedge.
+                // the added material instead of the removed wedge. Any unit blend
+                // of the two normals lies on the profile circle, and its ends
+                // (±n1, ±n2) land exactly on the tangency feet for every wedge
+                // angle, so only the center needed the general-angle fix.
                 let dir = v_norm(v_add(v_scale(n2, theta.cos()), v_scale(n1, theta.sin())))?;
                 let dir = v_scale(dir, -s);
                 rails.push((v_add(center_offset, v_scale(dir, dist)), dir));
@@ -217,15 +232,24 @@ fn edge_mod_circular_edge_preview_mesh(
     // rail's shading normal, exactly like the straight-edge version.
     let rails_at = |theta: f32| -> Option<Vec<([f32; 3], [f32; 3])>> {
         let n2_loc = v_scale(radial_at(theta), wall_sign);
+        // Real wedge angle between cap and wall normals at this sample — the
+        // same general-angle trig as the straight-edge ribbon (a rim where the
+        // wall meets the cap off-perpendicular, e.g. under a slanted face,
+        // otherwise floats the ribbon off the body).
+        let c = v_dot(n1, n2_loc);
         let mut rails = Vec::new();
         match kind {
             CornerKind::Chamfer => {
+                let sin_theta = (1.0 - c * c).max(1.0e-6).sqrt();
+                let t1 = v_scale(v_add(v_scale(n2_loc, -1.0), v_scale(n1, c)), 1.0 / sin_theta);
+                let t2 = v_scale(v_add(v_scale(n1, -1.0), v_scale(n2_loc, c)), 1.0 / sin_theta);
                 let normal = v_norm(v_add(n1, n2_loc)).unwrap_or(n1);
-                rails.push((v_scale(n1, -dist), normal));
-                rails.push((v_scale(n2_loc, -dist), normal));
+                rails.push((v_scale(t1, dist), normal));
+                rails.push((v_scale(t2, dist), normal));
             }
             CornerKind::Fillet => {
-                let center_offset = v_add(v_scale(n1, -dist), v_scale(n2_loc, -dist));
+                let center_offset =
+                    v_scale(v_add(n1, n2_loc), -dist / (1.0 + c).max(1.0e-3));
                 for i in 0..=EDGE_MOD_PREVIEW_FILLET_SEGS {
                     let phi = i as f32 / EDGE_MOD_PREVIEW_FILLET_SEGS as f32
                         * std::f32::consts::FRAC_PI_2;
@@ -503,6 +527,66 @@ mod tests {
                     "{kind:?} convex ribbon must carve inward, got [{}, {}]",
                     v[0],
                     v[1]
+                );
+            }
+        }
+    }
+
+    /// A SHARP (non-90°) wedge: vertical edge whose faces have outward normals
+    /// (0,−1,0) and (sin20°·…) — a ~20° corner. The ribbon's tangency rails
+    /// must lie ON the faces (perpendicular distance ~0) and the whole ribbon
+    /// must stay INSIDE the material wedge. The old ±(n1+n2)·dist center was
+    /// the 90°-only special case and floated the ribbon off the body here.
+    #[test]
+    fn sharp_wedge_preview_ribbon_hugs_the_faces() {
+        // Wedge angle 20°: faces y=0 (outward −y) and a plane rotated 20° up
+        // from it (outward normal at 20° from +y within the xy-plane, i.e.
+        // n2 = (sin20°, cos20°, 0) for a corner opening toward −x).
+        let a = 20.0f32.to_radians();
+        let edge = EdgeRef {
+            p0: [0.0, 0.0, 0.0],
+            p1: [0.0, 0.0, 6.0],
+            n1: [0.0, -1.0, 0.0],
+            n2: [a.sin(), a.cos(), 0.0],
+            curve: None,
+            topology: None,
+        };
+        let dist = 2.52;
+        for kind in [CornerKind::Fillet, CornerKind::Chamfer] {
+            let mesh = edge_mod_edge_preview_mesh(&edge, dist, kind, false)
+                .unwrap_or_else(|| panic!("{kind:?} sharp preview"));
+            // First and last rails are the tangency/foot rails; they must lie
+            // in their face planes (both planes pass through the edge origin).
+            let verts: Vec<[f32; 3]> = mesh
+                .vertices
+                .chunks_exact(6)
+                .map(|v| [v[0], v[1], v[2]])
+                .collect();
+            // Each end rail must lie on one of the two faces (which face pairs
+            // with which rail differs between fillet and chamfer).
+            for p in [verts[0], verts[verts.len() - 1]] {
+                let to_face1 = p[1].abs();
+                let to_face2 = (p[0] * edge.n2[0] + p[1] * edge.n2[1]).abs();
+                assert!(
+                    to_face1.min(to_face2) <= 1.0e-3,
+                    "{kind:?}: end rail [{}, {}, {}] lies on neither face \
+                     (d1={to_face1}, d2={to_face2})",
+                    p[0],
+                    p[1],
+                    p[2]
+                );
+            }
+            // Every ribbon vertex stays inside the material wedge (behind BOTH
+            // faces): x·n ≤ small for each outward normal.
+            for v in &verts {
+                let d1 = -v[1]; // signed distance beyond face 1 (outward −y)
+                let d2 = v[0] * edge.n2[0] + v[1] * edge.n2[1];
+                assert!(
+                    d1 <= 1.0e-3 && d2 <= 1.0e-3,
+                    "{kind:?}: ribbon vertex [{}, {}, {}] floats outside the wedge (d1={d1}, d2={d2})",
+                    v[0],
+                    v[1],
+                    v[2]
                 );
             }
         }

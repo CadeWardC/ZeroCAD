@@ -8,11 +8,17 @@ mod circular_bite;
 mod circular_bite_helpers;
 mod common;
 mod concave_edge_mod;
+mod datum_attach;
 mod edge_mods;
 mod extrude_modes;
 mod fillet_chamfer;
+mod hole_feature;
+mod import;
 mod node_map_resync;
+mod pattern_feature;
 mod reattachment_matrix;
+mod revolve_feature;
+mod shell_feature;
 mod variables;
 
 use circular_bite_helpers::*;

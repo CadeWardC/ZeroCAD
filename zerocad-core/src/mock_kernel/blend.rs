@@ -22,10 +22,39 @@ pub fn fillet_edge(
 /// gate for the additive one. False for convex edges and whenever the probe
 /// is inconclusive (unlocatable edge, curved faces).
 pub fn edge_wedge_is_concave(solid: &KernelSolid, p0: [f32; 3], p1: [f32; 3]) -> bool {
-    let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
-    let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
-    let e = Edge::between_points(a, b);
+    let e = Edge::between_points(
+        snap_point_to_topology(solid, p0),
+        snap_point_to_topology(solid, p1),
+    );
     openrcad::algo::edge_material_wedge_is_concave(solid, &e) == Some(true)
+}
+
+/// Snap a mesh-derived f32 endpoint to the exact kernel vertex it names.
+///
+/// `EdgeRef` endpoints are f32 casts of tessellated vertices, so they miss the
+/// f64 B-Rep topology by up to ~|coord|·f32-eps (≈4e-7 at coordinate 15.2) —
+/// orders of magnitude beyond the kernel's CONFUSION-scale edge matching. Only
+/// exactly-representable coordinates (integer-sized boxes) ever matched without
+/// this, which is why fillets located axis-aligned edges but failed on angled
+/// sketch geometry. A point with no nearby vertex is returned unchanged
+/// (circular-rim selections name arc midpoints, not vertices).
+fn snap_point_to_topology(solid: &KernelSolid, p: [f32; 3]) -> Pnt {
+    let q = Pnt::new(p[0] as f64, p[1] as f64, p[2] as f64);
+    let mut best: Option<(f64, Pnt)> = None;
+    for e in solid.edges() {
+        for v in [e.start().point(), e.end().point()] {
+            let d = v.distance(&q);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, v));
+            }
+        }
+    }
+    // f32 quantization noise stays below ~1e-4 for coordinates up to ~1e3;
+    // real model vertices are far more than 1e-3 apart.
+    match best {
+        Some((d, v)) if d <= 1.0e-3 => v,
+        _ => q,
+    }
 }
 
 pub fn fillet_edge_with_hint(
@@ -57,9 +86,10 @@ pub fn fillet_edge_with_hint(
         return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
     }
 
-    let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
-    let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
-    let e = Edge::between_points(a, b);
+    let e = Edge::between_points(
+        snap_point_to_topology(solid, p0),
+        snap_point_to_topology(solid, p1),
+    );
     let contour = BlendContour::constant(vec![e], BlendKind::Fillet, radius as f64, None);
     apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
 }
@@ -227,9 +257,10 @@ pub fn chamfer_edge_with_hint(
         return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
     }
 
-    let a = Pnt::new(p0[0] as f64, p0[1] as f64, p0[2] as f64);
-    let b = Pnt::new(p1[0] as f64, p1[1] as f64, p1[2] as f64);
-    let e = Edge::between_points(a, b);
+    let e = Edge::between_points(
+        snap_point_to_topology(solid, p0),
+        snap_point_to_topology(solid, p1),
+    );
     let contour = BlendContour::constant(vec![e], BlendKind::Chamfer, distance as f64, None);
     apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
 }
