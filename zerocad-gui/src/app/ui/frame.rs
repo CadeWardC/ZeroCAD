@@ -108,6 +108,9 @@ impl ZeroCadApp {
             show_onboarding: self.show_onboarding,
             dark_mode: self.dark_mode,
             unit: self.current_unit,
+            gpu_render: self.gpu_render,
+            backend: self.graphics_backend,
+            msaa: self.msaa_level,
         };
         if current != self.settings_baseline {
             current.save();

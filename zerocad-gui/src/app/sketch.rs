@@ -1,10 +1,111 @@
 use crate::*;
 
+/// Reflect point `p` across the line through `a` with unit direction `d`.
+fn reflect_pt(p: (f32, f32), a: (f32, f32), d: (f32, f32)) -> (f32, f32) {
+    let v = (p.0 - a.0, p.1 - a.1);
+    let proj = v.0 * d.0 + v.1 * d.1;
+    (
+        2.0 * (a.0 + proj * d.0) - p.0,
+        2.0 * (a.1 + proj * d.1) - p.1,
+    )
+}
+
+/// Reflect an entire curve set across the axis through `a` with unit direction
+/// `d`. Reflection is an isometry, so radii are preserved and a minor arc stays
+/// a minor arc — only the defining points move.
+pub(crate) fn reflect_curves(
+    curves: &SketchCurves,
+    a: (f32, f32),
+    d: (f32, f32),
+) -> SketchCurves {
+    let mut out = SketchCurves::new();
+    for s in &curves.segments {
+        out.add_line(reflect_pt(s.a, a, d), reflect_pt(s.b, a, d));
+    }
+    for c in &curves.circles {
+        out.add_circle(reflect_pt(c.center, a, d), c.radius);
+    }
+    for arc in &curves.arcs {
+        out.arcs.push(zerocad_core::sketch::Arc {
+            center: reflect_pt(arc.center, a, d),
+            radius: arc.radius,
+            start: reflect_pt(arc.start, a, d),
+            end: reflect_pt(arc.end, a, d),
+        });
+    }
+    out
+}
+
 impl ZeroCadApp {
+    /// Commit a sketch Mirror: reflect the whole live sketch across the 2-click
+    /// axis `p0`→`p1` and append the reflected copy as a new baked shape. Works
+    /// in a fresh drawing session (added to `sketch_shapes`) and in an Edit
+    /// Sketch session (also promoted into the constraint-solver model so it
+    /// renders and participates), matching how a drawn shape is committed.
+    pub(crate) fn commit_sketch_mirror(&mut self, p0: (f32, f32), p1: (f32, f32)) {
+        let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1.0e-4 {
+            self.status_msg = "Mirror axis too short — click two distinct points.".to_string();
+            return;
+        }
+        let mirrored = reflect_curves(&self.sketch_curves, p0, (dx / len, dy / len));
+        if mirrored.is_empty() {
+            self.status_msg = "Nothing to mirror — draw geometry first.".to_string();
+            return;
+        }
+        let shape = SketchShape::Raw { curves: mirrored };
+        // In an Edit Sketch session the solver model is the source of truth, so
+        // the mirrored geometry must be promoted into it (as free geometry) to
+        // render; a fresh session just appends to the parametric shape list.
+        if self.sketch_solver_model.is_some() {
+            let vars = self.graph.variable_map();
+            let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);
+            let (addition, next) = zerocad_core::sketch::constraints::promote_shapes_to_entities(
+                std::slice::from_ref(&shape),
+                &[shape_id],
+                &vars,
+                self.sketch_next_entity_id + 1,
+            );
+            if let Some(model) = &mut self.sketch_solver_model {
+                model.points.extend(addition.points);
+                model.entities.extend(addition.entities);
+                model.constraints.extend(addition.constraints);
+            }
+            self.sketch_entity_ids.push(shape_id);
+            self.sketch_next_entity_id = next;
+        }
+        self.sketch_shapes.push(shape);
+        self.rebuild_active_sketch_curves();
+        self.status_msg = "Mirrored sketch across the axis.".to_string();
+    }
+
+    /// The reflected copy of the live sketch across the in-progress mirror axis
+    /// `p0`→`cursor`, for the drawing preview. `None` if the axis is degenerate.
+    pub(crate) fn mirror_preview_curves(
+        &self,
+        p0: (f32, f32),
+        cursor: (f32, f32),
+    ) -> Option<SketchCurves> {
+        let (dx, dy) = (cursor.0 - p0.0, cursor.1 - p0.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1.0e-4 {
+            return None;
+        }
+        Some(reflect_curves(&self.sketch_curves, p0, (dx / len, dy / len)))
+    }
+
     /// Re-run planar region detection on the active sketch curves.
     /// Trims selected indices that no longer correspond to a region.
+    ///
+    /// A sketch on a body face folds the projected face boundary in as
+    /// reference curves — appended AFTER the drawn curves, the same merge
+    /// order the evaluator and every committed-sketch region site use, so the
+    /// region indices seen live match the ones an extrude will store.
     pub(crate) fn recompute_sketch_regions(&mut self) {
-        self.detected_regions = detect_regions(&self.sketch_curves);
+        let mut curves = self.sketch_curves.clone();
+        curves.extend_curves(&self.active_face_boundary);
+        self.detected_regions = detect_regions(&curves);
         let n = self.detected_regions.len();
         self.selected_region_indices.retain(|i| *i < n);
     }
@@ -12,6 +113,7 @@ impl ZeroCadApp {
     /// Reset everything related to the in-progress sketch.
     pub(crate) fn reset_sketch_state(&mut self) {
         self.sketch_curves = SketchCurves::new();
+        self.active_face_boundary = SketchCurves::new();
         self.sketch_shapes.clear();
         self.sketch_corner_mods.clear();
         self.pending_corners.clear();
@@ -247,7 +349,9 @@ impl ZeroCadApp {
                         egui::Color32::from_rgb(170, 180, 190),
                     ))
                     .shadow(egui::epaint::Shadow {
-                        extrusion: 8.0,
+                        offset: egui::vec2(0.0, 2.0),
+                        blur: 8.0,
+                        spread: 0.0,
                         color: egui::Color32::from_black_alpha(35),
                     })
                     .inner_margin(egui::Margin::symmetric(8.0, 5.0))

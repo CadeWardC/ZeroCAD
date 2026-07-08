@@ -93,6 +93,25 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Mirror Tool (single mode, no flyout). Click two points
+                        // to reflect the whole sketch across that axis.
+                        {
+                            let is_active = self.active_tool == Some(SketchTool::Mirror);
+                            let btn = draw_tool_btn(ui, is_active, "Mirror", Some(icons::Icon::Mirror));
+                            if btn
+                                .on_hover_text(
+                                    "Mirror the whole sketch — click two points to set the reflection axis",
+                                )
+                                .clicked()
+                            {
+                                self.active_tool = Some(SketchTool::Mirror);
+                                self.cancel_in_progress_shape();
+                                self.line_chain_start = None;
+                                self.clear_pending_corners();
+                                log::info!("Switched to Mirror tool");
+                            }
+                        }
+
                         // Rectangle, Circle and the corner tool each expose a mode
                         // flyout: click the active button again (or right-click it)
                         // to choose corner/center/3-point, ellipse, or Fillet ↔
@@ -108,6 +127,11 @@ impl ZeroCadApp {
                                 ToolFamily::Circle,
                                 "Circle",
                                 "Circle (C) — click again or right-click for ellipse / 3-point modes",
+                            ),
+                            (
+                                ToolFamily::Polygon,
+                                "Polygon",
+                                "Regular polygon — set the side count, then click center and rim. Click again or right-click for inscribed / circumscribed",
                             ),
                             (
                                 ToolFamily::Corner,
@@ -151,7 +175,12 @@ impl ZeroCadApp {
                                 ui.memory_mut(|m| m.open_popup(popup_id));
                             }
 
-                            egui::popup_below_widget(ui, popup_id, &btn, |ui| {
+                            egui::popup_below_widget(
+                                ui,
+                                popup_id,
+                                &btn,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
                                 ui.set_min_width(180.0);
                                 for &mode in family.modes() {
                                     let selected = self.active_tool == Some(mode);
@@ -170,6 +199,24 @@ impl ZeroCadApp {
                                     }
                                 }
                             });
+                        }
+
+                        // Side-count input for the active polygon tool. Clamped
+                        // to 3..=64; the live preview reads it directly.
+                        if self
+                            .active_tool
+                            .map_or(false, |t| t.family() == ToolFamily::Polygon)
+                        {
+                            ui.label(
+                                egui::RichText::new("Sides:")
+                                    .size(12.0)
+                                    .color(self.pal().text_body),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.polygon_sides)
+                                    .range(3..=64)
+                                    .speed(0.1),
+                            );
                         }
 
                         // Radius/distance input for the active corner tool, with

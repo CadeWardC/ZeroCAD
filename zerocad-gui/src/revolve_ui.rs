@@ -115,7 +115,7 @@ impl ZeroCadApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("Axis");
-                        egui::ComboBox::from_id_source("revolve_axis")
+                        egui::ComboBox::from_id_salt("revolve_axis")
                             .selected_text(op_new.axis.label())
                             .show_ui(ui, |ui| {
                                 for choice in [
@@ -127,8 +127,7 @@ impl ZeroCadApp {
                                     ui.selectable_value(&mut op_new.axis, choice, label);
                                 }
                                 for (id, name) in &datum_axes {
-                                    let choice =
-                                        RevolveAxisChoice::Datum(id.clone(), name.clone());
+                                    let choice = RevolveAxisChoice::Datum(id.clone(), name.clone());
                                     let label = choice.label();
                                     ui.selectable_value(&mut op_new.axis, choice, label);
                                 }
@@ -137,8 +136,7 @@ impl ZeroCadApp {
                     ui.horizontal(|ui| {
                         ui.label("Angle");
                         ui.add(
-                            egui::TextEdit::singleline(&mut op_new.angle_text)
-                                .desired_width(60.0),
+                            egui::TextEdit::singleline(&mut op_new.angle_text).desired_width(60.0),
                         );
                         ui.label("°");
                     });

@@ -98,6 +98,18 @@ impl SketchCurves {
         self.segments.is_empty() && self.circles.is_empty() && self.arcs.is_empty()
     }
 
+    /// Append every curve of `other` after this set's own curves. Used to fold
+    /// a sketch's projected **face boundary** (reference geometry from the body
+    /// face the sketch sits on) into region detection: the merge order —
+    /// drawn curves first, boundary last — must be identical everywhere
+    /// ([`detect_regions`] output order depends on input order, and extrude
+    /// features store region *indices*).
+    pub fn extend_curves(&mut self, other: &SketchCurves) {
+        self.segments.extend(other.segments.iter().copied());
+        self.circles.extend(other.circles.iter().copied());
+        self.arcs.extend(other.arcs.iter().copied());
+    }
+
     /// Append a rectangle as four segments around the two opposite corners.
     pub fn add_rectangle(&mut self, p0: (f32, f32), p2: (f32, f32)) {
         let p1 = (p2.0, p0.1);
@@ -382,6 +394,7 @@ pub fn build_sketch_curves(shapes: &[SketchShape], vars: &HashMap<String, f64>) 
         let c = s.build(vars);
         out.segments.extend(c.segments);
         out.circles.extend(c.circles);
+        out.arcs.extend(c.arcs);
     }
     out
 }

@@ -47,6 +47,9 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
         | SketchTool::ThreePointCircle
         | SketchTool::Ellipse
         | SketchTool::ThreePointEllipse
+        | SketchTool::PolygonInscribed
+        | SketchTool::PolygonCircumscribed
+        | SketchTool::Mirror
         | SketchTool::Fillet
         | SketchTool::Chamfer => &[],
     };

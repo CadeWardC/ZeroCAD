@@ -37,6 +37,13 @@ impl ZeroCadApp {
                 let pal = self.pal();
                 let current_unit = self.current_unit;
                 let var_map = self.graph.variable_map();
+                // Sketch-on-face reference outline, captured before the
+                // mutable node borrow below (used by the Sketch panel).
+                let face_boundary = self
+                    .graph
+                    .sketch_face_boundaries
+                    .get(&self.graph.graph[idx].id)
+                    .cloned();
                 let node = &mut self.graph.graph[idx];
 
                 // Render inside a highly visual white inspector card
@@ -141,73 +148,60 @@ impl ZeroCadApp {
                                         .color(pal.text_muted),
                                     );
                                 }
-                                FeatureType::DatumPlane { def } => {
-                                    match def {
-                                        DatumPlaneDef::Offset { distance, .. } => {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Offset").size(12.0),
-                                                );
-                                                if ui
-                                                    .add(
-                                                        egui::DragValue::new(distance)
-                                                            .speed(0.5)
-                                                            .suffix(current_unit.suffix()),
-                                                    )
-                                                    .changed()
-                                                {
-                                                    modified = true;
-                                                }
-                                            });
-                                        }
-                                        DatumPlaneDef::Angle { angle_deg, .. } => {
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Angle").size(12.0));
-                                                if ui
-                                                    .add(
-                                                        egui::DragValue::new(angle_deg)
-                                                            .speed(1.0)
-                                                            .suffix("°"),
-                                                    )
-                                                    .changed()
-                                                {
-                                                    modified = true;
-                                                }
-                                            });
-                                        }
-                                        DatumPlaneDef::ThreePoints { a, b, c } => {
-                                            for (label, p) in
-                                                [("A", a), ("B", b), ("C", c)]
-                                            {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(label).size(12.0),
-                                                    );
-                                                    for coord in p.iter_mut() {
-                                                        if ui
-                                                            .add(
-                                                                egui::DragValue::new(coord)
-                                                                    .speed(0.5),
-                                                            )
-                                                            .changed()
-                                                        {
-                                                            modified = true;
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        }
-                                        DatumPlaneDef::MidPlane { .. } => {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "Mid-plane between two planes.",
+                                FeatureType::DatumPlane { def } => match def {
+                                    DatumPlaneDef::Offset { distance, .. } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Offset").size(12.0));
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(distance)
+                                                        .speed(0.5)
+                                                        .suffix(current_unit.suffix()),
                                                 )
-                                                .size(11.5)
-                                                .color(pal.text_muted),
-                                            );
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
+                                    DatumPlaneDef::Angle { angle_deg, .. } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Angle").size(12.0));
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(angle_deg)
+                                                        .speed(1.0)
+                                                        .suffix("°"),
+                                                )
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
+                                    DatumPlaneDef::ThreePoints { a, b, c } => {
+                                        for (label, p) in [("A", a), ("B", b), ("C", c)] {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(label).size(12.0));
+                                                for coord in p.iter_mut() {
+                                                    if ui
+                                                        .add(egui::DragValue::new(coord).speed(0.5))
+                                                        .changed()
+                                                    {
+                                                        modified = true;
+                                                    }
+                                                }
+                                            });
                                         }
                                     }
-                                }
+                                    DatumPlaneDef::MidPlane { .. } => {
+                                        ui.label(
+                                            egui::RichText::new("Mid-plane between two planes.")
+                                                .size(11.5)
+                                                .color(pal.text_muted),
+                                        );
+                                    }
+                                },
                                 FeatureType::DatumAxis { def } => match def {
                                     DatumAxisDef::TwoPoints { a, b } => {
                                         for (label, p) in [("From", a), ("To", b)] {
@@ -215,9 +209,7 @@ impl ZeroCadApp {
                                                 ui.label(egui::RichText::new(label).size(12.0));
                                                 for coord in p.iter_mut() {
                                                     if ui
-                                                        .add(
-                                                            egui::DragValue::new(coord).speed(0.5),
-                                                        )
+                                                        .add(egui::DragValue::new(coord).speed(0.5))
                                                         .changed()
                                                     {
                                                         modified = true;
@@ -228,11 +220,9 @@ impl ZeroCadApp {
                                     }
                                     DatumAxisDef::PlaneIntersection { .. } => {
                                         ui.label(
-                                            egui::RichText::new(
-                                                "Intersection line of two planes.",
-                                            )
-                                            .size(11.5)
-                                            .color(pal.text_muted),
+                                            egui::RichText::new("Intersection line of two planes.")
+                                                .size(11.5)
+                                                .color(pal.text_muted),
                                         );
                                     }
                                 },
@@ -266,7 +256,7 @@ impl ZeroCadApp {
                                             .add(
                                                 egui::DragValue::new(angle_deg)
                                                     .speed(1.0)
-                                                    .clamp_range(0.1..=360.0)
+                                                    .range(0.1..=360.0)
                                                     .suffix("°"),
                                             )
                                             .changed()
@@ -305,7 +295,7 @@ impl ZeroCadApp {
                                             .add(
                                                 egui::DragValue::new(thickness)
                                                     .speed(0.1)
-                                                    .clamp_range(0.1..=100.0)
+                                                    .range(0.1..=100.0)
                                                     .suffix(current_unit.suffix()),
                                             )
                                             .changed()
@@ -326,7 +316,7 @@ impl ZeroCadApp {
                                             .add(
                                                 egui::DragValue::new(diameter)
                                                     .speed(0.2)
-                                                    .clamp_range(0.1..=500.0)
+                                                    .range(0.1..=500.0)
                                                     .suffix(current_unit.suffix()),
                                             )
                                             .changed()
@@ -341,7 +331,7 @@ impl ZeroCadApp {
                                                 .add(
                                                     egui::DragValue::new(d)
                                                         .speed(0.2)
-                                                        .clamp_range(0.1..=1000.0)
+                                                        .range(0.1..=1000.0)
                                                         .suffix(current_unit.suffix()),
                                                 )
                                                 .changed()
@@ -371,12 +361,12 @@ impl ZeroCadApp {
                                     ui.add_space(4.0);
                                     match kind {
                                         zerocad_core::PatternKind::Linear {
-                                            spacing, count, ..
+                                            spacing,
+                                            count,
+                                            ..
                                         } => {
                                             ui.horizontal(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Spacing").size(12.0),
-                                                );
+                                                ui.label(egui::RichText::new("Spacing").size(12.0));
                                                 if ui
                                                     .add(
                                                         egui::DragValue::new(spacing)
@@ -394,7 +384,7 @@ impl ZeroCadApp {
                                                     .add(
                                                         egui::DragValue::new(count)
                                                             .speed(0.1)
-                                                            .clamp_range(2..=200),
+                                                            .range(2..=200),
                                                     )
                                                     .changed()
                                                 {
@@ -413,7 +403,7 @@ impl ZeroCadApp {
                                                     .add(
                                                         egui::DragValue::new(count)
                                                             .speed(0.1)
-                                                            .clamp_range(2..=200),
+                                                            .range(2..=200),
                                                     )
                                                     .changed()
                                                 {
@@ -428,7 +418,7 @@ impl ZeroCadApp {
                                                     .add(
                                                         egui::DragValue::new(total_angle_deg)
                                                             .speed(1.0)
-                                                            .clamp_range(1.0..=360.0)
+                                                            .range(1.0..=360.0)
                                                             .suffix("°"),
                                                     )
                                                     .changed()
@@ -498,13 +488,19 @@ impl ZeroCadApp {
                                     ui.add_space(4.0);
                                     // Resolve against the current variables so the counts
                                     // (and any extrude below) reflect variable-driven dims.
-                                    let eff = zerocad_core::effective_curves_solved(
+                                    let mut eff = zerocad_core::effective_curves_solved(
                                         curves,
                                         shapes,
                                         corner_mods,
                                         solver.as_ref(),
                                         &var_map,
                                     );
+                                    // Sketch-on-face: the projected boundary joins
+                                    // region detection, so the face count here
+                                    // matches the viewport and the evaluator.
+                                    if let Some(b) = face_boundary.as_ref() {
+                                        eff.extend_curves(b);
+                                    }
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "Curves: {} segments, {} circles",
@@ -569,9 +565,7 @@ impl ZeroCadApp {
                                     }
                                     ui.add_space(4.0);
                                     if ui
-                                        .button(
-                                            egui::RichText::new("✏ Edit Sketch").size(12.0),
-                                        )
+                                        .button(egui::RichText::new("✏ Edit Sketch").size(12.0))
                                         .on_hover_text(
                                             "Re-open this sketch: drag points, geometry \
                                              re-solves against its constraints; Finish \
@@ -583,8 +577,7 @@ impl ZeroCadApp {
                                     }
                                     // Constraint status: DOF / fully constrained /
                                     // conflict, from the solver model when present.
-                                    if let Some(model) = solver.as_ref().filter(|m| !m.is_empty())
-                                    {
+                                    if let Some(model) = solver.as_ref().filter(|m| !m.is_empty()) {
                                         let report =
                                             zerocad_core::sketch::solve_model(model, &var_map);
                                         let (text, color) = match report.outcome {
@@ -610,19 +603,14 @@ impl ZeroCadApp {
                                                     )
                                                 } else {
                                                     (
-                                                        format!(
-                                                            "◐ {} DOF remaining",
-                                                            report.dof
-                                                        ),
+                                                        format!("◐ {} DOF remaining", report.dof),
                                                         egui::Color32::from_rgb(37, 99, 235),
                                                     )
                                                 }
                                             }
                                         };
                                         ui.add_space(2.0);
-                                        ui.label(
-                                            egui::RichText::new(text).size(11.0).color(color),
-                                        );
+                                        ui.label(egui::RichText::new(text).size(11.0).color(color));
                                     }
                                 }
                                 FeatureType::Extrude {
@@ -856,7 +844,7 @@ impl ZeroCadApp {
                                                             .min_decimals(0)
                                                             .max_decimals(3),
                                                     );
-                                                    egui::ComboBox::from_id_source(("var_unit", i))
+                                                    egui::ComboBox::from_id_salt(("var_unit", i))
                                                         .selected_text(var.unit.suffix())
                                                         .width(50.0)
                                                         .show_ui(ui, |ui| {
@@ -997,7 +985,7 @@ impl ZeroCadApp {
                                 ui.add(
                                     egui::DragValue::new(&mut self.measure_density)
                                         .speed(0.05)
-                                        .clamp_range(0.0..=30.0),
+                                        .range(0.0..=30.0),
                                 );
                             });
                             // mm³ → cm³ is ÷1000; g/cm³ × cm³ = grams.

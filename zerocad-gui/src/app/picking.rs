@@ -388,6 +388,15 @@ impl ZeroCadApp {
     /// nearer the camera. The `sin/cos` are the camera angles, used to cull
     /// back-facing triangles so only visible faces are pickable. Returns the
     /// body node id and which element was hit.
+    ///
+    /// `gpu_face` is the GPU pick buffer's answer for this pixel (see
+    /// [`ZeroCadApp::gpu_pick_face`]): when it's authoritative
+    /// ([`GpuFacePick::Hit`]) the CPU face triangle scan is skipped entirely —
+    /// the id buffer is exact to the rendered silhouette and O(1). Vertex and
+    /// edge picks keep their CPU proximity search (they select within a pixel
+    /// *tolerance*, which a coverage buffer can't express) and still take
+    /// priority over the face.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pick_body_element(
         &self,
         click: egui::Pos2,
@@ -396,6 +405,7 @@ impl ZeroCadApp {
         cos_p: f32,
         sin_y: f32,
         cos_y: f32,
+        gpu_face: gpu_viewport::GpuFacePick,
     ) -> Option<(String, BodyPick)> {
         const VERT_TOL_PX: f32 = 7.0;
         const EDGE_TOL_PX: f32 = 6.0;
@@ -403,6 +413,13 @@ impl ZeroCadApp {
         let mut best_vertex: Option<(String, u32, f32)> = None; // (node, vert, px)
         let mut best_edge: Option<(String, u32, f32)> = None; // (node, edge GROUP, px)
         let mut best_face: Option<(String, u32, f32)> = None; // (node, face, depth)
+        let scan_faces = match gpu_face {
+            gpu_viewport::GpuFacePick::Hit(hit) => {
+                best_face = hit.map(|(node, fid)| (node, fid, 0.0));
+                false
+            }
+            gpu_viewport::GpuFacePick::Unavailable => true,
+        };
 
         let faces_camera = |n: (f32, f32, f32)| -> bool {
             let rz_n = sin_y * n.0 + cos_y * n.2;
@@ -507,7 +524,8 @@ impl ZeroCadApp {
             }
 
             // Faces (front-facing triangles under the cursor; nearest wins).
-            let tcount = mesh.indices.len() / 3;
+            // Skipped when the GPU pick buffer already answered for this pixel.
+            let tcount = if scan_faces { mesh.indices.len() / 3 } else { 0 };
             for t in 0..tcount {
                 let i0 = mesh.indices[t * 3] as usize * 6;
                 let i1 = mesh.indices[t * 3 + 1] as usize * 6;
@@ -701,6 +719,25 @@ impl ZeroCadApp {
         let u = u.normalize();
         let v = n.cross(u).normalize();
         Some(CoordinateSystem::new(origin, u, v))
+    }
+
+    /// The boundary loops of body face `(node_id, fid)` — its outer wire plus
+    /// any hole rims — projected into `cs`'s 2D plane as line segments, ready
+    /// to join a sketch's region detection as reference geometry. Thin wrapper
+    /// over the shared kernel extraction (`mesh_face_boundary_2d`) — the SAME
+    /// code the evaluator uses to re-derive the outline when the body changes,
+    /// so a just-captured boundary and an eval-refreshed one are bit-identical
+    /// for an unchanged face. Empty when the face/body is missing.
+    pub(crate) fn face_boundary_curves(
+        &self,
+        node_id: &str,
+        fid: u32,
+        cs: &CoordinateSystem,
+    ) -> SketchCurves {
+        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+            return SketchCurves::new();
+        };
+        zerocad_core::mock_kernel::mesh_face_boundary_2d(mesh, fid, cs)
     }
 
     /// The durable [`FaceRef`] for a picked body face, so a sketch placed on it can

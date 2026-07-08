@@ -15,6 +15,11 @@ use crate::{BodyPick, PendingVisualMode, SnapKind, ZeroCadApp};
 const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
 const SELECTED_BODY_BASE: (f32, f32, f32) = (50.0, 165.0, 245.0);
 
+/// Weak-perspective camera distance used by every `project_3d` implementation
+/// (this file, the viewport pickers, and the GPU `build_view_proj`). One
+/// constant, so the CPU and GPU projections can never drift apart.
+pub(crate) const PERSP_DIST: f32 = 1200.0;
+
 // Unified render list structures for depth-sorted transparent overlays
 #[derive(Debug, Clone)]
 struct RenderItem {
@@ -206,7 +211,135 @@ fn rasterize_depth(
     }
 }
 
+/// What this frame's live-operation preview looks like, resolved once per frame
+/// and shared by BOTH renderers: the CPU painter consumes it as `Drawable`s and
+/// the GPU viewport as translucent/opaque scene layers — so the two paths can
+/// never disagree about what a preview shows.
+pub(crate) struct PreviewPlan {
+    /// The extrude mode being previewed, if any.
+    pub preview_mode: Option<ExtrudeMode>,
+    /// Full replacement body set (the evaluated Join/Cut/edge-mod result);
+    /// when `Some`, the committed bodies are NOT drawn.
+    pub preview_bodies: Option<Vec<(String, MockMesh)>>,
+    /// The extrude tool volume (red cut volume / warm additive ghost).
+    pub extrude_preview_mesh: Option<MockMesh>,
+    /// The lightweight edge-mod overlay ribbon (until exact bodies arrive).
+    pub edge_mod_preview_mesh: Option<MockMesh>,
+    /// Alpha for `preview_bodies` (Cut ghosts the result at 120).
+    pub body_alpha: u8,
+}
+
 impl ZeroCadApp {
+    /// Resolve this frame's operation preview (see [`PreviewPlan`]). Memoized
+    /// caches back every branch, so calling it once per renderer path is cheap.
+    pub(crate) fn resolve_preview(&mut self) -> PreviewPlan {
+        // Meshes to draw: New Body previews keep the warm additive tool volume;
+        // Join/Cut previews evaluate a temporary feature so the user sees the
+        // actual merged/cut result before committing.
+        // A live 3D edge fillet/chamfer previews the resulting (cut) body, the
+        // same way a Cut/Join extrude does — and suppresses the extrude preview.
+        let mut edge_mod_active = self.edge_mod_op.is_some();
+        let mut preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
+
+        // If there is no active operation but we have a pending visual, we can use the mode from the pending visual!
+        if !edge_mod_active && preview_mode.is_none() {
+            if let Some(pending) = &self.pending_visual {
+                match pending.mode {
+                    PendingVisualMode::Extrude(mode) => {
+                        preview_mode = Some(mode);
+                    }
+                    PendingVisualMode::EdgeMod(_) => {
+                        edge_mod_active = true;
+                    }
+                }
+            }
+        }
+
+        // A New Body extrude of overlapping shapes is a boolean (box-minus-cylinder
+        // etc.): the warm ghost would draw the un-booleaned split regions, so
+        // (once the drag settles) suppress it and show the real evaluated body.
+        let newbody_overlap = !edge_mod_active
+            && !self.extrude_depth_dragging
+            && preview_mode == Some(ExtrudeMode::NewBody)
+            && self.op_has_overlapping_shapes();
+        let extrude_preview_mesh = if edge_mod_active
+            || (newbody_overlap && self.cached_preview_extrude_bodies().is_some())
+        {
+            None
+        } else {
+            // Memoized: only re-tessellated when the depth/targets change.
+            self.cached_preview_mesh().or_else(|| {
+                if let Some(pending) = &self.pending_visual {
+                    if matches!(pending.mode, PendingVisualMode::Extrude(_)) {
+                        return pending.mesh.clone();
+                    }
+                }
+                None
+            })
+        };
+        let mut preview_bodies = if edge_mod_active {
+            // Exact edge-mod bodies arrive from the worker cache. Until then the
+            // lightweight overlay mesh below gives immediate visual feedback.
+            self.cached_preview_edge_mod_bodies()
+        } else if self.extrude_depth_dragging {
+            // Live ghost drag: skip the (expensive) truck boolean entirely. We
+            // render the un-booleaned model plus the cheap ghost tool volume
+            // (added below) so the preview tracks the cursor at full frame rate.
+            // The real merged/cut result is computed once on release.
+            None
+        } else {
+            match preview_mode {
+                // Memoized: the full-model re-evaluation (truck booleans) only
+                // reruns when the depth/mode/targets change, not every frame.
+                Some(ExtrudeMode::Join | ExtrudeMode::Cut) => self.cached_preview_extrude_bodies(),
+                // A boolean New Body (overlapping shapes) likewise previews its
+                // real evaluated result instead of the ghost.
+                Some(ExtrudeMode::NewBody) if newbody_overlap => {
+                    self.cached_preview_extrude_bodies()
+                }
+                _ => None,
+            }
+        };
+
+        // Fall back to pending_visual bodies if no active preview bodies are resolved:
+        if preview_bodies.is_none() {
+            if let Some(pending) = &self.pending_visual {
+                preview_bodies = Some(pending.bodies.clone());
+            }
+        }
+
+        let edge_mod_preview_mesh =
+            if edge_mod_active && self.cached_preview_edge_mod_bodies().is_none() {
+                self.cached_preview_edge_mod_mesh().or_else(|| {
+                    if let Some(pending) = &self.pending_visual {
+                        if matches!(pending.mode, PendingVisualMode::EdgeMod(_)) {
+                            return pending.mesh.clone();
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+
+        // A Cut preview ghosts the resulting body (alpha < 255) so the pocket /
+        // hole being formed shows through, like Fusion's cut preview. Everything
+        // else stays opaque.
+        let body_alpha: u8 = if preview_mode == Some(ExtrudeMode::Cut) {
+            120
+        } else {
+            255
+        };
+
+        PreviewPlan {
+            preview_mode,
+            preview_bodies,
+            extrude_preview_mesh,
+            edge_mod_preview_mesh,
+            body_alpha,
+        }
+    }
+
     /// A high-performance, robust, and clean CPU-projected vector viewport drawing engine
     /// utilizing egui's native vector Painter.
     pub(crate) fn draw_viewport(
@@ -227,6 +360,12 @@ impl ZeroCadApp {
         // big model smooth. When motion stops, the next repaint draws full detail.
         let interacting = self.orbiting || self.camera_anim_active;
 
+        // When the GPU viewport produced a scene texture this frame, it owns the
+        // shaded solids + wireframe; the CPU pipeline below then skips drawing the
+        // committed bodies and only paints the 2D overlays (planes, sketches,
+        // dimensions, gizmos) on top.
+        let gpu_active = self.gpu_texture_id.is_some();
+
         // Compute Orthographic or Perspective Projection matrices
         let cos_p = self.camera_pitch.cos();
         let sin_p = self.camera_pitch.sin();
@@ -244,7 +383,7 @@ impl ZeroCadApp {
             let final_z = sin_p * y + cos_p * rz; // depth for z-sorting
 
             if is_perspective {
-                let dist = 1200.0;
+                let dist = PERSP_DIST;
                 let factor = dist / (dist - final_z.min(dist * 0.85));
                 (
                     center_x + rx * view_scale * factor,
@@ -380,10 +519,22 @@ impl ZeroCadApp {
                 "", // Clean: no text label printed inside the viewport
             ),
             (
-                xz_pts, xz_world, xz_depth, SketchPlane::XZ, fill_xz, stroke_xz, "",
+                xz_pts,
+                xz_world,
+                xz_depth,
+                SketchPlane::XZ,
+                fill_xz,
+                stroke_xz,
+                "",
             ),
             (
-                yz_pts, yz_world, yz_depth, SketchPlane::YZ, fill_yz, stroke_yz, "",
+                yz_pts,
+                yz_world,
+                yz_depth,
+                SketchPlane::YZ,
+                fill_yz,
+                stroke_yz,
+                "",
             ),
         ];
 
@@ -500,9 +651,8 @@ impl ZeroCadApp {
                         }
                         let t0 = s as f32 / DASHES as f32;
                         let t1 = (s + 1) as f32 / DASHES as f32;
-                        let lerp = |t: f32| {
-                            egui::pos2(pa.0 + (pb.0 - pa.0) * t, pa.1 + (pb.1 - pa.1) * t)
-                        };
+                        let lerp =
+                            |t: f32| egui::pos2(pa.0 + (pb.0 - pa.0) * t, pa.1 + (pb.1 - pa.1) * t);
                         painter.line_segment([lerp(t0), lerp(t1)], egui::Stroke::new(1.6, violet));
                     }
                     painter.text(
@@ -619,106 +769,35 @@ impl ZeroCadApp {
             }
         }
 
+        // Composite the GPU-rendered 3D scene here — after the floor/plane grids,
+        // axes, and datum marks (which sit BEHIND solids, exactly as when the CPU
+        // paints the bodies at this point), and before the overlays that sit on
+        // top. The texture's background is transparent, so everything painted
+        // above shows through where there is no geometry — bodies read as solid,
+        // never see-through.
+        if let Some(tex) = self.gpu_texture_id {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(tex, rect, uv, egui::Color32::WHITE);
+        }
+
         // --- 4. DEPTH-SORTED RENDER LIST PIPELINE ---
         let mut render_items = Vec::new();
 
-        // Meshes to draw: New Body previews keep the warm additive tool volume;
-        // Join/Cut previews evaluate a temporary feature so the user sees the
-        // actual merged/cut result before committing.
-        // A live 3D edge fillet/chamfer previews the resulting (cut) body, the
-        // same way a Cut/Join extrude does — and suppresses the extrude preview.
-        let mut edge_mod_active = self.edge_mod_op.is_some();
-        let mut preview_mode = self.extrude_op.as_ref().map(|op| op.mode);
-
-        // If there is no active operation but we have a pending visual, we can use the mode from the pending visual!
-        if !edge_mod_active && preview_mode.is_none() {
-            if let Some(pending) = &self.pending_visual {
-                match pending.mode {
-                    PendingVisualMode::Extrude(mode) => {
-                        preview_mode = Some(mode);
-                    }
-                    PendingVisualMode::EdgeMod(_) => {
-                        edge_mod_active = true;
-                    }
-                }
-            }
-        }
-
-        // A New Body extrude of overlapping shapes is a boolean (box-minus-cylinder
-        // etc.): the warm ghost would draw the un-booleaned split regions, so
-        // (once the drag settles) suppress it and show the real evaluated body.
-        let newbody_overlap = !edge_mod_active
-            && !self.extrude_depth_dragging
-            && preview_mode == Some(ExtrudeMode::NewBody)
-            && self.op_has_overlapping_shapes();
-        let extrude_preview_mesh = if edge_mod_active
-            || (newbody_overlap && self.cached_preview_extrude_bodies().is_some())
-        {
-            None
-        } else {
-            // Memoized: only re-tessellated when the depth/targets change.
-            self.cached_preview_mesh().or_else(|| {
-                if let Some(pending) = &self.pending_visual {
-                    if matches!(pending.mode, PendingVisualMode::Extrude(_)) {
-                        return pending.mesh.clone();
-                    }
-                }
-                None
-            })
-        };
-        let mut preview_bodies = if edge_mod_active {
-            // Exact edge-mod bodies arrive from the worker cache. Until then the
-            // lightweight overlay mesh below gives immediate visual feedback.
-            self.cached_preview_edge_mod_bodies()
-        } else if self.extrude_depth_dragging {
-            // Live ghost drag: skip the (expensive) truck boolean entirely. We
-            // render the un-booleaned model plus the cheap ghost tool volume
-            // (added below) so the preview tracks the cursor at full frame rate.
-            // The real merged/cut result is computed once on release.
-            None
-        } else {
-            match preview_mode {
-                // Memoized: the full-model re-evaluation (truck booleans) only
-                // reruns when the depth/mode/targets change, not every frame.
-                Some(ExtrudeMode::Join | ExtrudeMode::Cut) => self.cached_preview_extrude_bodies(),
-                // A boolean New Body (overlapping shapes) likewise previews its
-                // real evaluated result instead of the ghost.
-                Some(ExtrudeMode::NewBody) if newbody_overlap => {
-                    self.cached_preview_extrude_bodies()
-                }
-                _ => None,
-            }
-        };
-
-        // Fall back to pending_visual bodies if no active preview bodies are resolved:
-        if preview_bodies.is_none() {
-            if let Some(pending) = &self.pending_visual {
-                preview_bodies = Some(pending.bodies.clone());
-            }
-        }
-
-        let edge_mod_preview_mesh =
-            if edge_mod_active && self.cached_preview_edge_mod_bodies().is_none() {
-                self.cached_preview_edge_mod_mesh().or_else(|| {
-                    if let Some(pending) = &self.pending_visual {
-                        if matches!(pending.mode, PendingVisualMode::EdgeMod(_)) {
-                            return pending.mesh.clone();
-                        }
-                    }
-                    None
-                })
-            } else {
-                None
-            };
-
-        // A Cut preview ghosts the resulting body (alpha < 255) so the pocket /
-        // hole being formed shows through, like Fusion's cut preview. Everything
-        // else stays opaque.
-        let body_alpha: u8 = if preview_mode == Some(ExtrudeMode::Cut) {
-            120
-        } else {
-            255
-        };
+        // This frame's operation preview, resolved by the shared planner (the
+        // GPU path feeds the same plan into its scene layers, so both renderers
+        // always agree on what a preview shows). When the GPU path ran this
+        // frame it already resolved the plan — reuse it instead of re-cloning
+        // the preview body set a second time.
+        let PreviewPlan {
+            preview_mode,
+            preview_bodies,
+            extrude_preview_mesh,
+            edge_mod_preview_mesh,
+            body_alpha,
+        } = self
+            .frame_preview_plan
+            .take()
+            .unwrap_or_else(|| self.resolve_preview());
         // Each drawable records HOW to render it. Translucent body ghosts keep
         // their back faces (so the far walls of a pocket show through) and draw
         // their wireframe. The red cut-tool VOLUME is different: it culls its
@@ -734,7 +813,11 @@ impl ZeroCadApp {
             cull_back: bool,
             draw_edges: bool,
         }
-        let mut meshes: Vec<Drawable> = if let Some(bodies) = preview_bodies.as_ref() {
+        let mut meshes: Vec<Drawable> = if gpu_active {
+            // The GPU composited this frame's full scene — committed bodies AND
+            // live preview layers — so the CPU paints no solids at all.
+            Vec::new()
+        } else if let Some(bodies) = preview_bodies.as_ref() {
             bodies
                 .iter()
                 .map(|(id, m)| Drawable {
@@ -760,7 +843,11 @@ impl ZeroCadApp {
                 })
                 .collect()
         };
+        // The preview tool volumes / overlay ribbon join the CPU draw list only
+        // when the CPU is painting solids; with the GPU active they are drawn
+        // as GPU scene layers instead (see `render_gpu_scene`).
         match preview_mode {
+            _ if gpu_active => {}
             // Cut: lay the FULL cut volume over the ghosted result in translucent
             // red, so the user sees exactly how far the cut reaches — including
             // where it punches out the far side of a body. Back faces culled +
@@ -811,14 +898,16 @@ impl ZeroCadApp {
             }
         }
         if let Some(pm) = edge_mod_preview_mesh.as_ref() {
-            meshes.push(Drawable {
-                node_id: None,
-                mesh: pm,
-                base: (255.0, 178.0, 96.0),
-                alpha: 235,
-                cull_back: false,
-                draw_edges: true,
-            });
+            if !gpu_active {
+                meshes.push(Drawable {
+                    node_id: None,
+                    mesh: pm,
+                    base: (255.0, 178.0, 96.0),
+                    alpha: 235,
+                    cull_back: false,
+                    draw_edges: true,
+                });
+            }
         }
 
         // Screen anchor for the inline extrude distance box: the projected
@@ -905,6 +994,81 @@ impl ZeroCadApp {
         if self.is_plane_selection_mode {
             if let Some((node, fid)) = self.hovered_sketch_face.as_ref() {
                 selected_faces.insert((node.as_str(), *fid));
+            }
+        }
+
+        // A0. GPU-composited mode: the solids are painted by the GPU texture
+        // (`meshes` is empty), but the plane sheets/grids and any remaining CPU
+        // strokes still consult this occlusion buffer to hide whatever dips
+        // behind a solid. Rasterize the front-facing depth of exactly what the
+        // GPU drew opaquely — the preview result set when one replaces the
+        // committed model (a translucent Cut ghost doesn't occlude, matching
+        // the CPU path), else the committed bodies — with the identical
+        // projection, so overlays keep the same hidden-surface behavior in
+        // both render modes.
+        if gpu_active {
+            let occluders: Option<&[(String, MockMesh)]> =
+                if let Some(bodies) = preview_bodies.as_ref() {
+                    (body_alpha == 255).then_some(bodies.as_slice())
+                } else {
+                    Some(self.body_meshes.as_slice())
+                };
+            let mut occluder_meshes: Vec<&MockMesh> =
+                occluders.into_iter().flatten().map(|(_, m)| m).collect();
+            // The warm extrude tool ghost is drawn OPAQUE (depth-written) by the
+            // GPU — New Body always, Join while push/pull dragging — so it must
+            // occlude overlays exactly like a committed body. The translucent
+            // red Cut volume and the settled-Join case (no ghost layer) don't.
+            let warm_ghost_opaque = match preview_mode {
+                Some(ExtrudeMode::Cut) => false,
+                Some(ExtrudeMode::Join) => self.extrude_depth_dragging,
+                Some(ExtrudeMode::NewBody) | None => true,
+            };
+            if warm_ghost_opaque {
+                if let Some(m) = extrude_preview_mesh.as_ref() {
+                    occluder_meshes.push(m);
+                }
+            }
+            for mesh in occluder_meshes {
+                let num_tris = mesh.indices.len() / 3;
+                for i in 0..num_tris {
+                    let i0 = mesh.indices[i * 3] as usize * 6;
+                    let i1 = mesh.indices[i * 3 + 1] as usize * 6;
+                    let i2 = mesh.indices[i * 3 + 2] as usize * 6;
+                    // Average vertex normal decides front/back, as in section A.
+                    let navg = (
+                        (mesh.vertices[i0 + 3] + mesh.vertices[i1 + 3] + mesh.vertices[i2 + 3])
+                            / 3.0,
+                        (mesh.vertices[i0 + 4] + mesh.vertices[i1 + 4] + mesh.vertices[i2 + 4])
+                            / 3.0,
+                        (mesh.vertices[i0 + 5] + mesh.vertices[i1 + 5] + mesh.vertices[i2 + 5])
+                            / 3.0,
+                    );
+                    let rz_n = sin_y * navg.0 + cos_y * navg.2;
+                    if sin_p * navg.1 + cos_p * rz_n <= 0.0 {
+                        continue;
+                    }
+                    let p0 = project_3d(
+                        mesh.vertices[i0],
+                        mesh.vertices[i0 + 1],
+                        mesh.vertices[i0 + 2],
+                    );
+                    let p1 = project_3d(
+                        mesh.vertices[i1],
+                        mesh.vertices[i1 + 1],
+                        mesh.vertices[i1 + 2],
+                    );
+                    let p2 = project_3d(
+                        mesh.vertices[i2],
+                        mesh.vertices[i2 + 1],
+                        mesh.vertices[i2 + 2],
+                    );
+                    for p in [p0, p1, p2] {
+                        depth_min = depth_min.min(p.2);
+                        depth_max = depth_max.max(p.2);
+                    }
+                    rasterize_depth(&mut zbuf, occ_w, occ_h, occ_cell, rect.min, p0, p1, p2);
+                }
             }
         }
 
@@ -1439,14 +1603,19 @@ impl ZeroCadApp {
                     egui::pos2(proj.0, proj.1)
                 };
 
-                // Draw the variable-resolved geometry of the sketch.
-                let eff = zerocad_core::effective_curves_solved(
+                // Draw the variable-resolved geometry of the sketch, with the
+                // projected face boundary folded in (sketch-on-face) so the
+                // fills/regions match what an extrude of this sketch builds.
+                let mut eff = zerocad_core::effective_curves_solved(
                     curves,
                     shapes,
                     corner_mods,
                     solver.as_ref(),
                     &var_map,
                 );
+                if let Some(b) = self.graph.sketch_face_boundaries.get(&node.id) {
+                    eff.extend_curves(b);
+                }
                 let curves = &eff;
                 let regions = detect_regions(curves);
                 let selected = if cut_preview_sources.contains(&node.id) {
@@ -1473,6 +1642,9 @@ impl ZeroCadApp {
                 egui::pos2(proj.0, proj.1)
             };
 
+            // Projected face boundary (sketch-on-face) first, as reference
+            // geometry in Fusion's projected-edge violet — under the drawn
+            // curves, over the region fills drawn next.
             draw_sketch_geometry(
                 &painter,
                 &self.sketch_curves,
@@ -1482,6 +1654,27 @@ impl ZeroCadApp {
                 &to_screen,
                 true,
             );
+            if !self.active_face_boundary.is_empty() {
+                let stroke =
+                    egui::Stroke::new(1.6, egui::Color32::from_rgb(150, 80, 200));
+                for s in &self.active_face_boundary.segments {
+                    painter.line_segment([to_screen(s.a), to_screen(s.b)], stroke);
+                }
+                for c in &self.active_face_boundary.circles {
+                    let mut prev: Option<egui::Pos2> = None;
+                    for k in 0..=48 {
+                        let th = (k as f32 / 48.0) * std::f32::consts::TAU;
+                        let p = to_screen((
+                            c.center.0 + c.radius * th.cos(),
+                            c.center.1 + c.radius * th.sin(),
+                        ));
+                        if let Some(pp) = prev {
+                            painter.line_segment([pp, p], stroke);
+                        }
+                        prev = Some(p);
+                    }
+                }
+            }
 
             // Constraint badges + selection markers for an Edit Sketch session:
             // each constraint draws its glyph at its anchor (line midpoint /
@@ -1558,6 +1751,59 @@ impl ZeroCadApp {
                         }
                     }
 
+                    // Mirror preview: the reflection axis (a thin guide) plus a
+                    // live reflected copy of the whole sketch across it.
+                    if self.active_tool == Some(crate::SketchTool::Mirror) {
+                        let p0 = self.sketch_points[0];
+                        let axis_stroke =
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 180, 255));
+                        painter.line_segment([to_screen(p0), to_screen(cursor)], axis_stroke);
+                        if let Some(m) = self.mirror_preview_curves(p0, cursor) {
+                            for seg in &m.segments {
+                                painter.line_segment(
+                                    [to_screen(seg.a), to_screen(seg.b)],
+                                    preview_stroke,
+                                );
+                            }
+                            for c in &m.circles {
+                                let mut prev: Option<egui::Pos2> = None;
+                                for i in 0..=48 {
+                                    let t = (i as f32 / 48.0) * std::f32::consts::TAU;
+                                    let p =
+                                        (c.center.0 + c.radius * t.cos(), c.center.1 + c.radius * t.sin());
+                                    let ps = to_screen(p);
+                                    if let Some(last) = prev {
+                                        painter.line_segment([last, ps], preview_stroke);
+                                    }
+                                    prev = Some(ps);
+                                }
+                            }
+                            for arc in &m.arcs {
+                                let a0 = (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
+                                let mut a1 = (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
+                                while a1 - a0 > std::f32::consts::PI {
+                                    a1 -= std::f32::consts::TAU;
+                                }
+                                while a1 - a0 < -std::f32::consts::PI {
+                                    a1 += std::f32::consts::TAU;
+                                }
+                                let mut prev: Option<egui::Pos2> = None;
+                                for i in 0..=16 {
+                                    let t = a0 + (a1 - a0) * (i as f32 / 16.0);
+                                    let p = (
+                                        arc.center.0 + arc.radius * t.cos(),
+                                        arc.center.1 + arc.radius * t.sin(),
+                                    );
+                                    let ps = to_screen(p);
+                                    if let Some(last) = prev {
+                                        painter.line_segment([last, ps], preview_stroke);
+                                    }
+                                    prev = Some(ps);
+                                }
+                            }
+                        }
+                    }
+
                     let shape = self.shape_from_points(cursor);
                     for seg in &shape.segments {
                         painter.line_segment([to_screen(seg.a), to_screen(seg.b)], preview_stroke);
@@ -1601,8 +1847,7 @@ impl ZeroCadApp {
                 if let Some(cp) = close_cue {
                     painter.circle_filled(cp, 6.0, orange);
                     painter.circle_stroke(cp, 6.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
-                } else if let (Some(cur), Some(kind)) =
-                    (current_cursor_snap, self.cursor_snap_kind)
+                } else if let (Some(cur), Some(kind)) = (current_cursor_snap, self.cursor_snap_kind)
                 {
                     let p = to_screen(cur);
                     let stroke = egui::Stroke::new(1.0, orange);

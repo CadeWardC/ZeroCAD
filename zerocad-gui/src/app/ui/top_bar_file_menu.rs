@@ -15,85 +15,91 @@ impl ZeroCadApp {
         if file_btn.clicked() {
             ui.memory_mut(|mem| mem.toggle_popup(file_btn_id));
         }
-        egui::popup_below_widget::<()>(ui, file_btn_id, &file_btn, |ui| {
-            ui.set_min_width(180.0);
-            ui.style_mut().spacing.button_padding = egui::vec2(16.0, 6.0);
+        egui::popup_below_widget::<()>(
+            ui,
+            file_btn_id,
+            &file_btn,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(180.0);
+                ui.style_mut().spacing.button_padding = egui::vec2(16.0, 6.0);
 
-            // Shortcut hint for a menu action, taken from the live keymap.
-            let hint = |app: &ZeroCadApp, action: ShortcutAction| {
-                app.keymap
-                    .get(action)
-                    .map(|h| h.label())
-                    .unwrap_or_default()
-            };
+                // Shortcut hint for a menu action, taken from the live keymap.
+                let hint = |app: &ZeroCadApp, action: ShortcutAction| {
+                    app.keymap
+                        .get(action)
+                        .map(|h| h.label())
+                        .unwrap_or_default()
+                };
 
-            if icons::Icon::New
-                .menu_button_hint(ui, "New Design", &hint(self, ShortcutAction::NewDesign))
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                self.new_design();
-            }
+                if icons::Icon::New
+                    .menu_button_hint(ui, "New Design", &hint(self, ShortcutAction::NewDesign))
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.new_design();
+                }
 
-            if icons::Icon::Save
-                .menu_button_hint(ui, "Save Design", &hint(self, ShortcutAction::SaveDesign))
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                self.open_save_dialog();
-            }
+                if icons::Icon::Save
+                    .menu_button_hint(ui, "Save Design", &hint(self, ShortcutAction::SaveDesign))
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.open_save_dialog();
+                }
 
-            if icons::Icon::Download
-                .menu_button_hint(ui, "Open Design", &hint(self, ShortcutAction::OpenDesign))
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                self.open_design();
-            }
+                if icons::Icon::Download
+                    .menu_button_hint(ui, "Open Design", &hint(self, ShortcutAction::OpenDesign))
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.open_design();
+                }
 
-            ui.separator();
+                ui.separator();
 
-            if icons::Icon::Download
-                .menu_button(ui, "Import STEP")
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                self.import_step();
-            }
+                if icons::Icon::Download
+                    .menu_button(ui, "Import STEP")
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.import_step();
+                }
 
-            if icons::Icon::Download
-                .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                self.export_stl();
-            }
+                if icons::Icon::Download
+                    .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.export_stl();
+                }
 
-            if icons::Icon::Download
-                .menu_button(ui, "Export 3MF")
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                self.export_3mf();
-            }
+                if icons::Icon::Download
+                    .menu_button(ui, "Export 3MF")
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.export_3mf();
+                }
 
-            ui.separator();
+                ui.separator();
 
-            if icons::Icon::Settings
-                .menu_button_hint(ui, "Settings", &hint(self, ShortcutAction::OpenSettings))
-                .clicked()
-            {
-                ui.memory_mut(|mem| mem.close_popup());
-                log::info!("Opening Settings window.");
-                self.show_preferences = true;
-            }
+                if icons::Icon::Settings
+                    .menu_button_hint(ui, "Settings", &hint(self, ShortcutAction::OpenSettings))
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    log::info!("Opening Settings window.");
+                    self.show_preferences = true;
+                }
 
-            ui.separator();
+                ui.separator();
 
-            if icons::Icon::Exit.menu_button(ui, "Exit ZeroCAD").clicked() {
-                ui.memory_mut(|mem| mem.close_popup());
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
+                if icons::Icon::Exit.menu_button(ui, "Exit ZeroCAD").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            },
+        );
     }
 }

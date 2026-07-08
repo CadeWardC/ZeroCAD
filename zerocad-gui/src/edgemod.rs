@@ -208,9 +208,8 @@ fn edge_mod_circular_edge_preview_mesh(
     let dist = dist.max(0.05);
     let n1 = v_norm(edge.n1)?;
 
-    let radial_at = |theta: f32| -> [f32; 3] {
-        v_add(v_scale(x, theta.cos()), v_scale(y, theta.sin()))
-    };
+    let radial_at =
+        |theta: f32| -> [f32; 3] { v_add(v_scale(x, theta.cos()), v_scale(y, theta.sin())) };
     // `edge.n2` is the wall normal captured at one (unknown) point of the arc:
     // its radial sign is read where it aligns best with the local radial
     // direction (that's the capture angle), so a concave bite wall (normal
@@ -241,22 +240,24 @@ fn edge_mod_circular_edge_preview_mesh(
         match kind {
             CornerKind::Chamfer => {
                 let sin_theta = (1.0 - c * c).max(1.0e-6).sqrt();
-                let t1 = v_scale(v_add(v_scale(n2_loc, -1.0), v_scale(n1, c)), 1.0 / sin_theta);
-                let t2 = v_scale(v_add(v_scale(n1, -1.0), v_scale(n2_loc, c)), 1.0 / sin_theta);
+                let t1 = v_scale(
+                    v_add(v_scale(n2_loc, -1.0), v_scale(n1, c)),
+                    1.0 / sin_theta,
+                );
+                let t2 = v_scale(
+                    v_add(v_scale(n1, -1.0), v_scale(n2_loc, c)),
+                    1.0 / sin_theta,
+                );
                 let normal = v_norm(v_add(n1, n2_loc)).unwrap_or(n1);
                 rails.push((v_scale(t1, dist), normal));
                 rails.push((v_scale(t2, dist), normal));
             }
             CornerKind::Fillet => {
-                let center_offset =
-                    v_scale(v_add(n1, n2_loc), -dist / (1.0 + c).max(1.0e-3));
+                let center_offset = v_scale(v_add(n1, n2_loc), -dist / (1.0 + c).max(1.0e-3));
                 for i in 0..=EDGE_MOD_PREVIEW_FILLET_SEGS {
                     let phi = i as f32 / EDGE_MOD_PREVIEW_FILLET_SEGS as f32
                         * std::f32::consts::FRAC_PI_2;
-                    let dir = v_norm(v_add(
-                        v_scale(n2_loc, phi.cos()),
-                        v_scale(n1, phi.sin()),
-                    ))?;
+                    let dir = v_norm(v_add(v_scale(n2_loc, phi.cos()), v_scale(n1, phi.sin())))?;
                     rails.push((v_add(center_offset, v_scale(dir, dist)), dir));
                 }
             }
@@ -372,7 +373,8 @@ impl EdgeModOp {
         let mut mesh = MockMesh::empty();
         for (i, edge) in self.edges.iter().enumerate() {
             let concave = self.concave.get(i).copied().unwrap_or(false);
-            if let Some(edge_mesh) = edge_mod_edge_preview_mesh(edge, self.dist, self.kind, concave) {
+            if let Some(edge_mesh) = edge_mod_edge_preview_mesh(edge, self.dist, self.kind, concave)
+            {
                 mesh.append(edge_mesh);
             }
         }
@@ -412,9 +414,15 @@ mod tests {
     /// wall normal pointing toward the axis, spanning 90°..270°.
     fn bite_arc_edge(closed: bool, reversed: bool) -> EdgeRef {
         let (start, end) = if reversed {
-            (3.0 * std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2)
+            (
+                3.0 * std::f32::consts::FRAC_PI_2,
+                std::f32::consts::FRAC_PI_2,
+            )
         } else {
-            (std::f32::consts::FRAC_PI_2, 3.0 * std::f32::consts::FRAC_PI_2)
+            (
+                std::f32::consts::FRAC_PI_2,
+                3.0 * std::f32::consts::FRAC_PI_2,
+            )
         };
         EdgeRef {
             p0: [20.0, 22.0, 10.0],
@@ -467,9 +475,13 @@ mod tests {
 
     #[test]
     fn closed_rim_preview_mesh_wraps_without_end_fans() {
-        let open =
-            edge_mod_edge_preview_mesh(&bite_arc_edge(false, false), 3.0, CornerKind::Fillet, false)
-                .expect("open preview");
+        let open = edge_mod_edge_preview_mesh(
+            &bite_arc_edge(false, false),
+            3.0,
+            CornerKind::Fillet,
+            false,
+        )
+        .expect("open preview");
         let closed =
             edge_mod_edge_preview_mesh(&bite_arc_edge(true, false), 3.0, CornerKind::Fillet, false)
                 .expect("closed preview");
@@ -1215,7 +1227,9 @@ impl ZeroCadApp {
                         egui::Color32::from_rgb(170, 180, 190),
                     ))
                     .shadow(egui::epaint::Shadow {
-                        extrusion: 8.0,
+                        offset: egui::vec2(0.0, 2.0),
+                        blur: 8.0,
+                        spread: 0.0,
                         color: egui::Color32::from_black_alpha(35),
                     })
                     .inner_margin(egui::Margin::symmetric(8.0, 5.0))

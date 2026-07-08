@@ -103,19 +103,35 @@ impl ZeroCadApp {
                             .clicked()
                     };
                     if btn(ui, "— H", "Horizontal (1 line)", only(0, 1, 0)) {
-                        add = Some(Constraint::Horizontal { id: alloc(), line: sel.lines[0] });
+                        add = Some(Constraint::Horizontal {
+                            id: alloc(),
+                            line: sel.lines[0],
+                        });
                     }
                     if btn(ui, "| V", "Vertical (1 line)", only(0, 1, 0)) {
-                        add = Some(Constraint::Vertical { id: alloc(), line: sel.lines[0] });
+                        add = Some(Constraint::Vertical {
+                            id: alloc(),
+                            line: sel.lines[0],
+                        });
                     }
-                    if btn(ui, "◎ Coincident", "Merge two points (2 points)", only(2, 0, 0)) {
+                    if btn(
+                        ui,
+                        "◎ Coincident",
+                        "Merge two points (2 points)",
+                        only(2, 0, 0),
+                    ) {
                         add = Some(Constraint::Coincident {
                             id: alloc(),
                             a: sel.points[0],
                             b: sel.points[1],
                         });
                     }
-                    if btn(ui, "↔ Distance", "Driving distance (2 points)", only(2, 0, 0)) {
+                    if btn(
+                        ui,
+                        "↔ Distance",
+                        "Driving distance (2 points)",
+                        only(2, 0, 0),
+                    ) {
                         // Seed the dimension with the CURRENT distance so adding
                         // it never moves geometry; edit the value afterwards.
                         let d = self.current_point_distance(sel.points[0], sel.points[1]);
@@ -133,14 +149,24 @@ impl ZeroCadApp {
                             b: sel.lines[1],
                         });
                     }
-                    if btn(ui, "⟂ Perpendicular", "Perpendicular (2 lines)", only(0, 2, 0)) {
+                    if btn(
+                        ui,
+                        "⟂ Perpendicular",
+                        "Perpendicular (2 lines)",
+                        only(0, 2, 0),
+                    ) {
                         add = Some(Constraint::Perpendicular {
                             id: alloc(),
                             a: sel.lines[0],
                             b: sel.lines[1],
                         });
                     }
-                    if btn(ui, "⌒ Tangent", "Tangent (1 line + 1 circle)", only(0, 1, 1)) {
+                    if btn(
+                        ui,
+                        "⌒ Tangent",
+                        "Tangent (1 line + 1 circle)",
+                        only(0, 1, 1),
+                    ) {
                         add = Some(Constraint::Tangent {
                             id: alloc(),
                             line: sel.lines[0],
@@ -148,8 +174,12 @@ impl ZeroCadApp {
                         });
                     }
                     let equal_ok = only(0, 2, 0) || only(0, 0, 2);
-                    if btn(ui, "= Equal", "Equal length/radius (2 lines or 2 circles)", equal_ok)
-                    {
+                    if btn(
+                        ui,
+                        "= Equal",
+                        "Equal length/radius (2 lines or 2 circles)",
+                        equal_ok,
+                    ) {
                         let (a, b) = if sel.lines.len() == 2 {
                             (sel.lines[0], sel.lines[1])
                         } else {
@@ -165,8 +195,16 @@ impl ZeroCadApp {
                             r: Dimension::literal(r),
                         });
                     }
-                    if btn(ui, "⚓ Fix", "Anchor a point in place (1 point)", only(1, 0, 0)) {
-                        add = Some(Constraint::Fixed { id: alloc(), p: sel.points[0] });
+                    if btn(
+                        ui,
+                        "⚓ Fix",
+                        "Anchor a point in place (1 point)",
+                        only(1, 0, 0),
+                    ) {
+                        add = Some(Constraint::Fixed {
+                            id: alloc(),
+                            p: sel.points[0],
+                        });
                     }
                 });
 
@@ -181,31 +219,36 @@ impl ZeroCadApp {
                 if constraints.is_empty() {
                     ui.label(egui::RichText::new("No constraints yet.").size(11.0).weak());
                 }
-                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    for c in &constraints {
-                        let id = c.id();
-                        let is_conflict = conflict == Some(id);
-                        ui.horizontal(|ui| {
-                            if ui.small_button("✕").on_hover_text("Delete constraint").clicked()
-                            {
-                                delete = Some(id);
-                            }
-                            let mut text =
-                                egui::RichText::new(constraint_label(c)).size(11.0);
-                            if is_conflict {
-                                text = text.color(egui::Color32::from_rgb(220, 38, 38)).strong();
-                            } else if self.sketch_selected_constraint == Some(id) {
-                                text = text.strong();
-                            }
-                            if ui
-                                .add(egui::Label::new(text).sense(egui::Sense::click()))
-                                .clicked()
-                            {
-                                self.sketch_selected_constraint = Some(id);
-                            }
-                        });
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for c in &constraints {
+                            let id = c.id();
+                            let is_conflict = conflict == Some(id);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button("✕")
+                                    .on_hover_text("Delete constraint")
+                                    .clicked()
+                                {
+                                    delete = Some(id);
+                                }
+                                let mut text = egui::RichText::new(constraint_label(c)).size(11.0);
+                                if is_conflict {
+                                    text =
+                                        text.color(egui::Color32::from_rgb(220, 38, 38)).strong();
+                                } else if self.sketch_selected_constraint == Some(id) {
+                                    text = text.strong();
+                                }
+                                if ui
+                                    .add(egui::Label::new(text).sense(egui::Sense::click()))
+                                    .clicked()
+                                {
+                                    self.sketch_selected_constraint = Some(id);
+                                }
+                            });
+                        }
+                    });
             });
 
         self.sketch_next_entity_id = next_id;
@@ -244,9 +287,7 @@ impl ZeroCadApp {
             } else if let Some(e) = model.entities.iter().find(|e| e.id() == id) {
                 match e {
                     SketchEntity::Line { .. } => sel.lines.push(id),
-                    SketchEntity::Circle { .. } | SketchEntity::Arc { .. } => {
-                        sel.circles.push(id)
-                    }
+                    SketchEntity::Circle { .. } | SketchEntity::Arc { .. } => sel.circles.push(id),
                 }
             }
         }
@@ -270,12 +311,12 @@ impl ZeroCadApp {
             .as_ref()
             .and_then(|m| {
                 m.entities.iter().find_map(|e| match e {
-                    SketchEntity::Circle { id: eid, radius, .. }
-                    | SketchEntity::Arc { id: eid, radius, .. }
-                        if *eid == id =>
-                    {
-                        Some(*radius as f32)
+                    SketchEntity::Circle {
+                        id: eid, radius, ..
                     }
+                    | SketchEntity::Arc {
+                        id: eid, radius, ..
+                    } if *eid == id => Some(*radius as f32),
                     _ => None,
                 })
             })
@@ -298,15 +339,25 @@ impl ZeroCadApp {
         let pos = |id: EntityId| model.point(id).map(|p| p.pos);
         let entity_anchor = |id: EntityId| -> Option<(f64, f64)> {
             model.entities.iter().find_map(|e| match e {
-                SketchEntity::Line { id: eid, p0, p1, .. } if *eid == id => {
+                SketchEntity::Line {
+                    id: eid, p0, p1, ..
+                } if *eid == id => {
                     let a = pos(*p0)?;
                     let b = pos(*p1)?;
                     Some(((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5))
                 }
-                SketchEntity::Circle { id: eid, center, radius, .. }
-                | SketchEntity::Arc { id: eid, center, radius, .. }
-                    if *eid == id =>
-                {
+                SketchEntity::Circle {
+                    id: eid,
+                    center,
+                    radius,
+                    ..
+                }
+                | SketchEntity::Arc {
+                    id: eid,
+                    center,
+                    radius,
+                    ..
+                } if *eid == id => {
                     let c = pos(*center)?;
                     Some((c.0 + radius * 0.7, c.1 + radius * 0.7))
                 }
@@ -337,9 +388,7 @@ impl ZeroCadApp {
                 Constraint::Distance { a, b, .. } => (
                     "↔",
                     match (pos(*a), pos(*b)) {
-                        (Some(pa), Some(pb)) => {
-                            Some(((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5))
-                        }
+                        (Some(pa), Some(pb)) => Some(((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5)),
                         _ => None,
                     },
                 ),

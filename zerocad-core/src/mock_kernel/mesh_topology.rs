@@ -1,5 +1,173 @@
 use super::*;
 
+/// The boundary loops of one mesh face (`fid` in [`MockMesh::face_ids`]) — its
+/// outer wire plus any hole rims — projected into `cs`'s 2D plane as line
+/// segments, ready to join a sketch's region detection as reference geometry.
+///
+/// Extraction is purely mesh-based: among the face's triangles, an undirected
+/// edge used by exactly ONE triangle is on the face boundary (internal
+/// triangulation diagonals are shared by two). The edges are chained into
+/// closed loops, then collinear runs are merged so a subdivided straight rim
+/// comes back as one segment; genuinely curved rims (hole circles) keep their
+/// tessellation chords, matching how region detection flattens drawn circles.
+/// Shared by the GUI (sketch-on-face capture) and the evaluator (re-deriving
+/// the outline from wherever the face is after the body changes) so both
+/// produce bit-identical curves for the same mesh face.
+pub fn mesh_face_boundary_2d(
+    mesh: &MockMesh,
+    fid: u32,
+    cs: &crate::geometry::CoordinateSystem,
+) -> crate::sketch::SketchCurves {
+    use crate::geometry::Vec3;
+    use std::collections::HashMap;
+
+    let mut out = crate::sketch::SketchCurves::new();
+    let ntris = mesh.indices.len() / 3;
+    let vpos = |vi: usize| -> Vec3 {
+        let i = vi * 6;
+        Vec3::new(mesh.vertices[i], mesh.vertices[i + 1], mesh.vertices[i + 2])
+    };
+    let q = |p: Vec3| -> (i64, i64, i64) {
+        let s = |v: f32| (v as f64 * 1.0e4).round() as i64;
+        (s(p.x), s(p.y), s(p.z))
+    };
+
+    // Undirected edge use-count among this face's triangles.
+    let mut edge_use: HashMap<((i64, i64, i64), (i64, i64, i64)), (u32, Vec3, Vec3)> =
+        HashMap::new();
+    for t in 0..ntris {
+        if mesh.face_ids.get(t).copied() != Some(fid) {
+            continue;
+        }
+        for k in 0..3 {
+            let a = vpos(mesh.indices[t * 3 + k] as usize);
+            let b = vpos(mesh.indices[t * 3 + (k + 1) % 3] as usize);
+            let (ka, kb) = (q(a), q(b));
+            if ka == kb {
+                continue;
+            }
+            let (key, pa, pb) = if ka < kb {
+                ((ka, kb), a, b)
+            } else {
+                ((kb, ka), b, a)
+            };
+            edge_use.entry(key).or_insert((0, pa, pb)).0 += 1;
+        }
+    }
+    // Deterministic boundary-edge order (HashMap iteration is randomized; the
+    // loops themselves are canonicalized below, this keeps multi-loop
+    // discovery order stable too).
+    let mut boundary: Vec<(((i64, i64, i64), (i64, i64, i64)), Vec3, Vec3)> = edge_use
+        .iter()
+        .filter(|(_, (c, _, _))| *c == 1)
+        .map(|(key, (_, a, b))| (*key, *a, *b))
+        .collect();
+    boundary.sort_by_key(|(k, _, _)| *k);
+    let boundary: Vec<(Vec3, Vec3)> = boundary.into_iter().map(|(_, a, b)| (a, b)).collect();
+
+    // Chain the loose boundary edges into closed loops.
+    let mut adj: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, (a, b)) in boundary.iter().enumerate() {
+        adj.entry(q(*a)).or_default().push(i);
+        adj.entry(q(*b)).or_default().push(i);
+    }
+    let to2 = |p: Vec3| -> (f32, f32) {
+        let rel = p.sub(cs.origin);
+        (rel.dot(cs.u), rel.dot(cs.v))
+    };
+    let mut loops: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut used = vec![false; boundary.len()];
+    for start in 0..boundary.len() {
+        if used[start] {
+            continue;
+        }
+        used[start] = true;
+        let (a0, b0) = boundary[start];
+        let mut pts: Vec<Vec3> = vec![a0, b0];
+        let start_key = q(a0);
+        let mut cursor = q(b0);
+        while cursor != start_key {
+            let Some(&ei) = adj
+                .get(&cursor)
+                .and_then(|cands| cands.iter().find(|&&e| !used[e]))
+            else {
+                break;
+            };
+            used[ei] = true;
+            let (a, b) = boundary[ei];
+            let nxt = if q(a) == cursor { b } else { a };
+            cursor = q(nxt);
+            if cursor != start_key {
+                pts.push(nxt);
+            }
+        }
+        if pts.len() < 3 || cursor != start_key {
+            continue; // open chain — not a valid face loop
+        }
+
+        // Merge collinear runs (2D): keep a vertex only where the loop
+        // actually turns, so a refinement-subdivided straight rim projects
+        // as one clean segment.
+        let p2: Vec<(f32, f32)> = pts.iter().map(|&p| to2(p)).collect();
+        let n = p2.len();
+        let mut keep: Vec<(f32, f32)> = Vec::new();
+        for i in 0..n {
+            let prev = p2[(i + n - 1) % n];
+            let cur = p2[i];
+            let next = p2[(i + 1) % n];
+            let (ux, uy) = (cur.0 - prev.0, cur.1 - prev.1);
+            let (vx, vy) = (next.0 - cur.0, next.1 - cur.1);
+            let lens = (ux.hypot(uy) * vx.hypot(vy)).max(1.0e-9);
+            let sin_turn = (ux * vy - uy * vx) / lens;
+            let dot = ux * vx + uy * vy;
+            if sin_turn.abs() > 1.0e-3 || dot < 0.0 {
+                keep.push(cur);
+            }
+        }
+        if keep.len() < 3 {
+            continue;
+        }
+        loops.push(keep);
+    }
+
+    // Canonicalize every loop — CCW winding, starting at the lexicographically
+    // smallest vertex — and order the loops by that start vertex. The emitted
+    // curves must be BIT-IDENTICAL for the same face regardless of the mesh's
+    // triangle/hash order: callers hash-compare a stored outline against a
+    // re-derived one to decide whether the face actually changed.
+    for keep in &mut loops {
+        let n = keep.len();
+        let area: f32 = (0..n)
+            .map(|i| {
+                let a = keep[i];
+                let b = keep[(i + 1) % n];
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum();
+        if area < 0.0 {
+            keep.reverse();
+        }
+        let start = keep
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        keep.rotate_left(start);
+    }
+    loops.sort_by(|a, b| {
+        a.first()
+            .partial_cmp(&b.first())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for keep in &loops {
+        for i in 0..keep.len() {
+            out.add_line(keep[i], keep[(i + 1) % keep.len()]);
+        }
+    }
+    out
+}
+
 /// Build a hidden-line-ready wireframe from a tessellated mesh (the interleaved
 /// `[x,y,z,nx,ny,nz]` `vertices`, `indices`, and one `face_ids` entry per
 /// triangle). Returns `(edge_vertices, edge_indices, edge_face_normals)` in the

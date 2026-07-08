@@ -20,15 +20,19 @@ impl ZeroCadApp {
                         let cos_y = self.camera_yaw.cos();
                         let sin_y = self.camera_yaw.sin();
 
-                        // 3D coordinate projection mapping function
+                        // 3D coordinate projection mapping function. Captures
+                        // `is_perspective` by value so the closure borrows nothing
+                        // from `self` — the GPU pick helper needs `&mut self`
+                        // while this closure is alive (same pattern as render.rs).
+                        let is_perspective = self.is_perspective;
                         let project_3d = |x: f32, y: f32, z: f32| -> (f32, f32, f32) {
                             let rx = cos_y * x - sin_y * z;
                             let rz = sin_y * x + cos_y * z;
                             let ry = cos_p * y - sin_p * rz;
                             let final_z = sin_p * y + cos_p * rz;
 
-                            if self.is_perspective {
-                                let dist = 1200.0;
+                            if is_perspective {
+                                let dist = crate::render::PERSP_DIST;
                                 let factor = dist / (dist - final_z.min(dist * 0.85));
                                 (
                                     center_x + rx * view_scale * factor,
@@ -114,8 +118,14 @@ impl ZeroCadApp {
                             if let Some(pos) = hover_pos {
                                 // A planar body face under the cursor takes priority over
                                 // the origin plane quads — sketch directly on the solid.
+                                // The GPU pick buffer answers exactly when available;
+                                // otherwise the CPU triangle scan runs as before.
+                                let gpu_face =
+                                    self.gpu_pick_face(pos, rect, ctx.pixels_per_point());
                                 let face_hit = self
-                                    .pick_body_element(pos, &project_3d, sin_p, cos_p, sin_y, cos_y)
+                                    .pick_body_element(
+                                        pos, &project_3d, sin_p, cos_p, sin_y, cos_y, gpu_face,
+                                    )
                                     .and_then(|(node, pick)| match pick {
                                         BodyPick::Face(fid) if self.face_is_planar(&node, fid) => {
                                             Some((node, fid))
@@ -143,7 +153,7 @@ impl ZeroCadApp {
                                 || self.hovered_datum_plane.is_some()
                                 || self.hovered_sketch_face.is_some()
                             {
-                                egui::show_tooltip_at_pointer(ctx, egui::Id::new("plane_select_tooltip"), |ui| {
+                                egui::show_tooltip_at_pointer(ctx, ui.layer_id(), egui::Id::new("plane_select_tooltip"), |ui| {
                                     ui.style_mut().visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
                                     ui.style_mut().visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 200));
                                     ui.label(
@@ -279,12 +289,17 @@ impl ZeroCadApp {
                                 if let Some(cs) = self.face_cs(&node, fid) {
                                     log::info!("Sketching on clicked body face {fid} of {node}.");
                                     let fref = self.face_ref(&node, fid);
+                                    let boundary = self.face_boundary_curves(&node, fid, &cs);
                                     let now = ctx.input(|i| i.time);
                                     self.active_sketch_on_face = true;
                                     self.active_sketch_face_ref = fref;
                                     self.active_sketch_datum_ref = None;
                                     self.hovered_sketch_face = None;
                                     self.begin_sketch_on(cs, now);
+                                    // After begin (it resets sketch state): the face
+                                    // outline joins the sketch as reference geometry.
+                                    self.active_face_boundary = boundary;
+                                    self.recompute_sketch_regions();
                                     self.status_msg = "Sketching on the selected face. Draw a profile, then Finish Sketch.".to_string();
                                 }
                             } else if let Some(datum_id) = self.hovered_datum_plane.clone() {
@@ -369,13 +384,14 @@ impl ZeroCadApp {
                                 } else {
                                     let point_count = tool.point_count();
                                     if self.sketch_points.is_empty() {
-                                        // First point (click or press-drag). 2-point tools open
-                                        // the inline dimension dialog here; multi-point tools
-                                        // (rotated rect, 3-point circle, ellipses) draw by
-                                        // clicking each point with a live preview.
+                                        // First point (click or press-drag). Dimensioned 2-point
+                                        // tools open the inline dimension dialog here; the
+                                        // point-drawn tools (rotated rect, 3-point circle,
+                                        // ellipses, polygon, mirror) draw by clicking each point
+                                        // with a live preview and no dialog.
                                         self.sketch_points.push(pt);
                                         self.sketch_temp_start = Some(pt);
-                                        if point_count == 2 {
+                                        if point_count == 2 && !tool.is_point_drawn() {
                                             self.dim_anchor = Some(hover_pos);
                                             self.dim_input = Some(DimInput {
                                                 fields: dim_fields_for(tool),
@@ -396,7 +412,15 @@ impl ZeroCadApp {
                                         // A subsequent explicit click. Finalize once enough
                                         // points exist, otherwise record an intermediate point.
                                         if self.sketch_points.len() + 1 >= point_count {
-                                            self.finalize_shape(pt);
+                                            if tool == SketchTool::Mirror {
+                                                // Mirror doesn't create a shape — its two clicks
+                                                // are the reflection axis.
+                                                let p0 = self.sketch_points[0];
+                                                self.commit_sketch_mirror(p0, pt);
+                                                self.cancel_in_progress_shape();
+                                            } else {
+                                                self.finalize_shape(pt);
+                                            }
                                         } else {
                                             self.sketch_points.push(pt);
                                             self.status_msg = format!(
@@ -437,7 +461,7 @@ impl ZeroCadApp {
                                 let ry = cos_p * y - sin_p * rz;
                                 let final_z = sin_p * y + cos_p * rz;
                                 if is_persp {
-                                    let dist = 1200.0;
+                                    let dist = crate::render::PERSP_DIST;
                                     let factor = dist / (dist - final_z.min(dist * 0.85));
                                     egui::pos2(
                                         center_x + rx * view_scale * factor,
@@ -480,7 +504,7 @@ impl ZeroCadApp {
                                         self.solve_live_sketch();
                                     }
                                 }
-                                if response.drag_released_by(egui::PointerButton::Primary) {
+                                if response.drag_stopped_by(egui::PointerButton::Primary) {
                                     self.sketch_drag_point = None;
                                     self.solve_live_sketch();
                                     self.status_msg =
@@ -546,7 +570,7 @@ impl ZeroCadApp {
                                     let ry = cos_p * y - sin_p * rz;
                                     let final_z = sin_p * y + cos_p * rz;
                                     if is_persp {
-                                        let dist = 1200.0;
+                                        let dist = crate::render::PERSP_DIST;
                                         let factor = dist / (dist - final_z.min(dist * 0.85));
                                         (center_x + rx * view_scale * factor, center_y - ry * view_scale * factor, final_z)
                                     } else {
@@ -625,7 +649,18 @@ impl ZeroCadApp {
                                             }
                                         }
 
-                                        for (ri, region) in detect_regions(curves).iter().enumerate() {
+                                        // Regions must include the projected face
+                                        // boundary (sketch-on-face) — same merge as
+                                        // eval — so a picked region index matches the
+                                        // one the extrude will store. Edge picking
+                                        // above stays on the drawn curves only.
+                                        let mut region_curves = curves.clone();
+                                        if let Some(b) =
+                                            self.graph.sketch_face_boundaries.get(&node.id)
+                                        {
+                                            region_curves.extend_curves(b);
+                                        }
+                                        for (ri, region) in detect_regions(&region_curves).iter().enumerate() {
                                             let screen = project_loop(&region.boundary);
                                             if screen.len() < 3 {
                                                 continue;
@@ -712,9 +747,18 @@ impl ZeroCadApp {
                                         );
                                     }
                                 } else {
-                                    // No sketch hit — try body picking instead.
-                                    let body_hit =
-                                        self.pick_body_element(click_pos, &proj, sin_p, cos_p, sin_y, cos_y);
+                                    // No sketch hit — try body picking instead. The face
+                                    // stage uses the GPU pick buffer when available (exact
+                                    // to the rendered silhouette); vertices/edges keep
+                                    // their CPU proximity search and their priority.
+                                    let gpu_face = self.gpu_pick_face(
+                                        click_pos,
+                                        rect,
+                                        ctx.pixels_per_point(),
+                                    );
+                                    let body_hit = self.pick_body_element(
+                                        click_pos, &proj, sin_p, cos_p, sin_y, cos_y, gpu_face,
+                                    );
                                     if let Some((node, pick)) = body_hit {
                                         // Sketch-region/edge selections are a separate
                                         // concept; a body pick always supersedes them.
@@ -826,6 +870,17 @@ impl ZeroCadApp {
                             };
                         } else {
                             self.dim_screen_positions.clear();
+                        }
+
+                        // GPU 3D scene: render the committed bodies plus any live
+                        // operation preview (ghost volumes, replacement result
+                        // sets) to an offscreen texture, composited inside
+                        // draw_viewport. Skipped only when GPU rendering is off
+                        // or the wgpu backend is unavailable.
+                        if self.gpu_render && self.gpu.is_available() {
+                            self.render_gpu_scene(rect, ctx);
+                        } else {
+                            self.gpu_texture_id = None;
                         }
 
                         // Draw the 3D projected CAD viewport

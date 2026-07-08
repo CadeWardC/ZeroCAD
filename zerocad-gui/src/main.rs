@@ -13,8 +13,9 @@ mod edgemod;
 mod expr;
 mod extrude;
 mod geom2d;
-mod icons;
+mod gpu_viewport;
 mod hole_ui;
+mod icons;
 mod loft_sweep_ui;
 mod pattern_ui;
 mod render;
@@ -28,12 +29,12 @@ mod thumbnail;
 use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
+use geom2d::{circumcircle, dist_point_to_segment, is_point_in_quad, project_point_on_segment};
 use hole_ui::HoleOp;
 use loft_sweep_ui::SweepOp;
 use pattern_ui::PatternOp;
 use revolve_ui::RevolveOp;
 use shell_ui::ShellOp;
-use geom2d::{circumcircle, dist_point_to_segment, is_point_in_quad, project_point_on_segment};
 use shortcuts::{Keymap, ShortcutAction};
 use sketch_ui::{dim_fields_for, DimInput};
 use theme::{apply_premium_dark_theme, apply_premium_light_theme, Palette};
@@ -50,18 +51,51 @@ fn main() -> eframe::Result<()> {
     log::info!("Console debug logger initialized at level: DEBUG");
     log::info!("========================================================");
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ZeroCAD - 3D Parametric CAD Designer")
-            .with_inner_size([1200.0, 800.0]),
-        ..Default::default()
+    // The user's persisted backend preference (Settings → Viewport) narrows
+    // which wgpu backends the adapter search may pick. The WGPU_BACKEND env var
+    // still overrides everything, as a debugging escape hatch.
+    let backends = match settings::AppSettings::load().backend {
+        settings::GraphicsBackend::Auto => wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+        settings::GraphicsBackend::Vulkan => wgpu::Backends::VULKAN,
+        settings::GraphicsBackend::Dx12 => wgpu::Backends::DX12,
+        settings::GraphicsBackend::OpenGl => wgpu::Backends::GL,
     };
 
-    eframe::run_native(
-        "ZeroCAD",
-        options,
-        Box::new(|_cc| Box::new(ZeroCadApp::new())),
-    )
+    let run = |renderer: eframe::Renderer| -> eframe::Result<()> {
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_title("ZeroCAD - 3D Parametric CAD Designer")
+                .with_inner_size([1200.0, 800.0]),
+            // The workspace viewport renders its 3D scene on the GPU via
+            // openrcad-render, embedded as an egui texture. That requires eframe
+            // to run on the wgpu backend so `frame.wgpu_render_state()` yields
+            // the device/queue the render core draws with.
+            renderer,
+            wgpu_options: egui_wgpu::WgpuConfiguration {
+                supported_backends: wgpu::util::backend_bits_from_env().unwrap_or(backends),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        eframe::run_native(
+            "ZeroCAD",
+            options,
+            Box::new(|_cc| Ok(Box::new(ZeroCadApp::new()))),
+        )
+    };
+
+    // Prefer wgpu (GPU viewport). If wgpu itself cannot start on this machine
+    // (no usable adapter/driver for the requested backends), fall back to the
+    // glow (OpenGL) backend: the app then runs entirely on the CPU renderer
+    // path — `wgpu_render_state()` is None there, so the viewport quietly skips
+    // its GPU compositor.
+    match run(eframe::Renderer::Wgpu) {
+        Err(eframe::Error::Wgpu(err)) => {
+            log::warn!("wgpu renderer unavailable ({err}); falling back to glow + CPU viewport");
+            run(eframe::Renderer::Glow)
+        }
+        other => other,
+    }
 }
 
 /// A drawing tool *mode*. Each toolbar button (a [`ToolFamily`]) exposes one or
@@ -83,6 +117,15 @@ pub enum SketchTool {
     Ellipse,
     /// Ellipse from a major-axis diameter (2 points) + minor radius (3rd point).
     ThreePointEllipse,
+    /// Regular N-gon with its vertices on the drag circle (center → vertex sets
+    /// the circumradius and the rotation). Side count comes from the toolbar.
+    PolygonInscribed,
+    /// Regular N-gon with its edge midpoints on the drag circle (center → flat
+    /// sets the apothem and the rotation). Side count comes from the toolbar.
+    PolygonCircumscribed,
+    /// Reflect the whole sketch across a 2-point axis (center line). Not a draw
+    /// tool in the shape sense — its two clicks define the mirror line.
+    Mirror,
     /// Round a sketch corner (click the corner). Not a draw tool.
     Fillet,
     /// Bevel a sketch corner (click the corner). Not a draw tool.
@@ -114,6 +157,10 @@ pub enum ToolFamily {
     Line,
     Rectangle,
     Circle,
+    /// The regular-polygon button, holding the inscribed and circumscribed modes.
+    Polygon,
+    /// The sketch mirror button (single mode, no flyout).
+    Mirror,
     /// The corner-modifier button, holding both Fillet and Chamfer (its flyout
     /// switches between them) — mirroring the single 3D edge fillet/chamfer button.
     Corner,
@@ -131,6 +178,8 @@ impl SketchTool {
             | SketchTool::ThreePointCircle
             | SketchTool::Ellipse
             | SketchTool::ThreePointEllipse => ToolFamily::Circle,
+            SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => ToolFamily::Polygon,
+            SketchTool::Mirror => ToolFamily::Mirror,
             SketchTool::Fillet => ToolFamily::Corner,
             SketchTool::Chamfer => ToolFamily::Corner,
         }
@@ -143,13 +192,33 @@ impl SketchTool {
             SketchTool::Line
             | SketchTool::Rectangle
             | SketchTool::RectangleCenter
-            | SketchTool::Circle => 2,
+            | SketchTool::Circle
+            | SketchTool::PolygonInscribed
+            | SketchTool::PolygonCircumscribed
+            | SketchTool::Mirror => 2,
             SketchTool::RectangleThreePoint
             | SketchTool::ThreePointCircle
             | SketchTool::Ellipse
             | SketchTool::ThreePointEllipse => 3,
             SketchTool::Fillet | SketchTool::Chamfer => 1,
         }
+    }
+
+    /// Whether this tool draws a shape geometrically (center/radius/points) with
+    /// no inline dimension dialog — the polygon and mirror tools, like the
+    /// 3-point tools, place points directly and never open the Fusion-style
+    /// dimension box.
+    pub fn is_point_drawn(self) -> bool {
+        matches!(
+            self,
+            SketchTool::RectangleThreePoint
+                | SketchTool::ThreePointCircle
+                | SketchTool::Ellipse
+                | SketchTool::ThreePointEllipse
+                | SketchTool::PolygonInscribed
+                | SketchTool::PolygonCircumscribed
+                | SketchTool::Mirror
+        )
     }
 
     /// The corner-modifier kind for the Fillet/Chamfer tools, else `None`.
@@ -172,6 +241,8 @@ impl SketchTool {
             SketchTool::ThreePointCircle => icons::Icon::ThreePointCircle,
             SketchTool::Ellipse => icons::Icon::Ellipse,
             SketchTool::ThreePointEllipse => icons::Icon::ThreePointEllipse,
+            SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => icons::Icon::Polygon,
+            SketchTool::Mirror => icons::Icon::Mirror,
             SketchTool::Fillet => icons::Icon::Fillet,
             SketchTool::Chamfer => icons::Icon::Chamfer,
         }
@@ -188,6 +259,9 @@ impl SketchTool {
             SketchTool::ThreePointCircle => "3-Point Circle",
             SketchTool::Ellipse => "Ellipse",
             SketchTool::ThreePointEllipse => "3-Point Ellipse",
+            SketchTool::PolygonInscribed => "Inscribed Polygon",
+            SketchTool::PolygonCircumscribed => "Circumscribed Polygon",
+            SketchTool::Mirror => "Mirror",
             SketchTool::Fillet => "Fillet",
             SketchTool::Chamfer => "Chamfer",
         }
@@ -201,6 +275,8 @@ impl ToolFamily {
             ToolFamily::Line => SketchTool::Line,
             ToolFamily::Rectangle => SketchTool::Rectangle,
             ToolFamily::Circle => SketchTool::Circle,
+            ToolFamily::Polygon => SketchTool::PolygonInscribed,
+            ToolFamily::Mirror => SketchTool::Mirror,
             ToolFamily::Corner => SketchTool::Fillet,
         }
     }
@@ -220,6 +296,11 @@ impl ToolFamily {
                 SketchTool::Ellipse,
                 SketchTool::ThreePointEllipse,
             ],
+            ToolFamily::Polygon => &[
+                SketchTool::PolygonInscribed,
+                SketchTool::PolygonCircumscribed,
+            ],
+            ToolFamily::Mirror => &[SketchTool::Mirror],
             ToolFamily::Corner => &[SketchTool::Fillet, SketchTool::Chamfer],
         }
     }
@@ -362,6 +443,29 @@ struct ZeroCadApp {
     /// only when the meshes change so the status bar doesn't re-sum every
     /// vertex/index of the whole model on every frame.
     mesh_stats: (usize, usize),
+    /// Monotonic counter bumped every time `body_meshes` is reassigned, so the
+    /// GPU viewport re-uploads its scene only when the geometry actually changed.
+    mesh_epoch: u64,
+    /// GPU-accelerated 3D viewport: renders the committed bodies via
+    /// `openrcad-render` into an offscreen texture composited under the CPU
+    /// overlays. Falls back to the CPU rasterizer when `gpu_render` is off or the
+    /// wgpu backend is unavailable.
+    gpu: gpu_viewport::GpuViewport,
+    /// Master toggle for the GPU viewport (settings-controlled, default on). When
+    /// off, the legacy CPU software renderer draws solids and edges.
+    gpu_render: bool,
+    /// Requested wgpu backend (Auto/Vulkan/DX12/OpenGL). Persisted; applied at
+    /// startup in `main`, so edits here take effect on the next launch.
+    graphics_backend: settings::GraphicsBackend,
+    /// GPU viewport anti-aliasing quality (persisted; applied live).
+    msaa_level: settings::MsaaLevel,
+    /// This frame's composited GPU scene texture, painted by `draw_viewport`.
+    gpu_texture_id: Option<egui::TextureId>,
+    /// The preview plan `render_gpu_scene` resolved this frame, handed to
+    /// `draw_viewport` so the plan (and its cloned preview body set) is built
+    /// once per frame, not once per renderer. `None` when the GPU path didn't
+    /// run this frame (CPU mode resolves its own).
+    frame_preview_plan: Option<render::PreviewPlan>,
     /// Background "refine" evaluation for slow arc fillets. `reevaluate_geometry`
     /// shows the fast faceted draft instantly, then — when the model has a fillet
     /// — spawns the arc-cutter evaluation on a worker thread and swaps the result
@@ -386,6 +490,13 @@ struct ZeroCadApp {
     /// from face-pick to sketch-commit so the finished sketch stores it (and the
     /// sketch plane then follows the body). `None` for origin-plane sketches.
     active_sketch_face_ref: Option<zerocad_core::parametric::FaceRef>,
+    /// When sketching on a body face, that face's boundary loops projected into
+    /// the sketch's 2D plane — reference geometry the user never drew. It joins
+    /// region detection (drawn shapes split against the face outline, and the
+    /// outline itself is an extrudable region), renders in a distinct color,
+    /// and is a snap target. Persisted onto `graph.sketch_face_boundaries` at
+    /// commit. Empty for origin-plane / datum sketches.
+    active_face_boundary: SketchCurves,
     /// When sketching on a datum plane, that datum's node id, carried from
     /// plane-pick to sketch-commit so the finished sketch records the
     /// attachment (and follows the datum when it's edited). `None` otherwise.
@@ -438,6 +549,9 @@ struct ZeroCadApp {
     /// Editable radius/setback for the Fillet/Chamfer tools (a number or a
     /// variable expression).
     corner_radius_text: String,
+    /// Side count for the regular-polygon tools (inscribed/circumscribed),
+    /// editable in the sketch toolbar. Clamped to a sane 3..=64 range.
+    polygon_sides: u32,
     /// Editable radius/setback for the **3D** edge Fillet/Chamfer (applied to a
     /// selected body edge). A number or a variable expression.
     edge_mod_dist_text: String,

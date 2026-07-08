@@ -79,9 +79,10 @@ impl ZeroCadApp {
     /// The body node the pattern tool would replicate: a whole-body viewport
     /// selection first, else the feature-tree selection.
     pub(crate) fn pattern_source_candidate(&self) -> Option<String> {
-        let from_viewport = self.selected_body.iter().find_map(|(id, pick)| {
-            matches!(pick, BodyPick::Whole).then(|| id.clone())
-        });
+        let from_viewport = self
+            .selected_body
+            .iter()
+            .find_map(|(id, pick)| matches!(pick, BodyPick::Whole).then(|| id.clone()));
         from_viewport
             .or_else(|| self.selected_node_id.clone())
             .filter(|id| self.node_is_body(id))
@@ -195,7 +196,7 @@ impl ZeroCadApp {
                         PatternKindChoice::Mirror => {
                             ui.horizontal(|ui| {
                                 ui.label("Plane");
-                                egui::ComboBox::from_id_source("pattern_mirror_plane")
+                                egui::ComboBox::from_id_salt("pattern_mirror_plane")
                                     .selected_text(op_new.plane.label())
                                     .show_ui(ui, |ui| {
                                         for choice in [
@@ -207,10 +208,8 @@ impl ZeroCadApp {
                                             ui.selectable_value(&mut op_new.plane, choice, label);
                                         }
                                         for (id, name) in &datum_planes {
-                                            let choice = MirrorPlaneChoice::Datum(
-                                                id.clone(),
-                                                name.clone(),
-                                            );
+                                            let choice =
+                                                MirrorPlaneChoice::Datum(id.clone(), name.clone());
                                             let label = choice.label();
                                             ui.selectable_value(&mut op_new.plane, choice, label);
                                         }
@@ -306,7 +305,7 @@ fn axis_combo(
     datum_axes: &[(String, String)],
     id: &str,
 ) {
-    egui::ComboBox::from_id_source(id)
+    egui::ComboBox::from_id_salt(id)
         .selected_text(axis.label())
         .show_ui(ui, |ui| {
             for choice in [

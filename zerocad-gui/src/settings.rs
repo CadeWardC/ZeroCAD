@@ -32,6 +32,73 @@ fn now_secs() -> u64 {
 // General preferences
 // ---------------------------------------------------------------------------
 
+/// Which graphics backend the GPU viewport requests from wgpu. Applied when the
+/// app starts (changing it needs a restart — the device/surface are created
+/// once at launch). `Auto` lets wgpu pick the best available backend, which on
+/// Windows normally means Vulkan, with DirectX 12 next. If the chosen backend
+/// can't initialize, the app falls back to the glow (OpenGL) renderer with the
+/// CPU viewport rather than failing to start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphicsBackend {
+    #[default]
+    Auto,
+    Vulkan,
+    /// DirectX 12 (Windows only).
+    Dx12,
+    /// wgpu's OpenGL backend, where the platform provides one.
+    OpenGl,
+}
+
+impl GraphicsBackend {
+    pub const ALL: [GraphicsBackend; 4] = [
+        GraphicsBackend::Auto,
+        GraphicsBackend::Vulkan,
+        GraphicsBackend::Dx12,
+        GraphicsBackend::OpenGl,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GraphicsBackend::Auto => "Auto (recommended)",
+            GraphicsBackend::Vulkan => "Vulkan",
+            GraphicsBackend::Dx12 => "DirectX 12",
+            GraphicsBackend::OpenGl => "OpenGL",
+        }
+    }
+}
+
+/// Anti-aliasing quality of the GPU viewport. Applied live (no restart) — the
+/// render pipelines are rebuilt on change. 8× falls back to 4× on adapters
+/// that don't support it for the surface format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MsaaLevel {
+    Off,
+    #[default]
+    X4,
+    X8,
+}
+
+impl MsaaLevel {
+    pub const ALL: [MsaaLevel; 3] = [MsaaLevel::Off, MsaaLevel::X4, MsaaLevel::X8];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MsaaLevel::Off => "Off",
+            MsaaLevel::X4 => "4× (recommended)",
+            MsaaLevel::X8 => "8×",
+        }
+    }
+
+    /// The wgpu sample count this level asks for.
+    pub fn samples(self) -> u32 {
+        match self {
+            MsaaLevel::Off => 1,
+            MsaaLevel::X4 => 4,
+            MsaaLevel::X8 => 8,
+        }
+    }
+}
+
 /// Preferences that should survive a restart. Anything the Settings window or a
 /// preference toggle edits and the user expects to "stick" belongs here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +109,21 @@ pub struct AppSettings {
     pub dark_mode: bool,
     /// Default measurement unit.
     pub unit: Unit,
+    /// GPU-accelerated 3D viewport on/off (falls back to the CPU software
+    /// renderer when off). Defaults on; `serde(default)` keeps older
+    /// settings.json files loading.
+    #[serde(default = "default_true")]
+    pub gpu_render: bool,
+    /// Requested wgpu backend for the GPU viewport (see [`GraphicsBackend`]).
+    #[serde(default)]
+    pub backend: GraphicsBackend,
+    /// Anti-aliasing quality of the GPU viewport (see [`MsaaLevel`]).
+    #[serde(default)]
+    pub msaa: MsaaLevel,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -50,6 +132,9 @@ impl Default for AppSettings {
             show_onboarding: true,
             dark_mode: false,
             unit: Unit::Millimeter,
+            gpu_render: true,
+            backend: GraphicsBackend::Auto,
+            msaa: MsaaLevel::X4,
         }
     }
 }

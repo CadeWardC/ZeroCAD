@@ -74,7 +74,7 @@ impl ZeroCadApp {
                     let mut create_var_set = false;
 
                     egui::ScrollArea::vertical()
-                        .id_source("tree_scroll")
+                        .id_salt("tree_scroll")
                         .max_height(300.0)
                         .show(ui, |ui| {
                             if let Some((id, name)) = &origin {

@@ -26,12 +26,19 @@ pub fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// The wgpu vertex layout for the wireframe overlay: a single `vec3` position.
+/// The wgpu vertex layout for the wireframe overlay. Each edge segment is one
+/// *instance* carrying its two world-space endpoints; the vertex shader expands
+/// it into a screen-aligned quad (6 vertices) of the requested pixel width with
+/// an anti-aliased feather — hardware line-list rasterization is fixed at 1px
+/// and ignores hi-dpi.
 pub fn edge_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+    const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+        0 => Float32x3, // segment start (world)
+        1 => Float32x3, // segment end (world)
+    ];
     wgpu::VertexBufferLayout {
-        array_stride: (3 * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
+        array_stride: (6 * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
         attributes: &ATTRS,
     }
 }
@@ -41,10 +48,11 @@ pub struct SceneMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
-    /// Line-list vertex buffer of the model's topological edges.
+    /// Per-instance segment buffer of the model's topological edges
+    /// (`[ax,ay,az, bx,by,bz]` per segment).
     pub edge_buffer: wgpu::Buffer,
-    /// Number of edge-overlay vertices (2 per segment).
-    pub edge_vertex_count: u32,
+    /// Number of edge segments (instances) in `edge_buffer`.
+    pub edge_segment_count: u32,
     /// Per-triangle source face index (CPU side, for picking).
     pub face_ids: Vec<u32>,
 }
@@ -74,11 +82,12 @@ impl SceneMesh {
         });
 
         let edge_lines = crate::edges::feature_edge_lines(mesh);
-        let edge_vertex_count = (edge_lines.len() / 3) as u32;
+        // 6 floats (two endpoints) per segment instance.
+        let edge_segment_count = (edge_lines.len() / 6) as u32;
         // wgpu rejects zero-sized buffers, so a model with no edges gets a tiny
-        // placeholder that is simply never drawn (edge_vertex_count == 0).
+        // placeholder that is simply never drawn (edge_segment_count == 0).
         let edge_contents: &[f32] = if edge_lines.is_empty() {
-            &[0.0, 0.0, 0.0]
+            &[0.0; 6]
         } else {
             &edge_lines
         };
@@ -93,7 +102,7 @@ impl SceneMesh {
             index_buffer,
             index_count: mesh.indices.len() as u32,
             edge_buffer,
-            edge_vertex_count,
+            edge_segment_count,
             face_ids: mesh.face_ids.clone(),
         }
     }

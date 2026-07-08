@@ -38,6 +38,22 @@ pub(crate) struct ExtrudeTarget {
     pub(crate) on_face: bool,
 }
 
+/// A helper sketch that will be created at COMMIT time for a direct push/pull
+/// on a body face: an empty (nothing drawn) on-face sketch whose projected
+/// face boundary is its only geometry, so its single region IS the face. Kept
+/// out of the parametric graph until the user confirms — cancelling the op
+/// leaves no trace.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingFaceSketch {
+    pub(crate) sketch_id: String,
+    pub(crate) name: String,
+    pub(crate) cs: CoordinateSystem,
+    pub(crate) fref: Option<zerocad_core::parametric::FaceRef>,
+    pub(crate) boundary: zerocad_core::SketchCurves,
+    /// The body the face belongs to (dependency edge + boolean target).
+    pub(crate) body_id: String,
+}
+
 /// A live, uncommitted extrude. Drives the right-hand tool window and the
 /// real-time push/pull preview (Fusion-style) until the user confirms.
 #[derive(Debug, Clone)]
@@ -57,6 +73,9 @@ pub(crate) struct ExtrudeOp {
     /// Set once the user clicks a mode button, which freezes the mode so the
     /// direction-driven default stops overriding their choice.
     pub(crate) mode_user_set: bool,
+    /// `Some` for a direct push/pull started from a body face: the helper
+    /// on-face sketch to materialize at commit (see [`PendingFaceSketch`]).
+    pub(crate) pending_face_sketch: Option<PendingFaceSketch>,
 }
 
 impl ExtrudeOp {
@@ -82,6 +101,36 @@ impl ExtrudeOp {
     }
 }
 
+/// Materialize a pending face sketch into `graph`: the (empty-curves) on-face
+/// sketch node, its face ref, its projected-boundary reference curves, and the
+/// dependency edge from the body. Shared by the preview graph clone and the
+/// real commit so both see identical regions.
+fn insert_pending_face_sketch(graph: &mut zerocad_core::ParametricGraph, p: &PendingFaceSketch) {
+    graph.add_feature(FeatureNode {
+        id: p.sketch_id.clone(),
+        name: p.name.clone(),
+        feature: FeatureType::Sketch {
+            cs: p.cs,
+            curves: zerocad_core::SketchCurves::new(),
+            shapes: Vec::new(),
+            corner_mods: Vec::new(),
+            on_face: true,
+            entity_ids: Vec::new(),
+            next_entity_id: 0,
+            solver: None,
+        },
+    });
+    graph.add_dependency(&p.body_id, &p.sketch_id);
+    if let Some(fref) = &p.fref {
+        graph
+            .sketch_face_refs
+            .insert(p.sketch_id.clone(), fref.clone());
+    }
+    graph
+        .sketch_face_boundaries
+        .insert(p.sketch_id.clone(), p.boundary.clone());
+}
+
 impl ZeroCadApp {
     fn clear_extrude_preview_eval(&mut self) {
         self.extrude_preview_cache = None;
@@ -97,6 +146,11 @@ impl ZeroCadApp {
         }
 
         let mut graph = self.graph.clone();
+        // Direct face push/pull: the helper sketch only exists in this preview
+        // clone (and later at commit) — never in the working graph.
+        if let Some(p) = &op.pending_face_sketch {
+            insert_pending_face_sketch(&mut graph, p);
+        }
         for (i, target) in op.targets.iter().enumerate() {
             if target.indices.is_empty() {
                 continue;
@@ -313,7 +367,9 @@ impl ZeroCadApp {
                         egui::Color32::from_rgb(170, 180, 190),
                     ))
                     .shadow(egui::epaint::Shadow {
-                        extrusion: 8.0,
+                        offset: egui::vec2(0.0, 2.0),
+                        blur: 8.0,
+                        spread: 0.0,
                         color: egui::Color32::from_black_alpha(35),
                     })
                     .inner_margin(egui::Margin::symmetric(8.0, 5.0))
@@ -520,13 +576,19 @@ impl ZeroCadApp {
                 } = &node.feature
                 {
                     // Resolve variable-driven dimensions before detecting faces.
-                    let eff = zerocad_core::effective_curves_solved(
+                    let mut eff = zerocad_core::effective_curves_solved(
                         curves,
                         shapes,
                         corner_mods,
                         solver.as_ref(),
                         &var_map,
                     );
+                    // Same merge order as the evaluator: drawn curves first,
+                    // then the projected face boundary (sketch-on-face), so
+                    // the region indices agree with what eval will build.
+                    if let Some(b) = self.graph.sketch_face_boundaries.get(sketch_id) {
+                        eff.extend_curves(b);
+                    }
                     return Some((*cs, detect_regions(&eff), *on_face));
                 }
             }
@@ -619,12 +681,108 @@ impl ZeroCadApp {
             mode,
             on_face,
             mode_user_set: false,
+            pending_face_sketch: None,
         });
         // Fresh op — drop any preview cached for a previous one.
         self.extrude_preview_cache = None;
         self.extrude_preview_mesh_cache = None;
         self.status_msg =
             "Extrude: drag up/down in the viewport to push/pull, or type a distance, then OK."
+                .to_string();
+    }
+
+    /// Begin a direct push/pull on a planar **body face** — no pre-drawn
+    /// sketch needed. Builds a pending on-face helper sketch whose only
+    /// geometry is the projected face outline, so its region(s) are exactly
+    /// the face; pulling out joins material, pushing in cuts. Nothing touches
+    /// the parametric graph until the user confirms.
+    pub(crate) fn begin_extrude_on_body_face(&mut self, node: String, fid: u32) {
+        if self.extrude_op.is_some() {
+            return;
+        }
+        if !self.face_is_planar(&node, fid) {
+            self.status_msg =
+                "Extrude needs a flat body face — curved faces aren't supported yet.".to_string();
+            return;
+        }
+        let Some(cs) = self.face_cs(&node, fid) else {
+            self.status_msg = "Couldn't resolve the selected face.".to_string();
+            return;
+        };
+        let fref = self.face_ref(&node, fid);
+        let boundary = self.face_boundary_curves(&node, fid, &cs);
+        let regions = detect_regions(&boundary);
+
+        // Keep only the regions holding actual face material: project this
+        // face's triangle centroids into the sketch plane and keep regions
+        // containing one. (A face with a hole projects the hole rim as its own
+        // disc region — no centroid lands in it, so it drops out and the hole
+        // survives the push/pull.)
+        let mut indices: Vec<usize> = Vec::new();
+        if let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| *id == node) {
+            let ntris = mesh.indices.len() / 3;
+            let mut centroids: Vec<(f32, f32)> = Vec::new();
+            for t in 0..ntris {
+                if mesh.face_ids.get(t).copied() != Some(fid) {
+                    continue;
+                }
+                let mut c = zerocad_core::Vec3::ZERO;
+                for k in 0..3 {
+                    let i = mesh.indices[t * 3 + k] as usize * 6;
+                    c = c.add(zerocad_core::Vec3::new(
+                        mesh.vertices[i],
+                        mesh.vertices[i + 1],
+                        mesh.vertices[i + 2],
+                    ));
+                }
+                let c = c.mul(1.0 / 3.0);
+                let rel = c.sub(cs.origin);
+                centroids.push((rel.dot(cs.u), rel.dot(cs.v)));
+            }
+            indices = regions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| centroids.iter().any(|&p| r.contains(p)))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        if indices.is_empty() {
+            self.status_msg = "Couldn't derive a closed outline from that face.".to_string();
+            return;
+        }
+
+        let sketch_id = format!("sketch_{}", self.next_id());
+        let name = self.next_sketch_name();
+        let depth = self.extrude_depth.max(1.0);
+        let mode = default_extrude_mode(true, depth);
+        self.extrude_op = Some(ExtrudeOp {
+            targets: vec![ExtrudeTarget {
+                sketch_id: sketch_id.clone(),
+                cs,
+                regions,
+                indices,
+                on_face: true,
+            }],
+            depth,
+            depth_text: format!("{:.2}", depth),
+            focus_request: true,
+            mode,
+            on_face: true,
+            mode_user_set: false,
+            pending_face_sketch: Some(PendingFaceSketch {
+                sketch_id,
+                name,
+                cs,
+                fref,
+                boundary,
+                body_id: node,
+            }),
+        });
+        self.selected_body.clear();
+        self.extrude_preview_cache = None;
+        self.extrude_preview_mesh_cache = None;
+        self.status_msg =
+            "Extrude face: drag along the normal to push/pull (out = Join, in = Cut), or type a distance, then OK."
                 .to_string();
     }
 
@@ -679,8 +837,7 @@ impl ZeroCadApp {
 
         // Copy preview cache if ready immediately to avoid any flash/refine delay
         if let Some(cb) = cached_bodies {
-            self.body_meshes = cb;
-            self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+            self.set_body_meshes(cb);
         }
 
         self.push_undo();
@@ -700,6 +857,12 @@ impl ZeroCadApp {
         } else {
             None
         };
+
+        // Direct face push/pull: materialize the helper on-face sketch now
+        // (inside this undo unit), so the extrude below has a real parent.
+        if let Some(p) = &op.pending_face_sketch {
+            insert_pending_face_sketch(&mut self.graph, p);
+        }
 
         let mut last_id = None;
         let mut count = 0;

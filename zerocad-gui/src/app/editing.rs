@@ -67,6 +67,14 @@ impl ZeroCadApp {
         self.begin_sketch_on(cs, now); // clears sketch state; set ours after
         self.active_sketch_on_face = on_face;
         self.active_sketch_face_ref = self.graph.sketch_face_refs.get(node_id).cloned();
+        // Restore the projected face outline so it re-joins region detection
+        // (and rendering/snapping) for the whole edit session.
+        self.active_face_boundary = self
+            .graph
+            .sketch_face_boundaries
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default();
         self.editing_sketch_id = Some(node_id.to_string());
         self.sketch_shapes = shapes.clone();
         self.sketch_entity_ids =
@@ -181,7 +189,15 @@ impl ZeroCadApp {
                 best_pt = Some((p, kind, d));
             }
         };
-        for s in &self.sketch_curves.segments {
+        // Drawn segments plus the projected face boundary (sketch-on-face):
+        // snapping onto the body's edges/corners is what lets a drawn profile
+        // land exactly on the face outline.
+        for s in self
+            .sketch_curves
+            .segments
+            .iter()
+            .chain(self.active_face_boundary.segments.iter())
+        {
             consider(s.a, SnapKind::Endpoint);
             consider(s.b, SnapKind::Endpoint);
             consider(
@@ -203,9 +219,14 @@ impl ZeroCadApp {
             return (p, Some(kind));
         }
 
-        // 2. Snap to the nearest point on a segment.
+        // 2. Snap to the nearest point on a segment (drawn or face boundary).
         let mut best_line: Option<((f32, f32), f32)> = None;
-        for s in &self.sketch_curves.segments {
+        for s in self
+            .sketch_curves
+            .segments
+            .iter()
+            .chain(self.active_face_boundary.segments.iter())
+        {
             let proj = project_point_on_segment(raw, s.a, s.b);
             let d = dist2(proj, raw);
             if d < tol * tol && best_line.map_or(true, |(_, bd)| d < bd) {
@@ -328,6 +349,36 @@ impl ZeroCadApp {
                     sc.add_ellipse(c, major, ry.max(0.01));
                 }
             }
+            SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => {
+                // p0 = center, `last` = the rim point (its distance sets the size,
+                // its direction the rotation). Inscribed puts a vertex under the
+                // cursor (drag = circumradius); circumscribed puts an edge-flat
+                // midpoint under the cursor (drag = apothem).
+                let n = self.polygon_sides.clamp(3, 64) as usize;
+                let (dx, dy) = (last.0 - p0.0, last.1 - p0.1);
+                let drag = (dx * dx + dy * dy).sqrt();
+                if drag > 1e-4 {
+                    let step = std::f32::consts::TAU / n as f32;
+                    let ang0 = dy.atan2(dx);
+                    // Circumradius and the angle of the first vertex.
+                    let (r, first) = if tool == SketchTool::PolygonCircumscribed {
+                        // Cursor = apothem; a flat faces the cursor, so the first
+                        // vertex sits half a step back from `ang0`.
+                        (drag / (step * 0.5).cos(), ang0 - step * 0.5)
+                    } else {
+                        (drag, ang0)
+                    };
+                    let verts: Vec<(f32, f32)> = (0..n)
+                        .map(|k| {
+                            let a = first + step * k as f32;
+                            (p0.0 + r * a.cos(), p0.1 + r * a.sin())
+                        })
+                        .collect();
+                    for k in 0..n {
+                        sc.add_line(verts[k], verts[(k + 1) % n]);
+                    }
+                }
+            }
             _ => {}
         }
         sc
@@ -372,11 +423,15 @@ impl ZeroCadApp {
             SketchTool::RectangleThreePoint
             | SketchTool::ThreePointCircle
             | SketchTool::Ellipse
-            | SketchTool::ThreePointEllipse => SketchShape::Raw {
+            | SketchTool::ThreePointEllipse
+            | SketchTool::PolygonInscribed
+            | SketchTool::PolygonCircumscribed => SketchShape::Raw {
                 curves: self.raw_curves_from_points(tool, p0, p1, last),
             },
+            // Mirror reflects existing geometry across its 2-click axis; it's
+            // committed via `commit_sketch_mirror`, not the shape pipeline.
             // Fillet/Chamfer modify existing corners; they don't create shapes.
-            SketchTool::Fillet | SketchTool::Chamfer => return None,
+            SketchTool::Mirror | SketchTool::Fillet | SketchTool::Chamfer => return None,
         };
         Some(shape)
     }

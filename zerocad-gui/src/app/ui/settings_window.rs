@@ -56,7 +56,7 @@ impl ZeroCadApp {
                                                 .strong(),
                                         );
                                         ui.add_space(2.0);
-                                        egui::ComboBox::from_id_source("pref_unit_select")
+                                        egui::ComboBox::from_id_salt("pref_unit_select")
                                             .selected_text(match self.current_unit {
                                                 Unit::Millimeter => "Millimeters (mm)",
                                                 Unit::Inch => "Inches (in)",
@@ -84,6 +84,67 @@ impl ZeroCadApp {
 
                                         // --- Onboarding ---
                                         ui.checkbox(&mut self.show_onboarding, "Onboarding Screen");
+
+                                        ui.add_space(12.0);
+
+                                        // --- Renderer ---
+                                        ui.label(egui::RichText::new("Viewport").strong());
+                                        ui.add_space(2.0);
+                                        ui.checkbox(
+                                            &mut self.gpu_render,
+                                            "GPU-accelerated 3D rendering",
+                                        );
+                                        ui.weak(
+                                            "Off falls back to the CPU software renderer (slower, \
+                                             for comparison/troubleshooting).",
+                                        );
+                                        if self.gpu_render && !self.gpu.is_available() {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(200, 140, 40),
+                                                "GPU renderer isn't available on this system — \
+                                                 the CPU renderer is being used.",
+                                            );
+                                        }
+
+                                        ui.add_space(6.0);
+                                        egui::ComboBox::from_label("Anti-aliasing")
+                                            .selected_text(self.msaa_level.label())
+                                            .show_ui(ui, |ui| {
+                                                for level in settings::MsaaLevel::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.msaa_level,
+                                                        level,
+                                                        level.label(),
+                                                    );
+                                                }
+                                            });
+                                        ui.weak(
+                                            "Smooths jagged silhouettes and wireframe edges. \
+                                             Applies immediately; 8× falls back to 4× where \
+                                             unsupported.",
+                                        );
+
+                                        ui.add_space(6.0);
+                                        egui::ComboBox::from_label("Graphics backend")
+                                            .selected_text(self.graphics_backend.label())
+                                            .show_ui(ui, |ui| {
+                                                for b in settings::GraphicsBackend::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.graphics_backend,
+                                                        b,
+                                                        b.label(),
+                                                    );
+                                                }
+                                            });
+                                        ui.weak(
+                                            "Which GPU API the viewport uses. Takes effect after \
+                                             restarting ZeroCAD; if the chosen backend can't \
+                                             start, the app falls back to OpenGL with the CPU \
+                                             renderer.",
+                                        );
+                                        if let Some(info) = self.gpu.adapter_info() {
+                                            ui.weak(format!("Currently rendering on: {info}"));
+                                        }
                                     }
                                     SettingsTab::Shortcuts => {
                                         ui.label(

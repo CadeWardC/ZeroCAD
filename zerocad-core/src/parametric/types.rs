@@ -543,6 +543,17 @@ pub struct ParametricGraph {
     /// it). Persisted; empty for origin-plane and face-attached sketches.
     #[serde(default)]
     pub sketch_datum_refs: HashMap<String, String>,
+    /// For a sketch placed on a body face: that face's boundary loops (outer
+    /// wire + holes), projected into the sketch's 2D plane at creation time and
+    /// keyed by sketch node id. These are *reference* curves — never drawn by
+    /// the user — that participate in region detection so drawn shapes
+    /// intersect the face outline exactly like they intersect each other (and
+    /// the bare face outline itself is an extrudable region). A snapshot: the
+    /// sketch's *plane* re-derives when the body changes (`sketch_face_refs`),
+    /// but the projected outline does not. Persisted; empty for origin-plane /
+    /// datum sketches and legacy documents.
+    #[serde(default)]
+    pub sketch_face_boundaries: HashMap<String, crate::sketch::SketchCurves>,
     #[serde(skip)]
     pub(crate) node_map: HashMap<String, NodeIndex>,
     /// Memoized planar-arrangement results, keyed by a content hash of a
@@ -555,6 +566,16 @@ pub struct ParametricGraph {
     /// starts warm); it is a transparent accelerator, never persisted state.
     #[serde(skip)]
     pub(crate) region_cache: RefCell<HashMap<u64, Vec<Region>>>,
+    /// Face-reattachment updates queued by the last evaluation of THIS graph
+    /// instance: when a face-attached sketch's parent body changed, the
+    /// evaluator re-projected the face outline and remapped the affected
+    /// extrudes' region indices onto the re-split regions — those refreshed
+    /// values are parked here (evaluation is `&self`) for the owner to commit
+    /// via [`ParametricGraph::apply_face_reattach`]. Skipped by serde; clone
+    /// evals (previews, background refines) write to their own clone's queue,
+    /// which dies with it.
+    #[serde(skip)]
+    pub(crate) pending_face_reattach: RefCell<FaceReattach>,
     /// Per-node geometry checkpoints from the previous evaluation, used to skip
     /// re-solving the unchanged prefix of the feature tree. Each entry holds the
     /// assembled bodies *after* one node, keyed by a cumulative content hash of
@@ -565,6 +586,24 @@ pub struct ParametricGraph {
     /// and a transparent accelerator (dropping it only costs a one-time rebuild).
     #[serde(skip)]
     pub(crate) eval_cache: RefCell<EvalCache>,
+}
+
+/// Refreshed sketch-on-face data queued during an evaluation — see
+/// [`ParametricGraph::pending_face_reattach`].
+#[derive(Debug, Clone, Default)]
+pub struct FaceReattach {
+    /// Sketch node id → the face outline re-projected from where the face is
+    /// now (replaces the `sketch_face_boundaries` snapshot).
+    pub boundaries: HashMap<String, crate::sketch::SketchCurves>,
+    /// Sketch node id → the re-derived placement plane the refreshed outline
+    /// was projected into. Written back to the sketch feature's saved `cs` so
+    /// the GUI draws the sketch (and its outline) where the evaluator actually
+    /// built from.
+    pub planes: HashMap<String, crate::geometry::CoordinateSystem>,
+    /// Extrude node id → its `region_indices` remapped onto the regions of the
+    /// refreshed outline (an old index keeps its region by material-point
+    /// containment).
+    pub region_indices: HashMap<String, Vec<usize>>,
 }
 
 /// Checkpoints of [`evaluate_bodies_inner`], one per processed body node, in
@@ -634,7 +673,17 @@ impl FeatureStatus {
 #[derive(Debug, Clone)]
 pub(crate) struct SketchEval {
     pub(crate) cs: CoordinateSystem,
+    /// The DRAWN curves only (variable-resolved). The projected face boundary
+    /// is deliberately NOT folded in here — the drawn-shape recognizers
+    /// (rect-minus-circle, single-circle smooth cylinder) read this field and
+    /// must see only what the user drew. `regions` below were detected on
+    /// drawn ⊕ `face_boundary`.
     pub(crate) curves: SketchCurves,
+    /// Sketch-on-face: the stored projected face outline that joined region
+    /// detection (`graph.sketch_face_boundaries` snapshot). `None` for
+    /// origin-plane / datum sketches. The extrude evaluator re-derives it from
+    /// the live face and re-splits regions when the two differ.
+    pub(crate) face_boundary: Option<SketchCurves>,
     pub(crate) regions: Vec<Region>,
     pub(crate) provenance: Vec<RegionProvenance>,
     /// Full closed outlines of the drawn shapes (before region-splitting), used

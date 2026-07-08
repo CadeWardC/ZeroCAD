@@ -66,7 +66,11 @@ impl ZeroCadApp {
                         egui::RichText::new(format!(
                             "Shell ({} open face{})",
                             op_new.open_faces.len(),
-                            if op_new.open_faces.len() == 1 { "" } else { "s" }
+                            if op_new.open_faces.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
                         ))
                         .strong()
                         .size(13.5)

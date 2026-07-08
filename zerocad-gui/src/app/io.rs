@@ -89,8 +89,7 @@ impl ZeroCadApp {
         self.push_undo();
         self.graph = ParametricGraph::new();
         self.doc_created_unix = None;
-        self.body_meshes = Vec::new();
-        self.mesh_stats = (0, 0);
+        self.set_body_meshes(Vec::new());
         self.selected_node_id = None;
         self.pending_visual = None;
         self.reset_sketch_state();
@@ -242,7 +241,7 @@ impl ZeroCadApp {
                 // --- File Format ---
                 ui.horizontal(|ui| {
                     ui.label("File Format:");
-                    egui::ComboBox::from_id_source("save_format")
+                    egui::ComboBox::from_id_salt("save_format")
                         .selected_text(state.save_format.label())
                         .show_ui(ui, |ui: &mut egui::Ui| {
                             ui.selectable_value(
@@ -714,8 +713,7 @@ impl ZeroCadApp {
         // present when fresh (its hash matched the loaded graph), so it's safe to
         // display; `reevaluate_geometry` then swaps in freshly-computed bodies.
         if let Some(cache) = loaded.mesh_cache {
-            self.body_meshes = cache;
-            self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+            self.set_body_meshes(cache);
         }
         // Seed the onboarding thumbnail cache from the file's embedded preview so
         // a `.zcad` from another machine shows its real thumbnail even if it has

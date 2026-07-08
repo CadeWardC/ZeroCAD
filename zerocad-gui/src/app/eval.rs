@@ -54,7 +54,7 @@ impl ZeroCadApp {
         // Normal dispatch. Skip entirely while a widget holds keyboard focus, so
         // typing in a text field (dimensions, variable names, …) never fires a
         // command. At most one action runs per frame.
-        if ctx.memory(|m| m.focus().is_some()) {
+        if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
         let mut fire = None;
@@ -103,6 +103,16 @@ impl ZeroCadApp {
         }
     }
 
+    /// The ONE way to replace the displayed body meshes. Bumps `mesh_epoch`
+    /// (the GPU viewport re-uploads its scene only when this changes — a
+    /// forgotten bump means it silently renders a stale model) and refreshes
+    /// the cached mesh stats. Never assign `self.body_meshes` directly.
+    pub(crate) fn set_body_meshes(&mut self, bodies: Vec<(String, MockMesh)>) {
+        self.body_meshes = bodies;
+        self.mesh_epoch = self.mesh_epoch.wrapping_add(1);
+        self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+    }
+
     /// Apply an evaluation result to the displayed model + status line.
     pub(crate) fn apply_eval_result(
         &mut self,
@@ -110,8 +120,21 @@ impl ZeroCadApp {
         warnings: Vec<String>,
     ) {
         self.pending_visual = None;
-        self.body_meshes = bodies;
-        self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+        self.set_body_meshes(bodies);
+        // Sketch-on-face reattachment: if the evaluation re-projected a face
+        // outline (the parent body changed), commit the refreshed boundary +
+        // remapped extrude region indices so the displayed sketch and any
+        // future picks agree with what was just built. Self-healing
+        // normalization, not a user edit — no undo step. If the user is
+        // mid-edit on such a sketch, refresh its live reference outline too.
+        if self.graph.apply_face_reattach() {
+            if let Some(editing_id) = self.editing_sketch_id.clone() {
+                if let Some(b) = self.graph.sketch_face_boundaries.get(&editing_id) {
+                    self.active_face_boundary = b.clone();
+                    self.recompute_sketch_regions();
+                }
+            }
+        }
         if warnings.is_empty() {
             self.error_msg = None;
             self.status_msg = "Model evaluated successfully.".to_string();

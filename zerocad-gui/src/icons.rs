@@ -30,6 +30,8 @@ pub const ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d.svg");
 pub const THREE_POINT_ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d-three-points.svg");
 pub const FILLET: &str = include_str!("../../icons/sketch/fillet3d.svg");
 pub const CHAMFER: &str = include_str!("../../icons/sketch/chamfer3d.svg");
+pub const POLYGON: &str = include_str!("../../icons/sketch/polygon.svg");
+pub const MIRROR: &str = include_str!("../../icons/sketch/mirror.svg");
 pub const SKETCH: &str = include_str!("../../icons/sketch/sketch.svg");
 pub const EXTRUDE: &str = include_str!("../../icons/3d/extrude.svg");
 pub const CHECK: &str = include_str!("../../icons/general/check.svg");
@@ -57,6 +59,8 @@ pub enum Icon {
     ThreePointEllipse,
     Fillet,
     Chamfer,
+    Polygon,
+    Mirror,
     Extrude,
     Check,
     EyeOpen,
@@ -85,6 +89,8 @@ impl Icon {
             Icon::ThreePointEllipse => THREE_POINT_ELLIPSE,
             Icon::Fillet => FILLET,
             Icon::Chamfer => CHAMFER,
+            Icon::Polygon => POLYGON,
+            Icon::Mirror => MIRROR,
             Icon::Extrude => EXTRUDE,
             Icon::Check => CHECK,
             Icon::EyeOpen => EYE_OPEN,

@@ -1,11 +1,15 @@
 use crate::*;
 
 impl eframe::App for ZeroCadApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Keep a context handle so a background refine worker can wake the UI.
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }
+        // Hand the GPU viewport eframe's wgpu device/queue for this frame. Cloned
+        // (the render state is Arc-backed) so nothing borrows `frame` past here.
+        self.gpu
+            .set_render_state(frame.wgpu_render_state().cloned());
         // Swap in any finished background refine.
         self.poll_refine_eval();
         self.tick_speculative_edge_mod(ctx);

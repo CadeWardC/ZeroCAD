@@ -125,6 +125,14 @@ impl ZeroCadApp {
                         }
                         self.graph.sketch_face_refs.insert(sketch_id.clone(), fref);
                     }
+                    // The projected face outline persists with the sketch so
+                    // rebuilds (and later edit sessions) detect the same
+                    // boundary-split regions the user saw while drawing.
+                    if self.active_sketch_on_face && !self.active_face_boundary.is_empty() {
+                        self.graph
+                            .sketch_face_boundaries
+                            .insert(sketch_id.clone(), self.active_face_boundary.clone());
+                    }
                     // A sketch placed on a datum plane records the datum + a
                     // dependency, so its plane re-derives from the datum's current
                     // resolution on every rebuild (editing the datum moves it).
@@ -179,16 +187,21 @@ impl ZeroCadApp {
 
                         let cs_and_ref = face_sel.and_then(|(nid, fid)| {
                             self.face_cs(&nid, fid)
-                                .map(|cs| (cs, self.face_ref(&nid, fid)))
+                                .map(|cs| (cs, self.face_ref(&nid, fid), nid, fid))
                         });
                         match cs_and_ref {
-                            Some((cs, fref)) => {
+                            Some((cs, fref, nid, fid)) => {
                                 log::info!("Sketching on a selected body face.");
+                                let boundary = self.face_boundary_curves(&nid, fid, &cs);
                                 let now = ui.input(|i| i.time);
                                 self.active_sketch_on_face = true;
                                 // Remember which face, so the finished sketch follows it.
                                 self.active_sketch_face_ref = fref;
                                 self.begin_sketch_on(cs, now);
+                                // After begin (it resets sketch state): the face
+                                // outline joins the sketch as reference geometry.
+                                self.active_face_boundary = boundary;
+                                self.recompute_sketch_regions();
                                 self.status_msg =
                                     "Sketching on the selected face. Draw a profile, then Finish Sketch.".to_string();
                             }
@@ -211,6 +224,14 @@ impl ZeroCadApp {
             let sel = self.selected_faces.len();
             let extrude_enabled = sel > 0;
 
+            // Direct push/pull: exactly one planar BODY face selected (and no
+            // sketch faces) → the Extrude button pulls/pushes that face via a
+            // hidden helper sketch of its projected outline.
+            let body_face = (sel == 0)
+                .then(|| self.hole_face_candidate())
+                .flatten()
+                .filter(|(n, f)| self.face_is_planar(n, *f));
+
             if extrude_enabled {
                 let extrude_btn = icons::Icon::Extrude.labeled_button(
                     ui,
@@ -225,6 +246,23 @@ impl ZeroCadApp {
                     .clicked()
                 {
                     self.begin_extrude_from_selection();
+                }
+            } else if let Some((node, fid)) = body_face {
+                let extrude_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Extrude Face",
+                    egui::Color32::from_rgb(37, 99, 235),
+                    egui::Color32::from_rgb(29, 78, 216),
+                    egui::Color32::WHITE,
+                    egui::Stroke::NONE,
+                );
+                if extrude_btn
+                    .on_hover_text(
+                        "Push/pull the selected body face: pull out to add material (Join), push in to remove it (Cut)",
+                    )
+                    .clicked()
+                {
+                    self.begin_extrude_on_body_face(node, fid);
                 }
             } else {
                 // Inert (no selection): same fill on hover so it reads disabled.
@@ -362,17 +400,23 @@ impl ZeroCadApp {
                 if btn.secondary_clicked() {
                     ui.memory_mut(|m| m.toggle_popup(popup_id));
                 }
-                egui::popup_below_widget(ui, popup_id, &btn, |ui| {
-                    ui.set_min_width(140.0);
-                    if icons::Icon::Fillet.menu_button(ui, "Fillet").clicked() {
-                        self.begin_edge_mod(CornerKind::Fillet);
-                        ui.memory_mut(|m| m.close_popup());
-                    }
-                    if icons::Icon::Chamfer.menu_button(ui, "Chamfer").clicked() {
-                        self.begin_edge_mod(CornerKind::Chamfer);
-                        ui.memory_mut(|m| m.close_popup());
-                    }
-                });
+                egui::popup_below_widget(
+                    ui,
+                    popup_id,
+                    &btn,
+                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                    |ui| {
+                        ui.set_min_width(140.0);
+                        if icons::Icon::Fillet.menu_button(ui, "Fillet").clicked() {
+                            self.begin_edge_mod(CornerKind::Fillet);
+                            ui.memory_mut(|m| m.close_popup());
+                        }
+                        if icons::Icon::Chamfer.menu_button(ui, "Chamfer").clicked() {
+                            self.begin_edge_mod(CornerKind::Chamfer);
+                            ui.memory_mut(|m| m.close_popup());
+                        }
+                    },
+                );
             });
             ui.label(
                 egui::RichText::new("Works best on a convex edge of a plain box/extrude.")
@@ -475,42 +519,48 @@ impl ZeroCadApp {
             if datum_btn.clicked() {
                 ui.memory_mut(|mem| mem.toggle_popup(datum_btn_id));
             }
-            egui::popup_below_widget::<()>(ui, datum_btn_id, &datum_btn, |ui| {
-                ui.set_min_width(190.0);
-                ui.style_mut().spacing.button_padding = egui::vec2(14.0, 5.0);
-                ui.label(
-                    egui::RichText::new("Offset plane from…")
-                        .size(10.5)
-                        .color(self.pal().text_faint),
-                );
-                for (label, base) in [
-                    ("XY Plane", zerocad_core::PlaneBase::XY),
-                    ("XZ Plane (ground)", zerocad_core::PlaneBase::XZ),
-                    ("YZ Plane", zerocad_core::PlaneBase::YZ),
-                ] {
-                    if ui.button(label).clicked() {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.create_datum(DatumKind::OffsetPlane(base));
+            egui::popup_below_widget::<()>(
+                ui,
+                datum_btn_id,
+                &datum_btn,
+                egui::PopupCloseBehavior::CloseOnClickOutside,
+                |ui| {
+                    ui.set_min_width(190.0);
+                    ui.style_mut().spacing.button_padding = egui::vec2(14.0, 5.0);
+                    ui.label(
+                        egui::RichText::new("Offset plane from…")
+                            .size(10.5)
+                            .color(self.pal().text_faint),
+                    );
+                    for (label, base) in [
+                        ("XY Plane", zerocad_core::PlaneBase::XY),
+                        ("XZ Plane (ground)", zerocad_core::PlaneBase::XZ),
+                        ("YZ Plane", zerocad_core::PlaneBase::YZ),
+                    ] {
+                        if ui.button(label).clicked() {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(DatumKind::OffsetPlane(base));
+                        }
                     }
-                }
-                ui.separator();
-                if ui.button("Angle Plane").clicked() {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.create_datum(DatumKind::AnglePlane);
-                }
-                if ui.button("3-Point Plane").clicked() {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.create_datum(DatumKind::ThreePointPlane);
-                }
-                if ui.button("Axis (2 points)").clicked() {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.create_datum(DatumKind::Axis);
-                }
-                if ui.button("Point").clicked() {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.create_datum(DatumKind::Point);
-                }
-            });
+                    ui.separator();
+                    if ui.button("Angle Plane").clicked() {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.create_datum(DatumKind::AnglePlane);
+                    }
+                    if ui.button("3-Point Plane").clicked() {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.create_datum(DatumKind::ThreePointPlane);
+                    }
+                    if ui.button("Axis (2 points)").clicked() {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.create_datum(DatumKind::Axis);
+                    }
+                    if ui.button("Point").clicked() {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.create_datum(DatumKind::Point);
+                    }
+                },
+            );
         }
 
         if self.is_plane_selection_mode {

@@ -49,6 +49,7 @@ pub use geom_utils::*;
 pub use history::*;
 #[allow(unused_imports)]
 pub(crate) use mesh_topology::*;
+pub use mesh_topology::mesh_face_boundary_2d;
 pub use primitives::*;
 #[allow(unused_imports)]
 pub(crate) use tessellation::*;

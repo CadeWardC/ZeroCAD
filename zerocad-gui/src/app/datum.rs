@@ -62,12 +62,7 @@ impl ZeroCadApp {
             let p = cs.unproject(u, v);
             [p.x, p.y, p.z]
         };
-        [
-            corner(-h, -h),
-            corner(h, -h),
-            corner(h, h),
-            corner(-h, h),
-        ]
+        [corner(-h, -h), corner(h, -h), corner(h, h), corner(-h, h)]
     }
 
     /// Create a datum feature with sensible defaults (undoable) and select it
@@ -145,4 +140,3 @@ impl ZeroCadApp {
         self.status_msg = format!("{name} created — tune it in the Properties panel.");
     }
 }
-

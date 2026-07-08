@@ -11,6 +11,7 @@ mod concave_edge_mod;
 mod datum_attach;
 mod edge_mods;
 mod extrude_modes;
+mod face_boundary_sketch;
 mod fillet_chamfer;
 mod hole_feature;
 mod import;

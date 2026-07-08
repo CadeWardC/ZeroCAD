@@ -105,8 +105,7 @@ impl ZeroCadApp {
             .node_indices()
             .filter_map(|i| {
                 let node = &self.graph.graph[i];
-                (matches!(node.feature, FeatureType::Sketch { .. })
-                    && node.id != op.profile_sketch)
+                (matches!(node.feature, FeatureType::Sketch { .. }) && node.id != op.profile_sketch)
                     .then(|| (node.id.clone(), node.name.clone()))
             })
             .collect();
@@ -134,7 +133,7 @@ impl ZeroCadApp {
                             .and_then(|id| sketches.iter().find(|(sid, _)| sid == id))
                             .map(|(_, name)| name.clone())
                             .unwrap_or_else(|| "— pick —".to_string());
-                        egui::ComboBox::from_id_source("sweep_path")
+                        egui::ComboBox::from_id_salt("sweep_path")
                             .selected_text(selected)
                             .show_ui(ui, |ui| {
                                 for (sid, name) in &sketches {

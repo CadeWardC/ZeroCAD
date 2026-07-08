@@ -6,8 +6,10 @@ impl ParametricGraph {
             graph: DiGraph::new(),
             sketch_face_refs: HashMap::new(),
             sketch_datum_refs: HashMap::new(),
+            sketch_face_boundaries: HashMap::new(),
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
+            pending_face_reattach: RefCell::new(FaceReattach::default()),
             eval_cache: RefCell::new(EvalCache::default()),
         };
         pg.bootstrap_origin();
@@ -75,7 +77,47 @@ impl ParametricGraph {
             return false;
         };
         self.graph.remove_node(idx);
+        // Drop the side-map entries keyed by this id — feature ids can be
+        // reused across sessions (the GUI counter restarts on load), and a
+        // stale face ref/boundary would silently attach to the newcomer.
+        self.sketch_face_refs.remove(id);
+        self.sketch_datum_refs.remove(id);
+        self.sketch_face_boundaries.remove(id);
         self.rebuild_node_map();
+        true
+    }
+
+    /// Commit the face-reattachment updates queued by the last evaluation of
+    /// this graph instance (see [`ParametricGraph::pending_face_reattach`]):
+    /// refreshed sketch-on-face outlines replace their
+    /// `sketch_face_boundaries` snapshots, and the affected extrudes' stored
+    /// `region_indices` are rewritten to the remapped values — atomically, so
+    /// the invariant "indices are in the space of drawn ⊕ stored-boundary
+    /// regions" holds at all times. Returns whether anything changed. A
+    /// self-healing normalization (like node-map resync), not a user edit —
+    /// callers should NOT push an undo step for it.
+    pub fn apply_face_reattach(&mut self) -> bool {
+        let pending = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
+        if pending.boundaries.is_empty() && pending.region_indices.is_empty() {
+            return false;
+        }
+        for (sketch_id, boundary) in pending.boundaries {
+            self.sketch_face_boundaries.insert(sketch_id, boundary);
+        }
+        for (sketch_id, plane) in pending.planes {
+            if let Some(idx) = self.resolve_node(&sketch_id) {
+                if let FeatureType::Sketch { cs, .. } = &mut self.graph[idx].feature {
+                    *cs = plane;
+                }
+            }
+        }
+        for (node_id, indices) in pending.region_indices {
+            if let Some(idx) = self.resolve_node(&node_id) {
+                if let FeatureType::Extrude { region_indices, .. } = &mut self.graph[idx].feature {
+                    *region_indices = indices;
+                }
+            }
+        }
         true
     }
 
@@ -797,6 +839,14 @@ impl ParametricGraph {
                     solver.as_ref(),
                     vars,
                 );
+                // Sketch-on-face: region detection sees the projected face
+                // boundary (reference curves) so drawn shapes split against the
+                // face outline and the outline itself is a region. Appended
+                // AFTER the drawn curves — the same order every GUI region site
+                // uses, so the region indices stored on extrudes stay
+                // consistent. `effective` itself stays drawn-only (the shape
+                // recognizers downstream depend on that).
+                let face_boundary = self.sketch_face_boundaries.get(&self.graph[idx].id).cloned();
                 // Fail-loud: a variable-driven constraint model that no longer
                 // solves keeps its last-valid geometry, and the failure reason
                 // rides along so the consuming extrude can report it.
@@ -825,7 +875,14 @@ impl ParametricGraph {
                             }),
                         }
                     });
-                let regions = self.cached_regions(&effective);
+                let regions = match &face_boundary {
+                    Some(boundary) => {
+                        let mut merged = effective.clone();
+                        merged.extend_curves(boundary);
+                        self.cached_regions(&merged)
+                    }
+                    None => self.cached_regions(&effective),
+                };
                 let provenance =
                     build_region_provenance(&effective, shapes, entity_ids, &regions);
                 // Whole-shape outlines drive the overlapping-shapes-as-boolean
@@ -844,6 +901,7 @@ impl ParametricGraph {
                         regions,
                         provenance,
                         curves: effective,
+                        face_boundary,
                         shape_loops,
                         solve_failure,
                     },
@@ -965,7 +1023,81 @@ impl ParametricGraph {
             })
             .unwrap_or(sketch.cs);
         let cs = &cs_owned;
-        let regions = &sketch.regions;
+
+        // Associative face outline: a sketch-on-face carries the projected face
+        // boundary as reference geometry. Re-project it from wherever the face
+        // is NOW (the body may have changed upstream); when it differs from the
+        // stored snapshot, re-split the regions against the fresh outline and
+        // remap this extrude's stored region indices onto them — an old region
+        // keeps its identity by material-point containment (same index
+        // preferred). The refreshed outline + indices are queued for a
+        // persistent write-back (`apply_face_reattach`) so the GUI shows the
+        // moved outline and the stored indices stay in the space they were
+        // detected in. On any failure the stored snapshot is used, as before.
+        let mut refreshed: Option<(Vec<Region>, Vec<usize>)> = None;
+        if let (Some(stored_boundary), Some(face_ref)) = (
+            sketch.face_boundary.as_ref(),
+            self.sketch_face_refs.get(sketch_id),
+        ) {
+            if let Some(fresh_boundary) = rederive_face_boundary(face_ref, live, cs) {
+                if hash_curves(&fresh_boundary) != hash_curves(stored_boundary) {
+                    let mut merged = sketch.curves.clone();
+                    merged.extend_curves(&fresh_boundary);
+                    let fresh_regions = self.cached_regions(&merged);
+                    let mut remapped: Vec<usize> = Vec::new();
+                    let mut lost = 0usize;
+                    for &i in region_indices {
+                        let Some(old) = sketch.regions.get(i) else {
+                            lost += 1;
+                            continue;
+                        };
+                        let p = region_material_point(old);
+                        let target = if fresh_regions.get(i).is_some_and(|r| r.contains(p)) {
+                            Some(i)
+                        } else {
+                            fresh_regions.iter().position(|r| r.contains(p))
+                        };
+                        match target {
+                            Some(j) => {
+                                if !remapped.contains(&j) {
+                                    remapped.push(j);
+                                }
+                            }
+                            None => lost += 1,
+                        }
+                    }
+                    if lost > 0 {
+                        warnings.push(format!(
+                            "Extrude '{node_id}': {lost} selected region(s) of sketch \
+                             '{sketch_id}' did not survive the face outline change."
+                        ));
+                    }
+                    // A selection that lost EVERY region would degenerate to
+                    // "all regions" (empty selector) — keep the stored snapshot
+                    // instead and fail loud above.
+                    let selection_survives = region_indices.is_empty() || !remapped.is_empty();
+                    if !fresh_regions.is_empty() && selection_survives {
+                        let mut pending = self.pending_face_reattach.borrow_mut();
+                        pending
+                            .boundaries
+                            .insert(sketch_id.clone(), fresh_boundary);
+                        pending.planes.insert(sketch_id.clone(), *cs);
+                        if remapped != region_indices {
+                            pending
+                                .region_indices
+                                .insert(node_id.to_string(), remapped.clone());
+                        }
+                        refreshed = Some((fresh_regions, remapped));
+                    }
+                }
+            }
+        }
+        let (regions_owned, indices_owned): (Vec<Region>, Vec<usize>) = match refreshed {
+            Some((r, i)) => (r, i),
+            None => (sketch.regions.clone(), region_indices.to_vec()),
+        };
+        let regions = &regions_owned;
+        let region_indices: &[usize] = &indices_owned;
         if regions.is_empty() {
             return;
         }
@@ -1066,7 +1198,11 @@ impl ParametricGraph {
             if region_is_boolean[i] && matches!(mode, ExtrudeMode::NewBody) {
                 newbody_has_boolean = true;
             }
-            let provenance = sketch.provenance.get(i);
+            // Provenance fragments are identical for every region of a sketch
+            // (see `build_region_provenance`), so when a refreshed face outline
+            // yields MORE regions than the snapshot had, the extras borrow the
+            // first entry rather than losing recognizer support.
+            let provenance = sketch.provenance.get(i).or_else(|| sketch.provenance.first());
             match mode {
                 ExtrudeMode::NewBody => {
                     // A filleted profile (analytic corner arcs) is NOT a rectangle
@@ -2108,6 +2244,44 @@ fn rederive_sketch_cs(face_ref: &FaceRef, live: &[LiveBody]) -> Option<Coordinat
     let body = live.iter().find(|b| b.id == body_id)?;
     let resolved = resolve_face_ref_by_topology(body, face_ref)?;
     Some(cs_from_face(resolved.centroid, resolved.normal))
+}
+
+/// Re-project a face-attached sketch's boundary outline from wherever its face
+/// is NOW, into `cs` (the sketch's already re-derived placement plane, so the
+/// outline and the drawn curves land in the same 2D space). Resolves the face
+/// the same way plane re-derivation does (topology name first, geometry
+/// fallback), then reads the numeric mesh face id off the nearest matching
+/// `MeshFaceRef` and extracts its boundary loops with the SAME shared code the
+/// GUI used at capture time — an unchanged face reproduces the stored snapshot
+/// bit-for-bit, which is the caller's cheap "did anything move?" test.
+fn rederive_face_boundary(
+    face_ref: &FaceRef,
+    live: &[LiveBody],
+    cs: &CoordinateSystem,
+) -> Option<SketchCurves> {
+    let body_id = face_ref.topology.as_ref()?.body_id.as_deref()?;
+    let body = live.iter().find(|b| b.id == body_id)?;
+    let resolved = resolve_face_ref_by_topology(body, face_ref)?;
+    let pick = |mesh: &MockMesh| -> Option<SketchCurves> {
+        let f = mesh
+            .face_refs
+            .iter()
+            .filter(|c| dot3(c.normal, resolved.normal) >= 0.99)
+            .min_by(|a, b| {
+                distance3(a.centroid, resolved.centroid)
+                    .partial_cmp(&distance3(b.centroid, resolved.centroid))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        if distance3(f.centroid, resolved.centroid) > 1.0e-3 {
+            return None;
+        }
+        let boundary = crate::mock_kernel::mesh_face_boundary_2d(mesh, f.face_id, cs);
+        (!boundary.is_empty()).then_some(boundary)
+    };
+    body.pristine
+        .as_ref()
+        .and_then(pick)
+        .or_else(|| pick(&edge_mod_reference_mesh(body)))
 }
 
 /// A sketch-plane coordinate system for a face at `centroid` with outward
