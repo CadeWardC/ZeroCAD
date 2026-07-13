@@ -17,7 +17,12 @@ fn pocketed_block_graph() -> ParametricGraph {
     add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (20.0, 20.0)));
     add_extrude(&mut g, "extrude_2", "sketch_1", 10.0, ExtrudeMode::NewBody);
     let top = CoordinateSystem::new(Vec3::new(0.0, 0.0, 10.0), Vec3::X, Vec3::Y);
-    add_sketch_cs(&mut g, "sketch_3", top, rect_sketch((5.0, 5.0), (15.0, 15.0)));
+    add_sketch_cs(
+        &mut g,
+        "sketch_3",
+        top,
+        rect_sketch((5.0, 5.0), (15.0, 15.0)),
+    );
     add_extrude(&mut g, "extrude_4", "sketch_3", 6.0, ExtrudeMode::Cut);
     g
 }
@@ -153,4 +158,94 @@ fn concave_pocket_edge_chamfer_applies_and_adds_bevel() {
         bevel_vertex,
         "expected chamfer bevel vertices on the x+y=11.5 plane at the pocket corner"
     );
+}
+
+fn pocket_vertical_edge_ref() -> EdgeRef {
+    EdgeRef {
+        p0: [5.0, 5.0, 3.9],
+        p1: [5.0, 5.0, 10.0],
+        n1: [1.0, 0.0, 0.0],
+        n2: [0.0, 1.0, 0.0],
+        curve: None,
+        topology: None,
+    }
+}
+
+fn pocket_top_rim_edge_ref() -> EdgeRef {
+    EdgeRef {
+        p0: [5.0, 5.0, 10.0],
+        p1: [15.0, 5.0, 10.0],
+        n1: [0.0, 0.0, 1.0],
+        n2: [0.0, 1.0, 0.0],
+        curve: None,
+        topology: None,
+    }
+}
+
+fn add_chained_pocket_fillets(g: &mut ParametricGraph, vertical_first: bool) {
+    let edges = if vertical_first {
+        [pocket_vertical_edge_ref(), pocket_top_rim_edge_ref()]
+    } else {
+        [pocket_top_rim_edge_ref(), pocket_vertical_edge_ref()]
+    };
+    for (id, edge) in [
+        ("edgemod_5", edges[0].clone()),
+        ("edgemod_6", edges[1].clone()),
+    ] {
+        g.add_feature(FeatureNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            feature: FeatureType::EdgeMod {
+                target: "extrude_2".to_string(),
+                edge,
+                dist: 2.0,
+                dist_expr: None,
+                scope: EdgeModScope::FullEdge,
+                replay: Default::default(),
+                kind: crate::sketch::CornerKind::Fillet,
+            },
+        });
+    }
+    g.add_dependency("extrude_4", "edgemod_5");
+    g.add_dependency("edgemod_5", "edgemod_6");
+}
+
+#[test]
+fn chained_pocket_fillets_form_concave_miter_through_parametric_graph() {
+    for (label, vertical_first) in [("vertical->top", true), ("top->vertical", false)] {
+        let mut g = pocketed_block_graph();
+        add_chained_pocket_fillets(&mut g, vertical_first);
+        let (live, warnings) = g
+            .build_live(&HashSet::new(), false)
+            .expect("chained pocket fillets must evaluate");
+        assert!(
+            warnings.is_empty(),
+            "{label} must apply without validation warnings: {warnings:?}"
+        );
+        assert_eq!(live.len(), 1, "{label} must keep one body");
+        let parts = &live[0].parts;
+        assert_eq!(parts.len(), 1, "{label} must retain one kernel solid");
+        let solid = &parts[0];
+        let mesh = MockMesh::from_solid(solid);
+        let (cracks, nonmanifold, _inward) = mesh_stats(&mesh);
+        assert_eq!(cracks, 0, "{label} display mesh must be crack-free");
+        assert_eq!(nonmanifold, 0, "{label} display mesh must remain manifold");
+        assert!(
+            solid.is_watertight() && solid.health_report().is_healthy(),
+            "{label} kernel solid must be healthy"
+        );
+        assert_eq!(
+            solid
+                .shell()
+                .faces()
+                .iter()
+                .filter(|face| matches!(
+                    face.surface(),
+                    Some(openrcad::geom::GeomSurface::Ruled(_))
+                ))
+                .count(),
+            1,
+            "{label} must contain one ruled concave-miter patch"
+        );
+    }
 }

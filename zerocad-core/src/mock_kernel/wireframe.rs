@@ -113,18 +113,6 @@ pub(crate) fn build_cylinder_wireframe(
         edge_face_normals.extend_from_slice(&radial(seg_mid(i)));
     }
 
-    // Four vertical struts at quadrants — silhouette helpers along the wall, so
-    // both adjacent "faces" are the wall at that angle.
-    for k in 0..4u32 {
-        let theta = (k as f32 / 4.0) * std::f32::consts::TAU;
-        let b = push_vtx(&mut edge_vertices, r * theta.cos(), 0.0, r * theta.sin());
-        let t = push_vtx(&mut edge_vertices, r * theta.cos(), h, r * theta.sin());
-        edge_indices.push(b);
-        edge_indices.push(t);
-        edge_face_normals.extend_from_slice(&radial(theta));
-        edge_face_normals.extend_from_slice(&radial(theta));
-    }
-
     (edge_vertices, edge_indices, edge_face_normals)
 }
 
@@ -245,8 +233,8 @@ pub(crate) fn build_extrusion_wireframe(
     (edge_vertices, edge_indices, edge_face_normals)
 }
 
-/// Wireframe for a real cylinder: two smooth rim circles (top + bottom) and a
-/// few silhouette struts down the wall, oriented onto the sketch plane. Each
+/// Wireframe for a real cylinder: only the two real smooth rim circles (top +
+/// bottom), oriented onto the sketch plane. Each
 /// edge carries the two adjacent face normals (cap + radial wall) so the
 /// renderer's hidden-line removal works exactly as it does for prisms — but the
 /// wall reads as one smooth surface instead of a fan of facet edges.
@@ -298,17 +286,6 @@ pub(crate) fn build_oriented_cylinder_wireframe(
         ei.push(top[i]);
         ei.push(top[j]);
         push_n(&mut efn, cap_top, radial(mid(i)));
-    }
-
-    // Four silhouette struts at the quadrants (both adjacent "faces" are the
-    // wall at that angle, so the strut shows whenever the wall faces the camera).
-    for k in 0..4 {
-        let a = (k as f32 / 4.0) * std::f32::consts::TAU;
-        let b = push(rim(a, Vec3::ZERO));
-        let t = push(rim(a, axis));
-        ei.push(b);
-        ei.push(t);
-        push_n(&mut efn, radial(a), radial(a));
     }
 
     (ev, ei, efn)

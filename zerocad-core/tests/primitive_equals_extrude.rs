@@ -31,7 +31,11 @@ fn faces(g: &ParametricGraph) -> (usize, usize) {
 
 /// Display-mesh triangle count of the single body.
 fn tris(g: &ParametricGraph) -> usize {
-    g.evaluate_bodies(&HashSet::new()).unwrap()[0].1.indices.len() / 3
+    g.evaluate_bodies(&HashSet::new()).unwrap()[0]
+        .1
+        .indices
+        .len()
+        / 3
 }
 
 fn box_primitive(w: f32, h: f32, d: f32) -> ParametricGraph {
@@ -59,6 +63,7 @@ fn sketched_rect(w: f32, h: f32, d: f32) -> ParametricGraph {
             curves: c,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -87,7 +92,11 @@ fn box_primitive_equals_sketched_rectangle() {
         faces(&sketch),
         "box primitive and sketched rectangle must have identical B-Rep faces"
     );
-    assert_eq!(faces(&prim), (6, 0), "a box is 6 planar faces, no cylinders");
+    assert_eq!(
+        faces(&prim),
+        (6, 0),
+        "a box is 6 planar faces, no cylinders"
+    );
 
     // Display meshes match too — both derive from the same part solid now.
     assert_eq!(
@@ -106,7 +115,10 @@ fn cylinder_primitive_is_analytic_and_display_matches_part() {
         feature: FeatureType::Cylinder { r: 8.0, h: 20.0 },
     });
     let (total, cyl) = faces(&g);
-    assert!(cyl >= 1, "cylinder primitive keeps an analytic cylindrical wall, got {cyl}");
+    assert!(
+        cyl >= 1,
+        "cylinder primitive keeps an analytic cylindrical wall, got {cyl}"
+    );
     assert!(
         total <= 8,
         "cylinder primitive stays analytic (a handful of faces), got {total}"

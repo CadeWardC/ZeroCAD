@@ -202,6 +202,16 @@ pub fn references_variable(input: &str) -> bool {
     }
 }
 
+/// True when `input` should be kept as editable source text instead of being
+/// collapsed to its evaluated numeric value. Plain numeric literals do not
+/// need a separate source representation; arithmetic and variable expressions
+/// do. Validation is deliberately left to [`eval`] because an expression may
+/// be temporarily incomplete while the user is editing it.
+pub fn preserves_source(input: &str) -> bool {
+    let input = input.trim();
+    !input.is_empty() && input.parse::<f64>().is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +272,14 @@ mod tests {
         assert!(references_variable("width / 2 + 3"));
         assert!(!references_variable("42"));
         assert!(!references_variable("3.5 * 2"));
+    }
+
+    #[test]
+    fn arithmetic_expression_preserves_its_source() {
+        assert!(!preserves_source("42"));
+        assert!(!preserves_source(" 3.5 "));
+        assert!(preserves_source("43/2"));
+        assert!(preserves_source("(2 + 3) * 4"));
+        assert!(preserves_source("width / 2"));
     }
 }

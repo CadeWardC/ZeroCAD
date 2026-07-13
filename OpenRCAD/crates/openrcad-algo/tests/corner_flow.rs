@@ -245,7 +245,7 @@ fn arc_then_straight_fillets_flow_through_the_corner() {
 /// The two application orders must converge on the SAME body (the miter seam is
 /// the mutual band∩band intersection either way).
 #[test]
-fn corner_flow_is_order_independent()  {
+fn corner_flow_is_order_independent() {
     let s = corner_bitten_box();
     let via_straight_first = fillet_arc_chain(&fillet_straight(&s));
     let via_arc_first = fillet_straight(&fillet_arc_chain(&s));

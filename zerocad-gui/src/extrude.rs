@@ -1,14 +1,16 @@
 //! The extrude tool: the live (uncommitted) extrude operation and its preview,
 //! plus committing it into the parametric graph and the inline distance dialog.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use zerocad_core::{
     detect_regions, CoordinateSystem, ExtrudeMode, FeatureNode, FeatureType, MockMesh, Region,
 };
 
-use crate::{PendingCommitVisual, PendingVisualMode, ZeroCadApp};
+use crate::{PendingCommitVisual, PendingVisualMode, SharedBodyMeshes, ZeroCadApp};
+
+const EXTRUDE_PREVIEW_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The default extrude mode for a freshly started op: a sketch on a body face
 /// pulled **outward** (depth ≥ 0, along the outward face normal) adds material
@@ -24,6 +26,59 @@ pub(crate) fn default_extrude_mode(on_face: bool, depth: f32) -> ExtrudeMode {
     }
 }
 
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn split_circle_preview_is_clean_in_every_extrude_mode() {
+        let circle = zerocad_core::Circle {
+            center: (0.0, 0.0),
+            radius: 2.0,
+        };
+        let mut curves = zerocad_core::SketchCurves::new();
+        curves.add_circle(circle.center, circle.radius);
+        curves.add_line((0.0, -3.0), (0.0, 3.0));
+        let regions = detect_regions(&curves);
+        assert!(regions.len() >= 2, "line should split the circle");
+
+        for mode in [ExtrudeMode::NewBody, ExtrudeMode::Join, ExtrudeMode::Cut] {
+            let op = ExtrudeOp {
+                targets: vec![ExtrudeTarget {
+                    sketch_id: "sketch_1".into(),
+                    cs: CoordinateSystem::XY,
+                    indices: (0..regions.len()).collect(),
+                    regions: regions.clone(),
+                    loops: Vec::new(),
+                    circles: vec![circle],
+                    on_face: mode != ExtrudeMode::NewBody,
+                }],
+                depth: 4.0,
+                depth_text: "4".into(),
+                focus_request: false,
+                mode,
+                on_face: mode != ExtrudeMode::NewBody,
+                mode_user_set: true,
+                pending_face_sketch: None,
+            };
+            let parts = op.preview_part_meshes(4.0);
+            assert_eq!(parts.len(), 1);
+            let seams: Vec<_> = parts[0]
+                .2
+                .edge_refs
+                .iter()
+                .filter(|edge| {
+                    matches!(
+                        edge.curve,
+                        Some(zerocad_core::mock_kernel::EdgeCurveHint::Line)
+                    ) && (edge.p0[2] - edge.p1[2]).abs() > 3.9
+                })
+                .collect();
+            assert!(seams.is_empty(), "{mode:?} preview seams: {seams:#?}");
+        }
+    }
+}
+
 /// Faces from one sketch that participate in an extrude, plus the geometry
 /// needed to build the preview mesh without touching the parametric graph.
 #[derive(Debug, Clone)]
@@ -32,6 +87,15 @@ pub(crate) struct ExtrudeTarget {
     pub(crate) cs: CoordinateSystem,
     pub(crate) regions: Vec<Region>,
     pub(crate) indices: Vec<usize>,
+    /// The sketch's shape outlines, so the ghost can resolve overlapping-shapes-
+    /// as-boolean exactly like the evaluator (dropping the tool-lens region of a
+    /// circle-in-rectangle so it reads as a hole). Empty for a direct face
+    /// push/pull (no drawn shapes).
+    pub(crate) loops: Vec<zerocad_core::ShapeLoop>,
+    /// Variable-resolved analytic circles from the sketch. Kept separately from
+    /// the split regions so the orange ghost can rebuild a clean cylinder when a
+    /// construction/projected line divides the circle into multiple faces.
+    pub(crate) circles: Vec<zerocad_core::Circle>,
     /// True when the source sketch sits on an existing body face (vs an origin
     /// plane). Drives the auto-chosen extrude mode (face → Join/Cut, plane →
     /// New Body).
@@ -79,26 +143,104 @@ pub(crate) struct ExtrudeOp {
 }
 
 impl ExtrudeOp {
-    /// Build the combined preview mesh for the current depth.
-    pub(crate) fn preview_mesh(&self) -> MockMesh {
-        let mut mesh = MockMesh::empty();
-        if self.depth.abs() < f32::EPSILON {
-            return mesh;
+    /// Build the per-target ghost meshes at `depth`, each paired with its
+    /// extrusion plane origin and axis so a cached build can later be rescaled
+    /// along the axis instead of re-tessellated (curved profiles run the
+    /// kernel prism per build — see [`ZeroCadApp::cached_preview_mesh`]).
+    pub(crate) fn preview_part_meshes(
+        &self,
+        depth: f32,
+    ) -> Vec<(zerocad_core::Vec3, zerocad_core::Vec3, MockMesh)> {
+        let mut parts = Vec::new();
+        if depth.abs() < f32::EPSILON {
+            return parts;
         }
         for t in &self.targets {
-            for &ri in &t.indices {
-                if let Some(r) = t.regions.get(ri) {
-                    mesh.append(zerocad_core::mock_kernel::extruded_region_display_mesh(
-                        &r.boundary,
-                        &r.holes,
-                        self.depth,
-                        &t.cs,
-                    ));
-                }
+            // Keep exactly the regions a commit would: for overlapping shapes the
+            // boolean plan drops the tool-lens region (the inner disc of a
+            // circle-in-rectangle), so the annulus — which already carries that
+            // disc as a hole — renders as a clean prism-with-hole.
+            let plan = zerocad_core::boolean_region_plan(&t.loops, &t.regions, &t.indices);
+            let mut mesh = MockMesh::empty();
+            let complete_circles =
+                zerocad_core::complete_selected_circles(&t.circles, &t.regions, &plan.process);
+            let mut collapsed_regions = HashSet::new();
+            for (circle, indices) in complete_circles {
+                let boundary: Vec<(f32, f32)> = (0..zerocad_core::CIRCLE_SEGS)
+                    .map(|i| {
+                        let angle =
+                            i as f32 / zerocad_core::CIRCLE_SEGS as f32 * std::f32::consts::TAU;
+                        (
+                            circle.center.0 + circle.radius * angle.cos(),
+                            circle.center.1 + circle.radius * angle.sin(),
+                        )
+                    })
+                    .collect();
+                mesh.append(zerocad_core::mock_kernel::extruded_region_display_mesh(
+                    &boundary,
+                    &[],
+                    depth,
+                    &t.cs,
+                ));
+                collapsed_regions.extend(indices);
             }
+            for (ri, r) in t.regions.iter().enumerate() {
+                if collapsed_regions.contains(&ri) {
+                    continue;
+                }
+                if !plan.process.get(ri).copied().unwrap_or(false) {
+                    continue;
+                }
+                mesh.append(zerocad_core::mock_kernel::extruded_region_display_mesh(
+                    &r.boundary,
+                    &r.holes,
+                    depth,
+                    &t.cs,
+                ));
+            }
+            // The true extrusion axis is u×v (cs.n can be flipped on
+            // left-handed planes); its sign doesn't matter for rescaling.
+            let axis = t.cs.u.cross(t.cs.v).normalize();
+            parts.push((t.cs.origin, axis, mesh));
         }
-        mesh
+        parts
     }
+}
+
+/// Rescale an extrusion ghost built at `ref_depth` to a new depth by scaling
+/// every point's offset along the extrusion axis about the sketch plane
+/// (`scale` = depth / ref_depth, same sign). Valid because an extrusion's
+/// cross-section is constant along the axis: wall normals stay perpendicular
+/// to it and cap normals stay along it, so only positions move.
+fn rescale_extrusion_mesh(
+    mesh: &MockMesh,
+    origin: zerocad_core::Vec3,
+    axis: zerocad_core::Vec3,
+    scale: f32,
+) -> MockMesh {
+    let mut out = mesh.clone();
+    let k = scale - 1.0;
+    let shift = |p: &mut [f32]| {
+        let d =
+            (p[0] - origin.x) * axis.x + (p[1] - origin.y) * axis.y + (p[2] - origin.z) * axis.z;
+        p[0] += axis.x * d * k;
+        p[1] += axis.y * d * k;
+        p[2] += axis.z * d * k;
+    };
+    for v in out.vertices.chunks_exact_mut(6) {
+        shift(&mut v[0..3]);
+    }
+    for v in out.edge_vertices.chunks_exact_mut(3) {
+        shift(v);
+    }
+    for e in &mut out.edge_refs {
+        shift(&mut e.p0);
+        shift(&mut e.p1);
+    }
+    for f in &mut out.face_refs {
+        shift(&mut f.centroid);
+    }
+    out
 }
 
 /// Materialize a pending face sketch into `graph`: the (empty-curves) on-face
@@ -114,6 +256,7 @@ fn insert_pending_face_sketch(graph: &mut zerocad_core::ParametricGraph, p: &Pen
             curves: zerocad_core::SketchCurves::new(),
             shapes: Vec::new(),
             corner_mods: Vec::new(),
+            mirrors: Vec::new(),
             on_face: true,
             entity_ids: Vec::new(),
             next_entity_id: 0,
@@ -132,11 +275,54 @@ fn insert_pending_face_sketch(graph: &mut zerocad_core::ParametricGraph, p: &Pen
 }
 
 impl ZeroCadApp {
+    fn extrude_preview_key(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+
+        let op = self.extrude_op.as_ref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ((op.depth / 0.05).round() as i64).hash(&mut h);
+        let mode_id: u8 = match op.mode {
+            ExtrudeMode::NewBody => 0,
+            ExtrudeMode::Join => 1,
+            ExtrudeMode::Cut => 2,
+        };
+        mode_id.hash(&mut h);
+        for target in &op.targets {
+            target.sketch_id.hash(&mut h);
+            target.indices.hash(&mut h);
+        }
+        self.id_counter.hash(&mut h);
+        let mut hidden: Vec<&String> = self.hidden_nodes.iter().collect();
+        hidden.sort();
+        for id in hidden {
+            id.hash(&mut h);
+        }
+        let vars = self.graph.variable_map();
+        let mut var_keys: Vec<&String> = vars.keys().collect();
+        var_keys.sort();
+        for key in var_keys {
+            key.hash(&mut h);
+            ((vars[key] * 1000.0) as i64).hash(&mut h);
+        }
+        Some(h.finish())
+    }
+
+    /// Whether the exact worker result corresponds to the values on screen
+    /// now. Older results remain useful context, but must not hide the live
+    /// ghost or be promoted while committing a newer value.
+    pub(crate) fn has_current_extrude_preview(&self) -> bool {
+        let Some(key) = self.extrude_preview_key() else {
+            return false;
+        };
+        matches!(self.extrude_preview_cache.as_ref(), Some((cached, _)) if *cached == key)
+    }
+
     fn clear_extrude_preview_eval(&mut self) {
         self.extrude_preview_cache = None;
         self.extrude_preview_mesh_cache = None;
+        self.extrude_ghost_base = None;
         self.extrude_preview_inflight = None;
-        self.extrude_preview_rx = None;
+        self.extrude_preview_settle = None;
     }
 
     fn build_preview_extrude_graph(&self) -> Option<zerocad_core::ParametricGraph> {
@@ -185,7 +371,7 @@ impl ZeroCadApp {
     pub(crate) fn preview_extrude_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
         let op = self.extrude_op.as_ref()?;
         if op.depth.abs() < 0.01 {
-            return Some(self.body_meshes.clone());
+            return Some((*self.body_meshes).clone());
         }
 
         let graph = self.build_preview_extrude_graph()?;
@@ -202,70 +388,15 @@ impl ZeroCadApp {
     /// field is focused or the depth is dragged). This caches the result and only
     /// recomputes when the depth (quantized to a sub-visible step), mode, or
     /// targets actually change, so idle frames and slow drags are nearly free.
-    pub(crate) fn cached_preview_extrude_bodies(&mut self) -> Option<Vec<(String, MockMesh)>> {
-        use std::hash::{Hash, Hasher};
-        let Some(op) = self.extrude_op.as_ref() else {
+    pub(crate) fn cached_preview_extrude_bodies(&mut self) -> Option<SharedBodyMeshes> {
+        let Some(depth) = self.extrude_op.as_ref().map(|op| op.depth) else {
             self.clear_extrude_preview_eval();
             return None;
         };
-        if op.depth.abs() < 0.01 {
+        if depth.abs() < 0.01 {
             return Some(self.body_meshes.clone());
         }
-
-        let key = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            // Quantize depth to 0.05mm: identical/idle frames and slow drags reuse
-            // the cache, and a sub-0.05mm preview lag is invisible (the commit
-            // still uses the exact depth).
-            ((op.depth / 0.05).round() as i64).hash(&mut h);
-            let mode_id: u8 = match op.mode {
-                ExtrudeMode::NewBody => 0,
-                ExtrudeMode::Join => 1,
-                ExtrudeMode::Cut => 2,
-            };
-            mode_id.hash(&mut h);
-            for t in &op.targets {
-                t.sketch_id.hash(&mut h);
-                t.indices.hash(&mut h);
-            }
-            self.id_counter.hash(&mut h);
-            let mut hidden: Vec<&String> = self.hidden_nodes.iter().collect();
-            hidden.sort();
-            for id in hidden {
-                id.hash(&mut h);
-            }
-            // Include variable values so that editing a dimension variable while
-            // the extrude dialog is open invalidates the cached boolean result.
-            let vars = self.graph.variable_map();
-            let mut var_keys: Vec<&String> = vars.keys().collect();
-            var_keys.sort();
-            for k in var_keys {
-                k.hash(&mut h);
-                ((vars[k] * 1000.0) as i64).hash(&mut h);
-            }
-            h.finish()
-        };
-
-        if let Some(rx) = self.extrude_preview_rx.as_ref() {
-            match rx.try_recv() {
-                Ok((finished_key, result)) => {
-                    self.extrude_preview_rx = None;
-                    self.extrude_preview_inflight = None;
-                    match result {
-                        Ok(bodies) => self.extrude_preview_cache = Some((finished_key, bodies)),
-                        Err(err) => {
-                            log::warn!("Background extrude preview failed: {err}");
-                            self.extrude_preview_cache = None;
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.extrude_preview_rx = None;
-                    self.extrude_preview_inflight = None;
-                }
-            }
-        }
+        let key = self.extrude_preview_key()?;
 
         if let Some((cached_key, bodies)) = self.extrude_preview_cache.as_ref() {
             if *cached_key == key {
@@ -273,59 +404,127 @@ impl ZeroCadApp {
             }
         }
 
-        if self
-            .extrude_preview_inflight
-            .is_some_and(|inflight| inflight != key)
-        {
-            self.extrude_preview_rx = None;
-            self.extrude_preview_inflight = None;
+        // An authoritative commit always wins the single evaluator. Keep the
+        // lightweight ghost visible until that final result lands, then allow
+        // settled preview work to use the worker.
+        if self.eval_pending {
+            return self
+                .extrude_preview_cache
+                .as_ref()
+                .map(|(_, bodies)| bodies.clone());
         }
+
+        // The ghost volume already follows the input at frame rate. Delay the
+        // exact boolean until the value settles, and cancel an obsolete solve as
+        // soon as a different key arrives.
+        let settled_at = match self.extrude_preview_settle {
+            Some((settled_key, at)) if settled_key == key => at,
+            _ => {
+                if self.extrude_preview_inflight.take().is_some() {
+                    self.evaluator.cancel();
+                }
+                let now = std::time::Instant::now();
+                self.extrude_preview_settle = Some((key, now));
+                if let Some(ctx) = &self.egui_ctx {
+                    ctx.request_repaint_after(EXTRUDE_PREVIEW_SETTLE);
+                }
+                return self
+                    .extrude_preview_cache
+                    .as_ref()
+                    .map(|(_, bodies)| bodies.clone());
+            }
+        };
+        let waited = settled_at.elapsed();
+        if waited < EXTRUDE_PREVIEW_SETTLE {
+            if let Some(ctx) = &self.egui_ctx {
+                ctx.request_repaint_after(EXTRUDE_PREVIEW_SETTLE - waited);
+            }
+            return self
+                .extrude_preview_cache
+                .as_ref()
+                .map(|(_, bodies)| bodies.clone());
+        }
+
+        // The persistent evaluator owns the single worker and applies latest-wins
+        // cancellation, so no per-preview thread or result channel is needed.
         if self.extrude_preview_inflight.is_none() {
             if let Some(graph) = self.build_preview_extrude_graph() {
-                let hidden = self.hidden_nodes.clone();
-                let ctx = self.egui_ctx.clone();
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.extrude_preview_rx = Some(rx);
+                self.evaluator.submit(
+                    crate::evaluation_worker::EvaluationPurpose::ExtrudePreview(key),
+                    graph,
+                    self.hidden_nodes.clone(),
+                    zerocad_core::EvaluationQuality::Interactive,
+                    self.egui_ctx.clone(),
+                );
                 self.extrude_preview_inflight = Some(key);
-                std::thread::spawn(move || {
-                    let result = graph.evaluate_bodies_draft(&hidden);
-                    let _ = tx.send((key, result));
-                    if let Some(ctx) = ctx {
-                        ctx.request_repaint();
-                    }
-                });
             }
         }
 
-        None
+        // Keep the last result cached while the worker chases the newest depth.
+        // The frame planner may use it for Cut context, but deliberately withholds
+        // stale opaque Join/New Body results so they cannot trail the live tool as
+        // an apparent second body.
+        self.extrude_preview_cache
+            .as_ref()
+            .map(|(_, bodies)| bodies.clone())
     }
 
-    /// Memoized [`ExtrudeOp::preview_mesh`] (the tool ghost volume). Rebuilt only
-    /// when the depth or targets change, so repaints that don't move the depth
-    /// (mouse hovering, field focus) don't re-tessellate the tool every frame.
+    /// Memoized ghost tool volume for the live extrude. The
+    /// tessellated base is built ONCE per target set + depth sign (curved
+    /// profiles run the kernel prism, far too slow per drag step) and every
+    /// depth change just rescales it along the extrusion axis — O(vertices),
+    /// no kernel calls — so the ghost tracks the cursor at full frame rate.
     pub(crate) fn cached_preview_mesh(&mut self) -> Option<MockMesh> {
         use std::hash::{Hash, Hasher};
-        if self.extrude_op.is_none() {
+        let Some(op) = self.extrude_op.as_ref() else {
             self.extrude_preview_mesh_cache = None;
+            self.extrude_ghost_base = None;
             return None;
+        };
+        let depth = op.depth;
+        if depth.abs() < f32::EPSILON {
+            return Some(MockMesh::empty());
         }
-        let key = {
-            let op = self.extrude_op.as_ref().unwrap();
+        let base_key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            ((op.depth / 0.05).round() as i64).hash(&mut h);
+            (depth >= 0.0).hash(&mut h);
             for t in &op.targets {
                 t.sketch_id.hash(&mut h);
                 t.indices.hash(&mut h);
             }
             h.finish()
         };
+        let full_key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            base_key.hash(&mut h);
+            depth.to_bits().hash(&mut h);
+            h.finish()
+        };
         if let Some((cached_key, mesh)) = self.extrude_preview_mesh_cache.as_ref() {
-            if *cached_key == key {
+            if *cached_key == full_key {
                 return Some(mesh.clone());
             }
         }
-        let mesh = self.extrude_op.as_ref().unwrap().preview_mesh();
-        self.extrude_preview_mesh_cache = Some((key, mesh.clone()));
+        let base_hit =
+            matches!(self.extrude_ghost_base.as_ref(), Some((k, _, _)) if *k == base_key);
+        if !base_hit {
+            // Build the base away from zero: a near-zero build tessellates a
+            // paper-thin (possibly degenerate) prism that rescales badly.
+            let build_depth = if depth.abs() < 0.05 {
+                1.0f32.copysign(depth)
+            } else {
+                depth
+            };
+            let parts = op.preview_part_meshes(build_depth);
+            self.extrude_ghost_base = Some((base_key, build_depth, parts));
+        }
+        let (_, ref_depth, parts) = self.extrude_ghost_base.as_ref().unwrap();
+        let scale = depth / ref_depth;
+        let mut mesh = MockMesh::empty();
+        for (origin, axis, part) in parts {
+            mesh.append(rescale_extrusion_mesh(part, *origin, *axis, scale));
+        }
+        self.extrude_preview_mesh_cache = Some((full_key, mesh.clone()));
         Some(mesh)
     }
 
@@ -409,7 +608,7 @@ impl ZeroCadApp {
                                     if let Ok(v) = crate::expr::eval(&op.depth_text, &varmap) {
                                         op.depth = (v as f32).clamp(-300.0, 300.0);
                                     }
-                                } else {
+                                } else if !zerocad_core::expr::preserves_source(&op.depth_text) {
                                     // Not focused → reflect drag/slider changes.
                                     op.depth_text = format!("{:.2}", op.depth);
                                 }
@@ -444,6 +643,17 @@ impl ZeroCadApp {
 
                         // Operation mode: New Body / Join / Cut — a compact
                         // segmented control beneath the distance, Fusion-style.
+                        if let Some(op) = self.extrude_op.as_ref() {
+                            if zerocad_core::expr::preserves_source(&op.depth_text) {
+                                if let Ok(value) = crate::expr::eval(&op.depth_text, &varmap) {
+                                    ui.label(
+                                        egui::RichText::new(format!("= {value:.2} {unit_suffix}"))
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(70, 120, 70)),
+                                    );
+                                }
+                            }
+                        }
                         ui.add_space(5.0);
                         if let Some(op) = self.extrude_op.as_mut() {
                             // Until the user picks a mode, follow the sketch's
@@ -560,7 +770,16 @@ impl ZeroCadApp {
 
     /// Find a sketch node by id and return its coordinate system, detected
     /// faces, and whether it sits on a body face.
-    fn lookup_sketch(&self, sketch_id: &str) -> Option<(CoordinateSystem, Vec<Region>, bool)> {
+    fn lookup_sketch(
+        &self,
+        sketch_id: &str,
+    ) -> Option<(
+        CoordinateSystem,
+        Vec<Region>,
+        bool,
+        Vec<zerocad_core::ShapeLoop>,
+        Vec<zerocad_core::Circle>,
+    )> {
         let var_map = self.graph.variable_map();
         self.graph.graph.node_indices().find_map(|idx| {
             let node = &self.graph.graph[idx];
@@ -570,6 +789,7 @@ impl ZeroCadApp {
                     curves,
                     shapes,
                     corner_mods,
+                    mirrors,
                     on_face,
                     solver,
                     ..
@@ -580,6 +800,7 @@ impl ZeroCadApp {
                         curves,
                         shapes,
                         corner_mods,
+                        mirrors,
                         solver.as_ref(),
                         &var_map,
                     );
@@ -589,19 +810,30 @@ impl ZeroCadApp {
                     if let Some(b) = self.graph.sketch_face_boundaries.get(sketch_id) {
                         eff.extend_curves(b);
                     }
-                    return Some((*cs, detect_regions(&eff), *on_face));
+                    // Shape outlines (skipped when the sketch uses corner-mods,
+                    // which take the legacy per-region path and are never boolean).
+                    let loops = if corner_mods.is_empty() {
+                        zerocad_core::shape_loops(shapes, &var_map)
+                    } else {
+                        Vec::new()
+                    };
+                    let circles = eff.circles.clone();
+                    return Some((*cs, detect_regions(&eff), *on_face, loops, circles));
                 }
             }
             None
         })
     }
 
-    /// True when any sketch feeding the live extrude has overlapping drawn shapes
-    /// (so its extrude resolves as a boolean). The warm ghost preview would show
-    /// the un-booleaned split regions, so the caller switches to the real
-    /// evaluated body preview instead. Sketches with sketch fillets/chamfers
-    /// (`corner_mods`) take the legacy per-region path and are not boolean.
-    pub(crate) fn op_has_overlapping_shapes(&self) -> bool {
+    /// True when any sketch feeding the live extrude has drawn shapes that
+    /// genuinely **cross** (a partial/edge-crossing overlap that resolves as a
+    /// boolean split or fusion). The warm ghost can't render those un-booleaned,
+    /// so the caller switches to the real evaluated body preview instead. Pure
+    /// containment (a circle inside a rectangle) is NOT a crossing — it is a
+    /// hole the ghost draws exactly and instantly (see [`shapes_cross`]).
+    /// Sketches with sketch fillets/chamfers (`corner_mods`) take the legacy
+    /// per-region path and are not boolean.
+    pub(crate) fn op_has_crossing_shapes(&self) -> bool {
         let Some(op) = self.extrude_op.as_ref() else {
             return false;
         };
@@ -622,9 +854,12 @@ impl ZeroCadApp {
                         return false;
                     }
                     let loops = zerocad_core::shape_loops(shapes, &var_map);
-                    zerocad_core::overlap_clusters(&loops)
-                        .iter()
-                        .any(|c| c.len() >= 2)
+                    loops.iter().enumerate().any(|(i, a)| {
+                        loops
+                            .iter()
+                            .skip(i + 1)
+                            .any(|b| zerocad_core::shapes_cross(a, b))
+                    })
                 } else {
                     false
                 }
@@ -648,7 +883,7 @@ impl ZeroCadApp {
         for (sid, mut idxs) in by_sketch {
             idxs.sort();
             idxs.dedup();
-            if let Some((cs, regions, on_face)) = self.lookup_sketch(&sid) {
+            if let Some((cs, regions, on_face, loops, circles)) = self.lookup_sketch(&sid) {
                 idxs.retain(|&i| i < regions.len());
                 if !idxs.is_empty() {
                     targets.push(ExtrudeTarget {
@@ -657,6 +892,8 @@ impl ZeroCadApp {
                         regions,
                         indices: idxs,
                         on_face,
+                        loops,
+                        circles,
                     });
                 }
             }
@@ -686,6 +923,7 @@ impl ZeroCadApp {
         // Fresh op — drop any preview cached for a previous one.
         self.extrude_preview_cache = None;
         self.extrude_preview_mesh_cache = None;
+        self.extrude_ghost_base = None;
         self.status_msg =
             "Extrude: drag up/down in the viewport to push/pull, or type a distance, then OK."
                 .to_string();
@@ -762,6 +1000,9 @@ impl ZeroCadApp {
                 regions,
                 indices,
                 on_face: true,
+                // A direct face push/pull has no drawn overlapping shapes.
+                loops: Vec::new(),
+                circles: Vec::new(),
             }],
             depth,
             depth_text: format!("{:.2}", depth),
@@ -781,6 +1022,7 @@ impl ZeroCadApp {
         self.selected_body.clear();
         self.extrude_preview_cache = None;
         self.extrude_preview_mesh_cache = None;
+        self.extrude_ghost_base = None;
         self.status_msg =
             "Extrude face: drag along the normal to push/pull (out = Join, in = Cut), or type a distance, then OK."
                 .to_string();
@@ -802,7 +1044,7 @@ impl ZeroCadApp {
     pub(crate) fn begin_extrude_whole_sketch(&mut self, sketch_id: &str) {
         let regions = self
             .lookup_sketch(sketch_id)
-            .map(|(_, r, _)| r)
+            .map(|(_, r, _, _, _)| r)
             .unwrap_or_default();
         if regions.is_empty() {
             self.status_msg =
@@ -819,9 +1061,12 @@ impl ZeroCadApp {
     pub(crate) fn commit_extrude_op(&mut self) {
         // Resolve preview state first to avoid borrow-check conflicts
         let cached_bodies = self.cached_preview_extrude_bodies();
-        let bodies = cached_bodies
-            .clone()
-            .unwrap_or_else(|| self.body_meshes.clone());
+        let exact_preview_is_current = self.has_current_extrude_preview();
+        let current_cached_bodies = cached_bodies.filter(|_| exact_preview_is_current);
+        let bodies = current_cached_bodies
+            .as_ref()
+            .map(|bodies| (**bodies).clone())
+            .unwrap_or_else(|| (*self.body_meshes).clone());
         let mesh = self.cached_preview_mesh();
 
         let Some(op) = self.extrude_op.take() else {
@@ -833,11 +1078,12 @@ impl ZeroCadApp {
             bodies: bodies.clone(),
             mesh,
             mode: PendingVisualMode::Extrude(op.mode),
+            exact_bodies: exact_preview_is_current,
         });
 
         // Copy preview cache if ready immediately to avoid any flash/refine delay
-        if let Some(cb) = cached_bodies {
-            self.set_body_meshes(cb);
+        if let Some(cb) = current_cached_bodies {
+            self.set_body_meshes((*cb).clone());
         }
 
         self.push_undo();
@@ -852,7 +1098,7 @@ impl ZeroCadApp {
 
         // If the distance box held a variable/expression (not a bare number),
         // persist it so the extrude re-evaluates when the variable changes.
-        let depth_expr = if zerocad_core::expr::references_variable(&op.depth_text) {
+        let depth_expr = if zerocad_core::expr::preserves_source(&op.depth_text) {
             Some(op.depth_text.trim().to_string())
         } else {
             None

@@ -123,7 +123,11 @@ impl SketchEntity {
 pub enum Constraint {
     /// Two points share a location (their residual drives them together; they
     /// remain distinct points so the constraint can be deleted).
-    Coincident { id: EntityId, a: EntityId, b: EntityId },
+    Coincident {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+    },
     /// A line's endpoints share a v-coordinate.
     Horizontal { id: EntityId, line: EntityId },
     /// A line's endpoints share a u-coordinate.
@@ -142,9 +146,17 @@ pub enum Constraint {
         r: crate::sketch::Dimension,
     },
     /// Two lines with parallel directions.
-    Parallel { id: EntityId, a: EntityId, b: EntityId },
+    Parallel {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+    },
     /// Two lines with perpendicular directions.
-    Perpendicular { id: EntityId, a: EntityId, b: EntityId },
+    Perpendicular {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+    },
     /// A line tangent to a circle/arc.
     Tangent {
         id: EntityId,
@@ -152,7 +164,11 @@ pub enum Constraint {
         circle: EntityId,
     },
     /// Equal lengths (two lines) or equal radii (two circles/arcs).
-    Equal { id: EntityId, a: EntityId, b: EntityId },
+    Equal {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+    },
     /// A point anchored at its current position (kills rigid-body freedom).
     Fixed { id: EntityId, p: EntityId },
 }
@@ -339,9 +355,15 @@ pub fn promote_shapes_to_entities(
                 for (line, horizontal) in [(0, true), (1, false), (2, true), (3, false)] {
                     let id = ids.alloc();
                     model.constraints.push(if horizontal {
-                        Constraint::Horizontal { id, line: lines[line] }
+                        Constraint::Horizontal {
+                            id,
+                            line: lines[line],
+                        }
                     } else {
-                        Constraint::Vertical { id, line: lines[line] }
+                        Constraint::Vertical {
+                            id,
+                            line: lines[line],
+                        }
                     });
                 }
                 let w_id = ids.alloc();
@@ -364,7 +386,10 @@ pub fn promote_shapes_to_entities(
                 // both sides (the minimum-motion solution). The user can delete
                 // the anchor to float the rectangle.
                 let anchor = ids.alloc();
-                model.constraints.push(Constraint::Fixed { id: anchor, p: pts[0] });
+                model.constraints.push(Constraint::Fixed {
+                    id: anchor,
+                    p: pts[0],
+                });
             }
             SketchShape::Circle { diameter, .. } => {
                 let Some(circle) = built.circles.first() else {
@@ -421,7 +446,9 @@ pub fn promote_shapes_to_entities(
                     d: length.clone(),
                 });
             }
-            SketchShape::Raw { .. } => promote_raw(&built, owner, &mut ids, &mut model),
+            SketchShape::RegularPolygon { .. } | SketchShape::Raw { .. } => {
+                promote_raw(&built, owner, &mut ids, &mut model)
+            }
         }
     }
     let next = ids.next_value();
@@ -437,11 +464,7 @@ fn promote_raw(
     ids: &mut IdAllocator,
     model: &mut SketchSolverModel,
 ) {
-    fn point_at(
-        ids: &mut IdAllocator,
-        model: &mut SketchSolverModel,
-        p: (f32, f32),
-    ) -> EntityId {
+    fn point_at(ids: &mut IdAllocator, model: &mut SketchSolverModel, p: (f32, f32)) -> EntityId {
         let pos = (p.0 as f64, p.1 as f64);
         if let Some(existing) = model
             .points
@@ -525,8 +548,14 @@ mod tests {
     fn solver_model_serde_round_trips_every_variant() {
         let model = SketchSolverModel {
             points: vec![
-                SketchPoint { id: EntityId(0), pos: (0.0, 0.0) },
-                SketchPoint { id: EntityId(1), pos: (10.0, 0.25) },
+                SketchPoint {
+                    id: EntityId(0),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (10.0, 0.25),
+                },
             ],
             entities: vec![
                 SketchEntity::Line {
@@ -551,25 +580,57 @@ mod tests {
                 },
             ],
             constraints: vec![
-                Constraint::Coincident { id: EntityId(5), a: EntityId(0), b: EntityId(1) },
-                Constraint::Horizontal { id: EntityId(6), line: EntityId(2) },
-                Constraint::Vertical { id: EntityId(7), line: EntityId(2) },
+                Constraint::Coincident {
+                    id: EntityId(5),
+                    a: EntityId(0),
+                    b: EntityId(1),
+                },
+                Constraint::Horizontal {
+                    id: EntityId(6),
+                    line: EntityId(2),
+                },
+                Constraint::Vertical {
+                    id: EntityId(7),
+                    line: EntityId(2),
+                },
                 Constraint::Distance {
                     id: EntityId(8),
                     a: EntityId(0),
                     b: EntityId(1),
-                    d: Dimension { value: 10.0, expr: Some("w".to_string()) },
+                    d: Dimension {
+                        value: 10.0,
+                        expr: Some("w".to_string()),
+                    },
                 },
                 Constraint::Radius {
                     id: EntityId(9),
                     circle: EntityId(3),
                     r: Dimension::literal(4.0),
                 },
-                Constraint::Parallel { id: EntityId(10), a: EntityId(2), b: EntityId(2) },
-                Constraint::Perpendicular { id: EntityId(11), a: EntityId(2), b: EntityId(2) },
-                Constraint::Tangent { id: EntityId(12), line: EntityId(2), circle: EntityId(3) },
-                Constraint::Equal { id: EntityId(13), a: EntityId(2), b: EntityId(2) },
-                Constraint::Fixed { id: EntityId(14), p: EntityId(0) },
+                Constraint::Parallel {
+                    id: EntityId(10),
+                    a: EntityId(2),
+                    b: EntityId(2),
+                },
+                Constraint::Perpendicular {
+                    id: EntityId(11),
+                    a: EntityId(2),
+                    b: EntityId(2),
+                },
+                Constraint::Tangent {
+                    id: EntityId(12),
+                    line: EntityId(2),
+                    circle: EntityId(3),
+                },
+                Constraint::Equal {
+                    id: EntityId(13),
+                    a: EntityId(2),
+                    b: EntityId(2),
+                },
+                Constraint::Fixed {
+                    id: EntityId(14),
+                    p: EntityId(0),
+                },
             ],
         };
         let json = serde_json::to_string(&model).expect("serialize");
@@ -594,7 +655,10 @@ mod tests {
                 origin: (0.0, 0.0),
                 sx: 1.0,
                 sy: 1.0,
-                w: Dimension { value: 20.0, expr: Some("w".to_string()) },
+                w: Dimension {
+                    value: 20.0,
+                    expr: Some("w".to_string()),
+                },
                 h: Dimension::literal(12.0),
                 from_center: false,
             },

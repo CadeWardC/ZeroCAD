@@ -21,7 +21,16 @@ impl ZeroCadApp {
                     "ℹ️"
                 };
 
-                ui.label(egui::RichText::new(status_icon).size(11.0));
+                let delayed_busy = self.eval_started.is_some_and(|started| {
+                    started.elapsed() >= std::time::Duration::from_millis(150)
+                }) || self.pending_save.as_ref().is_some_and(|save| {
+                    save.started.elapsed() >= std::time::Duration::from_millis(150)
+                });
+                if delayed_busy {
+                    ui.spinner();
+                } else {
+                    ui.label(egui::RichText::new(status_icon).size(11.0));
+                }
                 ui.label(
                     egui::RichText::new(&self.status_msg)
                         .size(11.5)

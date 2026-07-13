@@ -219,6 +219,8 @@ impl MockMesh {
         let (edge_vertices, edge_indices, edge_face_normals) = build_box_wireframe(w, h, d);
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
         let edge_refs = mesh_edge_refs_from_groups(
+            &vertices,
+            &indices,
             &edge_vertices,
             &edge_indices,
             &edge_face_normals,
@@ -252,6 +254,8 @@ impl MockMesh {
             build_cylinder_wireframe(r, h, segments.max(4));
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
         let edge_refs = mesh_edge_refs_from_groups(
+            &vertices,
+            &indices,
             &edge_vertices,
             &edge_indices,
             &edge_face_normals,
@@ -287,8 +291,8 @@ impl MockMesh {
         }
 
         // A hole-free circular profile is displayed as a true cylinder: a smooth
-        // curved wall plus a clean wireframe (two rim circles + a few silhouette
-        // struts), instead of the faceted prism the boolean path uses. Anything
+        // curved wall plus a clean wireframe containing only its two real rim
+        // circles, instead of the faceted prism the boolean path uses. Anything
         // else (polygons, holed profiles) extrudes as a prism.
         let circle = if holes.is_empty() {
             circle_profile(points)
@@ -322,6 +326,8 @@ impl MockMesh {
         };
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, None);
         let edge_refs = mesh_edge_refs_from_groups(
+            &vertices,
+            &indices,
             &edge_vertices,
             &edge_indices,
             &edge_face_normals,
@@ -380,7 +386,16 @@ impl MockMesh {
     /// extracted from the solid's B-Rep edges, and hidden-line normals are left
     /// empty (the renderer then shows every edge).
     pub fn from_solid(solid: &KernelSolid) -> Self {
-        let (vertices, indices, mut face_ids) = solid_to_flat_mesh(solid, true, false);
+        Self::from_solid_with_cancel(solid, &openrcad::foundation::NeverCancelled)
+            .expect("NeverCancelled cannot cancel")
+    }
+
+    pub(crate) fn from_solid_with_cancel(
+        solid: &KernelSolid,
+        cancel: &dyn openrcad::foundation::CancellationProbe,
+    ) -> Result<Self, openrcad::foundation::Cancelled> {
+        let (vertices, indices, mut face_ids) =
+            solid_to_flat_mesh_with_cancel(solid, true, false, cancel)?;
         // Faces on one analytic cylinder also SELECT as one face: remap each
         // triangle's face id to its surface group's canonical (first) face —
         // the same identity the wireframe already uses to suppress the
@@ -488,13 +503,16 @@ impl MockMesh {
         // viewport select a fillet arc — or a full circular rim — as one curve.
         let edge_groups = group_edge_segments(&edge_vertices, &edge_indices, Some(&edge_pairs));
         let edge_refs = mesh_edge_refs_from_groups(
+            &vertices,
+            &indices,
             &edge_vertices,
             &edge_indices,
             &edge_face_normals,
             &edge_groups,
         );
         let face_refs = mesh_face_refs(&vertices, &indices, &face_ids);
-        Self {
+        cancel.check_cancelled()?;
+        Ok(Self {
             vertices,
             indices,
             edge_vertices,
@@ -504,7 +522,7 @@ impl MockMesh {
             edge_groups,
             edge_refs,
             face_refs,
-        }
+        })
     }
 }
 

@@ -77,7 +77,7 @@ impl StepWriter {
         id
     }
 
-    fn write_curve(&mut self, curve: &GeomCurve) -> u32 {
+    fn write_curve_ranged(&mut self, curve: &GeomCurve, range: Option<(f64, f64)>) -> u32 {
         match curve {
             GeomCurve::Line(l) => {
                 let loc_id = self.write_point(l.location());
@@ -181,6 +181,25 @@ impl StepWriter {
                     self.write_line(id, content);
                 }
                 id
+            }
+            // STEP has no helix entity: approximate over the edge's parameter
+            // range (one turn if unknown) as a polyline-degree B-spline.
+            GeomCurve::Helix(h) => {
+                use openrcad_geom::Curve as _;
+                let (t0, t1) = range.unwrap_or((0.0, 2.0 * std::f64::consts::PI));
+                let turns = ((t1 - t0).abs() / (2.0 * std::f64::consts::PI)).max(1.0);
+                let n = ((turns * 24.0).ceil() as usize).clamp(8, 512);
+                let mut poles = Vec::with_capacity(n);
+                let mut knots = Vec::with_capacity(n);
+                let mut mults = Vec::with_capacity(n);
+                for i in 0..n {
+                    let t = t0 + (t1 - t0) * (i as f64) / ((n - 1) as f64);
+                    poles.push(h.point(t));
+                    knots.push(t);
+                    mults.push(if i == 0 || i == n - 1 { 2 } else { 1 });
+                }
+                let b = openrcad_geom::BSplineCurve::new(1, poles, None, knots, mults);
+                self.write_curve_ranged(&GeomCurve::BSpline(b), None)
             }
         }
     }
@@ -386,7 +405,7 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         let start_v = vertex_map[&e_data.start];
         let end_v = vertex_map[&e_data.end];
         let curve_id = if let Some(ref c) = e_data.curve {
-            writer.write_curve(c)
+            writer.write_curve_ranged(c, Some((e_data.first, e_data.last)))
         } else {
             // Degenerate edge: write a dummy line at start point
             let p = brep.vertices[e_data.start].point;

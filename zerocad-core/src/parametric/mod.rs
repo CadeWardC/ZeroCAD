@@ -17,20 +17,26 @@ mod edge_mod;
 mod eval;
 mod extrude;
 mod join;
+pub mod thread;
 pub mod topo_name;
 mod types;
 
 #[allow(unused_imports)]
 pub(crate) use cut::*;
+pub use edge_mod::edge_wedge_is_concave_mesh;
 #[allow(unused_imports)]
 pub(crate) use edge_mod::*;
-pub use edge_mod::edge_wedge_is_concave_mesh;
 #[allow(unused_imports)]
 pub(crate) use eval::*;
 #[allow(unused_imports)]
 pub(crate) use extrude::*;
+pub use extrude::{boolean_region_plan, complete_selected_circles, BooleanRegionPlan};
 #[allow(unused_imports)]
 pub(crate) use join::*;
+pub use thread::{
+    closest_preset, default_depth_mm, ThreadPreset, ThreadStandard, METRIC_COARSE, UNIFIED_COARSE,
+    UNIFIED_FINE,
+};
 pub use types::*;
 
 #[cfg(test)]

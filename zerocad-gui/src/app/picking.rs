@@ -1,6 +1,62 @@
 use crate::*;
 
+fn next_id_after<'a>(ids: impl Iterator<Item = &'a str>) -> usize {
+    ids.filter_map(|id| id.rsplit('_').next()?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
 impl ZeroCadApp {
+    /// Apply one body hit to the persistent selection. A modified double-click
+    /// promotes that body's transient first-click face/edge pick to `Whole`
+    /// without clearing other bodies; double-clicking an already-selected body
+    /// toggles it off.
+    pub(crate) fn select_body_hit(
+        &mut self,
+        node: String,
+        pick: BodyPick,
+        is_double: bool,
+        multi_select: bool,
+    ) {
+        if is_double {
+            let whole = (node.clone(), BodyPick::Whole);
+            let was_selected = self.selected_body.contains(&whole);
+            // Egui reports the first half of a double-click as a normal click.
+            // Remove that body's temporary face/edge selection before promoting
+            // it, otherwise Shift+double-click would leave three selections.
+            self.selected_body.retain(|(id, _)| id != &node);
+            if !multi_select {
+                self.selected_body.clear();
+            }
+            if !multi_select || !was_selected {
+                self.selected_body.insert(whole);
+            }
+            self.status_msg = if multi_select {
+                format!("{} body/bodies selected.", self.selected_body.len())
+            } else {
+                format!("Selected whole body {node}.")
+            };
+        } else if multi_select {
+            let key = (node, pick);
+            if !self.selected_body.insert(key.clone()) {
+                self.selected_body.remove(&key);
+            }
+            self.status_msg = format!("{} element(s) selected.", self.selected_body.len());
+        } else {
+            self.selected_body.clear();
+            self.selected_body.insert((node.clone(), pick));
+            self.status_msg = match pick {
+                BodyPick::Whole => format!("Selected whole body {node}."),
+                BodyPick::Face(face) => {
+                    format!("Selected face {face} of {node} (Draw Sketch to sketch on it).")
+                }
+                BodyPick::Edge(edge) => format!("Selected edge {edge} of {node}."),
+                BodyPick::Vertex(vertex) => format!("Selected point {vertex} of {node}."),
+            };
+        }
+    }
+
     /// The selected body **edges** of a single body, as `(node_id, [edge_index,…])`,
     /// or `None` when no edge is selected. With edges of more than one body
     /// selected, only the first body's edges are returned (a fillet/chamfer feature
@@ -27,6 +83,26 @@ impl ZeroCadApp {
         Some((node, ids))
     }
 
+    /// Expand selected body-edge groups through tangent-continuous neighbors.
+    /// This is the CAD "tangent chain" behavior: an analytic sketch fillet arc
+    /// pulls in its straight tangent runs, while sharp corners stop the walk.
+    pub(crate) fn tangent_edge_chain(&self, node_id: &str, seeds: &[u32]) -> Vec<u32> {
+        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+            return seeds.to_vec();
+        };
+        let mut groups: Vec<u32> = mesh.edge_refs.iter().map(|edge| edge.group).collect();
+        groups.extend(mesh.edge_groups.iter().copied());
+        groups.sort_unstable();
+        groups.dedup();
+        let candidates: Vec<(u32, EdgeRef)> = groups
+            .into_iter()
+            .filter_map(|group| {
+                Self::edge_ref_from_mesh(node_id, mesh, group).map(|edge| (group, edge))
+            })
+            .collect();
+        expand_tangent_edge_groups(&candidates, seeds)
+    }
+
     /// Read a body edge's world-space geometry (endpoints + the two adjacent
     /// face normals) straight from its wireframe, packaged for an [`EdgeRef`].
     ///
@@ -36,6 +112,12 @@ impl ZeroCadApp {
     /// fillet arc, the arc's ends.
     pub(crate) fn edge_ref_from(&self, node_id: &str, e: u32) -> Option<EdgeRef> {
         let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == node_id)?;
+        Self::edge_ref_from_mesh(node_id, mesh, e)
+    }
+
+    /// Mesh-level body of [`edge_ref_from`], separated so tests can drive the
+    /// exact GUI selection pipeline on a real evaluated mesh.
+    pub(crate) fn edge_ref_from_mesh(node_id: &str, mesh: &MockMesh, e: u32) -> Option<EdgeRef> {
         if let Some(edge_ref) = mesh.edge_refs.iter().find(|edge_ref| edge_ref.group == e) {
             let topology = edge_ref.topology.as_ref().map(|topology| {
                 let mut topology = zerocad_core::TopologyEdgeRef {
@@ -120,16 +202,27 @@ impl ZeroCadApp {
         if mesh.edge_face_normals.len() < fo + 6 {
             return None;
         }
-        let n1 = [
+        let mut n1 = [
             mesh.edge_face_normals[fo],
             mesh.edge_face_normals[fo + 1],
             mesh.edge_face_normals[fo + 2],
         ];
-        let n2 = [
+        let mut n2 = [
             mesh.edge_face_normals[fo + 3],
             mesh.edge_face_normals[fo + 4],
             mesh.edge_face_normals[fo + 5],
         ];
+        // On analytic (smooth-cylinder) tessellations the stored pair can be
+        // face-REPRESENTATIVE normals (the wall third's midpoint direction),
+        // not local to this chord — which points a rim's "wall" normal at the
+        // wrong angle and flips the fillet/chamfer ribbon outward. Prefer the
+        // chord's actual two adjacent triangles when they can be found.
+        if let Some((t1, t2)) =
+            Self::chord_adjacent_triangle_normals(mesh, vpos(first, 0), vpos(first, 1))
+        {
+            n1 = t1;
+            n2 = t2;
+        }
         let curve = Self::edge_curve_hint_from_group(mesh, &segs, p0, p1, n1, n2, closed);
         Some(EdgeRef {
             p0,
@@ -139,6 +232,61 @@ impl ZeroCadApp {
             curve,
             topology: None,
         })
+    }
+
+    /// The geometric normals of the (up to) two triangles sharing the chord
+    /// `a`–`b`, matched by quantized vertex position. `None` unless exactly two
+    /// distinct-normal triangles touch the chord (open/degenerate meshes fall
+    /// back to the stored per-segment normals).
+    fn chord_adjacent_triangle_normals(
+        mesh: &MockMesh,
+        a: [f32; 3],
+        b: [f32; 3],
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let qkey = |p: [f32; 3]| -> (i64, i64, i64) {
+            let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+            (q(p[0]), q(p[1]), q(p[2]))
+        };
+        let (ka, kb) = (qkey(a), qkey(b));
+        let vert = |vi: u32| -> [f32; 3] {
+            let o = vi as usize * 6;
+            [mesh.vertices[o], mesh.vertices[o + 1], mesh.vertices[o + 2]]
+        };
+        let mut normals: Vec<[f32; 3]> = Vec::new();
+        for tri in mesh.indices.chunks_exact(3) {
+            let ps = [vert(tri[0]), vert(tri[1]), vert(tri[2])];
+            let ks = [qkey(ps[0]), qkey(ps[1]), qkey(ps[2])];
+            if !(ks.contains(&ka) && ks.contains(&kb)) {
+                continue;
+            }
+            let u = Vec3::new(
+                ps[1][0] - ps[0][0],
+                ps[1][1] - ps[0][1],
+                ps[1][2] - ps[0][2],
+            );
+            let v = Vec3::new(
+                ps[2][0] - ps[0][0],
+                ps[2][1] - ps[0][1],
+                ps[2][2] - ps[0][2],
+            );
+            let n = u.cross(v);
+            if n.length() <= 1.0e-9 {
+                continue;
+            }
+            let n = n.normalize();
+            let n = [n.x, n.y, n.z];
+            // Coplanar neighbors (two cap triangles) count once.
+            let dup = normals
+                .iter()
+                .any(|m| m[0] * n[0] + m[1] * n[1] + m[2] * n[2] > 0.999);
+            if !dup {
+                normals.push(n);
+            }
+            if normals.len() > 2 {
+                return None;
+            }
+        }
+        (normals.len() == 2).then(|| (normals[0], normals[1]))
     }
 
     pub(crate) fn edge_curve_hint_from_group(
@@ -340,6 +488,8 @@ impl ZeroCadApp {
         self.sketch_points.clear();
         self.dim_input = None;
         self.dim_screen_positions.clear();
+        self.snap_guides.clear();
+        self.cursor_snap_guides.clear();
     }
 
     /// Allocate a fresh unique id suffix and bump the counter.
@@ -347,6 +497,21 @@ impl ZeroCadApp {
         let id = self.id_counter;
         self.id_counter += 1;
         id
+    }
+
+    /// Advance the shared feature-id counter past every numeric suffix already
+    /// present in the current graph. Loaded documents do not persist the GUI
+    /// counter, but evaluation uses these suffixes as creation order.
+    pub(crate) fn reseed_id_counter_from_graph(&mut self) {
+        let next = next_id_after(
+            self.graph
+                .graph
+                .node_indices()
+                .map(|i| self.graph.graph[i].id.as_str()),
+        );
+        // Never move backwards: undo can restore a graph from before a document
+        // load, and ids allocated earlier in this session must remain reserved.
+        self.id_counter = self.id_counter.max(next);
     }
 
     /// True when the viewport is locked to the 2D drawing plane (sketching).
@@ -438,7 +603,7 @@ impl ZeroCadApp {
             !(has_neg && has_pos)
         };
 
-        for (node_id, mesh) in &self.body_meshes {
+        for (node_id, mesh) in self.body_meshes.iter() {
             if self.hidden_nodes.contains(node_id) {
                 continue;
             }
@@ -525,7 +690,11 @@ impl ZeroCadApp {
 
             // Faces (front-facing triangles under the cursor; nearest wins).
             // Skipped when the GPU pick buffer already answered for this pixel.
-            let tcount = if scan_faces { mesh.indices.len() / 3 } else { 0 };
+            let tcount = if scan_faces {
+                mesh.indices.len() / 3
+            } else {
+                0
+            };
             for t in 0..tcount {
                 let i0 = mesh.indices[t * 3] as usize * 6;
                 let i1 = mesh.indices[t * 3 + 1] as usize * 6;
@@ -759,5 +928,235 @@ impl ZeroCadApp {
                 surface_kind: f.topology.as_ref().and_then(|t| t.surface_kind.clone()),
             }),
         })
+    }
+}
+
+fn normalized(v: [f32; 3]) -> Option<[f32; 3]> {
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    (length > 1.0e-6).then(|| [v[0] / length, v[1] / length, v[2] / length])
+}
+
+fn endpoint_tangent(edge: &EdgeRef, point: [f32; 3]) -> Option<[f32; 3]> {
+    match edge.curve.as_ref() {
+        Some(EdgeCurveHint::Circle {
+            center,
+            axis,
+            closed,
+            ..
+        }) if !closed => {
+            let radial = [
+                point[0] - center[0],
+                point[1] - center[1],
+                point[2] - center[2],
+            ];
+            normalized([
+                axis[1] * radial[2] - axis[2] * radial[1],
+                axis[2] * radial[0] - axis[0] * radial[2],
+                axis[0] * radial[1] - axis[1] * radial[0],
+            ])
+        }
+        Some(EdgeCurveHint::Circle { closed: true, .. }) => None,
+        _ => normalized([
+            edge.p1[0] - edge.p0[0],
+            edge.p1[1] - edge.p0[1],
+            edge.p1[2] - edge.p0[2],
+        ]),
+    }
+}
+
+fn dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
+fn shared_endpoint(a: &EdgeRef, b: &EdgeRef) -> Option<[f32; 3]> {
+    const ENDPOINT_TOL_SQ: f32 = 1.0e-6;
+    [a.p0, a.p1].into_iter().find(|&pa| {
+        [b.p0, b.p1]
+            .into_iter()
+            .any(|pb| dist_sq(pa, pb) <= ENDPOINT_TOL_SQ)
+    })
+}
+
+fn shares_named_face(a: &EdgeRef, b: &EdgeRef) -> bool {
+    let Some(a_topology) = a.topology.as_ref() else {
+        return true;
+    };
+    let Some(b_topology) = b.topology.as_ref() else {
+        return true;
+    };
+    if a_topology.adjacent_face_ids.is_empty() || b_topology.adjacent_face_ids.is_empty() {
+        return true;
+    }
+    a_topology
+        .adjacent_face_ids
+        .iter()
+        .any(|face| b_topology.adjacent_face_ids.contains(face))
+}
+
+fn edges_are_tangent(a: &EdgeRef, b: &EdgeRef) -> bool {
+    const COS_TANGENT_LIMIT: f32 = 0.9995; // about 1.8 degrees
+    let Some(point) = shared_endpoint(a, b) else {
+        return false;
+    };
+    if !shares_named_face(a, b) {
+        return false;
+    }
+    let (Some(ta), Some(tb)) = (endpoint_tangent(a, point), endpoint_tangent(b, point)) else {
+        return false;
+    };
+    (ta[0] * tb[0] + ta[1] * tb[1] + ta[2] * tb[2]).abs() >= COS_TANGENT_LIMIT
+}
+
+fn expand_tangent_edge_groups(candidates: &[(u32, EdgeRef)], seeds: &[u32]) -> Vec<u32> {
+    let mut selected: std::collections::HashSet<u32> = seeds.iter().copied().collect();
+    // Tangent propagation is contour assistance for an analytic arc. A straight
+    // edge is a complete, unambiguous selection by itself; using it as a walk
+    // seed can unexpectedly sweep around a rounded pocket and preview several
+    // fillets when the user clicked only one rim edge. Explicit multi-selection
+    // still selects several straight edges, and selecting the arc still expands
+    // through its G1-continuous straight runs.
+    let mut frontier: Vec<u32> = seeds
+        .iter()
+        .copied()
+        .filter(|seed| {
+            candidates.iter().any(|(id, edge)| {
+                id == seed
+                    && matches!(
+                        edge.curve,
+                        Some(EdgeCurveHint::Circle { closed: false, .. })
+                    )
+            })
+        })
+        .collect();
+    let mut result = Vec::new();
+    for &seed in seeds {
+        if !result.contains(&seed) {
+            result.push(seed);
+        }
+    }
+    while let Some(group) = frontier.pop() {
+        let Some((_, edge)) = candidates.iter().find(|(id, _)| *id == group) else {
+            continue;
+        };
+        for (candidate_group, candidate) in candidates {
+            if !selected.contains(candidate_group) && edges_are_tangent(edge, candidate) {
+                selected.insert(*candidate_group);
+                frontier.push(*candidate_group);
+                result.push(*candidate_group);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod id_counter_tests {
+    use super::next_id_after;
+
+    #[test]
+    fn loaded_graph_ids_reseed_the_shared_counter() {
+        let ids = ["origin", "sketch_1", "extrude_2", "datum_plane_17"];
+        assert_eq!(next_id_after(ids.into_iter()), 18);
+    }
+
+    #[test]
+    fn graph_without_numbered_features_starts_at_one() {
+        assert_eq!(next_id_after(["origin"].into_iter()), 1);
+    }
+}
+
+#[cfg(test)]
+mod body_selection_tests {
+    use crate::{BodyPick, ZeroCadApp};
+
+    #[test]
+    fn shift_double_click_keeps_the_first_whole_body_and_promotes_the_second() {
+        let mut app = ZeroCadApp::new();
+        app.select_body_hit("body_1".to_string(), BodyPick::Face(0), true, false);
+
+        // Egui reports the first click before it reports the completed double-click.
+        app.select_body_hit("body_2".to_string(), BodyPick::Face(3), false, true);
+        app.select_body_hit("body_2".to_string(), BodyPick::Face(3), true, true);
+
+        assert_eq!(app.selected_body.len(), 2);
+        assert!(app
+            .selected_body
+            .contains(&("body_1".to_string(), BodyPick::Whole)));
+        assert!(app
+            .selected_body
+            .contains(&("body_2".to_string(), BodyPick::Whole)));
+    }
+
+    #[test]
+    fn shift_double_click_toggles_an_already_selected_whole_body() {
+        let mut app = ZeroCadApp::new();
+        app.select_body_hit("body_1".to_string(), BodyPick::Face(0), true, false);
+        app.select_body_hit("body_2".to_string(), BodyPick::Face(0), true, true);
+        app.select_body_hit("body_2".to_string(), BodyPick::Face(0), false, true);
+        app.select_body_hit("body_2".to_string(), BodyPick::Face(0), true, true);
+
+        assert_eq!(
+            app.selected_body,
+            [("body_1".to_string(), BodyPick::Whole)]
+                .into_iter()
+                .collect()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tangent_chain_tests {
+    use super::expand_tangent_edge_groups;
+    use crate::{EdgeCurveHint, EdgeRef};
+
+    fn line(p0: [f32; 3], p1: [f32; 3]) -> EdgeRef {
+        EdgeRef {
+            p0,
+            p1,
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, 1.0, 0.0],
+            curve: Some(EdgeCurveHint::Line),
+            topology: None,
+        }
+    }
+
+    fn quarter_circle() -> EdgeRef {
+        EdgeRef {
+            p0: [1.0, 0.0, 0.0],
+            p1: [0.0, 1.0, 0.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, 1.0, 0.0],
+            curve: Some(EdgeCurveHint::Circle {
+                center: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                x_dir: [1.0, 0.0, 0.0],
+                radius: 1.0,
+                start: 0.0,
+                end: std::f32::consts::FRAC_PI_2,
+                closed: false,
+            }),
+            topology: None,
+        }
+    }
+
+    #[test]
+    fn rounded_segment_pulls_in_tangent_runs_but_stops_at_sharp_corner() {
+        let candidates = vec![
+            (0, quarter_circle()),
+            (1, line([1.0, -2.0, 0.0], [1.0, 0.0, 0.0])),
+            (2, line([0.0, 1.0, 0.0], [-2.0, 1.0, 0.0])),
+            (3, line([-2.0, 1.0, 0.0], [-2.0, 3.0, 0.0])),
+        ];
+        assert_eq!(expand_tangent_edge_groups(&candidates, &[0]), [0, 1, 2]);
+    }
+
+    #[test]
+    fn straight_segment_does_not_expand_around_rounded_pocket_contour() {
+        let candidates = vec![
+            (0, quarter_circle()),
+            (1, line([1.0, -2.0, 0.0], [1.0, 0.0, 0.0])),
+            (2, line([0.0, 1.0, 0.0], [-2.0, 1.0, 0.0])),
+        ];
+        assert_eq!(expand_tangent_edge_groups(&candidates, &[1]), [1]);
     }
 }

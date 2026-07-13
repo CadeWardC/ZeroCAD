@@ -38,18 +38,22 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mock_kernel::MockMesh;
-use crate::parametric::ParametricGraph;
+use crate::parametric::{FaceRef, FeatureNode, ParametricGraph};
+use crate::sketch::SketchCurves;
 use crate::units::Unit;
+use crate::EvaluationCacheSnapshot;
 
 /// Magic bytes at the start of every binary `.zcad` file.
 pub const MAGIC: &[u8; 4] = b"ZCAD";
 /// Current container framing version. Bumped only when the header/table/section
 /// framing changes — never for payload schema changes (those are absorbed by
 /// serde `#[serde(default)]`).
-pub const CURRENT_VERSION: u16 = 2;
+pub const CURRENT_VERSION: u16 = 3;
 
 const HEADER_LEN: usize = 32;
 const TABLE_ENTRY_LEN: usize = 32;
@@ -60,6 +64,11 @@ const SEC_GRAPH: u16 = 2;
 const SEC_THUMBNAIL: u16 = 3;
 const SEC_MESH_CACHE: u16 = 4;
 const SEC_HIDDEN_NODES: u16 = 5;
+const SEC_HYDRATED_CHECKPOINTS: u16 = 6;
+const HYDRATED_CACHE_SCHEMA: u16 = 1;
+const OPENRCAD_CACHE_ABI: u16 = 2;
+const MESH_CACHE_ABI: u16 = 2;
+pub const DEFAULT_HYDRATED_CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
 // Codecs.
 const CODEC_STORE: u8 = 0;
@@ -107,6 +116,11 @@ pub struct ZcadDocument<'a> {
     /// Node ids the user has hidden in the feature tree. Persisted so visibility
     /// state survives save/open.
     pub hidden_nodes: HashSet<String>,
+    /// Optional reusable kernel checkpoints for `.zcadh`. These are derived,
+    /// versioned accelerators and never part of the authoritative recipe.
+    pub evaluation_cache: Option<&'a EvaluationCacheSnapshot>,
+    /// Compressed section limit. `None` uses 128 MiB.
+    pub hydrated_cache_limit: Option<usize>,
 }
 
 /// What [`read_zcad`] returns. `graph` is authoritative; everything else is
@@ -123,6 +137,133 @@ pub struct LoadedZcad {
     pub was_legacy_json: bool,
     /// Node ids that were hidden when the file was saved.
     pub hidden_nodes: HashSet<String>,
+    pub evaluation_cache: Option<EvaluationCacheSnapshot>,
+}
+
+/// Stable, deterministic document recipe. This deliberately avoids serializing
+/// petgraph's arena/index representation: node records and dependencies are
+/// explicit, sorted, and independently migratable in future schema versions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DocumentRecipeV1 {
+    pub schema_version: u16,
+    pub features: Vec<RecipeFeature>,
+    pub dependencies: Vec<RecipeDependency>,
+    pub sketch_face_refs: Vec<(String, FaceRef)>,
+    pub sketch_datum_refs: Vec<(String, String)>,
+    pub sketch_face_boundaries: Vec<(String, SketchCurves)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecipeFeature {
+    pub id: String,
+    pub name: String,
+    pub creation_order: u64,
+    pub payload_schema: u16,
+    pub feature: crate::parametric::FeatureType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecipeDependency {
+    pub parent: String,
+    pub child: String,
+}
+
+impl DocumentRecipeV1 {
+    pub fn from_graph(graph: &ParametricGraph) -> Self {
+        use petgraph::visit::EdgeRef as _;
+
+        let creation_order = |id: &str| {
+            id.rsplit('_')
+                .next()
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut features: Vec<RecipeFeature> = graph
+            .graph
+            .node_indices()
+            .map(|idx| {
+                let node = &graph.graph[idx];
+                RecipeFeature {
+                    id: node.id.clone(),
+                    name: node.name.clone(),
+                    creation_order: creation_order(&node.id),
+                    payload_schema: 1,
+                    feature: node.feature.clone(),
+                }
+            })
+            .collect();
+        features.sort_by(|a, b| {
+            (a.creation_order, a.id.as_str()).cmp(&(b.creation_order, b.id.as_str()))
+        });
+
+        let mut dependencies: Vec<RecipeDependency> = graph
+            .graph
+            .edge_references()
+            .map(|edge| RecipeDependency {
+                parent: graph.graph[edge.source()].id.clone(),
+                child: graph.graph[edge.target()].id.clone(),
+            })
+            .collect();
+        dependencies.sort_by(|a, b| {
+            (a.parent.as_str(), a.child.as_str()).cmp(&(b.parent.as_str(), b.child.as_str()))
+        });
+
+        let sorted_pairs = |map: &std::collections::HashMap<String, String>| {
+            let mut pairs: Vec<(String, String)> =
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs
+        };
+        let mut sketch_face_refs: Vec<(String, FaceRef)> = graph
+            .sketch_face_refs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        sketch_face_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sketch_face_boundaries: Vec<(String, SketchCurves)> = graph
+            .sketch_face_boundaries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        sketch_face_boundaries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Self {
+            schema_version: 1,
+            features,
+            dependencies,
+            sketch_face_refs,
+            sketch_datum_refs: sorted_pairs(&graph.sketch_datum_refs),
+            sketch_face_boundaries,
+        }
+    }
+
+    pub fn into_graph(self) -> Result<ParametricGraph, ZcadError> {
+        if self.schema_version != 1 {
+            return Err(ZcadError::Decode(format!(
+                "unsupported document recipe schema {}",
+                self.schema_version
+            )));
+        }
+        let mut graph = ParametricGraph::new();
+        for record in self.features {
+            if record.id == "origin" {
+                continue;
+            }
+            graph.add_feature(FeatureNode {
+                id: record.id,
+                name: record.name,
+                feature: record.feature,
+            });
+        }
+        for dependency in self.dependencies {
+            graph.add_dependency(&dependency.parent, &dependency.child);
+        }
+        graph.sketch_face_refs = self.sketch_face_refs.into_iter().collect();
+        graph.sketch_datum_refs = self.sketch_datum_refs.into_iter().collect();
+        graph.sketch_face_boundaries = self.sketch_face_boundaries.into_iter().collect();
+        graph.rebuild_node_map();
+        Ok(graph)
+    }
 }
 
 #[derive(Debug)]
@@ -171,8 +312,128 @@ impl std::error::Error for ZcadError {}
 /// derived from, so a cache made stale by an out-of-band edit can be discarded.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MeshCachePayload {
-    graph_hash: u64,
+    #[serde(default)]
+    mesh_cache_abi: u16,
+    recipe_hash: [u8; 32],
     bodies: Vec<(String, MockMesh)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HydratedCheckpointPayloadV1 {
+    schema_version: u16,
+    openrcad_cache_abi: u16,
+    recipe_hash: [u8; 32],
+    hidden_hash: [u8; 32],
+    checkpoint_slots: Vec<Option<[u8; 32]>>,
+    blobs: Vec<HydratedCheckpointBlob>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HydratedCheckpointBlob {
+    hash: [u8; 32],
+    cbor: Vec<u8>,
+}
+
+fn hydrated_payload(
+    cache: &EvaluationCacheSnapshot,
+    recipe_hash: [u8; 32],
+    hidden_hash: [u8; 32],
+) -> Result<HydratedCheckpointPayloadV1, ZcadError> {
+    let mut checkpoint_slots = Vec::with_capacity(cache.cache.checkpoints.len());
+    let mut blobs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for checkpoint in &cache.cache.checkpoints {
+        if let Some(checkpoint) = checkpoint {
+            let cbor = cbor_to_vec(checkpoint)?;
+            let hash = *blake3::hash(&cbor).as_bytes();
+            checkpoint_slots.push(Some(hash));
+            if seen.insert(hash) {
+                blobs.push(HydratedCheckpointBlob { hash, cbor });
+            }
+        } else {
+            checkpoint_slots.push(None);
+        }
+    }
+    Ok(HydratedCheckpointPayloadV1 {
+        schema_version: HYDRATED_CACHE_SCHEMA,
+        openrcad_cache_abi: OPENRCAD_CACHE_ABI,
+        recipe_hash,
+        hidden_hash,
+        checkpoint_slots,
+        blobs,
+    })
+}
+
+fn decode_hydrated_cache(payload: HydratedCheckpointPayloadV1) -> Option<EvaluationCacheSnapshot> {
+    let mut decoded = std::collections::HashMap::new();
+    for blob in payload.blobs {
+        if blob.hash != *blake3::hash(&blob.cbor).as_bytes() {
+            return None;
+        }
+        let checkpoint = cbor_from_slice(&blob.cbor).ok()?;
+        decoded.insert(blob.hash, checkpoint);
+    }
+    let checkpoints = payload
+        .checkpoint_slots
+        .into_iter()
+        .map(|slot| slot.and_then(|hash| decoded.get(&hash).cloned()))
+        .collect();
+    let snapshot = EvaluationCacheSnapshot {
+        cache: std::sync::Arc::new(crate::parametric::EvalCache { checkpoints }),
+    };
+    let healthy = snapshot
+        .cache
+        .checkpoints
+        .iter()
+        .flatten()
+        .all(|checkpoint| {
+            checkpoint.live.iter().all(|body| {
+                body.parts
+                    .iter()
+                    .all(|solid| solid.health_report().is_healthy() && solid.is_watertight())
+            })
+        });
+    healthy.then_some(snapshot)
+}
+
+fn hidden_hash(hidden: &HashSet<String>) -> [u8; 32] {
+    let mut ids: Vec<&str> = hidden.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for id in ids {
+        hasher.update(id.as_bytes());
+        hasher.update(&[0]);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn sparse_hydrated_cache(source: &EvaluationCacheSnapshot) -> EvaluationCacheSnapshot {
+    let mut sparse = source.clone();
+    let len = sparse.cache.checkpoints.len();
+    if len <= 1 {
+        return sparse;
+    }
+    let mut keep = std::collections::HashSet::new();
+    keep.insert(len - 1);
+    for numerator in [1usize, 2, 3] {
+        keep.insert((len - 1) * numerator / 4);
+    }
+    let mut expensive: Vec<(usize, std::time::Duration)> = sparse
+        .cache
+        .checkpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cp)| cp.as_ref().map(|cp| (i, cp.feature_duration)))
+        .collect();
+    expensive.sort_by_key(|(_, duration)| std::cmp::Reverse(*duration));
+    keep.extend(expensive.into_iter().take(8).map(|(i, _)| i));
+    let cache = std::sync::Arc::make_mut(&mut sparse.cache);
+    for (i, checkpoint) in cache.checkpoints.iter_mut().enumerate() {
+        if !keep.contains(&i) {
+            *checkpoint = None;
+        }
+    }
+    sparse
 }
 
 /// Hash of the graph's CBOR bytes — used to tie a mesh cache to a specific graph.
@@ -181,22 +442,20 @@ struct MeshCachePayload {
 /// mesh-cache freshness check has negligible collision probability. This is an
 /// identity fingerprint, not an integrity/tamper check — corruption is caught by
 /// the per-section CRC, so a fast non-cryptographic hash is the right tool here.
-fn graph_hash(graph_cbor: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for &b in graph_cbor {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
+fn recipe_hash(recipe_cbor: &[u8]) -> [u8; 32] {
+    *blake3::hash(recipe_cbor).as_bytes()
+}
+
+#[cfg(test)]
+fn graph_hash(recipe_cbor: &[u8]) -> [u8; 32] {
+    recipe_hash(recipe_cbor)
 }
 
 /// Whether a mesh cache carrying `stored_hash` belongs to the graph whose CBOR
 /// is `graph_cbor`. A mismatch means the graph was edited out-of-band, so the
 /// cache is stale and must be discarded (the GUI re-evaluates instead).
-fn mesh_cache_fresh(stored_hash: u64, graph_cbor: &[u8]) -> bool {
-    stored_hash == graph_hash(graph_cbor)
+fn mesh_cache_fresh(stored_hash: [u8; 32], recipe_cbor: &[u8]) -> bool {
+    stored_hash == recipe_hash(recipe_cbor)
 }
 
 fn now_unix() -> u64 {
@@ -246,10 +505,10 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
     let mut sections: Vec<StagedSection> = Vec::new();
 
     // --- GRAPH (source of truth) ---
-    let graph_cbor = cbor_to_vec(doc.graph)?;
-    let graph_hash = graph_hash(&graph_cbor);
-    let graph_uncompressed = graph_cbor.len();
-    let graph_stored = zstd_compress(&graph_cbor, GRAPH_LEVEL)?;
+    let recipe_cbor = cbor_to_vec(&DocumentRecipeV1::from_graph(doc.graph))?;
+    let recipe_hash = recipe_hash(&recipe_cbor);
+    let recipe_uncompressed = recipe_cbor.len();
+    let recipe_stored = zstd_compress(&recipe_cbor, GRAPH_LEVEL)?;
 
     // --- METADATA (uncompressed, written first) ---
     let now = now_unix();
@@ -273,8 +532,8 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
     sections.push(StagedSection {
         id: SEC_GRAPH,
         codec: CODEC_ZSTD,
-        uncompressed_len: graph_uncompressed,
-        stored: graph_stored,
+        uncompressed_len: recipe_uncompressed,
+        stored: recipe_stored,
     });
 
     // --- THUMBNAIL (stored; PNG is already compressed) ---
@@ -292,7 +551,8 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
     // --- MESH_CACHE (optional, zstd) ---
     if let Some(bodies) = doc.mesh_cache {
         let payload = MeshCachePayload {
-            graph_hash,
+            mesh_cache_abi: MESH_CACHE_ABI,
+            recipe_hash,
             bodies: bodies.to_vec(),
         };
         let cbor = cbor_to_vec(&payload)?;
@@ -317,6 +577,45 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
             uncompressed_len,
             stored,
         });
+    }
+
+    // --- HYDRATED CHECKPOINTS (optional, disposable) ---
+    if let Some(cache) = doc.evaluation_cache {
+        let mut sparse = sparse_hydrated_cache(cache);
+        let limit = doc
+            .hydrated_cache_limit
+            .unwrap_or(DEFAULT_HYDRATED_CACHE_LIMIT);
+        loop {
+            let payload = hydrated_payload(&sparse, recipe_hash, hidden_hash(&doc.hidden_nodes))?;
+            let cbor = cbor_to_vec(&payload)?;
+            let stored = zstd_compress(&cbor, MESH_LEVEL)?;
+            if stored.len() <= limit {
+                sections.push(StagedSection {
+                    id: SEC_HYDRATED_CHECKPOINTS,
+                    codec: CODEC_ZSTD,
+                    uncompressed_len: cbor.len(),
+                    stored,
+                });
+                break;
+            }
+            let final_index = sparse.cache.checkpoints.len().saturating_sub(1);
+            let remove = sparse
+                .cache
+                .checkpoints
+                .iter()
+                .enumerate()
+                .filter_map(|(i, cp)| {
+                    (i != final_index)
+                        .then(|| cp.as_ref().map(|cp| (i, cp.feature_duration)))
+                        .flatten()
+                })
+                .min_by_key(|(_, duration)| *duration)
+                .map(|(i, _)| i);
+            match remove {
+                Some(i) => std::sync::Arc::make_mut(&mut sparse.cache).checkpoints[i] = None,
+                None => break, // final state alone exceeds the configured cap
+            }
+        }
     }
 
     // --- Lay out the file ---
@@ -361,6 +660,59 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
     Ok(out)
 }
 
+/// Crash-resilient path writer used by the GUI. The new bytes are fully written
+/// and synced before the previous document is moved aside; if the final rename
+/// fails, the previous file is restored from the sibling backup.
+pub fn write_zcad_file(path: impl AsRef<Path>, doc: &ZcadDocument) -> Result<(), ZcadError> {
+    let path = path.as_ref();
+    let bytes = write_zcad(doc)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.zcad");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp: PathBuf = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    let backup: PathBuf = parent.join(format!(".{file_name}.previous"));
+
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+        }
+        let had_previous = path.exists();
+        if had_previous {
+            std::fs::rename(path, &backup)?;
+        }
+        if let Err(error) = std::fs::rename(&temp, path) {
+            if had_previous {
+                let _ = std::fs::rename(&backup, path);
+            }
+            return Err(error);
+        }
+        if had_previous {
+            let _ = std::fs::remove_file(&backup);
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write_result.map_err(ZcadError::Io)
+}
+
+pub fn read_zcad_file(path: impl AsRef<Path>) -> Result<LoadedZcad, ZcadError> {
+    let bytes = std::fs::read(path).map_err(ZcadError::Io)?;
+    read_zcad(&bytes)
+}
+
 /// Parse a `.zcad` file. Accepts the binary container, an old plain-JSON
 /// `.zcad`, and rejects anything else with [`ZcadError::NotZcad`].
 pub fn read_zcad(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
@@ -380,6 +732,7 @@ pub fn read_zcad(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
                 mesh_cache: None,
                 was_legacy_json: true,
                 hidden_nodes: HashSet::new(),
+                evaluation_cache: None,
             });
         }
     }
@@ -456,11 +809,12 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
 
     // Decode each section into its slot. Unknown ids are skipped silently.
     let mut metadata = ZcadMetadata::default();
-    let mut graph: Option<ParametricGraph> = None;
-    let mut graph_bytes: Option<Vec<u8>> = None;
+    let mut recipe: Option<DocumentRecipeV1> = None;
+    let mut recipe_bytes: Option<Vec<u8>> = None;
     let mut thumbnail_png: Option<Vec<u8>> = None;
     let mut mesh_payload: Option<MeshCachePayload> = None;
     let mut hidden_nodes: HashSet<String> = HashSet::new();
+    let mut hydrated_payload: Option<HydratedCheckpointPayloadV1> = None;
 
     for s in &sections {
         match s.id {
@@ -470,8 +824,8 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
             }
             SEC_GRAPH => {
                 let raw = decode_section(s)?;
-                graph = Some(cbor_from_slice(&raw)?);
-                graph_bytes = Some(raw);
+                recipe = Some(cbor_from_slice(&raw)?);
+                recipe_bytes = Some(raw);
             }
             SEC_THUMBNAIL => {
                 thumbnail_png = Some(decode_section(s)?);
@@ -484,19 +838,81 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
                 let raw = decode_section(s)?;
                 hidden_nodes = cbor_from_slice(&raw)?;
             }
+            SEC_HYDRATED_CHECKPOINTS => {
+                if let Ok(raw) = decode_section(s) {
+                    hydrated_payload = cbor_from_slice(&raw).ok();
+                }
+            }
             _ => { /* unknown section — skip for forward compatibility */ }
         }
     }
 
-    let mut graph =
-        graph.ok_or_else(|| ZcadError::Decode("file has no graph section".into()))?;
-    // node_map is #[serde(skip)]; without this, features added after a load
-    // can't resolve their parents (add_dependency would no-op).
-    graph.rebuild_node_map();
+    let graph = recipe
+        .ok_or_else(|| ZcadError::Decode("file has no document recipe".into()))?
+        .into_graph()?;
 
     // Keep the mesh cache only if it matches the graph we actually loaded.
-    let mesh_cache = match (mesh_payload, &graph_bytes) {
-        (Some(p), Some(gb)) if mesh_cache_fresh(p.graph_hash, gb) => Some(p.bodies),
+    let mesh_cache = match (mesh_payload, &recipe_bytes) {
+        (Some(p), Some(bytes))
+            if p.mesh_cache_abi == MESH_CACHE_ABI && mesh_cache_fresh(p.recipe_hash, bytes) =>
+        {
+            log::debug!(
+                "[zcad_cache] accepted embedded mesh cache: abi={} bodies={}",
+                p.mesh_cache_abi,
+                p.bodies.len()
+            );
+            Some(p.bodies)
+        }
+        (Some(p), Some(bytes)) => {
+            log::debug!(
+                "[zcad_cache] discarded embedded mesh cache: stored_abi={} expected_abi={} recipe_match={}",
+                p.mesh_cache_abi,
+                MESH_CACHE_ABI,
+                mesh_cache_fresh(p.recipe_hash, bytes)
+            );
+            None
+        }
+        (Some(_), None) => {
+            log::debug!(
+                "[zcad_cache] discarded embedded mesh cache: document recipe bytes missing"
+            );
+            None
+        }
+        _ => None,
+    };
+
+    let evaluation_cache = match (hydrated_payload, &recipe_bytes) {
+        (Some(payload), Some(bytes))
+            if payload.schema_version == HYDRATED_CACHE_SCHEMA
+                && payload.openrcad_cache_abi == OPENRCAD_CACHE_ABI
+                && payload.recipe_hash == recipe_hash(bytes)
+                && payload.hidden_hash == hidden_hash(&hidden_nodes) =>
+        {
+            log::debug!(
+                "[zcad_cache] accepted hydrated evaluation checkpoints: abi={} slots={}",
+                payload.openrcad_cache_abi,
+                payload.checkpoint_slots.len()
+            );
+            decode_hydrated_cache(payload)
+        }
+        (Some(payload), Some(bytes)) => {
+            log::debug!(
+                "[zcad_cache] discarded hydrated checkpoints: schema={}/{} abi={}/{} recipe_match={} hidden_match={}",
+                payload.schema_version,
+                HYDRATED_CACHE_SCHEMA,
+                payload.openrcad_cache_abi,
+                OPENRCAD_CACHE_ABI,
+                payload.recipe_hash == recipe_hash(bytes),
+                payload.hidden_hash == hidden_hash(&hidden_nodes)
+            );
+            None
+        }
+        (Some(_), None) => {
+            log::debug!(
+                "[zcad_cache] discarded hydrated checkpoints: document recipe bytes missing"
+            );
+            None
+        }
         _ => None,
     };
 
@@ -507,6 +923,7 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
         mesh_cache,
         was_legacy_json: false,
         hidden_nodes,
+        evaluation_cache,
     })
 }
 
@@ -530,7 +947,7 @@ mod tests {
             name: "B".into(),
             feature: FeatureType::Box { w, h: 1.0, d: 1.0 },
         });
-        cbor_to_vec(&pg).unwrap()
+        cbor_to_vec(&DocumentRecipeV1::from_graph(&pg)).unwrap()
     }
 
     #[test]

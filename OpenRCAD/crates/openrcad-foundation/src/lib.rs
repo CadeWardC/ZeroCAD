@@ -28,6 +28,7 @@
 
 pub mod axis;
 pub mod bnd;
+pub mod cancellation;
 pub mod dir;
 pub mod double_double;
 pub mod frame;
@@ -42,6 +43,7 @@ pub mod xyz;
 
 pub use axis::{Ax1, Lin, Lin2d};
 pub use bnd::{BndBox, BndBox2d};
+pub use cancellation::{CancellationProbe, CancellationToken, Cancelled, NeverCancelled};
 pub use dir::{Dir, Dir2d};
 pub use double_double::DoubleDouble;
 pub use frame::{Ax2, Ax22d, Ax2d, Ax3};

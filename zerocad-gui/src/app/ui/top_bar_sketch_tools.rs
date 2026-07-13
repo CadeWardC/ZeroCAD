@@ -131,7 +131,7 @@ impl ZeroCadApp {
                             (
                                 ToolFamily::Polygon,
                                 "Polygon",
-                                "Regular polygon — set the side count, then click center and rim. Click again or right-click for inscribed / circumscribed",
+                                "Regular polygon — set the side count, click the center, then set the hidden guide-circle diameter. Click again or right-click for inscribed / circumscribed",
                             ),
                             (
                                 ToolFamily::Corner,
@@ -289,10 +289,7 @@ impl ZeroCadApp {
                         .rounding(egui::Rounding::same(4.0)),
                 );
                 if undo_btn.on_hover_text("Undo last drawn shape").clicked() {
-                    // One undo removes a whole shape (not a single
-                    // segment), then the live curves are rebuilt.
-                    self.sketch_shapes.pop();
-                    self.rebuild_active_sketch_curves();
+                    self.undo_last_sketch_action();
                 }
 
                 let reset_btn = icons::Icon::Trash.labeled_button(

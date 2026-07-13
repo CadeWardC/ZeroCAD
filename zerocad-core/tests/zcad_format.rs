@@ -3,7 +3,9 @@
 //! load, and unknown sections/fields are tolerated for forward compatibility.
 
 use std::collections::HashSet;
-use zerocad_core::zcad_format::{read_zcad, write_zcad, ZcadDocument, ZcadError, MAGIC};
+use zerocad_core::zcad_format::{
+    read_zcad, read_zcad_file, write_zcad, write_zcad_file, ZcadDocument, ZcadError, MAGIC,
+};
 use zerocad_core::{FeatureNode, FeatureType, ParametricGraph, Unit};
 
 /// A non-trivial document: a box plus a cylinder cut into it.
@@ -35,6 +37,8 @@ fn doc_for(graph: &ParametricGraph) -> ZcadDocument<'_> {
         bbox: [0.0; 6],
         created_unix: None,
         hidden_nodes: HashSet::new(),
+        evaluation_cache: None,
+        hydrated_cache_limit: None,
     }
 }
 
@@ -57,6 +61,41 @@ fn round_trip_recipe_only() {
 }
 
 #[test]
+fn path_save_replaces_an_existing_document_safely() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let path = dir.path().join("part.zcad");
+
+    let first = sample_graph();
+    write_zcad_file(&path, &doc_for(&first)).expect("initial atomic save");
+
+    let mut second = sample_graph();
+    second.add_feature(FeatureNode {
+        id: "box2".into(),
+        name: "Second block".into(),
+        feature: FeatureType::Box {
+            w: 5.0,
+            h: 6.0,
+            d: 7.0,
+        },
+    });
+    write_zcad_file(&path, &doc_for(&second)).expect("replacement atomic save");
+
+    let loaded = read_zcad_file(&path).expect("read replacement");
+    assert_eq!(loaded.graph.graph.node_count(), second.graph.node_count());
+    assert!(
+        dir.path()
+            .read_dir()
+            .expect("list temp directory")
+            .all(|entry| !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")),
+        "successful save must not leave temporary files"
+    );
+}
+
+#[test]
 fn round_trip_with_thumbnail_and_mesh_cache() {
     let pg = sample_graph();
     let bodies = pg.evaluate_bodies(&Default::default()).expect("bodies");
@@ -69,6 +108,8 @@ fn round_trip_with_thumbnail_and_mesh_cache() {
         bbox: [-1.0, -2.0, -3.0, 4.0, 5.0, 6.0],
         created_unix: Some(1_700_000_000),
         hidden_nodes: HashSet::new(),
+        evaluation_cache: None,
+        hydrated_cache_limit: None,
     };
     let bytes = write_zcad(&doc).expect("write");
     let loaded = read_zcad(&bytes).expect("read");
@@ -80,6 +121,43 @@ fn round_trip_with_thumbnail_and_mesh_cache() {
 
     let cache = loaded.mesh_cache.expect("fresh mesh cache present");
     assert_eq!(cache.len(), bodies.len());
+}
+
+#[test]
+fn hydrated_checkpoint_cache_round_trips_and_rebuilds_identically() {
+    let pg = sample_graph();
+    let bodies = pg
+        .evaluate_bodies_with_warnings(&HashSet::new())
+        .expect("populate cache")
+        .0;
+    let snapshot = pg.evaluation_cache_snapshot();
+    let doc = ZcadDocument {
+        graph: &pg,
+        thumbnail_png: None,
+        mesh_cache: Some(&bodies),
+        units: Unit::Millimeter,
+        bbox: [0.0; 6],
+        created_unix: None,
+        hidden_nodes: HashSet::new(),
+        evaluation_cache: Some(&snapshot),
+        hydrated_cache_limit: Some(128 * 1024 * 1024),
+    };
+    let bytes = write_zcad(&doc).expect("write hydrated document");
+    let loaded = read_zcad(&bytes).expect("read hydrated document");
+    let cache = loaded
+        .evaluation_cache
+        .expect("fresh hydrated checkpoint cache");
+    loaded.graph.install_evaluation_cache(cache);
+    let rebuilt = loaded
+        .graph
+        .evaluate_bodies(&HashSet::new())
+        .expect("evaluate from hydrated cache");
+    assert_eq!(rebuilt.len(), bodies.len());
+    for ((expected_id, expected), (actual_id, actual)) in bodies.iter().zip(&rebuilt) {
+        assert_eq!(expected_id, actual_id);
+        assert_eq!(expected.indices, actual.indices);
+        assert_eq!(expected.vertices, actual.vertices);
+    }
 }
 
 #[test]
@@ -129,6 +207,7 @@ fn round_trip_overlapping_boolean_extrude() {
             curves: SketchCurves::new(),
             shapes,
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -161,6 +240,105 @@ fn round_trip_overlapping_boolean_extrude() {
         "boolean result mesh identical after reload"
     );
     assert_eq!(after[0].1.vertices.len(), before[0].1.vertices.len());
+}
+
+#[test]
+fn round_trip_regular_polygon_keeps_expression_and_no_circle() {
+    use zerocad_core::{CoordinateSystem, Dimension, SketchCurves, SketchShape};
+
+    let mut pg = ParametricGraph::new();
+    pg.add_feature(FeatureNode {
+        id: "polygon_sketch".to_string(),
+        name: "Polygon Sketch".to_string(),
+        feature: FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: vec![SketchShape::RegularPolygon {
+                center: (1.0, 2.0),
+                sides: 7,
+                diameter: Dimension {
+                    value: 21.5,
+                    expr: Some("43/2".to_string()),
+                },
+                rotation_deg: 15.0,
+                circumscribed: false,
+            }],
+            corner_mods: vec![],
+            mirrors: vec![],
+            on_face: false,
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
+        },
+    });
+
+    let bytes = write_zcad(&doc_for(&pg)).expect("write polygon");
+    let loaded = read_zcad(&bytes).expect("read polygon");
+    let node = loaded
+        .graph
+        .graph
+        .node_weights()
+        .find(|node| node.id == "polygon_sketch")
+        .expect("polygon sketch node");
+    let FeatureType::Sketch { shapes, .. } = &node.feature else {
+        panic!("expected sketch feature");
+    };
+    let SketchShape::RegularPolygon { diameter, .. } = &shapes[0] else {
+        panic!("expected regular polygon");
+    };
+    assert_eq!(diameter.expr.as_deref(), Some("43/2"));
+    let curves = shapes[0].build(&loaded.graph.variable_map());
+    assert_eq!(curves.segments.len(), 7);
+    assert!(curves.circles.is_empty());
+}
+
+#[test]
+fn round_trip_body_transform_keeps_copy_and_translation() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".to_string(),
+        name: "Box".to_string(),
+        feature: FeatureType::Box {
+            w: 2.0,
+            h: 3.0,
+            d: 4.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "copy_2".to_string(),
+        name: "Copy".to_string(),
+        feature: FeatureType::BodyTransform {
+            source: "box_1".to_string(),
+            translation: [5.0, 1.0, -2.0],
+            copy: true,
+        },
+    });
+    graph.add_dependency("box_1", "copy_2");
+
+    let bytes = write_zcad(&doc_for(&graph)).expect("write body transform");
+    let loaded = read_zcad(&bytes).expect("read body transform");
+    let node = loaded
+        .graph
+        .graph
+        .node_weights()
+        .find(|node| node.id == "copy_2")
+        .expect("copy node");
+    let FeatureType::BodyTransform {
+        source,
+        translation,
+        copy,
+    } = &node.feature
+    else {
+        panic!("expected body transform");
+    };
+    assert_eq!(source, "box_1");
+    assert_eq!(*translation, [5.0, 1.0, -2.0]);
+    assert!(*copy);
+    let bodies = loaded
+        .graph
+        .evaluate_bodies(&HashSet::new())
+        .expect("evaluate restored transform");
+    assert_eq!(bodies.len(), 2);
 }
 
 #[test]

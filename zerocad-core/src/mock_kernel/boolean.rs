@@ -1,29 +1,68 @@
 use super::*;
 
-/// Run `f` with the panic hook silenced, restoring it afterward. `boolean_checked`
-/// already catches the kernel's panics, but the *default* hook still prints the
-/// panic (and any diagnostic dump) to stderr — which would spam the console on
-/// every degraded boolean (e.g. a drag frame). Silencing it keeps recoverable
-/// boolean failures quiet; the caller still just sees `None`.
+thread_local! {
+    static ACTIVE_CANCELLATION: std::cell::RefCell<Option<crate::EvaluationCancellation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_kernel_cancellation<R>(
+    cancellation: crate::EvaluationCancellation,
+    f: impl FnOnce() -> R,
+) -> R {
+    ACTIVE_CANCELLATION.with(|slot| {
+        let previous = slot.replace(Some(cancellation));
+        let result = f();
+        slot.replace(previous);
+        result
+    })
+}
+
+fn active_cancellation() -> Option<crate::EvaluationCancellation> {
+    ACTIVE_CANCELLATION.with(|slot| slot.borrow().clone())
+}
+
+fn checked_boolean(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    op: BooleanOp,
+) -> Result<KernelSolid, openrcad::algo::BooleanError> {
+    match active_cancellation() {
+        Some(cancel) => openrcad::algo::boolean_checked_with_cancel(a, b, op, &cancel),
+        None => boolean_checked(a, b, op),
+    }
+}
+
+/// Keep the recoverable-boolean call boundary explicit without changing the
+/// process-wide panic hook. `boolean_checked` catches solver panics itself.
 pub(crate) fn quiet_panic<R>(f: impl FnOnce() -> R) -> R {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let r = f();
-    std::panic::set_hook(prev);
-    r
+    // `boolean_checked` already catches solver panics. Swapping the process-wide
+    // panic hook here was racy once evaluations moved to background threads: an
+    // unrelated panic could be silenced, or two booleans could restore hooks in
+    // the wrong order. Keep recovery local and never mutate global panic state.
+    f()
 }
 
 /// Boolean union (`a ∪ b`). Returns `None` if the kernel can't resolve the
 /// configuration, panics, or produces a non-watertight result — callers decide
 /// how to degrade. `boolean_checked` catches panics and rejects leaky output.
 pub fn union(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
-    quiet_panic(|| boolean_checked(a, b, BooleanOp::Fuse).ok())
+    union_diagnostic(a, b).ok()
+}
+
+/// Boolean union that preserves the kernel's failure reason for operation-level
+/// diagnostics. Interactive callers normally use [`union`]; feature evaluators
+/// use this when they can identify the affected node in a useful log message.
+pub(crate) fn union_diagnostic(
+    a: &KernelSolid,
+    b: &KernelSolid,
+) -> Result<KernelSolid, openrcad::algo::BooleanError> {
+    quiet_panic(|| checked_boolean(a, b, BooleanOp::Fuse))
 }
 
 /// Boolean difference (`a − b`): subtract `b`'s volume from `a`. Returns `None`
 /// on kernel failure or non-watertight output.
 pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
-    quiet_panic(|| boolean_checked(a, b, BooleanOp::Cut).ok())
+    quiet_panic(|| checked_boolean(a, b, BooleanOp::Cut).ok())
 }
 
 /// Boolean union with the kernel's exact face history (see
@@ -34,8 +73,20 @@ pub fn union_with_history(
     b: &KernelSolid,
     obj_classes: Option<&[Option<u64>]>,
 ) -> Option<(KernelSolid, openrcad::algo::BooleanFaceHistory)> {
-    quiet_panic(|| {
-        openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Fuse, obj_classes, None).ok()
+    quiet_panic(|| match active_cancellation() {
+        Some(cancel) => openrcad::algo::boolean_checked_with_history_cancel(
+            a,
+            b,
+            BooleanOp::Fuse,
+            obj_classes,
+            None,
+            &cancel,
+        )
+        .ok(),
+        None => {
+            openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Fuse, obj_classes, None)
+                .ok()
+        }
     })
 }
 
@@ -51,8 +102,20 @@ pub fn difference_bodies_with_history(
     KernelSolid,
     openrcad::algo::BooleanFaceHistory,
 )> {
-    let (result, history) = quiet_panic(|| {
-        openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Cut, obj_classes, None).ok()
+    let (result, history) = quiet_panic(|| match active_cancellation() {
+        Some(cancel) => openrcad::algo::boolean_checked_with_history_cancel(
+            a,
+            b,
+            BooleanOp::Cut,
+            obj_classes,
+            None,
+            &cancel,
+        )
+        .ok(),
+        None => {
+            openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Cut, obj_classes, None)
+                .ok()
+        }
     })?;
     let parts = result.split_disconnected();
     let mut parts = if parts.is_empty() {

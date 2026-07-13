@@ -101,6 +101,7 @@ fn one_extrude(curves: SketchCurves, region_indices: Vec<usize>) -> zerocad_core
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });

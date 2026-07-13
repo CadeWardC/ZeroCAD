@@ -2,6 +2,10 @@ use crate::*;
 
 impl eframe::App for ZeroCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let frame_started = std::time::Instant::now();
+        // A thumbnail queued last frame is no longer referenced by that frame's
+        // command buffer, so it is now safe to let egui release the texture.
+        self.flush_onboarding_texture_evictions();
         // Keep a context handle so a background refine worker can wake the UI.
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
@@ -12,6 +16,7 @@ impl eframe::App for ZeroCadApp {
             .set_render_state(frame.wgpu_render_state().cloned());
         // Swap in any finished background refine.
         self.poll_refine_eval();
+        self.poll_document_worker();
         self.tick_speculative_edge_mod(ctx);
         // While the Welcome modal is up the workspace is inert, so its hotkeys
         // are suppressed (the modal reads Esc itself).
@@ -33,6 +38,9 @@ impl eframe::App for ZeroCadApp {
 
         self.draw_top_bar(ctx);
 
+        self.show_move_dialog(ctx);
+        self.show_combine_dialog(ctx);
+
         self.draw_feature_tree(ctx);
 
         self.draw_status_bar(ctx);
@@ -46,5 +54,14 @@ impl eframe::App for ZeroCadApp {
         self.handle_3d_escape(ctx);
 
         self.persist_settings();
+        let elapsed = frame_started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(17)
+            && self
+                .last_slow_frame_log
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            log::debug!("slow UI frame: {elapsed:?}");
+            self.last_slow_frame_log = Some(std::time::Instant::now());
+        }
     }
 }

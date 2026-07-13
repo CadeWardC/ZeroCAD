@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -5,11 +10,14 @@ use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{
     detect_regions, CoordinateSystem, CornerKind, CornerMod, Dimension, EdgeRef, ExtrudeMode,
-    FeatureNode, FeatureType, MockMesh, ParametricGraph, Region, SketchCurves, SketchPlane,
-    SketchShape, Unit, Variable, Vec3,
+    FeatureNode, FeatureType, LineSegment, MockMesh, ParametricGraph, Region, SketchCurves,
+    SketchPlane, SketchShape, Unit, Variable, Vec3,
 };
 
+mod combine_ui;
+mod document_worker;
 mod edgemod;
+mod evaluation_worker;
 mod expr;
 mod extrude;
 mod geom2d;
@@ -17,6 +25,7 @@ mod gpu_viewport;
 mod hole_ui;
 mod icons;
 mod loft_sweep_ui;
+mod move_ui;
 mod pattern_ui;
 mod render;
 mod revolve_ui;
@@ -25,19 +34,23 @@ mod shell_ui;
 mod shortcuts;
 mod sketch_ui;
 mod theme;
+mod thread_ui;
 mod thumbnail;
+use combine_ui::CombineOp;
 use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
 use geom2d::{circumcircle, dist_point_to_segment, is_point_in_quad, project_point_on_segment};
 use hole_ui::HoleOp;
 use loft_sweep_ui::SweepOp;
+use move_ui::{BodyClipboard, MoveOp};
 use pattern_ui::PatternOp;
 use revolve_ui::RevolveOp;
 use shell_ui::ShellOp;
 use shortcuts::{Keymap, ShortcutAction};
 use sketch_ui::{dim_fields_for, DimInput};
 use theme::{apply_premium_dark_theme, apply_premium_light_theme, Palette};
+use thread_ui::ThreadOp;
 
 fn main() -> eframe::Result<()> {
     let mut builder = env_logger::Builder::from_default_env();
@@ -146,8 +159,27 @@ pub(crate) enum SnapKind {
     Center,
     /// The nearest point along a segment.
     OnLine,
+    /// The active sketch plane's origin (sketch coords `(0, 0)`).
+    Origin,
+    /// A point lying on a woken midline inference guide (perpendicular through a
+    /// segment midpoint). No point glyph — the dashed guide line is the cue.
+    Midline,
+    /// The intersection of two midlines — e.g. the centre of a rectangle. Drawn
+    /// with the same orange X as [`SnapKind::Midpoint`]/[`SnapKind::Center`].
+    MidlineCenter,
     /// The background placement grid.
     Grid,
+}
+
+/// A "woken" midline inference guide (Fusion 360 style): the perpendicular line
+/// through a straight segment's midpoint. Waking one lets the cursor snap along
+/// the midline and onto its intersections with other midlines (rectangle centre).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MidlineGuide {
+    /// The segment midpoint the guide passes through.
+    pub origin: (f32, f32),
+    /// Unit direction of the guide line (perpendicular to the owning segment).
+    pub dir: (f32, f32),
 }
 
 /// The toolbar button a [`SketchTool`] lives under. Switching buttons is by
@@ -204,10 +236,9 @@ impl SketchTool {
         }
     }
 
-    /// Whether this tool draws a shape geometrically (center/radius/points) with
-    /// no inline dimension dialog — the polygon and mirror tools, like the
-    /// 3-point tools, place points directly and never open the Fusion-style
-    /// dimension box.
+    /// Whether this tool is defined entirely by point clicks and therefore has
+    /// no inline dimension dialog. Polygons are excluded because their second
+    /// point drives an editable construction-circle diameter.
     pub fn is_point_drawn(self) -> bool {
         matches!(
             self,
@@ -215,8 +246,6 @@ impl SketchTool {
                 | SketchTool::ThreePointCircle
                 | SketchTool::Ellipse
                 | SketchTool::ThreePointEllipse
-                | SketchTool::PolygonInscribed
-                | SketchTool::PolygonCircumscribed
                 | SketchTool::Mirror
         )
     }
@@ -306,8 +335,8 @@ impl ToolFamily {
     }
 }
 
-/// The variable expressions bound to a sketch's dimensions, for display in the
-/// property panel (so the user can see which dimensions follow a variable).
+/// The expressions bound to a sketch's dimensions, for display in the property
+/// panel (so the editable source remains visible after it evaluates).
 fn sketch_variable_dims(shapes: &[SketchShape]) -> Vec<String> {
     let mut out = Vec::new();
     for s in shapes {
@@ -317,6 +346,7 @@ fn sketch_variable_dims(shapes: &[SketchShape]) -> Vec<String> {
             SketchShape::Line {
                 length, angle_deg, ..
             } => vec![length, angle_deg],
+            SketchShape::RegularPolygon { diameter, .. } => vec![diameter],
             SketchShape::Raw { .. } => vec![],
         };
         for d in dims {
@@ -358,6 +388,8 @@ enum RowAction {
     ToggleVisibility,
     /// Right-clicked "Add Variable" on a variable-set row.
     AddVariable,
+    /// Right-clicked "Edit Sketch" on a sketch row.
+    EditSketch,
 }
 
 /// Which tab is selected in the Settings window (left rail). More tabs can be
@@ -415,21 +447,39 @@ struct SaveDialogState {
     save_dir: PathBuf,
 }
 
-/// Result delivered by a background refine evaluation: its generation tag (to
-/// discard superseded jobs) and the evaluated bodies + warnings (or an error).
-type EvalResult = (u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>);
-/// Result delivered by an asynchronous live-preview evaluation.
-type PreviewBodiesResult = (u64, Result<Vec<(String, MockMesh)>, String>);
+type SharedBodyMeshes = std::sync::Arc<Vec<(String, MockMesh)>>;
+
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    graph: zerocad_core::ParametricGraph,
+    hidden_nodes: HashSet<String>,
+}
+
+struct PendingSave {
+    path: PathBuf,
+    embed_hydrated: bool,
+    started: std::time::Instant,
+    dispatched: bool,
+}
+
+struct ExportCompletion {
+    message: String,
+    error: bool,
+}
 
 pub(crate) enum PendingVisualMode {
     Extrude(ExtrudeMode),
-    EdgeMod(CornerKind),
+    EdgeMod,
 }
 
 pub(crate) struct PendingCommitVisual {
     pub(crate) bodies: Vec<(String, MockMesh)>,
     pub(crate) mesh: Option<MockMesh>,
     pub(crate) mode: PendingVisualMode,
+    /// Whether `bodies` already represents the exact result for the committed
+    /// inputs. False means the current tool ghost must remain visible while the
+    /// final evaluator catches up.
+    pub(crate) exact_bodies: bool,
 }
 
 struct ZeroCadApp {
@@ -438,7 +488,7 @@ struct ZeroCadApp {
     selected_node_id: Option<String>,
     /// One mesh per solid body (node id + mesh), so faces/edges/points can be
     /// picked per body. Replaces the old single combined `current_mesh`.
-    body_meshes: Vec<(String, MockMesh)>,
+    body_meshes: SharedBodyMeshes,
     /// Cached `(vertices, triangles)` totals across `body_meshes`, refreshed
     /// only when the meshes change so the status bar doesn't re-sum every
     /// vertex/index of the whole model on every frame.
@@ -459,6 +509,7 @@ struct ZeroCadApp {
     graphics_backend: settings::GraphicsBackend,
     /// GPU viewport anti-aliasing quality (persisted; applied live).
     msaa_level: settings::MsaaLevel,
+    hydrated_cache_mb: u32,
     /// This frame's composited GPU scene texture, painted by `draw_viewport`.
     gpu_texture_id: Option<egui::TextureId>,
     /// The preview plan `render_gpu_scene` resolved this frame, handed to
@@ -472,10 +523,15 @@ struct ZeroCadApp {
     /// in here, so committing a fillet never stalls the UI (the arc boolean is
     /// ~1s; see `ParametricGraph::has_arc_fillet`). Stale jobs are ignored by
     /// generation.
-    eval_gen: u64,
-    eval_rx: Option<std::sync::mpsc::Receiver<EvalResult>>,
+    evaluator: evaluation_worker::ModelEvaluator,
+    document_worker: document_worker::DocumentWorker,
+    pending_save: Option<PendingSave>,
+    last_slow_frame_log: Option<std::time::Instant>,
+    export_completions: std::sync::Arc<std::sync::Mutex<Vec<ExportCompletion>>>,
+    eval_generation: u64,
     /// True while a background refine is in flight (drives a "Refining…" hint).
     eval_pending: bool,
+    eval_started: Option<std::time::Instant>,
     /// A clone of the egui context, captured each frame, so a worker thread can
     /// wake the UI (`request_repaint`) the instant its result is ready.
     egui_ctx: Option<egui::Context>,
@@ -542,6 +598,10 @@ struct ZeroCadApp {
     sketch_shapes: Vec<SketchShape>,
     /// Fillet/chamfer modifiers applied to corners of the in-progress sketch.
     sketch_corner_mods: Vec<CornerMod>,
+    /// Associative mirror operations of the in-progress sketch (see
+    /// [`zerocad_core::SketchMirror`]). Each reflects the live geometry across
+    /// its axis; persisted on the node at Finish Sketch.
+    sketch_mirrors: Vec<zerocad_core::SketchMirror>,
     /// Corners the user has clicked with the Fillet/Chamfer tool but not yet
     /// committed. They preview live with the current radius and are only folded
     /// into `sketch_corner_mods` when the user presses Enter / clicks OK.
@@ -634,6 +694,15 @@ struct ZeroCadApp {
     /// Separate from the sketch selection above so the extrude workflow is
     /// unaffected.
     selected_body: HashSet<(String, BodyPick)>,
+    /// Internal body clipboard used by Ctrl+C / Ctrl+V. The source remains a
+    /// parametric reference; each paste creates a translated copy feature.
+    body_clipboard: Option<BodyClipboard>,
+    /// Active body move dialog and manipulator.
+    move_op: Option<MoveOp>,
+    /// Active two-body Join/Cut dialog.
+    combine_op: Option<CombineOp>,
+    /// Cheap translated body-set preview shared by CPU and GPU renderers.
+    move_preview_bodies: Option<SharedBodyMeshes>,
     /// Depth used by the Extrude action.
     extrude_depth: f32,
     /// Last-used extrude mode (new body / join / cut), seeded into each new op.
@@ -648,50 +717,65 @@ struct ZeroCadApp {
     hole_op: Option<HoleOp>,
     /// The in-progress Shell tool dialog, `None` when idle.
     shell_op: Option<ShellOp>,
+    /// The in-progress Thread tool dialog, `None` when idle.
+    thread_op: Option<ThreadOp>,
     /// The in-progress Sweep tool dialog (profile chosen, picking path).
     sweep_op: Option<SweepOp>,
     /// Memoized live Cut/Join preview: `(input hash, evaluated bodies)`. The
     /// preview re-runs the whole parametric model (truck booleans), which is far
     /// too slow to redo every frame, so it's cached and only recomputed when the
     /// extrude's depth / mode / targets actually change. Cleared when the op ends.
-    extrude_preview_cache: Option<(u64, Vec<(String, MockMesh)>)>,
+    extrude_preview_cache: Option<(u64, SharedBodyMeshes)>,
     /// Memoized live extrude *tool* ghost (the orange New-Body volume / red Cut
     /// volume): `(input hash, mesh)`. Like `extrude_preview_cache`, it's rebuilt
     /// only when the depth/targets change, not on every repaint (e.g. mouse moves
     /// over the viewport while the dialog is open).
     extrude_preview_mesh_cache: Option<(u64, MockMesh)>,
+    /// Tessellated ghost base: `(targets+sign key, build depth, per-target
+    /// (plane origin, extrusion axis, mesh))`. Depth changes rescale these
+    /// along the axis instead of re-tessellating — curved profiles run the
+    /// kernel prism per build, far too slow per drag step. Rebuilt only when
+    /// the targets or the depth's sign change.
+    extrude_ghost_base: Option<(
+        u64,
+        f32,
+        Vec<(zerocad_core::Vec3, zerocad_core::Vec3, MockMesh)>,
+    )>,
     /// In-flight exact extrude preview job. The lightweight tool mesh is shown
     /// until this worker returns the real Cut/Join/overlap-NewBody result.
     extrude_preview_inflight: Option<u64>,
-    extrude_preview_rx: Option<std::sync::mpsc::Receiver<PreviewBodiesResult>>,
+    /// Debounce for exact Cut/Join previews. The lightweight ghost updates every
+    /// frame; B-Rep work starts only after this key stays unchanged for 100 ms.
+    extrude_preview_settle: Option<(u64, std::time::Instant)>,
     /// Memoized live edge fillet/chamfer preview: `(input hash, bodies)`. Like
     /// `extrude_preview_cache`, the underlying `preview_edge_mod_bodies` clones the
     /// graph and re-runs every truck boolean — far too slow to redo on every
     /// repaint while the size box is open or the handle is dragged. Recomputed only
     /// when the size/kind/target actually change. Cleared when the op ends.
-    edge_mod_preview_cache: Option<(u64, Vec<(String, MockMesh)>)>,
+    edge_mod_preview_cache: Option<(u64, SharedBodyMeshes)>,
     /// Memoized lightweight edge fillet/chamfer overlay mesh shown immediately
     /// while the exact worker-computed preview bodies are still pending.
     edge_mod_preview_mesh_cache: Option<(u64, MockMesh)>,
-    /// **Speculative** arc-fillet precompute for the live edge mod. While the user
-    /// is still adjusting a fillet, the moment its size settles (stops changing for
-    /// `EDGE_MOD_SETTLE`) the slow analytic-arc geometry for that size is computed
-    /// on a worker thread and cached here, keyed by the same hash `commit_edge_mod`
-    /// recomputes. If the user then commits at that size, the one-face result is
-    /// already done and is applied instantly — no faceted→arc "pop" a second later.
+    /// **Speculative** exact precompute for the live edge mod. Every new size or
+    /// kind is submitted immediately on the worker and cached here, keyed by the
+    /// same hash `commit_edge_mod` recomputes. If the user commits at that input,
+    /// an already-computed exact result can be applied instantly.
     /// Holds `(key, bodies, warnings)`; cleared when the op ends.
-    edge_mod_arc_cache: Option<(u64, Vec<(String, MockMesh)>, Vec<String>)>,
-    /// In-flight speculative arc job: its key (so a finished result can be matched
-    /// to the size it was computed for) and the channel it reports on. At most one
-    /// runs at a time — while it's busy, size changes don't spawn more.
+    edge_mod_arc_cache: Option<(u64, SharedBodyMeshes, Vec<String>)>,
+    /// A small most-recent-first cache of completed speculative solves, keyed by
+    /// the same size hash. Scrubbing the size back to a value solved earlier in
+    /// this edit finds it here and shows the exact preview instantly instead of
+    /// re-solving. Bounded (`EDGE_MOD_ARC_LRU_CAP`); cleared when the op ends.
+    edge_mod_arc_lru: Vec<(u64, SharedBodyMeshes, Vec<String>)>,
+    /// In-flight speculative arc job key. At most one preview request is active;
+    /// a newer request cooperatively cancels the obsolete evaluation.
     edge_mod_arc_inflight: Option<u64>,
-    edge_mod_arc_rx: Option<
-        std::sync::mpsc::Receiver<(u64, Result<(Vec<(String, MockMesh)>, Vec<String>), String>)>,
-    >,
-    /// Debounce tracker for the speculative precompute: the current size key and
-    /// when it was first observed. The arc job is spawned only once a key has been
-    /// stable for `EDGE_MOD_SETTLE`, so a fast drag doesn't kick off a job per step.
-    edge_mod_settle: Option<(u64, std::time::Instant)>,
+    /// Size key whose exact edge-mod solve came back failed (warnings / error).
+    /// Stops the per-frame tick from endlessly re-solving a failing blend while
+    /// the op stays alive (error in the status bar, ribbon + unchanged body on
+    /// screen). A size change makes a new key and retries; cleared with the rest
+    /// of the speculation state.
+    edge_mod_arc_failed: Option<u64>,
     /// True while the user is actively push/pull dragging the extrude depth in
     /// the viewport. During the drag we render only the cheap ghost tool volume
     /// (`cached_preview_mesh`) following the cursor live, and SKIP the expensive
@@ -721,10 +805,10 @@ struct ZeroCadApp {
 
     /// Snapshot stack for Undo (Ctrl+Z). Each entry is a serialized
     /// `ParametricGraph`; capped at 50 entries to bound memory.
-    undo_stack: Vec<String>,
+    undo_stack: Vec<UndoSnapshot>,
     /// Snapshot stack for Redo (Ctrl+Y / Ctrl+Shift+Z). Cleared whenever a new
     /// destructive change is committed.
-    redo_stack: Vec<String>,
+    redo_stack: Vec<UndoSnapshot>,
 
     /// Active shape-dimension dialog (after the first click of a shape).
     dim_input: Option<DimInput>,
@@ -736,6 +820,12 @@ struct ZeroCadApp {
     /// snap glyph drawn over the viewport. `None` when nothing snapped or when
     /// snapping is suppressed (Shift held).
     cursor_snap_kind: Option<SnapKind>,
+    /// Woken midline inference guides (≤2). A guide wakes when the cursor snaps
+    /// onto a segment midpoint and expires once the cursor drifts off its line.
+    snap_guides: Vec<MidlineGuide>,
+    /// Dashed guide segments (sketch-plane coords, anchor→snapped point) that the
+    /// viewport should draw this frame. Recomputed each hover; empty under Shift.
+    cursor_snap_guides: Vec<((f32, f32), (f32, f32))>,
     /// Screen-space positions for inline dimension labels (Fusion 360 style).
     dim_screen_positions: Vec<egui::Pos2>,
 
@@ -790,6 +880,10 @@ struct ZeroCadApp {
     /// Lazily-uploaded GPU textures for Recent thumbnails, keyed by project path,
     /// so the onboarding screen uploads each `.thumb` to egui only once.
     onboarding_textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Thumbnail textures that became stale during the current frame. They stay
+    /// alive until the next frame because egui-wgpu 0.29 destroys freed textures
+    /// before submitting the command buffer that may still reference them.
+    pending_onboarding_texture_evictions: HashSet<PathBuf>,
     /// Last preference snapshot persisted to `settings.json`. Compared at the end
     /// of every frame so any change to the unit / dark mode / onboarding toggle
     /// is saved without threading a save call through each edit site.

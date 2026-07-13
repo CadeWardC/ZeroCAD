@@ -121,8 +121,34 @@ impl GeomCurve {
             GeomCurve::Parabola(p) => parabola_box(p, t0, t1),
             GeomCurve::Hyperbola(h) => hyperbola_box(h, t0, t1),
             GeomCurve::BSpline(b) => b.interval_bbox(t0, t1),
+            GeomCurve::Helix(h) => helix_box(h, t0, t1),
         }
     }
+}
+
+/// Box of a helix `loc + r(u)·(cos u·X + sin u·Y) + (lead·u/2π)·Z` with
+/// `r(u) = r0 + taper·u`. The arc term is bounded like the cone (linear radius
+/// interval × exact cos/sin range); the axial term is linear in `u`. Valid,
+/// slightly conservative when tapered.
+fn helix_box(h: &crate::Helix, u0: f64, u1: f64) -> Interval3 {
+    let pos = h.position();
+    let loc = pos.location();
+    let x = pos.x_direction();
+    let y = pos.y_direction();
+    let z = pos.direction();
+    let r_iv = Interval::new(h.radius_at(u0), h.radius_at(u1));
+    let k = h.lead() / TAU;
+    let axial = Interval::new(k * u0, k * u1);
+    let axis_component = |xk: f64, yk: f64, zk: f64| -> Interval {
+        let (c_lo, c_hi) = cos_sin_range(xk, yk, u0, u1);
+        let arc = r_iv.mul(&Interval::new(c_lo, c_hi));
+        arc.add(&axial.scale(zk))
+    };
+    Interval3::new(
+        sum1(loc.x(), axis_component(x.x(), y.x(), z.x())),
+        sum1(loc.y(), axis_component(x.y(), y.y(), z.y())),
+        sum1(loc.z(), axis_component(x.z(), y.z(), z.z())),
+    )
 }
 
 /// Box of `center + r_x·cos u·X + r_y·sin u·Y` over `u ∈ [t0, t1]` (circle when

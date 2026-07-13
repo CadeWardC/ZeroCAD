@@ -101,6 +101,7 @@ impl ZeroCadApp {
         let mut commit = false;
         let mut cancel = false;
         let mut op_new = op.clone();
+        let var_map = self.visible_variable_map();
         egui::Area::new(egui::Id::new("revolve_dialog"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
@@ -139,6 +140,7 @@ impl ZeroCadApp {
                             egui::TextEdit::singleline(&mut op_new.angle_text).desired_width(60.0),
                         );
                         ui.label("°");
+                        crate::expr::evaluation_hint(ui, &op_new.angle_text, &var_map, "°");
                     });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -176,7 +178,10 @@ impl ZeroCadApp {
     }
 
     fn commit_revolve_op(&mut self, op: RevolveOp) {
-        let angle: f32 = op.angle_text.trim().parse().unwrap_or(360.0);
+        let Some(angle) = self.eval_dim(&op.angle_text) else {
+            self.status_msg = "Revolve angle must be a number or valid expression.".to_string();
+            return;
+        };
         if !(angle > 0.0 && angle <= 360.0) {
             self.status_msg = "Revolve angle must be in (0, 360].".to_string();
             return;
@@ -201,7 +206,8 @@ impl ZeroCadApp {
             feature: FeatureType::Revolve {
                 axis: op.axis.to_axis_base(),
                 angle_deg: angle,
-                angle_expr: None,
+                angle_expr: zerocad_core::expr::preserves_source(&op.angle_text)
+                    .then(|| op.angle_text.trim().to_string()),
                 region_indices: op.region_indices.clone(),
                 mode: op.mode,
                 target,

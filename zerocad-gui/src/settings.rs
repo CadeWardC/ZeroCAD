@@ -120,10 +120,16 @@ pub struct AppSettings {
     /// Anti-aliasing quality of the GPU viewport (see [`MsaaLevel`]).
     #[serde(default)]
     pub msaa: MsaaLevel,
+    #[serde(default = "default_hydrated_cache_mb")]
+    pub hydrated_cache_mb: u32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_hydrated_cache_mb() -> u32 {
+    128
 }
 
 impl Default for AppSettings {
@@ -135,6 +141,7 @@ impl Default for AppSettings {
             gpu_render: true,
             backend: GraphicsBackend::Auto,
             msaa: MsaaLevel::X4,
+            hydrated_cache_mb: default_hydrated_cache_mb(),
         }
     }
 }

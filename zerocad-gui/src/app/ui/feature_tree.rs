@@ -53,14 +53,28 @@ impl ZeroCadApp {
                                 mode: ExtrudeMode::NewBody,
                                 ..
                             }
-                            | FeatureType::Pattern { .. } => bodies.push(entry),
+                            | FeatureType::Pattern {
+                                kind:
+                                    zerocad_core::PatternKind::Linear { .. }
+                                    | zerocad_core::PatternKind::Circular { .. }
+                                    | zerocad_core::PatternKind::Mirror { join: false, .. },
+                                ..
+                            }
+                            | FeatureType::BodyTransform { .. } => bodies.push(entry),
                             FeatureType::Extrude { .. }
                             | FeatureType::Revolve { .. }
                             | FeatureType::Loft { .. }
                             | FeatureType::Sweep { .. }
                             | FeatureType::Hole { .. }
                             | FeatureType::Shell { .. }
-                            | FeatureType::EdgeMod { .. } => operations.push(entry),
+                            | FeatureType::Thread { .. }
+                            | FeatureType::EdgeMod { .. }
+                            | FeatureType::BodyJoin { .. }
+                            | FeatureType::BodyCut { .. }
+                            | FeatureType::Pattern {
+                                kind: zerocad_core::PatternKind::Mirror { join: true, .. },
+                                ..
+                            } => operations.push(entry),
                             FeatureType::DatumPlane { .. }
                             | FeatureType::DatumAxis { .. }
                             | FeatureType::DatumPoint { .. } => datums.push(entry),
@@ -71,6 +85,7 @@ impl ZeroCadApp {
                     let mut id_to_delete: Option<String> = None;
                     let mut id_to_toggle: Option<String> = None;
                     let mut id_to_add_var: Option<String> = None;
+                    let mut id_to_edit_sketch: Option<String> = None;
                     let mut create_var_set = false;
 
                     egui::ScrollArea::vertical()
@@ -79,11 +94,12 @@ impl ZeroCadApp {
                         .show(ui, |ui| {
                             if let Some((id, name)) = &origin {
                                 let hidden = self.hidden_nodes.contains(id);
-                                match self.feature_tree_row(ui, id, name, hidden, false) {
+                                match self.feature_tree_row(ui, id, name, hidden, false, false) {
                                     RowAction::Delete => id_to_delete = Some(id.clone()),
                                     RowAction::ToggleVisibility => id_to_toggle = Some(id.clone()),
                                     RowAction::None => {}
                                     RowAction::AddVariable => {}
+                                    RowAction::EditSketch => {}
                                 }
                             }
 
@@ -100,10 +116,13 @@ impl ZeroCadApp {
                                 }
                                 for (id, name) in &sketches {
                                     let hidden = self.hidden_nodes.contains(id);
-                                    match self.feature_tree_row(ui, id, name, hidden, false) {
+                                    match self.feature_tree_row(ui, id, name, hidden, false, true) {
                                         RowAction::Delete => id_to_delete = Some(id.clone()),
                                         RowAction::ToggleVisibility => {
                                             id_to_toggle = Some(id.clone())
+                                        }
+                                        RowAction::EditSketch => {
+                                            id_to_edit_sketch = Some(id.clone())
                                         }
                                         RowAction::None => {}
                                         RowAction::AddVariable => {}
@@ -124,13 +143,15 @@ impl ZeroCadApp {
                                 }
                                 for (id, name) in &bodies {
                                     let hidden = self.hidden_nodes.contains(id);
-                                    match self.feature_tree_row(ui, id, name, hidden, false) {
+                                    match self.feature_tree_row(ui, id, name, hidden, false, false)
+                                    {
                                         RowAction::Delete => id_to_delete = Some(id.clone()),
                                         RowAction::ToggleVisibility => {
                                             id_to_toggle = Some(id.clone())
                                         }
                                         RowAction::None => {}
                                         RowAction::AddVariable => {}
+                                        RowAction::EditSketch => {}
                                     }
                                 }
                             });
@@ -148,13 +169,15 @@ impl ZeroCadApp {
                                 }
                                 for (id, name) in &operations {
                                     let hidden = self.hidden_nodes.contains(id);
-                                    match self.feature_tree_row(ui, id, name, hidden, false) {
+                                    match self.feature_tree_row(ui, id, name, hidden, false, false)
+                                    {
                                         RowAction::Delete => id_to_delete = Some(id.clone()),
                                         RowAction::ToggleVisibility => {
                                             id_to_toggle = Some(id.clone())
                                         }
                                         RowAction::None => {}
                                         RowAction::AddVariable => {}
+                                        RowAction::EditSketch => {}
                                     }
                                 }
                             });
@@ -170,13 +193,16 @@ impl ZeroCadApp {
                                 .show(ui, |ui| {
                                     for (id, name) in &datums {
                                         let hidden = self.hidden_nodes.contains(id);
-                                        match self.feature_tree_row(ui, id, name, hidden, false) {
+                                        match self
+                                            .feature_tree_row(ui, id, name, hidden, false, false)
+                                        {
                                             RowAction::Delete => id_to_delete = Some(id.clone()),
                                             RowAction::ToggleVisibility => {
                                                 id_to_toggle = Some(id.clone())
                                             }
                                             RowAction::None => {}
                                             RowAction::AddVariable => {}
+                                            RowAction::EditSketch => {}
                                         }
                                     }
                                 });
@@ -218,11 +244,12 @@ impl ZeroCadApp {
                                 ui.weak("No variable sets yet — click ➕ to add one.");
                             }
                             for (id, name) in &variable_sets {
-                                match self.feature_tree_row(ui, id, name, false, true) {
+                                match self.feature_tree_row(ui, id, name, false, true, false) {
                                     RowAction::Delete => id_to_delete = Some(id.clone()),
                                     RowAction::AddVariable => id_to_add_var = Some(id.clone()),
                                     RowAction::ToggleVisibility => {}
                                     RowAction::None => {}
+                                    RowAction::EditSketch => {}
                                 }
                             }
                         });
@@ -238,6 +265,13 @@ impl ZeroCadApp {
 
                     if let Some(del_id) = id_to_delete {
                         self.delete_node_by_id(&del_id);
+                    }
+
+                    // Right-click "Edit Sketch": re-open the sketch for editing,
+                    // same entry point as the properties-panel button.
+                    if let Some(edit_id) = id_to_edit_sketch {
+                        let now = ctx.input(|i| i.time);
+                        self.edit_sketch(&edit_id, now);
                     }
 
                     // Create a new, empty variable set and select it so the user
@@ -287,6 +321,7 @@ impl ZeroCadApp {
         name: &str,
         hidden: bool,
         is_var_set: bool,
+        is_sketch: bool,
     ) -> RowAction {
         let mut action = RowAction::None;
         // A feature whose reference/boolean didn't resolve on the last rebuild is
@@ -409,6 +444,21 @@ impl ZeroCadApp {
                     self.rename_buffer = name.to_string();
                     self.rename_focus_pending = true;
                     ui.close_menu();
+                }
+                if is_sketch {
+                    let edit_btn = icons::Icon::Sketch.labeled_button(
+                        ui,
+                        "Edit Sketch",
+                        egui::Color32::from_rgb(239, 246, 255),
+                        egui::Color32::from_rgb(219, 234, 254),
+                        egui::Color32::from_rgb(29, 78, 216),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(191, 219, 254)),
+                    );
+                    if edit_btn.clicked() {
+                        action = RowAction::EditSketch;
+                        ui.close_menu();
+                        log::info!("Requested edit of sketch: {}", id);
+                    }
                 }
                 if is_var_set {
                     let add_btn = icons::Icon::Sketch.labeled_button(

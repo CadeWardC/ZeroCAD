@@ -37,6 +37,7 @@ fn add_shape_sketch(g: &mut ParametricGraph, id: &str, shapes: Vec<SketchShape>)
             curves: SketchCurves::new(),
             shapes,
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -154,6 +155,35 @@ fn selected_rect_cuts_unselected_overlapping_circle() {
 }
 
 #[test]
+fn single_selected_face_does_not_expand_to_the_rest_of_its_shape() {
+    // The vertical rectangle splits the horizontal rectangle into three faces.
+    // Picking only its left face must not resurrect the unpicked right face just
+    // because both came from the same Rectangle sketch primitive.
+    let shapes = vec![
+        rect_shape(0.0, 0.0, 30.0, 10.0),
+        rect_shape(10.0, -5.0, 20.0, 15.0),
+    ];
+    let mut g = ParametricGraph::new();
+    add_shape_sketch(&mut g, "s", shapes.clone());
+    let selected = region_indices_containing(&g, &shapes, (5.0, 5.0));
+    assert_eq!(selected.len(), 1, "expected one left-hand face");
+    add_extrude_sel(&mut g, "e", "s", 10.0, ExtrudeMode::NewBody, selected);
+
+    let bodies = g.evaluate_bodies(&HashSet::new()).unwrap();
+    assert_eq!(bodies.len(), 1);
+    let max_x = bodies[0]
+        .1
+        .vertices
+        .chunks(6)
+        .map(|v| v[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max_x <= 10.1,
+        "only the selected left face should extrude; geometry reached x={max_x:.2}"
+    );
+}
+
+#[test]
 fn two_selected_overlapping_rects_union_into_one_body() {
     let shapes = vec![
         rect_shape(0.0, 0.0, 10.0, 10.0),
@@ -180,6 +210,24 @@ fn two_selected_overlapping_rects_union_into_one_body() {
     assert!(
         (vol - 1500.0).abs() < 30.0,
         "union volume ≈1500 (no double-counted overlap), got {vol}"
+    );
+    let mesh = &bodies[0].1;
+    let has_internal_top_seam = mesh.edge_vertices.chunks_exact(6).any(|edge| {
+        let x0 = edge[0];
+        let y0 = edge[1];
+        let z0 = edge[2];
+        let x1 = edge[3];
+        let y1 = edge[4];
+        let z1 = edge[5];
+        (z0 - 10.0).abs() < 1.0e-3
+            && (z1 - 10.0).abs() < 1.0e-3
+            && (x0 - x1).abs() < 1.0e-3
+            && ((x0 - 5.0).abs() < 1.0e-3 || (x0 - 10.0).abs() < 1.0e-3)
+            && (y0 - y1).abs() > 1.0
+    });
+    assert!(
+        !has_internal_top_seam,
+        "the fused top face must not retain a sketch-region seam"
     );
 }
 

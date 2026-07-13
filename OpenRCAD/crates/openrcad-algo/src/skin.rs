@@ -88,9 +88,7 @@ pub fn skin_polygon_rings(rings: &[Vec<Pnt>]) -> Result<Solid, SkinError> {
         let mut best_shift = 0usize;
         let mut best_cost = f64::INFINITY;
         for shift in 0..n {
-            let cost: f64 = (0..n)
-                .map(|j| prev[j].distance(&r[(j + shift) % n]))
-                .sum();
+            let cost: f64 = (0..n).map(|j| prev[j].distance(&r[(j + shift) % n])).sum();
             if cost < best_cost {
                 best_cost = cost;
                 best_shift = shift;
@@ -200,8 +198,7 @@ mod tests {
 
     #[test]
     fn straight_skin_is_a_box() {
-        let solid =
-            skin_polygon_rings(&[square_ring(1.0, 0.0), square_ring(1.0, 3.0)]).unwrap();
+        let solid = skin_polygon_rings(&[square_ring(1.0, 0.0), square_ring(1.0, 3.0)]).unwrap();
         assert!(solid.is_watertight());
         let v = volume(&solid);
         assert!((v - 12.0).abs() < 1e-6, "box volume {v}");
@@ -211,12 +208,14 @@ mod tests {
     fn tapered_skin_is_a_frustum() {
         // Square 2×2 → 1×1 over height 3: pyramidal frustum,
         // V = h/3 (A0 + A1 + √(A0·A1)).
-        let solid =
-            skin_polygon_rings(&[square_ring(1.0, 0.0), square_ring(0.5, 3.0)]).unwrap();
+        let solid = skin_polygon_rings(&[square_ring(1.0, 0.0), square_ring(0.5, 3.0)]).unwrap();
         assert!(solid.is_watertight());
         let exact = 3.0 / 3.0 * (4.0 + 1.0 + 2.0);
         let v = volume(&solid);
-        assert!((v - exact).abs() / exact < 0.01, "frustum volume {v} vs {exact}");
+        assert!(
+            (v - exact).abs() / exact < 0.01,
+            "frustum volume {v} vs {exact}"
+        );
     }
 
     #[test]

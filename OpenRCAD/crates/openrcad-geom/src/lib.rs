@@ -23,6 +23,7 @@ pub mod curve;
 pub mod cylinder;
 pub mod ellipse;
 pub mod gregory;
+pub mod helix;
 pub mod hyperbola;
 pub mod interval_bounds;
 pub mod line;
@@ -42,6 +43,7 @@ pub use curve::Curve;
 pub use cylinder::CylindricalSurface;
 pub use ellipse::Ellipse;
 pub use gregory::GregorySurface;
+pub use helix::Helix;
 pub use hyperbola::Hyperbola;
 pub use line::Line;
 pub use offset::OffsetSurface;
@@ -67,6 +69,8 @@ pub enum GeomCurve {
     Hyperbola(Hyperbola),
     /// A B-spline/NURBS curve.
     BSpline(BSplineCurve),
+    /// A helix (or tapered conical spiral).
+    Helix(Helix),
 }
 
 impl GeomCurve {
@@ -106,6 +110,12 @@ impl GeomCurve {
         Self::BSpline(b)
     }
 
+    /// Wrap a [`Helix`].
+    #[inline]
+    pub fn helix(h: Helix) -> Self {
+        Self::Helix(h)
+    }
+
     /// Convert/approximate this curve to a B-Spline curve.
     pub fn to_bspline(&self) -> BSplineCurve {
         match self {
@@ -141,6 +151,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => p.point(u),
             Self::Hyperbola(h) => h.point(u),
             Self::BSpline(b) => b.point(u),
+            Self::Helix(h) => h.point(u),
         }
     }
 
@@ -152,6 +163,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => p.d1(u),
             Self::Hyperbola(h) => h.d1(u),
             Self::BSpline(b) => b.d1(u),
+            Self::Helix(h) => h.d1(u),
         }
     }
 
@@ -163,6 +175,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => p.bounds(),
             Self::Hyperbola(h) => h.bounds(),
             Self::BSpline(b) => b.bounds(),
+            Self::Helix(h) => h.bounds(),
         }
     }
 
@@ -174,6 +187,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => p.is_closed(),
             Self::Hyperbola(h) => h.is_closed(),
             Self::BSpline(b) => b.is_closed(),
+            Self::Helix(h) => h.is_closed(),
         }
     }
 
@@ -185,6 +199,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => p.is_periodic(),
             Self::Hyperbola(h) => h.is_periodic(),
             Self::BSpline(b) => b.is_periodic(),
+            Self::Helix(h) => h.is_periodic(),
         }
     }
 
@@ -196,6 +211,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => p.period(),
             Self::Hyperbola(h) => h.period(),
             Self::BSpline(b) => b.period(),
+            Self::Helix(h) => h.period(),
         }
     }
 
@@ -207,6 +223,7 @@ impl Curve for GeomCurve {
             Self::Parabola(p) => Self::Parabola(p.transformed(t)),
             Self::Hyperbola(h) => Self::Hyperbola(h.transformed(t)),
             Self::BSpline(b) => Self::BSpline(b.transformed(t)),
+            Self::Helix(h) => Self::Helix(h.transformed(t)),
         }
     }
 }

@@ -46,6 +46,7 @@ fn prism_boss_graph() -> ParametricGraph {
             curves: tri,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -75,6 +76,7 @@ fn prism_boss_graph() -> ParametricGraph {
             curves: boss,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -165,7 +167,12 @@ fn debug_dump_edges() {
                             let b = e.target().point();
                             format!(
                                 "[{:.9},{:.9},{:.9}]->[{:.9},{:.9},{:.9}]{}",
-                                a.x(), a.y(), a.z(), b.x(), b.y(), b.z(),
+                                a.x(),
+                                a.y(),
+                                a.z(),
+                                b.x(),
+                                b.y(),
+                                b.z(),
                                 e.curve().map(|c| curve_kind(&c)).unwrap_or("?")
                             )
                         })
@@ -262,6 +269,7 @@ fn prism_only_graph() -> ParametricGraph {
             curves: tri,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -301,6 +309,7 @@ fn fillet_really_sharp_prism_corner_edge_gui_path() {
             curves: tri,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });

@@ -77,6 +77,7 @@ impl ZeroCadApp {
         let mut commit = false;
         let mut cancel = false;
         let mut op_new = op.clone();
+        let var_map = self.visible_variable_map();
         egui::Area::new(egui::Id::new("hole_dialog"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
@@ -96,6 +97,7 @@ impl ZeroCadApp {
                                 .desired_width(50.0),
                         );
                         ui.label("mm");
+                        crate::expr::evaluation_hint(ui, &op_new.diameter_text, &var_map, "mm");
                     });
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut op_new.through, "Through all");
@@ -106,6 +108,7 @@ impl ZeroCadApp {
                                     .desired_width(50.0),
                             );
                             ui.label("mm");
+                            crate::expr::evaluation_hint(ui, &op_new.depth_text, &var_map, "mm");
                         }
                     });
                     ui.add_space(4.0);
@@ -129,10 +132,22 @@ impl ZeroCadApp {
                                     egui::TextEdit::singleline(&mut op_new.head_diameter_text)
                                         .desired_width(45.0),
                                 );
+                                crate::expr::evaluation_hint(
+                                    ui,
+                                    &op_new.head_diameter_text,
+                                    &var_map,
+                                    "mm",
+                                );
                                 ui.label("depth");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut op_new.head_depth_text)
                                         .desired_width(40.0),
+                                );
+                                crate::expr::evaluation_hint(
+                                    ui,
+                                    &op_new.head_depth_text,
+                                    &var_map,
+                                    "mm",
                                 );
                             });
                         }
@@ -143,12 +158,24 @@ impl ZeroCadApp {
                                     egui::TextEdit::singleline(&mut op_new.head_diameter_text)
                                         .desired_width(45.0),
                                 );
+                                crate::expr::evaluation_hint(
+                                    ui,
+                                    &op_new.head_diameter_text,
+                                    &var_map,
+                                    "mm",
+                                );
                                 ui.label("angle");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut op_new.head_angle_text)
                                         .desired_width(40.0),
                                 );
                                 ui.label("°");
+                                crate::expr::evaluation_hint(
+                                    ui,
+                                    &op_new.head_angle_text,
+                                    &var_map,
+                                    "°",
+                                );
                             });
                         }
                     }
@@ -176,7 +203,10 @@ impl ZeroCadApp {
     }
 
     fn commit_hole_op(&mut self, op: HoleOp) {
-        let diameter: f32 = op.diameter_text.trim().parse().unwrap_or(0.0);
+        let Some(diameter) = self.eval_dim(&op.diameter_text) else {
+            self.status_msg = "Hole diameter must be a number or valid expression.".to_string();
+            return;
+        };
         if diameter <= 0.0 {
             self.status_msg = "Hole diameter must be positive.".to_string();
             return;
@@ -184,7 +214,7 @@ impl ZeroCadApp {
         let depth = if op.through {
             None
         } else {
-            let d: f32 = op.depth_text.trim().parse().unwrap_or(0.0);
+            let d = self.eval_dim(&op.depth_text).unwrap_or(0.0);
             if d <= 0.0 {
                 self.status_msg = "Hole depth must be positive (or use Through all).".to_string();
                 return;
@@ -194,8 +224,8 @@ impl ZeroCadApp {
         let kind = match op.kind {
             HoleKindChoice::Simple => HoleKind::Simple,
             HoleKindChoice::Counterbore => {
-                let d: f32 = op.head_diameter_text.trim().parse().unwrap_or(0.0);
-                let dep: f32 = op.head_depth_text.trim().parse().unwrap_or(0.0);
+                let d = self.eval_dim(&op.head_diameter_text).unwrap_or(0.0);
+                let dep = self.eval_dim(&op.head_depth_text).unwrap_or(0.0);
                 if d <= diameter || dep <= 0.0 {
                     self.status_msg =
                         "Counterbore needs a diameter larger than the bore and a positive depth."
@@ -208,8 +238,8 @@ impl ZeroCadApp {
                 }
             }
             HoleKindChoice::Countersink => {
-                let d: f32 = op.head_diameter_text.trim().parse().unwrap_or(0.0);
-                let a: f32 = op.head_angle_text.trim().parse().unwrap_or(0.0);
+                let d = self.eval_dim(&op.head_diameter_text).unwrap_or(0.0);
+                let a = self.eval_dim(&op.head_angle_text).unwrap_or(0.0);
                 if d <= diameter || !(a > 0.0 && a < 180.0) {
                     self.status_msg = "Countersink needs a diameter larger than the bore and an \
                                        angle in (0, 180)."
@@ -233,7 +263,8 @@ impl ZeroCadApp {
                 position: op.position,
                 direction: op.direction,
                 diameter,
-                diameter_expr: None,
+                diameter_expr: zerocad_core::expr::preserves_source(&op.diameter_text)
+                    .then(|| op.diameter_text.trim().to_string()),
                 depth,
                 kind,
             },

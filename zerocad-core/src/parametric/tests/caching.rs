@@ -81,17 +81,33 @@ fn eval_cache_key_changes_when_a_sketch_constraint_changes() {
     // constraint add/edit must change the prefix key — a `#[serde(skip)]`
     // regression here would rebuild downstream bodies from a stale mesh.
     let mut baseline = ParametricGraph::new();
-    add_sketch(&mut baseline, "sketch_1", rect_sketch((0.0, 0.0), (20.0, 12.0)));
-    add_extrude(&mut baseline, "extrude_2", "sketch_1", 8.0, ExtrudeMode::NewBody);
+    add_sketch(
+        &mut baseline,
+        "sketch_1",
+        rect_sketch((0.0, 0.0), (20.0, 12.0)),
+    );
+    add_extrude(
+        &mut baseline,
+        "extrude_2",
+        "sketch_1",
+        8.0,
+        ExtrudeMode::NewBody,
+    );
 
     let mut with_constraint = baseline.clone();
     let idx = with_constraint.node_map["sketch_1"];
     if let FeatureType::Sketch { solver, .. } = &mut with_constraint.graph[idx].feature {
         use crate::sketch::{Constraint, EntityId, SketchPoint, SketchSolverModel};
         *solver = Some(SketchSolverModel {
-            points: vec![SketchPoint { id: EntityId(0), pos: (0.0, 0.0) }],
+            points: vec![SketchPoint {
+                id: EntityId(0),
+                pos: (0.0, 0.0),
+            }],
             entities: vec![],
-            constraints: vec![Constraint::Fixed { id: EntityId(1), p: EntityId(0) }],
+            constraints: vec![Constraint::Fixed {
+                id: EntityId(1),
+                p: EntityId(0),
+            }],
         });
     } else {
         panic!("test fixture should contain a Sketch");
@@ -133,4 +149,101 @@ fn eval_cache_key_changes_when_edge_mod_replay_metadata_changes() {
         with_replay.eval_prefix_keys(&replay_nodes, &hidden, &vars),
         "replay metadata must participate in the mesh-cache prefix hash"
     );
+}
+
+#[test]
+fn checkpoints_share_unchanged_pristine_meshes() {
+    let mut graph = ParametricGraph::new();
+    for i in 1..=8 {
+        graph.add_feature(FeatureNode {
+            id: format!("box_{i}"),
+            name: format!("Box {i}"),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
+        });
+    }
+    graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+
+    let cache = graph.eval_cache.borrow();
+    let first = cache.checkpoints[0].as_ref().unwrap().live[0]
+        .pristine
+        .as_ref()
+        .expect("box checkpoint has a pristine mesh");
+    for checkpoint in cache.checkpoints.iter().skip(1).flatten() {
+        let reused = checkpoint.live[0]
+            .pristine
+            .as_ref()
+            .expect("unchanged box remains pristine");
+        assert!(
+            std::sync::Arc::ptr_eq(first, reused),
+            "checkpoint clones must share unchanged mesh allocation"
+        );
+    }
+}
+
+#[test]
+fn superseded_evaluation_exits_without_geometry() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+    let cancellation = EvaluationCancellation::new(1, latest);
+    let result = graph.evaluate_request(
+        &std::collections::HashSet::new(),
+        EvaluationQuality::Interactive,
+        &cancellation,
+    );
+    assert!(matches!(result, Err(EvaluationError::Cancelled)));
+}
+
+#[test]
+fn cache_snapshot_survives_background_graph_handoff() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let expected = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap()
+        .0;
+    let snapshot = graph.evaluation_cache_snapshot();
+
+    let restored = graph.clone_document();
+    assert!(restored.eval_cache.borrow().checkpoints.is_empty());
+    restored.install_evaluation_cache(snapshot);
+    assert!(restored
+        .eval_cache
+        .borrow()
+        .checkpoints
+        .iter()
+        .any(Option::is_some));
+    let actual = restored
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap()
+        .0;
+    assert_eq!(actual.len(), expected.len());
+    for ((actual_id, actual_mesh), (expected_id, expected_mesh)) in actual.iter().zip(&expected) {
+        assert_eq!(actual_id, expected_id);
+        assert_eq!(actual_mesh.vertices, expected_mesh.vertices);
+        assert_eq!(actual_mesh.indices, expected_mesh.indices);
+    }
+}
+
+#[test]
+fn graph_clone_shares_warm_cache_until_worker_rebuilds_it() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+
+    let worker_graph = graph.clone();
+    assert!(std::sync::Arc::ptr_eq(
+        &graph.eval_cache.borrow(),
+        &worker_graph.eval_cache.borrow()
+    ));
+    let snapshot = graph.evaluation_cache_snapshot();
+    assert!(std::sync::Arc::ptr_eq(
+        &graph.eval_cache.borrow(),
+        &snapshot.cache
+    ));
 }

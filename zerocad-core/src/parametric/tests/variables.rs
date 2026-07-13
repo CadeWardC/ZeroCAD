@@ -41,6 +41,7 @@ fn sketch_dimension_follows_a_variable() {
                 from_center: false,
             }],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -120,6 +121,7 @@ fn topology_edge_ref_reattaches_after_sketch_dimension_edit() {
                 from_center: false,
             }],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });

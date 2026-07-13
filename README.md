@@ -310,6 +310,13 @@ done: under whole-model boolean semantics a body's final mesh depends on every
 later cut/join that touches it, so naive per-node output caching would be
 incorrect. The prefix-checkpoint scheme is the correct, conservative slice.
 
+Checkpoint meshes are held behind `Arc`, so snapshots of a long unchanged
+prefix share the same vertex/index allocation instead of copying it once per
+feature. The GUI also owns one persistent, latest-wins model evaluator: direct
+manipulation draws a lightweight ghost immediately, waits 100 ms for the input
+to settle, and then schedules an interactive B-Rep preview. A newer request
+cooperatively cancels the obsolete one; committed/final evaluation has priority.
+
 ---
 
 ## Dimension input — expressions + variable autocomplete
@@ -503,16 +510,12 @@ which sets `mode_user_set` and freezes their choice.
 
 ## Rendering (`render.rs`)
 
-The viewport is **CPU-projected** — despite the `wgpu` dependency (pulled in by
-eframe), projection, depth sorting (painter's algorithm), back-face culling, and
-hidden-line removal all run on the CPU. Pristine primitive bodies carry analytic
-wireframes with precomputed face normals; boolean results derive feature edges
-from the tessellation (`mesh_feature_edges`) using per-face ids, chained into
-selectable topological edges by `MockMesh::edge_groups`. Curved silhouettes use a
-5-cell neighbourhood occlusion test so they don't dash. This is correct but does
-not scale to large models — moving to a GPU z-buffer is the main performance lever
-and a near-total rewrite of this file. (OpenRCAD ships its own interactive `wgpu`
-viewer, `openrcad-render`, used standalone; ZeroCAD does not embed it.)
+The default viewport embeds `openrcad-render` into eframe's wgpu device and
+composites its depth-tested offscreen texture below egui's sketch/dimension
+overlays. Geometry uploads are per-body and content-fingerprinted; unchanged
+scenes reuse their rendered texture. Face hover uses a three-buffer asynchronous
+GPU readback ring, so pointer motion never waits for `device.poll(Wait)`. The CPU
+projector remains the automatic fallback when wgpu is unavailable or disabled.
 
 ---
 
@@ -522,19 +525,32 @@ A saved model is a binary `.zcad` container (`zerocad-core/src/zcad_format.rs`),
 not plain JSON. The layout is a fixed 32-byte header + a section table + section
 payloads, all little-endian, with CRC32 integrity checks:
 
-- **Header** — magic `ZCAD`, `format_version` (`CURRENT_VERSION = 2`), section
+- **Header** — magic `ZCAD`, `format_version` (`CURRENT_VERSION = 3`), section
   count, and a CRC32 over the header.
 - **Sections** (each CRC32-checked, individually codec-tagged as stored or
   zstd-compressed): **metadata** (uncompressed, written first so a browser can
-  read it without inflating the file), **graph** (the whole `ParametricGraph` as
-  zstd-compressed CBOR — the authoritative recipe), an optional PNG **thumbnail**,
-  an optional **mesh cache** (precomputed body meshes tagged with a hash of the
-  graph, discarded on load if the hash no longer matches so stale geometry is
-  never trusted), and an optional **hidden-nodes** set.
+  read it without inflating the file), **recipe** (`DocumentRecipeV1` as
+  zstd-compressed CBOR), an optional PNG **thumbnail**, an optional **mesh
+  cache** (precomputed body meshes tagged with the BLAKE3 recipe digest and
+  discarded on mismatch so stale geometry is
+  never trusted), an optional **hidden-nodes** set, and optional hydrated
+  **B-Rep checkpoints**.
 - `write_zcad(&ZcadDocument) -> Result<Vec<u8>, ZcadError>` and
   `read_zcad(&[u8]) -> Result<LoadedZcad, ZcadError>` are the API.
   `ZcadMetadata` carries the format/app version, created/modified timestamps,
   units, feature count, and bounding box.
+- The authoritative payload is `DocumentRecipeV1`: sorted feature records,
+  explicit dependency pairs, and sorted attachment maps. It does not serialize
+  petgraph's arena/index representation. Derived mesh caches are accepted only
+  when their BLAKE3 digest matches the exact recipe bytes.
+- `.zcad` is the compact recipe-first form. `.zcadh` carries the same recipe plus
+  display meshes and sparse high-value evaluator/B-Rep checkpoints for instant
+  open and fast first edits. Checkpoints are independently content-hashed,
+  recipe/visibility/ABI-bound, topology-validated, and capped at 128 MiB by
+  default (64/128/256 MiB or unlimited in Settings). Invalid accelerator data is
+  discarded without affecting the recipe. `write_zcad_file` writes and syncs a sibling
+  temporary file, preserves the previous document during replacement, and
+  restores it if the final rename fails.
 - **Robustness.** Corruption is caught per-section by CRC and by a
   decompressed-length check; a newer `format_version` is best-effort parsed
   (unknown sections skipped) or reported `UnsupportedVersion`. **Legacy plain-JSON
@@ -565,8 +581,9 @@ and embedded in the file's thumbnail section.
   (binary + legacy JSON) and graceful handling of a corrupt document.
   `stl::tests` covers binary STL export.
 
-Gaps worth filling: performance benchmarks and property-based tests over random
-profiles.
+`benches/modeling_pipeline.rs` tracks cold, warm, and hydrated-open long-history
+evaluation with Criterion. `tests/property_geometry.rs` generates bounded mechanical through-hole
+cases and asserts healthy, watertight, finite, repeatable results.
 
 ---
 

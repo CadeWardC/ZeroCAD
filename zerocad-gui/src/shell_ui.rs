@@ -57,6 +57,7 @@ impl ZeroCadApp {
         let mut commit = false;
         let mut cancel = false;
         let mut op_new = op.clone();
+        let var_map = self.visible_variable_map();
         egui::Area::new(egui::Id::new("shell_dialog"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
@@ -84,6 +85,7 @@ impl ZeroCadApp {
                                 .desired_width(50.0),
                         );
                         ui.label("mm");
+                        crate::expr::evaluation_hint(ui, &op_new.thickness_text, &var_map, "mm");
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -109,7 +111,10 @@ impl ZeroCadApp {
     }
 
     fn commit_shell_op(&mut self, op: ShellOp) {
-        let thickness: f32 = op.thickness_text.trim().parse().unwrap_or(0.0);
+        let Some(thickness) = self.eval_dim(&op.thickness_text) else {
+            self.status_msg = "Shell thickness must be a number or valid expression.".to_string();
+            return;
+        };
         if thickness <= 0.0 {
             self.status_msg = "Shell thickness must be positive.".to_string();
             return;
@@ -123,7 +128,8 @@ impl ZeroCadApp {
             feature: FeatureType::Shell {
                 target: op.target.clone(),
                 thickness,
-                thickness_expr: None,
+                thickness_expr: zerocad_core::expr::preserves_source(&op.thickness_text)
+                    .then(|| op.thickness_text.trim().to_string()),
                 open_faces: op.open_faces.clone(),
             },
         });

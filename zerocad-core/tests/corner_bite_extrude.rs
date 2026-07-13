@@ -56,6 +56,7 @@ fn corner_bite_graph_on(
             curves: c,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -104,10 +105,8 @@ fn assert_corner_bite_solid_probe(
         .count();
 
     // Material must be gone inside the bite and present outside it.
-    let inside_bite =
-        openrcad::algo::boolean::point_in_solid(&world(cs, bite_probe, 5.0), solid);
-    let in_material =
-        openrcad::algo::boolean::point_in_solid(&world(cs, (15.0, 15.0), 5.0), solid);
+    let inside_bite = openrcad::algo::boolean::point_in_solid(&world(cs, bite_probe, 5.0), solid);
+    let in_material = openrcad::algo::boolean::point_in_solid(&world(cs, (15.0, 15.0), 5.0), solid);
 
     assert!(
         in_material,

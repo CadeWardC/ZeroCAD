@@ -177,7 +177,7 @@ fn fillet_rounds_a_box_edge() {
 }
 
 #[test]
-fn fillet_tangent_boundary_edges_are_drawn() {
+fn fillet_tangent_boundary_edges_are_hidden() {
     let g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
     let (bodies, _) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
@@ -208,15 +208,16 @@ fn fillet_tangent_boundary_edges_are_drawn() {
 
     let t_true = tangent_len(true);
     let t_false = tangent_len(false);
-    // The round is ~10 long; require most of the tangent line to be present.
+    // Smooth-transition display: the B-Rep still owns these boundaries, but the
+    // wireframe must not draw them as creases across an otherwise smooth round.
     assert!(
-        t_true > 5.0,
-        "the fillet's tangent edge on the front (z=0) face must be drawn (got {})",
+        t_true < 0.1,
+        "the fillet's tangent edge on the front (z=0) face must be hidden (got {})",
         t_true
     );
     assert!(
-        t_false > 5.0,
-        "the fillet's tangent edge on the bottom (y=0) face must be drawn (got {})",
+        t_false < 0.1,
+        "the fillet's tangent edge on the bottom (y=0) face must be hidden (got {})",
         t_false
     );
 }

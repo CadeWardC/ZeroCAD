@@ -65,9 +65,10 @@ pub fn fillet_edge_with_hint(
     radius: f32,
 ) -> Result<KernelSolid, String> {
     if let Some(hint @ EdgeCurveHint::Circle { .. }) = curve {
-        let chain = circle_edge_requests(solid, hint).ok_or_else(|| {
+        let mut chain = circle_edge_requests(solid, hint).ok_or_else(|| {
             "curved circular-rim fillet could not be matched to the body topology".to_string()
         })?;
+        append_tangent_line_edges(solid, &mut chain);
         if chain.len() == 1 {
             let contour = BlendContour::constant(
                 chain,
@@ -92,6 +93,45 @@ pub fn fillet_edge_with_hint(
     );
     let contour = BlendContour::constant(vec![e], BlendKind::Fillet, radius as f64, None);
     apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
+}
+
+fn append_tangent_line_edges(solid: &KernelSolid, chain: &mut Vec<Edge>) {
+    let circular = chain.clone();
+    for arc in &circular {
+        let Some(GeomCurve::Circle(circle)) = arc.curve() else {
+            continue;
+        };
+        for point in [arc.source().point(), arc.target().point()] {
+            let radial = point - circle.center();
+            let tangent = GeomVec::from_dir(circle.axis()).cross(&radial);
+            let Some(tangent) = tangent.normalized() else {
+                continue;
+            };
+            for candidate in solid.edges() {
+                if !matches!(candidate.curve(), Some(GeomCurve::Line(_)) | None) {
+                    continue;
+                }
+                let (a, b) = (candidate.source().point(), candidate.target().point());
+                if a.distance(&point) > 1.0e-5 && b.distance(&point) > 1.0e-5 {
+                    continue;
+                }
+                let Some(direction) = (b - a).normalized() else {
+                    continue;
+                };
+                if direction.dot(&tangent).abs() < 0.9995 {
+                    continue;
+                }
+                if !chain.iter().any(|edge| {
+                    (edge.source().point().distance(&a) < 1.0e-5
+                        && edge.target().point().distance(&b) < 1.0e-5)
+                        || (edge.source().point().distance(&b) < 1.0e-5
+                            && edge.target().point().distance(&a) < 1.0e-5)
+                }) {
+                    chain.push(candidate);
+                }
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -245,9 +285,10 @@ pub fn chamfer_edge_with_hint(
     distance: f32,
 ) -> Result<KernelSolid, String> {
     if let Some(hint @ EdgeCurveHint::Circle { .. }) = curve {
-        let chain = circle_edge_requests(solid, hint).ok_or_else(|| {
+        let mut chain = circle_edge_requests(solid, hint).ok_or_else(|| {
             "curved circular-rim chamfer could not be matched to the body topology".to_string()
         })?;
+        append_tangent_line_edges(solid, &mut chain);
         let contour = BlendContour::constant(
             chain,
             BlendKind::Chamfer,

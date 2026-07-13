@@ -25,6 +25,7 @@ fn add_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: S
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: true,
         },
     });
@@ -247,7 +248,10 @@ fn cut_hole_rim_renders_as_a_smooth_circle() {
         max_gap = max_gap.max(first + std::f32::consts::TAU - last);
     }
     let max_deg = max_gap.to_degrees();
-    println!("top rim points = {}, max angular gap = {max_deg:.1}°", angs.len());
+    println!(
+        "top rim points = {}, max angular gap = {max_deg:.1}°",
+        angs.len()
+    );
     assert!(
         max_deg <= 12.0,
         "hole rim must render smooth (≤12° between samples), got {max_deg:.1}° — \

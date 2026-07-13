@@ -59,10 +59,7 @@ pub struct SolveReport {
 }
 
 /// Solve `model` against the document variables. Pure — see module docs.
-pub fn solve_model(
-    model: &SketchSolverModel,
-    vars: &HashMap<String, f64>,
-) -> SolveReport {
+pub fn solve_model(model: &SketchSolverModel, vars: &HashMap<String, f64>) -> SolveReport {
     let mut system = System::build(model, vars);
     let outcome = system.run_lm();
     let residual = system.max_residual();
@@ -154,12 +151,12 @@ impl System {
                 .entities
                 .iter()
                 .find_map(|e| match e {
-                    SketchEntity::Circle { id: eid, radius, .. }
-                    | SketchEntity::Arc { id: eid, radius, .. }
-                        if *eid == id =>
-                    {
-                        Some(*radius)
+                    SketchEntity::Circle {
+                        id: eid, radius, ..
                     }
+                    | SketchEntity::Arc {
+                        id: eid, radius, ..
+                    } if *eid == id => Some(*radius),
                     _ => None,
                 })
                 .expect("radius ids come from the model");
@@ -196,12 +193,9 @@ impl System {
         line: EntityId,
     ) -> Option<(usize, usize, usize, usize)> {
         model.entities.iter().find_map(|e| match e {
-            SketchEntity::Line { id, p0, p1, .. } if *id == line => Some((
-                self.px(*p0)?,
-                self.py(*p0)?,
-                self.px(*p1)?,
-                self.py(*p1)?,
-            )),
+            SketchEntity::Line { id, p0, p1, .. } if *id == line => {
+                Some((self.px(*p0)?, self.py(*p0)?, self.px(*p1)?, self.py(*p1)?))
+            }
             _ => None,
         })
     }
@@ -256,9 +250,7 @@ impl System {
                     if let Some(ri) = self.pr(*circle) {
                         let target = r.resolve(vars) as f64;
                         self.rows.push(ResidualRow {
-                            value_and_grad: Box::new(move |s| {
-                                (s.x[ri] - target, vec![(ri, 1.0)])
-                            }),
+                            value_and_grad: Box::new(move |s| (s.x[ri] - target, vec![(ri, 1.0)])),
                         });
                     }
                 }
@@ -336,8 +328,7 @@ impl System {
                                         let uay = s.x[ay1] - s.x[ay0];
                                         let ubx = s.x[bx1] - s.x[bx0];
                                         let uby = s.x[by1] - s.x[by0];
-                                        let f = uax * uax + uay * uay
-                                            - (ubx * ubx + uby * uby);
+                                        let f = uax * uax + uay * uay - (ubx * ubx + uby * uby);
                                         (
                                             f,
                                             vec![
@@ -363,14 +354,10 @@ impl System {
                         let x0 = self.x[xi];
                         let y0 = self.x[yi];
                         self.rows.push(ResidualRow {
-                            value_and_grad: Box::new(move |s| {
-                                (s.x[xi] - x0, vec![(xi, 1.0)])
-                            }),
+                            value_and_grad: Box::new(move |s| (s.x[xi] - x0, vec![(xi, 1.0)])),
                         });
                         self.rows.push(ResidualRow {
-                            value_and_grad: Box::new(move |s| {
-                                (s.x[yi] - y0, vec![(yi, 1.0)])
-                            }),
+                            value_and_grad: Box::new(move |s| (s.x[yi] - y0, vec![(yi, 1.0)])),
                         });
                     }
                 }
@@ -381,9 +368,7 @@ impl System {
     /// Row `x[i] − x[j]`.
     fn push_diff(&mut self, i: usize, j: usize) {
         self.rows.push(ResidualRow {
-            value_and_grad: Box::new(move |s| {
-                (s.x[i] - s.x[j], vec![(i, 1.0), (j, -1.0)])
-            }),
+            value_and_grad: Box::new(move |s| (s.x[i] - s.x[j], vec![(i, 1.0), (j, -1.0)])),
         });
     }
 
@@ -436,7 +421,10 @@ impl System {
     }
 
     fn residuals(&self) -> Vec<f64> {
-        self.rows.iter().map(|r| (r.value_and_grad)(self).0).collect()
+        self.rows
+            .iter()
+            .map(|r| (r.value_and_grad)(self).0)
+            .collect()
     }
 
     fn max_residual(&self) -> f64 {
@@ -554,10 +542,12 @@ pub fn apply_solution(model: &mut SketchSolverModel, report: &SolveReport) {
     for (id, r) in &report.radii {
         for e in model.entities.iter_mut() {
             match e {
-                SketchEntity::Circle { id: eid, radius, .. }
-                | SketchEntity::Arc { id: eid, radius, .. }
-                    if eid == id =>
-                {
+                SketchEntity::Circle {
+                    id: eid, radius, ..
+                }
+                | SketchEntity::Arc {
+                    id: eid, radius, ..
+                } if eid == id => {
                     *radius = *r;
                 }
                 _ => {}
@@ -699,9 +689,18 @@ mod tests {
         // Horizontal line y≈4.9 near a circle r=5 at origin: tangency solves to
         // distance(center, line) == r.
         let mut model = SketchSolverModel::default();
-        model.points.push(SketchPoint { id: EntityId(0), pos: (-10.0, 4.9) });
-        model.points.push(SketchPoint { id: EntityId(1), pos: (10.0, 4.9) });
-        model.points.push(SketchPoint { id: EntityId(2), pos: (0.0, 0.0) });
+        model.points.push(SketchPoint {
+            id: EntityId(0),
+            pos: (-10.0, 4.9),
+        });
+        model.points.push(SketchPoint {
+            id: EntityId(1),
+            pos: (10.0, 4.9),
+        });
+        model.points.push(SketchPoint {
+            id: EntityId(2),
+            pos: (0.0, 0.0),
+        });
         model.entities.push(SketchEntity::Line {
             id: EntityId(3),
             p0: EntityId(0),
@@ -714,7 +713,10 @@ mod tests {
             radius: 5.0,
             derived_from: None,
         });
-        model.constraints.push(Constraint::Fixed { id: EntityId(5), p: EntityId(2) });
+        model.constraints.push(Constraint::Fixed {
+            id: EntityId(5),
+            p: EntityId(2),
+        });
         model.constraints.push(Constraint::Radius {
             id: EntityId(6),
             circle: EntityId(4),

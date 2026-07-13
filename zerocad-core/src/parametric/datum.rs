@@ -111,10 +111,9 @@ impl ParametricGraph {
         for idx in nodes {
             let node = &self.graph[idx];
             let value = match &node.feature {
-                FeatureType::DatumPlane { def } => {
-                    self.resolve_plane_def(def, &resolved, vars, &node.id, warnings)
-                        .map(DatumValue::Plane)
-                }
+                FeatureType::DatumPlane { def } => self
+                    .resolve_plane_def(def, &resolved, vars, &node.id, warnings)
+                    .map(DatumValue::Plane),
                 FeatureType::DatumAxis { def } => match def {
                     DatumAxisDef::TwoPoints { a, b } => {
                         let dir = v3(*b).sub(v3(*a)).normalize();

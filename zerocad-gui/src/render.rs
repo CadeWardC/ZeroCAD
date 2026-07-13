@@ -10,10 +10,12 @@ use zerocad_core::{
 };
 
 use crate::geom2d::draw_sketch_geometry;
-use crate::{BodyPick, PendingVisualMode, SnapKind, ZeroCadApp};
+use crate::{BodyPick, PendingVisualMode, SharedBodyMeshes, SnapKind, ZeroCadApp};
 
 const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
-const SELECTED_BODY_BASE: (f32, f32, f32) = (50.0, 165.0, 245.0);
+// Match the GPU renderer's warm selected-face tint: yellow body fill with the
+// stronger orange outline drawn by the selection overlay.
+const SELECTED_BODY_BASE: (f32, f32, f32) = (255.0, 199.0, 71.0);
 
 /// Weak-perspective camera distance used by every `project_3d` implementation
 /// (this file, the viewport pickers, and the GPU `build_view_proj`). One
@@ -82,6 +84,23 @@ fn selected_material_sets(
     (selected_whole_bodies, selected_faces)
 }
 
+/// Whether the CPU hidden-surface buffer is needed for this frame.
+///
+/// The CPU renderer always needs it for hidden-line removal.  The GPU renderer
+/// already owns solid depth, so duplicating every triangle into a software depth
+/// grid is useful only for the few CPU overlays that intersect the model.  While
+/// the camera is moving those overlays use the same coarse visual LOD as the rest
+/// of the viewport and settle to depth-correct rendering on release.
+fn needs_cpu_occlusion(
+    gpu_active: bool,
+    interacting: bool,
+    plane_pick_active: bool,
+    has_datum_sheets: bool,
+    whole_body_selected: bool,
+) -> bool {
+    !gpu_active || (!interacting && (plane_pick_active || has_datum_sheets || whole_body_selected))
+}
+
 #[cfg(test)]
 mod selected_material_tests {
     use super::*;
@@ -93,6 +112,31 @@ mod selected_material_tests {
             .into_iter()
             .map(|(id, pick)| (id.to_string(), pick))
             .collect()
+    }
+
+    #[test]
+    fn stale_exact_preview_never_hides_live_additive_tool() {
+        assert!(show_live_extrude_tool(Some(ExtrudeMode::Join), false));
+        assert!(show_live_extrude_tool(Some(ExtrudeMode::NewBody), false));
+        assert!(!show_exact_extrude_result(Some(ExtrudeMode::Join), false));
+        assert!(!show_exact_extrude_result(
+            Some(ExtrudeMode::NewBody),
+            false
+        ));
+    }
+
+    #[test]
+    fn matching_exact_preview_replaces_additive_tool() {
+        assert!(!show_live_extrude_tool(Some(ExtrudeMode::Join), true));
+        assert!(!show_live_extrude_tool(Some(ExtrudeMode::NewBody), true));
+        assert!(show_exact_extrude_result(Some(ExtrudeMode::Join), true));
+        assert!(show_exact_extrude_result(Some(ExtrudeMode::NewBody), true));
+    }
+
+    #[test]
+    fn cut_tool_remains_visible_with_matching_exact_preview() {
+        assert!(show_live_extrude_tool(Some(ExtrudeMode::Cut), true));
+        assert!(show_exact_extrude_result(Some(ExtrudeMode::Cut), false));
     }
 
     #[test]
@@ -161,6 +205,20 @@ mod selected_material_tests {
         ));
         assert!(!face_uses_selected_material(None, 2, &whole, &faces));
     }
+
+    #[test]
+    fn gpu_plain_view_skips_the_software_depth_buffer() {
+        assert!(!needs_cpu_occlusion(true, false, false, false, false));
+        assert!(!needs_cpu_occlusion(true, true, true, true, true));
+    }
+
+    #[test]
+    fn overlays_request_software_depth_only_when_camera_is_still() {
+        assert!(needs_cpu_occlusion(true, false, true, false, false));
+        assert!(needs_cpu_occlusion(true, false, false, true, false));
+        assert!(needs_cpu_occlusion(true, false, false, false, true));
+        assert!(needs_cpu_occlusion(false, true, false, false, false));
+    }
 }
 
 /// Rasterize one projected triangle's depth into the coarse occlusion buffer,
@@ -220,13 +278,42 @@ pub(crate) struct PreviewPlan {
     pub preview_mode: Option<ExtrudeMode>,
     /// Full replacement body set (the evaluated Join/Cut/edge-mod result);
     /// when `Some`, the committed bodies are NOT drawn.
-    pub preview_bodies: Option<Vec<(String, MockMesh)>>,
+    pub preview_bodies: Option<SharedBodyMeshes>,
     /// The extrude tool volume (red cut volume / warm additive ghost).
     pub extrude_preview_mesh: Option<MockMesh>,
     /// The lightweight edge-mod overlay ribbon (until exact bodies arrive).
     pub edge_mod_preview_mesh: Option<MockMesh>,
+    /// Translucent reflected body shown after a Mirror plane is picked.
+    pub mirror_preview_mesh: Option<MockMesh>,
+    /// Cosmetic helical ribbon on the selected cylindrical face. The committed
+    /// body remains untouched until the Thread dialog is accepted.
+    pub thread_preview_mesh: Option<MockMesh>,
     /// Alpha for `preview_bodies` (Cut ghosts the result at 120).
     pub body_alpha: u8,
+}
+
+fn show_live_extrude_tool(mode: Option<ExtrudeMode>, exact_preview_is_current: bool) -> bool {
+    match mode {
+        // Keep the cutter visible through the translucent exact result so the
+        // removed volume remains legible.
+        Some(ExtrudeMode::Cut) => true,
+        // For additive modes, the lightweight tool is the immediate feedback.
+        // Only the exact result for these exact inputs may replace it.
+        Some(ExtrudeMode::Join | ExtrudeMode::NewBody) => !exact_preview_is_current,
+        None => true,
+    }
+}
+
+/// Whether an evaluated extrude result is allowed into the frame. Additive
+/// previews are opaque replacement body sets, so showing an older depth beside
+/// the current lightweight tool looks exactly like a second body lagging behind
+/// the drag. Withhold it until its input key matches. Cut keeps its translucent
+/// last result as context while the current red cutter remains explicit.
+fn show_exact_extrude_result(mode: Option<ExtrudeMode>, exact_preview_is_current: bool) -> bool {
+    match mode {
+        Some(ExtrudeMode::Join | ExtrudeMode::NewBody) => exact_preview_is_current,
+        Some(ExtrudeMode::Cut) | None => true,
+    }
 }
 
 impl ZeroCadApp {
@@ -248,63 +335,68 @@ impl ZeroCadApp {
                     PendingVisualMode::Extrude(mode) => {
                         preview_mode = Some(mode);
                     }
-                    PendingVisualMode::EdgeMod(_) => {
+                    PendingVisualMode::EdgeMod => {
                         edge_mod_active = true;
                     }
                 }
             }
         }
 
-        // A New Body extrude of overlapping shapes is a boolean (box-minus-cylinder
-        // etc.): the warm ghost would draw the un-booleaned split regions, so
-        // (once the drag settles) suppress it and show the real evaluated body.
+        // A New Body extrude of genuinely crossing shapes is a boolean
+        // (box straddled by a cylinder, two crossing rectangles): the warm ghost
+        // would draw the un-fused split regions, so suppress it and show the real
+        // evaluated body. A contained circle (a hole) is NOT a crossing — the
+        // ghost renders that prism-with-hole exactly and instantly.
         let newbody_overlap = !edge_mod_active
-            && !self.extrude_depth_dragging
             && preview_mode == Some(ExtrudeMode::NewBody)
-            && self.op_has_overlapping_shapes();
-        let extrude_preview_mesh = if edge_mod_active
-            || (newbody_overlap && self.cached_preview_extrude_bodies().is_some())
-        {
-            None
-        } else {
-            // Memoized: only re-tessellated when the depth/targets change.
-            self.cached_preview_mesh().or_else(|| {
-                if let Some(pending) = &self.pending_visual {
-                    if matches!(pending.mode, PendingVisualMode::Extrude(_)) {
-                        return pending.mesh.clone();
-                    }
-                }
+            && self.op_has_crossing_shapes();
+        let needs_exact_extrude = !edge_mod_active
+            && (matches!(preview_mode, Some(ExtrudeMode::Join | ExtrudeMode::Cut))
+                || newbody_overlap);
+        // The cache may return the last completed body while the worker evaluates
+        // the current input. Do not put that stale opaque body into an additive
+        // frame: it visibly trails the current lightweight tool as a second solid.
+        let cached_exact_extrude_bodies = needs_exact_extrude
+            .then(|| self.cached_preview_extrude_bodies())
+            .flatten();
+        let pending_exact_bodies = self.extrude_op.is_none()
+            && self.pending_visual.as_ref().is_some_and(|pending| {
+                matches!(pending.mode, PendingVisualMode::Extrude(_)) && pending.exact_bodies
+            });
+        let exact_preview_is_current = self.has_current_extrude_preview() || pending_exact_bodies;
+        let exact_extrude_bodies = cached_exact_extrude_bodies
+            .filter(|_| show_exact_extrude_result(preview_mode, exact_preview_is_current));
+        let extrude_preview_mesh =
+            if edge_mod_active || !show_live_extrude_tool(preview_mode, exact_preview_is_current) {
                 None
-            })
-        };
+            } else {
+                // Memoized: only re-tessellated when the depth/targets change.
+                self.cached_preview_mesh().or_else(|| {
+                    if let Some(pending) = &self.pending_visual {
+                        if matches!(pending.mode, PendingVisualMode::Extrude(_)) {
+                            return pending.mesh.clone();
+                        }
+                    }
+                    None
+                })
+            };
         let mut preview_bodies = if edge_mod_active {
             // Exact edge-mod bodies arrive from the worker cache. Until then the
             // lightweight overlay mesh below gives immediate visual feedback.
             self.cached_preview_edge_mod_bodies()
-        } else if self.extrude_depth_dragging {
-            // Live ghost drag: skip the (expensive) truck boolean entirely. We
-            // render the un-booleaned model plus the cheap ghost tool volume
-            // (added below) so the preview tracks the cursor at full frame rate.
-            // The real merged/cut result is computed once on release.
-            None
         } else {
-            match preview_mode {
-                // Memoized: the full-model re-evaluation (truck booleans) only
-                // reruns when the depth/mode/targets change, not every frame.
-                Some(ExtrudeMode::Join | ExtrudeMode::Cut) => self.cached_preview_extrude_bodies(),
-                // A boolean New Body (overlapping shapes) likewise previews its
-                // real evaluated result instead of the ghost.
-                Some(ExtrudeMode::NewBody) if newbody_overlap => {
-                    self.cached_preview_extrude_bodies()
-                }
-                _ => None,
-            }
+            // This also runs during push/pull. Additive results enter only when
+            // their key matches the current depth; until then the committed scene
+            // plus the current lightweight tool is the complete frame.
+            exact_extrude_bodies
         };
 
-        // Fall back to pending_visual bodies if no active preview bodies are resolved:
-        if preview_bodies.is_none() {
+        // A pending visual bridges an operation that has already committed and
+        // closed. Never let one leak into a newly active operation as stale body
+        // geometry.
+        if preview_bodies.is_none() && self.extrude_op.is_none() && self.edge_mod_op.is_none() {
             if let Some(pending) = &self.pending_visual {
-                preview_bodies = Some(pending.bodies.clone());
+                preview_bodies = Some(pending.bodies.clone().into());
             }
         }
 
@@ -312,7 +404,7 @@ impl ZeroCadApp {
             if edge_mod_active && self.cached_preview_edge_mod_bodies().is_none() {
                 self.cached_preview_edge_mod_mesh().or_else(|| {
                     if let Some(pending) = &self.pending_visual {
-                        if matches!(pending.mode, PendingVisualMode::EdgeMod(_)) {
+                        if matches!(pending.mode, PendingVisualMode::EdgeMod) {
                             return pending.mesh.clone();
                         }
                     }
@@ -321,6 +413,13 @@ impl ZeroCadApp {
             } else {
                 None
             };
+
+        // Body movement is a rigid mesh translation, so its preview is exact
+        // and immediate. It replaces the committed body set in both renderers.
+        if let Some(moved) = self.move_preview_bodies.as_ref() {
+            preview_mode = None;
+            preview_bodies = Some(moved.clone());
+        }
 
         // A Cut preview ghosts the resulting body (alpha < 255) so the pocket /
         // hole being formed shows through, like Fusion's cut preview. Everything
@@ -336,6 +435,8 @@ impl ZeroCadApp {
             preview_bodies,
             extrude_preview_mesh,
             edge_mod_preview_mesh,
+            mirror_preview_mesh: self.mirror_preview_mesh(),
+            thread_preview_mesh: self.thread_preview_mesh(),
             body_alpha,
         }
     }
@@ -693,7 +794,7 @@ impl ZeroCadApp {
                 None
             } else if self.is_sketch_mode {
                 Some(self.active_sketch_cs)
-            } else if self.is_plane_selection_mode {
+            } else if self.plane_pick_active() {
                 self.hovered_plane.map(|p| match p {
                     SketchPlane::XY => CoordinateSystem::XY,
                     SketchPlane::XZ => CoordinateSystem::XZ,
@@ -793,6 +894,8 @@ impl ZeroCadApp {
             preview_bodies,
             extrude_preview_mesh,
             edge_mod_preview_mesh,
+            mirror_preview_mesh,
+            thread_preview_mesh,
             body_alpha,
         } = self
             .frame_preview_plan
@@ -812,6 +915,10 @@ impl ZeroCadApp {
             alpha: u8,
             cull_back: bool,
             draw_edges: bool,
+            /// Sort after everything else (x-ray): for previews of surfaces
+            /// that lie INSIDE the body (the fillet/chamfer band), which the
+            /// depth sort would otherwise bury behind the walls around them.
+            on_top: bool,
         }
         let mut meshes: Vec<Drawable> = if gpu_active {
             // The GPU composited this frame's full scene — committed bodies AND
@@ -828,6 +935,7 @@ impl ZeroCadApp {
                     // A translucent ghost (Cut result) keeps its back faces.
                     cull_back: body_alpha == 255,
                     draw_edges: true,
+                    on_top: false,
                 })
                 .collect()
         } else {
@@ -840,6 +948,7 @@ impl ZeroCadApp {
                     alpha: 255,
                     cull_back: true,
                     draw_edges: true,
+                    on_top: false,
                 })
                 .collect()
         };
@@ -861,26 +970,24 @@ impl ZeroCadApp {
                         alpha: 90,
                         cull_back: true,
                         draw_edges: false,
+                        on_top: false,
                     });
                 }
             }
-            // Join: a settled preview already shows the merged result (the added
-            // material is part of the booleaned body), so no separate tool volume
-            // is needed. But while push/pull dragging, that boolean is deferred —
-            // so float the warm additive ghost over the live body for instant,
-            // full-rate feedback. On release the merge runs and replaces it.
+            // The plan supplies this tool only while the matching exact Join
+            // result is unavailable. Keep its real preview outline visible;
+            // the exact fused body replaces this layer when it arrives.
             Some(ExtrudeMode::Join) => {
-                if self.extrude_depth_dragging {
-                    if let Some(pm) = extrude_preview_mesh.as_ref() {
-                        meshes.push(Drawable {
-                            node_id: None,
-                            mesh: pm,
-                            base: (255.0, 178.0, 96.0),
-                            alpha: 255,
-                            cull_back: true,
-                            draw_edges: true,
-                        });
-                    }
+                if let Some(pm) = extrude_preview_mesh.as_ref() {
+                    meshes.push(Drawable {
+                        node_id: None,
+                        mesh: pm,
+                        base: (255.0, 178.0, 96.0),
+                        alpha: 255,
+                        cull_back: true,
+                        draw_edges: true,
+                        on_top: false,
+                    });
                 }
             }
             // New Body: the warm additive tool volume floats over the live model.
@@ -893,8 +1000,35 @@ impl ZeroCadApp {
                         alpha: 255,
                         cull_back: true,
                         draw_edges: true,
+                        on_top: false,
                     });
                 }
+            }
+        }
+        if !gpu_active {
+            if let Some(mesh) = mirror_preview_mesh.as_ref() {
+                meshes.push(Drawable {
+                    node_id: None,
+                    mesh,
+                    base: (70.0, 170.0, 245.0),
+                    alpha: 115,
+                    cull_back: false,
+                    draw_edges: true,
+                    on_top: false,
+                });
+            }
+        }
+        if !gpu_active {
+            if let Some(mesh) = thread_preview_mesh.as_ref() {
+                meshes.push(Drawable {
+                    node_id: None,
+                    mesh,
+                    base: (70.0, 145.0, 245.0),
+                    alpha: 220,
+                    cull_back: false,
+                    draw_edges: true,
+                    on_top: true,
+                });
             }
         }
         if let Some(pm) = edge_mod_preview_mesh.as_ref() {
@@ -903,9 +1037,12 @@ impl ZeroCadApp {
                     node_id: None,
                     mesh: pm,
                     base: (255.0, 178.0, 96.0),
-                    alpha: 235,
+                    alpha: 200,
                     cull_back: false,
                     draw_edges: true,
+                    // The blend band lies inside the body — depth-sorted it
+                    // would be buried behind the walls around it.
+                    on_top: true,
                 });
             }
         }
@@ -978,12 +1115,32 @@ impl ZeroCadApp {
         // so back edges x-ray through the solid. We rasterize the OPAQUE surface
         // into a coarse depth grid (section A), then in section F draw only the
         // edge spans that aren't behind a nearer face. Larger `final_z` = nearer.
-        let bw_full = rect.width().ceil().max(1.0) as usize;
-        let bh_full = rect.height().ceil().max(1.0) as usize;
-        // ~2px cells, scaled up on hi-dpi / fullscreen so the buffer stays small.
-        let occ_cell = (((bw_full.max(bh_full) + 1023) / 1024).max(1) * 2) as f32;
-        let occ_w = (bw_full as f32 / occ_cell) as usize + 2;
-        let occ_h = (bh_full as f32 / occ_cell) as usize + 2;
+        let whole_body_selected = self
+            .selected_body
+            .iter()
+            .any(|(_, pick)| matches!(pick, BodyPick::Whole));
+        let build_occlusion = needs_cpu_occlusion(
+            gpu_active,
+            interacting,
+            self.plane_pick_active(),
+            !datum_sheets.is_empty(),
+            whole_body_selected,
+        );
+        let (occ_cell, occ_w, occ_h) = if build_occlusion {
+            let bw_full = rect.width().ceil().max(1.0) as usize;
+            let bh_full = rect.height().ceil().max(1.0) as usize;
+            // ~2px cells, scaled up on hi-dpi / fullscreen so the buffer stays small.
+            let cell = (((bw_full.max(bh_full) + 1023) / 1024).max(1) * 2) as f32;
+            (
+                cell,
+                (bw_full as f32 / cell) as usize + 2,
+                (bh_full as f32 / cell) as usize + 2,
+            )
+        } else {
+            // Keep the shared `occluded` closure branch-free.  A one-cell empty
+            // buffer answers "visible" for every point at negligible cost.
+            (f32::MAX, 1, 1)
+        };
         let mut zbuf = vec![f32::NEG_INFINITY; occ_w * occ_h];
         let (mut depth_min, mut depth_max) = (f32::INFINITY, f32::NEG_INFINITY);
 
@@ -991,7 +1148,7 @@ impl ZeroCadApp {
             selected_material_sets(&self.selected_body);
         // While picking a sketch plane, preview the hovered planar body face as
         // selected so the user sees which face a click will sketch on.
-        if self.is_plane_selection_mode {
+        if self.plane_pick_active() {
             if let Some((node, fid)) = self.hovered_sketch_face.as_ref() {
                 selected_faces.insert((node.as_str(), *fid));
             }
@@ -1006,7 +1163,7 @@ impl ZeroCadApp {
         // the CPU path), else the committed bodies — with the identical
         // projection, so overlays keep the same hidden-surface behavior in
         // both render modes.
-        if gpu_active {
+        if gpu_active && build_occlusion {
             let occluders: Option<&[(String, MockMesh)]> =
                 if let Some(bodies) = preview_bodies.as_ref() {
                     (body_alpha == 255).then_some(bodies.as_slice())
@@ -1148,7 +1305,9 @@ impl ZeroCadApp {
                     rasterize_depth(&mut zbuf, occ_w, occ_h, occ_cell, rect.min, p0, p1, p2);
                 }
 
-                let avg_depth = (p0.2 + p1.2 + p2.2) / 3.0;
+                // On-top drawables sort after the whole scene (still depth-
+                // ordered among themselves) so the depth span stays finite.
+                let avg_depth = (p0.2 + p1.2 + p2.2) / 3.0 + if d.on_top { 1.0e6 } else { 0.0 };
                 let face_id = mesh.face_ids.get(i).copied().unwrap_or(0);
                 let base = if face_uses_selected_material(
                     d.node_id,
@@ -1188,7 +1347,7 @@ impl ZeroCadApp {
         }
 
         // B. Gather Origin Plane Sheets
-        if self.is_plane_selection_mode {
+        if self.plane_pick_active() {
             for (_pts, world, depth, plane, fill_col, border_col, label) in planes_to_draw {
                 render_items.push(RenderItem {
                     depth,
@@ -1508,8 +1667,26 @@ impl ZeroCadApp {
                     continue;
                 };
 
-                // Highlight the visible (front-facing) edges of the body.
-                let highlight_edge = |painter: &egui::Painter, e: usize| {
+                // Highlight one edge. Whole-body selection uses the same
+                // front-face and depth-buffer clipping as the normal hidden-line
+                // pass; explicit edge selection remains fully emphasized.
+                let highlight_edge = |painter: &egui::Painter, e: usize, visible_only: bool| {
+                    if visible_only && mesh.edge_face_normals.len() >= (e + 1) * 6 {
+                        let o = e * 6;
+                        let na = (
+                            mesh.edge_face_normals[o],
+                            mesh.edge_face_normals[o + 1],
+                            mesh.edge_face_normals[o + 2],
+                        );
+                        let nb = (
+                            mesh.edge_face_normals[o + 3],
+                            mesh.edge_face_normals[o + 4],
+                            mesh.edge_face_normals[o + 5],
+                        );
+                        if !faces_camera(na) && !faces_camera(nb) {
+                            return;
+                        }
+                    }
                     let i0 = mesh.edge_indices[e * 2] as usize * 3;
                     let i1 = mesh.edge_indices[e * 2 + 1] as usize * 3;
                     let a = project_3d(
@@ -1522,7 +1699,33 @@ impl ZeroCadApp {
                         mesh.edge_vertices[i1 + 1],
                         mesh.edge_vertices[i1 + 2],
                     );
-                    painter.line_segment([egui::pos2(a.0, a.1), egui::pos2(b.0, b.1)], sel_edge);
+                    if !visible_only {
+                        painter
+                            .line_segment([egui::pos2(a.0, a.1), egui::pos2(b.0, b.1)], sel_edge);
+                        return;
+                    }
+                    let len = (b.0 - a.0).hypot(b.1 - a.1);
+                    let steps = (len / 2.0).ceil().max(1.0) as usize;
+                    let mut run_start: Option<egui::Pos2> = None;
+                    let mut last_visible = egui::pos2(a.0, a.1);
+                    for step in 0..=steps {
+                        let t = step as f32 / steps as f32;
+                        let x = a.0 + (b.0 - a.0) * t;
+                        let y = a.1 + (b.1 - a.1) * t;
+                        let depth = a.2 + (b.2 - a.2) * t;
+                        if occluded(x, y, depth) {
+                            if let Some(start) = run_start.take() {
+                                painter.line_segment([start, last_visible], sel_edge);
+                            }
+                        } else {
+                            let point = egui::pos2(x, y);
+                            run_start.get_or_insert(point);
+                            last_visible = point;
+                        }
+                    }
+                    if let Some(start) = run_start {
+                        painter.line_segment([start, last_visible], sel_edge);
+                    }
                 };
 
                 match *pick {
@@ -1535,12 +1738,12 @@ impl ZeroCadApp {
                         let ecount = mesh.edge_indices.len() / 2;
                         if mesh.edge_groups.is_empty() {
                             if (g as usize) < ecount {
-                                highlight_edge(&painter, g as usize);
+                                highlight_edge(&painter, g as usize, false);
                             }
                         } else {
                             for seg in 0..ecount {
                                 if mesh.edge_groups.get(seg).copied() == Some(g) {
-                                    highlight_edge(&painter, seg);
+                                    highlight_edge(&painter, seg, false);
                                 }
                             }
                         }
@@ -1564,7 +1767,7 @@ impl ZeroCadApp {
                     BodyPick::Whole => {
                         let ecount = mesh.edge_indices.len() / 2;
                         for e in 0..ecount {
-                            highlight_edge(&painter, e);
+                            highlight_edge(&painter, e, true);
                         }
                     }
                 }
@@ -1575,10 +1778,9 @@ impl ZeroCadApp {
         // Every saved Sketch node is shown on its plane so the user can see and
         // pick it later; selected faces are highlighted for extrusion.
         let empty_sel: HashSet<usize> = HashSet::new();
-        let cut_preview_sources: HashSet<String> = self
+        let active_extrude_sources: HashSet<String> = self
             .extrude_op
             .as_ref()
-            .filter(|op| op.mode == ExtrudeMode::Cut)
             .map(|op| op.targets.iter().map(|t| t.sketch_id.clone()).collect())
             .unwrap_or_default();
         let var_map = self.graph.variable_map();
@@ -1587,11 +1789,15 @@ impl ZeroCadApp {
             if self.hidden_nodes.contains(&node.id) {
                 continue; // hidden sketch — don't draw
             }
+            if active_extrude_sources.contains(&node.id) {
+                continue;
+            }
             if let FeatureType::Sketch {
                 cs,
                 curves,
                 shapes,
                 corner_mods,
+                mirrors,
                 solver,
                 ..
             } = &node.feature
@@ -1610,6 +1816,7 @@ impl ZeroCadApp {
                     curves,
                     shapes,
                     corner_mods,
+                    mirrors,
                     solver.as_ref(),
                     &var_map,
                 );
@@ -1618,11 +1825,7 @@ impl ZeroCadApp {
                 }
                 let curves = &eff;
                 let regions = detect_regions(curves);
-                let selected = if cut_preview_sources.contains(&node.id) {
-                    HashSet::new()
-                } else {
-                    self.selected_regions_for(&node.id)
-                };
+                let selected = self.selected_regions_for(&node.id);
                 let sel_edges = self.selected_edges_for(&node.id);
                 // Finished sketches always draw "passive": unselected faces stay
                 // faint/neutral and only picked faces/edges are highlighted,
@@ -1655,8 +1858,7 @@ impl ZeroCadApp {
                 true,
             );
             if !self.active_face_boundary.is_empty() {
-                let stroke =
-                    egui::Stroke::new(1.6, egui::Color32::from_rgb(150, 80, 200));
+                let stroke = egui::Stroke::new(1.6, egui::Color32::from_rgb(150, 80, 200));
                 for s in &self.active_face_boundary.segments {
                     painter.line_segment([to_screen(s.a), to_screen(s.b)], stroke);
                 }
@@ -1769,8 +1971,10 @@ impl ZeroCadApp {
                                 let mut prev: Option<egui::Pos2> = None;
                                 for i in 0..=48 {
                                     let t = (i as f32 / 48.0) * std::f32::consts::TAU;
-                                    let p =
-                                        (c.center.0 + c.radius * t.cos(), c.center.1 + c.radius * t.sin());
+                                    let p = (
+                                        c.center.0 + c.radius * t.cos(),
+                                        c.center.1 + c.radius * t.sin(),
+                                    );
                                     let ps = to_screen(p);
                                     if let Some(last) = prev {
                                         painter.line_segment([last, ps], preview_stroke);
@@ -1779,8 +1983,10 @@ impl ZeroCadApp {
                                 }
                             }
                             for arc in &m.arcs {
-                                let a0 = (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
-                                let mut a1 = (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
+                                let a0 =
+                                    (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
+                                let mut a1 =
+                                    (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
                                 while a1 - a0 > std::f32::consts::PI {
                                     a1 -= std::f32::consts::TAU;
                                 }
@@ -1833,6 +2039,16 @@ impl ZeroCadApp {
             // armed — i.e. the cursor is actively placing a point.
             if self.active_tool.is_some() {
                 let orange = egui::Color32::from_rgb(255, 140, 0);
+                // Midline inference guides: dashed orange lines from a woken
+                // midpoint toward the snapped point (Fusion 360 style).
+                for (a, b) in &self.cursor_snap_guides {
+                    painter.add(egui::Shape::dashed_line(
+                        &[to_screen(*a), to_screen(*b)],
+                        egui::Stroke::new(1.0, orange),
+                        5.0,
+                        4.0,
+                    ));
+                }
                 // Close-loop cue: when a continuous-Line chain is open and the
                 // cursor has snapped back onto its start, emphasize that point
                 // (a filled disc + white ring) — a click there closes the loop
@@ -1855,7 +2071,12 @@ impl ZeroCadApp {
                         SnapKind::Endpoint => {
                             painter.circle_stroke(p, 5.0, stroke);
                         }
-                        SnapKind::Midpoint | SnapKind::Center => {
+                        SnapKind::Origin => {
+                            // Ring plus a filled centre dot to distinguish it.
+                            painter.circle_stroke(p, 5.0, stroke);
+                            painter.circle_filled(p, 1.5, orange);
+                        }
+                        SnapKind::Midpoint | SnapKind::Center | SnapKind::MidlineCenter => {
                             let r = 4.5;
                             painter.line_segment(
                                 [egui::pos2(p.x - r, p.y - r), egui::pos2(p.x + r, p.y + r)],
@@ -1866,14 +2087,14 @@ impl ZeroCadApp {
                                 stroke,
                             );
                         }
-                        SnapKind::OnLine | SnapKind::Grid => {}
+                        SnapKind::Midline | SnapKind::OnLine | SnapKind::Grid => {}
                     }
                 }
             }
         }
 
         // --- 6f. Draw Central Origin Sphere (when selecting planes) ---
-        if self.is_plane_selection_mode {
+        if self.plane_pick_active() {
             let orig_3d = project_3d(0.0, 0.0, 0.0);
             let orig_pt = egui::pos2(orig_3d.0, orig_3d.1);
             painter.circle_filled(orig_pt, 5.0, egui::Color32::WHITE);

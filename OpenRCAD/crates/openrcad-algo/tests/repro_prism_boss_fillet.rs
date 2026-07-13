@@ -34,11 +34,7 @@ fn prism_boss_body() -> Solid {
         ]),
     );
     let wedge = prism(&tri, GeomVec::new(0.0, 0.0, PRISM_H)).expect("triangle should extrude");
-    let boss = make_cylinder(
-        &Ax2::new(Pnt::new(20.0, 15.0, 0.0), Dir::dz()),
-        R,
-        BOSS_H,
-    );
+    let boss = make_cylinder(&Ax2::new(Pnt::new(20.0, 15.0, 0.0), Dir::dz()), R, BOSS_H);
     let fused = boolean(&wedge, &boss, BooleanOp::Fuse);
     assert!(fused.is_watertight(), "fused body must be watertight");
     assert!(
@@ -223,8 +219,7 @@ fn assert_prism_corner_fillet_inside(
         ))),
         Wire::from_edges(edges),
     );
-    let body =
-        prism(&face, GeomVec::new(0.0, 0.0, height)).expect("triangle base should extrude");
+    let body = prism(&face, GeomVec::new(0.0, 0.0, height)).expect("triangle base should extrude");
     assert!(body.is_watertight(), "{what}: base body must be watertight");
     let (cx, cy) = base[corner];
     let edge = Edge::between_points(Pnt::new(cx, cy, 0.0), Pnt::new(cx, cy, height));
@@ -236,7 +231,11 @@ fn assert_prism_corner_fillet_inside(
         "{what}: result must be healthy: {:?}",
         rounded.health_report().errors
     );
-    assert_eq!(cracks(&rounded), 0, "{what}: result mesh must be crack-free");
+    assert_eq!(
+        cracks(&rounded),
+        0,
+        "{what}: result mesh must be crack-free"
+    );
     let out = prism_outside_distance(&rounded, base, height);
     assert!(
         out <= 1.0e-3,

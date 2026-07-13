@@ -1111,6 +1111,26 @@ fn project_on_curve(curve: &GeomCurve, p: Pnt) -> f64 {
             }
             u
         }
+        GeomCurve::Helix(h) => {
+            // Angle from the radial component, disambiguated across turns by
+            // the axial height (u ≈ height·2π/lead).
+            let pos = h.position();
+            let loc = pos.location();
+            let v =
+                openrcad_foundation::Vec::new(p.x() - loc.x(), p.y() - loc.y(), p.z() - loc.z());
+            let tau = 2.0 * std::f64::consts::PI;
+            let axial = v.dot(&openrcad_foundation::Vec::from_dir(pos.direction()));
+            let u_height = if h.lead().abs() > 1e-12 {
+                axial * tau / h.lead()
+            } else {
+                0.0
+            };
+            let dx = v.dot(&openrcad_foundation::Vec::from_dir(pos.x_direction()));
+            let dy = v.dot(&openrcad_foundation::Vec::from_dir(pos.y_direction()));
+            let ang = dy.atan2(dx);
+            let k = ((u_height - ang) / tau).round();
+            ang + tau * k
+        }
         GeomCurve::Parabola(pa) => {
             let loc = pa.position().location();
             let y = pa.position().y_direction();

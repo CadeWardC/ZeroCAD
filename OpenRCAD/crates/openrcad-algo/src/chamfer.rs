@@ -133,15 +133,15 @@ pub fn chamfer_edges(solid: &Solid, edges: &[Edge], distance: f64) -> Result<Sol
 }
 
 #[derive(Clone)]
-struct ChamferBlend {
-    spine: Edge,
-    face_a: Face,
-    face_b: Face,
-    contact_a: Edge,
-    contact_b: Edge,
-    chamfer_face: Face,
-    start_edge: Edge,
-    end_edge: Edge,
+pub(crate) struct ChamferBlend {
+    pub(crate) spine: Edge,
+    pub(crate) face_a: Face,
+    pub(crate) face_b: Face,
+    pub(crate) contact_a: Edge,
+    pub(crate) contact_b: Edge,
+    pub(crate) chamfer_face: Face,
+    pub(crate) start_edge: Edge,
+    pub(crate) end_edge: Edge,
 }
 
 #[derive(Clone, Copy)]
@@ -151,26 +151,7 @@ enum Endpoint {
 }
 
 fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Solid, ChamferError> {
-    let adjacent = adjacent_faces(solid, edge);
-    if adjacent.len() != 2 {
-        return Err(ChamferError::EdgeAdjacency {
-            count: adjacent.len(),
-        });
-    }
-    if !matches!(adjacent[0].surface(), Some(GeomSurface::Plane(_)))
-        || !matches!(adjacent[1].surface(), Some(GeomSurface::Plane(_)))
-    {
-        return Err(ChamferError::UnsupportedSurfacePair);
-    }
-
-    // A reflex/concave wedge (inner pocket corner) bevels by ADDING material
-    // across the void: the offset lines walk the other way along each face.
-    // Solid-checked normals: boolean CUT tool faces can carry an inverted
-    // stored orientation, which would mirror the offsets into the material.
-    let n_a = planar_outward_normal_checked(solid, &adjacent[0])?;
-    let n_b = planar_outward_normal_checked(solid, &adjacent[1])?;
-    let concave = planar_edge_material_wedge_is_concave(solid, edge, n_a, n_b) == Some(true);
-    let mut blend = planar_chamfer(edge, &adjacent[0], &adjacent[1], n_a, n_b, distance, concave)?;
+    let mut blend = chamfer_planar_blend(solid, edge, distance)?;
     let start = edge.source().point();
     let end = edge.target().point();
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
@@ -224,6 +205,41 @@ fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Soli
         return Ok(result);
     }
     Err(ChamferError::InvalidTopology)
+}
+
+pub(crate) fn chamfer_planar_blend(
+    solid: &Solid,
+    edge: &Edge,
+    distance: f64,
+) -> Result<ChamferBlend, ChamferError> {
+    let adjacent = adjacent_faces(solid, edge);
+    if adjacent.len() != 2 {
+        return Err(ChamferError::EdgeAdjacency {
+            count: adjacent.len(),
+        });
+    }
+    if !matches!(adjacent[0].surface(), Some(GeomSurface::Plane(_)))
+        || !matches!(adjacent[1].surface(), Some(GeomSurface::Plane(_)))
+    {
+        return Err(ChamferError::UnsupportedSurfacePair);
+    }
+
+    // A reflex/concave wedge (inner pocket corner) bevels by ADDING material
+    // across the void: the offset lines walk the other way along each face.
+    // Solid-checked normals: boolean CUT tool faces can carry an inverted
+    // stored orientation, which would mirror the offsets into the material.
+    let n_a = planar_outward_normal_checked(solid, &adjacent[0])?;
+    let n_b = planar_outward_normal_checked(solid, &adjacent[1])?;
+    let concave = planar_edge_material_wedge_is_concave(solid, edge, n_a, n_b) == Some(true);
+    planar_chamfer(
+        edge,
+        &adjacent[0],
+        &adjacent[1],
+        n_a,
+        n_b,
+        distance,
+        concave,
+    )
 }
 
 fn planar_chamfer(

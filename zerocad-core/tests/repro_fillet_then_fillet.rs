@@ -23,6 +23,7 @@ fn add_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: S
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: true,
         },
     });
@@ -147,7 +148,7 @@ fn capture_edge(mesh: &MockMesh, pred: impl Fn([f32; 3]) -> bool) -> Option<Edge
 }
 
 #[test]
-fn fillet_then_fillet_perpendicular_edge() {
+fn fillet_then_larger_fillet_perpendicular_edge() {
     let mut g = ParametricGraph::new();
     add_sketch(
         &mut g,
@@ -201,7 +202,7 @@ fn fillet_then_fillet_perpendicular_edge() {
         feature: FeatureType::EdgeMod {
             target: "extrude_2".into(),
             edge: edge2,
-            dist: 4.0,
+            dist: 6.0,
             dist_expr: None,
             scope: EdgeModScope::FullEdge,
             replay: Default::default(),
@@ -214,18 +215,17 @@ fn fillet_then_fillet_perpendicular_edge() {
     println!("after fillet 2: bodies={}, warnings={w2:?}", bodies2.len());
     assert_eq!(bodies2.len(), 1, "two fillets keep one body");
 
-    // The SECOND round must appear: a rolled surface on the x=40 side, i.e. some
-    // vertex with x strictly between 36 and 40 at an intermediate z (11..14.8).
+    // The larger SECOND round must appear on the x=40 side.
     let mesh2 = &bodies2[0].1;
     let has_second_round = mesh2
         .vertices
         .chunks(6)
-        .any(|v| v[0] > 36.0 && v[0] < 39.95 && v[2] > 11.0 && v[2] < 14.8 && v[1] > 5.0);
+        .any(|v| v[0] > 34.0 && v[0] < 39.95 && v[2] > 14.0 && v[2] < 19.95 && v[1] > 5.0);
     println!("second round present: {has_second_round}");
 
     assert!(
         w2.is_empty(),
-        "fillet 2 (perpendicular edge) should succeed, got {w2:?}"
+        "larger fillet 2 (perpendicular edge) should succeed, got {w2:?}"
     );
     assert!(
         has_second_round,

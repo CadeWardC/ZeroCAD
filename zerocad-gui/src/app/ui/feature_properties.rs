@@ -1,6 +1,42 @@
 use crate::*;
 use zerocad_core::{DatumAxisDef, DatumPlaneDef, DatumPointDef};
 
+/// Edit the persisted source of an expression-backed numeric property and show
+/// its current evaluated value without replacing the source text.
+fn expression_editor(
+    ui: &mut egui::Ui,
+    expression: &mut Option<String>,
+    vars: &std::collections::HashMap<String, f64>,
+    hint: &str,
+    suffix: &str,
+    modified: &mut bool,
+) {
+    ui.add_space(3.0);
+    ui.horizontal(|ui| {
+        ui.label("=");
+        let mut source = expression.clone().unwrap_or_default();
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut source)
+                    .hint_text(hint)
+                    .desired_width(150.0),
+            )
+            .changed()
+        {
+            let source = source.trim();
+            *expression = (!source.is_empty()).then(|| source.to_string());
+            *modified = true;
+        }
+    });
+    if let Some(source) = expression.as_ref() {
+        let result = match zerocad_core::expr::eval(source, vars) {
+            Ok(value) => format!("→ {value:.2} {suffix}"),
+            Err(error) => format!("→ {error}"),
+        };
+        ui.label(egui::RichText::new(result).size(11.0).weak());
+    }
+}
+
 impl ZeroCadApp {
     pub(crate) fn draw_selected_feature_properties(&mut self, ui: &mut egui::Ui) {
         ui.add_space(15.0);
@@ -242,7 +278,10 @@ impl ZeroCadApp {
                                     }
                                 },
                                 FeatureType::Revolve {
-                                    angle_deg, mode, ..
+                                    angle_deg,
+                                    angle_expr,
+                                    mode,
+                                    ..
                                 } => {
                                     ui.label(
                                         egui::RichText::new(format!("Mode: {:?}", mode))
@@ -261,9 +300,18 @@ impl ZeroCadApp {
                                             )
                                             .changed()
                                         {
+                                            *angle_expr = None;
                                             modified = true;
                                         }
                                     });
+                                    expression_editor(
+                                        ui,
+                                        angle_expr,
+                                        &var_map,
+                                        "expression, e.g. 360/2",
+                                        "°",
+                                        &mut modified,
+                                    );
                                 }
                                 FeatureType::Loft { sections, mode, .. } => {
                                     ui.label(
@@ -288,7 +336,11 @@ impl ZeroCadApp {
                                         .color(pal.text_muted),
                                     );
                                 }
-                                FeatureType::Shell { thickness, .. } => {
+                                FeatureType::Shell {
+                                    thickness,
+                                    thickness_expr,
+                                    ..
+                                } => {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Thickness").size(12.0));
                                         if ui
@@ -300,13 +352,23 @@ impl ZeroCadApp {
                                             )
                                             .changed()
                                         {
+                                            *thickness_expr = None;
                                             modified = true;
                                         }
                                     });
+                                    expression_editor(
+                                        ui,
+                                        thickness_expr,
+                                        &var_map,
+                                        "expression, e.g. 5/2",
+                                        current_unit.suffix(),
+                                        &mut modified,
+                                    );
                                 }
                                 FeatureType::Hole {
                                     position,
                                     diameter,
+                                    diameter_expr,
                                     depth,
                                     ..
                                 } => {
@@ -321,9 +383,18 @@ impl ZeroCadApp {
                                             )
                                             .changed()
                                         {
+                                            *diameter_expr = None;
                                             modified = true;
                                         }
                                     });
+                                    expression_editor(
+                                        ui,
+                                        diameter_expr,
+                                        &var_map,
+                                        "expression, e.g. 43/2",
+                                        current_unit.suffix(),
+                                        &mut modified,
+                                    );
                                     if let Some(d) = depth {
                                         ui.horizontal(|ui| {
                                             ui.label(egui::RichText::new("Depth").size(12.0));
@@ -362,6 +433,7 @@ impl ZeroCadApp {
                                     match kind {
                                         zerocad_core::PatternKind::Linear {
                                             spacing,
+                                            spacing_expr,
                                             count,
                                             ..
                                         } => {
@@ -375,9 +447,18 @@ impl ZeroCadApp {
                                                     )
                                                     .changed()
                                                 {
+                                                    *spacing_expr = None;
                                                     modified = true;
                                                 }
                                             });
+                                            expression_editor(
+                                                ui,
+                                                spacing_expr,
+                                                &var_map,
+                                                "expression, e.g. pitch*2",
+                                                current_unit.suffix(),
+                                                &mut modified,
+                                            );
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("Count").size(12.0));
                                                 if ui
@@ -427,11 +508,37 @@ impl ZeroCadApp {
                                                 }
                                             });
                                         }
-                                        zerocad_core::PatternKind::Mirror { .. } => {
+                                        zerocad_core::PatternKind::Mirror {
+                                            offset,
+                                            offset_expr,
+                                            ..
+                                        } => {
                                             ui.label(
                                                 egui::RichText::new("Mirrored copy of the source.")
                                                     .size(11.5)
                                                     .color(pal.text_muted),
+                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Offset").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(offset)
+                                                            .speed(0.2)
+                                                            .suffix(current_unit.suffix()),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    *offset_expr = None;
+                                                    modified = true;
+                                                }
+                                            });
+                                            expression_editor(
+                                                ui,
+                                                offset_expr,
+                                                &var_map,
+                                                "expression, e.g. width/2",
+                                                current_unit.suffix(),
+                                                &mut modified,
                                             );
                                         }
                                     }
@@ -473,6 +580,7 @@ impl ZeroCadApp {
                                     curves,
                                     shapes,
                                     corner_mods,
+                                    mirrors,
                                     solver,
                                     ..
                                 } => {
@@ -492,6 +600,7 @@ impl ZeroCadApp {
                                         curves,
                                         shapes,
                                         corner_mods,
+                                        mirrors,
                                         solver.as_ref(),
                                         &var_map,
                                     );
@@ -516,14 +625,14 @@ impl ZeroCadApp {
                                             .size(11.5)
                                             .weak(),
                                     );
-                                    // Surface any variable-bound dimensions so the user knows
-                                    // the sketch is parametric (editing is done by redrawing).
+                                    // Surface stored expression dimensions so their editable
+                                    // source remains visible after evaluation.
                                     let bound = sketch_variable_dims(shapes);
                                     if !bound.is_empty() {
                                         ui.add_space(2.0);
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "🔗 Variable dims: {}",
+                                                "🔗 Expression dims: {}",
                                                 bound.join(", ")
                                             ))
                                             .size(11.0)
@@ -779,6 +888,151 @@ impl ZeroCadApp {
                                     ui.label(
                                         egui::RichText::new(
                                             "Edge captured in 3D; edits re-cut the body.",
+                                        )
+                                        .size(10.5)
+                                        .color(pal.text_faint),
+                                    );
+                                }
+                                FeatureType::BodyTransform {
+                                    source,
+                                    translation,
+                                    copy,
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(if *copy {
+                                            format!("Copy of {source}")
+                                        } else {
+                                            format!("Moved from {source}")
+                                        })
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.add_space(4.0);
+                                    for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(label).size(12.0));
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut translation[axis])
+                                                        .speed(0.25)
+                                                        .suffix(current_unit.suffix()),
+                                                )
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
+                                }
+                                FeatureType::BodyJoin { sources } => {
+                                    ui.label(
+                                        egui::RichText::new("Joined bodies")
+                                            .strong()
+                                            .size(12.0)
+                                            .color(pal.text_strong),
+                                    );
+                                    ui.add_space(4.0);
+                                    for source in sources {
+                                        ui.label(
+                                            egui::RichText::new(source.as_str())
+                                                .size(11.5)
+                                                .color(pal.text_muted),
+                                        );
+                                    }
+                                }
+                                FeatureType::BodyCut {
+                                    target,
+                                    tool,
+                                    keep_tool,
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Target: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("Cutting body: {tool}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    if ui.checkbox(keep_tool, "Keep cutting body").changed() {
+                                        modified = true;
+                                    }
+                                }
+                                FeatureType::Thread {
+                                    internal,
+                                    pitch,
+                                    depth,
+                                    right_handed,
+                                    designation,
+                                    ..
+                                } => {
+                                    if !designation.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(designation.as_str())
+                                                .strong()
+                                                .size(12.0)
+                                                .color(pal.text_strong),
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Pitch").size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(pitch, 0.2..=6.0)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            modified = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Depth").size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(depth, 0.05..=3.0)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            modified = true;
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(!*internal, "External").clicked()
+                                            && *internal
+                                        {
+                                            *internal = false;
+                                            modified = true;
+                                        }
+                                        if ui.selectable_label(*internal, "Internal").clicked()
+                                            && !*internal
+                                        {
+                                            *internal = true;
+                                            modified = true;
+                                        }
+                                        ui.separator();
+                                        if ui.selectable_label(*right_handed, "RH").clicked()
+                                            && !*right_handed
+                                        {
+                                            *right_handed = true;
+                                            modified = true;
+                                        }
+                                        if ui.selectable_label(!*right_handed, "LH").clicked()
+                                            && *right_handed
+                                        {
+                                            *right_handed = false;
+                                            modified = true;
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Cut into the selected cylindrical face. A failed \
+                                             helical boolean leaves the body intact (cosmetic).",
                                         )
                                         .size(10.5)
                                         .color(pal.text_faint),

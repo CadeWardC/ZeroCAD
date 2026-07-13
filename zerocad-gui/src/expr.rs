@@ -7,6 +7,28 @@ use eframe::egui;
 
 pub(crate) use zerocad_core::expr::eval;
 
+/// Show the live result of an arithmetic/variable expression next to its source
+/// field. Plain literals need no duplicate label.
+pub(crate) fn evaluation_hint(
+    ui: &mut egui::Ui,
+    text: &str,
+    vars: &std::collections::HashMap<String, f64>,
+    suffix: &str,
+) {
+    if !zerocad_core::expr::preserves_source(text) {
+        return;
+    }
+    let hint = match eval(text, vars) {
+        Ok(value) => egui::RichText::new(format!("= {value:.2} {suffix}"))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(70, 120, 70)),
+        Err(_) => egui::RichText::new("unresolved")
+            .size(11.0)
+            .color(egui::Color32::from_rgb(180, 70, 70)),
+    };
+    ui.label(hint);
+}
+
 // ===========================================================================
 // Autocomplete text field
 // ===========================================================================

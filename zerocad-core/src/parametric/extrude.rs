@@ -25,7 +25,11 @@ pub(crate) fn stamp_sketch_extrude_edge_refs(
     let edge_sort_key = |p0: [f32; 3], p1: [f32; 3]| {
         let a = (quant(p0[0]), quant(p0[1]), quant(p0[2]));
         let b = (quant(p1[0]), quant(p1[1]), quant(p1[2]));
-        if a <= b { (a, b) } else { (b, a) }
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
     };
     let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
     let mut base_ids: Vec<String> = Vec::with_capacity(mesh.edge_refs.len());
@@ -123,9 +127,17 @@ pub(crate) fn stamp_box_face_refs(mesh: &mut MockMesh, body_id: &str) {
         let n = face_ref.normal;
         let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
         let role = if ax >= ay && ax >= az {
-            if n[0] >= 0.0 { "+x" } else { "-x" }
+            if n[0] >= 0.0 {
+                "+x"
+            } else {
+                "-x"
+            }
         } else if ay >= az {
-            if n[1] >= 0.0 { "+y" } else { "-y" }
+            if n[1] >= 0.0 {
+                "+y"
+            } else {
+                "-y"
+            }
         } else if n[2] >= 0.0 {
             "+z"
         } else {
@@ -426,38 +438,70 @@ pub(crate) fn provenance_fragment_stable_id(
 /// holds the analytic mesh while the body is untouched by any boolean, so plain
 /// bodies keep their nice hidden-line wireframes. A boolean clears it, forcing a
 /// fresh tessellation from `parts`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LiveBody {
     pub(crate) id: String,
     pub(crate) parts: Vec<KernelSolid>,
-    pub(crate) pristine: Option<MockMesh>,
+    pub(crate) pristine: Option<std::sync::Arc<MockMesh>>,
     pub(crate) sketch_source: Option<SketchExtrudeSource>,
     pub(crate) cut_tools: Vec<CutTool>,
     pub(crate) cut_replay: Option<CutReplayHistory>,
     pub(crate) edge_mod_cut_history_path_used: bool,
+    /// Set once a Thread feature has replaced this body's cylindrical wall with
+    /// analytic helical bands. A boolean against those bands is neither robust
+    /// nor fast, so a later Join/Cut instead runs against the smooth pre-thread
+    /// solid held here, then replays the thread steps — the shaft stays
+    /// threaded, the added/removed volume stays smooth. See [`ThreadReplay`].
+    pub(crate) thread_replay: Option<ThreadReplay>,
 }
 
-#[derive(Debug, Clone)]
+/// Lets a threaded body absorb later Join/Cut booleans robustly. `base_parts`
+/// is the smooth solid *before* any thread wall replacement (with the chamfer /
+/// fillet rims kept); it is the surface booleans run against. `steps` are the
+/// thread applications, replayed in order after each boolean to rebuild the
+/// displayed threaded geometry from the updated smooth base.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ThreadReplay {
+    pub(crate) base_parts: Vec<KernelSolid>,
+    pub(crate) steps: Vec<ThreadReplayStep>,
+}
+
+/// One thread application, holding everything [`super::eval`]'s thread core
+/// needs to re-run against a freshly-booleaned smooth base.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ThreadReplayStep {
+    pub(crate) face: FaceRef,
+    pub(crate) internal: bool,
+    pub(crate) pitch: f32,
+    pub(crate) depth: f32,
+    pub(crate) angle_deg: f32,
+    pub(crate) right_handed: bool,
+    pub(crate) starts: u32,
+    pub(crate) length: Option<f32>,
+    pub(crate) flip: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CutReplayHistory {
     pub(crate) base_body_id: String,
     pub(crate) base_parts: Vec<KernelSolid>,
-    pub(crate) base_pristine: Option<MockMesh>,
+    pub(crate) base_pristine: Option<std::sync::Arc<MockMesh>>,
     pub(crate) base_sketch_source: Option<SketchExtrudeSource>,
     pub(crate) steps: Vec<CutReplayStep>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CutReplayStep {
     pub(crate) node_id: String,
     pub(crate) tool: CutTool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SketchExtrudeSource {
     pub(crate) regions: Vec<SketchExtrudeRegionSource>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SketchExtrudeRegionSource {
     pub(crate) boundary: Vec<(f32, f32)>,
     pub(crate) holes: Vec<Vec<(f32, f32)>>,
@@ -466,7 +510,7 @@ pub(crate) struct SketchExtrudeRegionSource {
     pub(crate) rect_circle: Option<RectCircleCanonicalSource>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RectCircleCanonicalSource {
     pub(crate) base: KernelSolid,
     pub(crate) cutter: KernelSolid,
@@ -828,6 +872,38 @@ pub(crate) fn region_material_point(region: &Region) -> (f32, f32) {
     p
 }
 
+/// Drawn circles whose every atomic arrangement region is selected for the
+/// current extrusion. Open/projected lines can split one circle into multiple
+/// regions; callers use this to rebuild the original analytic cylinder instead
+/// of previewing/evaluating touching semicylinders with construction seams.
+pub fn complete_selected_circles(
+    circles: &[crate::sketch::Circle],
+    regions: &[Region],
+    process: &[bool],
+) -> Vec<(crate::sketch::Circle, Vec<usize>)> {
+    circles
+        .iter()
+        .filter_map(|circle| {
+            let r2 = circle.radius * circle.radius;
+            let inside: Vec<usize> = regions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, region)| {
+                    let p = region_material_point(region);
+                    let dx = p.0 - circle.center.0;
+                    let dy = p.1 - circle.center.1;
+                    (dx * dx + dy * dy < r2 * 1.0001).then_some(i)
+                })
+                .collect();
+            (inside.len() >= 2
+                && inside
+                    .iter()
+                    .all(|&i| process.get(i).copied().unwrap_or(false)))
+            .then_some((*circle, inside))
+        })
+        .collect()
+}
+
 /// Every shape loop whose boundary contains `interior` (all shapes the region
 /// belongs to; >1 for an overlap region / lens).
 pub(crate) fn region_containing_shapes(interior: (f32, f32), loops: &[ShapeLoop]) -> Vec<usize> {
@@ -883,6 +959,89 @@ pub(crate) fn selected_shape_mask(
         }
     }
     mask
+}
+
+/// Which regions of a sketch to build as material, resolving overlapping-shapes-
+/// as-boolean the same way the extrude evaluator does. Shared so the live
+/// extrude ghost keeps exactly the regions a commit would, instead of drawing
+/// the tool-lens regions a boolean drops (e.g. the inner disc of a circle drawn
+/// inside a rectangle, which must read as a hole).
+///
+/// Returns one entry per region: `process` (build it) and `is_boolean` (it
+/// belongs to a multi-shape overlap cluster, so the shape selection — not the
+/// raw `region_indices` — decides whether it is kept). Mirrors the per-region
+/// classification in `apply_extrude`.
+pub struct BooleanRegionPlan {
+    pub process: Vec<bool>,
+    pub is_boolean: Vec<bool>,
+}
+
+/// Resolve which regions to build (see [`BooleanRegionPlan`]). `loops` are the
+/// sketch's shape outlines ([`crate::sketch::shape_loops`]); an empty `loops`
+/// (legacy sketch / sketch corner-mods) leaves every region on the normal
+/// `take_all || region_indices.contains(i)` selection path.
+pub fn boolean_region_plan(
+    loops: &[ShapeLoop],
+    regions: &[Region],
+    region_indices: &[usize],
+) -> BooleanRegionPlan {
+    let take_all = region_indices.is_empty();
+    // A single viewport click selects one detected face, not its originating
+    // sketch primitive. Overlap detection can split one rectangle/circle into
+    // several faces; expanding that one pick back to the whole source shape
+    // silently extruded unselected faces. Multi-face and whole-sketch requests
+    // retain the shape-level boolean behavior below.
+    if region_indices.len() == 1 {
+        let selected = region_indices[0];
+        return BooleanRegionPlan {
+            process: (0..regions.len()).map(|i| i == selected).collect(),
+            is_boolean: vec![false; regions.len()],
+        };
+    }
+    let clusters = if loops.is_empty() {
+        Vec::new()
+    } else {
+        crate::sketch::overlap_clusters(loops)
+    };
+    let mut shape_cluster = vec![usize::MAX; loops.len()];
+    for (ci, c) in clusters.iter().enumerate() {
+        for &s in c {
+            shape_cluster[s] = ci;
+        }
+    }
+    let cluster_is_multi: Vec<bool> = clusters.iter().map(|c| c.len() >= 2).collect();
+    let selected_mask = selected_shape_mask(regions, region_indices, loops);
+    let mut is_boolean = vec![false; regions.len()];
+    let mut process = vec![false; regions.len()];
+    for (i, r) in regions.iter().enumerate() {
+        let interior = region_material_point(r);
+        let containing = region_containing_shapes(interior, loops);
+        let in_multi = containing
+            .iter()
+            .any(|&s| cluster_is_multi[shape_cluster[s]]);
+        if in_multi {
+            let in_base = containing.iter().any(|&s| selected_mask[s]);
+            let in_tool = containing.iter().any(|&s| !selected_mask[s]);
+            is_boolean[i] = true;
+            // Explicit region selection wins over the base∩tool "drop the lens"
+            // rule. Picking a region that lies inside another shape — the inner
+            // rectangle of a nested pair, or an overlap lens — means the user
+            // wants THAT material, so build it. The tool-lens drop
+            // (`in_base && !in_tool`) still governs regions the user did NOT
+            // single out, which is what keeps "extrude the whole sketch" of a
+            // circle-in-rectangle yielding a rect-with-hole rather than a filled
+            // slab. `take_all` (whole-sketch) has no explicit picks, so it is
+            // unaffected.
+            let explicitly_selected = !take_all && region_indices.contains(&i);
+            process[i] = explicitly_selected || (in_base && !in_tool);
+        } else {
+            process[i] = take_all || region_indices.contains(&i);
+        }
+    }
+    BooleanRegionPlan {
+        process,
+        is_boolean,
+    }
 }
 
 /// Fuse a body's parts so that adjacent/overlapping kept regions of a boolean

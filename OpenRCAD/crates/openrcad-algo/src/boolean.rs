@@ -1,5 +1,6 @@
 use crate::BooleanOp;
 use core::f64::consts::TAU;
+use openrcad_foundation::{CancellationProbe, NeverCancelled};
 use openrcad_foundation::{Dir, Pnt, Trsf, Vec as GeomVec};
 use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Surface};
 use openrcad_topo::arena::EdgeId;
@@ -58,6 +59,8 @@ pub enum BooleanInput {
 /// Structured boolean failure for applications that need recoverable modeling.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BooleanError {
+    /// The caller superseded this operation. No partial result is returned.
+    Cancelled,
     /// One of the input solids is structurally invalid or not watertight.
     InvalidInput {
         /// The invalid operand.
@@ -92,6 +95,7 @@ pub enum BooleanError {
 impl core::fmt::Display for BooleanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Cancelled => write!(f, "boolean operation cancelled"),
             Self::InvalidInput { input, report } => {
                 write!(f, "invalid boolean {input:?} input: {report:?}")
             }
@@ -123,6 +127,31 @@ pub fn boolean_checked(object: &Solid, tool: &Solid, op: BooleanOp) -> Result<So
 
     let result = catch_unwind(AssertUnwindSafe(|| boolean(object, tool, op)))
         .map_err(|_| BooleanError::Panicked)?;
+    validate_output(result)
+}
+
+/// Cancellable checked boolean. Existing callers can continue to use
+/// [`boolean_checked`]; interactive schedulers should use this entry point.
+pub fn boolean_checked_with_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    cancel: &dyn CancellationProbe,
+) -> Result<Solid, BooleanError> {
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
+    validate_operand(BooleanInput::Object, object)?;
+    validate_operand(BooleanInput::Tool, tool)?;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(object, tool, op, None, None, false, cancel)
+    }))
+    .map_err(|_| BooleanError::Panicked)?
+    .map_err(|_| BooleanError::Cancelled)?
+    .0;
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
     validate_output(result)
 }
 
@@ -167,7 +196,9 @@ pub fn boolean_checked_bodies(
 
 /// Apply `op` between `object` and `tool`.
 pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
-    boolean_impl(object, tool, op, None, None, false).0
+    boolean_impl(object, tool, op, None, None, false, &NeverCancelled)
+        .expect("NeverCancelled cannot cancel")
+        .0
 }
 
 /// [`boolean`] plus the exact face correspondence ([`BooleanFaceHistory`]).
@@ -184,7 +215,16 @@ pub fn boolean_with_history(
     obj_classes: Option<&[Option<u64>]>,
     tool_classes: Option<&[Option<u64>]>,
 ) -> (Solid, BooleanFaceHistory) {
-    let (solid, history) = boolean_impl(object, tool, op, obj_classes, tool_classes, true);
+    let (solid, history) = boolean_impl(
+        object,
+        tool,
+        op,
+        obj_classes,
+        tool_classes,
+        true,
+        &NeverCancelled,
+    )
+    .expect("NeverCancelled cannot cancel");
     (solid, history.unwrap_or_default())
 }
 
@@ -208,6 +248,28 @@ pub fn boolean_checked_with_history(
     Ok((result, history))
 }
 
+pub fn boolean_checked_with_history_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    cancel: &dyn CancellationProbe,
+) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
+    validate_operand(BooleanInput::Object, object)?;
+    validate_operand(BooleanInput::Tool, tool)?;
+    let (result, history) = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(object, tool, op, obj_classes, tool_classes, true, cancel)
+    }))
+    .map_err(|_| BooleanError::Panicked)?
+    .map_err(|_| BooleanError::Cancelled)?;
+    let result = validate_output(result)?;
+    Ok((result, history.unwrap_or_default()))
+}
+
 fn boolean_impl(
     object: &Solid,
     tool: &Solid,
@@ -215,7 +277,9 @@ fn boolean_impl(
     obj_classes: Option<&[Option<u64>]>,
     tool_classes: Option<&[Option<u64>]>,
     want_history: bool,
-) -> (Solid, Option<BooleanFaceHistory>) {
+    cancel: &dyn CancellationProbe,
+) -> Result<(Solid, Option<BooleanFaceHistory>), openrcad_foundation::Cancelled> {
+    cancel.check_cancelled()?;
     let tol = 1e-5;
 
     // 0. Fuzzy pre-snap: nudge the tool so a near-coincident, overlapping planar
@@ -240,6 +304,7 @@ fn boolean_impl(
 
     // A. Split all boundary edges at mutual intersection points
     for &(f_obj_id, f_tool_id) in &pairs {
+        cancel.check_cancelled()?;
         let f_obj = Face::from_id(
             object.brep().clone(),
             f_obj_id,
@@ -305,6 +370,7 @@ fn boolean_impl(
     > = std::collections::HashMap::new();
 
     for &(f_obj_id, f_tool_id) in &pairs {
+        cancel.check_cancelled()?;
         let f_obj = Face::from_id(
             object.brep().clone(),
             f_obj_id,
@@ -469,11 +535,13 @@ fn boolean_impl(
     // deterministic original face lists pins the order so the boolean is
     // reproducible, which is what stable downstream edge/face identity needs.
     for f in &faces_obj {
+        cancel.check_cancelled()?;
         if let Some(sub) = obj_sub.get_mut(&f.id()) {
             run_partition(&mut builder_obj, sub, &mut splitting_edges_obj);
         }
     }
     for f in &faces_tool {
+        cancel.check_cancelled()?;
         if let Some(sub) = tool_sub.get_mut(&f.id()) {
             run_partition(&mut builder_tool, sub, &mut splitting_edges_tool);
         }
@@ -528,6 +596,7 @@ fn boolean_impl(
     let bvh_split_tool = Bvh::build(&split_faces_tool);
 
     for (f_id, f_data) in &brep_obj.faces {
+        cancel.check_cancelled()?;
         let face = Face::from_id(brep_obj.clone(), f_id, f_data.orientation);
         let pos = point_on_face(&face);
 
@@ -543,10 +612,20 @@ fn boolean_impl(
                         crate::intersect::search_nearest_parameter(s_tool, &pos, (0.0, 0.0));
                     if crate::intersect::is_inside_trimming_loops(u, v, &face_t) {
                         let n_obj = match s_obj {
+                            GeomSurface::Plane(p)
+                                if f_data.orientation == openrcad_topo::Orientation::Reversed =>
+                            {
+                                p.normal().reversed()
+                            }
                             GeomSurface::Plane(p) => p.normal(),
                             _ => openrcad_foundation::Dir::dz(),
                         };
                         let n_tool = match s_tool {
+                            GeomSurface::Plane(p)
+                                if ft_data.orientation == openrcad_topo::Orientation::Reversed =>
+                            {
+                                p.normal().reversed()
+                            }
                             GeomSurface::Plane(p) => p.normal(),
                             _ => openrcad_foundation::Dir::dz(),
                         };
@@ -564,7 +643,12 @@ fn boolean_impl(
         if coplanar_same {
             match op {
                 BooleanOp::Fuse | BooleanOp::Common => {
-                    kept_sources.push(origin_obj.get(&f_id).copied().map(BooleanFaceSource::Object));
+                    kept_sources.push(
+                        origin_obj
+                            .get(&f_id)
+                            .copied()
+                            .map(BooleanFaceSource::Object),
+                    );
                     kept_faces.push(face);
                 }
                 BooleanOp::Cut => {}
@@ -579,13 +663,19 @@ fn boolean_impl(
                 BooleanOp::Common => inside,
             };
             if keep {
-                kept_sources.push(origin_obj.get(&f_id).copied().map(BooleanFaceSource::Object));
+                kept_sources.push(
+                    origin_obj
+                        .get(&f_id)
+                        .copied()
+                        .map(BooleanFaceSource::Object),
+                );
                 kept_faces.push(face);
             }
         }
     }
 
     for (f_id, f_data) in &brep_tool.faces {
+        cancel.check_cancelled()?;
         let face = Face::from_id(brep_tool.clone(), f_id, f_data.orientation);
         let pos = point_on_face(&face);
 
@@ -628,6 +718,7 @@ fn boolean_impl(
     }
 
     // 4. Sew kept faces together
+    cancel.check_cancelled()?;
     let shell = sew(&kept_faces, tol);
     let solid = Solid::new(shell);
 
@@ -682,7 +773,8 @@ fn boolean_impl(
     let history = want_history
         .then(|| resolve_face_origins(&solid, &kept_faces, &kept_sources, tol))
         .map(|face_source| BooleanFaceHistory { face_source });
-    (solid, history)
+    cancel.check_cancelled()?;
+    Ok((solid, history))
 }
 
 /// For each face of `solid` (in shell order), the kept split face it descends
@@ -1476,6 +1568,18 @@ mod tests {
     use openrcad_foundation::Pnt;
     use openrcad_primitives::make_box;
     use openrcad_topo::Shell;
+
+    #[test]
+    fn cancelled_checked_boolean_returns_no_partial_solid() {
+        let object = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let token = openrcad_foundation::CancellationToken::new();
+        token.cancel();
+        assert_eq!(
+            boolean_checked_with_cancel(&object, &tool, BooleanOp::Fuse, &token),
+            Err(BooleanError::Cancelled)
+        );
+    }
 
     /// Shell position of the input/result face whose plane has |normal·axis|≈1
     /// and passes through `coord` on `axis`.

@@ -41,8 +41,14 @@ fn cylinder_rim_fillet_via_circle_hint_makes_a_torus() {
     let hint = top_rim_hint(4.0, 10.0);
     // p0/p1 are ignored when a Circle hint is present (the chain is resolved from
     // the hint), so any rim points suffice.
-    let out = fillet_edge_with_hint(&solid, [4.0, 10.0, 0.0], [-4.0, 10.0, 0.0], Some(&hint), 1.0)
-        .expect("cylinder rim fillet via hint should succeed");
+    let out = fillet_edge_with_hint(
+        &solid,
+        [4.0, 10.0, 0.0],
+        [-4.0, 10.0, 0.0],
+        Some(&hint),
+        1.0,
+    )
+    .expect("cylinder rim fillet via hint should succeed");
     assert!(out.is_watertight(), "filleted rim must be watertight");
     let tori = count_surface(&out, |s| matches!(s, GeomSurface::Torus(_)));
     assert!(tori >= 3, "rim fillet must add a torus band, got {tori}");
@@ -52,8 +58,14 @@ fn cylinder_rim_fillet_via_circle_hint_makes_a_torus() {
 fn cylinder_rim_chamfer_via_circle_hint_makes_a_cone() {
     let solid = cylinder_solid(4.0, 10.0).expect("cylinder primitive");
     let hint = top_rim_hint(4.0, 10.0);
-    let out = chamfer_edge_with_hint(&solid, [4.0, 10.0, 0.0], [-4.0, 10.0, 0.0], Some(&hint), 1.0)
-        .expect("cylinder rim chamfer via hint should succeed");
+    let out = chamfer_edge_with_hint(
+        &solid,
+        [4.0, 10.0, 0.0],
+        [-4.0, 10.0, 0.0],
+        Some(&hint),
+        1.0,
+    )
+    .expect("cylinder rim chamfer via hint should succeed");
     assert!(out.is_watertight(), "chamfered rim must be watertight");
     let cones = count_surface(&out, |s| matches!(s, GeomSurface::Cone(_)));
     assert!(cones >= 3, "rim chamfer must add a cone band, got {cones}");
@@ -68,8 +80,14 @@ fn slightly_off_fitted_radius_still_matches_the_rim() {
     if let EdgeCurveHint::Circle { radius, .. } = &mut hint {
         *radius = 4.0 * 1.005; // 0.5% high
     }
-    let out = fillet_edge_with_hint(&solid, [4.0, 10.0, 0.0], [-4.0, 10.0, 0.0], Some(&hint), 1.0)
-        .expect("a slightly-off fitted radius should still match the rim");
+    let out = fillet_edge_with_hint(
+        &solid,
+        [4.0, 10.0, 0.0],
+        [-4.0, 10.0, 0.0],
+        Some(&hint),
+        1.0,
+    )
+    .expect("a slightly-off fitted radius should still match the rim");
     assert!(out.is_watertight());
 }
 
@@ -248,8 +266,14 @@ fn bite_rim_hint() -> EdgeCurveHint {
 fn bite_arc_fillet_via_open_circle_hint_makes_a_torus() {
     let solid = bitten_box();
     let hint = bite_rim_hint();
-    let out = fillet_edge_with_hint(&solid, [6.33, 5.0, 10.0], [33.67, 5.0, 10.0], Some(&hint), 1.5)
-        .expect("bite arc fillet via open hint should succeed");
+    let out = fillet_edge_with_hint(
+        &solid,
+        [6.33, 5.0, 10.0],
+        [33.67, 5.0, 10.0],
+        Some(&hint),
+        1.5,
+    )
+    .expect("bite arc fillet via open hint should succeed");
     assert!(out.is_watertight(), "bite arc fillet must be watertight");
     let tori = count_surface(&out, |s| matches!(s, GeomSurface::Torus(_)));
     assert!(tori >= 1, "bite fillet must add a torus band, got {tori}");
@@ -259,9 +283,14 @@ fn bite_arc_fillet_via_open_circle_hint_makes_a_torus() {
 fn bite_arc_chamfer_via_open_circle_hint_makes_a_cone() {
     let solid = bitten_box();
     let hint = bite_rim_hint();
-    let out =
-        chamfer_edge_with_hint(&solid, [6.33, 5.0, 10.0], [33.67, 5.0, 10.0], Some(&hint), 1.5)
-            .expect("bite arc chamfer via open hint should succeed");
+    let out = chamfer_edge_with_hint(
+        &solid,
+        [6.33, 5.0, 10.0],
+        [33.67, 5.0, 10.0],
+        Some(&hint),
+        1.5,
+    )
+    .expect("bite arc chamfer via open hint should succeed");
     assert!(out.is_watertight(), "bite arc chamfer must be watertight");
     let cones = count_surface(&out, |s| matches!(s, GeomSurface::Cone(_)));
     assert!(cones >= 1, "bite chamfer must add a cone band, got {cones}");
@@ -325,8 +354,14 @@ fn interior_seam_segments(
 fn rim_fillet_band_reads_as_one_face_with_no_sector_seams() {
     let solid = cylinder_solid(4.0, 10.0).expect("cylinder primitive");
     let hint = top_rim_hint(4.0, 10.0);
-    let out = fillet_edge_with_hint(&solid, [4.0, 10.0, 0.0], [-4.0, 10.0, 0.0], Some(&hint), 1.0)
-        .expect("cylinder rim fillet via hint should succeed");
+    let out = fillet_edge_with_hint(
+        &solid,
+        [4.0, 10.0, 0.0],
+        [-4.0, 10.0, 0.0],
+        Some(&hint),
+        1.0,
+    )
+    .expect("cylinder rim fillet via hint should succeed");
     assert!(
         count_surface(&out, |s| matches!(s, GeomSurface::Torus(_))) >= 2,
         "the premise of this test is a band split into several torus sectors"
@@ -355,7 +390,10 @@ fn rim_fillet_band_reads_as_one_face_with_no_sector_seams() {
     let seams = interior_seam_segments(&mesh, &|x, y, z| {
         on_torus(x, y, z, 0.02) && y > 9.1 && y < 9.9
     });
-    assert_eq!(seams, 0, "no radial sector seam may be drawn across the band");
+    assert_eq!(
+        seams, 0,
+        "no radial sector seam may be drawn across the band"
+    );
 }
 
 /// The chamfer analogue: the cone band must read as one face with no seams.
@@ -363,8 +401,14 @@ fn rim_fillet_band_reads_as_one_face_with_no_sector_seams() {
 fn rim_chamfer_band_reads_as_one_face_with_no_sector_seams() {
     let solid = cylinder_solid(4.0, 10.0).expect("cylinder primitive");
     let hint = top_rim_hint(4.0, 10.0);
-    let out = chamfer_edge_with_hint(&solid, [4.0, 10.0, 0.0], [-4.0, 10.0, 0.0], Some(&hint), 1.0)
-        .expect("cylinder rim chamfer via hint should succeed");
+    let out = chamfer_edge_with_hint(
+        &solid,
+        [4.0, 10.0, 0.0],
+        [-4.0, 10.0, 0.0],
+        Some(&hint),
+        1.0,
+    )
+    .expect("cylinder rim chamfer via hint should succeed");
     assert!(
         count_surface(&out, |s| matches!(s, GeomSurface::Cone(_))) >= 2,
         "the premise of this test is a band split into several cone sectors"
@@ -385,7 +429,10 @@ fn rim_chamfer_band_reads_as_one_face_with_no_sector_seams() {
     let seams = interior_seam_segments(&mesh, &|x, y, z| {
         on_cone(x, y, z, 0.02) && y > 9.1 && y < 9.9
     });
-    assert_eq!(seams, 0, "no radial sector seam may be drawn across the band");
+    assert_eq!(
+        seams, 0,
+        "no radial sector seam may be drawn across the band"
+    );
 }
 
 /// The open bite-arc band (GUI round-3 picture 2): the boolean splits the rim
@@ -396,8 +443,14 @@ fn rim_chamfer_band_reads_as_one_face_with_no_sector_seams() {
 fn bite_fillet_band_reads_as_one_face_with_no_mid_arc_seam() {
     let solid = bitten_box();
     let hint = bite_rim_hint();
-    let out = fillet_edge_with_hint(&solid, [6.33, 5.0, 10.0], [33.67, 5.0, 10.0], Some(&hint), 1.5)
-        .expect("bite arc fillet via open hint should succeed");
+    let out = fillet_edge_with_hint(
+        &solid,
+        [6.33, 5.0, 10.0],
+        [33.67, 5.0, 10.0],
+        Some(&hint),
+        1.5,
+    )
+    .expect("bite arc fillet via open hint should succeed");
     let mesh = zerocad_core::MockMesh::from_solid(&out);
     // Concave fillet torus: axis +Z through (20, 8), tube circle radius 15.5 at
     // z = 8.5, tube radius 1.5.
@@ -422,7 +475,10 @@ fn bite_fillet_band_reads_as_one_face_with_no_mid_arc_seam() {
         // flush end sections against the y = 5 cap.
         on_torus(x, y, z, 0.02) && z > 8.65 && z < 9.85 && y > 5.5
     });
-    assert_eq!(seams, 0, "no seam may be drawn across the bite band interior");
+    assert_eq!(
+        seams, 0,
+        "no seam may be drawn across the bite band interior"
+    );
 }
 
 /// End-to-end through the parametric graph: a sketch-extruded box with a
@@ -455,6 +511,7 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -560,6 +617,7 @@ fn sketch_extrude_edge_mod(
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -792,6 +850,7 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -861,8 +920,14 @@ fn oversized_rim_fillet_via_hint_fails_safely() {
     let hint = top_rim_hint(4.0, 10.0);
     // Radius exceeds the cap radius → the analytic contact ring is invalid.
     assert!(
-        fillet_edge_with_hint(&solid, [4.0, 10.0, 0.0], [-4.0, 10.0, 0.0], Some(&hint), 6.0)
-            .is_err(),
+        fillet_edge_with_hint(
+            &solid,
+            [4.0, 10.0, 0.0],
+            [-4.0, 10.0, 0.0],
+            Some(&hint),
+            6.0
+        )
+        .is_err(),
         "an oversized rim fillet must fail rather than emit broken geometry"
     );
 }

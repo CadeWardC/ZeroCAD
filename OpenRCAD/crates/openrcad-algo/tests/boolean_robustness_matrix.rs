@@ -127,7 +127,10 @@ fn cylinder_walls_stay_on_surface(s: &Solid, cx: f64, cy: f64, r: f64) -> bool {
 fn cyl_cut_through_drill() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
-    let s = assert_sound("through-drill", boolean_checked(&block, &drill, BooleanOp::Cut));
+    let s = assert_sound(
+        "through-drill",
+        boolean_checked(&block, &drill, BooleanOp::Cut),
+    );
     assert!(
         analytic_cylinder_count(&s, 3.0, Dir::dz()) > 0,
         "through-drill must keep an analytic cylindrical bore wall"
@@ -139,7 +142,10 @@ fn cyl_cut_through_drill() {
 fn cyl_cut_blind_pocket() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let blind = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 5.0), Dir::dz()), 3.0, 8.0);
-    let s = assert_sound("blind-pocket", boolean_checked(&block, &blind, BooleanOp::Cut));
+    let s = assert_sound(
+        "blind-pocket",
+        boolean_checked(&block, &blind, BooleanOp::Cut),
+    );
     assert!(
         analytic_cylinder_count(&s, 3.0, Dir::dz()) > 0,
         "blind pocket must keep an analytic cylindrical wall"
@@ -151,7 +157,10 @@ fn cyl_cut_straddling_bite() {
     // Circle straddles the bottom edge of the block (the "vanishing bite").
     let block = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
     let cutter = make_cylinder(&Ax2::new(Pnt::new(20.0, 8.0, -1.0), Dir::dz()), 14.0, 12.0);
-    let s = assert_sound("straddling-bite", boolean_checked(&block, &cutter, BooleanOp::Cut));
+    let s = assert_sound(
+        "straddling-bite",
+        boolean_checked(&block, &cutter, BooleanOp::Cut),
+    );
     assert!(
         cylinder_walls_stay_on_surface(&s, 20.0, 8.0, 14.0),
         "straddling bite must keep an analytic radius-14 wall, not become a box"
@@ -167,7 +176,10 @@ fn cyl_cut_oblique_axis() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 20.0);
     let axis = Dir::from_vec(&openrcad_foundation::Vec::new(0.0, 1.0, 0.25)).unwrap();
     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, -2.0, 8.0), axis), 3.0, 30.0);
-    assert_sound("oblique-axis cut", boolean_checked(&block, &drill, BooleanOp::Cut));
+    assert_sound(
+        "oblique-axis cut",
+        boolean_checked(&block, &drill, BooleanOp::Cut),
+    );
 }
 
 #[test]
@@ -175,7 +187,10 @@ fn cyl_cut_oblique_axis_corner_exit() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 20.0);
     let axis = Dir::from_vec(&openrcad_foundation::Vec::new(0.0, 1.0, 1.0)).unwrap();
     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, -2.0, 8.0), axis), 3.0, 30.0);
-    assert_sound("oblique corner-exit cut", boolean_checked(&block, &drill, BooleanOp::Cut));
+    assert_sound(
+        "oblique corner-exit cut",
+        boolean_checked(&block, &drill, BooleanOp::Cut),
+    );
 }
 
 // ===========================================================================
@@ -186,7 +201,10 @@ fn cyl_cut_oblique_axis_corner_exit() {
 fn cyl_join_coplanar_boss() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let boss = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 10.0), Dir::dz()), 3.0, 8.0);
-    let s = assert_sound("coplanar boss", boolean_checked(&block, &boss, BooleanOp::Fuse));
+    let s = assert_sound(
+        "coplanar boss",
+        boolean_checked(&block, &boss, BooleanOp::Fuse),
+    );
     assert!(
         analytic_cylinder_count(&s, 3.0, Dir::dz()) > 0,
         "boss must keep an analytic cylindrical wall"
@@ -198,7 +216,10 @@ fn cyl_join_boss_straddling_edge() {
     // Boss rim overhangs the host's top edge (partially off the face).
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let boss = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 10.0), Dir::dz()), 4.0, 8.0);
-    assert_sound("boss straddling edge", boolean_checked(&block, &boss, BooleanOp::Fuse));
+    assert_sound(
+        "boss straddling edge",
+        boolean_checked(&block, &boss, BooleanOp::Fuse),
+    );
 }
 
 // ===========================================================================
@@ -211,7 +232,10 @@ fn coaxial_concentric_boss_union() {
     let lower = make_cylinder(&Ax2::new(Pnt::new(0.0, 0.0, 0.0), Dir::dz()), 6.0, 5.0);
     let upper = make_cylinder(&Ax2::new(Pnt::new(0.0, 0.0, 5.0), Dir::dz()), 6.0, 5.0);
     // Same radius, stacked end-to-end, coaxial: should fuse into one taller cylinder.
-    assert_sound("coaxial equal-radius stack", boolean_checked(&lower, &upper, BooleanOp::Fuse));
+    assert_sound(
+        "coaxial equal-radius stack",
+        boolean_checked(&lower, &upper, BooleanOp::Fuse),
+    );
 }
 
 #[test]
@@ -222,10 +246,13 @@ fn coaxial_recut_existing_hole() {
     // removed cleanly instead of leaving the r2 wire orphaned on the cap.
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let small = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 2.0, 12.0);
-    let drilled = boolean_checked(&block, &small, BooleanOp::Cut)
-        .expect("initial drill should succeed");
+    let drilled =
+        boolean_checked(&block, &small, BooleanOp::Cut).expect("initial drill should succeed");
     let big = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 4.0, 12.0);
-    assert_sound("re-cut coaxial hole", boolean_checked(&drilled, &big, BooleanOp::Cut));
+    assert_sound(
+        "re-cut coaxial hole",
+        boolean_checked(&drilled, &big, BooleanOp::Cut),
+    );
 }
 
 #[test]
@@ -268,7 +295,11 @@ fn coplanar_two_box_flush_union() {
     let a = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
     let b = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
     let s = assert_sound("flush box union", boolean_checked(&a, &b, BooleanOp::Fuse));
-    assert_eq!(s.face_count(), 6, "flush union must merge to a clean 6-face box");
+    assert_eq!(
+        s.face_count(),
+        6,
+        "flush union must merge to a clean 6-face box"
+    );
 }
 
 #[test]
@@ -276,7 +307,10 @@ fn coplanar_flush_through_cut() {
     // Tool spans the full Y/Z and removes a middle X-slab (severing the bar).
     let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);
     let knife = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
-    assert_sound("flush through-cut", boolean_checked(&bar, &knife, BooleanOp::Cut));
+    assert_sound(
+        "flush through-cut",
+        boolean_checked(&bar, &knife, BooleanOp::Cut),
+    );
 }
 
 #[test]
@@ -288,5 +322,8 @@ fn near_coincident_cut_snaps_clean() {
     let cap_y = back - 1e-7;
     let axis = Ax2::new_axes(Pnt::new(7.5, cap_y - 23.0, 5.0), Dir::dy(), Dir::dx());
     let cyl = make_cylinder(&axis, 7.81, 23.0);
-    assert_sound("near-coincident snap cut", boolean_checked(&cube, &cyl, BooleanOp::Cut));
+    assert_sound(
+        "near-coincident snap cut",
+        boolean_checked(&cube, &cyl, BooleanOp::Cut),
+    );
 }

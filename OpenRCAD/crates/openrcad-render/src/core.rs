@@ -118,6 +118,12 @@ pub struct LayerStyle {
     /// for `set_face_states` (e.g. a preview result set shown while the base
     /// scene — the texture's usual owner — is hidden).
     pub face_tint: bool,
+    /// Skip the depth test so the layer shows through opaque geometry (an
+    /// x-ray overlay). Used for previews of surfaces that lie *inside* the
+    /// body, e.g. the fillet/chamfer band left after material is removed —
+    /// depth-tested it would be entirely occluded. Only meaningful for
+    /// translucent layers (`alpha < 1`); opaque layers ignore it.
+    pub xray: bool,
 }
 
 impl LayerStyle {
@@ -281,8 +287,33 @@ pub struct PickTarget {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
-    /// Small MAP_READ staging buffer for the one-pixel readback.
-    readback: wgpu::Buffer,
+    /// Three staging buffers keep hover picking asynchronous. While one buffer
+    /// is waiting for the GPU, newer pointer samples can use another slot.
+    readbacks: Vec<PickReadbackSlot>,
+    /// Reserved for the uncommon uncached click fallback.
+    blocking_readback: wgpu::Buffer,
+}
+
+struct PickReadbackSlot {
+    buffer: wgpu::Buffer,
+    pending: Option<PendingPickReadback>,
+}
+
+struct PendingPickReadback {
+    request_id: u64,
+    x: u32,
+    y: u32,
+    ready: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// One completed asynchronous face-id sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncPickResult {
+    pub request_id: u64,
+    pub x: u32,
+    pub y: u32,
+    /// `None` is the background or a failed readback.
+    pub face_id: Option<u32>,
 }
 
 impl PickTarget {
@@ -317,8 +348,19 @@ impl PickTarget {
             view_formats: &[],
         });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("openrcad-render pick readback"),
+        let readbacks = (0..3)
+            .map(|_| PickReadbackSlot {
+                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("openrcad-render async pick readback"),
+                    size: 256,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                pending: None,
+            })
+            .collect();
+        let blocking_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openrcad-render blocking click readback"),
             size: 256,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -329,7 +371,8 @@ impl PickTarget {
             tex,
             view,
             depth_view,
-            readback,
+            readbacks,
+            blocking_readback,
         }
     }
 
@@ -350,6 +393,10 @@ pub struct RenderCore {
     pipeline_blend: wgpu::RenderPipeline,
     /// Alpha-blended fill with back faces culled.
     pipeline_blend_cull: wgpu::RenderPipeline,
+    /// Alpha-blended fill that skips the depth test (x-ray overlays).
+    pipeline_blend_xray: wgpu::RenderPipeline,
+    /// X-ray fill with back faces culled.
+    pipeline_blend_xray_cull: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
     /// Face ids → R32Uint at one sample, for exact cursor picking/hover.
     pick_pipeline: wgpu::RenderPipeline,
@@ -448,7 +495,7 @@ impl RenderCore {
         // factors produce premultiplied output over a possibly-transparent
         // background: color (SrcAlpha, OneMinusSrcAlpha), alpha (One,
         // OneMinusSrcAlpha).
-        let make_fill = |label: &str, blend: bool, cull_back: bool| {
+        let make_fill = |label: &str, blend: bool, cull_back: bool, xray: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -497,7 +544,13 @@ impl RenderCore {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: !blend,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    // X-ray layers blend over everything regardless of depth
+                    // (previews of surfaces that lie inside the body).
+                    depth_compare: if xray {
+                        wgpu::CompareFunction::Always
+                    } else {
+                        wgpu::CompareFunction::Less
+                    },
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -509,10 +562,19 @@ impl RenderCore {
                 cache: None,
             })
         };
-        let pipeline = make_fill("openrcad-render pipeline", false, false);
-        let pipeline_cull = make_fill("openrcad-render pipeline (cull)", false, true);
-        let pipeline_blend = make_fill("openrcad-render pipeline (blend)", true, false);
-        let pipeline_blend_cull = make_fill("openrcad-render pipeline (blend+cull)", true, true);
+        let pipeline = make_fill("openrcad-render pipeline", false, false, false);
+        let pipeline_cull = make_fill("openrcad-render pipeline (cull)", false, true, false);
+        let pipeline_blend = make_fill("openrcad-render pipeline (blend)", true, false, false);
+        let pipeline_blend_cull =
+            make_fill("openrcad-render pipeline (blend+cull)", true, true, false);
+        let pipeline_blend_xray =
+            make_fill("openrcad-render pipeline (blend+xray)", true, false, true);
+        let pipeline_blend_xray_cull = make_fill(
+            "openrcad-render pipeline (blend+xray+cull)",
+            true,
+            true,
+            true,
+        );
 
         // Wireframe overlay pipeline: line-list, sharing the globals bind group.
         // A negative depth bias pulls edges slightly toward the camera so they
@@ -632,6 +694,8 @@ impl RenderCore {
             pipeline_cull,
             pipeline_blend,
             pipeline_blend_cull,
+            pipeline_blend_xray,
+            pipeline_blend_xray_cull,
             edge_pipeline,
             pick_pipeline,
             uniform_buffer,
@@ -686,7 +750,8 @@ impl RenderCore {
                 (None, false) => {
                     debug_assert!(false, "new body slot {slot} must carry a mesh");
                     // Keep slots aligned even in release: an empty placeholder.
-                    self.bodies.push(SceneMesh::upload(device, &GpuMesh::default()));
+                    self.bodies
+                        .push(SceneMesh::upload(device, &GpuMesh::default()));
                 }
             }
         }
@@ -945,10 +1010,11 @@ impl RenderCore {
 
         // 3. Translucent layers (and their edges), in slice order.
         for layer in self.layers.iter().filter(|l| !l.style.is_opaque()) {
-            let pipeline = if layer.style.cull_back {
-                &self.pipeline_blend_cull
-            } else {
-                &self.pipeline_blend
+            let pipeline = match (layer.style.xray, layer.style.cull_back) {
+                (true, true) => &self.pipeline_blend_xray_cull,
+                (true, false) => &self.pipeline_blend_xray,
+                (false, true) => &self.pipeline_blend_cull,
+                (false, false) => &self.pipeline_blend,
             };
             fill(pass, pipeline, &layer.bind_group, &layer.mesh);
             if layer.style.draw_edges {
@@ -1037,7 +1103,7 @@ impl RenderCore {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::ImageCopyBuffer {
-                buffer: &target.readback,
+                buffer: &target.blocking_readback,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: None, // single row
@@ -1052,15 +1118,112 @@ impl RenderCore {
         );
         queue.submit(std::iter::once(encoder.finish()));
 
-        let slice = target.readback.slice(0..4);
+        let slice = target.blocking_readback.slice(0..4);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::Maintain::Wait);
         let id = {
             let data = slice.get_mapped_range();
             u32::from_le_bytes([data[0], data[1], data[2], data[3]])
         };
-        target.readback.unmap();
+        target.blocking_readback.unmap();
         id.checked_sub(1)
+    }
+
+    /// Queue a non-blocking one-pixel pick readback. Returns `false` when all
+    /// three slots are busy; callers should retain only their newest sample and
+    /// retry next frame rather than building an unbounded queue.
+    pub fn request_pick_at(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &mut PickTarget,
+        request_id: u64,
+        x: u32,
+        y: u32,
+    ) -> bool {
+        if x >= target.width || y >= target.height {
+            return false;
+        }
+        let Some(slot) = target
+            .readbacks
+            .iter_mut()
+            .find(|slot| slot.pending.is_none())
+        else {
+            return false;
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("openrcad-render async pick encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &target.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &slot.buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: None,
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        slot.buffer
+            .slice(0..4)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        slot.pending = Some(PendingPickReadback {
+            request_id,
+            x,
+            y,
+            ready: rx,
+        });
+        true
+    }
+
+    /// Collect ready asynchronous samples without waiting for the GPU.
+    pub fn poll_pick_results(
+        &self,
+        device: &wgpu::Device,
+        target: &mut PickTarget,
+    ) -> Vec<AsyncPickResult> {
+        let _ = device.poll(wgpu::Maintain::Poll);
+        let mut completed = Vec::new();
+        for slot in &mut target.readbacks {
+            let ready = slot
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.ready.try_recv().ok());
+            let Some(mapped) = ready else { continue };
+            let pending = slot.pending.take().expect("pending pick disappeared");
+            let face_id = if mapped.is_ok() {
+                let slice = slot.buffer.slice(0..4);
+                let data = slice.get_mapped_range();
+                let raw = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                drop(data);
+                raw.checked_sub(1)
+            } else {
+                None
+            };
+            slot.buffer.unmap();
+            completed.push(AsyncPickResult {
+                request_id: pending.request_id,
+                x: pending.x,
+                y: pending.y,
+                face_id,
+            });
+        }
+        completed
     }
 
     /// Only for the standalone [`State`](crate::state::State): expose the uniform

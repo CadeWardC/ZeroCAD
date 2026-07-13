@@ -47,6 +47,7 @@ fn filleted_rect(radius: f64, corners: &[(f32, f32)]) -> (usize, Vec<f64>, bool,
             curves,
             shapes: vec![],
             corner_mods,
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -86,7 +87,10 @@ fn filleted_rect(radius: f64, corners: &[(f32, f32)]) -> (usize, Vec<f64>, bool,
 fn single_corner_fillet_is_analytic() {
     for &r in &[0.5f64, 1.0, 3.0, 6.0] {
         let (_faces, cyls, wt, healthy) = filleted_rect(r, &[(0.0, 0.0)]);
-        assert!(wt && healthy, "r={r}: filleted-rect extrude must be watertight+healthy");
+        assert!(
+            wt && healthy,
+            "r={r}: filleted-rect extrude must be watertight+healthy"
+        );
         assert!(
             cyls.iter().any(|c| (c - r).abs() < 1.0e-2),
             "r={r}: single sketch fillet must extrude to an analytic cylinder of that radius, got {cyls:?}"
@@ -101,7 +105,10 @@ fn rounded_rectangle_corners_are_analytic() {
     let all4 = [(0.0, 0.0), (20.0, 0.0), (20.0, 12.0), (0.0, 12.0)];
     for &r in &[1.0f64, 3.0, 5.0] {
         let (_faces, cyls, wt, healthy) = filleted_rect(r, &all4);
-        assert!(wt && healthy, "r={r}: rounded-rect extrude must be watertight+healthy");
+        assert!(
+            wt && healthy,
+            "r={r}: rounded-rect extrude must be watertight+healthy"
+        );
         let n = cyls.iter().filter(|c| (**c - r).abs() < 1.0e-2).count();
         assert_eq!(
             n, 4,
@@ -120,12 +127,15 @@ fn rounded_rectangle_corners_are_analytic() {
 fn rounded_rectangle_display_mesh_is_the_analytic_part() {
     let mut g = ParametricGraph::new();
     let mut curves = SketchCurves::new();
-    curves.add_rectangle((0.0, 0.0), (20.0, 12.0));
-    let corner_mods = [(0.0f32, 0.0f32), (20.0, 0.0), (20.0, 12.0), (0.0, 12.0)]
+    // The reported performance case: a long, tiny rounded bar. Its straight
+    // extrusion direction must not inherit the curved hoop's tessellation
+    // spacing and grow to tens of thousands of triangles.
+    curves.add_rectangle((0.0, 0.0), (1.5, 3.5));
+    let corner_mods = [(0.0f32, 0.0f32), (1.5, 0.0), (1.5, 3.5), (0.0, 3.5)]
         .iter()
         .map(|&at| CornerMod {
             at,
-            radius: Dimension::literal(3.0),
+            radius: Dimension::literal(0.25),
             kind: CornerKind::Fillet,
         })
         .collect();
@@ -144,6 +154,7 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
             curves,
             shapes: vec![],
             corner_mods,
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -152,7 +163,7 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
         name: "E".into(),
         feature: FeatureType::Extrude {
             target: None,
-            depth: 10.0,
+            depth: 48.0,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
@@ -169,6 +180,11 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
         "display mesh must have the part's 10 faces (2 caps + 4 sides + 4 fillet \
          cylinders), not one face per tessellation facet"
     );
+    assert!(
+        mesh.indices.len() / 3 < 1_000,
+        "a 1.5 x 3.5 x 48 mm rounded bar should stay below 1,000 display triangles, got {}",
+        mesh.indices.len() / 3
+    );
 
     // The render mesh must be a closed manifold (every undirected edge used by
     // exactly two triangles at quantized positions) — the gate that decides
@@ -176,7 +192,11 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
     let q = |i: usize| {
         let b = i * 6;
         let f = |v: f32| (v as f64 * 1.0e4).round() as i64;
-        (f(mesh.vertices[b]), f(mesh.vertices[b + 1]), f(mesh.vertices[b + 2]))
+        (
+            f(mesh.vertices[b]),
+            f(mesh.vertices[b + 1]),
+            f(mesh.vertices[b + 2]),
+        )
     };
     let mut edges: std::collections::HashMap<_, u32> = std::collections::HashMap::new();
     for tri in mesh.indices.chunks_exact(3) {

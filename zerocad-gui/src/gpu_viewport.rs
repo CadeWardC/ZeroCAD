@@ -125,9 +125,18 @@ pub(crate) struct GpuViewport {
     /// The face under the cursor resolved by the last hover pick — consumed as
     /// this frame's hover tint (one frame of latency, invisible in practice).
     last_hover: Option<(String, u32)>,
+    /// Async hover readback bookkeeping. Context is retained per request so a
+    /// result from an older camera/scene can never tint the current frame.
+    pick_request_seq: u64,
+    last_applied_pick_request: u64,
+    pick_context: HashMap<u64, ((u64, u64, u32, u32), u32, u32)>,
+    last_hover_sample: Option<((u64, u64, u32, u32), u32, u32, Option<(String, u32)>)>,
+    last_hover_requested: Option<((u64, u64, u32, u32), u32, u32)>,
     /// The globals/epoch/size of the last rendered frame, so a click can probe
     /// the pick buffer on demand against exactly what was displayed.
     last_pick_ctx: Option<(SceneGlobals, u64, u32, u32)>,
+    /// Full visual-state key for reusing the already-rendered offscreen texture.
+    last_render_key: u64,
 }
 
 impl Default for GpuViewport {
@@ -150,7 +159,13 @@ impl Default for GpuViewport {
             pick: None,
             pick_key: (u64::MAX, 0, 0, 0),
             last_hover: None,
+            pick_request_seq: 0,
+            last_applied_pick_request: 0,
+            pick_context: HashMap::new(),
+            last_hover_sample: None,
+            last_hover_requested: None,
             last_pick_ctx: None,
+            last_render_key: 0,
         }
     }
 }
@@ -204,8 +219,7 @@ impl GpuViewport {
             let depth = rs
                 .adapter
                 .get_texture_format_features(openrcad_render::DEPTH_FORMAT);
-            color.flags.sample_count_supported(count)
-                && depth.flags.sample_count_supported(count)
+            color.flags.sample_count_supported(count) && depth.flags.sample_count_supported(count)
         };
         if supported(want) {
             want
@@ -285,8 +299,7 @@ impl GpuViewport {
                 });
             }
             if let Some(core) = self.core.as_mut() {
-                let refs: Vec<Option<&GpuMesh>> =
-                    rebuilt.iter().map(|m| m.as_ref()).collect();
+                let refs: Vec<Option<&GpuMesh>> = rebuilt.iter().map(|m| m.as_ref()).collect();
                 core.update_bodies(&device, &refs);
             }
             // Merged face maps + world bounds from the (partly reused) cache.
@@ -297,8 +310,7 @@ impl GpuViewport {
             for cache in &new_cache {
                 for (&mock_fid, &local_id) in &cache.local {
                     let merged = cache.base + local_id;
-                    self.face_map
-                        .insert((cache.node.clone(), mock_fid), merged);
+                    self.face_map.insert((cache.node.clone(), mock_fid), merged);
                     self.face_rev.insert(merged, (cache.node.clone(), mock_fid));
                 }
                 for k in 0..3 {
@@ -355,11 +367,10 @@ impl GpuViewport {
         // through the preview; otherwise against the committed map. Hover first
         // so a selection always wins the texel. (set_face_states skips the GPU
         // upload when nothing changed, so doing this every frame is cheap.)
-        let (state_map, state_count): (&FaceIdMap, u32) =
-            match frame.preview_faces {
-                Some((map, count)) if !frame.draw_bodies => (map, count),
-                _ => (&self.face_map, self.face_count),
-            };
+        let (state_map, state_count): (&FaceIdMap, u32) = match frame.preview_faces {
+            Some((map, count)) if !frame.draw_bodies => (map, count),
+            _ => (&self.face_map, self.face_count),
+        };
         if state_count > 0 {
             let mut states = vec![FaceHighlight::None; state_count as usize];
             if frame.draw_bodies {
@@ -446,9 +457,42 @@ impl GpuViewport {
             edge_px: frame.edge_px,
         };
 
-        {
+        let mut render_key = view_proj_hash(&globals.view_proj);
+        let mut mix = |value: u64| {
+            render_key ^= value;
+            render_key = render_key.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        mix(frame.epoch);
+        mix(self.layers_fp);
+        mix(((px_w as u64) << 32) | px_h as u64);
+        mix(samples as u64);
+        mix(frame.draw_bodies as u64);
+        for (node, face) in frame.selected_faces {
+            for byte in node.as_bytes() {
+                mix(*byte as u64);
+            }
+            mix(*face as u64);
+        }
+        for node in frame.whole_bodies {
+            for byte in node.as_bytes() {
+                mix(*byte as u64);
+            }
+        }
+        if let Some((node, face)) = &self.last_hover {
+            for byte in node.as_bytes() {
+                mix(*byte as u64);
+            }
+            mix(*face as u64);
+        }
+        if need_new || render_key != self.last_render_key {
             let (core, target) = (self.core.as_ref()?, self.target.as_ref()?);
+            let render_started = std::time::Instant::now();
             core.render_to(&device, &queue, target, &globals);
+            let elapsed = render_started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(8) {
+                log::debug!("GPU viewport submission: {elapsed:?}");
+            }
+            self.last_render_key = render_key;
         }
 
         // Remember this frame's pick context so a click can probe the id
@@ -459,12 +503,12 @@ impl GpuViewport {
         // Hover pick: resolve the face under the cursor for the NEXT frame's
         // tint. The id buffer re-renders only when the scene/camera/viewport
         // changed; a moving cursor over a still scene costs one 4-byte readback.
-        self.last_hover = match frame.hover_px {
-            Some((hx, hy)) if frame.draw_bodies => {
-                self.resolve_pick(&device, &queue, &globals, frame.epoch, px_w, px_h, hx, hy)
-            }
-            _ => None,
-        };
+        if let Some((hx, hy)) = frame.hover_px.filter(|_| frame.draw_bodies) {
+            self.poll_and_request_hover(&device, &queue, &globals, frame.epoch, px_w, px_h, hx, hy);
+        } else {
+            self.last_hover = None;
+            self.last_hover_requested = None;
+        }
 
         self.texture_id
     }
@@ -503,6 +547,71 @@ impl GpuViewport {
             .and_then(|id| self.face_rev.get(&id).cloned())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn poll_and_request_hover(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        globals: &SceneGlobals,
+        epoch: u64,
+        px_w: u32,
+        px_h: u32,
+        x: u32,
+        y: u32,
+    ) {
+        let stale = self
+            .pick
+            .as_ref()
+            .map(|p| !p.matches(px_w, px_h))
+            .unwrap_or(true);
+        if stale {
+            self.pick = Some(PickTarget::new(device, px_w, px_h));
+            self.pick_key = (u64::MAX, 0, 0, 0);
+            self.pick_context.clear();
+            self.last_applied_pick_request = 0;
+            self.last_hover_sample = None;
+            self.last_hover_requested = None;
+        }
+        let key = (epoch, view_proj_hash(&globals.view_proj), px_w, px_h);
+        let (Some(core), Some(pick)) = (self.core.as_ref(), self.pick.as_mut()) else {
+            return;
+        };
+        if key != self.pick_key {
+            core.render_pick(device, queue, pick, globals);
+            self.pick_key = key;
+        }
+
+        for result in core.poll_pick_results(device, pick) {
+            let Some((request_key, rx, ry)) = self.pick_context.remove(&result.request_id) else {
+                continue;
+            };
+            if request_key != key {
+                continue;
+            }
+            if result.request_id < self.last_applied_pick_request {
+                continue;
+            }
+            self.last_applied_pick_request = result.request_id;
+            let resolved = result
+                .face_id
+                .and_then(|id| self.face_rev.get(&id).cloned());
+            self.last_hover = resolved.clone();
+            self.last_hover_sample = Some((request_key, rx, ry, resolved));
+        }
+
+        let wanted = (key, x.min(px_w - 1), y.min(px_h - 1));
+        if self.last_hover_requested == Some(wanted) {
+            return;
+        }
+        self.pick_request_seq = self.pick_request_seq.wrapping_add(1);
+        let request_id = self.pick_request_seq;
+        if core.request_pick_at(device, queue, pick, request_id, wanted.1, wanted.2) {
+            self.pick_context
+                .insert(request_id, (wanted.0, wanted.1, wanted.2));
+            self.last_hover_requested = Some(wanted);
+        }
+    }
+
     /// Exact face under the physical pixel `(x, y)`, from the id buffer of the
     /// last rendered frame (what the user actually saw). `Unavailable` until a
     /// GPU frame has been rendered — callers then run their CPU fallback.
@@ -515,6 +624,12 @@ impl GpuViewport {
         };
         let device = rs.device.clone();
         let queue = rs.queue.clone();
+        let key = (epoch, view_proj_hash(&globals.view_proj), px_w, px_h);
+        if let Some((sample_key, sx, sy, hit)) = &self.last_hover_sample {
+            if *sample_key == key && sx.abs_diff(x) <= 2 && sy.abs_diff(y) <= 2 {
+                return GpuFacePick::Hit(hit.clone());
+            }
+        }
         GpuFacePick::Hit(self.resolve_pick(&device, &queue, &globals, epoch, px_w, px_h, x, y))
     }
 }
@@ -651,7 +766,7 @@ fn layers_fingerprint(layers: &[(GpuMesh, LayerStyle)]) -> u64 {
             mix(c.to_bits() as u64);
         }
         mix(style.alpha.to_bits() as u64);
-        mix(style.cull_back as u64 | ((style.draw_edges as u64) << 1));
+        mix(style.cull_back as u64 | ((style.draw_edges as u64) << 1) | ((style.xray as u64) << 2));
         for &p in &mesh.positions {
             mix(p.to_bits() as u64);
         }
@@ -659,9 +774,7 @@ fn layers_fingerprint(layers: &[(GpuMesh, LayerStyle)]) -> u64 {
     h.max(1)
 }
 
-fn mock_meshes_to_gpu(
-    bodies: &[(String, MockMesh)],
-) -> (GpuMesh, FaceIdMap, u32) {
+fn mock_meshes_to_gpu(bodies: &[(String, MockMesh)]) -> (GpuMesh, FaceIdMap, u32) {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut face_ids = Vec::new();
@@ -887,6 +1000,7 @@ impl ZeroCadApp {
     /// [`Self::gpu_texture_id`], to be composited by `draw_viewport`. No-op
     /// (clears the id) when the GPU path is unavailable.
     pub(crate) fn render_gpu_scene(&mut self, rect: egui::Rect, ctx: &egui::Context) {
+        let prepare_started = std::time::Instant::now();
         if !self.gpu.is_available() {
             self.gpu_texture_id = None;
             return;
@@ -915,6 +1029,7 @@ impl ZeroCadApp {
                     cull_back: false,
                     draw_edges: true,
                     face_tint: true,
+                    xray: false,
                 },
             ));
             preview_map = Some((map, count));
@@ -932,16 +1047,16 @@ impl ZeroCadApp {
                             cull_back: true,
                             draw_edges: false,
                             face_tint: false,
+                            xray: false,
                         },
                     ));
                 }
             }
-            // A settled Join preview already shows the merged result — no ghost.
-            Some(ExtrudeMode::Join) if !self.extrude_depth_dragging => {}
-            // The warm additive tool volume floats over the model: New Body
-            // always, Join while push/pull dragging (the boolean lands on
-            // release).
-            Some(ExtrudeMode::Join | ExtrudeMode::NewBody) | None => {
+            // Until the exact fused result arrives, keep Join's additive tool
+            // visually explicit. Its real outline edges must remain visible in
+            // the live preview; the exact boolean result replaces this layer
+            // once it is current.
+            Some(ExtrudeMode::Join) => {
                 if let Some(pm) = plan.extrude_preview_mesh.as_ref() {
                     layers.push((
                         mock_meshes_to_layer_soup(std::iter::once(pm)),
@@ -951,21 +1066,71 @@ impl ZeroCadApp {
                             cull_back: true,
                             draw_edges: true,
                             face_tint: false,
+                            xray: false,
+                        },
+                    ));
+                }
+            }
+            // New Body stays visually distinct because it intentionally creates
+            // a separate part rather than joining the current model.
+            Some(ExtrudeMode::NewBody) | None => {
+                if let Some(pm) = plan.extrude_preview_mesh.as_ref() {
+                    layers.push((
+                        mock_meshes_to_layer_soup(std::iter::once(pm)),
+                        LayerStyle {
+                            color: warm,
+                            alpha: 1.0,
+                            cull_back: true,
+                            draw_edges: true,
+                            face_tint: false,
+                            xray: false,
                         },
                     ));
                 }
             }
         }
+        if let Some(mesh) = plan.mirror_preview_mesh.as_ref() {
+            layers.push((
+                mock_meshes_to_layer_soup(std::iter::once(mesh)),
+                LayerStyle {
+                    color: srgb8_to_linear(70, 170, 245),
+                    alpha: 115.0 / 255.0,
+                    cull_back: false,
+                    draw_edges: true,
+                    face_tint: false,
+                    xray: false,
+                },
+            ));
+        }
+        if let Some(mesh) = plan.thread_preview_mesh.as_ref() {
+            layers.push((
+                mock_meshes_to_layer_soup(std::iter::once(mesh)),
+                LayerStyle {
+                    color: srgb8_to_linear(70, 145, 245),
+                    alpha: 220.0 / 255.0,
+                    cull_back: false,
+                    draw_edges: true,
+                    face_tint: false,
+                    // The ribbon sits directly on the selected wall. X-ray it
+                    // so both outside and inside thread previews remain legible.
+                    xray: true,
+                },
+            ));
+        }
         // Fillet/chamfer overlay ribbon (until the exact result bodies arrive).
+        // The band is the surface LEFT AFTER the corner material is removed, so
+        // it lies inside the body — depth-tested it would be invisible (only
+        // its rail wires peeked through). X-ray it over the body instead.
         if let Some(pm) = plan.edge_mod_preview_mesh.as_ref() {
             layers.push((
                 mock_meshes_to_layer_soup(std::iter::once(pm)),
                 LayerStyle {
                     color: warm,
-                    alpha: 235.0 / 255.0,
+                    alpha: 200.0 / 255.0,
                     cull_back: false,
                     draw_edges: true,
                     face_tint: false,
+                    xray: true,
                 },
             ));
         }
@@ -991,20 +1156,23 @@ impl ZeroCadApp {
                 _ => None,
             })
             .collect();
+        selected_faces.sort();
         // While picking a sketch plane, preview the hovered planar body face as
         // selected so the user sees which face a click will sketch on — the
         // same tint the CPU painter applies (render.rs section A).
-        if self.is_plane_selection_mode {
+        if self.plane_pick_active() {
             if let Some((node, fid)) = self.hovered_sketch_face.as_ref() {
                 selected_faces.push((node.clone(), *fid));
             }
         }
-        let whole_bodies: Vec<String> = self
+        selected_faces.sort();
+        let mut whole_bodies: Vec<String> = self
             .selected_body
             .iter()
             .filter(|(_, pick)| matches!(pick, BodyPick::Whole))
             .map(|(id, _)| id.clone())
             .collect();
+        whole_bodies.sort();
 
         // Hover pick: only in plain select mode (no live operation, sketch, or
         // plane picking, and not mid-orbit), with the pointer inside the
@@ -1014,7 +1182,7 @@ impl ZeroCadApp {
             && self.edge_mod_op.is_none()
             && self.pending_visual.is_none()
             && !self.is_sketch_mode
-            && !self.is_plane_selection_mode
+            && !self.plane_pick_active()
             && !self.orbiting;
         let hover_px = if hover_allowed {
             ctx.pointer_latest_pos()
@@ -1049,6 +1217,10 @@ impl ZeroCadApp {
             samples,
             edge_px,
         };
+        let prepare_elapsed = prepare_started.elapsed();
+        if prepare_elapsed >= std::time::Duration::from_millis(4) {
+            log::debug!("GPU scene/preview preparation: {prepare_elapsed:?}");
+        }
         self.gpu_texture_id = self.gpu.render(&scene);
 
         // Hand the resolved plan to this frame's `draw_viewport` so it doesn't

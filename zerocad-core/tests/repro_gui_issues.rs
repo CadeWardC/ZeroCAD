@@ -24,6 +24,7 @@ fn add_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: S
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: true,
         },
     });

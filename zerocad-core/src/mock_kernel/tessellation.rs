@@ -13,6 +13,51 @@ pub(crate) const TESS_TOL: f64 = 0.05;
 /// (not chordal) tolerance keeps the facet density uniform across radii.
 pub(crate) const TESS_ANGLE: f64 = 0.13;
 
+/// Coarser chordal/angular budget for **live previews** (an extrude Cut/Join
+/// drag, a fillet/chamfer edit). ~0.15 mm / ~15° roughly halves the triangle
+/// count and meshing time versus the committed budget while still reading as a
+/// smooth curve, so a preview body lands ~2× faster; the commit re-tessellates
+/// at the fine budget above. See [`with_preview_tess`].
+pub(crate) const TESS_TOL_PREVIEW: f64 = 0.15;
+pub(crate) const TESS_ANGLE_PREVIEW: f64 = 0.26;
+
+thread_local! {
+    /// Per-thread override for the body tessellation budget. `None` = the fine
+    /// committed budget ([`TESS_TOL`]/[`TESS_ANGLE`]); `Some((chord, angle))` =
+    /// a coarser preview budget. Thread-local so a background preview worker
+    /// coarsens only its own pass — the main thread's committed eval is
+    /// untouched — with no locking. Read on the calling (eval-worker) thread and
+    /// passed to `tessellate` as explicit args, so `tessellate`'s internal rayon
+    /// parallelism sees the resolved values (rayon workers don't inherit it).
+    static PREVIEW_TESS: std::cell::Cell<Option<(f64, f64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The active body tessellation budget for this thread — the preview override if
+/// one is set (see [`with_preview_tess`]), otherwise the fine committed budget.
+pub(crate) fn active_tess_budget() -> (f64, f64) {
+    PREVIEW_TESS
+        .with(|c| c.get())
+        .unwrap_or((TESS_TOL, TESS_ANGLE))
+}
+
+/// Run `f` with the coarse preview tessellation budget active on this thread,
+/// restoring the previous budget afterward (even on panic). Every body meshed
+/// while it runs uses [`TESS_TOL_PREVIEW`]/[`TESS_ANGLE_PREVIEW`].
+pub(crate) fn with_preview_tess<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<(f64, f64)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREVIEW_TESS.with(|c| c.set(self.0));
+        }
+    }
+    let _guard = PREVIEW_TESS.with(|c| {
+        let prev = c.get();
+        c.set(Some((TESS_TOL_PREVIEW, TESS_ANGLE_PREVIEW)));
+        Restore(prev)
+    });
+    f()
+}
+
 /// Build a wire from a closed 2D boundary loop (`cs`-plane coordinates),
 /// reconstructing circular arcs from co-circular runs so an extruded sketch arc
 /// becomes one smooth cylindrical wall. Returns `None` for fewer than 3 distinct
@@ -492,8 +537,8 @@ pub(crate) fn build_revolution_solid(
         axis_origin.y as f64,
         axis_origin.z as f64,
     );
-    let adir = GeomVec::new(axis_dir.x as f64, axis_dir.y as f64, axis_dir.z as f64)
-        .normalized()?;
+    let adir =
+        GeomVec::new(axis_dir.x as f64, axis_dir.y as f64, axis_dir.z as f64).normalized()?;
     match revolve(&face, apnt, adir, angle) {
         Ok(solid) => Some(solid),
         Err(e) => {
@@ -529,12 +574,28 @@ pub(crate) fn solid_to_flat_mesh(
     correct_boolean_bevels: bool,
     correct_mixed_triangle_normals: bool,
 ) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+    solid_to_flat_mesh_with_cancel(
+        solid,
+        correct_boolean_bevels,
+        correct_mixed_triangle_normals,
+        &openrcad::foundation::NeverCancelled,
+    )
+    .expect("NeverCancelled cannot cancel")
+}
+
+pub(crate) fn solid_to_flat_mesh_with_cancel(
+    solid: &KernelSolid,
+    correct_boolean_bevels: bool,
+    correct_mixed_triangle_normals: bool,
+    cancel: &dyn openrcad::foundation::CancellationProbe,
+) -> Result<(Vec<f32>, Vec<u32>, Vec<u32>), openrcad::foundation::Cancelled> {
     // `gpu_mesh` unwelds each triangle into three vertices carrying that
     // triangle's flat face normal, plus a per-triangle source-face id — exactly
     // the interleaved layout (minus the f32 normal smoothing) we want. Each
     // vertex copy belongs to a single triangle, so the per-vertex→face mapping
     // `smooth_vertex_normals` relies on holds.
-    let mesh = tessellate(solid, TESS_TOL, TESS_ANGLE);
+    let (chord, angle) = active_tess_budget();
+    let mesh = openrcad::mesh::tessellate_with_cancel(solid, chord, angle, cancel)?;
     let gpu = mesh.gpu_mesh();
 
     let vcount = gpu.positions.len() / 3;
@@ -585,7 +646,8 @@ pub(crate) fn solid_to_flat_mesh(
     align_normals_to_winding(&mut vertices, &indices);
     apply_analytic_cylinder_normals(solid, &mut vertices, &indices, &face_ids);
 
-    (vertices, indices, face_ids)
+    cancel.check_cancelled()?;
+    Ok((vertices, indices, face_ids))
 }
 
 /// `cos` of the crease angle (~30°) below which adjacent faces are treated as one
@@ -1083,6 +1145,7 @@ pub(crate) fn add_missing_straight_brep_edges(
 
     let mut face_normal: HashMap<u32, [f32; 3]> = HashMap::new();
     let mut face_count: HashMap<u32, u32> = HashMap::new();
+    let mut face_samples: HashMap<u32, Vec<([f32; 3], [f32; 3])>> = HashMap::new();
     for (t, tri) in indices.chunks_exact(3).enumerate() {
         let fid = face_ids.get(t).copied().unwrap_or(0);
         let b = tri[0] as usize * 6;
@@ -1092,6 +1155,14 @@ pub(crate) fn add_missing_straight_brep_edges(
         sum[1] += n[1];
         sum[2] += n[2];
         *face_count.entry(fid).or_insert(0) += 1;
+        let samples = face_samples.entry(fid).or_default();
+        for &vi in tri {
+            let b = vi as usize * 6;
+            samples.push((
+                [vertices[b], vertices[b + 1], vertices[b + 2]],
+                [vertices[b + 3], vertices[b + 4], vertices[b + 5]],
+            ));
+        }
     }
     for (fid, n) in &mut face_normal {
         let count = face_count.get(fid).copied().unwrap_or(1) as f32;
@@ -1105,6 +1176,18 @@ pub(crate) fn add_missing_straight_brep_edges(
             n[2] /= len;
         }
     }
+
+    let mut first_of_group: HashMap<u32, u32> = HashMap::new();
+    for (fi, &group) in surface_group.iter().enumerate() {
+        first_of_group.entry(group).or_insert(fi as u32);
+    }
+    let canonical_face = |fid: u32| {
+        surface_group
+            .get(fid as usize)
+            .and_then(|group| first_of_group.get(group))
+            .copied()
+            .unwrap_or(fid)
+    };
 
     let mut topo_edges: HashMap<
         ((i64, i64, i64), (i64, i64, i64)),
@@ -1143,6 +1226,39 @@ pub(crate) fn add_missing_straight_brep_edges(
             let g1 = surface_group.get(faces[1] as usize);
             if g0.is_some() && g0 == g1 {
                 continue;
+            }
+        }
+        // `mesh_feature_edges` already removed tangent/coplanar seams. Do not
+        // restore the same raw B-Rep edge here. Face-average normals cannot make
+        // this decision on a cylinder (radials cancel), so compare the closest
+        // smoothed normal from each face at this edge's midpoint.
+        if faces.len() >= 2 {
+            let midpoint = [
+                (pa[0] + pb[0]) * 0.5,
+                (pa[1] + pb[1]) * 0.5,
+                (pa[2] + pb[2]) * 0.5,
+            ];
+            let local_normal = |fid: u32| {
+                face_samples
+                    .get(&canonical_face(fid))
+                    .and_then(|samples| {
+                        samples.iter().min_by(|(a, _), (b, _)| {
+                            let da = (a[0] - midpoint[0]).powi(2)
+                                + (a[1] - midpoint[1]).powi(2)
+                                + (a[2] - midpoint[2]).powi(2);
+                            let db = (b[0] - midpoint[0]).powi(2)
+                                + (b[1] - midpoint[1]).powi(2)
+                                + (b[2] - midpoint[2]).powi(2);
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    })
+                    .map(|(_, normal)| *normal)
+            };
+            if let (Some(n0), Some(n1)) = (local_normal(faces[0]), local_normal(faces[1])) {
+                let dot = n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2];
+                if dot > 0.95 {
+                    continue;
+                }
             }
         }
         let d2 = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2);
@@ -1221,6 +1337,23 @@ pub(crate) fn add_analytic_curved_brep_edges(
             n[2] /= l;
         }
     }
+    // Per-face mesh samples (position + shading normal), for orienting a
+    // cylinder wall's radial LOCALLY. The face-average normal above is useless
+    // for that on a full 360° wall — the outward normals cancel to ~zero and
+    // its residual direction is a numerical coin toss, which flipped rim wall
+    // normals inward and swept the fillet/chamfer preview ribbon outward.
+    let mut face_samples: HashMap<u32, Vec<([f32; 3], [f32; 3])>> = HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        let fid = face_ids.get(t).copied().unwrap_or(0);
+        let samples = face_samples.entry(fid).or_default();
+        for &vi in tri {
+            let b = vi as usize * 6;
+            samples.push((
+                [vertices[b], vertices[b + 1], vertices[b + 2]],
+                [vertices[b + 3], vertices[b + 4], vertices[b + 5]],
+            ));
+        }
+    }
 
     let key = |a: [f32; 3], b: [f32; 3]| {
         let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
@@ -1259,6 +1392,24 @@ pub(crate) fn add_analytic_curved_brep_edges(
         }
     }
 
+    // The mesh's `face_ids` were remapped to each surface group's canonical
+    // (first) face before this call, so a non-canonical B-Rep face id (a wall
+    // the kernel split into arc-faces) owns NO triangles here — its average
+    // normal and samples must be read via its canonical id.
+    let canon = {
+        let mut first_of_group: HashMap<u32, u32> = HashMap::new();
+        for (fi, &g) in surface_group.iter().enumerate() {
+            first_of_group.entry(g).or_insert(fi as u32);
+        }
+        move |fid: u32, surface_group: &[u32]| -> u32 {
+            surface_group
+                .get(fid as usize)
+                .and_then(|g| first_of_group.get(g))
+                .copied()
+                .unwrap_or(fid)
+        }
+    };
+
     let mut drawn: HashSet<(u32, u32)> = HashSet::new();
     for (_k, (samples, faces)) in curved {
         if faces.len() < 2 || samples.len() < 2 {
@@ -1285,8 +1436,22 @@ pub(crate) fn add_analytic_curved_brep_edges(
                 (p[1] + q[1]) * 0.5,
                 (p[2] + q[2]) * 0.5,
             ];
-            let n0 = curved_edge_side_normal(solid, f0, mid, &face_normal);
-            let n1 = curved_edge_side_normal(solid, f1, mid, &face_normal);
+            let n0 = curved_edge_side_normal(
+                solid,
+                f0,
+                canon(f0, surface_group),
+                mid,
+                &face_normal,
+                &face_samples,
+            );
+            let n1 = curved_edge_side_normal(
+                solid,
+                f1,
+                canon(f1, surface_group),
+                mid,
+                &face_normal,
+                &face_samples,
+            );
             let base = (edge_vertices.len() / 3) as u32;
             edge_vertices.extend_from_slice(&p);
             edge_vertices.extend_from_slice(&q);
@@ -1324,13 +1489,23 @@ fn sample_curved_edge_polyline(edge: &Edge) -> Vec<[f32; 3]> {
 /// Outward normal of face `fid` at `point` for hidden-line removal: a cylinder's
 /// local radial (oriented to the face's meshed normal, so a bore points inward and
 /// a boss outward), otherwise the face's constant meshed normal.
+///
+/// The radial's SIGN is read off the face's nearest mesh vertex normal, never the
+/// face-average normal: on a full 360° wall the average cancels to ~zero and its
+/// residual direction is arbitrary, which flipped rim wall normals inward (and the
+/// edge-mod preview ribbon outward) on a per-tessellation coin toss.
 fn curved_edge_side_normal(
     solid: &KernelSolid,
     fid: u32,
+    mesh_fid: u32,
     point: [f32; 3],
     face_normal: &HashMap<u32, [f32; 3]>,
+    face_samples: &HashMap<u32, Vec<([f32; 3], [f32; 3])>>,
 ) -> [f32; 3] {
-    let base = face_normal.get(&fid).copied().unwrap_or([0.0, 0.0, 1.0]);
+    let base = face_normal
+        .get(&mesh_fid)
+        .copied()
+        .unwrap_or([0.0, 0.0, 1.0]);
     let shell = solid.shell();
     let faces = shell.faces();
     let Some(face) = faces.get(fid as usize) else {
@@ -1348,7 +1523,24 @@ fn curved_edge_side_normal(
         let l = (radial[0] * radial[0] + radial[1] * radial[1] + radial[2] * radial[2]).sqrt();
         if l > 1.0e-6 {
             let mut r = [radial[0] / l, radial[1] / l, radial[2] / l];
-            if r[0] * base[0] + r[1] * base[1] + r[2] * base[2] < 0.0 {
+            // Local orientation reference: the shading normal of the face's
+            // mesh vertex nearest to `point`.
+            let local = face_samples.get(&mesh_fid).and_then(|samples| {
+                samples
+                    .iter()
+                    .min_by(|(pa, _), (pb, _)| {
+                        let da = (pa[0] - point[0]).powi(2)
+                            + (pa[1] - point[1]).powi(2)
+                            + (pa[2] - point[2]).powi(2);
+                        let db = (pb[0] - point[0]).powi(2)
+                            + (pb[1] - point[1]).powi(2)
+                            + (pb[2] - point[2]).powi(2);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(_, n)| *n)
+            });
+            let orient = local.unwrap_or(base);
+            if r[0] * orient[0] + r[1] * orient[1] + r[2] * orient[2] < 0.0 {
                 r = [-r[0], -r[1], -r[2]];
             }
             return r;

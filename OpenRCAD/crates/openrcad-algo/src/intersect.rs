@@ -97,10 +97,15 @@ pub fn uv_of(s: &GeomSurface, p: &Pnt) -> (f64, f64) {
             let v = norm_angle(axial.atan2(radial.magnitude() - t.major_radius()));
             (u, v)
         }
-        GeomSurface::BSpline(_)
-        | GeomSurface::Gregory(_)
-        | GeomSurface::Offset(_)
-        | GeomSurface::Ruled(_) => search_nearest_parameter_newton(s, p, (0.0, 0.0)),
+        GeomSurface::Ruled(r) => match r.helical_uv_hinted(*p, None) {
+            // Helical thread bands span many turns; Newton from (0, 0) lands
+            // on the wrong turn, so use the analytic projection.
+            Some(uv) => uv,
+            None => search_nearest_parameter_newton(s, p, (0.0, 0.0)),
+        },
+        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) | GeomSurface::Offset(_) => {
+            search_nearest_parameter_newton(s, p, (0.0, 0.0))
+        }
     }
 }
 
@@ -2079,8 +2084,10 @@ mod tests {
         // Radius-3 cylinder about the Z axis, cut by a 45°-tilted plane through
         // the origin → an exact ellipse (semi-minor 3, semi-major 3/cos45°).
         let r = 3.0;
-        let cyl =
-            GeomSurface::Cylinder(CylindricalSurface::new(Ax3::new(Pnt::origin(), Dir::dz()), r));
+        let cyl = GeomSurface::Cylinder(CylindricalSurface::new(
+            Ax3::new(Pnt::origin(), Dir::dz()),
+            r,
+        ));
         let n = Dir::from_vec(&GeomVec::new(0.0, 1.0, 1.0)).unwrap();
         let plane = GeomSurface::Plane(Plane::from_point_normal(Pnt::origin(), n));
 

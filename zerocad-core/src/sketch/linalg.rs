@@ -202,7 +202,10 @@ mod tests {
         a.set(1, 0, 2.0);
         a.set(1, 1, 3.0);
         let x = cholesky_solve(&a, &[10.0, 9.0]).expect("SPD system");
-        assert!((x[0] - 1.5).abs() < 1e-12 && (x[1] - 2.0).abs() < 1e-12, "{x:?}");
+        assert!(
+            (x[0] - 1.5).abs() < 1e-12 && (x[1] - 2.0).abs() < 1e-12,
+            "{x:?}"
+        );
     }
 
     #[test]

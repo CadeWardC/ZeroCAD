@@ -6,11 +6,12 @@
 //! pass merges adjacent faces that lie on the same plane with the same outward
 //! side back into one trimmed face.
 //!
-//! After [`sew`](crate::sew::sew), two coplanar adjacent faces already reference
-//! the **same** `EdgeId` along their shared seam, so the merge is edge
-//! cancellation: within a coplanar group, an edge used by two faces is interior
-//! (drop it); an edge used once is a real boundary (keep it). The kept boundary
-//! co-edges are then re-traced into the merged face's outer loop and holes.
+//! Adjacent faces can reference either the same `EdgeId` or geometrically
+//! coincident edge copies along their shared seam. The merge therefore cancels
+//! edges by geometric span: within a coplanar group, a span used twice is
+//! interior (drop it); a span used once is a real boundary (keep it). The kept
+//! boundary co-edges are then re-traced into the merged face's outer loop and
+//! holes.
 //!
 //! The pass is wrapped in a hard safety net: if the merged solid is not
 //! watertight + healthy, or does not actually reduce the face count, the original
@@ -26,15 +27,21 @@ use openrcad_topo::arena::{
 };
 use openrcad_topo::{BRepBuilder, Orientation, Shell, Solid};
 
-/// A point quantized to a fine integer grid so coincident positions compare equal.
+/// Quantization used by the boolean-healing/merge passes. This matches the
+/// boolean solver's 1e-5 modeling tolerance: independently sewn copies of one
+/// seam may differ by a few floating-point ulps but still represent one edge.
+const MERGE_GRID: f64 = 1.0e5;
+
+/// A point quantized to the merge tolerance so coincident positions compare equal.
 type QPoint = (i64, i64, i64);
+/// Five ordered curve samples, canonicalized against traversal reversal.
+type EdgeGeomKey = (QPoint, QPoint, QPoint, QPoint, QPoint);
 
 fn quantize(p: &Pnt) -> QPoint {
-    const GRID: f64 = 1.0e6;
     (
-        (p.x() * GRID).round() as i64,
-        (p.y() * GRID).round() as i64,
-        (p.z() * GRID).round() as i64,
+        (p.x() * MERGE_GRID).round() as i64,
+        (p.y() * MERGE_GRID).round() as i64,
+        (p.z() * MERGE_GRID).round() as i64,
     )
 }
 
@@ -350,14 +357,10 @@ fn try_merge_cyl_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId
 
 /// Group planar faces by support plane + outward side, merge each group, and
 /// rewrite `face_ids` with the merged faces (curved/lone faces pass through).
-fn do_merge(
-    brep: &mut BRep,
-    face_ids: &mut Vec<FaceId>,
-    classes: Option<&HashMap<FaceId, u64>>,
-) {
+fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>, classes: Option<&HashMap<FaceId, u64>>) {
     // Key a face by its effective outward normal, signed plane offset, and
     // owner class (different owners must never merge; None = wildcard group).
-    let qf = |x: f64| (x * 1.0e6).round() as i64;
+    let qf = |x: f64| (x * MERGE_GRID).round() as i64;
     let mut groups: HashMap<(i64, i64, i64, i64, Option<u64>), Vec<FaceId>> = HashMap::new();
     let mut passthrough: Vec<FaceId> = Vec::new();
 
@@ -395,9 +398,22 @@ fn do_merge(
             result.extend(members);
             continue;
         }
-        match try_merge_group(brep, &members) {
-            Some(new_faces) => result.extend(new_faces),
-            None => result.extend(members),
+        // Merge each connected island independently. A malformed or merely
+        // disjoint face elsewhere on the same support plane must not prevent a
+        // valid adjacent island from consolidating.
+        let Some(components) = planar_face_components(brep, &members) else {
+            result.extend(members);
+            continue;
+        };
+        for component in components {
+            if component.len() < 2 {
+                result.extend(component);
+                continue;
+            }
+            match try_merge_group(brep, &component) {
+                Some(new_faces) => result.extend(new_faces),
+                None => result.extend(component),
+            }
         }
     }
     *face_ids = result;
@@ -631,6 +647,84 @@ fn oriented_points(brep: &BRep, oe: &OrientedEdge) -> Option<(Pnt, Pnt)> {
     })
 }
 
+/// Orientation-independent geometric identity for an edge span. Five samples
+/// distinguish curved alternatives sharing endpoints (semicircles, periodic
+/// arcs) and tolerate separate but coincident B-Rep edge copies.
+fn edge_geom_key(brep: &BRep, id: EdgeId) -> Option<EdgeGeomKey> {
+    let edge = brep.edges.get(id)?;
+    let (start, end) = edge_endpoints(brep, id)?;
+    let point_at = |fraction: f64| {
+        edge.curve.as_ref().map_or_else(
+            || {
+                Pnt::new(
+                    start.x() + (end.x() - start.x()) * fraction,
+                    start.y() + (end.y() - start.y()) * fraction,
+                    start.z() + (end.z() - start.z()) * fraction,
+                )
+            },
+            |curve| curve.point(edge.first + (edge.last - edge.first) * fraction),
+        )
+    };
+    let a = quantize(&start);
+    let q1 = quantize(&point_at(0.25));
+    let q2 = quantize(&point_at(0.5));
+    let q3 = quantize(&point_at(0.75));
+    let b = quantize(&end);
+    let forward = (a, q1, q2, q3, b);
+    let reverse = (b, q3, q2, q1, a);
+    Some(forward.min(reverse))
+}
+
+/// Partition same-plane faces into islands connected by coincident boundary
+/// spans. This makes merging local: one bad island falls back without blocking
+/// every other valid merge on that plane.
+fn planar_face_components(brep: &BRep, members: &[FaceId]) -> Option<Vec<Vec<FaceId>>> {
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+
+    let mut parent: Vec<usize> = (0..members.len()).collect();
+    let mut first_owner: HashMap<EdgeGeomKey, usize> = HashMap::new();
+    for (index, &fid) in members.iter().enumerate() {
+        let face = brep.faces.get(fid)?;
+        let mut wires = Vec::new();
+        if let Some(wire) = face.outer_wire {
+            wires.push(wire);
+        }
+        wires.extend(&face.inner_wires);
+        let mut face_keys = std::collections::HashSet::new();
+        for wire in wires {
+            for edge in &brep.loops.get(wire)?.edges {
+                face_keys.insert(edge_geom_key(brep, edge.id)?);
+            }
+        }
+        for key in face_keys {
+            if let Some(&other) = first_owner.get(&key) {
+                let a = root(&mut parent, index);
+                let b = root(&mut parent, other);
+                if a != b {
+                    let (keep, merge) = if a < b { (a, b) } else { (b, a) };
+                    parent[merge] = keep;
+                }
+            } else {
+                first_owner.insert(key, index);
+            }
+        }
+    }
+
+    let mut components: std::collections::BTreeMap<usize, Vec<FaceId>> =
+        std::collections::BTreeMap::new();
+    for (index, &fid) in members.iter().enumerate() {
+        let component = root(&mut parent, index);
+        components.entry(component).or_default().push(fid);
+    }
+    Some(components.into_values().collect())
+}
+
 /// Attempt to merge one coplanar group. Returns the merged face id(s), or `None`
 /// if the boundary cannot be cleanly re-traced (caller keeps the originals).
 fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
@@ -640,11 +734,14 @@ fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
     };
     let plane = *plane;
 
-    // 1. Count co-edge usage across every member loop; boundary = used once.
-    let mut count: HashMap<EdgeId, u32> = HashMap::new();
-    let mut all: Vec<OrientedEdge> = Vec::new();
+    // 1. Count geometric co-edge usage across every member loop; boundary =
+    // used once. `sew` can retain distinct EdgeIds for the two coincident copies
+    // of a flush join seam, so EdgeId-only cancellation leaves the faces split.
+    let mut count: HashMap<EdgeGeomKey, u32> = HashMap::new();
+    let mut all: Vec<(OrientedEdge, EdgeGeomKey)> = Vec::new();
     for &fid in members {
         let fd = brep.faces.get(fid)?;
+        let reverse_for_rep = fd.orientation != rep.orientation;
         let mut wires = Vec::new();
         if let Some(w) = fd.outer_wire {
             wires.push(w);
@@ -652,13 +749,29 @@ fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
         wires.extend(&fd.inner_wires);
         for w in wires {
             let l = brep.loops.get(w)?;
-            for oe in &l.edges {
-                *count.entry(oe.id).or_insert(0) += 1;
-                all.push(*oe);
+            if reverse_for_rep {
+                for oe in l.edges.iter().rev() {
+                    let oe = OrientedEdge {
+                        id: oe.id,
+                        orientation: oe.orientation.reversed(),
+                    };
+                    let key = edge_geom_key(brep, oe.id)?;
+                    *count.entry(key).or_insert(0) += 1;
+                    all.push((oe, key));
+                }
+            } else {
+                for &oe in &l.edges {
+                    let key = edge_geom_key(brep, oe.id)?;
+                    *count.entry(key).or_insert(0) += 1;
+                    all.push((oe, key));
+                }
             }
         }
     }
-    let boundary: Vec<OrientedEdge> = all.into_iter().filter(|oe| count[&oe.id] == 1).collect();
+    let boundary: Vec<OrientedEdge> = all
+        .into_iter()
+        .filter_map(|(oe, key)| (count[&key] == 1).then_some(oe))
+        .collect();
     if boundary.len() < 3 {
         return None;
     }
@@ -821,6 +934,57 @@ mod tests {
     use super::*;
     use openrcad_foundation::{Ax2, Dir};
     use openrcad_primitives::{make_box, make_cylinder};
+
+    fn planar_faces_at(solid: &Solid, axis: Dir, coordinate: f64) -> usize {
+        solid
+            .shell()
+            .faces()
+            .iter()
+            .filter(|face| {
+                let Some(GeomSurface::Plane(plane)) = face.surface() else {
+                    return false;
+                };
+                let location = FVec::from_dir(axis).dot(&(plane.location() - Pnt::origin()));
+                plane.normal().dot(&axis).abs() > 0.999_999
+                    && (location - coordinate).abs() < 1.0e-5
+            })
+            .count()
+    }
+
+    #[test]
+    fn chained_flush_fuses_collapse_to_one_face_per_outer_plane() {
+        let first = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let second = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let third = make_box(&Pnt::new(20.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let joined = crate::boolean(&first, &second, crate::BooleanOp::Fuse);
+        let joined = crate::boolean(&joined, &third, crate::BooleanOp::Fuse);
+
+        assert!(joined.is_watertight() && joined.health_report().is_healthy());
+        assert_eq!(
+            joined.shell().faces().len(),
+            6,
+            "three boxes form one prism"
+        );
+        assert_eq!(
+            planar_faces_at(&joined, Dir::dz(), 10.0),
+            1,
+            "the three top patches must merge into one face"
+        );
+    }
+
+    #[test]
+    fn partial_end_join_builds_one_concave_top_face() {
+        let base = make_box(&Pnt::origin(), 20.0, 10.0, 3.0);
+        let extension = make_box(&Pnt::new(20.0, 0.0, 0.0), 4.0, 6.0, 3.0);
+        let joined = crate::boolean(&base, &extension, crate::BooleanOp::Fuse);
+
+        assert!(joined.is_watertight() && joined.health_report().is_healthy());
+        assert_eq!(
+            planar_faces_at(&joined, Dir::dz(), 3.0),
+            1,
+            "an L-shaped joined top must be one trimmed planar face"
+        );
+    }
 
     /// Count Ø8 (radius-4) vertical-axis cylinder faces.
     fn vertical_cyl_faces(s: &Solid, r: f64) -> usize {

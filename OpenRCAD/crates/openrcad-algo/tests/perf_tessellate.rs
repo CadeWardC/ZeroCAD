@@ -72,7 +72,13 @@ fn perf_tessellate_report() {
     for (i, d, tris) in face_times.iter().take(6) {
         let surf = faces[*i]
             .surface()
-            .map(|s| format!("{s:?}").split('(').next().unwrap_or("?").to_string())
+            .map(|s| {
+                format!("{s:?}")
+                    .split('(')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string()
+            })
             .unwrap_or_default();
         println!("    face {i:>3} {surf:<18} {d:>8.1?}  ({tris} tris)");
     }

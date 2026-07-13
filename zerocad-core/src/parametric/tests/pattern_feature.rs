@@ -105,6 +105,10 @@ fn mirror_produces_well_oriented_copy() {
         "box_1",
         PatternKind::Mirror {
             plane: PlaneBase::YZ,
+            face: None,
+            offset: 0.0,
+            offset_expr: None,
+            join: false,
         },
     );
     let (bodies, warnings) = g
@@ -114,12 +118,222 @@ fn mirror_produces_well_oriented_copy() {
     assert_eq!(bodies.len(), 2);
     let mirrored = &bodies.iter().find(|(id, _)| id == "pattern_2").unwrap().1;
     let mp = mirrored.mass_properties().expect("closed mirrored mesh");
-    assert!((mp.volume - 8.0).abs() < 1e-3, "mirror volume {}", mp.volume);
+    assert!(
+        (mp.volume - 8.0).abs() < 1e-3,
+        "mirror volume {}",
+        mp.volume
+    );
     assert!(
         (mp.centroid[0] + 1.0).abs() < 1e-3,
         "mirror centroid x {}",
         mp.centroid[0]
     );
+}
+
+#[test]
+fn mirror_can_follow_a_planar_body_face() {
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_1", 2.0, 2.0, 2.0);
+    let bodies = g
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .unwrap();
+    let top = bodies[0]
+        .1
+        .face_refs
+        .iter()
+        .find(|face| face.normal[2] > 0.99)
+        .expect("box top face")
+        .clone();
+    let face = FaceRef {
+        centroid: top.centroid,
+        normal: top.normal,
+        topology: Some(TopologyFaceRef {
+            body_id: Some("box_1".to_string()),
+            topology_version: top.topology.as_ref().and_then(|t| t.topology_version),
+            face_id: top.topology.as_ref().and_then(|t| t.face_id.clone()),
+            surface_kind: top.topology.as_ref().and_then(|t| t.surface_kind.clone()),
+        }),
+    };
+    add_pattern(
+        &mut g,
+        "mirror_2",
+        "box_1",
+        PatternKind::Mirror {
+            plane: PlaneBase::XY,
+            face: Some(face),
+            offset: 0.0,
+            offset_expr: None,
+            join: false,
+        },
+    );
+
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    let mirrored = &bodies.iter().find(|(id, _)| id == "mirror_2").unwrap().1;
+    let mp = mirrored.mass_properties().expect("closed mirrored mesh");
+    assert!(
+        (mp.centroid[2] - 3.0).abs() < 1.0e-3,
+        "mirroring [0,2] across its z=2 top face should center at z=3, got {}",
+        mp.centroid[2]
+    );
+}
+
+#[test]
+fn mirror_offset_moves_copy_along_plane_normal() {
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_1", 2.0, 2.0, 2.0);
+    add_pattern(
+        &mut g,
+        "mirror_2",
+        "box_1",
+        PatternKind::Mirror {
+            plane: PlaneBase::YZ,
+            face: None,
+            offset: 3.0,
+            offset_expr: None,
+            join: false,
+        },
+    );
+    let bodies = g
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .unwrap();
+    let mirrored = &bodies.iter().find(|(id, _)| id == "mirror_2").unwrap().1;
+    let mp = mirrored.mass_properties().expect("closed mirrored mesh");
+    assert!(
+        (mp.centroid[0] - 2.0).abs() < 1.0e-3,
+        "reflection centroid -1 translated +3 should be x=2, got {}",
+        mp.centroid[0]
+    );
+}
+
+#[test]
+fn mirror_join_unions_connected_copy_into_source_body() {
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_1", 2.0, 2.0, 2.0);
+    let source = g
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .unwrap();
+    let side = source[0]
+        .1
+        .face_refs
+        .iter()
+        .find(|face| face.normal[0] > 0.99)
+        .expect("box +X face");
+    let face = FaceRef {
+        centroid: side.centroid,
+        normal: side.normal,
+        topology: Some(TopologyFaceRef {
+            body_id: Some("box_1".to_string()),
+            topology_version: side.topology.as_ref().and_then(|t| t.topology_version),
+            face_id: side.topology.as_ref().and_then(|t| t.face_id.clone()),
+            surface_kind: side.topology.as_ref().and_then(|t| t.surface_kind.clone()),
+        }),
+    };
+    add_pattern(
+        &mut g,
+        "mirror_2",
+        "box_1",
+        PatternKind::Mirror {
+            plane: PlaneBase::YZ,
+            face: Some(face),
+            // Reflected [2,4] shares the source's x=2 side face.
+            offset: 0.0,
+            offset_expr: None,
+            join: true,
+        },
+    );
+
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(bodies.len(), 1, "connected mirror should become one body");
+    assert_eq!(
+        bodies[0].0, "box_1",
+        "Mirror Join modifies the source body identity"
+    );
+    let mp = bodies[0].1.mass_properties().expect("closed joined mirror");
+    assert!(
+        (mp.volume - 16.0).abs() < 0.1,
+        "joined volume {}",
+        mp.volume
+    );
+    let mirror_plane_edges = bodies[0]
+        .1
+        .edge_refs
+        .iter()
+        .filter(|edge| (edge.p0[0] - 2.0).abs() < 1.0e-3 && (edge.p1[0] - 2.0).abs() < 1.0e-3)
+        .count();
+    assert_eq!(
+        mirror_plane_edges, 0,
+        "joined mirror must not expose its internal centre seam"
+    );
+    let mirror_plane_segments = bodies[0]
+        .1
+        .edge_indices
+        .chunks_exact(2)
+        .filter(|edge| {
+            edge.iter().all(|&vertex| {
+                let base = vertex as usize * 3;
+                (bodies[0].1.edge_vertices[base] - 2.0).abs() < 1.0e-3
+            })
+        })
+        .count();
+    assert_eq!(
+        mirror_plane_segments, 0,
+        "joined mirror must not draw or pick a centre-plane segment"
+    );
+    let internal_cap_triangles = bodies[0]
+        .1
+        .indices
+        .chunks_exact(3)
+        .filter(|triangle| {
+            triangle.iter().all(|&vertex| {
+                let base = vertex as usize * 6;
+                (bodies[0].1.vertices[base] - 2.0).abs() < 1.0e-3
+            })
+        })
+        .count();
+    assert_eq!(
+        internal_cap_triangles, 0,
+        "joined mirror must remove the coincident internal cap faces"
+    );
+    assert_eq!(
+        bodies[0]
+            .1
+            .face_refs
+            .iter()
+            .filter(|face| face.normal[2] > 0.99)
+            .count(),
+        1,
+        "the coplanar top halves must be one continuous selectable face"
+    );
+}
+
+#[test]
+fn mirror_join_keeps_disconnected_copy_separate() {
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_1", 2.0, 2.0, 2.0);
+    add_pattern(
+        &mut g,
+        "mirror_2",
+        "box_1",
+        PatternKind::Mirror {
+            plane: PlaneBase::YZ,
+            face: None,
+            offset: 10.0,
+            offset_expr: None,
+            join: true,
+        },
+    );
+    let bodies = g
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(bodies.len(), 2, "disconnected mirror stays a separate body");
+    assert!(bodies.iter().any(|(id, _)| id == "box_1"));
+    assert!(bodies.iter().any(|(id, _)| id == "mirror_2"));
 }
 
 #[test]

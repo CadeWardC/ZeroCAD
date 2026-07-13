@@ -128,8 +128,7 @@ pub fn meshes_to_3mf<'a>(meshes: impl IntoIterator<Item = (&'a str, &'a MockMesh
             owned.push((name.to_string(), tri));
         }
     }
-    let refs: Vec<(String, &TriangleMesh)> =
-        owned.iter().map(|(n, m)| (n.clone(), m)).collect();
+    let refs: Vec<(String, &TriangleMesh)> = owned.iter().map(|(n, m)| (n.clone(), m)).collect();
     openrcad::exchange::to_3mf_bytes(&refs)
 }
 

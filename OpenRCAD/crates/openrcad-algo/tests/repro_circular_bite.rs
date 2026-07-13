@@ -78,8 +78,8 @@ fn bite_wall_stays_on_cylinder(s: &Solid) -> bool {
 
 #[test]
 fn straddling_cylinder_cut_is_watertight_and_healthy() {
-    let bite = circular_bite_cut()
-        .unwrap_or_else(|e| panic!("circular-bite cut must succeed: {e}"));
+    let bite =
+        circular_bite_cut().unwrap_or_else(|e| panic!("circular-bite cut must succeed: {e}"));
     assert!(bite.is_watertight(), "circular bite must be watertight");
     assert!(
         bite.health_report().is_healthy(),
@@ -90,8 +90,8 @@ fn straddling_cylinder_cut_is_watertight_and_healthy() {
 
 #[test]
 fn straddling_cylinder_cut_keeps_analytic_bite_wall() {
-    let bite = circular_bite_cut()
-        .unwrap_or_else(|e| panic!("circular-bite cut must succeed: {e}"));
+    let bite =
+        circular_bite_cut().unwrap_or_else(|e| panic!("circular-bite cut must succeed: {e}"));
 
     // The concave wall must survive as analytic radius-14 cylinder(s) about the
     // vertical cut axis. If the bite collapsed to a box there would be none.

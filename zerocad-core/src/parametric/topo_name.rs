@@ -119,7 +119,10 @@ impl std::fmt::Display for TopoName {
                 role,
                 occ,
             } => {
-                write!(f, "sketch:{body}:region:{region}:fragment:{fragment}:role:{role}")?;
+                write!(
+                    f,
+                    "sketch:{body}:region:{region}:fragment:{fragment}:role:{role}"
+                )?;
                 if let Some(n) = occ {
                     write!(f, ":occ:{n}")?;
                 }
@@ -283,7 +286,13 @@ mod tests {
 
     #[test]
     fn unrecognized_names_pass_through_verbatim() {
-        for s in ["", "weird", "sketch:broken", "mesh:not-a-number", "box_:face:+x"] {
+        for s in [
+            "",
+            "weird",
+            "sketch:broken",
+            "mesh:not-a-number",
+            "box_:face:+x",
+        ] {
             let parsed = TopoName::parse(s);
             assert_eq!(parsed.to_string(), s, "lossless for out-of-grammar input");
             assert!(!parsed.is_durable());

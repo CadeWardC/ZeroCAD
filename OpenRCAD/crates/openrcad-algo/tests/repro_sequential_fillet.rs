@@ -461,20 +461,14 @@ fn fillet_three_edges_makes_spherical_corner() {
 
 /// Two perpendicular top edges sharing a corner, filleted with DIFFERENT radii
 /// (front-top r=4, then the surviving right-top r=2). The corner is convex and
-/// perpendicular but NOT equal-radius, so the analytic equal-radius miter/sphere
-/// must NOT engage — yet the corner must still close into a smooth, watertight,
-/// crack-free blend (the Fusion behaviour), not the flat-trim crease + spike.
+/// perpendicular but NOT equal-radius, so the equal-radius ellipse/sphere must
+/// NOT engage.  The two cylinders instead share their sampled quartic miter seam
+/// and run out to the remaining sharp edge on the limiting side plane.
 ///
 /// Regression for Issue A ("close to the miter it becomes flat + artifact"): the
 /// flatten/crack came from the equal-radius gate bailing to `trim_face_at_corner`.
 ///
-/// IGNORED: tracks the unimplemented general (unequal-radius) vertex blend. The
-/// two fillets are mutually-tangent cylinders of different radii whose exact
-/// corner seam is a sphere∩cylinder quartic — a dedicated feature, not yet built.
-/// Today the kernel closes this corner watertight via the flat-trim fallback (so
-/// it is valid, just creased); this test asserts the rounded result we still owe.
 #[test]
-#[ignore = "general unequal-radius vertex blend not yet implemented (creases, but stays watertight)"]
 fn fillet_two_unequal_radius_perpendicular_corner() {
     let (w, h, d, r1, r2) = (40.0_f64, 30.0, 20.0, 4.0, 2.0);
     let cube = make_box(&Pnt::origin(), w, h, d);
@@ -519,17 +513,60 @@ fn fillet_two_unequal_radius_perpendicular_corner() {
         0,
         "unequal-radius corner must not fan coincident flat triangles (the flat-trim crease)"
     );
-    // The corner is NOT equal-radius, so the analytic equal-radius sphere must not
-    // fire; the general corner patch fills it instead.
+    // The corner is NOT equal-radius, so neither equal-radius closure applies.
     assert_eq!(
         spheres(&s),
         0,
         "unequal-radius corner must not use the equal-radius sphere"
     );
+    assert!(
+        s.edges()
+            .iter()
+            .any(|edge| matches!(edge.curve(), Some(GeomCurve::BSpline(_)))),
+        "the unequal-radius corner must carry its quartic miter seam"
+    );
+}
+
+/// A larger second radius used to leave four open render-mesh seams even though
+/// the corresponding smaller-second-radius order happened to close through the
+/// legacy flat-cap fallback.  Both orders must build the same kind of valid
+/// unequal-radius corner transition.
+#[test]
+fn fillet_two_unequal_radius_perpendicular_corner_larger_second_radius() {
+    let (w, h, d, r1, r2) = (40.0_f64, 30.0, 20.0, 4.0, 6.0);
+    let cube = make_box(&Pnt::origin(), w, h, d);
+
+    let front_top = Edge::between_points(Pnt::new(0.0, 0.0, d), Pnt::new(w, 0.0, d));
+    let s1 = fillet_planar_edge(&cube, &front_top, r1).expect("first fillet (r=4)");
+
+    let right_top = s1
+        .edges()
+        .into_iter()
+        .find(|e| {
+            let on = |p: Pnt| (p.x() - w).abs() < 1e-6 && (p.z() - d).abs() < 1e-6;
+            on(e.source().point()) && on(e.target().point())
+        })
+        .expect("right-top edge must survive fillet 1");
+
+    let s = fillet_edges(&s1, std::slice::from_ref(&right_top), r2)
+        .expect("larger second fillet must miter into the established fillet");
+    describe("after fillet 2 (right-top r=6)", &s);
+    assert!(s.is_watertight(), "unequal-radius miter must be watertight");
+    assert!(
+        s.health_report().is_healthy(),
+        "unequal-radius miter must be healthy"
+    );
+    assert_eq!(cracks(&s), 0, "unequal-radius miter must be crack-free");
     assert_eq!(
-        gregory_patches(&s),
-        1,
-        "the unequal-radius corner must close with one general (Gregory) corner patch"
+        nonmanifold(&s),
+        0,
+        "unequal-radius miter must remain manifold"
+    );
+    assert!(
+        s.edges()
+            .iter()
+            .any(|edge| matches!(edge.curve(), Some(GeomCurve::BSpline(_)))),
+        "the larger-radius corner must carry its quartic miter seam"
     );
 }
 

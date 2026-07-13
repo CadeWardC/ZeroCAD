@@ -58,6 +58,7 @@ fn variable_rect_graph(w0: f32) -> ParametricGraph {
                 from_center: false,
             }],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -198,11 +199,9 @@ fn circle_then_rect_graph(w0: f32) -> ParametricGraph {
                 },
             ],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
-            entity_ids: vec![
-                crate::sketch::EntityId(0),
-                crate::sketch::EntityId(1),
-            ],
+            entity_ids: vec![crate::sketch::EntityId(0), crate::sketch::EntityId(1)],
             next_entity_id: 2,
             solver: None,
         },
@@ -366,12 +365,8 @@ fn primitive_box_edge_reattaches_after_resize() {
         .iter()
         .find(|e| {
             e.topology.as_ref().is_some_and(|t| {
-                t.adjacent_face_ids
-                    .iter()
-                    .any(|f| f.ends_with(":face:+x"))
-                    && t.adjacent_face_ids
-                        .iter()
-                        .any(|f| f.ends_with(":face:+y"))
+                t.adjacent_face_ids.iter().any(|f| f.ends_with(":face:+x"))
+                    && t.adjacent_face_ids.iter().any(|f| f.ends_with(":face:+y"))
             })
         })
         .expect("box should expose the +x/+y edge by face pair")
@@ -492,9 +487,14 @@ fn cut_walls_carry_generated_names_and_survive_upstream_edit() {
 fn clean_model_reports_all_features_resolved() {
     let g = variable_rect_graph(20.0);
     let (_bodies, warnings, statuses) = g.evaluate_bodies_with_status(&no_hidden()).unwrap();
-    assert!(warnings.is_empty(), "clean model has no warnings, got {warnings:?}");
     assert!(
-        statuses.iter().all(|s| s.state == ResolutionState::Resolved),
+        warnings.is_empty(),
+        "clean model has no warnings, got {warnings:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|s| s.state == ResolutionState::Resolved),
         "every feature of a clean model must be Resolved, got {statuses:?}"
     );
     assert!(
@@ -624,9 +624,19 @@ fn targeted_cut_ignores_a_bystander_body() {
     };
     let b_before = tri_count(&g, "extrude_4");
 
-    add_extrude_targeted(&mut g, "extrude_6", "sketch_5", 8.0, ExtrudeMode::Cut, Some("extrude_2"));
+    add_extrude_targeted(
+        &mut g,
+        "extrude_6",
+        "sketch_5",
+        8.0,
+        ExtrudeMode::Cut,
+        Some("extrude_2"),
+    );
     let (_, warnings) = g.evaluate_bodies_with_warnings(&no_hidden()).unwrap();
-    assert!(warnings.is_empty(), "targeted cut applies cleanly, got {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "targeted cut applies cleanly, got {warnings:?}"
+    );
     assert_eq!(
         tri_count(&g, "extrude_4"),
         b_before,
@@ -645,7 +655,14 @@ fn cut_with_missing_target_fails_loud_and_touches_nothing() {
     add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (20.0, 12.0)));
     add_extrude(&mut g, "extrude_2", "sketch_1", 8.0, ExtrudeMode::NewBody);
     add_sketch(&mut g, "sketch_3", rect_sketch((8.0, 4.0), (12.0, 8.0)));
-    add_extrude_targeted(&mut g, "extrude_4", "sketch_3", 8.0, ExtrudeMode::Cut, Some("gone_99"));
+    add_extrude_targeted(
+        &mut g,
+        "extrude_4",
+        "sketch_3",
+        8.0,
+        ExtrudeMode::Cut,
+        Some("gone_99"),
+    );
 
     let (bodies, _warnings, statuses) = g.evaluate_bodies_with_status(&no_hidden()).unwrap();
     let cut = statuses
@@ -769,6 +786,7 @@ fn solved_rect_graph(w0: f64) -> ParametricGraph {
             curves: SketchCurves::new(),
             shapes,
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
             entity_ids: ids,
             next_entity_id: next,
@@ -813,7 +831,11 @@ fn conflicting_sketch_degrades_to_last_valid_and_reports_unresolved() {
     // Sabotage: a second, contradictory width dimension (also variable-bound so
     // evaluation re-solves rather than trusting stored positions).
     for idx in g.graph.node_indices() {
-        if let FeatureType::Sketch { solver: Some(model), .. } = &mut g.graph[idx].feature {
+        if let FeatureType::Sketch {
+            solver: Some(model),
+            ..
+        } = &mut g.graph[idx].feature
+        {
             let (a, b) = (model.points[0].id, model.points[1].id);
             model.constraints.push(crate::sketch::Constraint::Distance {
                 id: crate::sketch::EntityId(900),
@@ -968,7 +990,10 @@ fn face_reattaches_through_added_cut() {
     add_extrude(&mut g, "extrude_5", "sketch_4", 8.0, ExtrudeMode::Cut);
 
     let (live, warnings) = g.build_live(&no_hidden(), false).unwrap();
-    assert!(warnings.is_empty(), "cut should apply cleanly, got {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "cut should apply cleanly, got {warnings:?}"
+    );
     let resolved = resolve_face_ref_by_topology(&live[0], &face)
         .expect("captured top face must survive the cut via name propagation");
     assert!(
@@ -1015,7 +1040,11 @@ fn face_survives_a_severing_cut() {
     };
 
     // A through-slot (x 9..11, full y and z) severs the bar into [0,9] and [11,20].
-    add_sketch(&mut g, "slot_sketch", rect_sketch((9.0, -2.0), (11.0, 12.0)));
+    add_sketch(
+        &mut g,
+        "slot_sketch",
+        rect_sketch((9.0, -2.0), (11.0, 12.0)),
+    );
     add_extrude(&mut g, "slot", "slot_sketch", 10.0, ExtrudeMode::Cut);
 
     let (live, _warnings) = g.build_live(&no_hidden(), false).unwrap();
@@ -1068,15 +1097,27 @@ fn sketch_on_face_plane_follows_the_body() {
     };
 
     // A sketch on that face + a boss extruded from it.
-    add_sketch(&mut g, "on_face_sketch", rect_sketch((2.0, 2.0), (6.0, 6.0)));
-    g.sketch_face_refs.insert("on_face_sketch".to_string(), face);
+    add_sketch(
+        &mut g,
+        "on_face_sketch",
+        rect_sketch((2.0, 2.0), (6.0, 6.0)),
+    );
+    g.sketch_face_refs
+        .insert("on_face_sketch".to_string(), face);
     g.add_dependency("base", "on_face_sketch");
     add_extrude(&mut g, "boss", "on_face_sketch", 3.0, ExtrudeMode::NewBody);
 
     let boss_base_z = |g: &ParametricGraph| -> f32 {
         let bodies = g.evaluate_bodies(&no_hidden()).unwrap();
-        let boss = bodies.iter().find(|(id, _)| id == "boss").expect("boss body");
-        boss.1.vertices.chunks(6).map(|v| v[2]).fold(f32::MAX, f32::min)
+        let boss = bodies
+            .iter()
+            .find(|(id, _)| id == "boss")
+            .expect("boss body");
+        boss.1
+            .vertices
+            .chunks(6)
+            .map(|v| v[2])
+            .fold(f32::MAX, f32::min)
     };
 
     assert!(

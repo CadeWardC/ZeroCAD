@@ -15,10 +15,23 @@ pub(crate) struct DimField {
     #[allow(dead_code)]
     pub(crate) label: &'static str,
     pub(crate) value: String,
+    /// Angle fields use degrees; every other sketch dimension follows the
+    /// document's selected length unit.
+    pub(crate) is_angle: bool,
     /// True once the user pressed Enter on it — its value is fixed.
     pub(crate) locked: bool,
     /// True once the user typed in it — stop overwriting it with the live value.
     pub(crate) edited: bool,
+}
+
+impl DimField {
+    /// Turn a displayed dimension into an editor. Because a display-only box
+    /// has no caret position, the first typed text replaces its shown value.
+    fn begin_text_entry(&mut self) {
+        self.value.clear();
+        self.locked = false;
+        self.edited = true;
+    }
 }
 
 /// Fusion 360-style inline dimension inputs shown at edge midpoints during
@@ -30,16 +43,75 @@ pub(crate) struct DimInput {
     pub(crate) focus_request: Option<usize>,
     /// Which field is currently active (receives keyboard input).
     pub(crate) active_field: usize,
-    /// True on the frame a field just received focus — triggers select-all.
-    pub(crate) select_all: bool,
+    /// The field currently rendered as a text editor. A selected field remains
+    /// a display-only box until the user actually starts typing.
+    pub(crate) editing_field: Option<usize>,
+}
+
+impl DimInput {
+    /// Focus is requested only when a field first opens or Tab activates it.
+    fn requests_focus(&self, field: usize) -> bool {
+        self.focus_request == Some(field)
+    }
+
+    fn begin_active_text_entry(&mut self) {
+        if self.fields.is_empty() || self.editing_field == Some(self.active_field) {
+            return;
+        }
+        self.fields[self.active_field].begin_text_entry();
+        self.editing_field = Some(self.active_field);
+        self.focus_request = Some(self.active_field);
+    }
+
+    /// Tab cycles through every field, including completed fields. Keeping the
+    /// completed value intact until typing begins makes navigation reversible.
+    fn select_adjacent(&mut self, backwards: bool) {
+        if self.fields.is_empty() {
+            return;
+        }
+        self.active_field = if backwards {
+            (self.active_field + self.fields.len() - 1) % self.fields.len()
+        } else {
+            (self.active_field + 1) % self.fields.len()
+        };
+        self.editing_field = None;
+        self.focus_request = None;
+    }
+
+    /// Lock the active value and select the next unfinished dimension. Returns
+    /// true once every field is complete.
+    fn commit_active(&mut self) -> bool {
+        if self.fields.is_empty() {
+            return false;
+        }
+        let active = self.active_field;
+        self.fields[active].locked = true;
+        self.fields[active].edited = true;
+        self.editing_field = None;
+        self.focus_request = None;
+
+        for offset in 1..=self.fields.len() {
+            let next = (active + offset) % self.fields.len();
+            if !self.fields[next].locked {
+                self.active_field = next;
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Build the dimension fields for a tool.
 pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
-    let labels: &[&'static str] = match tool {
-        SketchTool::Rectangle | SketchTool::RectangleCenter => &["Width", "Height"],
-        SketchTool::Circle => &["Diameter"],
-        SketchTool::Line => &["Length", "Angle (°)"],
+    let fields: &[(&'static str, bool)] = match tool {
+        SketchTool::Rectangle | SketchTool::RectangleCenter => {
+            &[("Width", false), ("Height", false)]
+        }
+        SketchTool::Circle => &[("Diameter", false)],
+        SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => {
+            &[("Guide diameter", false)]
+        }
+        SketchTool::Line => &[("Length", false), ("Angle (°)", true)],
         // 3-point tools (rotated rectangle, 3-point circle, ellipses) draw by
         // clicking points; the corner tools (fillet/chamfer) take their radius
         // from the toolbar. None use inline dimension fields.
@@ -47,17 +119,16 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
         | SketchTool::ThreePointCircle
         | SketchTool::Ellipse
         | SketchTool::ThreePointEllipse
-        | SketchTool::PolygonInscribed
-        | SketchTool::PolygonCircumscribed
         | SketchTool::Mirror
         | SketchTool::Fillet
         | SketchTool::Chamfer => &[],
     };
-    labels
+    fields
         .iter()
-        .map(|&label| DimField {
+        .map(|&(label, is_angle)| DimField {
             label,
             value: String::new(),
+            is_angle,
             locked: false,
             edited: false,
         })
@@ -67,8 +138,9 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
 impl ZeroCadApp {
     /// Render Fusion 360-style inline dimension inputs at shape edge midpoints.
     /// Only shown while drawing (before the shape is finalized). Each field
-    /// appears as a small input box at the edge midpoint. The active field has a
-    /// blue border and its text is selected so typing replaces the value.
+    /// appears as a small box at the edge midpoint. The selected field has an
+    /// orange outline but remains display-only (with no caret) until typing
+    /// starts; the first typed character replaces its displayed value.
     /// Tab switches fields, Enter locks a field (finalizes when all locked),
     /// Escape cancels.
     pub(crate) fn show_dimension_dialog(&mut self, ctx: &egui::Context) {
@@ -80,6 +152,7 @@ impl ZeroCadApp {
         // and the shared autocomplete state while the per-field closures hold
         // `&mut self`.
         let var_names = self.visible_variable_names();
+        let var_map = self.visible_variable_map();
         let mut ac = self.autocomplete.take();
         // Set when the autocomplete swallowed Enter/Tab to accept a suggestion,
         // so that key isn't also treated as "lock field" / "next field".
@@ -87,13 +160,19 @@ impl ZeroCadApp {
 
         let field_count = self.dim_input.as_ref().map(|d| d.fields.len()).unwrap_or(0);
         let active = self.dim_input.as_ref().map(|d| d.active_field).unwrap_or(0);
-        let do_select_all = self
-            .dim_input
-            .as_ref()
-            .map(|d| d.select_all)
-            .unwrap_or(false);
-        let focus_req = self.dim_input.as_ref().and_then(|d| d.focus_request);
-
+        let starts_typing = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Text(text) | egui::Event::Paste(text) if !text.is_empty()
+                )
+            })
+        });
+        if starts_typing {
+            if let Some(dim) = self.dim_input.as_mut() {
+                dim.begin_active_text_entry();
+            }
+        }
         let unit_suffix = match self.current_unit {
             Unit::Millimeter => " mm",
             Unit::Inch => " in",
@@ -109,6 +188,19 @@ impl ZeroCadApp {
                 .copied()
                 .unwrap_or(egui::pos2(100.0 + i as f32 * 120.0, 100.0));
             let is_active = i == active;
+            let is_editing = self
+                .dim_input
+                .as_ref()
+                .is_some_and(|dim| dim.editing_field == Some(i));
+            let field_suffix = if self
+                .dim_input
+                .as_ref()
+                .is_some_and(|dim| dim.fields[i].is_angle)
+            {
+                " °"
+            } else {
+                unit_suffix
+            };
 
             // Read field state for rendering.
             let is_locked = self
@@ -116,21 +208,23 @@ impl ZeroCadApp {
                 .as_ref()
                 .map(|d| d.fields[i].locked)
                 .unwrap_or(false);
+            let req_focus = self
+                .dim_input
+                .as_ref()
+                .map(|d| d.requests_focus(i))
+                .unwrap_or(false);
 
-            // Fusion 360 style: active = blue border, inactive = subtle gray.
-            let border_color = if is_active && !is_locked {
-                egui::Color32::from_rgb(0, 120, 215)
+            // The orange outline marks keyboard selection without implying that
+            // the display-only box is already a focused input.
+            let border_color = if is_active {
+                egui::Color32::from_rgb(245, 135, 25)
             } else if is_locked {
                 egui::Color32::from_rgb(100, 160, 100)
             } else {
                 egui::Color32::from_rgb(160, 160, 160)
             };
-            let border_width = if is_active && !is_locked { 1.5 } else { 1.0 };
-            let bg = if is_active && !is_locked {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_rgb(245, 245, 245)
-            };
+            let border_width = if is_active { 1.5 } else { 1.0 };
+            let bg = egui::Color32::from_rgb(245, 245, 245);
 
             let area_id = egui::Id::new("dim_inline").with(i);
             egui::Area::new(area_id)
@@ -153,37 +247,55 @@ impl ZeroCadApp {
                                         egui::Stroke::NONE;
                                     ui.style_mut().visuals.widgets.hovered.bg_stroke =
                                         egui::Stroke::NONE;
-                                    ui.style_mut().visuals.selection.bg_fill =
-                                        egui::Color32::from_rgb(0, 120, 215).linear_multiply(0.3);
 
-                                    // Force-focus the active field; keep its text
-                                    // selected until the user starts typing.
-                                    let req_focus =
-                                        focus_req == Some(i) || (is_active && !is_locked);
-                                    let sel_all = do_select_all || !f.edited;
                                     let field_id = egui::Id::new(("sketch_dim_field", i));
-                                    let outcome = crate::expr::autocomplete_field(
-                                        ui,
-                                        field_id,
-                                        &mut f.value,
-                                        50.0,
-                                        false,
-                                        req_focus,
-                                        sel_all,
-                                        &var_names,
-                                        &mut ac,
-                                    );
-                                    if outcome.response.changed() || outcome.accepted {
-                                        f.edited = true;
+                                    if is_editing {
+                                        // Focus before laying out TextEdit so the event that
+                                        // initiated editing is accepted on this same frame.
+                                        if req_focus {
+                                            ui.memory_mut(|memory| memory.request_focus(field_id));
+                                        }
+                                        let outcome = crate::expr::autocomplete_field(
+                                            ui,
+                                            field_id,
+                                            &mut f.value,
+                                            50.0,
+                                            false,
+                                            false,
+                                            false,
+                                            &var_names,
+                                            &mut ac,
+                                        );
+                                        if outcome.response.changed() || outcome.accepted {
+                                            f.edited = true;
+                                        }
+                                        if outcome.accepted_via_key {
+                                            suppress_keys = true;
+                                        }
+                                    } else {
+                                        ui.add_sized(
+                                            [50.0, ui.spacing().interact_size.y],
+                                            egui::Label::new(
+                                                egui::RichText::new(&f.value)
+                                                    .color(egui::Color32::from_rgb(30, 30, 30)),
+                                            ),
+                                        );
                                     }
-                                    if outcome.accepted_via_key {
-                                        suppress_keys = true;
+
+                                    if zerocad_core::expr::preserves_source(&f.value) {
+                                        if let Ok(value) = crate::expr::eval(&f.value, &var_map) {
+                                            ui.label(
+                                                egui::RichText::new(format!("= {value:.2}"))
+                                                    .color(egui::Color32::from_rgb(70, 120, 70))
+                                                    .size(11.0),
+                                            );
+                                        }
                                     }
                                 }
 
                                 // Unit suffix label.
                                 ui.label(
-                                    egui::RichText::new(unit_suffix)
+                                    egui::RichText::new(field_suffix)
                                         .color(egui::Color32::from_rgb(120, 120, 120))
                                         .size(11.0),
                                 );
@@ -192,10 +304,9 @@ impl ZeroCadApp {
                 });
         }
 
-        // Clear pending focus/select-all (applied above) and stash autocomplete.
+        // Clear the one-shot focus request and stash autocomplete.
         if let Some(d) = self.dim_input.as_mut() {
             d.focus_request = None;
-            d.select_all = false;
         }
         self.autocomplete = ac;
 
@@ -206,41 +317,24 @@ impl ZeroCadApp {
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let tab = ctx.input(|i| i.key_pressed(egui::Key::Tab));
 
-        // Tab: advance to the next unlocked field.
+        // Tab cycles through all fields. This intentionally includes completed
+        // fields so a user can return to one and replace its value by typing.
         if tab && !suppress_keys && field_count > 0 {
             if let Some(dim) = self.dim_input.as_mut() {
-                let mut next = (active + 1) % field_count;
-                for _ in 0..field_count {
-                    if !dim.fields[next].locked {
-                        break;
-                    }
-                    next = (next + 1) % field_count;
-                }
-                dim.active_field = next;
-                dim.focus_request = Some(next);
-                dim.select_all = true;
+                let backwards = ctx.input(|i| i.modifiers.shift);
+                dim.select_adjacent(backwards);
             }
+            self.autocomplete = None;
         }
 
         // Enter: lock the active field, advance to the next, or finalize.
         if enter && !suppress_keys {
             if let Some(dim) = self.dim_input.as_mut() {
-                let a = dim.active_field;
-                if a < dim.fields.len() && !dim.fields[a].locked {
-                    dim.fields[a].locked = true;
-                    dim.fields[a].edited = true;
-                    let next = (0..dim.fields.len()).find(|&j| !dim.fields[j].locked);
-                    let all_locked = next.is_none();
-                    if let Some(n) = next {
-                        dim.active_field = n;
-                        dim.focus_request = Some(n);
-                        dim.select_all = true;
-                    }
-                    if all_locked {
-                        let start = self.sketch_temp_start.unwrap_or((0.0, 0.0));
-                        let cursor = self.last_cursor.unwrap_or((start.0 + 1.0, start.1 + 1.0));
-                        self.finalize_shape(cursor);
-                    }
+                let all_locked = dim.commit_active();
+                if all_locked {
+                    let start = self.sketch_temp_start.unwrap_or((0.0, 0.0));
+                    let cursor = self.last_cursor.unwrap_or((start.0 + 1.0, start.1 + 1.0));
+                    self.finalize_shape(cursor);
                 }
             }
         }
@@ -258,6 +352,115 @@ impl ZeroCadApp {
             } else {
                 "Shape cancelled.".to_string()
             };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dim_fields_for, DimField, DimInput};
+    use crate::{SketchTool, ZeroCadApp};
+
+    fn dimension_input(focus_request: Option<usize>) -> DimInput {
+        DimInput {
+            fields: ["Width", "Height"]
+                .into_iter()
+                .map(|label| DimField {
+                    label,
+                    value: "12.34".to_string(),
+                    is_angle: false,
+                    locked: false,
+                    edited: false,
+                })
+                .collect(),
+            focus_request,
+            active_field: 0,
+            editing_field: None,
+        }
+    }
+
+    #[test]
+    fn selected_dimension_is_display_only_until_typing_replaces_seed() {
+        let mut dim = dimension_input(Some(0));
+        assert!(dim.requests_focus(0));
+        assert!(!dim.requests_focus(1));
+        assert_eq!(dim.editing_field, None);
+
+        // The field remains active after the request is consumed without a
+        // visible select-all state.
+        dim.focus_request = None;
+        assert_eq!(dim.active_field, 0);
+        assert!(!dim.requests_focus(0));
+
+        dim.begin_active_text_entry();
+        assert_eq!(dim.editing_field, Some(0));
+        assert!(dim.fields[0].edited);
+        assert!(dim.fields[0].value.is_empty());
+    }
+
+    #[test]
+    fn selected_box_only_creates_and_focuses_editor_when_typing_starts() {
+        let mut app = ZeroCadApp::new();
+        app.is_sketch_mode = true;
+        app.dim_input = Some(dimension_input(None));
+        app.dim_screen_positions = vec![egui::pos2(100.0, 100.0), egui::pos2(220.0, 100.0)];
+
+        let ctx = egui::Context::default();
+        let field_id = egui::Id::new(("sketch_dim_field", 0));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_dimension_dialog(ctx);
+        });
+        assert!(!ctx.memory(|memory| memory.has_focus(field_id)));
+        assert_eq!(app.dim_input.as_ref().unwrap().editing_field, None);
+
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Text("7".to_string()));
+        let _ = ctx.run(input, |ctx| {
+            app.show_dimension_dialog(ctx);
+        });
+
+        let dim = app.dim_input.as_ref().unwrap();
+        assert_eq!(dim.editing_field, Some(0));
+        assert_eq!(dim.fields[0].value, "7");
+        assert!(ctx.memory(|memory| memory.has_focus(field_id)));
+    }
+
+    #[test]
+    fn tab_can_return_to_a_completed_dimension_for_replacement() {
+        let mut dim = dimension_input(None);
+        assert!(!dim.commit_active());
+        assert!(dim.fields[0].locked);
+        assert_eq!(dim.active_field, 1);
+
+        dim.select_adjacent(false);
+        assert_eq!(dim.active_field, 0);
+        assert!(dim.fields[0].locked);
+        assert_eq!(dim.editing_field, None);
+
+        dim.begin_active_text_entry();
+        assert!(!dim.fields[0].locked);
+        assert_eq!(dim.editing_field, Some(0));
+        assert!(dim.fields[0].value.is_empty());
+    }
+
+    #[test]
+    fn line_angle_field_uses_degrees_instead_of_length_units() {
+        let fields = dim_fields_for(SketchTool::Line);
+        assert_eq!(fields.len(), 2);
+        assert!(!fields[0].is_angle);
+        assert!(fields[1].is_angle);
+    }
+
+    #[test]
+    fn polygon_uses_one_guide_diameter_field() {
+        for tool in [
+            SketchTool::PolygonInscribed,
+            SketchTool::PolygonCircumscribed,
+        ] {
+            let fields = dim_fields_for(tool);
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].label, "Guide diameter");
+            assert!(!fields[0].is_angle);
         }
     }
 }

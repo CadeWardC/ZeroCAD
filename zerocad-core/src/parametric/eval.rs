@@ -10,10 +10,44 @@ impl ParametricGraph {
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
             pending_face_reattach: RefCell::new(FaceReattach::default()),
-            eval_cache: RefCell::new(EvalCache::default()),
+            eval_cache: RefCell::new(std::sync::Arc::new(EvalCache::default())),
         };
         pg.bootstrap_origin();
         pg
+    }
+
+    /// Clone only authoritative document state, dropping all derived caches.
+    /// Undo/autosave paths must use this instead of `Clone`: an evaluation cache
+    /// can contain many checkpoint bodies and meshes that serde would skip only
+    /// *after* paying to deep-clone them.
+    pub fn clone_document(&self) -> Self {
+        let mut graph = Self {
+            graph: self.graph.clone(),
+            sketch_face_refs: self.sketch_face_refs.clone(),
+            sketch_datum_refs: self.sketch_datum_refs.clone(),
+            sketch_face_boundaries: self.sketch_face_boundaries.clone(),
+            node_map: HashMap::new(),
+            region_cache: RefCell::new(HashMap::new()),
+            pending_face_reattach: RefCell::new(FaceReattach::default()),
+            eval_cache: RefCell::new(std::sync::Arc::new(EvalCache::default())),
+        };
+        graph.rebuild_node_map();
+        graph
+    }
+
+    /// Copy the current derived evaluator state for transfer between graph
+    /// clones or optional hydrated document caches.
+    pub fn evaluation_cache_snapshot(&self) -> EvaluationCacheSnapshot {
+        EvaluationCacheSnapshot {
+            cache: self.eval_cache.borrow().clone(),
+        }
+    }
+
+    /// Seed this graph with a cache created from an equivalent recipe. Prefix
+    /// keys are validated lazily by the next evaluation, so stale data can
+    /// never be applied to a changed model.
+    pub fn install_evaluation_cache(&self, snapshot: EvaluationCacheSnapshot) {
+        *self.eval_cache.borrow_mut() = snapshot.cache;
     }
 
     /// Add base coordinate system planes
@@ -98,6 +132,13 @@ impl ParametricGraph {
     /// callers should NOT push an undo step for it.
     pub fn apply_face_reattach(&mut self) -> bool {
         let pending = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
+        self.apply_face_reattach_updates(pending)
+    }
+
+    /// Apply reattachment updates produced by an evaluation of a graph clone.
+    /// The GUI's background evaluator uses this only for the still-current
+    /// generation, so updates can never cross from a stale model revision.
+    pub fn apply_face_reattach_updates(&mut self, pending: FaceReattach) -> bool {
         if pending.boundaries.is_empty() && pending.region_indices.is_empty() {
             return false;
         }
@@ -241,10 +282,105 @@ impl ParametricGraph {
             .eval_cache
             .borrow()
             .checkpoints
-            .last()
+            .iter()
+            .rev()
+            .flatten()
+            .next()
             .map(|cp| cp.statuses.clone())
             .unwrap_or_default();
         Ok((tessellate_bodies(live), warnings, statuses))
+    }
+
+    /// Cancellable, timed evaluator used by interactive schedulers. Existing
+    /// `evaluate_bodies*` methods remain the compatibility/final-quality API.
+    pub fn evaluate_request(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        quality: EvaluationQuality,
+        cancellation: &EvaluationCancellation,
+    ) -> Result<EvaluationOutput, EvaluationError> {
+        let total_started = std::time::Instant::now();
+        let draft = quality == EvaluationQuality::Interactive;
+        let run_inner = || {
+            if cancellation.is_cancelled() {
+                return Err(EvaluationError::Cancelled);
+            }
+            let build_started = std::time::Instant::now();
+            let (live, warnings) = self
+                .build_live_with_cancel(hidden, draft, Some(cancellation))
+                .map_err(|message| {
+                    if cancellation.is_cancelled() {
+                        EvaluationError::Cancelled
+                    } else {
+                        EvaluationError::Failed(message)
+                    }
+                })?;
+            let build = build_started.elapsed();
+            let statuses = self
+                .eval_cache
+                .borrow()
+                .checkpoints
+                .iter()
+                .rev()
+                .flatten()
+                .next()
+                .map(|cp| cp.statuses.clone())
+                .unwrap_or_default();
+            let diagnostics = statuses
+                .iter()
+                .filter_map(|status| {
+                    status.reason().map(|message| EvaluationDiagnostic {
+                        feature_id: status.feature_id.clone(),
+                        operation: "feature evaluation".to_string(),
+                        failure_class: "unresolved_feature".to_string(),
+                        fallback: Some("kept last valid body".to_string()),
+                        severity: DiagnosticSeverity::Warning,
+                        message: message.to_string(),
+                    })
+                })
+                .collect();
+            let feature_timings = self
+                .eval_cache
+                .borrow()
+                .checkpoints
+                .iter()
+                .enumerate()
+                .filter_map(|(i, checkpoint)| {
+                    checkpoint.as_ref().map(|checkpoint| FeatureTiming {
+                        feature_id: self
+                            .body_nodes_in_creation_order()
+                            .get(i)
+                            .map(|idx| self.graph[*idx].id.clone())
+                            .unwrap_or_default(),
+                        duration: checkpoint.feature_duration,
+                    })
+                })
+                .collect();
+            let tess_started = std::time::Instant::now();
+            let bodies = tessellate_bodies_with_cancel(live, Some(cancellation))?;
+            let tessellation = tess_started.elapsed();
+            let face_reattach = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
+            Ok(EvaluationOutput {
+                bodies,
+                warnings,
+                statuses,
+                diagnostics,
+                face_reattach,
+                timings: EvaluationTimings {
+                    total: total_started.elapsed(),
+                    build,
+                    tessellation,
+                },
+                feature_timings,
+                cache_snapshot: self.evaluation_cache_snapshot(),
+            })
+        };
+        let run = || crate::mock_kernel::with_kernel_cancellation(cancellation.clone(), run_inner);
+        if draft {
+            crate::mock_kernel::with_preview_tess(run)
+        } else {
+            run()
+        }
     }
 
     /// **Draft** evaluation for live previews (a fillet drag, an extrude
@@ -286,8 +422,20 @@ impl ParametricGraph {
         hidden: &std::collections::HashSet<String>,
         draft: bool,
     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
-        let (live, warnings) = self.build_live(hidden, draft)?;
-        Ok((tessellate_bodies(live), warnings))
+        let run = || -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+            let (live, warnings) = self.build_live(hidden, draft)?;
+            Ok((tessellate_bodies(live), warnings))
+        };
+        // Draft previews mesh newly-built bodies at the coarse preview budget (a
+        // fillet/chamfer/boolean preview lands ~2× faster). Draft evaluation only
+        // ever runs on a throwaway graph clone on a background worker, so the
+        // thread-local budget can't leak into the committed (fine) result, and
+        // any reused prefix checkpoint keeps whatever budget it was built at.
+        if draft {
+            crate::mock_kernel::with_preview_tess(run)
+        } else {
+            run()
+        }
     }
 
     /// Diagnostic/test only: the raw B-Rep kernel solids per body, before
@@ -307,6 +455,18 @@ impl ParametricGraph {
         hidden: &std::collections::HashSet<String>,
         draft: bool,
     ) -> Result<(Vec<LiveBody>, Vec<String>), String> {
+        self.build_live_with_cancel(hidden, draft, None)
+    }
+
+    fn build_live_with_cancel(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        draft: bool,
+        cancellation: Option<&EvaluationCancellation>,
+    ) -> Result<(Vec<LiveBody>, Vec<String>), String> {
+        if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
+            return Err("model evaluation was superseded".to_string());
+        }
         // Surface circular dependencies (toposort result is otherwise unused,
         // but a cycle should still fail the whole evaluation).
         toposort(&self.graph, None)
@@ -323,6 +483,10 @@ impl ParametricGraph {
         let mut datum_warnings = Vec::new();
         let datums = self.resolve_datums(&vars, &mut datum_warnings);
 
+        if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
+            return Err("model evaluation was superseded".to_string());
+        }
+
         // Body-eval nodes in creation order, with a cumulative content hash after
         // each one (see [`eval_prefix_keys`]). An edit that touches only a trailing
         // node — dragging a fillet/chamfer radius, say — leaves every earlier key
@@ -334,30 +498,47 @@ impl ParametricGraph {
         let (mut live, mut warnings, mut statuses, reuse, mut checkpoints) = {
             let cache = self.eval_cache.borrow();
             let cps = &cache.checkpoints;
-            let mut m = 0;
-            while m < keys.len() && m < cps.len() && keys[m] == cps[m].key {
-                m += 1;
-            }
-            if m > 0 {
-                let cp = &cps[m - 1];
+            let matched = (0..keys.len().min(cps.len()))
+                .rev()
+                .find(|&i| cps[i].as_ref().is_some_and(|cp| cp.key == keys[i]));
+            if let Some(last) = matched {
+                let cp = cps[last].as_ref().expect("matched checkpoint missing");
+                let mut retained = vec![None; keys.len()];
+                for i in 0..=last {
+                    if let Some(old) = cps.get(i).and_then(Option::as_ref) {
+                        if old.key == keys[i] {
+                            retained[i] = Some(old.clone());
+                        }
+                    }
+                }
                 (
                     cp.live.clone(),
                     cp.warnings.clone(),
                     cp.statuses.clone(),
-                    m,
-                    cps[..m].to_vec(),
+                    last + 1,
+                    retained,
                 )
             } else {
-                (Vec::new(), Vec::new(), Vec::new(), 0usize, Vec::new())
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0usize,
+                    vec![None; keys.len()],
+                )
             }
         };
 
         for (i, &idx) in nodes.iter().enumerate() {
+            if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
+                return Err("model evaluation was superseded".to_string());
+            }
             // Reused prefix: its checkpoints (and so its `live`/`warnings`) were
             // restored above; skip recomputing it.
             if i < reuse {
                 continue;
             }
+            let feature_started = std::time::Instant::now();
             let node = &self.graph[idx];
             let warn_before = warnings.len();
             if !hidden.contains(&node.id) {
@@ -389,11 +570,12 @@ impl ParametricGraph {
                         live.push(LiveBody {
                             id: node.id.clone(),
                             parts: vec![solid],
-                            pristine: Some(pristine),
+                            pristine: Some(pristine.into()),
                             sketch_source: Some(source),
                             cut_tools: Vec::new(),
                             cut_replay: None,
                             edge_mod_cut_history_path_used: false,
+                            thread_replay: None,
                         });
                     }
                     FeatureType::Cylinder { r, h } => {
@@ -408,11 +590,12 @@ impl ParametricGraph {
                             live.push(LiveBody {
                                 id: node.id.clone(),
                                 parts: vec![solid],
-                                pristine: Some(pristine),
+                                pristine: Some(pristine.into()),
                                 sketch_source: None,
                                 cut_tools: Vec::new(),
                                 cut_replay: None,
                                 edge_mod_cut_history_path_used: false,
+                                thread_replay: None,
                             });
                         }
                     }
@@ -433,11 +616,12 @@ impl ParametricGraph {
                                 live.push(LiveBody {
                                     id: node.id.clone(),
                                     parts: vec![solid],
-                                    pristine: Some(pristine),
+                                    pristine: Some(pristine.into()),
                                     sketch_source: None,
                                     cut_tools: Vec::new(),
                                     cut_replay: None,
                                     edge_mod_cut_history_path_used: false,
+                                    thread_replay: None,
                                 });
                             }
                             Err(e) => warnings.push(format!(
@@ -481,6 +665,7 @@ impl ParametricGraph {
                             target.as_deref(),
                             &sketch_cache,
                             &datums,
+                            draft,
                             &mut live,
                             &mut warnings,
                         );
@@ -528,6 +713,66 @@ impl ParametricGraph {
                             kind,
                             &vars,
                             &datums,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::BodyTransform {
+                        source,
+                        translation,
+                        copy,
+                    } => {
+                        apply_body_transform(
+                            &node.id,
+                            source,
+                            *translation,
+                            *copy,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::BodyJoin { sources } => {
+                        apply_body_join(&node.id, sources, &mut live, &mut warnings);
+                    }
+                    FeatureType::BodyCut {
+                        target,
+                        tool,
+                        keep_tool,
+                    } => {
+                        apply_body_cut(
+                            &node.id,
+                            target,
+                            tool,
+                            *keep_tool,
+                            &mut live,
+                            &mut warnings,
+                        );
+                    }
+                    FeatureType::Thread {
+                        target,
+                        face,
+                        internal,
+                        pitch,
+                        depth,
+                        angle_deg,
+                        right_handed,
+                        starts,
+                        length,
+                        flip,
+                        ..
+                    } => {
+                        apply_thread(
+                            &node.id,
+                            target,
+                            face,
+                            *internal,
+                            *pitch,
+                            *depth,
+                            *angle_deg,
+                            *right_handed,
+                            *starts,
+                            *length,
+                            *flip,
                             &mut live,
                             &mut warnings,
                         );
@@ -690,15 +935,16 @@ impl ParametricGraph {
             }
             // Snapshot the assembled bodies after this node so a later evaluation
             // that shares this prefix can resume from here.
-            checkpoints.push(EvalCheckpoint {
+            checkpoints[i] = Some(EvalCheckpoint {
                 key: keys[i],
                 live: live.clone(),
                 warnings: warnings.clone(),
                 statuses: statuses.clone(),
+                feature_duration: feature_started.elapsed(),
             });
         }
 
-        *self.eval_cache.borrow_mut() = EvalCache { checkpoints };
+        *self.eval_cache.borrow_mut() = std::sync::Arc::new(EvalCache { checkpoints });
 
         if !datum_warnings.is_empty() {
             datum_warnings.extend(warnings);
@@ -823,6 +1069,7 @@ impl ParametricGraph {
                 curves,
                 shapes,
                 corner_mods,
+                mirrors,
                 entity_ids,
                 solver,
                 ..
@@ -836,6 +1083,7 @@ impl ParametricGraph {
                     curves,
                     shapes,
                     corner_mods,
+                    mirrors,
                     solver.as_ref(),
                     vars,
                 );
@@ -846,13 +1094,18 @@ impl ParametricGraph {
                 // uses, so the region indices stored on extrudes stay
                 // consistent. `effective` itself stays drawn-only (the shape
                 // recognizers downstream depend on that).
-                let face_boundary = self.sketch_face_boundaries.get(&self.graph[idx].id).cloned();
+                let face_boundary = self
+                    .sketch_face_boundaries
+                    .get(&self.graph[idx].id)
+                    .cloned();
                 // Fail-loud: a variable-driven constraint model that no longer
                 // solves keeps its last-valid geometry, and the failure reason
                 // rides along so the consuming extrude can report it.
                 let solve_failure = solver
                     .as_ref()
-                    .filter(|m| !m.is_empty() && crate::sketch::solve::has_variable_bound_constraint(m))
+                    .filter(|m| {
+                        !m.is_empty() && crate::sketch::solve::has_variable_bound_constraint(m)
+                    })
                     .and_then(|m| {
                         let report = crate::sketch::solve_model(m, vars);
                         match report.outcome {
@@ -861,18 +1114,18 @@ impl ParametricGraph {
                                 "its constraints did not converge; keeping the last valid geometry"
                                     .to_string(),
                             ),
-                            crate::sketch::SolveOutcome::Conflicting => Some(match report
-                                .conflicting
-                            {
-                                Some(id) => format!(
+                            crate::sketch::SolveOutcome::Conflicting => {
+                                Some(match report.conflicting {
+                                    Some(id) => format!(
                                     "its constraints conflict (constraint {}); keeping the last \
                                      valid geometry",
                                     id.0
                                 ),
-                                None => "its constraints conflict; keeping the last valid \
+                                    None => "its constraints conflict; keeping the last valid \
                                          geometry"
-                                    .to_string(),
-                            }),
+                                        .to_string(),
+                                })
+                            }
                         }
                     });
                 let regions = match &face_boundary {
@@ -883,8 +1136,7 @@ impl ParametricGraph {
                     }
                     None => self.cached_regions(&effective),
                 };
-                let provenance =
-                    build_region_provenance(&effective, shapes, entity_ids, &regions);
+                let provenance = build_region_provenance(&effective, shapes, entity_ids, &regions);
                 // Whole-shape outlines drive the overlapping-shapes-as-boolean
                 // path. Sketch fillets/chamfers (`corner_mods`) reshape the
                 // displayed geometry, which the raw shape outlines wouldn't
@@ -946,10 +1198,14 @@ impl ParametricGraph {
                         | FeatureType::Import { .. }
                         | FeatureType::Revolve { .. }
                         | FeatureType::Pattern { .. }
+                        | FeatureType::BodyTransform { .. }
+                        | FeatureType::BodyJoin { .. }
+                        | FeatureType::BodyCut { .. }
                         | FeatureType::Hole { .. }
                         | FeatureType::Shell { .. }
                         | FeatureType::Loft { .. }
                         | FeatureType::Sweep { .. }
+                        | FeatureType::Thread { .. }
                 )
             })
             .collect();
@@ -972,6 +1228,7 @@ impl ParametricGraph {
         boolean_target: Option<&str>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         datums: &HashMap<String, DatumValue>,
+        draft: bool,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
     ) {
@@ -1003,18 +1260,19 @@ impl ParametricGraph {
         // attachment re-derives from wherever the face is now; otherwise the
         // sketch's saved plane. A datum that no longer resolves fails loud and
         // falls back to the saved plane snapshot.
-        let datum_cs = self.sketch_datum_refs.get(sketch_id).and_then(|datum_id| {
-            match datums.get(datum_id) {
-                Some(DatumValue::Plane(cs)) => Some(*cs),
-                _ => {
-                    warnings.push(format!(
-                        "Extrude '{node_id}': sketch '{sketch_id}' is attached to datum plane \
+        let datum_cs =
+            self.sketch_datum_refs
+                .get(sketch_id)
+                .and_then(|datum_id| match datums.get(datum_id) {
+                    Some(DatumValue::Plane(cs)) => Some(*cs),
+                    _ => {
+                        warnings.push(format!(
+                            "Extrude '{node_id}': sketch '{sketch_id}' is attached to datum plane \
                          '{datum_id}', which did not resolve; using the sketch's saved plane."
-                    ));
-                    None
-                }
-            }
-        });
+                        ));
+                        None
+                    }
+                });
         let cs_owned = datum_cs
             .or_else(|| {
                 self.sketch_face_refs
@@ -1078,9 +1336,7 @@ impl ParametricGraph {
                     let selection_survives = region_indices.is_empty() || !remapped.is_empty();
                     if !fresh_regions.is_empty() && selection_survives {
                         let mut pending = self.pending_face_reattach.borrow_mut();
-                        pending
-                            .boundaries
-                            .insert(sketch_id.clone(), fresh_boundary);
+                        pending.boundaries.insert(sketch_id.clone(), fresh_boundary);
                         pending.planes.insert(sketch_id.clone(), *cs);
                         if remapped != region_indices {
                             pending
@@ -1112,41 +1368,15 @@ impl ParametricGraph {
         // extrude, which already turns a rect-with-circular-bite region into a
         // clean box-minus-cylinder. Empty `shape_loops` (legacy sketch / sketch
         // corner-mods) leaves every region on the normal selection path.
-        let take_all = region_indices.is_empty();
-        let loops = &sketch.shape_loops;
-        let clusters = if loops.is_empty() {
-            Vec::new()
-        } else {
-            crate::sketch::overlap_clusters(loops)
-        };
-        let mut shape_cluster = vec![usize::MAX; loops.len()];
-        for (ci, c) in clusters.iter().enumerate() {
-            for &s in c {
-                shape_cluster[s] = ci;
-            }
-        }
-        let cluster_is_multi: Vec<bool> = clusters.iter().map(|c| c.len() >= 2).collect();
-        let selected_mask = selected_shape_mask(regions, region_indices, loops);
         // Per region: is it part of a multi-shape boolean cluster, and (if so)
         // should it be kept? `region_is_boolean` regions ignore `region_indices`
-        // (the shape selection decides); other regions use the normal rule.
-        let mut region_is_boolean = vec![false; regions.len()];
-        let mut process_region = vec![false; regions.len()];
-        for (i, r) in regions.iter().enumerate() {
-            let interior = region_material_point(r);
-            let containing = region_containing_shapes(interior, loops);
-            let in_multi = containing
-                .iter()
-                .any(|&s| cluster_is_multi[shape_cluster[s]]);
-            if in_multi {
-                let in_base = containing.iter().any(|&s| selected_mask[s]);
-                let in_tool = containing.iter().any(|&s| !selected_mask[s]);
-                region_is_boolean[i] = true;
-                process_region[i] = in_base && !in_tool;
-            } else {
-                process_region[i] = take_all || region_indices.contains(&i);
-            }
-        }
+        // (the shape selection decides); other regions use the normal rule. This
+        // is the SAME classification the live extrude ghost uses, so a preview
+        // keeps exactly the regions this commit will (see `boolean_region_plan`).
+        let loops = &sketch.shape_loops;
+        let plan = crate::parametric::extrude::boolean_region_plan(loops, regions, region_indices);
+        let region_is_boolean = plan.is_boolean;
+        let process_region = plan.process;
         // Did any boolean-cluster region get built in NewBody mode? Its adjacent
         // kept pieces are fused at the end so a unioned cluster reads as one solid.
         let mut newbody_has_boolean = false;
@@ -1191,7 +1421,113 @@ impl ParametricGraph {
         let mut newbody_body_count = 0usize;
         let mut newbody_cut_replay: Option<CutReplayHistory> = None;
 
+        // An open construction/projected line can partition a drawn circle into
+        // two or more selected regions. Extruding those pieces independently
+        // leaves touching half-cylinders (and their diameter/generator seams)
+        // when the kernel cannot fuse an exactly coincident interface. When every
+        // atomic region inside a circle is selected for New Body or Join,
+        // reconstruct the original circle as one analytic cylinder and skip its
+        // fragments below.
+        let mut collapsed_circle_regions: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        if matches!(
+            mode,
+            ExtrudeMode::NewBody | ExtrudeMode::Join | ExtrudeMode::Cut
+        ) {
+            for (circle, inside) in crate::parametric::extrude::complete_selected_circles(
+                &sketch.curves.circles,
+                regions,
+                &process_region,
+            ) {
+                let boundary: Vec<(f32, f32)> = (0..crate::CIRCLE_SEGS)
+                    .map(|i| {
+                        let angle = i as f32 / crate::CIRCLE_SEGS as f32 * std::f32::consts::TAU;
+                        (
+                            circle.center.0 + circle.radius * angle.cos(),
+                            circle.center.1 + circle.radius * angle.sin(),
+                        )
+                    })
+                    .collect();
+                let smooth = crate::mock_kernel::circular_cylinder_tool(&boundary, &[], depth, cs);
+                if let Some(solid) = smooth {
+                    match mode {
+                        ExtrudeMode::NewBody => {
+                            newbody_tools.push(solid);
+                            newbody_body_count += 1;
+                        }
+                        ExtrudeMode::Join => {
+                            let dipped = crate::mock_kernel::circular_cylinder_tool(
+                                &boundary,
+                                &[],
+                                overshoot_depth(depth, 1.0),
+                                &overshoot_cs(cs, depth),
+                            );
+                            join_tools.push(JoinTool {
+                                smooth: Some(solid),
+                                exact: None,
+                                dipped,
+                            });
+                        }
+                        ExtrudeMode::Cut => {
+                            let (cut_cs, cut_depth) = directional_cut(cs, depth);
+                            let smooth = crate::mock_kernel::circular_cylinder_tool(
+                                &boundary,
+                                &[],
+                                cut_depth,
+                                &cut_cs,
+                            );
+                            let exact = crate::mock_kernel::extruded_region_solid(
+                                &boundary,
+                                &[],
+                                cut_depth,
+                                &cut_cs,
+                            );
+                            let grown = grow_loop(&boundary, true);
+                            let expanded = crate::mock_kernel::extruded_region_solid(
+                                &grown,
+                                &[],
+                                cut_depth,
+                                &cut_cs,
+                            );
+                            let (rev_cs, rev_depth) = directional_cut(cs, -depth);
+                            let smooth_rev = crate::mock_kernel::circular_cylinder_tool(
+                                &boundary,
+                                &[],
+                                rev_depth,
+                                &rev_cs,
+                            );
+                            let exact_rev = crate::mock_kernel::extruded_region_solid(
+                                &boundary,
+                                &[],
+                                rev_depth,
+                                &rev_cs,
+                            );
+                            let expanded_rev = crate::mock_kernel::extruded_region_solid(
+                                &grown,
+                                &[],
+                                rev_depth,
+                                &rev_cs,
+                            );
+                            cut_tools.push(CutTool {
+                                smooth,
+                                exact,
+                                expanded,
+                                smooth_rev,
+                                exact_rev,
+                                expanded_rev,
+                                circle: Some(circle),
+                            });
+                        }
+                    }
+                    collapsed_circle_regions.extend(inside);
+                }
+            }
+        }
+
         for (i, region) in regions.iter().enumerate() {
+            if collapsed_circle_regions.contains(&i) {
+                continue;
+            }
             if !process_region[i] {
                 continue;
             }
@@ -1202,7 +1538,10 @@ impl ParametricGraph {
             // (see `build_region_provenance`), so when a refreshed face outline
             // yields MORE regions than the snapshot had, the extras borrow the
             // first entry rather than losing recognizer support.
-            let provenance = sketch.provenance.get(i).or_else(|| sketch.provenance.first());
+            let provenance = sketch
+                .provenance
+                .get(i)
+                .or_else(|| sketch.provenance.first());
             match mode {
                 ExtrudeMode::NewBody => {
                     // A filleted profile (analytic corner arcs) is NOT a rectangle
@@ -1432,24 +1771,30 @@ impl ParametricGraph {
 
         match mode {
             ExtrudeMode::NewBody => {
-                if newbody_has_boolean {
-                    // Fuse the cluster's adjacent kept regions so a union reads as
-                    // one solid for later edge-mods. The clean per-region analytic
-                    // mesh accumulated in `newbody_mesh` still drives display
-                    // (kept as `pristine`), so this only affects the kernel parts.
+                let before_fuse = newbody_tools.len();
+                if newbody_has_boolean || before_fuse > 1 {
+                    // Disjoint lumps remain separate; adjacent/touching sketch
+                    // regions are offered to the union builder so their shared
+                    // boundary becomes internal topology.
                     newbody_tools = fuse_overlapping_solids(newbody_tools);
                 }
+                let merged_regions = newbody_tools.len() < before_fuse;
                 if !newbody_tools.is_empty() {
                     live.push(LiveBody {
                         id: node_id.to_string(),
                         parts: newbody_tools,
-                        pristine: (!newbody_mesh.indices.is_empty()).then_some(newbody_mesh),
+                        // Per-region meshes retain the shared sketch boundary.
+                        // Tessellate the fused B-Rep after a successful union so
+                        // a continuous coplanar face has no internal display edge.
+                        pristine: (!merged_regions && !newbody_mesh.indices.is_empty())
+                            .then(|| std::sync::Arc::new(newbody_mesh)),
                         sketch_source: (!sketch_source.regions.is_empty()).then_some(sketch_source),
                         cut_tools: newbody_cut_tools,
                         cut_replay: (newbody_body_count == 1)
                             .then_some(())
                             .and(newbody_cut_replay),
                         edge_mod_cut_history_path_used: false,
+                        thread_replay: None,
                     });
                 }
             }
@@ -1462,19 +1807,81 @@ impl ParametricGraph {
                         warnings.push(format!(
                             "{} '{node_id}': its target body '{target_id}' no longer \
                              exists, so it had no effect.",
-                            if mode == ExtrudeMode::Cut { "Cut" } else { "Join" },
+                            if mode == ExtrudeMode::Cut {
+                                "Cut"
+                            } else {
+                                "Join"
+                            },
                         ));
                         return;
                     }
                 }
                 if mode == ExtrudeMode::Join {
-                    apply_join(live, node_id, join_tools, boolean_target, warnings);
+                    apply_join(live, node_id, join_tools, boolean_target, draft, warnings);
                 } else {
-                    apply_cut(live, node_id, cut_tools, boolean_target, warnings);
+                    apply_cut(live, node_id, cut_tools, boolean_target, draft, warnings);
                 }
             }
         }
     }
+}
+
+/// Apply a persistent rigid translation to a live body. A copy leaves the
+/// source untouched; a move consumes it and gives the transform node the new
+/// body identity so subsequent features can target the moved result.
+fn apply_body_transform(
+    node_id: &str,
+    source: &str,
+    translation: [f32; 3],
+    copy: bool,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(source_index) = live.iter().position(|body| body.id == source) else {
+        warnings.push(format!(
+            "Body transform '{node_id}': source body '{source}' no longer exists."
+        ));
+        return;
+    };
+    let source_body = live[source_index].clone();
+    if source_body.parts.is_empty() {
+        warnings.push(format!(
+            "Body transform '{node_id}': source body '{source}' has no solid geometry."
+        ));
+        return;
+    }
+
+    use openrcad::foundation::{Trsf, Vec as GeomVec};
+    let transform = Trsf::translation(GeomVec::new(
+        translation[0] as f64,
+        translation[1] as f64,
+        translation[2] as f64,
+    ));
+    let parts: Vec<KernelSolid> = source_body
+        .parts
+        .iter()
+        .map(|part| crate::mock_kernel::transformed_solid(part, &transform, false))
+        .collect();
+    let mut mesh = MockMesh::empty();
+    for part in &parts {
+        let mut part_mesh = MockMesh::from_solid(part);
+        stamp_pattern_face_refs(&mut part_mesh, node_id, 0);
+        crate::mock_kernel::populate_edge_adjacent_face_names(&mut part_mesh);
+        mesh.append(part_mesh);
+    }
+    if !copy {
+        live.remove(source_index);
+    }
+    live.push(LiveBody {
+        id: node_id.to_string(),
+        parts,
+        pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
+        sketch_source: None,
+        cut_tools: Vec::new(),
+        cut_replay: None,
+        edge_mod_cut_history_path_used: false,
+        thread_replay: None,
+    });
 }
 
 impl ParametricGraph {
@@ -1515,12 +1922,13 @@ impl ParametricGraph {
         }
         // Same plane priority as extrude: datum attachment, face attachment,
         // saved plane.
-        let datum_cs = self.sketch_datum_refs.get(sketch_id).and_then(|datum_id| {
-            match datums.get(datum_id) {
-                Some(DatumValue::Plane(cs)) => Some(*cs),
-                _ => None,
-            }
-        });
+        let datum_cs =
+            self.sketch_datum_refs
+                .get(sketch_id)
+                .and_then(|datum_id| match datums.get(datum_id) {
+                    Some(DatumValue::Plane(cs)) => Some(*cs),
+                    _ => None,
+                });
         let cs_owned = datum_cs
             .or_else(|| {
                 self.sketch_face_refs
@@ -1623,11 +2031,13 @@ impl ParametricGraph {
                     live.push(LiveBody {
                         id: node_id.to_string(),
                         parts: newbody_parts,
-                        pristine: (!newbody_mesh.indices.is_empty()).then_some(newbody_mesh),
+                        pristine: (!newbody_mesh.indices.is_empty())
+                            .then(|| std::sync::Arc::new(newbody_mesh)),
                         sketch_source: None,
                         cut_tools: Vec::new(),
                         cut_replay: None,
                         edge_mod_cut_history_path_used: false,
+                        thread_replay: None,
                     });
                 }
             }
@@ -1647,9 +2057,9 @@ impl ParametricGraph {
                     }
                 }
                 if mode == ExtrudeMode::Join {
-                    apply_join(live, node_id, join_tools, boolean_target, warnings);
+                    apply_join(live, node_id, join_tools, boolean_target, false, warnings);
                 } else {
-                    apply_cut(live, node_id, cut_tools, boolean_target, warnings);
+                    apply_cut(live, node_id, cut_tools, boolean_target, false, warnings);
                 }
             }
         }
@@ -1668,13 +2078,13 @@ impl ParametricGraph {
         datums: &HashMap<String, DatumValue>,
         live: &[LiveBody],
     ) -> CoordinateSystem {
-        let datum_cs = self
-            .sketch_datum_refs
-            .get(sketch_id)
-            .and_then(|datum_id| match datums.get(datum_id) {
-                Some(DatumValue::Plane(cs)) => Some(*cs),
-                _ => None,
-            });
+        let datum_cs =
+            self.sketch_datum_refs
+                .get(sketch_id)
+                .and_then(|datum_id| match datums.get(datum_id) {
+                    Some(DatumValue::Plane(cs)) => Some(*cs),
+                    _ => None,
+                });
         datum_cs
             .or_else(|| {
                 self.sketch_face_refs
@@ -1785,9 +2195,11 @@ impl ParametricGraph {
             ));
             return;
         };
-        let path_3d: Vec<Vec3> = path_2d.iter().map(|&(u, v)| path_cs.unproject(u, v)).collect();
-        let Some(solid) =
-            crate::mock_kernel::swept_solid(&profile_cs, &region.boundary, &path_3d)
+        let path_3d: Vec<Vec3> = path_2d
+            .iter()
+            .map(|&(u, v)| path_cs.unproject(u, v))
+            .collect();
+        let Some(solid) = crate::mock_kernel::swept_solid(&profile_cs, &region.boundary, &path_3d)
         else {
             warnings.push(format!(
                 "Sweep '{node_id}': the profile could not be swept along the path \
@@ -1825,11 +2237,12 @@ impl ParametricGraph {
                 live.push(LiveBody {
                     id: node_id.to_string(),
                     parts: vec![solid],
-                    pristine: Some(mesh),
+                    pristine: Some(mesh.into()),
                     sketch_source: None,
                     cut_tools: Vec::new(),
                     cut_replay: None,
                     edge_mod_cut_history_path_used: false,
+                    thread_replay: None,
                 });
             }
             ExtrudeMode::Join | ExtrudeMode::Cut => {
@@ -1851,6 +2264,7 @@ impl ParametricGraph {
                             dipped: None,
                         }],
                         boolean_target,
+                        false,
                         warnings,
                     );
                 } else {
@@ -1859,6 +2273,7 @@ impl ParametricGraph {
                         node_id,
                         vec![CutTool::single_direction(None, Some(solid), None, None)],
                         boolean_target,
+                        false,
                         warnings,
                     );
                 }
@@ -2063,12 +2478,8 @@ fn apply_hole(
             }
         }
     }
-    let bore = crate::mock_kernel::cylinder_tool_at(
-        start,
-        dir,
-        diameter as f64 / 2.0,
-        bore_len as f64,
-    );
+    let bore =
+        crate::mock_kernel::cylinder_tool_at(start, dir, diameter as f64 / 2.0, bore_len as f64);
     match bore {
         Some(tool) => cut_tools.push(CutTool::single_direction(Some(tool), None, None, None)),
         None => {
@@ -2076,7 +2487,206 @@ fn apply_hole(
             return;
         }
     }
-    apply_cut(live, node_id, cut_tools, Some(target), warnings);
+    apply_cut(live, node_id, cut_tools, Some(target), false, warnings);
+}
+
+/// Evaluate one Thread node: model a helical thread on a cylindrical face of the
+/// target body. A helical-tool boolean against a smooth cylinder is neither
+/// robust nor fast in this kernel, so threads are modeled **directly** with
+/// analytic helix-railed faces (see [`crate::mock_kernel::thread_wall_faces`]):
+/// an EXTERNAL thread on a plain cylinder body replaces the whole part with a
+/// threaded cylinder; an INTERNAL thread (tapped hole) — or an external thread
+/// on a boss — replaces just the body's cylindrical wall faces and re-sews
+/// (see [`crate::mock_kernel::threaded_replace_cylinder_wall`]). If neither
+/// path closes watertight the body is left intact with a cosmetic note — the
+/// honest fallback the user opted into.
+#[allow(clippy::too_many_arguments)]
+fn apply_thread(
+    node_id: &str,
+    target: &str,
+    face: &FaceRef,
+    internal: bool,
+    pitch: f32,
+    depth: f32,
+    angle_deg: f32,
+    right_handed: bool,
+    starts: u32,
+    length: Option<f32>,
+    flip: bool,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    if pitch <= 1e-3 || depth <= 1e-3 || angle_deg <= 0.0 || angle_deg >= 180.0 {
+        warnings.push(format!(
+            "Thread '{node_id}': needs positive pitch/depth and an angle in (0, 180)."
+        ));
+        return;
+    }
+    let Some(bi) = live.iter().position(|b| b.id == target) else {
+        warnings.push(format!(
+            "Thread '{node_id}': its target body '{target}' no longer exists."
+        ));
+        return;
+    };
+
+    let step = ThreadReplayStep {
+        face: face.clone(),
+        internal,
+        pitch,
+        depth,
+        angle_deg,
+        right_handed,
+        starts,
+        length,
+        flip,
+    };
+
+    // Snapshot the smooth pre-thread solids the FIRST time this body is threaded,
+    // *before* `thread_one` mutates `parts`. A later Join/Cut runs its boolean
+    // against these instead of the helical bands, then replays the thread steps.
+    let base_snapshot = live[bi]
+        .thread_replay
+        .is_none()
+        .then(|| live[bi].parts.clone());
+
+    match thread_one(&mut live[bi], &step) {
+        Ok(()) => {
+            let tr = live[bi].thread_replay.get_or_insert_with(|| ThreadReplay {
+                base_parts: base_snapshot.unwrap_or_default(),
+                steps: Vec::new(),
+            });
+            tr.steps.push(step);
+        }
+        Err(ThreadFailure::NoCylinderFace) => warnings.push(format!(
+            "Thread '{node_id}': no cylindrical face found near the selection — thread left cosmetic."
+        )),
+        Err(ThreadFailure::WallReplaceFailed) => warnings.push(format!(
+            "Thread '{node_id}': modeled as cosmetic — the thread wall could not be cut into this \
+             body's cylindrical face (interrupted wall or too-short thread length)."
+        )),
+    }
+}
+
+/// Why a single thread application could not cut real geometry (see
+/// [`thread_one`]). Both outcomes leave the body's `parts` untouched, so the
+/// caller keeps the un-threaded solid rather than losing it.
+pub(crate) enum ThreadFailure {
+    /// No cylindrical face resolved near the selection on any part.
+    NoCylinderFace,
+    /// The face resolved but the analytic wall replacement didn't close
+    /// watertight (interrupted wall, crossing feature, or too-short window).
+    WallReplaceFailed,
+}
+
+/// Apply ONE thread step to `body` in place: resolve the cylindrical wall it
+/// targets, build the [`crate::mock_kernel::ThreadSpec`], replace the wall with
+/// analytic helix-railed faces, and refresh the body's pristine mesh. Only
+/// mutates `body` on success, so a failure leaves the input geometry intact.
+///
+/// Shared by the graph-driven [`apply_thread`] and by the Join/Cut replay path,
+/// which re-runs each stored step against a freshly-booleaned smooth base so a
+/// threaded body can still absorb later booleans (see [`ThreadReplay`]).
+pub(crate) fn thread_one(
+    body: &mut LiveBody,
+    step: &ThreadReplayStep,
+) -> Result<(), ThreadFailure> {
+    // Resolve the selected cylindrical face and which part it belongs to. A
+    // single LiveBody may contain several disjoint/boolean-fallback parts. Do
+    // not stop at the first part that happens to contain a cylinder: the thread
+    // preview captured a real point on the picked wall, so rank the best
+    // cylinder from EVERY part by its distance from that point. The axial term
+    // also disambiguates coaxial walls with the same radius but different spans.
+    let selection_error = |info: &crate::mock_kernel::CylinderFaceInfo| {
+        let p = step.face.centroid;
+        let rel = [
+            p[0] - info.origin[0],
+            p[1] - info.origin[1],
+            p[2] - info.origin[2],
+        ];
+        let axial = rel[0] * info.dir[0] + rel[1] * info.dir[1] + rel[2] * info.dir[2];
+        let radial_vec = [
+            rel[0] - info.dir[0] * axial,
+            rel[1] - info.dir[1] * axial,
+            rel[2] - info.dir[2] * axial,
+        ];
+        let radial = (radial_vec[0] * radial_vec[0]
+            + radial_vec[1] * radial_vec[1]
+            + radial_vec[2] * radial_vec[2])
+            .sqrt();
+        let radial_error = (radial - info.radius).abs();
+        let axial_error = if axial < info.axial_min {
+            info.axial_min - axial
+        } else if axial > info.axial_max {
+            axial - info.axial_max
+        } else {
+            0.0
+        };
+        radial_error.hypot(axial_error)
+    };
+    let resolved = body
+        .parts
+        .iter()
+        .enumerate()
+        .filter_map(|(pi, part)| {
+            crate::mock_kernel::cylinder_face_near(part, step.face.centroid).map(|info| (pi, info))
+        })
+        .min_by(|(_, a), (_, b)| {
+            selection_error(a)
+                .partial_cmp(&selection_error(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    let Some((pi, info)) = resolved else {
+        return Err(ThreadFailure::NoCylinderFace);
+    };
+
+    let face_len = info.axial_max - info.axial_min;
+    let lead = step.pitch * step.starts.max(1) as f32;
+    let spec = crate::mock_kernel::ThreadSpec {
+        mean_radius: info.radius,
+        pitch: lead,
+        length: face_len,
+        depth: step.depth,
+        half_angle_deg: step.angle_deg * 0.5,
+        right_handed: step.right_handed,
+        internal: step.internal,
+        segments_per_turn: 16,
+        starts: step.starts.max(1),
+    };
+
+    // Replace the picked cylindrical wall faces (hole wall for internal, rod or
+    // boss wall for external) with the analytic thread wall and re-sew the
+    // body. Ends against a flat cap cut straight through the profile; ends
+    // against anything else (a chamfer cone, fillet torus, or a partial-length
+    // stop) fade out through a runout band into an untouched cylinder collar,
+    // so rim blends survive.
+    let Some(threaded) = crate::mock_kernel::threaded_replace_cylinder_wall(
+        &body.parts[pi],
+        &info,
+        &spec,
+        step.length.map(|l| l as f64),
+        step.flip,
+    ) else {
+        return Err(ThreadFailure::WallReplaceFailed);
+    };
+    body.parts[pi] = threaded;
+
+    // Tessellating the dense helical bands is the expensive part of a thread
+    // (hundreds of ms for a long/large one), so do it ONCE here and store it as
+    // the body's pristine mesh — identical to what `tessellate_bodies` would
+    // build from the parts, but carried by the eval checkpoints instead of
+    // being rebuilt on every evaluation (previews re-run the model constantly).
+    refresh_thread_pristine(body);
+    Ok(())
+}
+
+/// Rebuild `body.pristine` from its `parts` (the analytic mesh a threaded body
+/// carries so it need not re-tessellate the dense bands each evaluation).
+pub(crate) fn refresh_thread_pristine(body: &mut LiveBody) {
+    let mut mesh = MockMesh::empty();
+    for part in &body.parts {
+        mesh.append(MockMesh::from_solid(part));
+    }
+    body.pristine = (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh));
 }
 
 /// Evaluate one Pattern node: replicate the source BODY's solids by the
@@ -2112,6 +2722,7 @@ fn apply_pattern(
 
     // Instance transforms, EXCLUDING the identity instance 0 (that's the
     // source body itself). `(transform, is_reflection)`.
+    let mut mirror_join_plane: Option<(Vec3, Vec3)> = None;
     let transforms: Vec<(Trsf, bool)> = match kind {
         PatternKind::Linear {
             dir,
@@ -2185,15 +2796,47 @@ fn apply_pattern(
                 .map(|k| (Trsf::rotation(&ax, step * k as f64), false))
                 .collect()
         }
-        PatternKind::Mirror { plane } => {
-            let Some(cs) = super::datum::resolve_plane_base_world(plane, datums) else {
+        PatternKind::Mirror {
+            plane,
+            face,
+            offset,
+            offset_expr,
+            ..
+        } => {
+            let resolved = match face {
+                Some(face_ref) => rederive_sketch_cs(face_ref, live),
+                None => super::datum::resolve_plane_base_world(plane, datums),
+            };
+            let Some(cs) = resolved else {
                 warnings.push(format!(
                     "Pattern '{node_id}': its mirror plane could not be resolved."
                 ));
                 return;
             };
             let frame = Ax2::new(to_pnt(cs.origin), to_dir(cs.n));
-            vec![(Trsf::mirror_plane(&frame), true)]
+            let mirror = Trsf::mirror_plane(&frame);
+            let effective_offset = match offset_expr.as_ref() {
+                Some(expr) => match crate::expr::eval(expr, vars) {
+                    Ok(value) => value as f32,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "Mirror '{node_id}': offset expression \"{expr}\" no longer \
+                             evaluates; using last value {offset:.3}."
+                        ));
+                        *offset
+                    }
+                },
+                None => *offset,
+            };
+            let translation = Trsf::translation(GeomVec::new(
+                cs.n.x as f64 * effective_offset as f64,
+                cs.n.y as f64 * effective_offset as f64,
+                cs.n.z as f64 * effective_offset as f64,
+            ));
+            if effective_offset.abs() < 1.0e-4 {
+                mirror_join_plane = Some((cs.origin, cs.n));
+            }
+            vec![(translation.multiply(&mirror), true)]
         }
     };
     if transforms.is_empty() {
@@ -2219,17 +2862,809 @@ fn apply_pattern(
             new_parts.push(s);
         }
     }
+    let join_mirror = matches!(kind, PatternKind::Mirror { join: true, .. });
+    if join_mirror && !new_parts.is_empty() {
+        log::debug!(
+            "[mirror_join:{node_id}] source={source} source_parts={} mirrored_parts={} plane_origin=({:.4},{:.4},{:.4}) plane_normal=({:.4},{:.4},{:.4})",
+            parts.len(),
+            new_parts.len(),
+            mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.0).x,
+            mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.0).y,
+            mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.0).z,
+            mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.1).x,
+            mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.1).y,
+            mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.1).z,
+        );
+        if let Some(joined_parts) = try_join_mirrored_parts(node_id, &parts, &new_parts) {
+            let pristine = mirror_join_plane.map(|(origin, normal)| {
+                std::sync::Arc::new(mirror_join_display_mesh(
+                    node_id,
+                    &joined_parts,
+                    origin,
+                    normal,
+                ))
+            });
+            if let Some(source_index) = live.iter().position(|body| body.id == source) {
+                live.remove(source_index);
+            }
+            live.push(LiveBody {
+                // Mirror+Join modifies the selected source body; the Pattern node
+                // is an operation, not a second body identity.
+                id: source.to_string(),
+                parts: joined_parts,
+                pristine,
+                sketch_source: None,
+                cut_tools: Vec::new(),
+                cut_replay: None,
+                edge_mod_cut_history_path_used: false,
+                thread_replay: None,
+            });
+            log::info!(
+                "[mirror_join:{node_id}] completed as body={source} kernel_parts={} display_cleanup={}",
+                live.last().map_or(0, |body| body.parts.len()),
+                mirror_join_plane.is_some()
+            );
+            return;
+        }
+        log::warn!(
+            "[mirror_join:{node_id}] requested Join could not connect source={source}; keeping mirrored result as a separate body"
+        );
+        warnings.push(format!(
+            "Mirror '{node_id}': Join was requested, but its copy could not be connected to source body '{source}'; it remains separate."
+        ));
+    }
     if !new_parts.is_empty() {
         live.push(LiveBody {
             id: node_id.to_string(),
             parts: new_parts,
-            pristine: (!mesh.indices.is_empty()).then_some(mesh),
+            pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
             sketch_source: None,
             cut_tools: Vec::new(),
             cut_replay: None,
             edge_mod_cut_history_path_used: false,
+            thread_replay: None,
         });
     }
+}
+
+/// Strict all-or-nothing Mirror Join. Every mirrored part must produce a real
+/// union with the source (or a source+earlier-mirror union); otherwise the
+/// caller keeps both bodies separate.
+fn try_join_mirrored_parts(
+    node_id: &str,
+    source_parts: &[KernelSolid],
+    mirrored_parts: &[KernelSolid],
+) -> Option<Vec<KernelSolid>> {
+    // A joined source can itself contain several kernel parts. A reflected part
+    // may meet another reflected part before that chain reaches the source, so a
+    // greedy part-by-part connectivity check can incorrectly leave a visually
+    // joined mirror as a second body. Validate the complete contact graph once.
+    let connected_fallback = mirrored_parts_reach_source(source_parts, mirrored_parts);
+    log::debug!(
+        "[mirror_join:{node_id}] complete contact graph reaches_source={connected_fallback}"
+    );
+    let mut joined = source_parts.to_vec();
+    for (mirrored_index, mirrored) in mirrored_parts.iter().enumerate() {
+        let mirrored_bounds = crate::mock_kernel::solid_aabb(mirrored)?;
+        let mut merged = false;
+        for (source_index, source) in joined.iter_mut().enumerate() {
+            let source_bounds = crate::mock_kernel::solid_aabb(source)?;
+            if !crate::mock_kernel::aabbs_overlap(&source_bounds, &mirrored_bounds, 0.05) {
+                continue;
+            }
+            let union = match crate::mock_kernel::union_diagnostic(source, mirrored) {
+                Ok(union) => union,
+                Err(error) => {
+                    log::debug!(
+                        "[mirror_join:{node_id}] exact union failed mirrored_part={mirrored_index} source_part={source_index}: {error}"
+                    );
+                    continue;
+                }
+            };
+            let union_bounds = crate::mock_kernel::solid_aabb(&union)?;
+            if crate::mock_kernel::aabb_contains(&union_bounds, &source_bounds, 0.05)
+                && crate::mock_kernel::aabb_contains(&union_bounds, &mirrored_bounds, 0.05)
+            {
+                *source = union;
+                merged = true;
+                log::debug!(
+                    "[mirror_join:{node_id}] exact union succeeded mirrored_part={mirrored_index} source_part={source_index}"
+                );
+                break;
+            }
+            log::debug!(
+                "[mirror_join:{node_id}] rejected exact union mirrored_part={mirrored_index} source_part={source_index}: result bounds did not contain both inputs"
+            );
+        }
+        // Reflected shells can hit a guarded-boolean limitation even when their
+        // material demonstrably overlaps or they share a real face. Match the
+        // existing Join feature's safe degradation: keep both kernel parts in
+        // one selectable body, but only after a geometric connection check.
+        if !merged && connected_fallback {
+            joined.push(mirrored.clone());
+            merged = true;
+            log::debug!(
+                "[mirror_join:{node_id}] using guarded multi-part fallback for mirrored_part={mirrored_index}"
+            );
+        }
+        if !merged {
+            log::debug!(
+                "[mirror_join:{node_id}] no valid exact union or connected fallback for mirrored_part={mirrored_index}"
+            );
+            return None;
+        }
+    }
+    Some(joined)
+}
+
+fn mirrored_parts_reach_source(
+    source_parts: &[KernelSolid],
+    mirrored_parts: &[KernelSolid],
+) -> bool {
+    if source_parts.is_empty() || mirrored_parts.is_empty() {
+        return false;
+    }
+    let all: Vec<&KernelSolid> = source_parts.iter().chain(mirrored_parts).collect();
+    let bounds: Option<Vec<_>> = all
+        .iter()
+        .map(|solid| crate::mock_kernel::solid_aabb(solid))
+        .collect();
+    let Some(bounds) = bounds else {
+        return false;
+    };
+    let mut reached = vec![false; all.len()];
+    let mut queue = std::collections::VecDeque::new();
+    for i in 0..source_parts.len() {
+        reached[i] = true;
+        queue.push_back(i);
+    }
+    while let Some(i) = queue.pop_front() {
+        for j in 0..all.len() {
+            if reached[j]
+                || !crate::mock_kernel::aabbs_overlap(&bounds[i], &bounds[j], 0.05)
+                || !solids_are_connected(all[i], all[j], &bounds[i], &bounds[j])
+            {
+                continue;
+            }
+            reached[j] = true;
+            queue.push_back(j);
+        }
+    }
+    reached[source_parts.len()..].iter().all(|reached| *reached)
+}
+
+fn solids_are_connected(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    abb: &([f32; 3], [f32; 3]),
+    bbb: &([f32; 3], [f32; 3]),
+) -> bool {
+    let lo = [
+        abb.0[0].max(bbb.0[0]),
+        abb.0[1].max(bbb.0[1]),
+        abb.0[2].max(bbb.0[2]),
+    ];
+    let hi = [
+        abb.1[0].min(bbb.1[0]),
+        abb.1[1].min(bbb.1[1]),
+        abb.1[2].min(bbb.1[2]),
+    ];
+    let extent = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    if extent.iter().any(|value| *value < -0.01) {
+        return false;
+    }
+    let positive_axes = extent.iter().filter(|value| **value > 0.01).count();
+    // A shared face has area on two axes and near-zero thickness on the third.
+    if positive_axes == 2 {
+        return true;
+    }
+    if positive_axes != 3 {
+        return false;
+    }
+    // A single centre probe can land in a slot/hole even when broad mirrored
+    // plates overlap elsewhere. Sample the overlap volume deterministically.
+    const FRACTIONS: [f32; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+    let grid_overlap = FRACTIONS.iter().any(|&fx| {
+        FRACTIONS.iter().any(|&fy| {
+            FRACTIONS.iter().any(|&fz| {
+                let probe = openrcad::foundation::Pnt::new(
+                    (lo[0] + extent[0] * fx) as f64,
+                    (lo[1] + extent[1] * fy) as f64,
+                    (lo[2] + extent[2] * fz) as f64,
+                );
+                openrcad::prelude::boolean::point_in_solid(&probe, a)
+                    && openrcad::prelude::boolean::point_in_solid(&probe, b)
+            })
+        })
+    });
+    grid_overlap || solid_surface_enters_other(a, b) || solid_surface_enters_other(b, a)
+}
+
+/// Probe just inside tessellated boundary faces. This catches thin, slotted, or
+/// highly concave overlaps whose material misses a coarse AABB grid (the Razor
+/// joined mirror is one such case). Moving opposite the outward normal avoids
+/// asking the point classifier about a numerically ambiguous boundary point.
+fn solid_surface_enters_other(surface: &KernelSolid, other: &KernelSolid) -> bool {
+    let mesh = MockMesh::from_solid(surface);
+    let triangle_count = mesh.indices.len() / 3;
+    let stride = (triangle_count / 512).max(1);
+    mesh.indices
+        .chunks_exact(3)
+        .enumerate()
+        .step_by(stride)
+        .any(|(_, triangle)| {
+            let mut centroid = [0.0f32; 3];
+            let mut normal = [0.0f32; 3];
+            for &vertex in triangle {
+                let base = vertex as usize * 6;
+                for axis in 0..3 {
+                    centroid[axis] += mesh.vertices[base + axis] / 3.0;
+                    normal[axis] += mesh.vertices[base + 3 + axis] / 3.0;
+                }
+            }
+            let length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            if length < 1.0e-6 {
+                return false;
+            }
+            let probe = openrcad::foundation::Pnt::new(
+                (centroid[0] - normal[0] / length * 1.0e-3) as f64,
+                (centroid[1] - normal[1] / length * 1.0e-3) as f64,
+                (centroid[2] - normal[2] / length * 1.0e-3) as f64,
+            );
+            openrcad::prelude::boolean::point_in_solid(&probe, other)
+        })
+}
+
+/// Display mesh for Mirror+Join. Guarded boolean fallbacks can retain coincident
+/// caps and distinct face ids at the mirror plane even though they are one logical
+/// body. Remove those internal caps and merge continuous coplanar faces before
+/// suppressing the construction edge at the interface.
+fn mirror_join_display_mesh(
+    node_id: &str,
+    parts: &[KernelSolid],
+    origin: Vec3,
+    normal: Vec3,
+) -> MockMesh {
+    let mut combined = MockMesh::empty();
+    let mut removed_plane_triangles = 0usize;
+    let mut removed_plane_edges = 0usize;
+    let mut removed_overlap_edges = 0usize;
+    let raw_meshes: Vec<MockMesh> = parts.iter().map(MockMesh::from_solid).collect();
+    for (part_index, mut mesh) in raw_meshes.iter().cloned().enumerate() {
+        let triangles_before = mesh.indices.len() / 3;
+        suppress_faces_on_plane(&mut mesh, origin, normal);
+        removed_plane_triangles += triangles_before - mesh.indices.len() / 3;
+        let edges_before = mesh.edge_indices.len() / 2;
+        suppress_edges_on_plane(&mut mesh, origin, normal);
+        removed_plane_edges += edges_before - mesh.edge_indices.len() / 2;
+        let edges_before = mesh.edge_indices.len() / 2;
+        suppress_edges_inside_other_parts(&mut mesh, part_index, parts, &raw_meshes);
+        removed_overlap_edges += edges_before - mesh.edge_indices.len() / 2;
+        combined.append(mesh);
+    }
+    let faces_before = combined.face_refs.len();
+    merge_coplanar_faces_across_plane(&mut combined, origin, normal);
+    let edge_segments_before_regroup = combined.edge_indices.len() / 2;
+    let edge_groups_before_regroup = combined
+        .edge_groups
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    regroup_joined_mirror_edges(&mut combined);
+    log::debug!(
+        "[mirror_join:{node_id}] display cleanup parts={} removed_plane_triangles={} removed_plane_edges={} removed_overlap_edges={} merged_faces={} edge_segments={}->{} edge_groups={}->{} final_triangles={} final_faces={}",
+        parts.len(),
+        removed_plane_triangles,
+        removed_plane_edges,
+        removed_overlap_edges,
+        faces_before.saturating_sub(combined.face_refs.len()),
+        edge_segments_before_regroup,
+        combined.edge_indices.len() / 2,
+        edge_groups_before_regroup,
+        combined.edge_refs.len(),
+        combined.indices.len() / 3,
+        combined.face_refs.len(),
+    );
+    combined
+}
+
+/// Rebuild edge ownership after all joined-mirror parts have been combined.
+/// `MockMesh::append` deliberately keeps each input's edge groups separate; that
+/// is correct for separate bodies but leaves a continuous mirrored boundary as
+/// two selectable half-edges. Here tangent-connected and collinear-overlapping
+/// segments are unioned globally. Straight runs are collapsed to one segment;
+/// curved runs retain their chords so circle/arc fitting remains analytic.
+fn regroup_joined_mirror_edges(mesh: &mut MockMesh) {
+    let segment_count = mesh.edge_indices.len() / 2;
+    if segment_count == 0 {
+        mesh.edge_groups.clear();
+        mesh.edge_refs.clear();
+        return;
+    }
+
+    let initial =
+        crate::mock_kernel::group_edge_segments(&mesh.edge_vertices, &mesh.edge_indices, None);
+    let mut parent: Vec<usize> = (0..segment_count).collect();
+    fn find(parent: &mut [usize], mut value: usize) -> usize {
+        while parent[value] != value {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        value
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (a, b) = (find(parent, a), find(parent, b));
+        if a != b {
+            parent[a.max(b)] = a.min(b);
+        }
+    }
+    for a in 0..segment_count {
+        for b in (a + 1)..segment_count {
+            if initial[a] == initial[b] || collinear_segments_overlap(mesh, a, b) {
+                union(&mut parent, a, b);
+            }
+        }
+    }
+
+    let mut dense = std::collections::HashMap::new();
+    let mut groups = vec![0u32; segment_count];
+    let mut next = 0u32;
+    for (segment, group) in groups.iter_mut().enumerate() {
+        let root = find(&mut parent, segment);
+        *group = *dense.entry(root).or_insert_with(|| {
+            let value = next;
+            next += 1;
+            value
+        });
+    }
+
+    let mut members: std::collections::BTreeMap<u32, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (segment, group) in groups.iter().copied().enumerate() {
+        members.entry(group).or_default().push(segment);
+    }
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut normals = Vec::new();
+    let mut rebuilt_groups = Vec::new();
+    for (group, segments) in members {
+        if let Some((start, end)) = collapsed_collinear_run(mesh, &segments) {
+            let base = (vertices.len() / 3) as u32;
+            vertices.extend_from_slice(&start);
+            vertices.extend_from_slice(&end);
+            indices.extend_from_slice(&[base, base + 1]);
+            let first = segments[0];
+            if mesh.edge_face_normals.len() >= (first + 1) * 6 {
+                normals.extend_from_slice(&mesh.edge_face_normals[first * 6..first * 6 + 6]);
+            }
+            rebuilt_groups.push(group);
+        } else {
+            for segment in segments {
+                let base = (vertices.len() / 3) as u32;
+                for &vertex in &mesh.edge_indices[segment * 2..segment * 2 + 2] {
+                    let offset = vertex as usize * 3;
+                    vertices.extend_from_slice(&mesh.edge_vertices[offset..offset + 3]);
+                }
+                indices.extend_from_slice(&[base, base + 1]);
+                if mesh.edge_face_normals.len() >= (segment + 1) * 6 {
+                    normals
+                        .extend_from_slice(&mesh.edge_face_normals[segment * 6..segment * 6 + 6]);
+                }
+                rebuilt_groups.push(group);
+            }
+        }
+    }
+    mesh.edge_vertices = vertices;
+    mesh.edge_indices = indices;
+    mesh.edge_face_normals = normals;
+    mesh.edge_groups = rebuilt_groups;
+    mesh.edge_refs = crate::mock_kernel::mesh_edge_refs_from_groups(
+        &mesh.vertices,
+        &mesh.indices,
+        &mesh.edge_vertices,
+        &mesh.edge_indices,
+        &mesh.edge_face_normals,
+        &mesh.edge_groups,
+    );
+    crate::mock_kernel::populate_edge_adjacent_face_names(mesh);
+}
+
+fn edge_segment_points(mesh: &MockMesh, segment: usize) -> ([f32; 3], [f32; 3]) {
+    let read = |vertex: u32| {
+        let offset = vertex as usize * 3;
+        [
+            mesh.edge_vertices[offset],
+            mesh.edge_vertices[offset + 1],
+            mesh.edge_vertices[offset + 2],
+        ]
+    };
+    (
+        read(mesh.edge_indices[segment * 2]),
+        read(mesh.edge_indices[segment * 2 + 1]),
+    )
+}
+
+fn collinear_segments_overlap(mesh: &MockMesh, a: usize, b: usize) -> bool {
+    let ((a0, a1), (b0, b1)) = (edge_segment_points(mesh, a), edge_segment_points(mesh, b));
+    collinear_edge_points_overlap(a0, a1, b0, b1)
+}
+
+fn collinear_edge_points_overlap(a0: [f32; 3], a1: [f32; 3], b0: [f32; 3], b1: [f32; 3]) -> bool {
+    let direction = [a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]];
+    let length =
+        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
+    if length < 1.0e-6 {
+        return false;
+    }
+    let unit = [
+        direction[0] / length,
+        direction[1] / length,
+        direction[2] / length,
+    ];
+    let projection = |point: [f32; 3]| {
+        (point[0] - a0[0]) * unit[0] + (point[1] - a0[1]) * unit[1] + (point[2] - a0[2]) * unit[2]
+    };
+    let distance_to_line = |point: [f32; 3]| {
+        let t = projection(point);
+        let nearest = [
+            a0[0] + unit[0] * t,
+            a0[1] + unit[1] * t,
+            a0[2] + unit[2] * t,
+        ];
+        crate::mock_kernel::dist3(point, nearest)
+    };
+    if distance_to_line(b0) > 1.0e-3 || distance_to_line(b1) > 1.0e-3 {
+        return false;
+    }
+    let (b0, b1) = (projection(b0), projection(b1));
+    let (b_lo, b_hi) = (b0.min(b1), b0.max(b1));
+    b_hi >= -1.0e-3 && b_lo <= length + 1.0e-3
+}
+
+fn collapsed_collinear_run(mesh: &MockMesh, segments: &[usize]) -> Option<([f32; 3], [f32; 3])> {
+    let (origin, first_end) = edge_segment_points(mesh, *segments.first()?);
+    let direction = [
+        first_end[0] - origin[0],
+        first_end[1] - origin[1],
+        first_end[2] - origin[2],
+    ];
+    let length =
+        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
+    if length < 1.0e-6 {
+        return None;
+    }
+    let unit = [
+        direction[0] / length,
+        direction[1] / length,
+        direction[2] / length,
+    ];
+    let mut lo = 0.0f32;
+    let mut hi = length;
+    for &segment in segments {
+        let (a, b) = edge_segment_points(mesh, segment);
+        for point in [a, b] {
+            let t = (point[0] - origin[0]) * unit[0]
+                + (point[1] - origin[1]) * unit[1]
+                + (point[2] - origin[2]) * unit[2];
+            let nearest = [
+                origin[0] + unit[0] * t,
+                origin[1] + unit[1] * t,
+                origin[2] + unit[2] * t,
+            ];
+            if crate::mock_kernel::dist3(point, nearest) > 1.0e-3 {
+                return None;
+            }
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+    }
+    Some((
+        [
+            origin[0] + unit[0] * lo,
+            origin[1] + unit[1] * lo,
+            origin[2] + unit[2] * lo,
+        ],
+        [
+            origin[0] + unit[0] * hi,
+            origin[1] + unit[1] * hi,
+            origin[2] + unit[2] * hi,
+        ],
+    ))
+}
+
+fn plane_distance(p: [f32; 3], origin: Vec3, normal: Vec3) -> f32 {
+    (p[0] - origin.x) * normal.x + (p[1] - origin.y) * normal.y + (p[2] - origin.z) * normal.z
+}
+
+fn suppress_faces_on_plane(mesh: &mut MockMesh, origin: Vec3, normal: Vec3) {
+    let mut indices = Vec::with_capacity(mesh.indices.len());
+    let mut face_ids = Vec::with_capacity(mesh.face_ids.len());
+    for (triangle, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let on_plane = tri.iter().all(|&vertex| {
+            let base = vertex as usize * 6;
+            plane_distance(
+                [
+                    mesh.vertices[base],
+                    mesh.vertices[base + 1],
+                    mesh.vertices[base + 2],
+                ],
+                origin,
+                normal,
+            )
+            .abs()
+                < 1.0e-3
+        });
+        if !on_plane {
+            indices.extend_from_slice(tri);
+            face_ids.push(mesh.face_ids.get(triangle).copied().unwrap_or(0));
+        }
+    }
+    mesh.indices = indices;
+    mesh.face_ids = face_ids;
+    let topology: std::collections::HashMap<_, _> = mesh
+        .face_refs
+        .iter()
+        .map(|face| (face.face_id, face.topology.clone()))
+        .collect();
+    mesh.face_refs =
+        crate::mock_kernel::mesh_face_refs(&mesh.vertices, &mesh.indices, &mesh.face_ids);
+    for face in &mut mesh.face_refs {
+        face.topology = topology.get(&face.face_id).cloned().flatten();
+    }
+}
+
+fn merge_coplanar_faces_across_plane(mesh: &mut MockMesh, origin: Vec3, normal: Vec3) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut plane_points: HashMap<u32, HashSet<(i64, i64, i64)>> = HashMap::new();
+    for (triangle, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let fid = mesh.face_ids.get(triangle).copied().unwrap_or(0);
+        for &vertex in tri {
+            let base = vertex as usize * 6;
+            let p = [
+                mesh.vertices[base],
+                mesh.vertices[base + 1],
+                mesh.vertices[base + 2],
+            ];
+            if plane_distance(p, origin, normal).abs() < 1.0e-3 {
+                let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+                plane_points
+                    .entry(fid)
+                    .or_default()
+                    .insert((q(p[0]), q(p[1]), q(p[2])));
+            }
+        }
+    }
+
+    let mut face_bounds: HashMap<u32, ([f32; 3], [f32; 3])> = HashMap::new();
+    for (triangle, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let fid = mesh.face_ids.get(triangle).copied().unwrap_or(0);
+        let bounds = face_bounds
+            .entry(fid)
+            .or_insert(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]));
+        for &vertex in tri {
+            let base = vertex as usize * 6;
+            for axis in 0..3 {
+                bounds.0[axis] = bounds.0[axis].min(mesh.vertices[base + axis]);
+                bounds.1[axis] = bounds.1[axis].max(mesh.vertices[base + axis]);
+            }
+        }
+    }
+
+    let mut remap: HashMap<u32, u32> = mesh
+        .face_refs
+        .iter()
+        .map(|face| (face.face_id, face.face_id))
+        .collect();
+    for (i, a) in mesh.face_refs.iter().enumerate() {
+        for b in mesh.face_refs.iter().skip(i + 1) {
+            let dot =
+                a.normal[0] * b.normal[0] + a.normal[1] * b.normal[1] + a.normal[2] * b.normal[2];
+            let plane_delta = (a.normal[0] * (a.centroid[0] - b.centroid[0])
+                + a.normal[1] * (a.centroid[1] - b.centroid[1])
+                + a.normal[2] * (a.centroid[2] - b.centroid[2]))
+                .abs();
+            let shared = plane_points.get(&a.face_id).is_some_and(|points| {
+                plane_points
+                    .get(&b.face_id)
+                    .is_some_and(|other| points.intersection(other).take(2).count() >= 2)
+            });
+            let overlapping_footprints = face_bounds
+                .get(&a.face_id)
+                .zip(face_bounds.get(&b.face_id))
+                .is_some_and(|(a, b)| {
+                    // Coplanar faces have one near-zero local dimension. Their
+                    // remaining footprint must overlap or touch on both axes;
+                    // this joins overlapping mirror faces without grouping
+                    // unrelated coplanar faces elsewhere in the body.
+                    (0..3)
+                        .filter(|&axis| {
+                            a.1[axis].min(b.1[axis]) >= a.0[axis].max(b.0[axis]) - 1.0e-3
+                        })
+                        .count()
+                        >= 2
+                });
+            if dot > 0.999 && plane_delta < 1.0e-3 && (shared || overlapping_footprints) {
+                let canonical = remap[&a.face_id].min(remap[&b.face_id]);
+                let old_a = remap[&a.face_id];
+                let old_b = remap[&b.face_id];
+                for value in remap.values_mut() {
+                    if *value == old_a || *value == old_b {
+                        *value = canonical;
+                    }
+                }
+            }
+        }
+    }
+    for fid in &mut mesh.face_ids {
+        *fid = remap.get(fid).copied().unwrap_or(*fid);
+    }
+    let topology: HashMap<_, _> = mesh
+        .face_refs
+        .iter()
+        .filter_map(|face| {
+            face.topology
+                .clone()
+                .map(|topology| (remap[&face.face_id], topology))
+        })
+        .collect();
+    mesh.face_refs =
+        crate::mock_kernel::mesh_face_refs(&mesh.vertices, &mesh.indices, &mesh.face_ids);
+    for face in &mut mesh.face_refs {
+        face.topology = topology.get(&face.face_id).cloned();
+    }
+}
+
+fn suppress_edges_inside_other_parts(
+    mesh: &mut MockMesh,
+    owner: usize,
+    parts: &[KernelSolid],
+    raw_meshes: &[MockMesh],
+) {
+    let mut hidden_segments = std::collections::HashSet::new();
+    for (segment, pair) in mesh.edge_indices.chunks_exact(2).enumerate() {
+        let read = |vertex: u32| {
+            let base = vertex as usize * 3;
+            [
+                mesh.edge_vertices[base],
+                mesh.edge_vertices[base + 1],
+                mesh.edge_vertices[base + 2],
+            ]
+        };
+        let a = read(pair[0]);
+        let b = read(pair[1]);
+        let midpoint = [
+            (a[0] + b[0]) * 0.5,
+            (a[1] + b[1]) * 0.5,
+            (a[2] + b[2]) * 0.5,
+        ];
+        let mut probes = vec![midpoint];
+        if let Some(normals) = mesh.edge_face_normals.get(segment * 6..segment * 6 + 6) {
+            for normal in [
+                [normals[0], normals[1], normals[2]],
+                [normals[3], normals[4], normals[5]],
+            ] {
+                probes.push([
+                    midpoint[0] - normal[0] * 1.0e-3,
+                    midpoint[1] - normal[1] * 1.0e-3,
+                    midpoint[2] - normal[2] * 1.0e-3,
+                ]);
+            }
+        }
+        let inside_other = parts.iter().enumerate().any(|(index, part)| {
+            index != owner
+                && probes.iter().any(|probe| {
+                    openrcad::prelude::boolean::point_in_solid(
+                        &openrcad::foundation::Pnt::new(
+                            probe[0] as f64,
+                            probe[1] as f64,
+                            probe[2] as f64,
+                        ),
+                        part,
+                    )
+                })
+        });
+        // A coincident exterior boundary is present in both input meshes. Keep
+        // both spans for now: the global regrouping below unions/collapses them
+        // into one full edge. An internal cross-boundary has no collinear mate
+        // in the other mesh and is correctly removed here.
+        let has_coincident_exterior = raw_meshes.iter().enumerate().any(|(index, other)| {
+            index != owner
+                && (0..other.edge_indices.len() / 2).any(|other_segment| {
+                    let (c, d) = edge_segment_points(other, other_segment);
+                    collinear_edge_points_overlap(a, b, c, d)
+                })
+        });
+        if inside_other && !has_coincident_exterior {
+            hidden_segments.insert(segment);
+        }
+    }
+    if hidden_segments.is_empty() {
+        return;
+    }
+    retain_edge_segments(mesh, |segment, _| !hidden_segments.contains(&segment));
+}
+
+fn retain_edge_segments(mesh: &mut MockMesh, keep: impl Fn(usize, u32) -> bool) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut normals = Vec::new();
+    let mut groups = Vec::new();
+    for (segment, pair) in mesh.edge_indices.chunks_exact(2).enumerate() {
+        let group = mesh
+            .edge_groups
+            .get(segment)
+            .copied()
+            .unwrap_or(segment as u32);
+        if !keep(segment, group) {
+            continue;
+        }
+        let base = (vertices.len() / 3) as u32;
+        for &vertex in pair {
+            let offset = vertex as usize * 3;
+            vertices.extend_from_slice(&mesh.edge_vertices[offset..offset + 3]);
+        }
+        indices.extend_from_slice(&[base, base + 1]);
+        if mesh.edge_face_normals.len() >= (segment + 1) * 6 {
+            normals.extend_from_slice(&mesh.edge_face_normals[segment * 6..segment * 6 + 6]);
+        }
+        groups.push(group);
+    }
+    let kept: std::collections::HashSet<_> = groups.iter().copied().collect();
+    mesh.edge_refs.retain(|edge| kept.contains(&edge.group));
+    mesh.edge_vertices = vertices;
+    mesh.edge_indices = indices;
+    mesh.edge_face_normals = normals;
+    mesh.edge_groups = groups;
+}
+
+fn suppress_edges_on_plane(mesh: &mut MockMesh, origin: Vec3, normal: Vec3) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut normals = Vec::new();
+    let mut groups = Vec::new();
+    for (segment, pair) in mesh.edge_indices.chunks_exact(2).enumerate() {
+        let ia = pair[0] as usize * 3;
+        let ib = pair[1] as usize * 3;
+        let a = [
+            mesh.edge_vertices[ia],
+            mesh.edge_vertices[ia + 1],
+            mesh.edge_vertices[ia + 2],
+        ];
+        let b = [
+            mesh.edge_vertices[ib],
+            mesh.edge_vertices[ib + 1],
+            mesh.edge_vertices[ib + 2],
+        ];
+        if plane_distance(a, origin, normal).abs() < 1.0e-3
+            && plane_distance(b, origin, normal).abs() < 1.0e-3
+        {
+            continue;
+        }
+        let base = (vertices.len() / 3) as u32;
+        vertices.extend_from_slice(&a);
+        vertices.extend_from_slice(&b);
+        indices.extend_from_slice(&[base, base + 1]);
+        if mesh.edge_face_normals.len() >= (segment + 1) * 6 {
+            normals.extend_from_slice(&mesh.edge_face_normals[segment * 6..segment * 6 + 6]);
+        }
+        groups.push(
+            mesh.edge_groups
+                .get(segment)
+                .copied()
+                .unwrap_or(segment as u32),
+        );
+    }
+    let kept: std::collections::HashSet<u32> = groups.iter().copied().collect();
+    mesh.edge_refs.retain(|edge| kept.contains(&edge.group));
+    mesh.edge_vertices = vertices;
+    mesh.edge_indices = indices;
+    mesh.edge_face_normals = normals;
+    mesh.edge_groups = groups;
 }
 
 /// Tessellate each assembled body: reuse the analytic mesh when the body was
@@ -2279,7 +3714,7 @@ fn rederive_face_boundary(
         (!boundary.is_empty()).then_some(boundary)
     };
     body.pristine
-        .as_ref()
+        .as_deref()
         .and_then(pick)
         .or_else(|| pick(&edge_mod_reference_mesh(body)))
 }
@@ -2319,14 +3754,29 @@ fn cs_from_face(centroid: [f32; 3], normal: [f32; 3]) -> CoordinateSystem {
 }
 
 pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> {
+    tessellate_bodies_with_cancel(live, None).expect("uncancellable tessellation cannot cancel")
+}
+
+fn tessellate_bodies_with_cancel(
+    live: Vec<LiveBody>,
+    cancellation: Option<&EvaluationCancellation>,
+) -> Result<Vec<(String, MockMesh)>, EvaluationError> {
     let mut bodies: Vec<(String, MockMesh)> = Vec::new();
     for body in live {
+        if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
+            return Err(EvaluationError::Cancelled);
+        }
         let mesh = match body.pristine {
-            Some(m) => m,
+            Some(m) => (*m).clone(),
             None => {
                 let mut m = MockMesh::empty();
                 for part in &body.parts {
-                    m.append(MockMesh::from_solid(part));
+                    let part_mesh = match cancellation {
+                        Some(cancel) => MockMesh::from_solid_with_cancel(part, cancel)
+                            .map_err(|_| EvaluationError::Cancelled)?,
+                        None => MockMesh::from_solid(part),
+                    };
+                    m.append(part_mesh);
                 }
                 m
             }
@@ -2335,7 +3785,7 @@ pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> 
             bodies.push((body.id, mesh));
         }
     }
-    bodies
+    Ok(bodies)
 }
 
 /// Upper bound on distinct sketch states retained in [`ParametricGraph::region_cache`].
@@ -2400,4 +3850,63 @@ pub(crate) fn creation_key(id: &str) -> u64 {
         .next()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod mirror_join_display_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_mirror_fallback_is_one_continuous_display_body() {
+        let source = openrcad::primitives::make_box(
+            &openrcad::foundation::Pnt::new(-1.0, 0.0, 0.0),
+            4.0,
+            2.0,
+            1.0,
+        );
+        let mirrored = openrcad::primitives::make_box(
+            &openrcad::foundation::Pnt::new(-3.0, 0.0, 0.0),
+            4.0,
+            2.0,
+            1.0,
+        );
+        let mesh =
+            mirror_join_display_mesh("test_mirror", &[source, mirrored], Vec3::ZERO, Vec3::X);
+
+        assert_eq!(
+            mesh.face_refs
+                .iter()
+                .filter(|face| face.normal[2] > 0.99)
+                .count(),
+            1,
+            "overlapping coplanar top faces should select as one face"
+        );
+        let internal_outline_segments = mesh
+            .edge_indices
+            .chunks_exact(2)
+            .filter(|edge| {
+                let x = |vertex: u32| mesh.edge_vertices[vertex as usize * 3];
+                [1.0, -1.0].iter().any(|cut| {
+                    (x(edge[0]) - cut).abs() < 1.0e-3 && (x(edge[1]) - cut).abs() < 1.0e-3
+                })
+            })
+            .count();
+        assert_eq!(
+            internal_outline_segments, 0,
+            "overlap boundaries inside the joined result must not be drawn or picked"
+        );
+        let full_width_edges = mesh
+            .edge_refs
+            .iter()
+            .filter(|edge| {
+                let lo = edge.p0[0].min(edge.p1[0]);
+                let hi = edge.p0[0].max(edge.p1[0]);
+                (lo + 3.0).abs() < 1.0e-3 && (hi - 3.0).abs() < 1.0e-3
+            })
+            .count();
+        assert!(
+            full_width_edges >= 1,
+            "the mirrored halves' collinear boundary must regroup into one full-width edge"
+        );
+    }
 }

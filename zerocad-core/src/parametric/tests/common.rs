@@ -38,6 +38,7 @@ pub(super) fn add_sketch(g: &mut ParametricGraph, id: &str, curves: SketchCurves
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -146,6 +147,7 @@ pub(super) fn add_sketch_cs(
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });

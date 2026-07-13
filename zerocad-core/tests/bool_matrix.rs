@@ -23,6 +23,7 @@ fn sk(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, c: SketchCurves) 
             curves: c,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });

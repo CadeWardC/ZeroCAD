@@ -40,8 +40,8 @@ pub mod scene;
 pub mod state;
 
 pub use crate::core::{
-    FaceHighlight, LayerStyle, OffscreenTarget, PickTarget, RenderCore, SceneGlobals,
-    DEPTH_FORMAT, PICK_FORMAT, SAMPLE_COUNT,
+    FaceHighlight, LayerStyle, OffscreenTarget, PickTarget, RenderCore, SceneGlobals, DEPTH_FORMAT,
+    PICK_FORMAT, SAMPLE_COUNT,
 };
 pub use openrcad_mesh::GpuMesh;
 

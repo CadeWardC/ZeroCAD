@@ -1,3 +1,4 @@
+use crate::app::editing::snap_line_angle;
 use crate::*;
 
 impl ZeroCadApp {
@@ -10,6 +11,33 @@ impl ZeroCadApp {
                             ui.available_size() - egui::vec2(0.0, 4.0),
                             egui::Sense::click() | egui::Sense::drag(),
                         );
+
+                        let context_body = self.selected_whole_body();
+                        response.context_menu(|ui| {
+                            if let Some(source) = context_body.clone() {
+                                if ui.button("Move").clicked() {
+                                    self.begin_move_body(source);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Copy").clicked() {
+                                    self.copy_selected_body();
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.label("Fully select a body for body commands.");
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(
+                                    self.body_clipboard.is_some(),
+                                    egui::Button::new("Paste"),
+                                )
+                                .clicked()
+                            {
+                                self.paste_copied_body();
+                                ui.close_menu();
+                            }
+                        });
 
                         let center_x = rect.center().x + self.camera_pan.x;
                         let center_y = rect.center().y + self.camera_pan.y;
@@ -109,12 +137,25 @@ impl ZeroCadApp {
                             })
                             .collect();
 
-                        // Perform frame-perfect hover checking immediately
-                        let hover_pos = response.hover_pos();
+                        // Perform frame-perfect hover checking immediately. Inline
+                        // sketch dimensions are keyboard controls and deliberately
+                        // mouse-transparent while a shape is being placed. Read the
+                        // physical pointer inside the viewport in that state instead
+                        // of `Response::hover_pos`: egui otherwise reports `None` as
+                        // the pointer crosses the foreground TextEdit, making the
+                        // rubber-band sketch disappear/flicker for a frame.
+                        let hover_pos = if self.is_sketch_mode && self.dim_input.is_some() {
+                            ctx.input(|i| i.pointer.hover_pos())
+                                .filter(|pos| rect.contains(*pos))
+                        } else {
+                            response.hover_pos()
+                        };
                         self.hovered_plane = None;
                         self.hovered_datum_plane = None;
                         self.hovered_sketch_face = None;
-                        if self.is_plane_selection_mode {
+                        let plane_pick_active =
+                            self.is_plane_selection_mode || self.mirror_plane_pick_active();
+                        if plane_pick_active {
                             if let Some(pos) = hover_pos {
                                 // A planar body face under the cursor takes priority over
                                 // the origin plane quads — sketch directly on the solid.
@@ -169,9 +210,11 @@ impl ZeroCadApp {
                         //   • Middle-drag  → orbit (3D) / pan (sketch, where orbit is locked)
                         //   • Shift + drag → pan (3D)
                         //   • Left-drag    → selecting faces·edges / drawing shapes
-                        //   • Shift (sketch) → suppress snapping while drawing
+                        //   • Shift (line tool) → snap angle to 15° increments
+                        //   • Ctrl (sketch) → suppress all snapping while drawing
                         let pointer_delta = ctx.input(|i| i.pointer.delta());
                         let shift = ctx.input(|i| i.modifiers.shift);
+                        let ctrl = ctx.input(|i| i.modifiers.ctrl);
 
                         // Middle-drag orbit/pan is latched rather than read from egui's
                         // per-frame `dragged_by`, which can momentarily report false
@@ -199,8 +242,8 @@ impl ZeroCadApp {
                                 self.camera_pitch = p;
                                 self.camera_yaw = y;
                                 // Sketch mode: pan with middle-drag (camera can't orbit
-                                // here). Shift is reserved for suppressing snapping while
-                                // drawing, so it must NOT pan here.
+                                // here). Sketch modifiers are reserved for drawing, so
+                                // Shift must NOT pan here.
                                 if middle_drag {
                                     self.camera_pan += pointer_delta;
                                 }
@@ -276,11 +319,51 @@ impl ZeroCadApp {
                         // Zoom: Mouse scroll
                         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                         if scroll_delta != 0.0 {
-                            self.camera_zoom = (self.camera_zoom * (1.0 + scroll_delta * 0.002)).clamp(1.0, 50.0);
+                            self.camera_zoom =
+                                (self.camera_zoom * (scroll_delta * 0.002).exp()).clamp(1.0, 50.0);
                         }
 
-                        // Plane selection click interaction
-                        if self.is_plane_selection_mode && response.clicked() {
+                        // Standalone 3D Mirror plane/face selection. This shares
+                        // the sketch plane sheets and planar-face hit testing but
+                        // does not enter sketch mode or move the camera.
+                        if self.mirror_plane_pick_active() && response.clicked() {
+                            let choice = if let Some((node, fid)) =
+                                self.hovered_sketch_face.clone()
+                            {
+                                self.face_ref(&node, fid).map(|face| {
+                                    crate::pattern_ui::MirrorPlaneChoice::Face(
+                                        face,
+                                        format!("Face {fid} of {node}"),
+                                    )
+                                })
+                            } else if let Some(datum_id) = self.hovered_datum_plane.clone() {
+                                let name = self
+                                    .resolved_datum_planes()
+                                    .into_iter()
+                                    .find(|(id, _, _)| *id == datum_id)
+                                    .map(|(_, name, _)| name)
+                                    .unwrap_or_else(|| datum_id.clone());
+                                Some(crate::pattern_ui::MirrorPlaneChoice::Datum(
+                                    datum_id, name,
+                                ))
+                            } else {
+                                self.hovered_plane.map(|plane| match plane {
+                                    SketchPlane::XY => crate::pattern_ui::MirrorPlaneChoice::XY,
+                                    SketchPlane::XZ => crate::pattern_ui::MirrorPlaneChoice::XZ,
+                                    SketchPlane::YZ => crate::pattern_ui::MirrorPlaneChoice::YZ,
+                                })
+                            };
+                            if let Some(choice) = choice {
+                                if let Some(op) = self.pattern_op.as_mut() {
+                                    op.plane = Some(choice);
+                                    op.pick_plane = false;
+                                }
+                                self.status_msg =
+                                    "Mirror plane selected. Click OK to create the mirrored body."
+                                        .to_string();
+                            }
+                        // Sketch plane selection click interaction
+                        } else if self.is_plane_selection_mode && response.clicked() {
                             if let Some((node, fid)) = self.hovered_sketch_face.clone() {
                                 // Sketch directly on the clicked planar body face — the
                                 // same path as pre-selecting a face and pressing Draw
@@ -369,10 +452,17 @@ impl ZeroCadApp {
                                 // Map the click onto the active sketch plane via a ray /
                                 // plane intersection — WYSIWYG on any plane orientation.
                                 let raw = self.screen_to_sketch(hover_pos, rect, &self.active_sketch_cs);
-                                let (sketch_x, sketch_y) = self.snap_sketch_point(raw, scale, shift);
+                                let snapped = self.snap_sketch_point(raw, scale, ctrl);
 
                                 let tool = self.active_tool.unwrap();
-                                let pt = (sketch_x, sketch_y);
+                                let pt = if shift && !ctrl && tool == SketchTool::Line {
+                                    self.sketch_points
+                                        .first()
+                                        .copied()
+                                        .map_or(snapped, |start| snap_line_angle(start, snapped))
+                                } else {
+                                    snapped
+                                };
 
                                 if let Some(kind) = tool.corner_kind() {
                                     // Fillet/Chamfer: a click STAGES the nearest corner
@@ -395,9 +485,9 @@ impl ZeroCadApp {
                                             self.dim_anchor = Some(hover_pos);
                                             self.dim_input = Some(DimInput {
                                                 fields: dim_fields_for(tool),
-                                                focus_request: Some(0),
+                                                focus_request: None,
                                                 active_field: 0,
-                                                select_all: true,
+                                                editing_field: None,
                                             });
                                             self.status_msg =
                                                 "First point set — move and click, or type dimensions (Tab/Enter)."
@@ -541,6 +631,34 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Face picks requested by the Move dialog are consumed by
+                        // that operation instead of replacing the normal selection.
+                        if response.clicked()
+                            && self
+                                .move_op
+                                .as_ref()
+                                .is_some_and(|op| op.picking.is_some())
+                        {
+                            if let Some(click_pos) = response.interact_pointer_pos() {
+                                let gpu_face = self.gpu_pick_face(
+                                    click_pos,
+                                    rect,
+                                    ctx.pixels_per_point(),
+                                );
+                                if let Some((node, BodyPick::Face(face))) = self.pick_body_element(
+                                    click_pos,
+                                    &project_3d,
+                                    sin_p,
+                                    cos_p,
+                                    sin_y,
+                                    cos_y,
+                                    gpu_face,
+                                ) {
+                                    self.pick_move_face(node, face);
+                                }
+                            }
+                        }
+
                         // 3D selection: click picks a body face/edge/vertex (or a finished
                         // sketch's face/edge); double-click selects the whole body/sketch.
                         // Works in normal 3D view, and while sketching when no drawing
@@ -548,9 +666,11 @@ impl ZeroCadApp {
                         // selected without leaving the sketch.
                         if (response.clicked() || response.double_clicked())
                             && (!self.is_sketch_mode || self.active_tool.is_none())
-                            && !self.is_plane_selection_mode
+                            && !plane_pick_active
                             && self.extrude_op.is_none()
                             && self.edge_mod_op.is_none()
+                            && self.move_op.is_none()
+                            && self.combine_op.is_none()
                             && !self.camera_anim_active
                         {
                             let is_double = response.double_clicked();
@@ -593,10 +713,10 @@ impl ZeroCadApp {
                                     if self.hidden_nodes.contains(&node.id) {
                                         continue; // can't pick a hidden sketch
                                     }
-                                    if let FeatureType::Sketch { cs, curves, shapes, corner_mods, solver, .. } = &node.feature {
+                                    if let FeatureType::Sketch { cs, curves, shapes, corner_mods, mirrors, solver, .. } = &node.feature {
                                         let cs = *cs;
                                         // Pick against the variable-resolved geometry.
-                                        let eff = zerocad_core::effective_curves_solved(curves, shapes, corner_mods, solver.as_ref(), &var_map);
+                                        let eff = zerocad_core::effective_curves_solved(curves, shapes, corner_mods, mirrors, solver.as_ref(), &var_map);
                                         let curves = &eff;
                                         let to_scr = |u: f32, v: f32| -> egui::Pos2 {
                                             let w = cs.unproject(u, v);
@@ -764,34 +884,7 @@ impl ZeroCadApp {
                                         // concept; a body pick always supersedes them.
                                         self.selected_faces.clear();
                                         self.selected_edges.clear();
-                                        if is_double {
-                                            // Double-click always selects the whole body.
-                                            self.selected_body.clear();
-                                            self.selected_body.insert((node.clone(), BodyPick::Whole));
-                                            self.status_msg = format!("Selected whole body {}.", node);
-                                        } else if multi_select {
-                                            // Add to the selection, or remove it if already
-                                            // selected, so multiple faces/edges/points can be
-                                            // picked together (e.g. to fillet several edges).
-                                            let key = (node.clone(), pick);
-                                            if !self.selected_body.insert(key.clone()) {
-                                                self.selected_body.remove(&key);
-                                            }
-                                            self.status_msg =
-                                                format!("{} element(s) selected.", self.selected_body.len());
-                                        } else {
-                                            // Plain click replaces the selection.
-                                            self.selected_body.clear();
-                                            self.selected_body.insert((node.clone(), pick));
-                                            self.status_msg = match pick {
-                                                BodyPick::Whole => format!("Selected whole body {}.", node),
-                                                BodyPick::Face(f) => {
-                                                    format!("Selected face {} of {} (Draw Sketch to sketch on it).", f, node)
-                                                }
-                                                BodyPick::Edge(e) => format!("Selected edge {} of {}.", e, node),
-                                                BodyPick::Vertex(v) => format!("Selected point {} of {}.", v, node),
-                                            };
-                                        }
+                                        self.select_body_hit(node, pick, is_double, multi_select);
                                     } else if !multi_select {
                                         // Nothing hit and no modifier held — clear everything
                                         // (body AND sketch face/edge selections), so an empty
@@ -811,11 +904,32 @@ impl ZeroCadApp {
                         let current_cursor_snap = if let Some(pos) = hover_pos {
                             let scale = rect.width().min(rect.height()) / (self.camera_zoom * 5.0);
                             let raw = self.screen_to_sketch(pos, rect, &self.active_sketch_cs);
-                            let (snapped, kind) = self.snap_sketch_point_kind(raw, scale, shift);
-                            self.cursor_snap_kind = kind;
-                            Some(snapped)
+                            let res = self.snap_sketch_point_kind(raw, scale, ctrl);
+                            let angle_snapping = shift
+                                && !ctrl
+                                && self.active_tool == Some(SketchTool::Line)
+                                && self.sketch_temp_start.is_some();
+                            self.cursor_snap_kind = if angle_snapping { None } else { res.kind };
+                            self.cursor_snap_guides = if angle_snapping {
+                                Vec::new()
+                            } else {
+                                res.guides_used.clone()
+                            };
+                            // Ctrl freezes the guides and hides their dashes while
+                            // all snapping is temporarily disabled.
+                            if !ctrl {
+                                let tol = 9.0 / scale.max(1e-4);
+                                self.update_snap_guides(&res, raw, tol);
+                            }
+                            Some(if angle_snapping {
+                                snap_line_angle(self.sketch_temp_start.unwrap(), res.pos)
+                            } else {
+                                res.pos
+                            })
                         } else {
                             self.cursor_snap_kind = None;
+                            self.snap_guides.clear();
+                            self.cursor_snap_guides.clear();
                             None
                         };
 
@@ -826,44 +940,99 @@ impl ZeroCadApp {
                         {
                             self.update_dim_live(start, cursor);
 
-                            // Compute Fusion 360-style screen positions for inline dim inputs.
-                            let s_scr = egui::pos2(
-                                center_x + start.0 * view_scale,
-                                center_y - start.1 * view_scale,
-                            );
-                            let c_scr = egui::pos2(
-                                center_x + cursor.0 * view_scale,
-                                center_y - cursor.1 * view_scale,
-                            );
-                            self.dim_screen_positions = match self.active_tool.unwrap_or(SketchTool::Line) {
-                                SketchTool::Rectangle | SketchTool::RectangleCenter => {
-                                    // Width: midpoint of the edge furthest from shape center (bottom or top)
-                                    let outer_y = if c_scr.y > s_scr.y { c_scr.y } else { s_scr.y };
-                                    let mid_w = egui::pos2((s_scr.x + c_scr.x) / 2.0, outer_y + 22.0);
-                                    // Height: midpoint of the edge furthest from shape center (right or left)
-                                    let outer_x = if c_scr.x > s_scr.x { c_scr.x } else { s_scr.x };
-                                    let mid_h = egui::pos2(outer_x + 22.0, (s_scr.y + c_scr.y) / 2.0);
-                                    vec![mid_w, mid_h]
+                            // Anchor inputs to the same dimension-resolved geometry
+                            // drawn by `draw_viewport`. Using the raw cursor here made
+                            // the boxes drift far away as soon as a typed value changed
+                            // the preview's true width/height.
+                            let cs = self.active_sketch_cs;
+                            let to_screen = |p: (f32, f32)| {
+                                let w = cs.unproject(p.0, p.1);
+                                let projected = project_3d(w.x, w.y, w.z);
+                                egui::pos2(projected.0, projected.1)
+                            };
+                            let shape = self.shape_from_points(cursor);
+                            self.dim_screen_positions = match self
+                                .active_tool
+                                .unwrap_or(SketchTool::Line)
+                            {
+                                SketchTool::Rectangle | SketchTool::RectangleCenter
+                                    if shape.segments.len() >= 4 =>
+                                {
+                                    let mid = |segment: &LineSegment| {
+                                        let a = to_screen(segment.a);
+                                        let b = to_screen(segment.b);
+                                        a + (b - a) * 0.5
+                                    };
+                                    let width_a = mid(&shape.segments[0]);
+                                    let width_b = mid(&shape.segments[2]);
+                                    let height_a = mid(&shape.segments[1]);
+                                    let height_b = mid(&shape.segments[3]);
+                                    let width_mid = if width_a.y >= width_b.y {
+                                        width_a
+                                    } else {
+                                        width_b
+                                    };
+                                    let height_mid = if height_a.x >= height_b.x {
+                                        height_a
+                                    } else {
+                                        height_b
+                                    };
+                                    let center = egui::pos2(
+                                        (width_a.x + width_b.x) * 0.5,
+                                        (height_a.y + height_b.y) * 0.5,
+                                    );
+                                    vec![
+                                        offset_dimension_box(width_mid, center),
+                                        offset_dimension_box(height_mid, center),
+                                    ]
                                 }
-                                SketchTool::Circle => {
+                                SketchTool::Circle if !shape.circles.is_empty() => {
+                                    let circle = shape.circles[0];
+                                    let center = to_screen(circle.center);
+                                    let rim = to_screen((
+                                        circle.center.0 + circle.radius,
+                                        circle.center.1,
+                                    ));
+                                    vec![offset_dimension_box(rim, center)]
+                                }
+                                SketchTool::PolygonInscribed
+                                | SketchTool::PolygonCircumscribed
+                                    if !shape.segments.is_empty() =>
+                                {
+                                    let center = to_screen(start);
                                     let dx = cursor.0 - start.0;
                                     let dy = cursor.1 - start.1;
-                                    let r = (dx * dx + dy * dy).sqrt();
-                                    let r_scr = egui::pos2(
-                                        center_x + (start.0 + r) * view_scale,
-                                        center_y - start.1 * view_scale,
-                                    );
-                                    vec![egui::pos2(r_scr.x + 18.0, r_scr.y)]
+                                    let drag = (dx * dx + dy * dy).sqrt();
+                                    let diameter = self
+                                        .dim_param(0, 2.0 * drag)
+                                        .resolve(&self.graph.variable_map());
+                                    let (ux, uy) = if drag > 1.0e-4 {
+                                        (dx / drag, dy / drag)
+                                    } else {
+                                        (1.0, 0.0)
+                                    };
+                                    let rim = to_screen((
+                                        start.0 + ux * diameter * 0.5,
+                                        start.1 + uy * diameter * 0.5,
+                                    ));
+                                    vec![offset_dimension_box(rim, center)]
                                 }
-                                SketchTool::Line => {
-                                    // Length: midpoint of line, offset perpendicular (upward in screen)
-                                    let mid = egui::pos2(
-                                        (s_scr.x + c_scr.x) / 2.0,
-                                        (s_scr.y + c_scr.y) / 2.0 - 22.0,
-                                    );
-                                    // Angle: near start point
-                                    let ang_pos = egui::pos2(s_scr.x + 40.0, s_scr.y + 22.0);
-                                    vec![mid, ang_pos]
+                                SketchTool::Line if !shape.segments.is_empty() => {
+                                    let segment = shape.segments[0];
+                                    let a = to_screen(segment.a);
+                                    let b = to_screen(segment.b);
+                                    let center = a + (b - a) * 0.5;
+                                    let axis = b - a;
+                                    let mut normal = egui::vec2(axis.y, -axis.x);
+                                    if normal.y > 0.0 {
+                                        normal = -normal;
+                                    }
+                                    let length_pos = if normal.length_sq() > 1.0e-4 {
+                                        center + normal.normalized() * 14.0
+                                    } else {
+                                        center
+                                    };
+                                    vec![length_pos, a + egui::vec2(34.0, 18.0)]
                                 }
                                 // 3-point tools have no inline dimensions.
                                 _ => Vec::new(),
@@ -886,6 +1055,11 @@ impl ZeroCadApp {
                         // Draw the 3D projected CAD viewport
                         let painter = ui.painter_at(rect);
                         self.draw_viewport(painter.clone(), rect, hover_pos, current_cursor_snap);
+                        let gizmo_project = |point: [f32; 3]| {
+                            let p = project_3d(point[0], point[1], point[2]);
+                            egui::pos2(p.0, p.1)
+                        };
+                        self.move_gizmo(&painter, &response, &gizmo_project);
                         painter
                     });
                 });
@@ -899,6 +1073,7 @@ impl ZeroCadApp {
         self.show_revolve_dialog(ctx);
         self.show_pattern_dialog(ctx);
         self.show_hole_dialog(ctx);
+        self.show_thread_dialog(ctx);
         self.show_shell_dialog(ctx);
         self.show_sweep_dialog(ctx);
 
@@ -912,6 +1087,24 @@ impl ZeroCadApp {
 
         // Constraint palette + list for the active Edit Sketch session.
         self.show_constraints_panel(ctx);
+    }
+}
+
+/// Move a dimension box just outside its shape while keeping it attached to the
+/// edge midpoint. The inline area is positioned around `(40, 10)` within the
+/// box, so include that footprint before adding the visible gap; moving only
+/// the anchor by a few pixels still left the widget drawn across the edge.
+fn offset_dimension_box(point: egui::Pos2, center: egui::Pos2) -> egui::Pos2 {
+    const ANCHOR_HALF_EXTENT: egui::Vec2 = egui::vec2(40.0, 10.0);
+    const VISUAL_GAP: f32 = 8.0;
+    let outward = point - center;
+    if outward.length_sq() <= 1.0e-4 {
+        point
+    } else {
+        let normal = outward.normalized();
+        let footprint =
+            normal.x.abs() * ANCHOR_HALF_EXTENT.x + normal.y.abs() * ANCHOR_HALF_EXTENT.y;
+        point + normal * (footprint + VISUAL_GAP)
     }
 }
 
@@ -964,4 +1157,24 @@ pub(crate) fn pick_solver_element(
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(id, _)| id)
+}
+
+#[cfg(test)]
+mod dimension_anchor_tests {
+    use super::offset_dimension_box;
+    use eframe::egui;
+
+    #[test]
+    fn dimension_anchor_stays_close_to_its_edge_midpoint() {
+        let center = egui::pos2(100.0, 100.0);
+        let bottom_mid = egui::pos2(100.0, 150.0);
+        let anchored = offset_dimension_box(bottom_mid, center);
+        // 10 px from the anchor to the box edge, then an 8 px visual gap.
+        assert_eq!(anchored, egui::pos2(100.0, 168.0));
+
+        let right_mid = egui::pos2(150.0, 100.0);
+        let anchored = offset_dimension_box(right_mid, center);
+        // The wider horizontal footprint is also kept fully off the edge.
+        assert_eq!(anchored, egui::pos2(198.0, 100.0));
+    }
 }

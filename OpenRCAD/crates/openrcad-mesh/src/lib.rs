@@ -207,42 +207,145 @@ impl TriangleMesh {
 /// exactly along shared boundaries and the combined mesh has no cracks to
 /// stitch by construction.
 pub fn tessellate(solid: &openrcad_topo::Solid, chord_err: f64, angle_err: f64) -> TriangleMesh {
+    tessellate_with_cancel(
+        solid,
+        chord_err,
+        angle_err,
+        &openrcad_foundation::NeverCancelled,
+    )
+    .expect("NeverCancelled cannot cancel")
+}
+
+/// Cancellable tessellation. Cancellation is checked around shared-boundary
+/// construction, independently for every face (including rayon workers), and
+/// before each global repair pass. No partial mesh is returned.
+pub fn tessellate_with_cancel(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    cancel: &dyn openrcad_foundation::CancellationProbe,
+) -> Result<TriangleMesh, openrcad_foundation::Cancelled> {
+    cancel.check_cancelled()?;
     let faces = solid.shell().faces();
     let shared = triangulate::shared_edge_polylines(&faces, chord_err, angle_err);
+    cancel.check_cancelled()?;
 
     // Faces tessellate independently, so this parallelises cleanly across the
     // shell. The `parallel` feature (on by default) maps each face on a rayon
     // pool; with it disabled the identical work runs sequentially.
     #[cfg(feature = "parallel")]
-    let meshes: Vec<TriangleMesh> = faces
+    let meshes: Result<Vec<TriangleMesh>, openrcad_foundation::Cancelled> = faces
         .par_iter()
         .enumerate()
         .map(|(i, face)| {
-            triangulate::tessellate_face_budget(face, chord_err, angle_err, i as u32, Some(&shared))
+            cancel.check_cancelled()?;
+            Ok(triangulate::tessellate_face_budget(
+                face,
+                chord_err,
+                angle_err,
+                i as u32,
+                Some(&shared),
+            ))
         })
         .collect();
     #[cfg(not(feature = "parallel"))]
-    let meshes: Vec<TriangleMesh> = faces
+    let meshes: Result<Vec<TriangleMesh>, openrcad_foundation::Cancelled> = faces
         .iter()
         .enumerate()
         .map(|(i, face)| {
-            triangulate::tessellate_face_budget(face, chord_err, angle_err, i as u32, Some(&shared))
+            cancel.check_cancelled()?;
+            Ok(triangulate::tessellate_face_budget(
+                face,
+                chord_err,
+                angle_err,
+                i as u32,
+                Some(&shared),
+            ))
         })
         .collect();
 
+    let meshes = meshes?;
+    cancel.check_cancelled()?;
     let mut combined = triangulate::combine(&meshes);
     // Safety net for boundaries the shared-edge pass could not cover (edges
     // whose geometric keys did not match across faces): stitch lens cracks
     // where two faces sampled a shared boundary differently.
     triangulate::stitch_boundary_lenses(&mut combined);
+    cancel.check_cancelled()?;
     triangulate::refine_cylinder_mesh_edges(&mut combined, &faces, chord_err);
-    combined
+    cancel.check_cancelled()?;
+    Ok(combined)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openrcad_foundation::{Trsf, Vec};
+    use openrcad_foundation::{Ax2, Dir, Trsf, Vec};
+    use std::collections::HashMap;
+
+    #[test]
+    fn cancelled_tessellation_returns_no_partial_mesh() {
+        let solid = openrcad_primitives::make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let token = openrcad_foundation::CancellationToken::new();
+        token.cancel();
+        assert_eq!(
+            tessellate_with_cancel(&solid, 0.05, 0.5, &token),
+            Err(openrcad_foundation::Cancelled)
+        );
+    }
+
+    #[test]
+    fn plain_short_cylinder_has_a_compact_closed_display_mesh() {
+        let solid =
+            openrcad_primitives::make_cylinder(&Ax2::new(Pnt::origin(), Dir::dz()), 7.5, 2.0);
+        let angle_err = std::f64::consts::TAU / 48.0;
+        let faces = solid.shell().faces();
+        let shared = triangulate::shared_edge_polylines(&faces, 0.05, angle_err);
+        let local_counts: std::vec::Vec<(usize, usize)> = faces
+            .iter()
+            .enumerate()
+            .map(|(index, face)| {
+                let local = triangulate::tessellate_face_budget(
+                    face,
+                    0.05,
+                    angle_err,
+                    index as u32,
+                    Some(&shared),
+                );
+                (local.vertex_count(), local.triangle_count())
+            })
+            .collect();
+        let mesh = tessellate(&solid, 0.05, angle_err);
+
+        // A 48-sided cylinder needs 96 wall triangles plus 48 per cap. Reject
+        // the old fixed eight-row wall grid (1,110 triangles / 3,330 unwelded
+        // display vertices).
+        assert_eq!(
+            mesh.triangle_count(),
+            192,
+            "plain cylinder should be a 48-segment wall plus two caps, got {} vertices / {} triangles; faces={local_counts:?}",
+            mesh.vertex_count(),
+            mesh.triangle_count(),
+        );
+        assert_eq!(mesh.gpu_mesh().positions.len() / 3, 576);
+
+        // Every indexed edge of a closed cylinder is shared by exactly two
+        // triangles; reducing support rows must not trade density for cracks.
+        let mut edge_uses: HashMap<(u32, u32), usize> = HashMap::new();
+        for triangle in &mesh.triangles {
+            for (a, b) in [
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                *edge_uses.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        assert!(
+            edge_uses.values().all(|&uses| uses == 2),
+            "compact cylinder mesh must remain closed"
+        );
+    }
 
     #[test]
     fn mesh_counts_and_flat_positions() {

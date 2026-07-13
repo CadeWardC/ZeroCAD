@@ -125,6 +125,31 @@ impl ZeroCadApp {
                                         );
 
                                         ui.add_space(6.0);
+                                        egui::ComboBox::from_label("Hydrated project cache")
+                                            .selected_text(if self.hydrated_cache_mb == 0 {
+                                                "Unlimited".to_string()
+                                            } else {
+                                                format!("{} MB", self.hydrated_cache_mb)
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                for (value, label) in [
+                                                    (64, "64 MB"),
+                                                    (128, "128 MB (recommended)"),
+                                                    (256, "256 MB"),
+                                                    (0, "Unlimited"),
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut self.hydrated_cache_mb,
+                                                        value,
+                                                        label,
+                                                    );
+                                                }
+                                            });
+                                        ui.weak(
+                                            "Maximum reusable B-Rep checkpoint data stored in .zcadh files.",
+                                        );
+
+                                        ui.add_space(6.0);
                                         egui::ComboBox::from_label("Graphics backend")
                                             .selected_text(self.graphics_backend.label())
                                             .show_ui(ui, |ui| {

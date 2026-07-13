@@ -78,9 +78,7 @@ fn shell_planar_general(
     for (fi, face) in faces.iter().enumerate() {
         for wire in face.wires() {
             for edge in wire.edges() {
-                if edge.curve().is_some()
-                    && !matches!(edge.curve(), Some(GeomCurve::Line(_)))
-                {
+                if edge.curve().is_some() && !matches!(edge.curve(), Some(GeomCurve::Line(_))) {
                     return Err(BlendError::UnsupportedShape);
                 }
                 for p in [edge.source().point(), edge.target().point()] {
@@ -181,10 +179,9 @@ fn shell_planar_general(
                 for edge in wire.edges() {
                     let p0 = edge.source().point();
                     let p1 = edge.target().point();
-                    let (Some(&q0), Some(&q1)) = (
-                        offset_of.get(&quant(&p0)),
-                        offset_of.get(&quant(&p1)),
-                    ) else {
+                    let (Some(&q0), Some(&q1)) =
+                        (offset_of.get(&quant(&p0)), offset_of.get(&quant(&p1)))
+                    else {
                         return Err(BlendError::UnsupportedShape);
                     };
                     let n = ((p1 - p0).cross(&(q0 - p0))).normalized();

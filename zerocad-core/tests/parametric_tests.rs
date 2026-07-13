@@ -176,6 +176,7 @@ fn test_parametric_graph_sketch_extrude() {
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     };
@@ -223,6 +224,7 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -255,6 +257,7 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
             curves: single,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: false,
         },
     });

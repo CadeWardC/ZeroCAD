@@ -209,6 +209,12 @@ pub enum FeatureType {
         /// built (see [`crate::sketch::effective_curves`]).
         #[serde(default)]
         corner_mods: Vec<crate::sketch::CornerMod>,
+        /// Associative mirror operations, applied after the shapes and corner
+        /// mods are built: each reflects the accumulated curves across its axis
+        /// and appends the copy, so editing the source updates the mirror.
+        /// `#[serde(default)]` so documents saved before mirrors existed load.
+        #[serde(default)]
+        mirrors: Vec<crate::sketch::SketchMirror>,
         /// True when the sketch was placed on an existing body face rather than
         /// an origin plane. Lets the extrude tool default to Join/Cut (combine
         /// with that body) instead of New Body. Defaults to `false` for
@@ -389,15 +395,85 @@ pub enum FeatureType {
         source: String,
         kind: PatternKind,
     },
+    /// Translate a finished body. `copy` leaves the source in place and emits a
+    /// second body; otherwise the source is consumed and replaced by the moved
+    /// result. Keeping this as a history feature makes later edits rebuild at
+    /// the same placement.
+    BodyTransform {
+        source: String,
+        translation: [f32; 3],
+        #[serde(default)]
+        copy: bool,
+    },
+    /// A modeled thread on a cylindrical face of a body: the wall is replaced by
+    /// analytic helical thread bands (external = a rod OD, internal = a hole
+    /// wall) — no boolean. Ends adjacent to a flat cap cut straight through the
+    /// profile (Fusion-style); any other end (a chamfer cone, fillet torus, or a
+    /// partial-length stop) gets a runout band fading the tooth to a plain
+    /// circle plus an untouched cylinder collar, so blends on the rim survive.
+    /// If the wall can't be replaced cleanly the body is left intact (cosmetic
+    /// fallback) with a warning rather than hard-failing. The thread standard
+    /// (metric / Unified / custom) only sets the numeric fields below.
+    Thread {
+        /// Node id of the body being threaded.
+        target: String,
+        /// The selected cylindrical face, resolved to axis + radius at build.
+        face: FaceRef,
+        /// Internal (tapped hole) vs external (rod). Sets the cut direction.
+        internal: bool,
+        /// Axial pitch — distance between crests along the axis (mm).
+        pitch: f32,
+        /// Radial thread depth, crest to root (mm).
+        depth: f32,
+        /// Included thread angle (degrees); 60 for metric and Unified.
+        angle_deg: f32,
+        /// Right-handed thread when true (the common case), else left-handed.
+        right_handed: bool,
+        /// Number of thread starts (lead = pitch × starts). 0/1 both mean single.
+        #[serde(default)]
+        starts: u32,
+        /// Threaded length along the axis (mm); `None` = the full face length.
+        #[serde(default)]
+        length: Option<f32>,
+        /// Anchor a partial thread at the axis-min end instead of the axis-max
+        /// end. Ignored for full-length threads.
+        #[serde(default)]
+        flip: bool,
+        /// Human designation for display (e.g. "M6×1", "¼-20 UNC", "Custom").
+        #[serde(default)]
+        designation: String,
+    },
     /// A reference plane (datum). Carries no geometry of its own — it resolves
     /// to a [`crate::geometry::CoordinateSystem`] during evaluation and exists
     /// so sketches (and later revolve axes, mirrors, …) can attach to a
     /// construction plane that isn't one of the three base planes.
-    DatumPlane { def: DatumPlaneDef },
+    DatumPlane {
+        def: DatumPlaneDef,
+    },
     /// A reference axis (datum), resolving to an origin + direction.
-    DatumAxis { def: DatumAxisDef },
+    DatumAxis {
+        def: DatumAxisDef,
+    },
     /// A reference point (datum), resolving to a 3D position.
-    DatumPoint { def: DatumPointDef },
+    DatumPoint {
+        def: DatumPointDef,
+    },
+    /// Combine two or more finished bodies into one persistent body. Appended
+    /// after all pre-existing variants to preserve binary `.zcad` enum tags.
+    /// Connected solids are fused; disconnected inputs leave their original
+    /// bodies unchanged and report the operation unresolved.
+    BodyJoin {
+        sources: Vec<String>,
+    },
+    /// Subtract one finished body (`tool`) from another (`target`). Appended
+    /// after all pre-existing variants to preserve binary `.zcad` enum tags.
+    /// The cutting body is consumed unless `keep_tool` is enabled.
+    BodyCut {
+        target: String,
+        tool: String,
+        #[serde(default)]
+        keep_tool: bool,
+    },
 }
 
 /// A plane input to a datum definition: one of the three base planes or a
@@ -420,7 +496,10 @@ pub enum AxisBase {
     /// A previously created datum axis (by node id).
     Datum(String),
     /// An explicit segment.
-    TwoPoints { a: [f32; 3], b: [f32; 3] },
+    TwoPoints {
+        a: [f32; 3],
+        b: [f32; 3],
+    },
 }
 
 /// How a [`FeatureType::DatumPlane`] is constructed. All inputs are resolvable
@@ -460,9 +539,15 @@ pub enum DatumPlaneDef {
 /// How a [`FeatureType::DatumAxis`] is constructed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DatumAxisDef {
-    TwoPoints { a: [f32; 3], b: [f32; 3] },
+    TwoPoints {
+        a: [f32; 3],
+        b: [f32; 3],
+    },
     /// The intersection line of two non-parallel planes.
-    PlaneIntersection { a: PlaneBase, b: PlaneBase },
+    PlaneIntersection {
+        a: PlaneBase,
+        b: PlaneBase,
+    },
 }
 
 /// How a [`FeatureType::DatumPoint`] is constructed.
@@ -504,8 +589,21 @@ pub enum PatternKind {
         count: u32,
         total_angle_deg: f32,
     },
-    /// One mirrored copy across `plane`.
-    Mirror { plane: PlaneBase },
+    /// One mirrored copy across an origin/datum plane, or an associatively
+    /// captured planar body face. `face` defaults to `None` for older files.
+    Mirror {
+        plane: PlaneBase,
+        #[serde(default)]
+        face: Option<FaceRef>,
+        /// Translation of the reflected copy along the mirror plane normal.
+        #[serde(default)]
+        offset: f32,
+        #[serde(default)]
+        offset_expr: Option<String>,
+        /// Union the source and mirrored copy when every mirrored part connects.
+        #[serde(default)]
+        join: bool,
+    },
 }
 
 /// A resolved datum: what a datum feature node evaluates to. Never serialized —
@@ -585,7 +683,7 @@ pub struct ParametricGraph {
     /// are restored from here instead of recomputed every frame. Skipped by serde
     /// and a transparent accelerator (dropping it only costs a one-time rebuild).
     #[serde(skip)]
-    pub(crate) eval_cache: RefCell<EvalCache>,
+    pub(crate) eval_cache: RefCell<std::sync::Arc<EvalCache>>,
 }
 
 /// Refreshed sketch-on-face data queued during an evaluation — see
@@ -608,14 +706,14 @@ pub struct FaceReattach {
 
 /// Checkpoints of [`evaluate_bodies_inner`], one per processed body node, in
 /// creation order. A pure accelerator — see [`ParametricGraph::eval_cache`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EvalCache {
-    pub(crate) checkpoints: Vec<EvalCheckpoint>,
+    pub(crate) checkpoints: Vec<Option<EvalCheckpoint>>,
 }
 
 /// The assembled bodies and accumulated warnings immediately after one node was
 /// applied, tagged with the cumulative hash of all geometry inputs up to it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EvalCheckpoint {
     pub(crate) key: u64,
     pub(crate) live: Vec<LiveBody>,
@@ -624,6 +722,23 @@ pub(crate) struct EvalCheckpoint {
     /// in creation order. Cached alongside `warnings` so a reused prefix restores
     /// its statuses too — see [`FeatureStatus`].
     pub(crate) statuses: Vec<FeatureStatus>,
+    /// Time spent applying this feature when the checkpoint was built. Reused
+    /// checkpoints preserve the original measurement.
+    pub(crate) feature_duration: std::time::Duration,
+}
+
+/// Opaque reusable evaluator state produced by a background graph clone.
+/// Installing it is always safe: every checkpoint is content-keyed and a
+/// mismatch merely causes the evaluator to rebuild from an earlier prefix.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct EvaluationCacheSnapshot {
+    pub(crate) cache: std::sync::Arc<EvalCache>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureTiming {
+    pub feature_id: String,
+    pub duration: std::time::Duration,
 }
 
 /// Whether a feature resolved its references and applied cleanly on the last
@@ -669,6 +784,102 @@ impl FeatureStatus {
         }
     }
 }
+
+/// Geometry/detail budget requested from the parametric evaluator.
+/// Interactive evaluation keeps the same feature semantics but uses the coarse
+/// tessellation budget; final evaluation is the authoritative save/export path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationQuality {
+    Interactive,
+    Final,
+}
+
+/// Cooperative cancellation shared by the GUI scheduler and core evaluator.
+/// A request is current only while `latest_generation == generation`.
+#[derive(Debug, Clone)]
+pub struct EvaluationCancellation {
+    generation: u64,
+    latest_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl EvaluationCancellation {
+    pub fn new(
+        generation: u64,
+        latest_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            generation,
+            latest_generation,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.latest_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != self.generation
+    }
+}
+
+impl openrcad::foundation::CancellationProbe for EvaluationCancellation {
+    fn is_cancelled(&self) -> bool {
+        EvaluationCancellation::is_cancelled(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvaluationTimings {
+    pub total: std::time::Duration,
+    pub build: std::time::Duration,
+    pub tessellation: std::time::Duration,
+}
+
+#[derive(Debug)]
+pub struct EvaluationOutput {
+    pub bodies: Vec<(String, MockMesh)>,
+    pub warnings: Vec<String>,
+    pub statuses: Vec<FeatureStatus>,
+    pub diagnostics: Vec<EvaluationDiagnostic>,
+    pub face_reattach: FaceReattach,
+    pub timings: EvaluationTimings,
+    pub feature_timings: Vec<FeatureTiming>,
+    pub cache_snapshot: EvaluationCacheSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+/// Machine-readable counterpart to the status-bar warning text. Kernel wrappers
+/// can progressively provide a narrower failure class/fallback without changing
+/// the scheduler or saved-document APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationDiagnostic {
+    pub feature_id: String,
+    pub operation: String,
+    pub failure_class: String,
+    pub fallback: Option<String>,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvaluationError {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for EvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("model evaluation was superseded"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for EvaluationError {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SketchEval {

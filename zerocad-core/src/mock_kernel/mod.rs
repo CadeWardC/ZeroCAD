@@ -19,7 +19,6 @@ use openrcad::algo::{
 pub use openrcad::algo::{BooleanFaceHistory, BooleanFaceSource};
 use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, Trsf, Vec as GeomVec};
 use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
-use openrcad::mesh::tessellate;
 use openrcad::primitives::{make_box, make_cylinder};
 use openrcad::topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
@@ -47,9 +46,9 @@ pub use edge_ops::*;
 pub use geom_utils::*;
 #[allow(unused_imports)]
 pub use history::*;
+pub use mesh_topology::mesh_face_boundary_2d;
 #[allow(unused_imports)]
 pub(crate) use mesh_topology::*;
-pub use mesh_topology::mesh_face_boundary_2d;
 pub use primitives::*;
 #[allow(unused_imports)]
 pub(crate) use tessellation::*;

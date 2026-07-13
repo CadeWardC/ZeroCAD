@@ -230,6 +230,7 @@ fn translucent_layer_blends_over_base_scene() {
                 cull_back: false,
                 draw_edges: false,
                 face_tint: false,
+                xray: false,
             },
         )],
     );

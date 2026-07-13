@@ -6,11 +6,14 @@
 
 use core::fmt;
 
+use openrcad_foundation::Vec as GeomVec;
+use openrcad_geom::GeomCurve;
 use openrcad_topo::{Edge, Solid};
 
 use crate::{
-    chamfer_circular_edge_chain, chamfer_edges, fillet_circular_edge_chain, fillet_edges,
-    ChamferError, RollingBallError,
+    chamfer_circular_edge_chain, chamfer_edges, chamfer_tangent_edge_chain,
+    fillet_circular_edge_chain, fillet_edges, fillet_tangent_edge_chain, ChamferError,
+    RollingBallError,
 };
 
 /// Selected-edge operation kind.
@@ -120,6 +123,26 @@ pub fn apply_blend_contour(
         .constant()
         .ok_or(BlendContourError::VariableLawUnsupported)?;
 
+    let mixed = is_mixed_tangent_chain(&contour.edges);
+    if mixed {
+        return match contour.kind {
+            BlendKind::Fillet => fillet_tangent_edge_chain(solid, &contour.edges, value)
+                .map_err(BlendContourError::Fillet),
+            BlendKind::Chamfer => {
+                let circular: Vec<Edge> = contour
+                    .edges
+                    .iter()
+                    .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+                    .cloned()
+                    .collect();
+                let spine =
+                    circular_spine_from_chain(&circular).unwrap_or_else(|| circular[0].clone());
+                chamfer_tangent_edge_chain(solid, &contour.edges, &spine, value)
+                    .map_err(BlendContourError::Chamfer)
+            }
+        };
+    }
+
     match contour.kind {
         BlendKind::Fillet => {
             // A Circle hint routes to the co-circular chain solver for ANY edge
@@ -132,9 +155,8 @@ pub fn apply_blend_contour(
                     .unwrap_or_else(|| contour.edges[0].clone());
                 match fillet_circular_edge_chain(solid, &contour.edges, &spine, value) {
                     Ok(result) => Ok(result),
-                    Err(_) => {
-                        fillet_edges(solid, &contour.edges, value).map_err(BlendContourError::Fillet)
-                    }
+                    Err(_) => fillet_edges(solid, &contour.edges, value)
+                        .map_err(BlendContourError::Fillet),
                 }
             } else {
                 fillet_edges(solid, &contour.edges, value).map_err(BlendContourError::Fillet)
@@ -156,6 +178,43 @@ pub fn apply_blend_contour(
             }
         }
     }
+}
+
+fn is_mixed_tangent_chain(edges: &[Edge]) -> bool {
+    let circles: Vec<&Edge> = edges
+        .iter()
+        .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+        .collect();
+    let lines: Vec<&Edge> = edges
+        .iter()
+        .filter(|edge| !matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+        .collect();
+    if circles.is_empty() || lines.is_empty() {
+        return false;
+    }
+    lines.iter().all(|line| {
+        let (a, b) = (line.source().point(), line.target().point());
+        let Some(line_dir) = (b - a).normalized() else {
+            return false;
+        };
+        circles.iter().any(|arc| {
+            let Some(GeomCurve::Circle(circle)) = arc.curve() else {
+                return false;
+            };
+            [arc.source().point(), arc.target().point()]
+                .into_iter()
+                .any(|point| {
+                    if point.distance(&a) > 1.0e-5 && point.distance(&b) > 1.0e-5 {
+                        return false;
+                    }
+                    let tangent =
+                        GeomVec::from_dir(circle.axis()).cross(&(point - circle.center()));
+                    tangent
+                        .normalized()
+                        .is_some_and(|tangent| tangent.dot(&line_dir).abs() >= 0.985)
+                })
+        })
+    })
 }
 
 /// One contiguous spine edge covering the chain's co-circular fragments.

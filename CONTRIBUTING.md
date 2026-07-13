@@ -20,6 +20,7 @@ the architectural map and this guide does not repeat it.
 cargo run --release          # release is strongly recommended — the geometry kernel is CPU-heavy
 cargo test --workspace       # full test suite
 cargo test -p zerocad-core   # geometry engine only (no GUI/system deps)
+cargo test --workspace --manifest-path OpenRCAD/Cargo.toml  # kernel suites
 ```
 
 The geometry is built by **[OpenRCAD](OpenRCAD/)**, a pure-Rust B-Rep kernel that
@@ -27,6 +28,8 @@ lives in this tree as its own cargo workspace and is consumed through the
 `openrcad` façade crate. It is excluded from the ZeroCAD workspace, so
 `cargo test --workspace` does not build it directly; work on the kernel from
 inside `OpenRCAD/`.
+CI runs that separate OpenRCAD workspace as a required job; a root-workspace
+pass alone is not sufficient for geometry changes.
 
 ## Code style
 

@@ -2,6 +2,9 @@ use super::*;
 use crate::geometry::CoordinateSystem;
 use crate::sketch::SketchCurves;
 
+mod body_cut;
+mod body_join;
+mod body_transform;
 mod boolean_extrude;
 mod caching;
 mod circular_bite;
@@ -21,6 +24,8 @@ mod pattern_feature;
 mod reattachment_matrix;
 mod revolve_feature;
 mod shell_feature;
+mod thread_feature;
+mod thread_join_head;
 mod variables;
 
 use circular_bite_helpers::*;

@@ -40,6 +40,7 @@ impl ZeroCadApp {
                                 curves,
                                 shapes,
                                 corner_mods,
+                                mirrors,
                                 entity_ids,
                                 next_entity_id,
                                 solver,
@@ -49,6 +50,7 @@ impl ZeroCadApp {
                                 *curves = self.sketch_curves.clone();
                                 *shapes = self.sketch_shapes.clone();
                                 *corner_mods = self.sketch_corner_mods.clone();
+                                *mirrors = self.sketch_mirrors.clone();
                                 // Surviving shapes keep their durable ids; any
                                 // shape drawn during this edit session gets a
                                 // fresh one (ids are never reused).
@@ -101,6 +103,7 @@ impl ZeroCadApp {
                             curves: self.sketch_curves.clone(),
                             shapes: self.sketch_shapes.clone(),
                             corner_mods: self.sketch_corner_mods.clone(),
+                            mirrors: self.sketch_mirrors.clone(),
                             on_face: self.active_sketch_on_face,
                             // New sketches allocate real per-shape ids at commit;
                             // identity is the id, never the Vec position.
@@ -452,6 +455,34 @@ impl ZeroCadApp {
             }
         }
 
+        // THREAD: cut a modeled thread into the selected cylindrical face.
+        if !active_sketching
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.hole_op.is_none()
+            && self.thread_op.is_none()
+        {
+            if let Some((node, fid)) = self.thread_face_candidate() {
+                ui.separator();
+                let thread_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Thread",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if thread_btn
+                    .on_hover_text(
+                        "Cut a modeled thread into the selected cylindrical face (metric / Unified / custom)",
+                    )
+                    .clicked()
+                {
+                    self.begin_thread(node, fid);
+                }
+            }
+        }
+
         // SHELL: hollow the selected body, removing the selected face(s).
         if !active_sketching
             && self.extrude_op.is_none()
@@ -476,7 +507,58 @@ impl ZeroCadApp {
             }
         }
 
-        // PATTERN / MIRROR: replicate the selected body.
+        // COMBINE: shown only for two fully-selected bodies; its dialog offers
+        // strict Join and body-on-body Cut.
+        if !active_sketching
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.move_op.is_none()
+            && self.pattern_op.is_none()
+            && self.combine_op.is_none()
+        {
+            if let Some(sources) = self.selected_bodies_to_combine() {
+                ui.separator();
+                let join_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Combine",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if join_btn
+                    .on_hover_text("Join touching bodies or cut one overlapping body with another")
+                    .clicked()
+                {
+                    self.begin_combine(sources);
+                }
+            }
+        }
+
+        // MOVE: shown only for one fully-selected body. The same command is in
+        // the viewport's right-click menu.
+        if !active_sketching && self.move_op.is_none() {
+            if let Some(source) = self.selected_whole_body() {
+                ui.separator();
+                let move_btn = icons::Icon::Mirror.labeled_button(
+                    ui,
+                    "Move",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if move_btn
+                    .on_hover_text("Translate the selected body or align one of its faces")
+                    .clicked()
+                {
+                    self.begin_move_body(source);
+                }
+            }
+        }
+
+        // PATTERN / MIRROR: separate commands over the selected body. Mirror
+        // immediately enters the viewport plane/face picker.
         if !active_sketching
             && self.extrude_op.is_none()
             && self.edge_mod_op.is_none()
@@ -493,10 +575,24 @@ impl ZeroCadApp {
                     egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
                 );
                 if pattern_btn
-                    .on_hover_text("Linear/circular array or mirror of the selected body")
+                    .on_hover_text("Create a linear or circular array of the selected body")
                     .clicked()
                 {
-                    self.begin_pattern(source);
+                    self.begin_pattern(source.clone());
+                }
+                let mirror_btn = icons::Icon::Mirror.labeled_button(
+                    ui,
+                    "Mirror",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if mirror_btn
+                    .on_hover_text("Mirror the selected body across a picked plane or planar face")
+                    .clicked()
+                {
+                    self.begin_mirror(source);
                 }
             }
         }

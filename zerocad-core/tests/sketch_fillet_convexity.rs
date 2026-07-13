@@ -59,6 +59,7 @@ fn rounded_rect_graph_on(
             curves,
             shapes: vec![],
             corner_mods,
+            mirrors: vec![],
             on_face: false,
         },
     });
@@ -89,7 +90,11 @@ fn extruded_fillet_corners_are_convex() {
         let solids = g.debug_kernel_solids(&HashSet::new()).unwrap();
         let solid = &solids[0].1[0];
 
-        let zmid = if depth > 0.0 { depth as f64 / 2.0 } else { depth as f64 / 2.0 };
+        let zmid = if depth > 0.0 {
+            depth as f64 / 2.0
+        } else {
+            depth as f64 / 2.0
+        };
         // Fillet center of the (0,0) corner is (r, r). Just inside the arc
         // toward the corner: c + 0.98r * (-1/sqrt2, -1/sqrt2). Material must be
         // there for a CONVEX roundover; a scalloped (inverted) corner has none.
@@ -106,8 +111,14 @@ fn extruded_fillet_corners_are_convex() {
         let outside_ok = !openrcad::algo::boolean::point_in_solid(&outside, solid);
         let center_ok = openrcad::algo::boolean::point_in_solid(&center, solid);
         assert!(inside_ok, "w={w} h={h} r={r} depth={depth}: fillet corner must keep material just inside the arc (inverted/scalloped arc otherwise)");
-        assert!(outside_ok, "w={w} h={h} r={r} depth={depth}: no material beyond the roundover");
-        assert!(center_ok, "w={w} h={h} r={r} depth={depth}: solid center must be material");
+        assert!(
+            outside_ok,
+            "w={w} h={h} r={r} depth={depth}: no material beyond the roundover"
+        );
+        assert!(
+            center_ok,
+            "w={w} h={h} r={r} depth={depth}: solid center must be material"
+        );
     }
 }
 
@@ -118,7 +129,9 @@ fn ground_plane_fillet_corners_are_convex() {
     let cs = CoordinateSystem::XZ;
     let (w, h, r, depth) = (14.0f32, 11.0, 4.0, 8.0);
     let g = rounded_rect_graph_on(w, h, r, depth, cs);
-    let solids = g.debug_kernel_solids(&std::collections::HashSet::new()).unwrap();
+    let solids = g
+        .debug_kernel_solids(&std::collections::HashSet::new())
+        .unwrap();
     let solid = &solids[0].1[0];
 
     // Corner (0,0) in sketch space → world (x, y, z) = (u*a + v*b) with the
@@ -153,7 +166,10 @@ fn ground_plane_fillet_corners_are_convex() {
     let inside_ok = openrcad::algo::boolean::point_in_solid(&inside, solid);
     let outside_ok = !openrcad::algo::boolean::point_in_solid(&outside, solid);
     let center_ok = openrcad::algo::boolean::point_in_solid(&center, solid);
-    assert!(inside_ok, "ground plane: fillet corner must keep material just inside the arc");
+    assert!(
+        inside_ok,
+        "ground plane: fillet corner must keep material just inside the arc"
+    );
     assert!(outside_ok, "ground plane: no material beyond the roundover");
     assert!(center_ok, "ground plane: solid center must be material");
 }

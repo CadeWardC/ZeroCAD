@@ -326,3 +326,78 @@ fn join_overlapping_stays_one_body() {
         bodies.len()
     );
 }
+
+#[test]
+fn end_face_join_is_one_continuous_prism() {
+    use crate::geometry::Vec3;
+
+    // Reproduce a full-face Join from the end of a sketched prism. The result
+    // should be topologically equivalent to one 24×10×3 prism: no internal cap,
+    // no join-plane edge, and one selectable face per continuous outer plane.
+    let mut g = ParametricGraph::new();
+    add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (20.0, 10.0)));
+    add_extrude(&mut g, "extrude_2", "sketch_1", 3.0, ExtrudeMode::NewBody);
+
+    let end = CoordinateSystem::new(Vec3::new(20.0, 0.0, 0.0), Vec3::Y, Vec3::Z);
+    add_sketch_cs(
+        &mut g,
+        "sketch_3",
+        end,
+        rect_sketch((0.0, 0.0), (10.0, 3.0)),
+    );
+    add_extrude(&mut g, "extrude_4", "sketch_3", 4.0, ExtrudeMode::Join);
+    g.add_dependency("extrude_2", "extrude_4");
+
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("end-face join evaluates");
+    assert_eq!(bodies.len(), 1, "end-face join must remain one body");
+    assert!(warnings.is_empty(), "end-face join warned: {warnings:?}");
+
+    let mesh = &bodies[0].1;
+    let faces_on_plane = |axis: usize, coordinate: f32| {
+        mesh.indices
+            .chunks_exact(3)
+            .enumerate()
+            .filter_map(|(triangle, indices)| {
+                indices
+                    .iter()
+                    .all(|&vertex| {
+                        let base = vertex as usize * 6;
+                        (mesh.vertices[base + axis] - coordinate).abs() < 0.02
+                    })
+                    .then(|| mesh.face_ids[triangle])
+            })
+            .collect::<std::collections::HashSet<u32>>()
+    };
+
+    assert_eq!(
+        faces_on_plane(2, 3.0).len(),
+        1,
+        "the joined top must be one continuous selectable face"
+    );
+    assert_eq!(
+        faces_on_plane(1, 0.0).len(),
+        1,
+        "the joined front must be one continuous selectable face"
+    );
+    assert!(
+        faces_on_plane(0, 20.0).is_empty(),
+        "the former end face must not remain as an internal cap"
+    );
+
+    let seam_segments = mesh
+        .edge_indices
+        .chunks_exact(2)
+        .filter(|edge| {
+            edge.iter().all(|&vertex| {
+                let base = vertex as usize * 3;
+                (mesh.edge_vertices[base] - 20.0).abs() < 0.02
+            })
+        })
+        .count();
+    assert_eq!(
+        seam_segments, 0,
+        "the fused body must not expose a join-plane edge"
+    );
+}

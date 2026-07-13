@@ -164,10 +164,12 @@ impl SketchCurves {
             endpoints.push(a);
             endpoints.push(b);
         }
-        let degree = |p: (f32, f32), eps: &[(f32, f32)]| {
-            eps.iter().filter(|&&q| near(p, q)).count()
-        };
-        let start = endpoints.iter().copied().find(|&p| degree(p, &endpoints) == 1);
+        let degree =
+            |p: (f32, f32), eps: &[(f32, f32)]| eps.iter().filter(|&&q| near(p, q)).count();
+        let start = endpoints
+            .iter()
+            .copied()
+            .find(|&p| degree(p, &endpoints) == 1);
         // Closed loops (every endpoint degree 2) have no free end → not a v1
         // open path.
         let start = start?;
@@ -279,10 +281,10 @@ impl SketchCurves {
 // Parametric sketch shapes
 // ---------------------------------------------------------------------------
 
-/// A sketch dimension that may be a literal or an expression over the document's
-/// variables. `value` is the resolved fallback (the value drawn / last known);
-/// `expr`, when set, is re-evaluated against the current variables every build,
-/// so editing the variable updates the sketch.
+/// A sketch dimension that may be a literal or an arithmetic expression.
+/// `value` is the resolved fallback (the value drawn / last known); `expr`, when
+/// set, is kept as the editable source and re-evaluated every build. Expressions
+/// may contain plain arithmetic and/or document variables.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dimension {
     pub value: f32,
@@ -333,6 +335,17 @@ pub enum SketchShape {
         length: Dimension,
         angle_deg: Dimension,
     },
+    /// Regular polygon sized from a construction circle's diameter. The guide
+    /// circle is never emitted as sketch geometry: when `circumscribed` is
+    /// false the vertices lie on it; when true the polygon's edges are tangent
+    /// to it.
+    RegularPolygon {
+        center: (f32, f32),
+        sides: u32,
+        diameter: Dimension,
+        rotation_deg: f32,
+        circumscribed: bool,
+    },
     /// Pre-built geometry with no variable bindings (3-point rect/circle,
     /// ellipses). Stored as-is and emitted verbatim.
     Raw { curves: SketchCurves },
@@ -378,6 +391,37 @@ impl SketchShape {
                     (start.0 + len * ang.cos(), start.1 + len * ang.sin()),
                 );
             }
+            SketchShape::RegularPolygon {
+                center,
+                sides,
+                diameter,
+                rotation_deg,
+                circumscribed,
+            } => {
+                let n = (*sides).clamp(3, 64) as usize;
+                let guide_radius = (diameter.resolve(vars) * 0.5).max(0.0);
+                if guide_radius > 1.0e-4 {
+                    let step = std::f32::consts::TAU / n as f32;
+                    let guide_angle = rotation_deg.to_radians();
+                    let (radius, first_angle) = if *circumscribed {
+                        (guide_radius / (step * 0.5).cos(), guide_angle - step * 0.5)
+                    } else {
+                        (guide_radius, guide_angle)
+                    };
+                    let vertices: Vec<(f32, f32)> = (0..n)
+                        .map(|k| {
+                            let angle = first_angle + step * k as f32;
+                            (
+                                center.0 + radius * angle.cos(),
+                                center.1 + radius * angle.sin(),
+                            )
+                        })
+                        .collect();
+                    for k in 0..n {
+                        c.add_line(vertices[k], vertices[(k + 1) % n]);
+                    }
+                }
+            }
             SketchShape::Raw { curves } => c = curves.clone(),
         }
         c
@@ -419,6 +463,65 @@ pub struct CornerMod {
     pub kind: CornerKind,
 }
 
+/// An **associative** sketch mirror: a reflection axis (two points in sketch
+/// coordinates). Stored at the sketch level and applied *after* the shapes and
+/// corner mods are built — it reflects the current curve set across the axis and
+/// appends the copy, so editing the source geometry updates the mirror on every
+/// rebuild. Multiple mirrors compose in order (a second mirror reflects the
+/// accumulated result, e.g. mirror-X then mirror-Y gives four copies).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SketchMirror {
+    pub a: (f32, f32),
+    pub b: (f32, f32),
+}
+
+/// Reflect point `p` across the line through `a` with unit direction `d`.
+fn reflect_pt(p: (f32, f32), a: (f32, f32), d: (f32, f32)) -> (f32, f32) {
+    let v = (p.0 - a.0, p.1 - a.1);
+    let proj = v.0 * d.0 + v.1 * d.1;
+    (
+        2.0 * (a.0 + proj * d.0) - p.0,
+        2.0 * (a.1 + proj * d.1) - p.1,
+    )
+}
+
+/// Reflect an entire curve set across the axis `a`→`b`. Reflection is an
+/// isometry, so radii are preserved and a minor arc stays a minor arc — only the
+/// defining points move. A degenerate axis (`a == b`) returns an empty set.
+pub fn reflect_curves_across(curves: &SketchCurves, a: (f32, f32), b: (f32, f32)) -> SketchCurves {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    let mut out = SketchCurves::new();
+    if len < 1.0e-6 {
+        return out;
+    }
+    let d = (dx / len, dy / len);
+    for s in &curves.segments {
+        out.add_line(reflect_pt(s.a, a, d), reflect_pt(s.b, a, d));
+    }
+    for c in &curves.circles {
+        out.add_circle(reflect_pt(c.center, a, d), c.radius);
+    }
+    for arc in &curves.arcs {
+        out.arcs.push(Arc {
+            center: reflect_pt(arc.center, a, d),
+            radius: arc.radius,
+            start: reflect_pt(arc.start, a, d),
+            end: reflect_pt(arc.end, a, d),
+        });
+    }
+    out
+}
+
+/// Apply every mirror in `mirrors` to `c` in order, each reflecting the current
+/// accumulated curves across its axis and appending the copy.
+pub fn apply_mirrors(c: &mut SketchCurves, mirrors: &[SketchMirror]) {
+    for m in mirrors {
+        let reflected = reflect_curves_across(c, m.a, m.b);
+        c.extend_curves(&reflected);
+    }
+}
+
 /// How many straight segments to approximate an arc of `angle` radians and
 /// radius `r` so it reads as a *smooth* curve. Combines an angular budget
 /// (~3.6°/segment, so the polyline corners are imperceptible at any size) with a
@@ -453,7 +556,7 @@ pub fn effective_curves(
     corner_mods: &[CornerMod],
     vars: &HashMap<String, f64>,
 ) -> SketchCurves {
-    effective_curves_solved(curves, shapes, corner_mods, None, vars)
+    effective_curves_solved(curves, shapes, corner_mods, &[], None, vars)
 }
 
 /// [`effective_curves`] with the constraint-solver model. When `solver` is
@@ -472,6 +575,7 @@ pub fn effective_curves_solved(
     curves: &SketchCurves,
     shapes: &[SketchShape],
     corner_mods: &[CornerMod],
+    mirrors: &[SketchMirror],
     solver: Option<&SketchSolverModel>,
     vars: &HashMap<String, f64>,
 ) -> SketchCurves {
@@ -492,6 +596,7 @@ pub fn effective_curves_solved(
             let r = m.radius.resolve(vars);
             apply_corner_mod(&mut c, m.at, r, m.kind);
         }
+        apply_mirrors(&mut c, mirrors);
         return c;
     }
     let mut c = if shapes.is_empty() {
@@ -503,6 +608,7 @@ pub fn effective_curves_solved(
         let r = m.radius.resolve(vars);
         apply_corner_mod(&mut c, m.at, r, m.kind);
     }
+    apply_mirrors(&mut c, mirrors);
     c
 }
 
@@ -791,7 +897,12 @@ fn sketch_provenance_fragments(
         fragments.push(RegionProvenanceFragment::RawPolyline {
             shape_id: shapes
                 .iter()
-                .position(|shape| matches!(shape, SketchShape::Raw { .. }))
+                .position(|shape| {
+                    matches!(
+                        shape,
+                        SketchShape::RegularPolygon { .. } | SketchShape::Raw { .. }
+                    )
+                })
                 .and_then(id_at),
         });
     }
@@ -1443,6 +1554,45 @@ pub fn shapes_overlap(a: &ShapeLoop, b: &ShapeLoop) -> bool {
     false
 }
 
+/// True when two overlapping loops are in a *pure containment* relationship —
+/// one lies entirely inside the other with no boundary crossing. That makes the
+/// inner loop a HOLE (a circle drawn inside a rectangle), which
+/// [`detect_regions`]/`assign_holes` already turns into a hole; it needs no
+/// boolean split. Assumes the two loops overlap.
+fn loops_purely_contained(a: &ShapeLoop, b: &ShapeLoop) -> bool {
+    let (pa, pb) = (&a.boundary, &b.boundary);
+    let (na, nb) = (pa.len(), pb.len());
+    if na < 3 || nb < 3 {
+        return false;
+    }
+    // Any proper edge crossing means the boundaries interpenetrate — a genuine
+    // partial overlap, not containment.
+    for i in 0..na {
+        let (a0, a1) = (pa[i], pa[(i + 1) % na]);
+        for j in 0..nb {
+            if segments_cross_2d(a0, a1, pb[j], pb[(j + 1) % nb]) {
+                return false;
+            }
+        }
+    }
+    // No crossings: it is containment iff every vertex of one loop lies inside
+    // the other (so the whole loop is nested, not merely edge-touching).
+    let b_in_a = pb.iter().all(|&v| point_in_polygon(v, pa));
+    let a_in_b = pa.iter().all(|&v| point_in_polygon(v, pb));
+    b_in_a || a_in_b
+}
+
+/// True when two shape outlines genuinely interpenetrate and so require a
+/// boolean split/fusion to resolve (an edge crossing, or a partial/edge-aligned
+/// overlap). This is [`shapes_overlap`] minus the pure-containment case: a loop
+/// fully nested inside another is a hole, which `detect_regions` handles
+/// directly and the instant extrude ghost can render exactly — no boolean worker
+/// needed. Used by the live extrude preview to decide when the fast hole-aware
+/// ghost suffices versus when the evaluated boolean result must be shown.
+pub fn shapes_cross(a: &ShapeLoop, b: &ShapeLoop) -> bool {
+    shapes_overlap(a, b) && !loops_purely_contained(a, b)
+}
+
 /// Group shape loops into connected components by the overlap relation. A
 /// singleton cluster is a non-overlapping shape (extrudes independently); a
 /// cluster of ≥2 becomes one boolean solid.
@@ -1509,6 +1659,47 @@ mod tests {
             regions
         );
         assert!(approx(regions[0].area, 80.0, 0.1));
+    }
+
+    #[test]
+    fn regular_polygon_uses_expression_diameter_without_emitting_guide_circle() {
+        let polygon = SketchShape::RegularPolygon {
+            center: (2.0, 3.0),
+            sides: 6,
+            diameter: Dimension {
+                value: 1.0,
+                expr: Some("43/2".to_string()),
+            },
+            rotation_deg: 0.0,
+            circumscribed: false,
+        };
+        let curves = polygon.build(&HashMap::new());
+        assert_eq!(curves.segments.len(), 6);
+        assert!(
+            curves.circles.is_empty(),
+            "guide circle must remain construction-only"
+        );
+        let first = curves.segments[0].a;
+        assert!(approx(first.0, 12.75, 1.0e-4));
+        assert!(approx(first.1, 3.0, 1.0e-4));
+        assert_eq!(detect_regions(&curves).len(), 1);
+    }
+
+    #[test]
+    fn circumscribed_polygon_edges_are_tangent_to_guide_circle() {
+        let polygon = SketchShape::RegularPolygon {
+            center: (0.0, 0.0),
+            sides: 4,
+            diameter: Dimension::literal(20.0),
+            rotation_deg: 0.0,
+            circumscribed: true,
+        };
+        let curves = polygon.build(&HashMap::new());
+        assert_eq!(curves.segments.len(), 4);
+        assert!(curves.circles.is_empty());
+        let edge = curves.segments[0];
+        let midpoint = ((edge.a.0 + edge.b.0) * 0.5, (edge.a.1 + edge.b.1) * 0.5);
+        assert!(approx(midpoint.0.hypot(midpoint.1), 10.0, 1.0e-4));
     }
 
     #[test]
@@ -1585,6 +1776,68 @@ mod tests {
         let cregions = detect_regions(&chamfered);
         assert_eq!(cregions.len(), 1, "chamfered square is still one region");
         assert!(cregions[0].area < base_area);
+    }
+
+    #[test]
+    fn associative_mirror_reflects_and_follows_source() {
+        let vars = HashMap::new();
+        // A 4×2 rectangle whose left edge is at x=4 (fully on +x side).
+        let rect = vec![SketchShape::Rectangle {
+            origin: (4.0, 0.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: Dimension::literal(4.0),
+            h: Dimension::literal(2.0),
+            from_center: false,
+        }];
+        // Mirror across the Y axis (x = 0).
+        let mirror = SketchMirror {
+            a: (0.0, 0.0),
+            b: (0.0, 1.0),
+        };
+        let out = effective_curves_solved(
+            &SketchCurves::new(),
+            &rect,
+            &[],
+            std::slice::from_ref(&mirror),
+            None,
+            &vars,
+        );
+        // Two disjoint regions (source + reflected copy), equal total area.
+        let regions = detect_regions(&out);
+        assert_eq!(regions.len(), 2, "mirror yields source + reflected region");
+        let total: f32 = regions.iter().map(|r| r.area).sum();
+        assert!(approx(total, 16.0, 0.1), "both 4×2 rects: {total}");
+        // Associativity: widening the source (via a fresh build) moves the mirror
+        // too — the reflected copy is re-derived, never stale.
+        let wider = vec![SketchShape::Rectangle {
+            origin: (4.0, 0.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: Dimension::literal(6.0),
+            h: Dimension::literal(2.0),
+            from_center: false,
+        }];
+        let out2 = effective_curves_solved(
+            &SketchCurves::new(),
+            &wider,
+            &[],
+            std::slice::from_ref(&mirror),
+            None,
+            &vars,
+        );
+        let total2: f32 = detect_regions(&out2).iter().map(|r| r.area).sum();
+        assert!(
+            approx(total2, 24.0, 0.1),
+            "widened source + mirror: {total2}"
+        );
+        // The reflected copy must sit on the −x side (min x is negative).
+        let min_x = out2
+            .segments
+            .iter()
+            .flat_map(|s| [s.a.0, s.b.0])
+            .fold(f32::INFINITY, f32::min);
+        assert!(min_x < -0.5, "reflected copy lands on the −x side: {min_x}");
     }
 
     #[test]
@@ -1842,6 +2095,72 @@ mod tests {
             shapes_overlap(&loops[0], &loops[1]),
             "fully-contained circle must register as overlap (→ cut)"
         );
+    }
+
+    #[test]
+    fn contained_circle_overlaps_but_does_not_cross() {
+        // A circle fully inside a rectangle is a HOLE, not a boolean split: it
+        // overlaps (so it clusters and commits as a hole) but does NOT cross, so
+        // the live extrude ghost may render it directly (prism-with-hole) instead
+        // of waiting on the boolean worker.
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(-10.0, -10.0, 10.0, 10.0),
+                circle_shape(0.0, 0.0, 4.0),
+            ],
+            &vars,
+        );
+        assert!(shapes_overlap(&loops[0], &loops[1]));
+        assert!(
+            !shapes_cross(&loops[0], &loops[1]),
+            "a fully-contained circle is a hole, not a crossing boolean"
+        );
+        // Containment still clusters (so the commit drops the tool-lens disc).
+        assert_eq!(overlap_clusters(&loops), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn straddling_circle_crosses() {
+        // A circle straddling a rectangle edge genuinely interpenetrates — this
+        // must still route through the boolean worker (shapes_cross = true).
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 10.0, 10.0),
+                circle_shape(10.0, 5.0, 4.0),
+            ],
+            &vars,
+        );
+        assert!(shapes_cross(&loops[0], &loops[1]));
+    }
+
+    #[test]
+    fn edge_aligned_rects_cross() {
+        // Horizontally overlapping rectangles (partial overlap, no containment)
+        // are a genuine boolean — they cross.
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 2.0, 2.0),
+                rect_shape(1.0, 0.0, 3.0, 2.0),
+            ],
+            &vars,
+        );
+        assert!(shapes_cross(&loops[0], &loops[1]));
+    }
+
+    #[test]
+    fn disjoint_shapes_do_not_cross() {
+        let vars: HashMap<String, f64> = HashMap::new();
+        let loops = shape_loops(
+            &[
+                rect_shape(0.0, 0.0, 10.0, 10.0),
+                circle_shape(30.0, 5.0, 4.0),
+            ],
+            &vars,
+        );
+        assert!(!shapes_cross(&loops[0], &loops[1]));
     }
 
     #[test]

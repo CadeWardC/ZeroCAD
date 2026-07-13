@@ -25,7 +25,7 @@ panic = "unwind"
 
 [workspace.dependencies]
 petgraph = { version = "0.6", features = ["serde-1"] }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 crossbeam-channel = "0.5"
 rayon = "1.8"
@@ -51,4 +51,5 @@ rfd = "0.14"
 ciborium = "0.2"
 zstd = "0.13"
 crc32fast = "1.4"
+blake3 = "1.5"
 png = "0.17"

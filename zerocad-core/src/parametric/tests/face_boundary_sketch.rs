@@ -32,8 +32,10 @@ fn box_with_face_sketch(drawn: SketchCurves) -> ParametricGraph {
     add_sketch_cs(&mut g, "sketch_2", top_face_cs(), drawn);
     g.add_dependency("box_1", "sketch_2");
     // The projected top-face outline, as the GUI captures it at sketch start.
-    g.sketch_face_boundaries
-        .insert("sketch_2".to_string(), rect_sketch((0.0, 0.0), (10.0, 10.0)));
+    g.sketch_face_boundaries.insert(
+        "sketch_2".to_string(),
+        rect_sketch((0.0, 0.0), (10.0, 10.0)),
+    );
     g
 }
 
@@ -105,11 +107,16 @@ fn face_outline_rederives_when_the_body_changes() {
 
     let boss_x_span = |g: &ParametricGraph| -> (f32, f32) {
         let bodies = g.evaluate_bodies(&none).unwrap();
-        let boss = bodies.iter().find(|(id, _)| id == "boss").expect("boss body");
-        boss.1.vertices.chunks(6).fold(
-            (f32::INFINITY, f32::NEG_INFINITY),
-            |(lo, hi), v| (lo.min(v[0]), hi.max(v[0])),
-        )
+        let boss = bodies
+            .iter()
+            .find(|(id, _)| id == "boss")
+            .expect("boss body");
+        boss.1
+            .vertices
+            .chunks(6)
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v[0]), hi.max(v[0]))
+            })
     };
     let (x0, x1) = boss_x_span(&g);
     assert!(
@@ -138,10 +145,13 @@ fn face_outline_rederives_when_the_body_changes() {
         .sketch_face_boundaries
         .get("face_sketch")
         .expect("refreshed outline stored");
-    let (u_min, u_max) = refreshed.segments.iter().flat_map(|s| [s.a.0, s.b.0]).fold(
-        (f32::INFINITY, f32::NEG_INFINITY),
-        |(lo, hi), u| (lo.min(u), hi.max(u)),
-    );
+    let (u_min, u_max) = refreshed
+        .segments
+        .iter()
+        .flat_map(|s| [s.a.0, s.b.0])
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), u| {
+            (lo.min(u), hi.max(u))
+        });
     assert!(
         (u_min + 7.0).abs() < 0.2 && (u_max - 7.0).abs() < 0.2,
         "stored outline should now span the 14-wide face, got u {u_min}..{u_max}"
@@ -221,8 +231,9 @@ fn drawn_circle_splits_against_face_boundary() {
         "cut must not change the outer z range, got {min_z}..{max_z}"
     );
     // The pocket floor: some vertex near z=5 inside the lens footprint.
-    let has_floor = mesh.vertices.chunks(6).any(|v| {
-        (v[2] - 5.0).abs() < 0.11 && v[0] > 7.0 - 0.11 && (v[1] - 5.0).abs() < 3.11
-    });
+    let has_floor = mesh
+        .vertices
+        .chunks(6)
+        .any(|v| (v[2] - 5.0).abs() < 0.11 && v[0] > 7.0 - 0.11 && (v[1] - 5.0).abs() < 3.11);
     assert!(has_floor, "expected a pocket floor near z=5 under the lens");
 }

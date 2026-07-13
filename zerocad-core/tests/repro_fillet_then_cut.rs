@@ -70,6 +70,7 @@ fn add_circle_cut(g: &mut ParametricGraph, depth: f32) {
             curves,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: true,
         },
     });

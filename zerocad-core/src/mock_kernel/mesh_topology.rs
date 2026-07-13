@@ -227,7 +227,17 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
         let loc = p.location();
         let t = loc.x() * dx + loc.y() * dy + loc.z() * dz; // (loc·d)
         let (fx, fy, fz) = (loc.x() - dx * t, loc.y() - dy * t, loc.z() - dz * t);
-        (0, q(fx), q(fy), q(fz), q(dx), q(dy), q(dz), q(s.radius()), 0)
+        (
+            0,
+            q(fx),
+            q(fy),
+            q(fz),
+            q(dx),
+            q(dy),
+            q(dz),
+            q(s.radius()),
+            0,
+        )
     };
     // A torus is symmetric under flipping its axis, so its identity is centre +
     // axis line + both radii; the centre already lies on the axis.
@@ -366,30 +376,6 @@ pub(crate) fn mesh_feature_edges(
         }
     }
 
-    // Classify each B-rep face as flat or curved by whether its triangles' stored
-    // (smoothed) normals vary. A fillet/cylinder face is curved; box and cap faces
-    // are flat. Used below so a fillet's *tangent boundary* — where its curved face
-    // meets a flat one with nearly-equal normals — is kept as a real edge (the
-    // top/bottom line of the round), while a faceted fallback's flat-facet seams
-    // (also shallow) stay suppressed.
-    let mut face_ref_n: HashMap<u32, [f32; 3]> = HashMap::new();
-    let mut face_curved: HashMap<u32, bool> = HashMap::new();
-    for (t, tri) in indices.chunks_exact(3).enumerate() {
-        let fid = face_ids.get(t).copied().unwrap_or(0);
-        let r = *face_ref_n
-            .entry(fid)
-            .or_insert_with(|| nrm(tri[0] as usize));
-        for &v in tri {
-            let n = nrm(v as usize);
-            // ~2.5°: a flat B-rep face's vertices share one (anchored) normal, so
-            // it never trips this; a curved face's normals fan out and do.
-            const CURVE_COS: f32 = 0.999;
-            if r[0] * n[0] + r[1] * n[1] + r[2] * n[2] < CURVE_COS {
-                face_curved.insert(fid, true);
-            }
-        }
-    }
-
     let mut edge_vertices: Vec<f32> = Vec::new();
     let mut edge_indices: Vec<u32> = Vec::new();
     let mut edge_face_normals: Vec<f32> = Vec::new();
@@ -421,31 +407,16 @@ pub(crate) fn mesh_feature_edges(
                 continue;
             }
         }
-        // Suppress the *facet-boundary* lines of a curved surface: a crease whose
-        // two faces meet at a shallow dihedral (their outward normals nearly
-        // agree) is a tessellation seam of a fillet / boolean'd cylinder, not a
-        // design edge. Hiding it lets the round read as one smooth face, while
-        // genuine edges (box corners at 90°, chamfer bevels at 45°, …) — whose
-        // normals differ well past the threshold — still draw. The crease is kept
-        // only when the normals diverge by more than ~`CREASE_COS` (≈18°).
+        // Suppress tangent-continuous boundaries, including the construction seam
+        // where a circular end joins a straight profile. The B-Rep faces remain
+        // intact; this only removes their misleading display/selectable edge.
+        // Genuine corners, chamfers, and cylinder rims exceed this threshold.
         if rec.faces.len() >= 2 {
             let n0 = rec.faces[0].1;
             let n1 = rec.faces[1].1;
             let dot = (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).clamp(-1.0, 1.0);
             const CREASE_COS: f32 = 0.95; // cos(~18°)
-                                          // A curved face (fillet/cylinder) meets its neighbour along a *tangent*
-                                          // edge whose normals nearly agree — yet it's a real design edge (the
-                                          // top/bottom of a fillet, a cylinder's rim), so any shallow crease that
-                                          // touches a curved face is kept. Only a shallow crease between two
-                                          // genuinely flat faces is a faceted tessellation seam to hide.
-                                          // (A *same-surface* seam — two arc-faces of one cylinder — is handled
-                                          // separately above via `surface_group`; here the representative
-                                          // per-face normals are too coarse to recognise it.)
-            let touches_curved = rec
-                .faces
-                .iter()
-                .any(|(fid, _)| face_curved.get(fid).copied().unwrap_or(false));
-            if dot > CREASE_COS && !touches_curved {
+            if dot > CREASE_COS {
                 continue;
             }
         }
@@ -764,7 +735,75 @@ pub(crate) fn populate_edge_adjacent_face_names(mesh: &mut MockMesh) {
     }
 }
 
+/// The geometric normals of the (up to) two triangles of the display mesh
+/// sharing the chord `a`–`b`, matched by quantized vertex position. `None`
+/// unless exactly two distinct-normal triangles touch the chord.
+///
+/// The per-segment `edge_face_normals` a wireframe stores can be face
+/// REPRESENTATIVE directions on analytic (smooth-cylinder) tessellations — a
+/// wall normal sampled somewhere ELSE around the rim, up to 180° from this
+/// chord. Anything that reads a normal's radial *sign* at the chord (the
+/// fillet/chamfer preview ribbon does) then flips. The chord's own adjacent
+/// triangles are always local, so prefer them.
+pub(crate) fn chord_adjacent_triangle_normals(
+    vertices: &[f32],
+    indices: &[u32],
+    a: [f32; 3],
+    b: [f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    let qkey = |p: [f32; 3]| -> (i64, i64, i64) {
+        let q = |v: f32| (v as f64 * 10_000.0).round() as i64;
+        (q(p[0]), q(p[1]), q(p[2]))
+    };
+    let (ka, kb) = (qkey(a), qkey(b));
+    let vert = |vi: u32| -> [f32; 3] {
+        let o = vi as usize * 6;
+        [vertices[o], vertices[o + 1], vertices[o + 2]]
+    };
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    for tri in indices.chunks_exact(3) {
+        let ps = [vert(tri[0]), vert(tri[1]), vert(tri[2])];
+        let ks = [qkey(ps[0]), qkey(ps[1]), qkey(ps[2])];
+        if !(ks.contains(&ka) && ks.contains(&kb)) {
+            continue;
+        }
+        let u = [
+            ps[1][0] - ps[0][0],
+            ps[1][1] - ps[0][1],
+            ps[1][2] - ps[0][2],
+        ];
+        let v = [
+            ps[2][0] - ps[0][0],
+            ps[2][1] - ps[0][1],
+            ps[2][2] - ps[0][2],
+        ];
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if len <= 1.0e-9 {
+            continue;
+        }
+        let n = [n[0] / len, n[1] / len, n[2] / len];
+        // Coplanar neighbors (two cap triangles) count once.
+        let dup = normals
+            .iter()
+            .any(|m| m[0] * n[0] + m[1] * n[1] + m[2] * n[2] > 0.999);
+        if !dup {
+            normals.push(n);
+        }
+        if normals.len() > 2 {
+            return None;
+        }
+    }
+    (normals.len() == 2).then(|| (normals[0], normals[1]))
+}
+
 pub(crate) fn mesh_edge_refs_from_groups(
+    vertices: &[f32],
+    indices: &[u32],
     edge_vertices: &[f32],
     edge_indices: &[u32],
     edge_face_normals: &[f32],
@@ -827,16 +866,26 @@ pub(crate) fn mesh_edge_refs_from_groups(
         if edge_face_normals.len() < fo + 6 {
             continue;
         }
-        let n1 = [
+        let mut n1 = [
             edge_face_normals[fo],
             edge_face_normals[fo + 1],
             edge_face_normals[fo + 2],
         ];
-        let n2 = [
+        let mut n2 = [
             edge_face_normals[fo + 3],
             edge_face_normals[fo + 4],
             edge_face_normals[fo + 5],
         ];
+        // The stored pair can be face-representative (sampled far from this
+        // chord on smooth walls); anything reading a radial SIGN off n1/n2 at
+        // p0/p1 — the edge-mod preview ribbon — then flips. Re-localize to the
+        // chord's own two adjacent display triangles when they resolve.
+        if let Some((t1, t2)) =
+            chord_adjacent_triangle_normals(vertices, indices, vpos(first, 0), vpos(first, 1))
+        {
+            n1 = t1;
+            n2 = t2;
+        }
         let curve = edge_curve_hint_from_points(&pts, p0, p1, n1, n2, closed);
         let curve_kind = match curve {
             Some(EdgeCurveHint::Circle { .. }) => Some("circle".to_string()),

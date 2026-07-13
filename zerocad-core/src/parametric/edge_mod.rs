@@ -145,7 +145,11 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
                     // Prefer candidates that also match geometrically; if an
                     // edit moved every fragment (the stable-id escape hatch
                     // exists for exactly that), fall back to the nearest.
-                    let pool = if geometric.is_empty() { matches } else { geometric };
+                    let pool = if geometric.is_empty() {
+                        matches
+                    } else {
+                        geometric
+                    };
                     pool.into_iter().min_by(|a, b| {
                         span_dist(a)
                             .partial_cmp(&span_dist(b))
@@ -215,7 +219,11 @@ fn resolve_edge_by_face_pair(
                     .copied()
                     .filter(|c| mesh_candidate_matches_captured_edge(c, edge))
                     .collect();
-                let pool = if geometric.is_empty() { matches } else { geometric };
+                let pool = if geometric.is_empty() {
+                    matches
+                } else {
+                    geometric
+                };
                 pool.into_iter().min_by(|a, b| {
                     span_dist(a)
                         .partial_cmp(&span_dist(b))
@@ -226,7 +234,7 @@ fn resolve_edge_by_face_pair(
         best.map(|candidate| edge_ref_from_mesh_candidate(body, candidate, requested))
     };
     body.pristine
-        .as_ref()
+        .as_deref()
         .and_then(pick)
         .or_else(|| pick(&edge_mod_reference_mesh(body)))
 }
@@ -300,7 +308,7 @@ pub(crate) fn resolve_face_ref_by_topology(body: &LiveBody, face: &FaceRef) -> O
                     })
                     .map(|c| face_ref_from_mesh_face(body, c, requested))
             };
-            if let Some(resolved) = body.pristine.as_ref().and_then(pick) {
+            if let Some(resolved) = body.pristine.as_deref().and_then(pick) {
                 return Some(resolved);
             }
             return pick(&edge_mod_reference_mesh(body));
@@ -364,7 +372,7 @@ fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<FaceR
             })
     };
     body.pristine
-        .as_ref()
+        .as_deref()
         .and_then(pick)
         .or_else(|| pick(&edge_mod_reference_mesh(body)))
 }
@@ -1257,7 +1265,7 @@ pub(crate) fn apply_fillet(
         );
         if outcome.applied && outcome.last_err.is_none() {
             body.parts = outcome.parts;
-            body.pristine = outcome.pristine;
+            body.pristine = outcome.pristine.map(std::sync::Arc::new);
             body.sketch_source = None;
             body.cut_replay = None;
             body.edge_mod_cut_history_path_used = false;
@@ -1274,7 +1282,7 @@ pub(crate) fn apply_fillet(
         match edge_mod_try_construction_replay(body, selection, replay, dist) {
             ReplayAttempt::Applied(result) => {
                 body.parts = result.parts;
-                body.pristine = result.pristine;
+                body.pristine = result.pristine.map(std::sync::Arc::new);
                 body.sketch_source = None;
                 body.cut_replay = result.cut_replay;
                 body.edge_mod_cut_history_path_used = true;
@@ -1287,7 +1295,7 @@ pub(crate) fn apply_fillet(
         match edge_mod_try_native_cut_history_replay(body, selection, replay, dist) {
             ReplayAttempt::Applied(result) => {
                 body.parts = result.parts;
-                body.pristine = result.pristine;
+                body.pristine = result.pristine.map(std::sync::Arc::new);
                 body.sketch_source = None;
                 body.cut_replay = result.cut_replay;
                 body.edge_mod_cut_history_path_used = true;
@@ -1307,7 +1315,7 @@ pub(crate) fn apply_fillet(
         match edge_mod_try_construction_replay(body, selection, replay, dist) {
             ReplayAttempt::Applied(result) => {
                 body.parts = result.parts;
-                body.pristine = result.pristine;
+                body.pristine = result.pristine.map(std::sync::Arc::new);
                 body.sketch_source = None;
                 body.cut_replay = result.cut_replay;
                 body.edge_mod_cut_history_path_used = true;
@@ -1343,7 +1351,7 @@ pub(crate) fn apply_fillet(
     );
     body.parts = outcome.parts;
     if outcome.applied {
-        body.pristine = outcome.pristine;
+        body.pristine = outcome.pristine.map(std::sync::Arc::new);
         body.sketch_source = None;
         body.cut_replay = None;
         body.edge_mod_cut_history_path_used = cut_history_path_used;
@@ -1622,7 +1630,7 @@ pub(crate) fn apply_chamfer(
     );
     body.parts = outcome.parts;
     if outcome.applied {
-        body.pristine = outcome.pristine;
+        body.pristine = outcome.pristine.map(std::sync::Arc::new);
         body.sketch_source = None;
         body.cut_replay = None;
         body.edge_mod_cut_history_path_used = false;
@@ -2179,7 +2187,10 @@ pub(crate) fn edge_mod_reference_mesh(body: &LiveBody) -> MockMesh {
     if !mesh.indices.is_empty() {
         mesh
     } else {
-        body.pristine.clone().unwrap_or_else(MockMesh::empty)
+        body.pristine
+            .as_ref()
+            .map(|mesh| (**mesh).clone())
+            .unwrap_or_else(MockMesh::empty)
     }
 }
 
@@ -2210,7 +2221,8 @@ pub(crate) fn edge_mod_accept_candidate_or_recut(
     let has_curved_band = candidate.shell().faces().iter().any(|f| {
         matches!(
             f.surface(),
-            Some(openrcad::geom::GeomSurface::Torus(_)) | Some(openrcad::geom::GeomSurface::Cone(_))
+            Some(openrcad::geom::GeomSurface::Torus(_))
+                | Some(openrcad::geom::GeomSurface::Cone(_))
         )
     });
     if has_curved_band {
@@ -2252,8 +2264,12 @@ pub(crate) fn edge_mod_accept_candidate_for_edge(
     circular_bite_locality: Option<CircularBiteLocality<'_>>,
     additive: Option<ConcaveBlendAllowance>,
 ) -> Result<KernelSolid, String> {
-    let (candidate, candidate_mesh) =
-        edge_mod_accept_candidate_with_mesh_gated(reference_mesh, original_part, candidate, additive)?;
+    let (candidate, candidate_mesh) = edge_mod_accept_candidate_with_mesh_gated(
+        reference_mesh,
+        original_part,
+        candidate,
+        additive,
+    )?;
     if let Some(locality) = circular_bite_locality {
         if let Some(candidate_mesh) = candidate_mesh.as_ref() {
             edge_mod_circular_bite_locality_mesh(locality, candidate_mesh)?;
@@ -2825,7 +2841,8 @@ pub(crate) fn edge_mod_selected_blend_present(
 
     if matches!(kind, crate::sketch::CornerKind::Fillet) && scan.normal_bins.len() < 2 {
         return Err(
-            "candidate fillet surface on the selected edge did not have rounded normals".to_string(),
+            "candidate fillet surface on the selected edge did not have rounded normals"
+                .to_string(),
         );
     }
 
@@ -3061,6 +3078,21 @@ pub(crate) fn circular_bite_unselected_side_segments(
     };
     let original = &selection.original_edge;
     let selected = &selection.active_edge;
+    // A CLOSED rim selection (the full circle — a small cylinder's top edge, a
+    // bored hole's rim) has no unselected remainder by definition, and its seam
+    // endpoint always sits on the loop's bounding-box extreme, which the
+    // straight-side classifier below would otherwise mistake for a rect side —
+    // fabricating a one-tessellation-chord "unselected span" next to the seam
+    // that rejects a perfectly good blend. Bail before classifying.
+    let closed_circle = |e: &EdgeRef| {
+        matches!(
+            e.curve.as_ref(),
+            Some(EdgeCurveHint::Circle { closed: true, .. })
+        )
+    };
+    if closed_circle(original) || closed_circle(selected) {
+        return Vec::new();
+    }
     let p0_world = Vec3::new(original.p0[0], original.p0[1], original.p0[2]);
     let p1_world = Vec3::new(original.p1[0], original.p1[1], original.p1[2]);
     let p0 = region.cs.project(p0_world);
@@ -3081,6 +3113,12 @@ pub(crate) fn circular_bite_unselected_side_segments(
         return Vec::new();
     }
     let side_eps = 0.12;
+    // Same degenerate case when no curve hint survived: a closed-loop selection
+    // projects both endpoints onto (nearly) the same point — never a straight
+    // rect side.
+    if dist2(p0, p1) <= side_eps {
+        return Vec::new();
+    }
 
     let side = if (p0.1 - min_y).abs() <= side_eps && (p1.1 - min_y).abs() <= side_eps {
         0usize

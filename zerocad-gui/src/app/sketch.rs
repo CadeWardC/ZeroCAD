@@ -1,83 +1,107 @@
 use crate::*;
 
-/// Reflect point `p` across the line through `a` with unit direction `d`.
-fn reflect_pt(p: (f32, f32), a: (f32, f32), d: (f32, f32)) -> (f32, f32) {
-    let v = (p.0 - a.0, p.1 - a.1);
-    let proj = v.0 * d.0 + v.1 * d.1;
-    (
-        2.0 * (a.0 + proj * d.0) - p.0,
-        2.0 * (a.1 + proj * d.1) - p.1,
-    )
-}
-
-/// Reflect an entire curve set across the axis through `a` with unit direction
-/// `d`. Reflection is an isometry, so radii are preserved and a minor arc stays
-/// a minor arc — only the defining points move.
-pub(crate) fn reflect_curves(
-    curves: &SketchCurves,
-    a: (f32, f32),
-    d: (f32, f32),
-) -> SketchCurves {
-    let mut out = SketchCurves::new();
-    for s in &curves.segments {
-        out.add_line(reflect_pt(s.a, a, d), reflect_pt(s.b, a, d));
-    }
-    for c in &curves.circles {
-        out.add_circle(reflect_pt(c.center, a, d), c.radius);
-    }
-    for arc in &curves.arcs {
-        out.arcs.push(zerocad_core::sketch::Arc {
-            center: reflect_pt(arc.center, a, d),
-            radius: arc.radius,
-            start: reflect_pt(arc.start, a, d),
-            end: reflect_pt(arc.end, a, d),
-        });
-    }
-    out
-}
-
 impl ZeroCadApp {
-    /// Commit a sketch Mirror: reflect the whole live sketch across the 2-click
-    /// axis `p0`→`p1` and append the reflected copy as a new baked shape. Works
-    /// in a fresh drawing session (added to `sketch_shapes`) and in an Edit
-    /// Sketch session (also promoted into the constraint-solver model so it
-    /// renders and participates), matching how a drawn shape is committed.
+    /// Undo the most recently committed action in the live sketch instead of
+    /// stepping the document history. Sketch edits do not enter the document
+    /// undo stack until Finish Sketch, so routing Ctrl/Cmd+Z to `undo()` while
+    /// this mode is active either did nothing or changed an unrelated feature.
+    pub(crate) fn undo_last_sketch_action(&mut self) {
+        if self.clear_pending_corners() {
+            self.status_msg = "Undid the staged sketch corner.".to_string();
+            return;
+        }
+
+        let Some(_shape) = self.sketch_shapes.pop() else {
+            if self.sketch_mirrors.pop().is_some() || self.sketch_corner_mods.pop().is_some() {
+                self.rebuild_active_sketch_curves();
+                self.status_msg = "Undid the last sketch operation.".to_string();
+            } else {
+                self.status_msg = "Nothing to undo in this sketch.".to_string();
+            }
+            return;
+        };
+
+        // Edit Sketch uses the solver model as its geometry source. Remove the
+        // entities promoted from the popped shape as well, plus constraints and
+        // points that would otherwise keep that shape visible.
+        if let Some(owner) = self.sketch_entity_ids.pop() {
+            if let Some(model) = &mut self.sketch_solver_model {
+                model
+                    .entities
+                    .retain(|entity| entity.derived_from() != Some(owner));
+
+                let mut entity_ids = std::collections::HashSet::new();
+                let mut point_ids = std::collections::HashSet::new();
+                for entity in &model.entities {
+                    entity_ids.insert(entity.id());
+                    match entity {
+                        zerocad_core::sketch::SketchEntity::Line { p0, p1, .. } => {
+                            point_ids.insert(*p0);
+                            point_ids.insert(*p1);
+                        }
+                        zerocad_core::sketch::SketchEntity::Circle { center, .. } => {
+                            point_ids.insert(*center);
+                        }
+                        zerocad_core::sketch::SketchEntity::Arc {
+                            center, start, end, ..
+                        } => {
+                            point_ids.insert(*center);
+                            point_ids.insert(*start);
+                            point_ids.insert(*end);
+                        }
+                    }
+                }
+                model.points.retain(|point| point_ids.contains(&point.id));
+                model.constraints.retain(|constraint| {
+                    use zerocad_core::sketch::Constraint;
+                    match constraint {
+                        Constraint::Coincident { a, b, .. } | Constraint::Distance { a, b, .. } => {
+                            point_ids.contains(a) && point_ids.contains(b)
+                        }
+                        Constraint::Horizontal { line, .. } | Constraint::Vertical { line, .. } => {
+                            entity_ids.contains(line)
+                        }
+                        Constraint::Radius { circle, .. } => entity_ids.contains(circle),
+                        Constraint::Parallel { a, b, .. }
+                        | Constraint::Perpendicular { a, b, .. }
+                        | Constraint::Equal { a, b, .. } => {
+                            entity_ids.contains(a) && entity_ids.contains(b)
+                        }
+                        Constraint::Tangent { line, circle, .. } => {
+                            entity_ids.contains(line) && entity_ids.contains(circle)
+                        }
+                        Constraint::Fixed { p, .. } => point_ids.contains(p),
+                    }
+                });
+            }
+        }
+
+        self.line_chain_start = None;
+        self.cancel_in_progress_shape();
+        self.rebuild_active_sketch_curves();
+        self.status_msg = "Undid the last drawn shape.".to_string();
+    }
+
+    /// Commit an **associative** sketch Mirror across the 2-click axis `p0`→`p1`.
+    /// Rather than baking a reflected copy, this stores a [`SketchMirror`] record
+    /// that [`zerocad_core::effective_curves_solved`] re-applies on every rebuild
+    /// — so editing (or drag-solving) the source half updates the mirror. Works
+    /// the same in a fresh drawing session and an Edit Sketch session, since the
+    /// record is geometry-independent.
     pub(crate) fn commit_sketch_mirror(&mut self, p0: (f32, f32), p1: (f32, f32)) {
         let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
-        let len = (dx * dx + dy * dy).sqrt();
-        if len < 1.0e-4 {
+        if (dx * dx + dy * dy).sqrt() < 1.0e-4 {
             self.status_msg = "Mirror axis too short — click two distinct points.".to_string();
             return;
         }
-        let mirrored = reflect_curves(&self.sketch_curves, p0, (dx / len, dy / len));
-        if mirrored.is_empty() {
+        if self.sketch_curves.is_empty() {
             self.status_msg = "Nothing to mirror — draw geometry first.".to_string();
             return;
         }
-        let shape = SketchShape::Raw { curves: mirrored };
-        // In an Edit Sketch session the solver model is the source of truth, so
-        // the mirrored geometry must be promoted into it (as free geometry) to
-        // render; a fresh session just appends to the parametric shape list.
-        if self.sketch_solver_model.is_some() {
-            let vars = self.graph.variable_map();
-            let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);
-            let (addition, next) = zerocad_core::sketch::constraints::promote_shapes_to_entities(
-                std::slice::from_ref(&shape),
-                &[shape_id],
-                &vars,
-                self.sketch_next_entity_id + 1,
-            );
-            if let Some(model) = &mut self.sketch_solver_model {
-                model.points.extend(addition.points);
-                model.entities.extend(addition.entities);
-                model.constraints.extend(addition.constraints);
-            }
-            self.sketch_entity_ids.push(shape_id);
-            self.sketch_next_entity_id = next;
-        }
-        self.sketch_shapes.push(shape);
+        self.sketch_mirrors
+            .push(zerocad_core::SketchMirror { a: p0, b: p1 });
         self.rebuild_active_sketch_curves();
-        self.status_msg = "Mirrored sketch across the axis.".to_string();
+        self.status_msg = "Mirrored sketch across the axis (associative).".to_string();
     }
 
     /// The reflected copy of the live sketch across the in-progress mirror axis
@@ -88,11 +112,14 @@ impl ZeroCadApp {
         cursor: (f32, f32),
     ) -> Option<SketchCurves> {
         let (dx, dy) = (cursor.0 - p0.0, cursor.1 - p0.1);
-        let len = (dx * dx + dy * dy).sqrt();
-        if len < 1.0e-4 {
+        if (dx * dx + dy * dy).sqrt() < 1.0e-4 {
             return None;
         }
-        Some(reflect_curves(&self.sketch_curves, p0, (dx / len, dy / len)))
+        Some(zerocad_core::reflect_curves_across(
+            &self.sketch_curves,
+            p0,
+            cursor,
+        ))
     }
 
     /// Re-run planar region detection on the active sketch curves.
@@ -116,6 +143,7 @@ impl ZeroCadApp {
         self.active_face_boundary = SketchCurves::new();
         self.sketch_shapes.clear();
         self.sketch_corner_mods.clear();
+        self.sketch_mirrors.clear();
         self.pending_corners.clear();
         self.detected_regions.clear();
         self.selected_region_indices.clear();
@@ -148,6 +176,7 @@ impl ZeroCadApp {
             &SketchCurves::new(),
             &self.sketch_shapes,
             &mods,
+            &self.sketch_mirrors,
             self.sketch_solver_model.as_ref(),
             &vars,
         );
@@ -180,7 +209,7 @@ impl ZeroCadApp {
     pub(crate) fn corner_radius_dim(&self) -> Dimension {
         let text = self.corner_radius_text.clone();
         let value = self.eval_dim(&text).unwrap_or(5.0).max(0.0);
-        if zerocad_core::expr::references_variable(&text) {
+        if zerocad_core::expr::preserves_source(&text) {
             Dimension {
                 value,
                 expr: Some(text.trim().to_string()),
@@ -334,6 +363,7 @@ impl ZeroCadApp {
         };
         let unit_suffix = self.current_unit.suffix();
         let var_names = self.visible_variable_names();
+        let var_map = self.visible_variable_map();
         let mut ac = self.autocomplete.take();
         let mut changed = false;
 
@@ -388,6 +418,17 @@ impl ZeroCadApp {
                                     .size(12.0)
                                     .color(egui::Color32::from_rgb(110, 110, 110)),
                             );
+                            if zerocad_core::expr::preserves_source(&self.corner_radius_text) {
+                                if let Ok(value) =
+                                    crate::expr::eval(&self.corner_radius_text, &var_map)
+                                {
+                                    ui.label(
+                                        egui::RichText::new(format!("= {value:.2}"))
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(70, 120, 70)),
+                                    );
+                                }
+                            }
                         });
                     });
             });

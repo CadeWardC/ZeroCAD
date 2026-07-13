@@ -156,6 +156,7 @@ fn cutout_fillet_repro_graph() -> ParametricGraph {
             curves: cut,
             shapes: vec![],
             corner_mods: vec![],
+            mirrors: vec![],
             on_face: true,
         },
     });

@@ -38,6 +38,24 @@ jobs:
       - name: Test zerocad-core
         run: cargo test -p zerocad-core --locked
 
+  # OpenRCAD is intentionally a separate workspace, so the jobs above only
+  # compile it as a dependency; they do not run the kernel's own regression
+  # suites. Geometry changes are not safe unless these tests run as a hard gate.
+  openrcad-linux:
+    name: OpenRCAD kernel (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OpenRCAD
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: OpenRCAD -> target
+      - name: Test OpenRCAD workspace
+        run: cargo test --workspace --locked
+
   # Formatting is normalized and required.
   format:
     name: Format
@@ -49,6 +67,9 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: rustfmt (OpenRCAD workspace)
+        working-directory: OpenRCAD
         run: cargo fmt --all -- --check
 
   # Clippy remains advisory while geometry-heavy code still has useful but

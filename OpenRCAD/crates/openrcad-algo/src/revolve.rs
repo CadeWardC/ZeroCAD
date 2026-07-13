@@ -409,7 +409,11 @@ pub(crate) fn loop_agrees_with_surface(wire: &Wire, surface: &GeomSurface, cente
 /// The analytic surface swept by one profile edge (in its base position —
 /// every surface of revolution covers all `u`, so the angular window doesn't
 /// change the surface).
-fn lateral_surface(edge: &Edge, axis_point: Pnt, axis_dir: Dir) -> Result<GeomSurface, RevolveError> {
+fn lateral_surface(
+    edge: &Edge,
+    axis_point: Pnt,
+    axis_dir: Dir,
+) -> Result<GeomSurface, RevolveError> {
     let p0 = edge.source().point();
     let p1 = edge.target().point();
     let c0 = closest_axis_point(p0, axis_point, axis_dir);
@@ -419,7 +423,9 @@ fn lateral_surface(edge: &Edge, axis_point: Pnt, axis_dir: Dir) -> Result<GeomSu
 
     match edge.curve() {
         Some(GeomCurve::Line(_)) | None => {
-            let d = (p1 - p0).normalized().ok_or(RevolveError::UnsupportedProfileCurve)?;
+            let d = (p1 - p0)
+                .normalized()
+                .ok_or(RevolveError::UnsupportedProfileCurve)?;
             let along = d.dot(&axis_dir).abs();
             if (along - 1.0).abs() < 1e-9 {
                 // Parallel to the axis → cylinder.
@@ -640,7 +646,10 @@ mod tests {
         // matches the analytic volume to <1%, like cylinders and tori.
         let exact = PI * 4.0 * 4.0 / 3.0;
         let v = volume(&solid);
-        assert!((v - exact).abs() / exact < 0.01, "cone volume {v} vs {exact}");
+        assert!(
+            (v - exact).abs() / exact < 0.01,
+            "cone volume {v} vs {exact}"
+        );
     }
 
     #[test]
@@ -717,6 +726,9 @@ mod tests {
         );
         let exact = PI * 4.0 * 4.0; // height reduced 5 → 4
         let v = volume(&cut);
-        assert!((v - exact).abs() / exact < 0.01, "cut volume {v} vs {exact}");
+        assert!(
+            (v - exact).abs() / exact < 0.01,
+            "cut volume {v} vs {exact}"
+        );
     }
 }

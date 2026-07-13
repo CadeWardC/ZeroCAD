@@ -263,18 +263,16 @@ fn free_edge_lines(s: &Solid) -> Vec<String> {
         .into_iter()
         .filter(|(_, count)| *count == 1)
         .map(|(key, _)| {
-            {
-                let (a, b, kind, face_ids) = &samples[&key];
-                format!(
-                    "free {kind} faces={face_ids:?} ({:.4},{:.4},{:.4}) -> ({:.4},{:.4},{:.4})",
-                    a.x(),
-                    a.y(),
-                    a.z(),
-                    b.x(),
-                    b.y(),
-                    b.z()
-                )
-            }
+            let (a, b, kind, face_ids) = &samples[&key];
+            format!(
+                "free {kind} faces={face_ids:?} ({:.4},{:.4},{:.4}) -> ({:.4},{:.4},{:.4})",
+                a.x(),
+                a.y(),
+                a.z(),
+                b.x(),
+                b.y(),
+                b.z()
+            )
         })
         .collect();
     out.sort();

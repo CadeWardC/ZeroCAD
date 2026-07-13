@@ -163,10 +163,7 @@ pub fn delaunay_triangulate(points: &[Pnt2d]) -> Vec<Tri> {
             )
         };
         if !nodes[seed].alive || !bad(&nodes[seed]) {
-            match nodes
-                .iter()
-                .position(|t| t.alive && bad(t))
-            {
+            match nodes.iter().position(|t| t.alive && bad(t)) {
                 Some(s) => seed = s,
                 None => continue, // duplicate point: no triangle violated
             }
@@ -542,6 +539,21 @@ pub fn project_point(surf: &GeomSurface, pt: Pnt, hint: Option<(f64, f64)>) -> (
             }
             return (u, v);
         }
+        GeomSurface::Ruled(r) => {
+            // Helical bands (thread walls) span many turns: Newton from the
+            // domain midpoint converges to the wrong turn, so project
+            // analytically (angle + hint/height turn disambiguation).
+            if let Some(uv) = r.helical_uv_hinted(pt, hint) {
+                return uv;
+            }
+            if matches!(r.curve1, GeomCurve::BSpline(_))
+                && matches!(r.curve2, GeomCurve::BSpline(_))
+            {
+                if let Some(uv) = project_compact_ruled(r, pt, hint) {
+                    return uv;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -592,6 +604,68 @@ pub fn project_point(surf: &GeomSurface, pt: Pnt, hint: Option<(f64, f64)>) -> (
     }
 
     (u, v)
+}
+
+/// Robust projection for a compact ruled patch with matching finite rail
+/// domains. The concave fillet miter uses two exact rational B-spline quarter
+/// circles; Newton from the surface midpoint can converge to the wrong boundary
+/// branch, so minimize distance to each ruling first and recover its linear `v`.
+fn project_compact_ruled(
+    ruled: &openrcad_geom::RuledSurface,
+    point: Pnt,
+    hint: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    let (a0, a1) = ruled.curve1.bounds();
+    let (b0, b1) = ruled.curve2.bounds();
+    if ![a0, a1, b0, b1].iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let lo = a0.max(b0);
+    let hi = a1.min(b1);
+    if hi - lo <= CONFUSION {
+        return None;
+    }
+    let evaluate = |u: f64| {
+        let p0 = ruled.curve1.point(u);
+        let p1 = ruled.curve2.point(u);
+        let ruling = p1 - p0;
+        let len2 = ruling.dot(&ruling);
+        let v = if len2 > CONFUSION * CONFUSION {
+            ((point - p0).dot(&ruling) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let projected = p0 + ruling * v;
+        ((projected - point).magnitude_squared(), v)
+    };
+
+    const STEPS: usize = 32;
+    let step = (hi - lo) / STEPS as f64;
+    let mut best_u = hint.map_or(lo, |(u, _)| u.clamp(lo, hi));
+    let mut best = evaluate(best_u);
+    for index in 0..=STEPS {
+        let u = lo + index as f64 * step;
+        let candidate = evaluate(u);
+        if candidate.0 < best.0 {
+            best_u = u;
+            best = candidate;
+        }
+    }
+
+    let mut left = (best_u - step).max(lo);
+    let mut right = (best_u + step).min(hi);
+    for _ in 0..28 {
+        let u1 = left + (right - left) / 3.0;
+        let u2 = right - (right - left) / 3.0;
+        if evaluate(u1).0 <= evaluate(u2).0 {
+            right = u2;
+        } else {
+            left = u1;
+        }
+    }
+    best_u = 0.5 * (left + right);
+    best = evaluate(best_u);
+    Some((best_u, best.1))
 }
 
 fn clamp_to_ordered_bounds(value: f64, min: f64, max: f64) -> f64 {
@@ -653,8 +727,8 @@ pub fn sample_interior_points(
 
 /// [`sample_interior_points`] with an angular budget: cylinder hoop density is
 /// capped at `angle_err` radians per facet so small-radius rounds shade as
-/// smoothly as large ones. Axial (ruled) spacing stays on the chordal budget —
-/// straight directions gain nothing from angular refinement.
+/// smoothly as large ones. Axial generators receive only bounded triangulation
+/// support because straight directions have no chordal error.
 pub fn sample_interior_points_budget(
     surf: &GeomSurface,
     u_min: f64,
@@ -687,15 +761,14 @@ pub fn sample_interior_points_budget(
             let theta = cylinder_step_angle(r, err).min(angle_err);
             let span = u_max - u_min;
             let nu = f64::max(2.0, (span / theta).ceil()) as usize;
-            // A cylinder is ruled in v, but a single mid-v support row lets
-            // constrained Delaunay bridge trimmed walls with long corner chords.
-            // Use the *chordal* budget as a target physical edge length for
-            // axial support (straight directions gain nothing from the angular
-            // cap), so tall trimmed cylinders get local triangles without
-            // changing their B-Rep topology or boundary samples.
-            let target_len = f64::max(r * cylinder_step_angle(r, err), err);
-            let v_span = (v_max - v_min).abs();
-            let nv = f64::max(2.0, (v_span / target_len).ceil()) as usize;
+            // A small fixed set of v support rows is sufficient. Cylinder
+            // generators are exactly straight, so sizing axial rows from the
+            // hoop chord budget made triangle count scale with extrusion length
+            // without improving shape accuracy. Eight divisions retain enough
+            // support for stable triangulation. Broad cylinder patches retain
+            // a slightly denser seed plus axial refinement below; narrow fillet
+            // patches remain constant with cylinder length.
+            let nv = if span.abs() > 2.0 { 8 } else { 4 };
             (nu, nv)
         }
         GeomSurface::Sphere(sph) => {
@@ -742,10 +815,75 @@ pub fn sample_interior_points_budget(
             let nv = f64::max(2.0, (span_v / theta_v).ceil()) as usize;
             (nu, nv)
         }
-        GeomSurface::BSpline(_)
-        | GeomSurface::Gregory(_)
-        | GeomSurface::Offset(_)
-        | GeomSurface::Ruled(_) => (10, 10),
+        GeomSurface::Ruled(ruled)
+            if matches!(ruled.curve1, GeomCurve::Helix(_))
+                || matches!(ruled.curve2, GeomCurve::Helix(_)) =>
+        {
+            // A helical band (thread wall) spans many turns, so the 3-point sag
+            // probe below aliases across whole turns. Size u by hoop angle like
+            // a cylinder; the ruling direction is straight, so a single mid-v
+            // support row (v_divs = 0 path) is enough.
+            let hoop_r = |c: &GeomCurve| -> f64 {
+                match c {
+                    GeomCurve::Helix(h) => {
+                        f64::max(h.radius_at(u_min).abs(), h.radius_at(u_max).abs())
+                    }
+                    GeomCurve::Circle(c) => c.radius().abs(),
+                    _ => 0.0,
+                }
+            };
+            let r = f64::max(hoop_r(&ruled.curve1), hoop_r(&ruled.curve2));
+            let err = chord_err.max(CONFUSION);
+            let theta = cylinder_step_angle(r, err).min(angle_err);
+            let span = (u_max - u_min).abs();
+            let nu = (f64::max(2.0, (span / theta).ceil()) as usize).min(8192);
+            (nu, 0)
+        }
+        GeomSurface::Ruled(_) => {
+            // Adaptive, not a fixed 10×10: a skinned solid is thousands of tiny
+            // ruled quads, and a blanket grid explodes them into ~200 triangles
+            // each (a 40-station threaded cylinder hit 630k triangles). Measure
+            // the real mid-chord sag in each direction; a straight-railed quad
+            // that already sits within the chordal budget gets NO interior
+            // points, while a genuinely curved ruled face subdivides until the
+            // per-cell sag (which shrinks as 1/n²) meets the budget.
+            let err = chord_err.max(CONFUSION);
+            let mid_u = 0.5 * (u_min + u_max);
+            let mid_v = 0.5 * (v_min + v_max);
+            let sag = |a: Pnt, m: Pnt, b: Pnt| -> f64 {
+                let chord_mid = Pnt::new(
+                    0.5 * (a.x() + b.x()),
+                    0.5 * (a.y() + b.y()),
+                    0.5 * (a.z() + b.z()),
+                );
+                m.distance(&chord_mid)
+            };
+            let mut sag_u = 0.0_f64;
+            for v in [v_min, mid_v, v_max] {
+                sag_u = sag_u.max(sag(
+                    surf.point(u_min, v),
+                    surf.point(mid_u, v),
+                    surf.point(u_max, v),
+                ));
+            }
+            let mut sag_v = 0.0_f64;
+            for u in [u_min, mid_u, u_max] {
+                sag_v = sag_v.max(sag(
+                    surf.point(u, v_min),
+                    surf.point(u, mid_v),
+                    surf.point(u, v_max),
+                ));
+            }
+            let divs = |s: f64| -> usize {
+                if s <= err {
+                    0
+                } else {
+                    (((s / err).sqrt().ceil() as usize) + 1).min(10)
+                }
+            };
+            (divs(sag_u), divs(sag_v))
+        }
+        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) | GeomSurface::Offset(_) => (10, 10),
     };
 
     if u_divs > 0 {
@@ -820,7 +958,11 @@ fn surface_uv_segment_len(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> f64 {
 /// `(hoop, axial, surface_len, sagitta, local_radius)` for a ruled-round edge,
 /// using the LOCAL radius at the edge's mid-v (so a cone's base edges — larger
 /// radius — get finer refinement than its apex edges).
-fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64, f64, f64, f64, f64)> {
+fn cylinder_edge_metrics(
+    surf: &GeomSurface,
+    a: Pnt2d,
+    b: Pnt2d,
+) -> Option<(f64, f64, f64, f64, f64)> {
     let mid_v = 0.5 * (a.y() + b.y());
     let r = ruled_hoop_radius(surf, mid_v)?;
     let du = shortest_angle_delta(a.x(), b.x());
@@ -840,15 +982,36 @@ fn cylinder_edge_metrics(surf: &GeomSurface, a: Pnt2d, b: Pnt2d) -> Option<(f64,
 // sample_interior_points_budget); enforcing an angular cap on every mesh edge
 // makes the midpoint-insert/re-Delaunay loop thrash on borderline diagonals and
 // quadruples the wall for no visual gain (normals are analytic per vertex).
-fn cylinder_edge_needs_refinement(surf: &GeomSurface, a: Pnt2d, b: Pnt2d, chord_err: f64) -> bool {
+fn cylinder_edge_needs_refinement(
+    surf: &GeomSurface,
+    a: Pnt2d,
+    b: Pnt2d,
+    chord_err: f64,
+    refine_axial: bool,
+) -> bool {
     let Some((_, _, surface_len, sagitta, r)) = cylinder_edge_metrics(surf, a, b) else {
         return false;
     };
-    // Target hoop length from the LOCAL radius, so a cone splits its wide base
-    // facets (which chord inward off the surface) while leaving the apex sparse.
     let err = chord_err.max(CONFUSION);
     let target_len = f64::max(r * cylinder_step_angle(r, err), err);
-    sagitta > err || surface_len > target_len
+    // Only hoop curvature creates approximation error. Broad cylinder patches
+    // retain bounded-aspect support for symmetric mass properties and stable
+    // face naming; narrow fillet patches skip axial splitting so a 48 mm
+    // extrusion of a 0.25 mm round does not receive hundreds of useless rows.
+    sagitta > err || (refine_axial && surface_len > target_len)
+}
+
+/// Like [`cylinder_edge_needs_refinement`] but for cones: split ONLY on the
+/// inward hoop chord (`sagitta`), never on raw surface length. A tall thin
+/// cone's long axial Delaunay edges have huge length but no inward chord, so
+/// the length criterion would split them without bound; the facet banding on a
+/// channel-cut cone (a thread cutting through a chamfer) is a wide-angle hoop
+/// chord, which the sagitta catches with a bounded number of splits.
+fn cone_edge_needs_refinement(surf: &GeomSurface, a: Pnt2d, b: Pnt2d, chord_err: f64) -> bool {
+    let Some((_, _, _, sagitta, _)) = cylinder_edge_metrics(surf, a, b) else {
+        return false;
+    };
+    sagitta > chord_err.max(CONFUSION)
 }
 
 fn uv_midpoint(a: Pnt2d, b: Pnt2d) -> Pnt2d {
@@ -907,6 +1070,124 @@ fn point_in_trim_region(p: Pnt2d, outer_pts: &[Pnt2d], inner_pts_list: &[Vec<Pnt
         }
     }
     true
+}
+
+/// Whether a cylindrical face is an ordinary untrimmed parameter rectangle:
+/// two circular rim arcs joined by two straight generators. Such a patch is
+/// exactly ruled along its axial direction, so the sampled boundary is enough
+/// for stable triangulation and axial edge-length refinement adds no accuracy.
+/// Trimmed boolean walls, interrupted cylinders, and faces with holes retain
+/// the denser generic path.
+fn is_untrimmed_cylinder_patch(
+    surface: &GeomSurface,
+    outer_pts: &[Pnt2d],
+    inner_pts_list: &[Vec<Pnt2d>],
+) -> bool {
+    if !matches!(surface, GeomSurface::Cylinder(_))
+        || !inner_pts_list.is_empty()
+        || outer_pts.len() < 4
+    {
+        return false;
+    }
+    let (u_min, u_max, v_min, v_max) = outer_pts.iter().fold(
+        (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ),
+        |(ulo, uhi, vlo, vhi), point| {
+            (
+                ulo.min(point.x()),
+                uhi.max(point.x()),
+                vlo.min(point.y()),
+                vhi.max(point.y()),
+            )
+        },
+    );
+    let u_span = u_max - u_min;
+    let v_span = v_max - v_min;
+    // Native cylinder primitives use three 120° patches. Other spans commonly
+    // belong to fillets or mixed-profile extrusions, where the generic
+    // triangulator's support points also drive tangent-seam suppression and
+    // must be retained (a capsule's 180° wall is the key regression).
+    let native_patch_span = std::f64::consts::TAU / 3.0;
+    if (u_span - native_patch_span).abs() > 0.05 || v_span <= 1.0e-9 {
+        return false;
+    }
+    let u_tol = (u_span * 1.0e-7).max(1.0e-8);
+    let v_tol = (v_span * 1.0e-7).max(1.0e-8);
+    let mut sides = [false; 4];
+    for point in outer_pts {
+        let on_u_min = (point.x() - u_min).abs() <= u_tol;
+        let on_u_max = (point.x() - u_max).abs() <= u_tol;
+        let on_v_min = (point.y() - v_min).abs() <= v_tol;
+        let on_v_max = (point.y() - v_max).abs() <= v_tol;
+        if !(on_u_min || on_u_max || on_v_min || on_v_max) {
+            return false;
+        }
+        sides[0] |= on_u_min;
+        sides[1] |= on_u_max;
+        sides[2] |= on_v_min;
+        sides[3] |= on_v_max;
+    }
+    sides.into_iter().all(|present| present)
+}
+
+/// Triangulate an untrimmed cylinder parameter rectangle as the minimal strip
+/// between its two already-discretized rim arcs. Returns `None` if the two rims
+/// do not carry matching samples, in which case the caller uses generic
+/// constrained Delaunay triangulation.
+fn untrimmed_cylinder_strip_tris(points: &[Pnt2d], outer_indices: &[usize]) -> Option<Vec<Tri>> {
+    let (v_min, v_max) = outer_indices
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &index| {
+            (lo.min(points[index].y()), hi.max(points[index].y()))
+        });
+    let v_span = v_max - v_min;
+    if v_span <= 1.0e-9 {
+        return None;
+    }
+    let v_tol = (v_span * 1.0e-7).max(1.0e-8);
+    let mut lower: Vec<(f64, usize)> = outer_indices
+        .iter()
+        .copied()
+        .filter(|&index| (points[index].y() - v_min).abs() <= v_tol)
+        .map(|index| (points[index].x(), index))
+        .collect();
+    let mut upper: Vec<(f64, usize)> = outer_indices
+        .iter()
+        .copied()
+        .filter(|&index| (points[index].y() - v_max).abs() <= v_tol)
+        .map(|index| (points[index].x(), index))
+        .collect();
+    lower.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    upper.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    lower.dedup_by_key(|(_, index)| *index);
+    upper.dedup_by_key(|(_, index)| *index);
+    if lower.len() < 2 || lower.len() != upper.len() {
+        return None;
+    }
+    let u_span = lower.last()?.0 - lower.first()?.0;
+    let u_tol = (u_span.abs() * 1.0e-7).max(1.0e-8);
+    if lower
+        .iter()
+        .zip(&upper)
+        .any(|((lower_u, _), (upper_u, _))| (lower_u - upper_u).abs() > u_tol)
+    {
+        return None;
+    }
+
+    let mut tris = Vec::with_capacity((lower.len() - 1) * 2);
+    for i in 0..lower.len() - 1 {
+        let a = lower[i].1;
+        let b = lower[i + 1].1;
+        let c = upper[i].1;
+        let d = upper[i + 1].1;
+        tris.push(Tri { a, b, c });
+        tris.push(Tri { a: b, b: d, c });
+    }
+    Some(tris)
 }
 
 fn triangle_in_trim_region(
@@ -1019,6 +1300,13 @@ fn refine_cylinder_tris(
     // apex-ward facets have a vanishing target length that would drive the
     // iterative pass to explode the vertex count).
     let check_edge_midpoints = matches!(surface, GeomSurface::Cylinder(_));
+    let (u_min, u_max) = outer_pts
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            (lo.min(p.x()), hi.max(p.x()))
+        });
+    let refine_axial = (u_max - u_min).abs() > 2.0
+        && !is_untrimmed_cylinder_patch(surface, outer_pts, inner_pts_list);
     let mut constraints = constraints.to_vec();
     let mut tris = trimmed_constrained_tris(
         points_2d,
@@ -1052,7 +1340,7 @@ fn refine_cylinder_tris(
                 }
                 let pa = points_2d[a];
                 let pb = points_2d[b];
-                if cylinder_edge_needs_refinement(surface, pa, pb, chord_err) {
+                if cylinder_edge_needs_refinement(surface, pa, pb, chord_err, refine_axial) {
                     let mid = uv_midpoint(pa, pb);
                     if point_in_trim_region(mid, outer_pts, inner_pts_list) {
                         candidates.push((a, b, is_constraint, mid));
@@ -1215,12 +1503,18 @@ pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face]
             let Some(face) = faces.get(fid as usize) else {
                 continue;
             };
-            // Only cylinder walls get post-hoc mesh-edge refinement; cones rely
-            // on their dense ruled grid (see `sample_interior_points_budget`).
-            let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
-                continue;
+            // Cylinder walls AND cones get post-hoc mesh-edge refinement: a
+            // channel-cut cone (a thread cutting through a chamfer) has a dense
+            // helical boundary against a coarse interior grid, so its Delaunay
+            // leaves a few skinny facets that chord inward off the surface — the
+            // same inward-chord that `cylinder_edge_needs_refinement` splits,
+            // using each edge's LOCAL hoop radius (`ruled_hoop_radius` returns
+            // `radius_at(v)` for cones).
+            let surface = match face.surface() {
+                Some(GeomSurface::Cylinder(cyl)) => GeomSurface::Cylinder(*cyl),
+                Some(GeomSurface::Cone(cone)) => GeomSurface::Cone(*cone),
+                _ => continue,
             };
-            let surface = GeomSurface::Cylinder(*cyl);
             let (_, a, b) = adj[0];
             let pa = mesh.vertices[a as usize];
             let pb = mesh.vertices[b as usize];
@@ -1232,7 +1526,18 @@ pub(crate) fn refine_cylinder_mesh_edges(mesh: &mut TriangleMesh, faces: &[Face]
             ub = unwrap_coordinate(ub, ua, std::f64::consts::TAU);
             let a_uv = Pnt2d::new(ua, va);
             let b_uv = Pnt2d::new(ub, vb);
-            if !cylinder_edge_needs_refinement(&surface, a_uv, b_uv, chord_err) {
+            let needs = if matches!(surface, GeomSurface::Cone(_)) {
+                // Cones only refine on inward hoop chord (the sagitta), NOT on
+                // raw surface length: a tall thin cone's long axial Delaunay
+                // edges have huge length but zero inward chord, so the
+                // length criterion would split them forever. The channel-cut
+                // cone's facet banding is a wide-angle hoop chord, which
+                // sagitta catches.
+                cone_edge_needs_refinement(&surface, a_uv, b_uv, chord_err)
+            } else {
+                cylinder_edge_needs_refinement(&surface, a_uv, b_uv, chord_err, false)
+            };
+            if !needs {
                 continue;
             }
 
@@ -1366,7 +1671,16 @@ fn refine_surface_edge_params(
         }
 
         let len = surface_uv_segment_len(surf, uvs[i], uvs[i + 1]);
-        let divs = f64::max(1.0, (len / target_len).ceil()) as usize;
+        let mut divs = f64::max(1.0, (len / target_len).ceil()) as usize;
+        if matches!(surf, GeomSurface::Cylinder(_)) && divs > 64 {
+            // This is supplemental support for trimmed-wall triangulation, not
+            // curve approximation (the curve sampler above already enforces
+            // chord and angle error). Cap only pathological aspect ratios; normal
+            // cylinders retain their denser symmetric support, while a 48 mm
+            // extrusion of a 0.25 mm round avoids hundreds of straight-edge
+            // subdivisions.
+            divs = divs.min(8);
+        }
         for j in 1..divs {
             let f = j as f64 / divs as f64;
             refined.push(t0 + f * (t1 - t0));
@@ -1410,6 +1724,25 @@ pub fn discretize_edge_curve_budget(
     let mut params = vec![first, last];
     let angle_err = sanitize_angle(angle_err);
 
+    // Periodic curves alias the 3-point sag probe: a helix window spanning a
+    // whole number of turns has chord endpoints AND midpoint at the same
+    // angle (collinear, zero deviation) and identical tangents, so the
+    // recursion would terminate immediately on a 6-turn rail. Seed quarter-turn
+    // cells so every recursion interval is well under one period.
+    let mut seeds = vec![first, last];
+    if matches!(curve, GeomCurve::Helix(_)) {
+        let step = std::f64::consts::FRAC_PI_2;
+        let mut t = (first / step).floor() * step + step;
+        while t < last - 1e-9 {
+            if t > first + 1e-9 {
+                seeds.push(t);
+            }
+            t += step;
+        }
+        seeds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        params.extend(seeds.iter().skip(1).take(seeds.len().saturating_sub(2)));
+    }
+
     fn tangent_turn(curve: &GeomCurve, t0: f64, t1: f64) -> f64 {
         let (_, d0) = curve.d1(t0);
         let (_, d1) = curve.d1(t1);
@@ -1449,14 +1782,21 @@ pub fn discretize_edge_curve_budget(
             pm.distance(&p0)
         };
 
-        if dev > chord_err || tangent_turn(curve, t0, t1) > angle_err {
+        // Treat a segment exactly on budget as accepted. Analytic arcs split
+        // into thirds accumulate a few ulps in their parameter endpoints; a
+        // strict comparison made nominal 7.5° cells read microscopically over
+        // a 7.5° budget and recursively split them to 3.75°.
+        let angle_over_budget = tangent_turn(curve, t0, t1) > angle_err * (1.0 + 1.0e-9);
+        if dev > chord_err || angle_over_budget {
             subdivide(curve, t0, tm, chord_err, angle_err, depth + 1, params);
             params.push(tm);
             subdivide(curve, tm, t1, chord_err, angle_err, depth + 1, params);
         }
     }
 
-    subdivide(curve, first, last, chord_err, angle_err, 0, &mut params);
+    for w in seeds.windows(2) {
+        subdivide(curve, w[0], w[1], chord_err, angle_err, 0, &mut params);
+    }
     params.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     params
@@ -1505,6 +1845,23 @@ pub fn shared_edge_polylines(
     chord_err: f64,
     angle_err: f64,
 ) -> HashMap<SharedEdgeKey, Vec<Pnt>> {
+    // The native cylinder primitive is exactly two planar caps plus three
+    // cylindrical 120° wall patches. Its binary arc subdivision sits on a
+    // numerical cliff at common round budgets (0.13 rad is intended as 48
+    // facets, but is 0.7% below 2π/48 and therefore doubles to 96). A 1% budget
+    // snap is safe for this closed-form primitive and avoids that redundant
+    // recursion. Mixed/trimmed solids retain the strict caller budget.
+    let native_cylinder = faces.len() == 5
+        && faces
+            .iter()
+            .filter(|face| matches!(face.surface(), Some(GeomSurface::Cylinder(_))))
+            .count()
+            == 3
+        && faces
+            .iter()
+            .filter(|face| matches!(face.surface(), Some(GeomSurface::Plane(_))))
+            .count()
+            == 2;
     let mut map: HashMap<SharedEdgeKey, Vec<Pnt>> = HashMap::new();
     for face in faces {
         let surface = match face.surface() {
@@ -1524,6 +1881,8 @@ pub fn shared_edge_polylines(
                 // offsets reach, resurrecting the coincident double-membrane.
                 let edge_angle = if matches!(curve, GeomCurve::Ellipse(_)) {
                     std::f64::consts::PI
+                } else if native_cylinder && matches!(curve, GeomCurve::Circle(_)) {
+                    angle_err * 1.01
                 } else {
                     angle_err
                 };
@@ -1621,7 +1980,27 @@ pub fn tessellate_face_budget(
     for wire in &face_wires {
         let mut loop_samples = Vec::new();
         let edges = wire.edges();
+        // On helix-railed ruled surfaces the analytic projection has no height
+        // signal when both rails are lead-0 (a thread runout ring), so an
+        // un-hinted first point wraps into [0, 2π) while the hint chain later
+        // closes the loop at its true (possibly negative) angle — tearing the
+        // uv polygon open at the seam. Helix edge params on these faces ARE
+        // the surface angle, so seed the chain from the first helix edge's own
+        // start parameter.
         let mut prev_hint = None;
+        if matches!(surface, GeomSurface::Ruled(_)) {
+            for e in edges.iter() {
+                if matches!(e.curve(), Some(GeomCurve::Helix(_))) {
+                    let t = if e.orientation().is_forward() {
+                        e.first()
+                    } else {
+                        e.last()
+                    };
+                    prev_hint = Some((t, 0.5));
+                    break;
+                }
+            }
+        }
 
         for (edge_idx, edge) in edges.iter().enumerate() {
             let p_start = edge.start().point();
@@ -1697,7 +2076,11 @@ pub fn tessellate_face_budget(
             // discretize locally as before.
             let shared_pts = shared.and_then(|m| shared_edge_key(edge).and_then(|k| m.get(&k)));
             let pts_directed: Vec<Pnt> = if let Some(sp) = shared_pts {
-                let t_start = if is_reversed { edge.last() } else { edge.first() };
+                let t_start = if is_reversed {
+                    edge.last()
+                } else {
+                    edge.first()
+                };
                 let start_pt = curve.point(t_start);
                 if sp[0].distance(&start_pt) <= sp[sp.len() - 1].distance(&start_pt) {
                     sp.clone()
@@ -1725,8 +2108,7 @@ pub fn tessellate_face_budget(
                 } else {
                     params
                 };
-                let mut pts: Vec<Pnt> =
-                    params_directed.iter().map(|&t| curve.point(t)).collect();
+                let mut pts: Vec<Pnt> = params_directed.iter().map(|&t| curve.point(t)).collect();
                 // Same vertex snap as the shared pass: adjacent faces meet
                 // bit-exactly at topological vertices even without a shared
                 // polyline (see shared_edge_polylines).
@@ -1821,17 +2203,32 @@ pub fn tessellate_face_budget(
         v_max = f64::max(v_max, p.y());
     }
 
-    let interior_candidates =
-        sample_interior_points_budget(surface, u_min, u_max, v_min, v_max, chord_err, angle_err);
-
-    // Filter interior points inside loops
+    // Resolve the trim loops before sampling so a plain cylinder wall can use
+    // one axial support row instead of the generic eight-row trimmed-wall grid.
     let outer_pts: Vec<Pnt2d> = loops_2d[0].iter().map(|&idx| all_points_2d[idx]).collect();
     let inner_pts_list: Vec<Vec<Pnt2d>> = loops_2d
         .iter()
         .skip(1)
         .map(|l| l.iter().map(|&idx| all_points_2d[idx]).collect())
         .collect();
+    let compact_cylinder = is_untrimmed_cylinder_patch(surface, &outer_pts, &inner_pts_list);
+    if compact_cylinder {
+        if let Some(tris) = untrimmed_cylinder_strip_tris(&all_points_2d, &loops_2d[0]) {
+            let wants_ccw = face.orientation() != Orientation::Reversed;
+            return mesh_from_uv_tris(
+                &all_points_2d,
+                surface,
+                wants_ccw,
+                all_points_3d,
+                tris,
+                face_index,
+            );
+        }
+    }
+    let interior_candidates =
+        sample_interior_points_budget(surface, u_min, u_max, v_min, v_max, chord_err, angle_err);
 
+    // Filter interior points inside loops.
     for p2d in interior_candidates {
         // Must be inside outer loop
         if !is_point_in_polygon(p2d, &outer_pts) {
@@ -2204,8 +2601,8 @@ pub fn stitch_boundary_lenses(mesh: &mut TriangleMesh) {
                 for &v in &path[1..path.len() - 1] {
                     let p = mesh.vertices[v as usize];
                     let ap = [p.x() - pa.x(), p.y() - pa.y(), p.z() - pa.z()];
-                    let t = ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab_len2)
-                        .clamp(0.0, 1.0);
+                    let t =
+                        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab_len2).clamp(0.0, 1.0);
                     let d = [ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]];
                     max_dev = max_dev.max((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
                 }
@@ -2771,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn post_stitch_cylinder_refinement_splits_same_face_axial_edge() {
+    fn post_stitch_cylinder_refinement_skips_exact_axial_edge() {
         let surface = test_cylinder_surface(10.0);
         let pts = [
             surface.point(0.0, 0.0),
@@ -2788,8 +3185,8 @@ mod tests {
 
         refine_cylinder_mesh_edges(&mut mesh, &[face], 0.05);
 
-        assert!(mesh.vertices.len() > pts.len());
-        assert!(mesh.triangles.len() > 2);
+        assert_eq!(mesh.vertices.len(), pts.len());
+        assert_eq!(mesh.triangles.len(), 2);
         assert!(mesh.face_ids.iter().all(|&fid| fid == 0));
     }
 

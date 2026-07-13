@@ -18,16 +18,23 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    edge_wedge_is_concave_mesh, AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue,
-    EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode,
-    FeatureType, HoleKind, ParametricGraph, PatternKind, PlaneBase, TopologyEdgeRef, Variable,
+    boolean_region_plan, complete_selected_circles, edge_wedge_is_concave_mesh, AxisBase,
+    BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticSeverity,
+    EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef, EvaluationCacheSnapshot,
+    EvaluationCancellation, EvaluationDiagnostic, EvaluationError, EvaluationOutput,
+    EvaluationQuality, EvaluationTimings, ExtrudeMode, FeatureNode, FeatureTiming, FeatureType,
+    HoleKind, ParametricGraph, PatternKind, PlaneBase, TopologyEdgeRef, Variable,
 };
 pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,
-    effective_curves_solved, overlap_clusters, shape_loops, shapes_overlap, Circle, CornerKind,
-    CornerMod, Dimension, LineSegment, Region, RegionProvenance, RegionProvenanceFragment,
-    RegionWithProvenance, ShapeLoop, SketchCurves, SketchShape,
+    effective_curves_solved, overlap_clusters, reflect_curves_across, shape_loops, shapes_cross,
+    shapes_overlap, Circle, CornerKind, CornerMod, Dimension, LineSegment, Region,
+    RegionProvenance, RegionProvenanceFragment, RegionWithProvenance, ShapeLoop, SketchCurves,
+    SketchMirror, SketchShape,
 };
 pub use stl::{meshes_to_3mf, meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};
-pub use zcad_format::{read_zcad, write_zcad, LoadedZcad, ZcadDocument, ZcadError, ZcadMetadata};
+pub use zcad_format::{
+    read_zcad, read_zcad_file, write_zcad, write_zcad_file, DocumentRecipeV1, LoadedZcad,
+    RecipeDependency, RecipeFeature, ZcadDocument, ZcadError, ZcadMetadata,
+};

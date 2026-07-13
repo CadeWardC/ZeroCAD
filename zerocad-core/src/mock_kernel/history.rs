@@ -133,8 +133,10 @@ pub fn boolean_face_history(
     let tool_faces = tool.shell().faces();
     let obj_sigs: Vec<Option<SurfaceSig>> =
         obj_faces.iter().map(|f| surface_sig(f.surface())).collect();
-    let tool_sigs: Vec<Option<SurfaceSig>> =
-        tool_faces.iter().map(|f| surface_sig(f.surface())).collect();
+    let tool_sigs: Vec<Option<SurfaceSig>> = tool_faces
+        .iter()
+        .map(|f| surface_sig(f.surface()))
+        .collect();
 
     let face_source = result
         .shell()
@@ -161,7 +163,10 @@ pub fn boolean_face_history(
 /// the tool — for *name propagation* only the faces that descend from the named
 /// source body matter; a fresh cut wall (on the tool's surface) matches nothing
 /// and stays unnamed, which is correct.
-pub fn match_result_faces_to_source(source: &KernelSolid, result: &KernelSolid) -> Vec<Option<usize>> {
+pub fn match_result_faces_to_source(
+    source: &KernelSolid,
+    result: &KernelSolid,
+) -> Vec<Option<usize>> {
     let src_sigs: Vec<Option<SurfaceSig>> = source
         .shell()
         .faces()
@@ -420,9 +425,7 @@ pub fn propagate_face_names_via_history(
         let shell_idx = face_ref.face_id as usize;
         let name = match history.source_of(shell_idx) {
             Some(BooleanFaceSource::Object(i)) => input_names.get(i).cloned().flatten(),
-            Some(BooleanFaceSource::Tool(i)) => {
-                Some(format!("{generated_prefix}:tool-face:{i}"))
-            }
+            Some(BooleanFaceSource::Tool(i)) => Some(format!("{generated_prefix}:tool-face:{i}")),
             None => None,
         }
         .or_else(|| matching_input_face_name(input_mesh, face_ref.centroid, face_ref.normal));
@@ -481,8 +484,8 @@ mod tests {
         // obj box [0,10]^3 ; tool box translated +5 in X -> [5,15]x[0,10]x[0,10].
         // Union is one [0,15] box. The x=0 face comes from obj, x=15 from tool.
         let obj = box_solid(10.0, 10.0, 10.0);
-        let tool =
-            box_solid(10.0, 10.0, 10.0).transformed(&Trsf::translation(GeomVec::new(5.0, 0.0, 0.0)));
+        let tool = box_solid(10.0, 10.0, 10.0)
+            .transformed(&Trsf::translation(GeomVec::new(5.0, 0.0, 0.0)));
         let result = union(&obj, &tool).expect("axis-aligned box union should succeed");
         let hist = boolean_face_history(&obj, &tool, &result);
 
@@ -512,8 +515,8 @@ mod tests {
         // walls, each on one of the tool's side planes -> Tool. The box's own outer
         // faces (possibly split) trace to the Object.
         let obj = box_solid(10.0, 10.0, 10.0);
-        let tool = box_solid(4.0, 4.0, 12.0)
-            .transformed(&Trsf::translation(GeomVec::new(3.0, 3.0, -1.0)));
+        let tool =
+            box_solid(4.0, 4.0, 12.0).transformed(&Trsf::translation(GeomVec::new(3.0, 3.0, -1.0)));
         let result = difference(&obj, &tool).expect("through-pocket difference should succeed");
         let hist = boolean_face_history(&obj, &tool, &result);
 
@@ -544,8 +547,7 @@ mod tests {
     fn push_named_quad(mesh: &mut MockMesh, fid: u32, name: &str, x0: f32, x1: f32) {
         let base = (mesh.vertices.len() / 6) as u32;
         for (x, y) in [(x0, 0.0), (x1, 0.0), (x1, 10.0), (x0, 10.0)] {
-            mesh.vertices
-                .extend_from_slice(&[x, y, 0.0, 0.0, 0.0, 1.0]);
+            mesh.vertices.extend_from_slice(&[x, y, 0.0, 0.0, 0.0, 1.0]);
         }
         mesh.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -594,7 +596,10 @@ mod tests {
         assert_eq!(parts.len(), 2, "the slot must sever the bar into two lumps");
 
         let keys: Vec<[i64; 6]> = parts.iter().map(part_key).collect();
-        assert_ne!(keys[0], keys[1], "the two lumps must have distinct identities");
+        assert_ne!(
+            keys[0], keys[1],
+            "the two lumps must have distinct identities"
+        );
         assert!(
             keys[0] < keys[1],
             "parts must come back ordered by canonical key, got {keys:?}"

@@ -29,6 +29,89 @@ pub fn aabb_contains(outer: &([f32; 3], [f32; 3]), inner: &([f32; 3], [f32; 3]),
 // openrcad Solid builders
 // ---------------------------------------------------------------------------
 
+/// Axis, radius, and axial extent of a cylindrical face on a solid, resolved for
+/// the thread feature. `origin`/`dir` define the axis line; `radius` is the wall
+/// radius; `axial_min`/`axial_max` bound the threaded span along `dir` (measured
+/// from `origin`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CylinderFaceInfo {
+    pub origin: [f32; 3],
+    pub dir: [f32; 3],
+    pub radius: f32,
+    pub axial_min: f32,
+    pub axial_max: f32,
+}
+
+/// Find the cylindrical face of `solid` whose wall passes closest to `centroid`
+/// (the captured pick point) and report its axis/radius/axial-extent. The extent
+/// is measured from the tessellated vertices that lie on that cylinder, so it
+/// matches the visible face span. `None` if the solid has no cylindrical face.
+pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<CylinderFaceInfo> {
+    let radial_dist = |p: [f32; 3], origin: [f32; 3], dir: [f32; 3]| -> (f32, f32) {
+        let rel = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+        let t = rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2];
+        let perp = [
+            rel[0] - dir[0] * t,
+            rel[1] - dir[1] * t,
+            rel[2] - dir[2] * t,
+        ];
+        (
+            (perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt(),
+            t,
+        )
+    };
+
+    let mut best: Option<(f32, [f32; 3], [f32; 3], f32)> = None;
+    for face in solid.shell().faces() {
+        let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
+            continue;
+        };
+        let p = cyl.position();
+        let loc = p.location();
+        let d = p.direction();
+        let dl = (d.x() * d.x() + d.y() * d.y() + d.z() * d.z()).sqrt();
+        if dl < 1e-9 {
+            continue;
+        }
+        let origin = [loc.x() as f32, loc.y() as f32, loc.z() as f32];
+        let dir = [
+            (d.x() / dl) as f32,
+            (d.y() / dl) as f32,
+            (d.z() / dl) as f32,
+        ];
+        let r = cyl.radius() as f32;
+        let (radial, _) = radial_dist(centroid, origin, dir);
+        let err = (radial - r).abs();
+        if best.as_ref().map_or(true, |b| err < b.0) {
+            best = Some((err, origin, dir, r));
+        }
+    }
+    let (_, origin, dir, radius) = best?;
+
+    // Axial extent from the tessellated vertices that lie on this cylinder.
+    let mesh = try_display_mesh_from_part(solid)?;
+    let tol = 0.05 * radius.max(1.0) + 0.05;
+    let mut amin = f32::INFINITY;
+    let mut amax = f32::NEG_INFINITY;
+    for v in mesh.vertices.chunks(6) {
+        let (radial, t) = radial_dist([v[0], v[1], v[2]], origin, dir);
+        if (radial - radius).abs() <= tol {
+            amin = amin.min(t);
+            amax = amax.max(t);
+        }
+    }
+    if !amin.is_finite() || amax - amin <= 1e-3 {
+        return None;
+    }
+    Some(CylinderFaceInfo {
+        origin,
+        dir,
+        radius,
+        axial_min: amin,
+        axial_max: amax,
+    })
+}
+
 pub fn solid_has_cylindrical_face(solid: &KernelSolid) -> bool {
     solid
         .shell()

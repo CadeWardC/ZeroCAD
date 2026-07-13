@@ -147,114 +147,175 @@ impl BRep {
     /// 2. Deduplicating vertices within Precision confusion tolerance (coincident).
     /// 3. Deduplicating edges sharing the same start/end vertices and curves.
     pub fn merge(&mut self, other: &Self) -> MergeMap {
-        let mut map = MergeMap::new();
+        self.merge_many(&[other]).pop().unwrap()
+    }
 
-        // 1. Merge and deduplicate vertices
-        for (v_id, v_data) in &other.vertices {
-            let mut matched = None;
-            for (self_v_id, self_v_data) in &self.vertices {
-                if self_v_data
-                    .point
-                    .is_equal(&v_data.point, openrcad_foundation::tolerance::CONFUSION)
-                {
-                    matched = Some(self_v_id);
-                    break;
+    /// Bulk [`BRep::merge`]: merge many source arenas in one pass, returning one
+    /// [`MergeMap`] per source, in order. The vertex and edge deduplication
+    /// indexes (a spatial hash grid and an endpoint-pair bucket map) are built
+    /// once over `self` and maintained incrementally across all sources, so
+    /// merging N small arenas costs O(total entities) instead of the O(n²) the
+    /// per-element linear scans gave — sewing a skinned solid's thousands of
+    /// quad faces spent whole seconds there. Dedup semantics match serial
+    /// `merge` calls exactly.
+    pub fn merge_many(&mut self, others: &[&Self]) -> Vec<MergeMap> {
+        let tol = openrcad_foundation::tolerance::CONFUSION;
+        // Cells no smaller than the match tolerance: two points within `tol`
+        // always land in the same or an adjacent cell, so the 27-neighbour
+        // probe sees every candidate the old full scan would have.
+        let cell = tol.max(1e-12);
+        let key_of = |p: &Pnt| -> (i64, i64, i64) {
+            (
+                (p.x() / cell).floor() as i64,
+                (p.y() / cell).floor() as i64,
+                (p.z() / cell).floor() as i64,
+            )
+        };
+        let mut vgrid: std::collections::HashMap<(i64, i64, i64), Vec<VertexId>> =
+            std::collections::HashMap::new();
+        for (v_id, v_data) in &self.vertices {
+            vgrid.entry(key_of(&v_data.point)).or_default().push(v_id);
+        }
+        // Edges can only merge when they share BOTH (deduplicated) endpoint
+        // vertices, in either direction — bucket by the unordered pair.
+        let pair_of = |a: VertexId, b: VertexId| if a <= b { (a, b) } else { (b, a) };
+        let mut ebuckets: std::collections::HashMap<(VertexId, VertexId), Vec<EdgeId>> =
+            std::collections::HashMap::new();
+        for (e_id, e_data) in &self.edges {
+            ebuckets
+                .entry(pair_of(e_data.start, e_data.end))
+                .or_default()
+                .push(e_id);
+        }
+
+        let mut maps = Vec::with_capacity(others.len());
+        for other in others {
+            let mut map = MergeMap::new();
+
+            // 1. Merge and deduplicate vertices
+            for (v_id, v_data) in &other.vertices {
+                let (kx, ky, kz) = key_of(&v_data.point);
+                let mut matched = None;
+                'probe: for dx in -1..=1_i64 {
+                    for dy in -1..=1_i64 {
+                        for dz in -1..=1_i64 {
+                            let Some(bucket) = vgrid.get(&(kx + dx, ky + dy, kz + dz)) else {
+                                continue;
+                            };
+                            for &cand in bucket {
+                                if self.vertices[cand].point.is_equal(&v_data.point, tol) {
+                                    matched = Some(cand);
+                                    break 'probe;
+                                }
+                            }
+                        }
+                    }
                 }
+                let new_id = if let Some(m_id) = matched {
+                    m_id
+                } else {
+                    let id = self.vertices.insert(*v_data);
+                    vgrid.entry((kx, ky, kz)).or_default().push(id);
+                    id
+                };
+                map.vertices.insert(v_id, new_id);
             }
-            let new_id = if let Some(m_id) = matched {
-                m_id
-            } else {
-                self.vertices.insert(*v_data)
-            };
-            map.vertices.insert(v_id, new_id);
-        }
 
-        // 2. Merge and deduplicate edges
-        for (e_id, e_data) in &other.edges {
-            let new_start = map.vertices[&e_data.start];
-            let new_end = map.vertices[&e_data.end];
+            // 2. Merge and deduplicate edges
+            for (e_id, e_data) in &other.edges {
+                let new_start = map.vertices[&e_data.start];
+                let new_end = map.vertices[&e_data.end];
+                let bkey = pair_of(new_start, new_end);
 
-            let mut matched = None;
-            for (self_e_id, self_e_data) in &self.edges {
-                let endpoints_match = (self_e_data.start == new_start
-                    && self_e_data.end == new_end)
-                    || (self_e_data.start == new_end && self_e_data.end == new_start);
-                // Curve equality + shared endpoints is not enough to call two
-                // edges the same: the TWO arcs of one circle (e.g. two
-                // semicircles, or the thirds of a cylinder rim) share a curve
-                // AND both endpoints but cover different spans. Merging them
-                // loses one arc's parameter range and collapses distinct
-                // boundary edges into one — a false non-manifold downstream.
-                // A midpoint sample distinguishes co-endpoint sub-arcs; for
-                // lines (and identical arcs) the midpoints coincide, so this is
-                // a no-op there.
-                if endpoints_match
-                    && self_e_data.curve == e_data.curve
-                    && edge_midpoints_match(self_e_data, e_data)
-                {
-                    matched = Some(self_e_id);
-                    break;
+                let mut matched = None;
+                if let Some(bucket) = ebuckets.get(&bkey) {
+                    for &cand in bucket {
+                        let self_e_data = &self.edges[cand];
+                        let endpoints_match = (self_e_data.start == new_start
+                            && self_e_data.end == new_end)
+                            || (self_e_data.start == new_end && self_e_data.end == new_start);
+                        // Curve equality + shared endpoints is not enough to call two
+                        // edges the same: the TWO arcs of one circle (e.g. two
+                        // semicircles, or the thirds of a cylinder rim) share a curve
+                        // AND both endpoints but cover different spans. Merging them
+                        // loses one arc's parameter range and collapses distinct
+                        // boundary edges into one — a false non-manifold downstream.
+                        // A midpoint sample distinguishes co-endpoint sub-arcs; for
+                        // lines (and identical arcs) the midpoints coincide, so this is
+                        // a no-op there.
+                        if endpoints_match
+                            && self_e_data.curve == e_data.curve
+                            && edge_midpoints_match(self_e_data, e_data)
+                        {
+                            matched = Some(cand);
+                            break;
+                        }
+                    }
                 }
+
+                let new_id = if let Some(m_id) = matched {
+                    m_id
+                } else {
+                    let id = self.edges.insert(EdgeData {
+                        curve: e_data.curve.clone(),
+                        first: e_data.first,
+                        last: e_data.last,
+                        start: new_start,
+                        end: new_end,
+                        tolerance: e_data.tolerance,
+                    });
+                    ebuckets.entry(bkey).or_default().push(id);
+                    id
+                };
+                map.edges.insert(e_id, new_id);
             }
 
-            let new_id = if let Some(m_id) = matched {
-                m_id
-            } else {
-                self.edges.insert(EdgeData {
-                    curve: e_data.curve.clone(),
-                    first: e_data.first,
-                    last: e_data.last,
-                    start: new_start,
-                    end: new_end,
-                    tolerance: e_data.tolerance,
-                })
-            };
-            map.edges.insert(e_id, new_id);
-        }
+            // 3. Merge loops
+            for (l_id, l_data) in &other.loops {
+                let new_edges: Vec<OrientedEdge> = l_data
+                    .edges
+                    .iter()
+                    .map(|&oe| OrientedEdge {
+                        id: map.edges[&oe.id],
+                        orientation: oe.orientation,
+                    })
+                    .collect();
+                let new_id = self.loops.insert(LoopData { edges: new_edges });
+                map.loops.insert(l_id, new_id);
+            }
 
-        // 3. Merge loops
-        for (l_id, l_data) in &other.loops {
-            let new_edges: Vec<OrientedEdge> = l_data
-                .edges
-                .iter()
-                .map(|&oe| OrientedEdge {
-                    id: map.edges[&oe.id],
-                    orientation: oe.orientation,
-                })
-                .collect();
-            let new_id = self.loops.insert(LoopData { edges: new_edges });
-            map.loops.insert(l_id, new_id);
-        }
+            // 4. Merge faces
+            for (f_id, f_data) in &other.faces {
+                let new_outer = f_data.outer_wire.map(|w| map.loops[&w]);
+                let new_inner: Vec<LoopId> =
+                    f_data.inner_wires.iter().map(|&w| map.loops[&w]).collect();
+                let new_id = self.faces.insert(FaceData {
+                    surface: f_data.surface.clone(),
+                    outer_wire: new_outer,
+                    inner_wires: new_inner,
+                    orientation: f_data.orientation,
+                });
+                map.faces.insert(f_id, new_id);
+            }
 
-        // 4. Merge faces
-        for (f_id, f_data) in &other.faces {
-            let new_outer = f_data.outer_wire.map(|w| map.loops[&w]);
-            let new_inner: Vec<LoopId> =
-                f_data.inner_wires.iter().map(|&w| map.loops[&w]).collect();
-            let new_id = self.faces.insert(FaceData {
-                surface: f_data.surface.clone(),
-                outer_wire: new_outer,
-                inner_wires: new_inner,
-                orientation: f_data.orientation,
-            });
-            map.faces.insert(f_id, new_id);
-        }
+            // 5. Merge shells
+            for (s_id, s_data) in &other.shells {
+                let new_faces: Vec<FaceId> = s_data.faces.iter().map(|&f| map.faces[&f]).collect();
+                let new_id = self.shells.insert(ShellData { faces: new_faces });
+                map.shells.insert(s_id, new_id);
+            }
 
-        // 5. Merge shells
-        for (s_id, s_data) in &other.shells {
-            let new_faces: Vec<FaceId> = s_data.faces.iter().map(|&f| map.faces[&f]).collect();
-            let new_id = self.shells.insert(ShellData { faces: new_faces });
-            map.shells.insert(s_id, new_id);
-        }
+            // 6. Merge solids
+            for (so_id, so_data) in &other.solids {
+                let new_shells: Vec<ShellId> =
+                    so_data.shells.iter().map(|&s| map.shells[&s]).collect();
+                let new_id = self.solids.insert(SolidData { shells: new_shells });
+                map.solids.insert(so_id, new_id);
+            }
 
-        // 6. Merge solids
-        for (so_id, so_data) in &other.solids {
-            let new_shells: Vec<ShellId> = so_data.shells.iter().map(|&s| map.shells[&s]).collect();
-            let new_id = self.solids.insert(SolidData { shells: new_shells });
-            map.solids.insert(so_id, new_id);
+            maps.push(map);
         }
-
-        map
+        maps
     }
 
     /// Discard every face not in `keep`, plus every loop, edge, and vertex no

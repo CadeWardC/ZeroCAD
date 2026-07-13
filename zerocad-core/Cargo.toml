@@ -15,3 +15,13 @@ openrcad.workspace = true
 ciborium.workspace = true
 zstd.workspace = true
 crc32fast.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.6"
+tempfile = "3"
+
+[[bench]]
+name = "modeling_pipeline"
+harness = false

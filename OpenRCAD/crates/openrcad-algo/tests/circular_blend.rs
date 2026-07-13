@@ -33,7 +33,10 @@ fn top_cap(solid: &Solid) -> Face {
 }
 
 fn top_rim_arcs(solid: &Solid) -> Vec<Edge> {
-    top_cap(solid).outer_wire().expect("cap has an outer wire").edges()
+    top_cap(solid)
+        .outer_wire()
+        .expect("cap has an outer wire")
+        .edges()
 }
 
 fn count_surface(solid: &Solid, pred: impl Fn(&GeomSurface) -> bool) -> usize {
@@ -94,7 +97,10 @@ fn cylinder_top_rim_fillet_is_watertight_with_torus() {
     assert_watertight("cylinder rim fillet", &result);
     assert_mesh_crack_free("cylinder rim fillet", &result);
     let tori = count_surface(&result, |s| matches!(s, GeomSurface::Torus(_)));
-    assert!(tori >= 3, "the rim fillet must add a torus band, got {tori}");
+    assert!(
+        tori >= 3,
+        "the rim fillet must add a torus band, got {tori}"
+    );
 }
 
 #[test]
@@ -119,7 +125,10 @@ fn bored_hole_rim_fillet_is_watertight_with_torus() {
             assert_watertight("bored hole rim fillet", &result);
             assert_mesh_crack_free("bored hole rim fillet", &result);
             let tori = count_surface(&result, |s| matches!(s, GeomSurface::Torus(_)));
-            assert!(tori >= 3, "the hole rim fillet must add a torus band, got {tori}");
+            assert!(
+                tori >= 3,
+                "the hole rim fillet must add a torus band, got {tori}"
+            );
         }
         Err(e) => panic!("bored hole rim fillet should succeed, got {e}"),
     }
@@ -149,7 +158,10 @@ fn cylinder_top_rim_chamfer_is_watertight_with_cone() {
     assert_watertight("cylinder rim chamfer", &result);
     assert_mesh_crack_free("cylinder rim chamfer", &result);
     let cones = count_surface(&result, |s| matches!(s, GeomSurface::Cone(_)));
-    assert!(cones >= 3, "the rim chamfer must add a cone band, got {cones}");
+    assert!(
+        cones >= 3,
+        "the rim chamfer must add a cone band, got {cones}"
+    );
 }
 
 #[test]
@@ -172,7 +184,10 @@ fn bored_hole_rim_chamfer_is_watertight_with_cone() {
             assert_watertight("bored hole rim chamfer", &result);
             assert_mesh_crack_free("bored hole rim chamfer", &result);
             let cones = count_surface(&result, |s| matches!(s, GeomSurface::Cone(_)));
-            assert!(cones >= 3, "the hole rim chamfer must add a cone band, got {cones}");
+            assert!(
+                cones >= 3,
+                "the hole rim chamfer must add a cone band, got {cones}"
+            );
         }
         Err(e) => panic!("bored hole rim chamfer should succeed, got {e}"),
     }
@@ -222,7 +237,10 @@ fn bite_arc_open_chain_fillet_is_watertight_flush_and_crack_free() {
     assert_mesh_crack_free("bite arc fillet", &result);
     assert_no_front_bulge("bite arc fillet", &result);
     let tori = count_surface(&result, |s| matches!(s, GeomSurface::Torus(_)));
-    assert!(tori >= 1, "the bite fillet must add a torus band, got {tori}");
+    assert!(
+        tori >= 1,
+        "the bite fillet must add a torus band, got {tori}"
+    );
 }
 
 #[test]
@@ -235,7 +253,10 @@ fn bite_arc_open_chain_chamfer_is_watertight_flush_and_crack_free() {
     assert_mesh_crack_free("bite arc chamfer", &result);
     assert_no_front_bulge("bite arc chamfer", &result);
     let cones = count_surface(&result, |s| matches!(s, GeomSurface::Cone(_)));
-    assert!(cones >= 1, "the bite chamfer must add a cone band, got {cones}");
+    assert!(
+        cones >= 1,
+        "the bite chamfer must add a cone band, got {cones}"
+    );
 }
 
 #[test]

@@ -31,8 +31,9 @@ impl ZeroCadApp {
                 );
             } else {
                 let t = (elapsed / self.camera_anim_duration) as f32;
-                // Easing: Smoothstep
-                let t_smooth = t * t * (3.0 - 2.0 * t);
+                // Smootherstep: zero velocity and acceleration at both ends,
+                // avoiding the small start/stop jerk of cubic smoothstep.
+                let t_smooth = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
                 self.camera_pitch = self.camera_anim_start_pitch
                     + (self.camera_anim_target_pitch - self.camera_anim_start_pitch) * t_smooth;
                 self.camera_yaw = self.camera_anim_start_yaw
@@ -80,11 +81,22 @@ impl ZeroCadApp {
     }
 
     pub(crate) fn handle_3d_escape(&mut self, ctx: &egui::Context) {
+        if self.combine_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.combine_op = None;
+            self.status_msg = "Combine cancelled.".to_string();
+            return;
+        }
+        if self.move_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_move_body();
+            return;
+        }
         // In the plain 3D view (no sketch, no live op or dialog), Escape returns to
         // the neutral Select state by clearing the current selection.
         if !self.is_sketch_mode
             && self.extrude_op.is_none()
             && self.edge_mod_op.is_none()
+            && self.move_op.is_none()
+            && self.combine_op.is_none()
             && self.dim_input.is_none()
             && !self.is_plane_selection_mode
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -111,6 +123,7 @@ impl ZeroCadApp {
             gpu_render: self.gpu_render,
             backend: self.graphics_backend,
             msaa: self.msaa_level,
+            hydrated_cache_mb: self.hydrated_cache_mb,
         };
         if current != self.settings_baseline {
             current.save();

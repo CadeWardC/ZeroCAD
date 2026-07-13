@@ -9,7 +9,7 @@ use core::fmt;
 use openrcad_foundation::{tolerance, Ax2, Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface,
-    GregorySurface, Plane, SphericalSurface, Surface, ToroidalSurface,
+    GregorySurface, Plane, RuledSurface, SphericalSurface, Surface, ToroidalSurface,
 };
 use openrcad_mesh::tessellate;
 use openrcad_primitives::make_cylinder;
@@ -48,7 +48,7 @@ pub enum RollingBallError {
     InvalidDihedral,
     /// The selected edge was not found in a face that should be trimmed.
     SpineNotOnFace,
-    /// This local trim pass only supports simple outer-loop faces.
+    /// The selected face loop could not be trimmed safely.
     UnsupportedTrimTopology,
     /// The numeric tangency solver diverged.
     NewtonDiverged { iterations: usize },
@@ -81,9 +81,9 @@ impl fmt::Display for RollingBallError {
             Self::SpineNotOnFace => {
                 f.write_str("rolling ball: selected edge was not found on an adjacent face")
             }
-            Self::UnsupportedTrimTopology => f.write_str(
-                "rolling ball: local trimming currently supports simple outer-loop faces only",
-            ),
+            Self::UnsupportedTrimTopology => {
+                f.write_str("rolling ball: selected face loop could not be trimmed safely")
+            }
             Self::NewtonDiverged { iterations } => write!(
                 f,
                 "rolling ball: numeric tangency solver diverged after {iterations} iterations"
@@ -355,7 +355,7 @@ fn fillet_planar_edge_inner(
             end_caps.iter().map(kind).collect::<Vec<_>>()
         );
     }
-    let cut_guards = cut_cylinder_guards(solid, &start_caps, &end_caps);
+    let cut_guards = cut_cylinder_guards(solid, &blend, start, &start_caps, end, &end_caps);
 
     let mut faces = Vec::new();
     let mut skipped_faces = std::collections::HashSet::new();
@@ -377,10 +377,11 @@ fn fillet_planar_edge_inner(
     // path, so it runs regardless of `use_sphere`, and takes priority over the
     // miter/sphere closures.
     //
-    // A CONCAVE spine blend adds material in the void wedge; every smart corner
-    // closure below encodes the subtractive geometry (ball center inside the
-    // material), so a concave blend skips them all and terminates with the flat
-    // cap trim, which is side-agnostic wire surgery.
+    // A CONCAVE spine blend adds material in the void wedge. Spheres, cut
+    // runouts, and curved-wall closures below encode convex/subtractive geometry,
+    // so concave blends still skip those. The equal-radius cylinder/cylinder
+    // miter is side-agnostic once its contact direction is mirrored, however, and
+    // is the one smart closure concave blends are allowed to use.
     let convex = !blend.concave;
     let start_cut = convex
         && try_corner_cut(
@@ -392,24 +393,10 @@ fn fillet_planar_edge_inner(
             &mut faces,
             &mut skipped_faces,
         )?;
-    let start_tangent_wall = if start_cut || !convex {
-        false
-    } else {
-        try_tangent_curved_wall_runout(
-            solid,
-            &mut blend,
-            start,
-            &start_caps,
-            radius,
-            &mut faces,
-            &mut skipped_faces,
-        )?
-    };
-    let start_mitered = start_cut
-        || start_tangent_wall
-        || (convex
-            && use_sphere
-            && (try_corner_sphere_two_caps(
+    let start_smart_corner = !start_cut
+        && use_sphere
+        && if convex {
+            try_corner_sphere_two_caps(
                 solid,
                 &blend,
                 start,
@@ -432,7 +419,32 @@ fn fillet_planar_edge_inner(
                 radius,
                 &mut faces,
                 &mut skipped_faces,
-            )));
+            )
+        } else {
+            try_corner_miter(
+                solid,
+                &mut blend,
+                start,
+                &start_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            )
+        };
+    let start_tangent_wall = if start_cut || start_smart_corner || !convex {
+        false
+    } else {
+        try_tangent_curved_wall_runout(
+            solid,
+            &mut blend,
+            start,
+            &start_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?
+    };
+    let start_mitered = start_cut || start_smart_corner || start_tangent_wall;
     // Oblique planar cap (any non-perpendicular angle): flush ellipse trim.
     // Side-agnostic wire surgery, so it serves convex and concave blends alike.
     let start_mitered = start_mitered
@@ -443,7 +455,14 @@ fn fillet_planar_edge_inner(
             radius,
             &mut faces,
             &mut skipped_faces,
-        )?;
+        )?
+        || try_perpendicular_planar_setback(
+            &mut blend,
+            start,
+            &start_caps,
+            &mut faces,
+            &mut skipped_faces,
+        );
     let end_cut = convex
         && try_corner_cut(
             solid,
@@ -454,24 +473,10 @@ fn fillet_planar_edge_inner(
             &mut faces,
             &mut skipped_faces,
         )?;
-    let end_tangent_wall = if end_cut || !convex {
-        false
-    } else {
-        try_tangent_curved_wall_runout(
-            solid,
-            &mut blend,
-            end,
-            &end_caps,
-            radius,
-            &mut faces,
-            &mut skipped_faces,
-        )?
-    };
-    let end_mitered = end_cut
-        || end_tangent_wall
-        || (convex
-            && use_sphere
-            && (try_corner_sphere_two_caps(
+    let end_smart_corner = !end_cut
+        && use_sphere
+        && if convex {
+            try_corner_sphere_two_caps(
                 solid,
                 &blend,
                 end,
@@ -494,7 +499,32 @@ fn fillet_planar_edge_inner(
                 radius,
                 &mut faces,
                 &mut skipped_faces,
-            )));
+            )
+        } else {
+            try_corner_miter(
+                solid,
+                &mut blend,
+                end,
+                &end_caps,
+                radius,
+                &mut faces,
+                &mut skipped_faces,
+            )
+        };
+    let end_tangent_wall = if end_cut || end_smart_corner || !convex {
+        false
+    } else {
+        try_tangent_curved_wall_runout(
+            solid,
+            &mut blend,
+            end,
+            &end_caps,
+            radius,
+            &mut faces,
+            &mut skipped_faces,
+        )?
+    };
+    let end_mitered = end_cut || end_smart_corner || end_tangent_wall;
     let end_mitered = end_mitered
         || try_oblique_planar_cap(
             &mut blend,
@@ -503,7 +533,14 @@ fn fillet_planar_edge_inner(
             radius,
             &mut faces,
             &mut skipped_faces,
-        )?;
+        )?
+        || try_perpendicular_planar_setback(
+            &mut blend,
+            end,
+            &end_caps,
+            &mut faces,
+            &mut skipped_faces,
+        );
 
     if !start_mitered {
         handle_corner_endpoint(
@@ -546,7 +583,12 @@ fn fillet_planar_edge_inner(
                     let b = e.target().point();
                     format!(
                         "[{:.2},{:.2},{:.2}]->[{:.2},{:.2},{:.2}]",
-                        a.x(), a.y(), a.z(), b.x(), b.y(), b.z()
+                        a.x(),
+                        a.y(),
+                        a.z(),
+                        b.x(),
+                        b.y(),
+                        b.z()
                     )
                 })
                 .collect();
@@ -627,14 +669,27 @@ struct CutCylinderGuard {
 
 fn cut_cylinder_guards(
     solid: &Solid,
+    blend: &RollingBallBlend,
+    start: Pnt,
     start_caps: &[Face],
+    end: Pnt,
     end_caps: &[Face],
 ) -> Vec<CutCylinderGuard> {
     start_caps
         .iter()
-        .chain(end_caps.iter())
-        .filter(|cap| is_concave_cut_cylinder(solid, cap))
-        .filter_map(|cap| {
+        .map(|cap| (cap, start))
+        .chain(end_caps.iter().map(|cap| (cap, end)))
+        .filter(|(cap, _)| is_concave_cut_cylinder(solid, cap))
+        // A cylinder tangent to the selected support is a continuation wall,
+        // not a pre-existing cylindrical cut that the new blend must avoid.
+        // Guarding it would reject an otherwise healthy tangent-chain segment.
+        .filter(|(cap, endpoint)| {
+            let Some(GeomSurface::Cylinder(cyl)) = cap.surface() else {
+                return false;
+            };
+            !wall_is_tangent_to_selected_side(cap, cyl, blend, *endpoint).unwrap_or(false)
+        })
+        .filter_map(|(cap, _)| {
             let Some(GeomSurface::Cylinder(cyl)) = cap.surface() else {
                 return None;
             };
@@ -952,8 +1007,7 @@ fn merged_coplanar_cap(caps: &[Face]) -> Option<Face> {
         .iter()
         .map(|cap| effective_normal(cap).is_some_and(|n| n.dot(&n0) > 0.0))
         .collect();
-    let majority_agrees =
-        2 * agrees_with_first.iter().filter(|&&a| a).count() >= caps.len();
+    let majority_agrees = 2 * agrees_with_first.iter().filter(|&&a| a).count() >= caps.len();
 
     let mut pool: Vec<Edge> = Vec::new();
     let mut pool_cap: Vec<usize> = Vec::new();
@@ -1286,18 +1340,48 @@ pub(crate) fn is_concave_cut_cylinder(solid: &Solid, cap: &Face) -> bool {
     let Some(wire) = cap.outer_wire() else {
         return false;
     };
-    let verts: std::vec::Vec<Pnt> = wire.edges().iter().map(|e| e.source().point()).collect();
-    if verts.is_empty() {
-        return false;
-    }
-    let mut sum = GeomVec::new(0.0, 0.0, 0.0);
-    for v in &verts {
-        sum += *v - Pnt::origin();
-    }
-    let centroid = Pnt::origin() + sum * (1.0 / verts.len() as f64);
     let axis_pt = cyl.position().location();
     let axis_dir = GeomVec::from_dir(cyl.position().direction());
-    let v = centroid - axis_pt;
+    // Never average a partial/full circular wall's boundary vertices: symmetric
+    // arcs average onto the cylinder axis, where no radial direction exists.
+    // Instead choose the sampled boundary point with the strongest radial
+    // component. Curve midpoints ensure a semicircle with opposite endpoints
+    // still contributes a point on the actual wall.
+    let wire_edges = wire.edges();
+    let circular_midpoint = wire_edges
+        .iter()
+        .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+        .max_by(|a, b| {
+            (a.last() - a.first())
+                .abs()
+                .partial_cmp(&(b.last() - b.first()).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .and_then(|edge| {
+            edge.curve()
+                .map(|curve| curve.point(0.5 * (edge.first() + edge.last())))
+        });
+    let mut samples = Vec::new();
+    for edge in wire_edges {
+        samples.push(edge.source().point());
+        samples.push(edge.target().point());
+    }
+    let sample = circular_midpoint.or_else(|| {
+        samples.into_iter().max_by(|a, b| {
+            let radial_sq = |p: &Pnt| {
+                let v = *p - axis_pt;
+                let perpendicular = v - axis_dir * v.dot(&axis_dir);
+                perpendicular.magnitude_squared()
+            };
+            radial_sq(a)
+                .partial_cmp(&radial_sq(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    let Some(sample) = sample else {
+        return false;
+    };
+    let v = sample - axis_pt;
     let along = axis_dir * v.dot(&axis_dir);
     let radial = match (v - along).normalized() {
         Some(r) => GeomVec::from_dir(r),
@@ -1308,8 +1392,15 @@ pub(crate) fn is_concave_cut_cylinder(solid: &Solid, cap: &Face) -> bool {
     let outside = on_wall + radial * eps;
     let inside = on_wall - radial * eps;
     // Concave cut: material outside, void inside.
-    crate::boolean::point_in_solid(&outside, solid)
-        && !crate::boolean::point_in_solid(&inside, solid)
+    match (
+        crate::boolean::point_in_solid(&outside, solid),
+        crate::boolean::point_in_solid(&inside, solid),
+    ) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => face_outward_normal_at(cap, on_wall)
+            .is_ok_and(|normal| GeomVec::from_dir(normal).dot(&radial) < -0.5),
+    }
 }
 
 /// Intersect the infinite line `p0 + t·dir` with `cyl`, returning the hit point
@@ -1530,7 +1621,7 @@ fn cyl_cyl_trim_edge(
 /// cylinder, so both surfaces keep analytic support and sew without cracks.
 #[allow(clippy::too_many_arguments)]
 fn try_tangent_curved_wall_runout(
-    solid: &Solid,
+    _solid: &Solid,
     blend: &mut RollingBallBlend,
     corner: Pnt,
     caps: &[Face],
@@ -1542,9 +1633,6 @@ fn try_tangent_curved_wall_runout(
         return Ok(false);
     }
     let cap = &caps[0];
-    if is_concave_cut_cylinder(solid, cap) {
-        return Ok(false);
-    }
     let wall_cyl = match cap.surface() {
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return Ok(false),
@@ -1554,9 +1642,10 @@ fn try_tangent_curved_wall_runout(
         _ => return Ok(false),
     };
 
-    // Prior fillets are also cylindrical endpoint caps. They are handled by the
-    // miter/sphere paths when the cap axis passes through the rolling-ball center
-    // at this corner. A tangent sketch wall sits away from that center.
+    // Equal-radius prior fillets are also cylindrical endpoint caps, but their
+    // axis passes through the new rolling-ball center. They belong to the corner
+    // closure path (which is tried before this runout). A tangent sketch wall
+    // sits away from that center.
     let center = nearest_endpoint(&blend.centerline, corner);
     if point_line_distance(
         center,
@@ -1574,9 +1663,9 @@ fn try_tangent_curved_wall_runout(
     //   wall and is trimmed flush against it. Both share the same analytic
     //   construction (contact lines extended to the wall, cyl∩cyl trim curve);
     //   they differ only in how the wall is recognized.
-    if !wall_is_tangent_to_selected_side(cap, &wall_cyl, blend, corner)?
-        && !wall_crosses_blend_at_corner(cap, &wall_cyl, corner)
-    {
+    let tangent_wall = wall_is_tangent_to_selected_side(cap, &wall_cyl, blend, corner)?;
+    let crossing_wall = wall_crosses_blend_at_corner(cap, &wall_cyl, corner);
+    if !tangent_wall && !crossing_wall {
         return Ok(false);
     }
 
@@ -1603,14 +1692,16 @@ fn try_tangent_curved_wall_runout(
     };
 
     let ca_real = match line_meets_cylinder_on_edge(a_far, a_dir, &wall_cyl, a_corner, a_trim_edge)
+        .or_else(|| line_meets_cylinder_on_edge(a_far, a_dir, &wall_cyl, a_corner, b_trim_edge))
     {
         Some(p) => p,
-        None => return Err(RollingBallError::UnsupportedTrimTopology),
+        None => return Ok(false),
     };
     let cb_real = match line_meets_cylinder_on_edge(b_far, b_dir, &wall_cyl, b_corner, b_trim_edge)
+        .or_else(|| line_meets_cylinder_on_edge(b_far, b_dir, &wall_cyl, b_corner, a_trim_edge))
     {
         Some(p) => p,
-        None => return Err(RollingBallError::UnsupportedTrimTopology),
+        None => return Ok(false),
     };
     if ca_real.distance(&cb_real) <= tolerance::CONFUSION {
         return Err(RollingBallError::UnsupportedTrimTopology);
@@ -1752,6 +1843,13 @@ fn try_corner_cut(
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return Err(RollingBallError::UnsupportedTrimTopology),
     };
+    // A pocket wall can be both concave (material outside the cylinder) and
+    // tangent-continuous with the selected straight rim. That is a runout, not
+    // a crossing cut: let `try_tangent_curved_wall_runout` extend the blend into
+    // the wall instead of forcing the cylinder-crossing construction below.
+    if wall_is_tangent_to_selected_side(cap, &cut_cyl, blend, corner)? {
+        return Ok(false);
+    }
     let blend_cyl = match blend.blend_face.surface() {
         Some(GeomSurface::Cylinder(c)) => *c,
         // A non-cylindrical blend (e.g. a torus rim fillet) has no analytic
@@ -1988,6 +2086,138 @@ fn try_oblique_planar_cap(
     Ok(true)
 }
 
+/// Close a perpendicular sharp endpoint whose fillet profile falls outside the
+/// third face's finite boundary. This is the unfilleted end of a pocket-rim
+/// edge: splicing the quarter arc into the narrow pocket wall drags that wall's
+/// edges off-surface and opens the shell. Keep the third face unchanged, add a
+/// planar quarter-sector at the corner, and insert its two radial connectors in
+/// the selected edge's support faces before their normal spine trim.
+fn try_perpendicular_planar_setback(
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    caps: &[Face],
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> bool {
+    if caps.len() != 1 {
+        return false;
+    }
+    let cap = &caps[0];
+    let Some(GeomSurface::Plane(cap_plane)) = cap.surface() else {
+        return false;
+    };
+    let Some(GeomSurface::Cylinder(cylinder)) = blend.blend_face.surface() else {
+        return false;
+    };
+    if GeomVec::from_dir(cap_plane.normal())
+        .dot(&GeomVec::from_dir(cylinder.position().direction()))
+        .abs()
+        < 0.999
+    {
+        return false;
+    }
+
+    let ca = nearest_endpoint(&blend.contact_a, corner);
+    let cb = nearest_endpoint(&blend.contact_b, corner);
+    let Ok((prev, next)) = cap_edges_at_corner(cap, corner) else {
+        return false;
+    };
+    let edge_for_contact = |point: Pnt| {
+        let prev_dist = point_segment_distance(point, prev.source().point(), prev.target().point());
+        let next_dist = point_segment_distance(point, next.source().point(), next.target().point());
+        let (edge, distance) = if prev_dist <= next_dist {
+            (&prev, prev_dist)
+        } else {
+            (&next, next_dist)
+        };
+        (distance <= corner_tol(blend.radius)).then_some(edge)
+    };
+    // If both feet lie on the two finite cap edges, the established splice is
+    // exact and should retain ownership of the endpoint.
+    let ca_cap_edge = edge_for_contact(ca);
+    let cb_cap_edge = edge_for_contact(cb);
+    if ca_cap_edge.is_some() && cb_cap_edge.is_some() {
+        return false;
+    }
+
+    let corner_is_source = corner.distance(&blend.spine.source().point())
+        <= corner.distance(&blend.spine.target().point());
+    let arc = if corner_is_source {
+        &blend.start_arc
+    } else {
+        &blend.end_arc
+    };
+    let sector = Face::new(
+        cap.surface().cloned(),
+        Wire::from_edges([
+            Edge::between_points(corner, ca),
+            orient_edge_between(arc, ca, cb),
+            Edge::between_points(cb, corner),
+        ]),
+    );
+
+    let plane_offset = |face: &Face, point: Pnt| -> Option<f64> {
+        let Some(GeomSurface::Plane(plane)) = face.surface() else {
+            return None;
+        };
+        Some(
+            (point - plane.position().location())
+                .dot(&GeomVec::from_dir(plane.normal()))
+                .abs(),
+        )
+    };
+    let (Some(ca_to_a), Some(ca_to_b)) = (
+        plane_offset(&blend.face_a, ca),
+        plane_offset(&blend.face_b, ca),
+    ) else {
+        return false;
+    };
+    let ca_on_a = ca_to_a <= ca_to_b;
+    let (face_for_a, face_for_b) = if ca_on_a {
+        (blend.face_a.clone(), blend.face_b.clone())
+    } else {
+        (blend.face_b.clone(), blend.face_a.clone())
+    };
+    let rebased_a = if ca_cap_edge.is_some() {
+        face_for_a.clone()
+    } else {
+        let Some(face) = insert_connector_next_to_spine(&face_for_a, &blend.spine, corner, ca)
+        else {
+            return false;
+        };
+        face
+    };
+    let rebased_b = if cb_cap_edge.is_some() {
+        face_for_b.clone()
+    } else {
+        let Some(face) = insert_connector_next_to_spine(&face_for_b, &blend.spine, corner, cb)
+        else {
+            return false;
+        };
+        face
+    };
+
+    blend.face_a = rebased_a;
+    blend.face_b = rebased_b;
+    faces.push(sector);
+    // A contact that still lies on one finite cap edge divides that old shared
+    // edge between the support face and the new sector. Split it explicitly so
+    // all three faces meet pairwise instead of leaving one long overlapping edge.
+    if let Some((edge, point)) = ca_cap_edge
+        .map(|edge| (edge, ca))
+        .or_else(|| cb_cap_edge.map(|edge| (edge, cb)))
+    {
+        let Some(split_cap) = split_face_edge_at_point(cap, edge, point) else {
+            return false;
+        };
+        faces.push(split_cap);
+        skipped.insert(cap.id());
+    }
+    skipped.insert(face_for_a.id());
+    skipped.insert(face_for_b.id());
+    true
+}
+
 /// The endpoint of `edge` farthest from `point`.
 pub(crate) fn farthest_endpoint(edge: &Edge, point: Pnt) -> Pnt {
     let s = edge.source().point();
@@ -2041,7 +2271,7 @@ fn build_blend_face_with_trim(
 /// is distinct from the spherical ball-corner, which only belongs when all three
 /// edges at the corner are rounded.
 ///
-/// On the supported convex, mutually-perpendicular, equal-radius case this:
+/// On the supported mutually-perpendicular, equal-radius case this:
 /// - retracts the prior cylinder cap so its corner end follows the seam (its top
 ///   contact shortens to `T`; its side contact already ends at `K`), pushing the
 ///   retracted cap and skipping the original,
@@ -2064,16 +2294,19 @@ fn try_corner_miter(
     let r = radius;
     let near = |p: Pnt, q: Pnt| p.distance(&q) <= 10.0 * tolerance::CONFUSION;
 
-    if caps.len() != 1 {
+    let cylinder_caps: Vec<&Face> = caps
+        .iter()
+        .filter(|cap| matches!(cap.surface(), Some(GeomSurface::Cylinder(_))))
+        .collect();
+    if cylinder_caps.len() != 1 {
         return false;
     }
-    let cap = &caps[0];
-    if !matches!(
-        cap.surface(),
-        Some(GeomSurface::Cylinder(_)) | Some(GeomSurface::Torus(_))
-    ) {
-        return false;
-    }
+    let cap = cylinder_caps[0];
+    let auxiliary_cap_ids: Vec<FaceId> = caps
+        .iter()
+        .filter(|candidate| candidate.id() != cap.id())
+        .map(Face::id)
+        .collect();
 
     // The corner's two new-blend contacts (nearest endpoint of each contact curve).
     let contact_a_corner = nearest_endpoint(&blend.contact_a, corner);
@@ -2093,12 +2326,25 @@ fn try_corner_miter(
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return false,
     };
-    if point_line_distance(
+    let center_axis_gap = point_line_distance(
         center,
         cyl.position().location(),
         cyl.position().direction(),
-    ) > 1e-5 * r.max(1.0) + 1e-6
-    {
+    );
+    // Equal-radius perpendicular fillets have intersecting rolling-ball axes.
+    // With unequal radii the axes are parallel to the opposite support planes
+    // and separated by exactly |r_new - r_old|.  Anything else is a generic
+    // cylindrical wall, not an earlier fillet band for this corner.
+    let radius_gap = (r - cyl.radius()).abs();
+    let axis_tol = 5.0 * corner_tol(r.max(cyl.radius()));
+    let axes_intersect = (center_axis_gap - radius_gap).abs() <= axis_tol;
+    // At a pocket opening the vertical additive fillet and horizontal
+    // subtractive rim fillet live on opposite sides of their shared wall. Their
+    // equal-radius axes are separated by exactly two radii, so the cylinders
+    // touch at one contact instead of crossing along the ordinary ellipse.
+    let mixed_side_axes =
+        radius_gap <= axis_tol && (center_axis_gap - (r + cyl.radius())).abs() <= axis_tol;
+    if !axes_intersect && !mixed_side_axes {
         return false;
     }
 
@@ -2152,13 +2398,40 @@ fn try_corner_miter(
         return false;
     };
 
-    let side2 = if same_face(&common, &blend.face_a) {
+    let same_planar_support = |a: &Face, b: &Face| {
+        if same_face(a, b) {
+            return true;
+        }
+        let (Some(GeomSurface::Plane(pa)), Some(GeomSurface::Plane(pb))) =
+            (a.surface(), b.surface())
+        else {
+            return false;
+        };
+        let na = GeomVec::from_dir(pa.normal());
+        let nb = GeomVec::from_dir(pb.normal());
+        na.dot(&nb).abs() > 0.999
+            && (pb.position().location() - pa.position().location())
+                .dot(&na)
+                .abs()
+                <= corner_tol(r)
+    };
+    let side2 = if same_planar_support(&common, &blend.face_a) {
         blend.face_b.clone()
-    } else if same_face(&common, &blend.face_b) {
+    } else if same_planar_support(&common, &blend.face_b) {
         blend.face_a.clone()
     } else {
         return false;
     };
+    // `contact_a`/`contact_b` follow wire orientation, not the similarly named
+    // support face. Identify the common-face rail geometrically.
+    let common_plane = match common.surface() {
+        Some(GeomSurface::Plane(plane)) => *plane,
+        _ => return false,
+    };
+    let common_normal = GeomVec::from_dir(common_plane.normal());
+    let common_origin = common_plane.position().location();
+    let plane_offset = |point: Pnt| (point - common_origin).dot(&common_normal).abs();
+    let common_contact_is_a = plane_offset(contact_a_corner) <= plane_offset(contact_b_corner);
 
     let (Ok(n_top), Ok(n_side1), Ok(n_side2)) = (
         planar_outward_normal(&common),
@@ -2173,22 +2446,98 @@ fn try_corner_miter(
         return false;
     }
 
-    // Seam endpoints: `T` (top tangent), `R` (new-blend side tangent), `K` (stub).
-    let t = center + GeomVec::from_dir(n_top) * r;
-    let rr = center + GeomVec::from_dir(n_side2) * r;
-    let k = center + (GeomVec::from_dir(n_side1) + GeomVec::from_dir(n_side2)) * r;
+    if radius_gap > corner_tol(r.max(cyl.radius())) {
+        // The general unequal-radius transition below currently models a convex
+        // removal. A concave join deliberately falls back to the existing flat
+        // endpoint until its asymmetric additive transition is implemented.
+        if blend.concave {
+            return false;
+        }
+        return try_corner_unequal_miter(
+            blend,
+            corner,
+            cap,
+            &cap_edges,
+            corner_arc_idx,
+            other_corner,
+            side1_contact,
+            &side1,
+            &side2,
+            n_top,
+            n_side2,
+            cyl,
+            center,
+            r,
+            faces,
+            skipped,
+        );
+    }
+
+    if mixed_side_axes {
+        // When the convex rim fillet was applied first, its sharp-end planar
+        // setback remains as a second cap at this vertex. It is coplanar with
+        // the new concave blend's side support; merge the two temporarily so
+        // the prior cylinder's full end arc is again a boundary edge that can
+        // be replaced by the miter connector.
+        let mixed_side2 = caps
+            .iter()
+            .filter(|candidate| candidate.id() != cap.id() && candidate.id() != side2.id())
+            .find_map(|candidate| {
+                same_planar_support(candidate, &side2)
+                    .then(|| merged_coplanar_cap(&[side2.clone(), candidate.clone()]))
+                    .flatten()
+            })
+            .unwrap_or_else(|| side2.clone());
+        let applied = try_corner_mixed_side_miter(
+            blend,
+            corner,
+            cap,
+            &cap_edges[corner_arc_idx],
+            top_contact,
+            side1_contact,
+            other_corner,
+            &common,
+            &side1,
+            &mixed_side2,
+            common_contact_is_a,
+            center,
+            cyl,
+            r,
+            faces,
+            skipped,
+        );
+        if applied {
+            skipped.insert(side2.id());
+            skipped.extend(auxiliary_cap_ids);
+        }
+        return applied;
+    }
+
+    // Seam endpoints: `T` (common-face tangent), `R` (new-blend side tangent),
+    // `K` (the prior cap's stub). Derive them from the actual contacts instead
+    // of assuming one global outward-normal sign: at a pocket opening the
+    // vertical corner fillet is concave/additive while the adjacent top-rim
+    // fillet is convex/subtractive, so their two contact signs are mixed.
+    let (t, rr) = if common_contact_is_a {
+        (contact_a_corner, contact_b_corner)
+    } else {
+        (contact_b_corner, contact_a_corner)
+    };
+    let k = other_corner;
 
     // Cross-check against the geometry the rest of the build already produced: `T`
     // and `R` are the new blend's two corner contacts, and `K` the cap stub vertex.
     let xtol = corner_tol(r);
-    let matches_a_or_b =
-        |x: Pnt| x.distance(&contact_a_corner) < xtol || x.distance(&contact_b_corner) < xtol;
-    if !matches_a_or_b(t) || !matches_a_or_b(rr) || k.distance(&other_corner) > xtol {
+    let expected_stub_radius = r * core::f64::consts::SQRT_2;
+    if (center.distance(&t) - r).abs() > xtol
+        || (center.distance(&rr) - r).abs() > xtol
+        || (center.distance(&k) - expected_stub_radius).abs() > xtol
+    {
         return false;
     }
 
     // The miter seam: cylinder cap ∩ new blend, a quarter-ellipse `K -> T`.
-    let Some(seam) = miter_seam_edge(center, n_top, n_side1, n_side2, r) else {
+    let Some(seam) = miter_seam_edge(center, k, t, r) else {
         return false;
     };
 
@@ -2265,24 +2614,947 @@ fn try_corner_miter(
     true
 }
 
+/// Join the opposite-side fillets at a pocket opening. The earlier concave
+/// vertical band and the new convex rim band have equal-radius perpendicular
+/// axes separated by `2r`; their cylinders touch at only one point, so there is
+/// no cylinder/cylinder intersection ellipse to use as the ordinary miter.
+/// Instead, retain both exact quarter-circle end profiles and span them with a
+/// ruled setback patch. Its other two rails lie in the shared support planes,
+/// producing the inward/concave miter visible at the pocket corner.
+#[allow(clippy::too_many_arguments)]
+fn try_corner_mixed_side_miter(
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    cap: &Face,
+    cap_arc: &Edge,
+    cap_common_contact: &Edge,
+    cap_side_contact: &Edge,
+    old_side_corner: Pnt,
+    common: &Face,
+    side1: &Face,
+    side2: &Face,
+    common_contact_is_a: bool,
+    center: Pnt,
+    old_cyl: CylindricalSurface,
+    radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> bool {
+    let tol = 5.0 * corner_tol(radius);
+    let old_axis = GeomVec::from_dir(old_cyl.position().direction());
+    let old_axis_origin = old_cyl.position().location();
+    let old_center = old_axis_origin + old_axis * (corner - old_axis_origin).dot(&old_axis);
+
+    // The new arc runs from its side2 contact A to its common-face contact B.
+    // The old cap arc runs from K (old side) to C (the relocated sharp corner).
+    let contact_a = nearest_endpoint(&blend.contact_a, corner);
+    let contact_b = nearest_endpoint(&blend.contact_b, corner);
+    let (new_side_contact, common_contact) = if common_contact_is_a {
+        (contact_b, contact_a)
+    } else {
+        (contact_a, contact_b)
+    };
+    let (k, c, a, b) = (old_side_corner, corner, new_side_contact, common_contact);
+    let quarter = |center: Pnt, p: Pnt, q: Pnt| {
+        (center.distance(&p) - radius).abs() <= tol
+            && (center.distance(&q) - radius).abs() <= tol
+            && (p - center).dot(&(q - center)).abs() <= tol * radius.max(1.0)
+    };
+    if !quarter(old_center, k, c) || !quarter(center, a, b) {
+        return false;
+    }
+
+    let canonical_quarter_arc = |circle_center: Pnt, start: Pnt, end: Pnt| {
+        // Exact rational-quadratic quarter circle with a compact [0,1] domain.
+        // A full Circle rail advertises [0,2pi], making the generic ruled-surface
+        // projector seed Newton on the complementary branch and tear the patch's
+        // boundary mesh away from the adjacent cylinder faces.
+        let tangent_corner = circle_center + (start - circle_center) + (end - circle_center);
+        GeomCurve::bspline(openrcad_geom::BSplineCurve::new(
+            2,
+            vec![start, tangent_corner, end],
+            Some(vec![1.0, core::f64::consts::FRAC_1_SQRT_2, 1.0]),
+            vec![0.0, 1.0],
+            vec![3, 3],
+        ))
+    };
+    let old_curve = canonical_quarter_arc(old_center, k, c);
+    let new_curve = canonical_quarter_arc(center, a, b);
+
+    // If the convex rim was applied first, edge reattachment presents its band
+    // at the original pocket corner and the later concave vertical band two
+    // radii below the top. Canonicalize both endpoints to the same setback used
+    // by the opposite application order: retract the old rim along its axis and
+    // extend the new vertical band along its axis. This makes the resulting
+    // miter geometric, rather than merely topological, order-independent.
+    if blend.concave {
+        let shift_toward = |point: Pnt, target: Pnt| {
+            (target - point)
+                .normalized()
+                .map(|direction| point + GeomVec::from_dir(direction) * radius)
+        };
+        let shift_away = |point: Pnt, target: Pnt| {
+            (point - target)
+                .normalized()
+                .map(|direction| point + GeomVec::from_dir(direction) * radius)
+        };
+
+        let Some(k_setback) = shift_toward(k, farthest_endpoint(cap_side_contact, k)) else {
+            return false;
+        };
+        let Some(c_setback) = shift_toward(c, farthest_endpoint(cap_common_contact, c)) else {
+            return false;
+        };
+        let new_side_edge = if common_contact_is_a {
+            &blend.contact_b
+        } else {
+            &blend.contact_a
+        };
+        let new_common_edge = if common_contact_is_a {
+            &blend.contact_a
+        } else {
+            &blend.contact_b
+        };
+        let Some(a_extended) = shift_away(a, farthest_endpoint(new_side_edge, a)) else {
+            return false;
+        };
+        let Some(b_extended) = shift_away(b, farthest_endpoint(new_common_edge, b)) else {
+            return false;
+        };
+
+        let old_shift = k_setback - k;
+        let new_shift = a_extended - a;
+        if (c + old_shift).distance(&c_setback) > tol || (b + new_shift).distance(&b_extended) > tol
+        {
+            return false;
+        }
+        let old_setback_curve = canonical_quarter_arc(old_center + old_shift, k_setback, c_setback);
+        let new_extended_curve = canonical_quarter_arc(center + new_shift, a_extended, b_extended);
+        let curve_edge = |curve: &GeomCurve, start: Pnt, end: Pnt| {
+            Edge::new(
+                Some(curve.clone()),
+                0.0,
+                1.0,
+                Vertex::new(start),
+                Vertex::new(end),
+            )
+        };
+
+        let old_rail = curve_edge(&old_setback_curve, k_setback, c_setback);
+        let new_rail = curve_edge(&new_extended_curve, a_extended, b_extended);
+        let common_connector = Edge::between_points(c_setback, b_extended);
+        let side_connector = Edge::between_points(a_extended, k_setback);
+        let patch = Face::new(
+            Some(GeomSurface::ruled(RuledSurface::new(
+                old_setback_curve,
+                new_extended_curve.clone(),
+            ))),
+            Wire::from_edges([
+                old_rail,
+                common_connector.clone(),
+                new_rail.reversed(),
+                side_connector,
+            ]),
+        );
+
+        let Some(retracted_cap) = retract_cylindrical_band_end(
+            cap,
+            cap_arc,
+            k,
+            k_setback,
+            c,
+            c_setback,
+            &curve_edge(
+                &canonical_quarter_arc(old_center + old_shift, k_setback, c_setback),
+                k_setback,
+                c_setback,
+            ),
+        ) else {
+            return false;
+        };
+        let Some(rebased_side1) =
+            replace_planar_corner_path(side1, cap_side_contact, k, k_setback, a_extended)
+        else {
+            return false;
+        };
+        let Some(rebased_side2) = collapse_planar_cap_before_trim(side2, cap_arc, c, a_extended)
+        else {
+            return false;
+        };
+
+        if common_contact_is_a {
+            blend.contact_b = extend_contact_corner(&blend.contact_b, corner, a_extended);
+            blend.face_a = common.clone();
+            blend.face_b = rebased_side2;
+        } else {
+            blend.contact_a = extend_contact_corner(&blend.contact_a, corner, a_extended);
+            blend.face_a = rebased_side2;
+            blend.face_b = common.clone();
+        }
+        let corner_is_source = corner.distance(&blend.spine.source().point())
+            <= corner.distance(&blend.spine.target().point());
+        let extended_arc = curve_edge(&new_extended_curve, a_extended, b_extended);
+        if corner_is_source {
+            blend.start_arc = orient_edge_between(
+                &extended_arc,
+                blend.contact_b.source().point(),
+                blend.contact_a.source().point(),
+            );
+        } else {
+            blend.end_arc = orient_edge_between(
+                &extended_arc,
+                blend.contact_a.target().point(),
+                blend.contact_b.target().point(),
+            );
+        }
+        let mut blend_edges = Vec::with_capacity(5);
+        blend_edges.push(blend.contact_a.clone());
+        if !corner_is_source && common_contact_is_a {
+            blend_edges.push(common_connector.clone());
+        }
+        blend_edges.push(blend.end_arc.clone());
+        if !corner_is_source && !common_contact_is_a {
+            blend_edges.push(common_connector.reversed());
+        }
+        blend_edges.push(blend.contact_b.clone().reversed());
+        if corner_is_source && !common_contact_is_a {
+            blend_edges.push(common_connector.clone());
+        }
+        blend_edges.push(blend.start_arc.clone());
+        if corner_is_source && common_contact_is_a {
+            blend_edges.push(common_connector.reversed());
+        }
+        blend.blend_face = Face::new(
+            blend.blend_face.surface().cloned(),
+            Wire::from_edges(blend_edges),
+        );
+
+        faces.push(patch);
+        faces.push(retracted_cap);
+        faces.push(rebased_side1);
+        skipped.insert(cap.id());
+        skipped.insert(common.id());
+        skipped.insert(side1.id());
+        skipped.insert(side2.id());
+        return true;
+    }
+
+    let corner_is_source = corner.distance(&blend.spine.source().point())
+        <= corner.distance(&blend.spine.target().point());
+    let new_arc = if corner_is_source {
+        &blend.start_arc
+    } else {
+        &blend.end_arc
+    };
+    let old_rail = orient_edge_between(cap_arc, k, c);
+    let new_rail = orient_edge_between(new_arc, a, b);
+    let common_connector = Edge::between_points(c, b);
+    let side_connector = Edge::between_points(a, k);
+    let patch = Face::new(
+        Some(GeomSurface::ruled(RuledSurface::new(old_curve, new_curve))),
+        Wire::from_edges([
+            old_rail,
+            common_connector.clone(),
+            new_rail.reversed(),
+            side_connector.clone(),
+        ]),
+    );
+
+    // Prepare the adjacent loops for the ordinary spine trim below. On side2
+    // the old cap arc is consumed and replaced by K->A. The common face retreats
+    // to B normally; splitting the prior cap's common contact at B lets B->C
+    // belong to the miter patch and the remaining contact stay paired to the
+    // common face without overlapping three faces on one edge.
+    let Some(rebased_side2) = replace_corner_edge_with_connector(side2, c, k, a) else {
+        return false;
+    };
+    let Some(split_cap) = split_face_edge_at_point(cap, cap_common_contact, b) else {
+        return false;
+    };
+    if common_contact_is_a {
+        blend.face_a = common.clone();
+        blend.face_b = rebased_side2;
+    } else {
+        blend.face_b = common.clone();
+        blend.face_a = rebased_side2;
+    }
+
+    faces.push(patch);
+    faces.push(split_cap);
+    skipped.insert(cap.id());
+    skipped.insert(common.id());
+    skipped.insert(side2.id());
+    true
+}
+
+fn replace_corner_edge_with_connector(
+    face: &Face,
+    corner: Pnt,
+    other: Pnt,
+    contact: Pnt,
+) -> Option<Face> {
+    let tol = 10.0 * tolerance::CONFUSION;
+    let replace = |wire: &Wire| -> Option<Wire> {
+        let mut edges = wire.edges();
+        let index = edges.iter().position(|edge| {
+            let s = edge.source().point();
+            let t = edge.target().point();
+            (s.distance(&corner) <= tol && t.distance(&other) <= tol)
+                || (t.distance(&corner) <= tol && s.distance(&other) <= tol)
+        })?;
+        let edge = &edges[index];
+        let (start, end) = if edge.source().point().distance(&corner) <= tol {
+            (contact, other)
+        } else {
+            (other, contact)
+        };
+        edges[index] = Edge::between_points(start, end);
+        Some(Wire::from_edges(edges))
+    };
+    replace_one_face_wire(face, replace)
+}
+
+fn retract_cylindrical_band_end(
+    face: &Face,
+    end_arc: &Edge,
+    side_old: Pnt,
+    side_new: Pnt,
+    common_old: Pnt,
+    common_new: Pnt,
+    setback_arc: &Edge,
+) -> Option<Face> {
+    let tol = 10.0 * tolerance::CONFUSION;
+    let remap = |point: Pnt| {
+        if point.distance(&side_old) <= tol {
+            side_new
+        } else if point.distance(&common_old) <= tol {
+            common_new
+        } else {
+            point
+        }
+    };
+    let replace = |wire: &Wire| -> Option<Wire> {
+        if !wire
+            .edges()
+            .iter()
+            .any(|edge| same_undirected_edge(edge, end_arc))
+        {
+            return None;
+        }
+        let rebuilt: Vec<Edge> = wire
+            .edges()
+            .into_iter()
+            .map(|edge| {
+                if same_undirected_edge(&edge, end_arc) {
+                    orient_edge_between(
+                        setback_arc,
+                        remap(edge.source().point()),
+                        remap(edge.target().point()),
+                    )
+                } else {
+                    let source = remap(edge.source().point());
+                    let target = remap(edge.target().point());
+                    if source.distance(&edge.source().point()) <= tol
+                        && target.distance(&edge.target().point()) <= tol
+                    {
+                        edge
+                    } else {
+                        Edge::between_points(source, target)
+                    }
+                }
+            })
+            .collect();
+        Some(Wire::from_edges(rebuilt))
+    };
+    replace_one_face_wire(face, replace)
+}
+
+/// On the planar support shared by the old convex band and the canonical mixed
+/// miter, replace the sharp-corner boundary path with the miter connector while
+/// shortening the old band's contact to its setback endpoint.
+fn replace_planar_corner_path(
+    face: &Face,
+    old_contact: &Edge,
+    old_corner: Pnt,
+    old_setback: Pnt,
+    new_contact: Pnt,
+) -> Option<Face> {
+    let tol = 10.0 * tolerance::CONFUSION;
+    let replace = |wire: &Wire| -> Option<Wire> {
+        let mut edges = wire.edges();
+        let contact_index = edges.iter().position(|edge| {
+            same_undirected_edge(edge, old_contact)
+                || edge_contains_requested_span(edge, old_contact)
+        })?;
+        edges.rotate_left(contact_index);
+        let cap_contact = &edges[0];
+        let corner_at_source = cap_contact.source().point().distance(&old_corner) <= tol;
+        let corner_at_target = cap_contact.target().point().distance(&old_corner) <= tol;
+        if !corner_at_source && !corner_at_target {
+            return None;
+        }
+        let path_edge = edges
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, edge)| point_on_edge_score(edge, new_contact) <= tol)
+            .map(|(index, _)| index)?;
+
+        let mut rebuilt = Vec::with_capacity(edges.len() + 1);
+        if corner_at_target {
+            rebuilt.push(Edge::between_points(
+                cap_contact.source().point(),
+                old_setback,
+            ));
+            rebuilt.push(Edge::between_points(old_setback, new_contact));
+            let tail = &edges[path_edge];
+            if new_contact.distance(&tail.target().point()) > tol {
+                rebuilt.push(Edge::between_points(new_contact, tail.target().point()));
+            }
+            rebuilt.extend(edges.into_iter().skip(path_edge + 1));
+        } else {
+            rebuilt.push(Edge::between_points(
+                old_setback,
+                cap_contact.target().point(),
+            ));
+            rebuilt.extend(edges.iter().skip(1).take(path_edge - 1).cloned());
+            let head = &edges[path_edge];
+            if head.source().point().distance(&new_contact) > tol {
+                rebuilt.push(Edge::between_points(head.source().point(), new_contact));
+            }
+            rebuilt.push(Edge::between_points(new_contact, old_setback));
+        }
+        Some(Wire::from_edges(rebuilt))
+    };
+    replace_one_face_wire(face, replace)
+}
+
+/// Remove the planar endpoint sector left by a previously closed convex band.
+/// The following support trim then replaces the restored sharp boundary with
+/// the later fillet's contact, so no obsolete flat cap remains in the miter.
+fn collapse_planar_cap_before_trim(
+    face: &Face,
+    cap_arc: &Edge,
+    corner: Pnt,
+    new_contact: Pnt,
+) -> Option<Face> {
+    let tol = 10.0 * tolerance::CONFUSION;
+    let replace = |wire: &Wire| -> Option<Wire> {
+        let mut edges = wire.edges();
+        let index = edges
+            .iter()
+            .position(|edge| same_undirected_edge(edge, cap_arc))?;
+        edges.rotate_left(index);
+        let cap = &edges[0];
+        if cap.target().point().distance(&corner) <= tol {
+            let previous = edges.last()?;
+            if point_on_edge_score(previous, new_contact) > tol {
+                return None;
+            }
+            let mut rebuilt: Vec<Edge> = edges
+                .iter()
+                .skip(1)
+                .take(edges.len() - 2)
+                .cloned()
+                .collect();
+            rebuilt.push(Edge::between_points(previous.source().point(), corner));
+            Some(Wire::from_edges(rebuilt))
+        } else if cap.source().point().distance(&corner) <= tol {
+            let path_end = edges
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, edge)| point_on_edge_score(edge, new_contact) <= tol)
+                .map(|(index, _)| index)?;
+            let mut rebuilt = Vec::with_capacity(edges.len() - path_end + 1);
+            rebuilt.push(Edge::between_points(
+                corner,
+                edges[path_end].target().point(),
+            ));
+            rebuilt.extend(edges.into_iter().skip(path_end + 1));
+            Some(Wire::from_edges(rebuilt))
+        } else {
+            None
+        }
+    };
+    replace_one_face_wire(face, replace)
+}
+
+fn split_face_edge_at_point(face: &Face, target: &Edge, split: Pnt) -> Option<Face> {
+    let insert = |wire: &Wire| -> Option<Wire> {
+        let edges = wire.edges();
+        let index = edges
+            .iter()
+            .position(|edge| same_undirected_edge(edge, target))?;
+        let mut rebuilt = Vec::with_capacity(edges.len() + 1);
+        for (i, edge) in edges.into_iter().enumerate() {
+            if i == index {
+                rebuilt.push(Edge::between_points(edge.source().point(), split));
+                rebuilt.push(Edge::between_points(split, edge.target().point()));
+            } else {
+                rebuilt.push(edge);
+            }
+        }
+        Some(Wire::from_edges(rebuilt))
+    };
+    replace_one_face_wire(face, insert)
+}
+
+fn insert_connector_next_to_spine(
+    face: &Face,
+    spine: &Edge,
+    corner: Pnt,
+    contact: Pnt,
+) -> Option<Face> {
+    let tol = 10.0 * tolerance::CONFUSION;
+    let insert = |wire: &Wire| -> Option<Wire> {
+        let edges = wire.edges();
+        let index = edges.iter().position(|edge| {
+            same_undirected_edge(edge, spine) || edge_contains_requested_span(edge, spine)
+        })?;
+        let corner_at_source = edges[index].source().point().distance(&corner) <= tol;
+        let corner_at_target = edges[index].target().point().distance(&corner) <= tol;
+        if !corner_at_source && !corner_at_target {
+            return None;
+        }
+        let mut rebuilt = Vec::with_capacity(edges.len() + 1);
+        for (i, edge) in edges.into_iter().enumerate() {
+            if i == index && corner_at_source {
+                rebuilt.push(Edge::between_points(corner, contact));
+            }
+            rebuilt.push(edge);
+            if i == index && corner_at_target {
+                rebuilt.push(Edge::between_points(contact, corner));
+            }
+        }
+        Some(Wire::from_edges(rebuilt))
+    };
+    replace_one_face_wire(face, insert)
+}
+
+fn replace_one_face_wire(
+    face: &Face,
+    mut transform: impl FnMut(&Wire) -> Option<Wire>,
+) -> Option<Face> {
+    if let Some(outer) = face.outer_wire() {
+        if let Some(rebuilt) = transform(&outer) {
+            return Some(Face::with_wires(
+                face.surface().cloned(),
+                Some(rebuilt),
+                face.inner_wires(),
+                face.orientation(),
+            ));
+        }
+    }
+    let mut inners = face.inner_wires();
+    for index in 0..inners.len() {
+        if let Some(rebuilt) = transform(&inners[index]) {
+            inners[index] = rebuilt;
+            return Some(Face::with_wires(
+                face.surface().cloned(),
+                face.outer_wire(),
+                inners,
+                face.orientation(),
+            ));
+        }
+    }
+    None
+}
+
+/// Miter two perpendicular convex fillets whose radii differ.
+///
+/// The two cylinders meet along a quartic seam from their shared top tangency to
+/// the side plane belonging to the smaller fillet.  From that point a short
+/// circular runout on the same plane reaches the surviving sharp third edge.
+/// Keeping the seam and runout as separate shared edges is important: combining
+/// them into the old perpendicular end arc makes one cap wire topologically
+/// closed but off-surface, which tessellates as four visible crack edges.
+#[allow(clippy::too_many_arguments)]
+fn try_corner_unequal_miter(
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    cap: &Face,
+    cap_edges: &[Edge],
+    corner_arc_idx: usize,
+    old_side_corner: Pnt,
+    side1_contact: &Edge,
+    side1: &Face,
+    side2: &Face,
+    n_top: Dir,
+    n_side2: Dir,
+    old_cyl: CylindricalSurface,
+    center: Pnt,
+    new_radius: f64,
+    faces: &mut Vec<Face>,
+    skipped: &mut std::collections::HashSet<FaceId>,
+) -> bool {
+    let Some(GeomSurface::Cylinder(new_cyl)) = blend.blend_face.surface() else {
+        return false;
+    };
+    let new_cyl = *new_cyl;
+    let old_radius = old_cyl.radius();
+    let tol = corner_tol(new_radius.max(old_radius));
+
+    let contact_a_corner = nearest_endpoint(&blend.contact_a, corner);
+    let contact_b_corner = nearest_endpoint(&blend.contact_b, corner);
+    let t = center + GeomVec::from_dir(n_top) * new_radius;
+    let new_side_tangent = center + GeomVec::from_dir(n_side2) * new_radius;
+    let matches_contact = |p: Pnt| {
+        p.distance(&contact_a_corner) <= 5.0 * tol || p.distance(&contact_b_corner) <= 5.0 * tol
+    };
+    if !matches_contact(t) || !matches_contact(new_side_tangent) {
+        return false;
+    }
+
+    let side2_contact_is_a = contact_a_corner.distance(&new_side_tangent)
+        <= contact_b_corner.distance(&new_side_tangent);
+    let side2_contact = if side2_contact_is_a {
+        &blend.contact_a
+    } else {
+        &blend.contact_b
+    };
+
+    let larger_new = new_radius > old_radius;
+    let seam_end = if larger_new {
+        let Some(dir) = (side1_contact.target().point() - side1_contact.source().point())
+            .normalized()
+            .map(|v| Dir::new(v.x(), v.y(), v.z()))
+        else {
+            return false;
+        };
+        let Some(p) = line_meets_cylinder(
+            side1_contact.source().point(),
+            dir,
+            &new_cyl,
+            old_side_corner,
+        ) else {
+            return false;
+        };
+        p
+    } else {
+        let Some(dir) = (side2_contact.target().point() - side2_contact.source().point())
+            .normalized()
+            .map(|v| Dir::new(v.x(), v.y(), v.z()))
+        else {
+            return false;
+        };
+        let Some(p) = line_meets_cylinder(
+            side2_contact.source().point(),
+            dir,
+            &old_cyl,
+            old_side_corner,
+        ) else {
+            return false;
+        };
+        p
+    };
+    if seam_end.distance(&t) <= tol {
+        return false;
+    }
+    let Some(seam) = cyl_cyl_trim_edge(&new_cyl, &old_cyl, t, seam_end) else {
+        return false;
+    };
+
+    // The limiting side plane owns the short circular runout from the cylinder
+    // seam to the sharp third edge.  For a larger new radius this lies on the
+    // new cylinder and side1; for a smaller new radius it lies on the old
+    // cylinder and side2.
+    let (side_corner, runout) = if larger_new {
+        let Some(GeomSurface::Plane(side1_plane)) = side1.surface() else {
+            return false;
+        };
+        let Some(k_new) = line_plane_crossing(side2_contact, side1_plane) else {
+            return false;
+        };
+        let Some(runout) = cylinder_plane_circle_arc(&new_cyl, side1_plane, seam_end, k_new) else {
+            return false;
+        };
+        (k_new, runout)
+    } else {
+        let Some(GeomSurface::Plane(side2_plane)) = side2.surface() else {
+            return false;
+        };
+        let Some(runout) =
+            cylinder_plane_circle_arc(&old_cyl, side2_plane, seam_end, old_side_corner)
+        else {
+            return false;
+        };
+        (seam_end, runout)
+    };
+
+    // Retract the earlier cylindrical cap.  Its top contact moves to T.  When
+    // the new radius is larger, its side contact also retreats to the quartic
+    // seam; when it is smaller, the old cap retains the circular runout to its
+    // original side tangent.
+    let near = |p: Pnt, q: Pnt| p.distance(&q) <= 10.0 * tolerance::CONFUSION;
+    let old_arc = &cap_edges[corner_arc_idx];
+    let old_arc_corner_first = near(old_arc.source().point(), corner);
+    let mut new_cap_edges = Vec::with_capacity(cap_edges.len() + 1);
+    for (i, edge) in cap_edges.iter().enumerate() {
+        if i == corner_arc_idx {
+            let mut pieces = vec![seam.clone()];
+            if !larger_new {
+                pieces.push(runout.clone());
+            }
+            let cap_side_end = if larger_new {
+                seam_end
+            } else {
+                old_side_corner
+            };
+            let from = if old_arc_corner_first {
+                t
+            } else {
+                cap_side_end
+            };
+            let to = if old_arc_corner_first {
+                cap_side_end
+            } else {
+                t
+            };
+            let Some(oriented) = orient_edge_chain(&pieces, from, to) else {
+                return false;
+            };
+            new_cap_edges.extend(oriented);
+        } else if matches!(edge.curve(), Some(GeomCurve::Line(_))) {
+            let remap = |p: Pnt| {
+                if near(p, corner) {
+                    t
+                } else if larger_new && near(p, old_side_corner) {
+                    seam_end
+                } else {
+                    p
+                }
+            };
+            new_cap_edges.push(Edge::between_points(
+                remap(edge.source().point()),
+                remap(edge.target().point()),
+            ));
+        } else {
+            new_cap_edges.push(edge.clone());
+        }
+    }
+    new_cap_edges.retain(|edge| {
+        edge.source().point().distance(&edge.target().point()) > tolerance::CONFUSION
+    });
+    let retracted_cap = Face::with_wires(
+        cap.surface().cloned(),
+        Some(Wire::from_edges(new_cap_edges)),
+        cap.inner_wires(),
+        cap.orientation(),
+    );
+
+    // Move the new blend's side contact to the limiting side plane / third edge.
+    if side2_contact_is_a {
+        blend.contact_a = extend_contact_corner(&blend.contact_a, corner, side_corner);
+    } else {
+        blend.contact_b = extend_contact_corner(&blend.contact_b, corner, side_corner);
+    }
+
+    let mut corner_pieces = vec![seam.clone()];
+    if larger_new {
+        corner_pieces.push(runout.clone());
+    }
+    if !rebuild_blend_face_with_corner_edges(blend, corner, &corner_pieces) {
+        return false;
+    }
+
+    if larger_new {
+        // The larger new blend consumes the old cap arc completely on side2;
+        // rebase that support face so the normal spine trim drops the consumed
+        // arc and joins the extended contact to the shifted sharp edge.
+        let Some(rebased_side2) =
+            rebase_face_past_consumed_corner_arc(side2, corner, old_side_corner, side_corner)
+        else {
+            return false;
+        };
+        if same_face(side2, &blend.face_a) {
+            blend.face_a = rebased_side2;
+        } else if same_face(side2, &blend.face_b) {
+            blend.face_b = rebased_side2;
+        } else {
+            return false;
+        }
+        skipped.insert(side2.id());
+
+        // side1 keeps a planar runout bounded by the same analytic circle.
+        let Ok(trimmed_side1) =
+            trim_face_at_corner(side1, old_side_corner, seam_end, side_corner, &runout)
+        else {
+            return false;
+        };
+        faces.push(trimmed_side1);
+        skipped.insert(side1.id());
+    }
+
+    // The common top face is intentionally not rebuilt here: the ordinary spine
+    // trim sees the moved top contact T and shortens the established fillet's
+    // top contact to the exact same vertex.
+    faces.push(retracted_cap);
+    skipped.insert(cap.id());
+    true
+}
+
+fn line_plane_crossing(edge: &Edge, plane: &Plane) -> Option<Pnt> {
+    let a = edge.source().point();
+    let d = edge.target().point() - a;
+    let n = GeomVec::from_dir(plane.normal());
+    let denom = d.dot(&n);
+    if denom.abs() <= tolerance::CONFUSION {
+        return None;
+    }
+    let t = (plane.position().location() - a).dot(&n) / denom;
+    Some(a + d * t)
+}
+
+fn cylinder_plane_circle_arc(
+    cylinder: &CylindricalSurface,
+    plane: &Plane,
+    start: Pnt,
+    end: Pnt,
+) -> Option<Edge> {
+    let axis = cylinder.position().direction();
+    let axis_vec = GeomVec::from_dir(axis);
+    let plane_n = GeomVec::from_dir(plane.normal());
+    if axis_vec.dot(&plane_n).abs() < 0.999 {
+        return None;
+    }
+    let axis_point = cylinder.position().location();
+    let denom = axis_vec.dot(&plane_n);
+    let t = (plane.position().location() - axis_point).dot(&plane_n) / denom;
+    let center = axis_point + axis_vec * t;
+    let x = (start - center).normalized()?;
+    contact_arc(
+        center,
+        axis,
+        Dir::new(x.x(), x.y(), x.z()),
+        cylinder.radius(),
+        start,
+        end,
+    )
+    .ok()
+}
+
+fn orient_edge_chain(edges: &[Edge], from: Pnt, to: Pnt) -> Option<Vec<Edge>> {
+    let tol = 5.0e-4_f64.max(10.0 * tolerance::CONFUSION);
+    let mut remaining = edges.to_vec();
+    let mut current = from;
+    let mut oriented = Vec::with_capacity(edges.len());
+    while !remaining.is_empty() {
+        let idx = remaining.iter().position(|edge| {
+            edge.source().point().distance(&current) <= tol
+                || edge.target().point().distance(&current) <= tol
+        })?;
+        let edge = remaining.remove(idx);
+        let edge = if edge.source().point().distance(&current)
+            <= edge.target().point().distance(&current)
+        {
+            edge
+        } else {
+            edge.reversed()
+        };
+        current = edge.target().point();
+        oriented.push(edge);
+    }
+    (current.distance(&to) <= tol).then_some(oriented)
+}
+
+fn rebuild_blend_face_with_corner_edges(
+    blend: &mut RollingBallBlend,
+    corner: Pnt,
+    pieces: &[Edge],
+) -> bool {
+    let corner_is_source = corner.distance(&blend.spine.source().point())
+        <= corner.distance(&blend.spine.target().point());
+    let (from, to) = if corner_is_source {
+        (
+            blend.contact_b.source().point(),
+            blend.contact_a.source().point(),
+        )
+    } else {
+        (
+            blend.contact_a.target().point(),
+            blend.contact_b.target().point(),
+        )
+    };
+    let Some(oriented) = orient_edge_chain(pieces, from, to) else {
+        return false;
+    };
+    let mut wire_edges = Vec::with_capacity(3 + oriented.len());
+    wire_edges.push(blend.contact_a.clone());
+    if corner_is_source {
+        wire_edges.push(blend.end_arc.clone());
+        wire_edges.push(blend.contact_b.clone().reversed());
+        wire_edges.extend(oriented);
+    } else {
+        wire_edges.extend(oriented);
+        wire_edges.push(blend.contact_b.clone().reversed());
+        wire_edges.push(blend.start_arc.clone());
+    }
+    blend.blend_face = Face::new(
+        blend.blend_face.surface().cloned(),
+        Wire::from_edges(wire_edges),
+    );
+    true
+}
+
+fn rebase_face_past_consumed_corner_arc(
+    face: &Face,
+    corner: Pnt,
+    old_side_corner: Pnt,
+    new_side_corner: Pnt,
+) -> Option<Face> {
+    let edges = face.outer_wire()?.edges();
+    let arc_idx = edges.iter().position(|edge| {
+        (edge.source().point().distance(&corner) <= 10.0 * tolerance::CONFUSION
+            && edge.target().point().distance(&old_side_corner) <= 10.0 * tolerance::CONFUSION)
+            || (edge.target().point().distance(&corner) <= 10.0 * tolerance::CONFUSION
+                && edge.source().point().distance(&old_side_corner) <= 10.0 * tolerance::CONFUSION)
+    })?;
+    let mut rebuilt = Vec::with_capacity(edges.len());
+    for (i, edge) in edges.iter().enumerate() {
+        if i == arc_idx {
+            let replacement = if edge.source().point().distance(&corner)
+                <= edge.target().point().distance(&corner)
+            {
+                Edge::between_points(corner, new_side_corner)
+            } else {
+                Edge::between_points(new_side_corner, corner)
+            };
+            rebuilt.push(replacement);
+        } else {
+            rebuilt.push(move_edge_endpoint_keep_curve(
+                edge,
+                old_side_corner,
+                new_side_corner,
+            ));
+        }
+    }
+    Some(Face::with_wires(
+        face.surface().cloned(),
+        Some(Wire::from_edges(rebuilt)),
+        face.inner_wires(),
+        face.orientation(),
+    ))
+}
+
 /// The miter seam between two equal-radius perpendicular fillets meeting at a
 /// corner with center `center`: the quarter-ellipse where their two cylinders
-/// intersect, running from the stub vertex `K = center + r(n_side1 + n_side2)`
-/// (parameter 0) to the shared top tangent `T = center + r·n_top` (parameter π/2).
+/// intersect, running from the contact-derived stub vertex `k` (parameter 0)
+/// to the shared tangent `t` (parameter π/2).
 ///
 /// The intersection of two equal-radius cylinders whose axes cross at right angles
 /// is a planar ellipse with semi-axes `r√2` (along `n_side1 + n_side2`) and `r`
 /// (along `n_top`).
-fn miter_seam_edge(center: Pnt, n_top: Dir, n_side1: Dir, n_side2: Dir, r: f64) -> Option<Edge> {
+fn miter_seam_edge(center: Pnt, k: Pnt, t: Pnt, r: f64) -> Option<Edge> {
     use core::f64::consts::{FRAC_PI_2, SQRT_2};
     let to_dir = |v: GeomVec| v.normalized().map(|d| Dir::new(d.x(), d.y(), d.z()));
-    let major_vec = GeomVec::from_dir(n_side1) + GeomVec::from_dir(n_side2);
+    let major_vec = k - center;
+    let minor_vec = t - center;
     let major_dir = to_dir(major_vec)?;
-    let normal = to_dir(GeomVec::from_dir(major_dir).cross(&GeomVec::from_dir(n_top)))?;
+    let minor_dir = to_dir(minor_vec)?;
+    let normal = to_dir(GeomVec::from_dir(major_dir).cross(&GeomVec::from_dir(minor_dir)))?;
     let pos = Ax3::new_axes(center, normal, major_dir);
     let ell = Ellipse::new(pos, r * SQRT_2, r);
-    let k = center + major_vec * r;
-    let t = center + GeomVec::from_dir(n_top) * r;
     Some(Edge::new(
         Some(GeomCurve::ellipse(ell)),
         0.0,
@@ -2404,7 +3676,11 @@ fn try_corner_circular_band_miter(
         t_corner - side_sign * 0.6 * radius,
         t_corner + side_sign * 2.5 * radius,
     );
-    let t_a = minimize_scalar(|t| g_tor(rail_pt(0.0, t)).abs(), w_lo.min(w_hi), w_lo.max(w_hi));
+    let t_a = minimize_scalar(
+        |t| g_tor(rail_pt(0.0, t)).abs(),
+        w_lo.min(w_hi),
+        w_lo.max(w_hi),
+    );
     if g_tor(rail_pt(0.0, t_a)).abs() > 1e-4 * radius.max(1.0) {
         return false;
     }
@@ -2414,12 +3690,8 @@ fn try_corner_circular_band_miter(
     let mut prev_t = t_a;
     for k in 1..=steps {
         let f = k as f64 / steps as f64;
-        let Some(t) = directional_root(
-            |t| g_tor(rail_pt(f, t)),
-            prev_t,
-            side_sign,
-            0.6 * radius,
-        ) else {
+        let Some(t) = directional_root(|t| g_tor(rail_pt(f, t)), prev_t, side_sign, 0.6 * radius)
+        else {
             return false;
         };
         if (t - prev_t).abs() > 0.4 * radius {
@@ -2717,6 +3989,428 @@ pub fn fillet_edges(solid: &Solid, edges: &[Edge], radius: f64) -> Result<Solid,
     Ok(current)
 }
 
+/// Fillet one G1-continuous chain as a simultaneous local rebuild.
+///
+/// Sequential filleting consumes each shared tangent endpoint and leaves the
+/// next segment looking for a corner that no longer exists. Here every rolling
+/// surface is solved against the original body, common support faces receive
+/// all of their trims, and only the two real chain ends are capped. Internal
+/// line/arc junctions therefore sew directly along their common cross-section.
+pub fn fillet_tangent_edge_chain(
+    solid: &Solid,
+    edges: &[Edge],
+    radius: f64,
+) -> Result<Solid, RollingBallError> {
+    if edges.is_empty() {
+        return Err(RollingBallError::SpineNotOnFace);
+    }
+    let blends: Vec<RollingBallBlend> = edges
+        .iter()
+        .map(|edge| rolling_ball_fillet_edge(solid, edge, radius))
+        .collect::<Result<_, _>>()?;
+
+    let endpoint_key = |p: Pnt| {
+        let scale = 1.0 / (20.0 * tolerance::CONFUSION);
+        (
+            (p.x() * scale).round() as i64,
+            (p.y() * scale).round() as i64,
+            (p.z() * scale).round() as i64,
+        )
+    };
+    let mut endpoint_counts = std::collections::HashMap::new();
+    let trim_order = blends
+        .iter()
+        .filter(|blend| matches!(blend.spine.curve(), Some(GeomCurve::Circle(_))))
+        .chain(
+            blends
+                .iter()
+                .filter(|blend| !matches!(blend.spine.curve(), Some(GeomCurve::Circle(_)))),
+        );
+    for blend in trim_order {
+        *endpoint_counts
+            .entry(endpoint_key(blend.spine.source().point()))
+            .or_insert(0usize) += 1;
+        *endpoint_counts
+            .entry(endpoint_key(blend.spine.target().point()))
+            .or_insert(0usize) += 1;
+    }
+
+    let mut support_trims: std::collections::HashMap<FaceId, (Face, Vec<(Edge, Edge)>)> =
+        std::collections::HashMap::new();
+    for blend in &blends {
+        for (support, contact) in [
+            (&blend.face_a, &blend.contact_a),
+            (&blend.face_b, &blend.contact_b),
+        ] {
+            let oriented_contact = if matches!(blend.spine.curve(), Some(GeomCurve::Circle(_)))
+                && matches!(support.surface(), Some(GeomSurface::Cylinder(_)))
+            {
+                contact.clone().reversed()
+            } else {
+                contact.clone()
+            };
+            support_trims
+                .entry(support.id())
+                .or_insert_with(|| (support.clone(), Vec::new()))
+                .1
+                .push((blend.spine.clone(), oriented_contact));
+        }
+    }
+    let mut trimmed = std::collections::HashMap::new();
+    for (id, (support, replacements)) in support_trims {
+        let next = if replacements.len() == 1
+            && matches!(replacements[0].0.curve(), Some(GeomCurve::Circle(_)))
+            && matches!(support.surface(), Some(GeomSurface::Cylinder(_)))
+        {
+            trim_cylinder_wall_to_contact(&support, &replacements[0].1)?
+        } else {
+            trim_face_along_multiple_spines(&support, &replacements)?
+        };
+        trimmed.insert(id, next);
+    }
+
+    let mut faces = Vec::new();
+    let mut skipped = std::collections::HashSet::new();
+    let mut shared_planar_caps: std::collections::HashMap<
+        FaceId,
+        (Face, Vec<(Pnt, Pnt, Pnt, Edge)>),
+    > = std::collections::HashMap::new();
+    for blend in &blends {
+        for (point, arc) in [
+            (blend.spine.source().point(), &blend.start_arc),
+            (blend.spine.target().point(), &blend.end_arc),
+        ] {
+            if endpoint_counts.get(&endpoint_key(point)).copied() != Some(1) {
+                continue;
+            }
+            let caps = endpoint_cap_faces(solid, point, &blend.face_a, &blend.face_b);
+            if caps.len() == 1 && matches!(caps[0].surface(), Some(GeomSurface::Plane(_))) {
+                let ca = nearest_endpoint(&blend.contact_a, point);
+                let cb = nearest_endpoint(&blend.contact_b, point);
+                shared_planar_caps
+                    .entry(caps[0].id())
+                    .or_insert_with(|| (caps[0].clone(), Vec::new()))
+                    .1
+                    .push((point, ca, cb, arc.clone()));
+                continue;
+            }
+            handle_corner_endpoint(
+                solid,
+                blend,
+                point,
+                &caps,
+                arc,
+                radius,
+                !blend.concave,
+                &mut faces,
+                &mut skipped,
+            )?;
+        }
+    }
+    for (id, (mut cap, trims)) in shared_planar_caps {
+        for (corner, ca, cb, arc) in trims {
+            cap = trim_face_at_corner(&cap, corner, ca, cb, &arc)?;
+        }
+        faces.push(cap);
+        skipped.insert(id);
+    }
+
+    for face in solid.shell().faces() {
+        if skipped.contains(&face.id()) || trimmed.contains_key(&face.id()) {
+            continue;
+        }
+        faces.push(face);
+    }
+    faces.extend(trimmed.into_values());
+    faces.extend(blends.into_iter().map(|blend| blend.blend_face));
+
+    let result = Solid::new(sew(&faces, radius * 0.1));
+    if result.is_watertight() && result.health_report().is_healthy() {
+        Ok(crate::merge::merge_cocylindrical_faces(
+            &crate::merge::merge_coplanar_faces(&result),
+        ))
+    } else {
+        Err(RollingBallError::InvalidTopology)
+    }
+}
+
+pub fn chamfer_tangent_edge_chain(
+    solid: &Solid,
+    edges: &[Edge],
+    spine: &Edge,
+    distance: f64,
+) -> Result<Solid, crate::chamfer::ChamferError> {
+    use core::f64::consts::FRAC_PI_2;
+
+    let circular: Vec<Edge> = edges
+        .iter()
+        .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+        .cloned()
+        .collect();
+    let straight: Vec<Edge> = edges
+        .iter()
+        .filter(|edge| !matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+        .cloned()
+        .collect();
+    if circular.is_empty() || straight.is_empty() {
+        return Err(crate::chamfer::ChamferError::UnsupportedSurfacePair);
+    }
+    let geom = recover_closed_rim_geom(solid, &circular, spine, distance)
+        .map_err(|_| crate::chamfer::ChamferError::UnsupportedSurfacePair)?;
+    let sign = if geom.n_plane.dot(&geom.cax) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let concave_sign = if geom.concave { 1.0 } else { -1.0 };
+    let cone = GeomSurface::cone(ConicalSurface::new(
+        Ax3::new_axes(geom.contact_center, geom.cax, geom.cxr),
+        geom.spine_r,
+        concave_sign * sign * (FRAC_PI_2 / 2.0),
+    ));
+
+    let straight_blends = straight
+        .iter()
+        .map(|edge| crate::chamfer::chamfer_planar_blend(solid, edge, distance))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut support_trims: std::collections::HashMap<FaceId, (Face, Vec<(Edge, Edge)>)> =
+        std::collections::HashMap::new();
+    let mut band_faces = Vec::new();
+    for blend in &straight_blends {
+        for (support, contact) in [
+            (&blend.face_a, &blend.contact_a),
+            (&blend.face_b, &blend.contact_b),
+        ] {
+            support_trims
+                .entry(support.id())
+                .or_insert_with(|| (support.clone(), Vec::new()))
+                .1
+                .push((blend.spine.clone(), contact.clone()));
+        }
+        band_faces.push(blend.chamfer_face.clone());
+    }
+    for arc in &circular {
+        let (u0, u1) = spine_param_span(spine, arc)
+            .map_err(|_| crate::chamfer::ChamferError::UnsupportedSurfacePair)?;
+        let plane_arc = closed_rim_arc(&geom.c_plane, u0, u1);
+        let cyl_arc = closed_rim_arc(&geom.c_cyl, u0, u1);
+        support_trims
+            .entry(geom.plane_face.id())
+            .or_insert_with(|| (geom.plane_face.clone(), Vec::new()))
+            .1
+            .push((arc.clone(), plane_arc.clone()));
+        let cyl_face = geom
+            .cyl_faces
+            .iter()
+            .find(|face| {
+                face.wires()
+                    .into_iter()
+                    .flat_map(|wire| wire.edges())
+                    .any(|edge| same_undirected_edge(&edge, arc))
+            })
+            .ok_or(crate::chamfer::ChamferError::UnsupportedSurfacePair)?;
+        support_trims
+            .entry(cyl_face.id())
+            .or_insert_with(|| (cyl_face.clone(), Vec::new()))
+            .1
+            .push((arc.clone(), cyl_arc.clone()));
+        let seam0 = Edge::between_points(geom.c_plane.point(u0), geom.c_cyl.point(u0));
+        let seam1 = Edge::between_points(geom.c_plane.point(u1), geom.c_cyl.point(u1));
+        let wire = Wire::from_edges([plane_arc, seam1, cyl_arc.reversed(), seam0.reversed()]);
+        band_faces.push(band_face(
+            &cone,
+            wire,
+            band_mid_point(&geom, 0.5 * (u0 + u1), distance, true),
+        ));
+    }
+
+    let mut trimmed = std::collections::HashMap::new();
+    for (id, (support, replacements)) in support_trims {
+        let face = if replacements.len() == 1
+            && matches!(replacements[0].0.curve(), Some(GeomCurve::Circle(_)))
+            && matches!(support.surface(), Some(GeomSurface::Cylinder(_)))
+        {
+            trim_cylinder_wall_to_contact(&support, &replacements[0].1)
+        } else {
+            trim_face_along_multiple_spines(&support, &replacements)
+        }
+        .map_err(|_| crate::chamfer::ChamferError::UnsupportedTrimTopology)?;
+        trimmed.insert(id, face);
+    }
+
+    let endpoint_key = |p: Pnt| {
+        let s = 1.0 / (20.0 * tolerance::CONFUSION);
+        (
+            (p.x() * s).round() as i64,
+            (p.y() * s).round() as i64,
+            (p.z() * s).round() as i64,
+        )
+    };
+    let mut counts = std::collections::HashMap::new();
+    for edge in edges {
+        *counts
+            .entry(endpoint_key(edge.source().point()))
+            .or_insert(0usize) += 1;
+        *counts
+            .entry(endpoint_key(edge.target().point()))
+            .or_insert(0usize) += 1;
+    }
+    let mut cap_trims: std::collections::HashMap<FaceId, (Face, Vec<(Pnt, Pnt, Pnt, Edge)>)> =
+        std::collections::HashMap::new();
+    for blend in &straight_blends {
+        for (point, section) in [
+            (blend.spine.source().point(), &blend.start_edge),
+            (blend.spine.target().point(), &blend.end_edge),
+        ] {
+            if counts.get(&endpoint_key(point)).copied() != Some(1) {
+                continue;
+            }
+            let caps = endpoint_cap_faces(solid, point, &blend.face_a, &blend.face_b);
+            if caps.len() != 1 || !matches!(caps[0].surface(), Some(GeomSurface::Plane(_))) {
+                return Err(crate::chamfer::ChamferError::UnsupportedTrimTopology);
+            }
+            cap_trims
+                .entry(caps[0].id())
+                .or_insert_with(|| (caps[0].clone(), Vec::new()))
+                .1
+                .push((
+                    point,
+                    nearest_endpoint(&blend.contact_a, point),
+                    nearest_endpoint(&blend.contact_b, point),
+                    section.clone(),
+                ));
+        }
+    }
+    let mut faces = Vec::new();
+    let mut skipped = std::collections::HashSet::new();
+    for (id, (mut cap, trims)) in cap_trims {
+        for (corner, ca, cb, section) in trims {
+            cap = trim_face_at_corner(&cap, corner, ca, cb, &section)
+                .map_err(|_| crate::chamfer::ChamferError::UnsupportedTrimTopology)?;
+        }
+        faces.push(cap);
+        skipped.insert(id);
+    }
+    for face in solid.shell().faces() {
+        if skipped.contains(&face.id()) || trimmed.contains_key(&face.id()) {
+            continue;
+        }
+        faces.push(face);
+    }
+    faces.extend(trimmed.into_values());
+    faces.extend(band_faces);
+    let result = Solid::new(sew(&faces, distance * 0.1));
+    if result.is_watertight() && result.health_report().is_healthy() {
+        Ok(result)
+    } else {
+        Err(crate::chamfer::ChamferError::InvalidTopology)
+    }
+}
+
+fn trim_face_along_multiple_spines(
+    face: &Face,
+    replacements: &[(Edge, Edge)],
+) -> Result<Face, RollingBallError> {
+    let trim_wire = |wire: Wire| -> Result<Wire, RollingBallError> {
+        let edges = wire.edges();
+        let n = edges.len();
+        let mapped: Vec<Option<Edge>> = edges
+            .iter()
+            .map(|edge| {
+                replacements.iter().find_map(|(spine, contact)| {
+                    same_undirected_edge(edge, spine).then(|| {
+                        let start =
+                            contact_point_for_spine_vertex(spine, contact, edge.source().point());
+                        let end =
+                            contact_point_for_spine_vertex(spine, contact, edge.target().point());
+                        orient_edge_between(contact, start, end)
+                    })
+                })
+            })
+            .collect();
+        if !mapped.iter().any(Option::is_some) {
+            return Ok(wire);
+        }
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(contact) = &mapped[i] {
+                result.push(contact.clone());
+                continue;
+            }
+            let source = mapped[(i + n - 1) % n]
+                .as_ref()
+                .map_or(edges[i].source().point(), |edge| edge.target().point());
+            let target = mapped[(i + 1) % n]
+                .as_ref()
+                .map_or(edges[i].target().point(), |edge| edge.source().point());
+            let replacement = if matches!(edges[i].curve(), Some(GeomCurve::Line(_)) | None) {
+                Edge::between_points(source, target)
+            } else {
+                let shortened =
+                    shorten_edge_keep_curve(&edges[i], edges[i].source().point(), target);
+                shorten_edge_keep_curve(&shortened, target, source)
+            };
+            result.push(orient_edge_between(&replacement, source, target));
+        }
+        Ok(Wire::from_edges(result))
+    };
+
+    let outer = face.outer_wire().map(trim_wire).transpose()?;
+    let inners = face
+        .inner_wires()
+        .into_iter()
+        .map(trim_wire)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Face::with_wires(
+        face.surface().cloned(),
+        outer,
+        inners,
+        face.orientation(),
+    ))
+}
+
+fn trim_cylinder_wall_to_contact(face: &Face, contact: &Edge) -> Result<Face, RollingBallError> {
+    let bottom = face
+        .wires()
+        .into_iter()
+        .flat_map(|wire| wire.edges())
+        .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+        .max_by(|a, b| {
+            let distance = |edge: &Edge| {
+                let p = edge
+                    .curve()
+                    .unwrap()
+                    .point(0.5 * (edge.first() + edge.last()));
+                p.distance(&contact.source().point()) + p.distance(&contact.target().point())
+            };
+            distance(a)
+                .partial_cmp(&distance(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+    let c0 = contact.source().point();
+    let c1 = contact.target().point();
+    let (b0, b1) = if bottom.source().point().distance(&c0) + bottom.target().point().distance(&c1)
+        <= bottom.source().point().distance(&c1) + bottom.target().point().distance(&c0)
+    {
+        (bottom.source().point(), bottom.target().point())
+    } else {
+        (bottom.target().point(), bottom.source().point())
+    };
+    let wire = Wire::from_edges([
+        orient_edge_between(contact, c0, c1),
+        Edge::between_points(c1, b1),
+        orient_edge_between(&bottom, b1, b0),
+        Edge::between_points(b0, c0),
+    ]);
+    Ok(Face::with_wires(
+        face.surface().cloned(),
+        Some(wire),
+        Vec::new(),
+        face.orientation(),
+    ))
+}
+
 /// Fillet a logical circular edge that is represented in the B-Rep as several
 /// co-circular edge fragments.
 ///
@@ -2760,7 +4454,7 @@ pub fn fillet_circular_edge_chain(
 
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
     let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
-    let cut_guards = cut_cylinder_guards(solid, &start_caps, &end_caps);
+    let cut_guards = cut_cylinder_guards(solid, &blend, start, &start_caps, end, &end_caps);
 
     let mut faces = Vec::new();
     let mut skipped_faces = std::collections::HashSet::new();
@@ -2867,8 +4561,8 @@ fn spine_wraps_full_circle(spine: &Edge, chain_edges: &[Edge]) -> bool {
     {
         return false;
     }
-    let closed_endpoints = spine.source().point().distance(&spine.target().point())
-        <= 100.0 * tolerance::CONFUSION;
+    let closed_endpoints =
+        spine.source().point().distance(&spine.target().point()) <= 100.0 * tolerance::CONFUSION;
     // A single full-circle edge (source == target) also wraps.
     let full_span = (spine.last() - spine.first()).abs() >= core::f64::consts::TAU - 1e-4;
     closed_endpoints || full_span
@@ -3061,20 +4755,13 @@ fn fillet_closed_circular_rim(
         let cyl_arc = closed_rim_arc(&geom.c_cyl, u0, u1);
         let tube0 = geom.contact_center + radial(geom.cax, geom.cxr, u0) * geom.major_radius;
         let tube1 = geom.contact_center + radial(geom.cax, geom.cxr, u1) * geom.major_radius;
-        let seam0 = crate::blend::quarter_arc(
-            tube0,
-            radius,
-            geom.c_plane.point(u0),
-            geom.c_cyl.point(u0),
-        );
-        let seam1 = crate::blend::quarter_arc(
-            tube1,
-            radius,
-            geom.c_plane.point(u1),
-            geom.c_cyl.point(u1),
-        );
+        let seam0 =
+            crate::blend::quarter_arc(tube0, radius, geom.c_plane.point(u0), geom.c_cyl.point(u0));
+        let seam1 =
+            crate::blend::quarter_arc(tube1, radius, geom.c_plane.point(u1), geom.c_cyl.point(u1));
         let wire = Wire::from_edges([plane_arc, seam1, cyl_arc.reversed(), seam0.reversed()]);
-        faces.push(Face::new(Some(torus_surf.clone()), wire));
+        let mid = band_mid_point(&geom, 0.5 * (u0 + u1), radius, false);
+        faces.push(band_face(&torus_surf, wire, mid));
     }
 
     assemble_closed_rim(solid, chain_edges, spine, &geom, radius, faces)
@@ -3094,7 +4781,12 @@ fn chamfer_closed_circular_rim(
     if chain_edges.len() < 2 {
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
-    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist)?;
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist).map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed at rim recovery: {error:?}");
+        }
+        error
+    })?;
 
     // The cone passes through both contact rings: reference radius `spine_r` at the
     // wall contact, growing/shrinking to `major_radius` at the cap over axial
@@ -3122,10 +4814,49 @@ fn chamfer_closed_circular_rim(
         let seam0 = Edge::between_points(geom.c_plane.point(u0), geom.c_cyl.point(u0));
         let seam1 = Edge::between_points(geom.c_plane.point(u1), geom.c_cyl.point(u1));
         let wire = Wire::from_edges([plane_arc, seam1, cyl_arc.reversed(), seam0.reversed()]);
-        faces.push(Face::new(Some(cone_surf.clone()), wire));
+        let mid = band_mid_point(&geom, 0.5 * (u0 + u1), dist, true);
+        faces.push(band_face(&cone_surf, wire, mid));
     }
 
     assemble_closed_rim(solid, chain_edges, spine, &geom, dist, faces)
+}
+
+/// Build one blend-band face upholding the curved-face winding invariant (see
+/// `revolve::loop_agrees_with_surface`): a curved face handed to `sew` must
+/// wind CCW in its surface's own uv, else the wire is reversed here. Without
+/// this, sew's BFS keeps the shell winding-consistent but the band's effective
+/// normal points INTO the solid — the tessellated band renders/classifies
+/// inside-out and the divergence-theorem volume gate rejects the whole blend.
+/// `center` must be a point ON `surface` in the middle of the patch.
+fn band_face(surface: &GeomSurface, wire: Wire, center: Pnt) -> Face {
+    let wire = if crate::revolve::loop_agrees_with_surface(&wire, surface, center) {
+        wire
+    } else {
+        crate::revolve::reversed_wire(&wire)
+    };
+    Face::new(Some(surface.clone()), wire)
+}
+
+/// A mid-patch point ON the closed-rim blend band between the cap-contact and
+/// wall-contact rings at spine param `um`: the chamfer band is a ruled cone
+/// (chord midpoint lies on it); the fillet band is a torus (point at the
+/// 45° position of the tube arc).
+fn band_mid_point(geom: &ClosedRimGeom, um: f64, dist: f64, chamfer: bool) -> Pnt {
+    let p_pl = geom.c_plane.point(um);
+    let p_cy = geom.c_cyl.point(um);
+    if chamfer {
+        return Pnt::new(
+            0.5 * (p_pl.x() + p_cy.x()),
+            0.5 * (p_pl.y() + p_cy.y()),
+            0.5 * (p_pl.z() + p_cy.z()),
+        );
+    }
+    let tube = geom.contact_center + radial(geom.cax, geom.cxr, um) * geom.major_radius;
+    let bisector = (p_pl - tube) + (p_cy - tube);
+    match bisector.normalized() {
+        Some(d) => tube + GeomVec::from_dir(d) * dist,
+        None => p_pl,
+    }
 }
 
 /// An arc edge of `circle` between spine params `u0`..`u1` (source → target).
@@ -3225,8 +4956,8 @@ fn directional_root(g: impl Fn(f64) -> f64, start: f64, dir: f64, ahead: f64) ->
         }
         None
     };
-    let bracket = scan(start, start + dir * ahead, 240)
-        .or_else(|| scan(start, start - dir * 0.05, 40))?;
+    let bracket =
+        scan(start, start + dir * ahead, 240).or_else(|| scan(start, start - dir * 0.05, 40))?;
     let (mut a, mut b) = bracket;
     if a == b {
         return Some(a);
@@ -3348,7 +5079,12 @@ fn blend_open_circular_chain(
     if chain_edges.is_empty() {
         return Err(RollingBallError::SpineNotOnFace);
     }
-    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist)?;
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist).map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed at rim recovery: {error:?}");
+        }
+        error
+    })?;
 
     let (t_lo, t_hi) = (
         spine.first().min(spine.last()),
@@ -3406,8 +5142,18 @@ fn blend_open_circular_chain(
             _ => Err(RollingBallError::UnsupportedTrimTopology),
         }
     };
-    let (cap_lo, miter_lo) = cap_at(corner_lo)?;
-    let (cap_hi, miter_hi) = cap_at(corner_hi)?;
+    let (cap_lo, miter_lo) = cap_at(corner_lo).map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed at low cap lookup: {error:?}");
+        }
+        error
+    })?;
+    let (cap_hi, miter_hi) = cap_at(corner_hi).map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed at high cap lookup: {error:?}");
+        }
+        error
+    })?;
 
     // Ring frame (shared by both contact rings) and the cap-ring axial offset.
     let xv = GeomVec::from_dir(geom.c_plane.position().x_direction());
@@ -3450,6 +5196,11 @@ fn blend_open_circular_chain(
             let c = (geom.contact_center + caxv * h - p0).dot(&n);
             let hyp = a.hypot(b);
             if hyp <= tolerance::CONFUSION || (c / hyp).abs() > 1.0 + 1.0e-9 {
+                if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+                    eprintln!(
+                        "open circular solve_u rejected rho={rho:.6} h={h:.6} near={seed:.6} a={a:.6} b={b:.6} c={c:.6} hyp={hyp:.6}"
+                    );
+                }
                 return None;
             }
             let phi = b.atan2(a);
@@ -3471,9 +5222,19 @@ fn blend_open_circular_chain(
             .ok_or(RollingBallError::UnsupportedTrimTopology)?;
         let ub =
             solve_u(geom.spine_r, 0.0, near).ok_or(RollingBallError::UnsupportedTrimTopology)?;
-        // Both crossings must sit inside the chain's own span: the blend runs
-        // OUT of the solid at this free end, never past the far one.
-        if ua < t_lo - 1.0e-6 || ua > t_hi + 1.0e-6 || ub < t_lo - 1.0e-6 || ub > t_hi + 1.0e-6 {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!(
+                "open circular end params near={near:.6} ua={ua:.6} ub={ub:.6} span=[{t_lo:.6},{t_hi:.6}] concave={}",
+                geom.concave
+            );
+        }
+        // A convex outer rim retracts both contacts into the selected span. A
+        // concave pocket rim is the opposite: its plane-contact radius grows,
+        // so that contact must extend a short way PAST the original arc endpoint
+        // to meet the tangent straight wall, while the wall contact stays on the
+        // original span. Reject only a wrong/complementary branch.
+        let wall_in_span = ub >= t_lo - 1.0e-6 && ub <= t_hi + 1.0e-6;
+        if !wall_in_span || (ua - near).abs() > FRAC_PI_2 {
             return Err(RollingBallError::UnsupportedTrimTopology);
         }
 
@@ -3537,7 +5298,9 @@ fn blend_open_circular_chain(
         let ring_pt = |rho: f64, h: f64, u: f64| {
             geom.contact_center + caxv * h + (xv * u.cos() + yv * u.sin()) * rho
         };
-        let g = |rho: f64, h: f64, u: f64| point_line_distance(ring_pt(rho, h, u), axis_pt, axis_dir) - r;
+        let g = |rho: f64, h: f64, u: f64| {
+            point_line_distance(ring_pt(rho, h, u), axis_pt, axis_dir) - r
+        };
 
         let steps = ((dist * 2.0 / 0.05).ceil() as usize).clamp(24, 160);
         let h_plane = s_plane * dist;
@@ -3581,13 +5344,25 @@ fn blend_open_circular_chain(
     };
 
     let end_lo = match &miter_lo {
-        Some(cyl) => resolve_end_miter(&cap_lo, cyl, corner_lo, t_lo, -1.0)?,
-        None => resolve_end(&cap_lo, corner_lo, t_lo)?,
-    };
+        Some(cyl) => resolve_end_miter(&cap_lo, cyl, corner_lo, t_lo, -1.0),
+        None => resolve_end(&cap_lo, corner_lo, t_lo),
+    }
+    .map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed resolving low end: {error:?}");
+        }
+        error
+    })?;
     let end_hi = match &miter_hi {
-        Some(cyl) => resolve_end_miter(&cap_hi, cyl, corner_hi, t_hi, 1.0)?,
-        None => resolve_end(&cap_hi, corner_hi, t_hi)?,
-    };
+        Some(cyl) => resolve_end_miter(&cap_hi, cyl, corner_hi, t_hi, 1.0),
+        None => resolve_end(&cap_hi, corner_hi, t_hi),
+    }
+    .map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed resolving high end: {error:?}");
+        }
+        error
+    })?;
     if end_lo.ua >= end_hi.ua - 1.0e-6 || end_lo.ub >= end_hi.ub - 1.0e-6 {
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
@@ -3602,9 +5377,10 @@ fn blend_open_circular_chain(
         .collect::<Result<_, RollingBallError>>()?;
     spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let junctions: Vec<f64> = spans.iter().skip(1).map(|s| s.0).collect();
-    if junctions.iter().any(|&j| {
-        j <= end_lo.ua.max(end_lo.ub) + 1.0e-6 || j >= end_hi.ua.min(end_hi.ub) - 1.0e-6
-    }) {
+    if junctions
+        .iter()
+        .any(|&j| j <= end_lo.ua.max(end_lo.ub) + 1.0e-6 || j >= end_hi.ua.min(end_hi.ub) - 1.0e-6)
+    {
         // An end trim swallowing a whole fragment is out of scope.
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
@@ -3642,29 +5418,29 @@ fn blend_open_circular_chain(
     let mut faces: Vec<Face> = Vec::with_capacity(n_frag + solid.shell().faces().len());
     for k in 0..n_frag {
         let pa0 = if k == 0 { end_lo.ua } else { junctions[k - 1] };
-        let pa1 = if k == n_frag - 1 { end_hi.ua } else { junctions[k] };
+        let pa1 = if k == n_frag - 1 {
+            end_hi.ua
+        } else {
+            junctions[k]
+        };
         let pb0 = if k == 0 { end_lo.ub } else { junctions[k - 1] };
-        let pb1 = if k == n_frag - 1 { end_hi.ub } else { junctions[k] };
+        let pb1 = if k == n_frag - 1 {
+            end_hi.ub
+        } else {
+            junctions[k]
+        };
         if pa1 - pa0 <= 1.0e-9 || pb1 - pb0 <= 1.0e-9 {
             return Err(RollingBallError::UnsupportedTrimTopology);
         }
         let plane_arc = closed_rim_arc(&geom.c_plane, pa0, pa1);
         let cyl_arc = closed_rim_arc(&geom.c_cyl, pb0, pb1);
         let start_edge = if k == 0 {
-            orient_edge_between(
-                &end_lo.trim,
-                geom.c_plane.point(pa0),
-                geom.c_cyl.point(pb0),
-            )
+            orient_edge_between(&end_lo.trim, geom.c_plane.point(pa0), geom.c_cyl.point(pb0))
         } else {
             seams[k - 1].clone()
         };
         let end_edge = if k == n_frag - 1 {
-            orient_edge_between(
-                &end_hi.trim,
-                geom.c_plane.point(pa1),
-                geom.c_cyl.point(pb1),
-            )
+            orient_edge_between(&end_hi.trim, geom.c_plane.point(pa1), geom.c_cyl.point(pb1))
         } else {
             seams[k].clone()
         };
@@ -3674,7 +5450,8 @@ fn blend_open_circular_chain(
             cyl_arc.reversed(),
             start_edge.reversed(),
         ]);
-        faces.push(Face::new(Some(band_surf.clone()), wire));
+        let mid = band_mid_point(&geom, 0.5 * (pa0.max(pb0) + pa1.min(pb1)), dist, chamfer);
+        faces.push(band_face(&band_surf, wire, mid));
     }
 
     // Supports trimmed to the contact rings, clamped to the flush end params.
@@ -3698,16 +5475,30 @@ fn blend_open_circular_chain(
         spine,
         &c_plane_edge,
         (end_lo.ua, end_hi.ua),
-    )?;
+    )
+    .map_err(|error| {
+        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+            eprintln!("open circular blend failed trimming cap support: {error:?}");
+        }
+        error
+    })?;
     let mut trimmed_walls = Vec::new();
     for cyl in &geom.cyl_faces {
-        trimmed_walls.push(trim_face_along_spine_segments_clamped(
-            cyl,
-            chain_edges,
-            spine,
-            &c_cyl_edge,
-            (end_lo.ub, end_hi.ub),
-        )?);
+        trimmed_walls.push(
+            trim_face_along_spine_segments_clamped(
+                cyl,
+                chain_edges,
+                spine,
+                &c_cyl_edge,
+                (end_lo.ub, end_hi.ub),
+            )
+            .map_err(|error| {
+                if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+                    eprintln!("open circular blend failed trimming wall support: {error:?}");
+                }
+                error
+            })?,
+        );
     }
 
     // End caps re-trimmed to the flush sections (both ends can land on the
@@ -3734,8 +5525,18 @@ fn blend_open_circular_chain(
     };
     let mut trimmed_caps: Vec<Face> = Vec::new();
     if same_face(&end_lo.cap, &end_hi.cap) {
-        let once = trim_cap(&end_lo.cap, &end_lo)?;
-        trimmed_caps.push(trim_cap(&once, &end_hi)?);
+        let once = trim_cap(&end_lo.cap, &end_lo).map_err(|error| {
+            if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+                eprintln!("open circular low cap trim failed: {error:?}");
+            }
+            error
+        })?;
+        trimmed_caps.push(trim_cap(&once, &end_hi).map_err(|error| {
+            if std::env::var("ORC_DEBUG_FILLET").is_ok() {
+                eprintln!("open circular high cap trim failed: {error:?}");
+            }
+            error
+        })?);
     } else {
         trimmed_caps.push(trim_cap(&end_lo.cap, &end_lo)?);
         trimmed_caps.push(trim_cap(&end_hi.cap, &end_hi)?);
@@ -4903,6 +6704,52 @@ pub(crate) fn trim_face_along_spine(
     spine: &Edge,
     contact: &Edge,
 ) -> Result<Face, RollingBallError> {
+    // Most selected edges live on a face's outer boundary. Pocket-rim edges are
+    // different: the top face owns that same edge in an INNER wire. Run the
+    // established wire surgery against the outer loop first, then against each
+    // hole loop through a temporary single-wire face. Reassemble the original
+    // face with only the matching loop replaced, preserving every other hole.
+    match trim_face_along_outer_wire(face, spine, contact, true) {
+        Ok(trimmed) => return Ok(trimmed),
+        Err(RollingBallError::SpineNotOnFace) => {}
+        Err(error) => return Err(error),
+    }
+
+    let inners = face.inner_wires();
+    for (index, inner) in inners.iter().enumerate() {
+        let loop_face = Face::with_wires(
+            face.surface().cloned(),
+            Some(inner.clone()),
+            Vec::new(),
+            face.orientation(),
+        );
+        match trim_face_along_outer_wire(&loop_face, spine, contact, false) {
+            Ok(trimmed_loop_face) => {
+                let trimmed_loop = trimmed_loop_face
+                    .outer_wire()
+                    .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+                let mut new_inners = inners.clone();
+                new_inners[index] = trimmed_loop;
+                return Ok(Face::with_wires(
+                    face.surface().cloned(),
+                    face.outer_wire(),
+                    new_inners,
+                    face.orientation(),
+                ));
+            }
+            Err(RollingBallError::SpineNotOnFace) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(RollingBallError::SpineNotOnFace)
+}
+
+fn trim_face_along_outer_wire(
+    face: &Face,
+    spine: &Edge,
+    contact: &Edge,
+    clamp_overflow: bool,
+) -> Result<Face, RollingBallError> {
     ensure_trimmable_face(face)?;
     let edges = face
         .outer_wire()
@@ -4946,18 +6793,22 @@ pub(crate) fn trim_face_along_spine(
     // to the arc's far end, collapsing the trim.
     let is_straight = |e: &Edge| matches!(e.curve(), Some(GeomCurve::Line(_)) | None);
 
-    if is_straight(prev) {
+    if clamp_overflow && is_straight(prev) {
         let len_prev = prev.source().point().distance(&prev.target().point());
         let dist_start_to_prev_start = contact_start.distance(&prev.source().point());
-        if dist_start_to_prev_start > len_prev * 0.99 {
+        if contact_start.distance(&prev.target().point()) > 10.0 * tolerance::CONFUSION
+            && dist_start_to_prev_start > len_prev * 0.99
+        {
             contact_start_clamped = prev.source().point();
         }
     }
 
-    if is_straight(next) {
+    if clamp_overflow && is_straight(next) {
         let len_next = next.source().point().distance(&next.target().point());
         let dist_end_to_next_end = contact_end.distance(&next.target().point());
-        if dist_end_to_next_end > len_next * 0.99 {
+        if contact_end.distance(&next.source().point()) > 10.0 * tolerance::CONFUSION
+            && dist_end_to_next_end > len_next * 0.99
+        {
             contact_end_clamped = next.target().point();
         }
     }
@@ -5109,6 +6960,54 @@ fn trim_face_along_spine_segments(
 /// ON their curves, e.g. a box's front-top edge), instead of being dragged off
 /// their lines to the un-clamped ring ends.
 fn trim_face_along_spine_segments_clamped(
+    face: &Face,
+    spine_edges: &[Edge],
+    spine: &Edge,
+    contact: &Edge,
+    clamp: (f64, f64),
+) -> Result<Face, RollingBallError> {
+    match trim_outer_wire_along_spine_segments_clamped(face, spine_edges, spine, contact, clamp) {
+        Ok(trimmed) => return Ok(trimmed),
+        Err(RollingBallError::SpineNotOnFace) => {}
+        Err(error) => return Err(error),
+    }
+
+    let inners = face.inner_wires();
+    for (index, inner) in inners.iter().enumerate() {
+        let loop_face = Face::with_wires(
+            face.surface().cloned(),
+            Some(inner.clone()),
+            Vec::new(),
+            face.orientation(),
+        );
+        match trim_outer_wire_along_spine_segments_clamped(
+            &loop_face,
+            spine_edges,
+            spine,
+            contact,
+            clamp,
+        ) {
+            Ok(trimmed_loop_face) => {
+                let trimmed_loop = trimmed_loop_face
+                    .outer_wire()
+                    .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+                let mut new_inners = inners.clone();
+                new_inners[index] = trimmed_loop;
+                return Ok(Face::with_wires(
+                    face.surface().cloned(),
+                    face.outer_wire(),
+                    new_inners,
+                    face.orientation(),
+                ));
+            }
+            Err(RollingBallError::SpineNotOnFace) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(RollingBallError::SpineNotOnFace)
+}
+
+fn trim_outer_wire_along_spine_segments_clamped(
     face: &Face,
     spine_edges: &[Edge],
     spine: &Edge,
@@ -5668,15 +7567,13 @@ mod tests {
         let tool = make_box(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 6.0);
         let body = crate::boolean::boolean(&block, &tool, crate::BooleanOp::Cut);
 
-        let pocket_edge =
-            Edge::between_points(Pnt::new(5.0, 5.0, 4.0), Pnt::new(5.0, 5.0, 10.0));
+        let pocket_edge = Edge::between_points(Pnt::new(5.0, 5.0, 4.0), Pnt::new(5.0, 5.0, 10.0));
         assert_eq!(
             edge_material_wedge_is_concave(&body, &pocket_edge),
             Some(true)
         );
 
-        let outer_edge =
-            Edge::between_points(Pnt::new(0.0, 0.0, 0.0), Pnt::new(0.0, 0.0, 10.0));
+        let outer_edge = Edge::between_points(Pnt::new(0.0, 0.0, 0.0), Pnt::new(0.0, 0.0, 10.0));
         assert_eq!(
             edge_material_wedge_is_concave(&body, &outer_edge),
             Some(false)

@@ -3,20 +3,12 @@ use crate::*;
 /// One undo/redo entry: the parametric history plus the visibility set. The
 /// visibility set has to travel with the graph — an extrude auto-hides its
 /// sketch, so undoing the extrude must also reveal the sketch again.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct UndoSnapshot {
-    graph: zerocad_core::ParametricGraph,
-    #[serde(default)]
-    hidden_nodes: HashSet<String>,
-}
-
 impl ZeroCadApp {
-    fn snapshot_string(&self) -> Option<String> {
-        let snap = UndoSnapshot {
-            graph: self.graph.clone(),
+    fn snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
+            graph: self.graph.clone_document(),
             hidden_nodes: self.hidden_nodes.clone(),
-        };
-        serde_json::to_string(&snap).ok()
+        }
     }
 
     /// Restore a snapshot: swap in the graph (rebuilding its skipped id→index
@@ -32,6 +24,9 @@ impl ZeroCadApp {
         self.selected_body.clear();
         self.extrude_op = None;
         self.edge_mod_op = None;
+        self.move_op = None;
+        self.combine_op = None;
+        self.move_preview_bodies = None;
         self.pending_visual = None;
         self.reevaluate_geometry();
     }
@@ -41,25 +36,20 @@ impl ZeroCadApp {
     /// Snapshot the current `ParametricGraph` onto the undo stack (capped at 50)
     /// and clear the redo stack. Call before any destructive graph mutation.
     pub(crate) fn push_undo(&mut self) {
-        if let Some(snap) = self.snapshot_string() {
-            if self.undo_stack.len() >= 50 {
-                self.undo_stack.remove(0);
-            }
-            self.undo_stack.push(snap);
-            self.redo_stack.clear();
+        let snap = self.snapshot();
+        if self.undo_stack.len() >= 50 {
+            self.undo_stack.remove(0);
         }
+        self.undo_stack.push(snap);
+        self.redo_stack.clear();
     }
 
     /// Restore the previous graph snapshot (Ctrl+Z).
     pub(crate) fn undo(&mut self) {
         if let Some(snap) = self.undo_stack.pop() {
-            if let Some(current) = self.snapshot_string() {
-                self.redo_stack.push(current);
-            }
-            if let Ok(snap) = serde_json::from_str::<UndoSnapshot>(&snap) {
-                self.restore_snapshot(snap);
-                self.status_msg = "Undo.".to_string();
-            }
+            self.redo_stack.push(self.snapshot());
+            self.restore_snapshot(snap);
+            self.status_msg = "Undo.".to_string();
         } else {
             self.status_msg = "Nothing to undo.".to_string();
         }
@@ -68,16 +58,12 @@ impl ZeroCadApp {
     /// Reapply the previously undone change (Ctrl+Y / Ctrl+Shift+Z).
     pub(crate) fn redo(&mut self) {
         if let Some(snap) = self.redo_stack.pop() {
-            if let Some(current) = self.snapshot_string() {
-                if self.undo_stack.len() >= 50 {
-                    self.undo_stack.remove(0);
-                }
-                self.undo_stack.push(current);
+            if self.undo_stack.len() >= 50 {
+                self.undo_stack.remove(0);
             }
-            if let Ok(snap) = serde_json::from_str::<UndoSnapshot>(&snap) {
-                self.restore_snapshot(snap);
-                self.status_msg = "Redo.".to_string();
-            }
+            self.undo_stack.push(self.snapshot());
+            self.restore_snapshot(snap);
+            self.status_msg = "Redo.".to_string();
         } else {
             self.status_msg = "Nothing to redo.".to_string();
         }
@@ -96,6 +82,10 @@ impl ZeroCadApp {
         self.selected_faces.clear();
         self.selected_edges.clear();
         self.selected_body.clear();
+        self.body_clipboard = None;
+        self.move_op = None;
+        self.combine_op = None;
+        self.move_preview_bodies = None;
         self.status_msg = "New blank design created.".to_string();
     }
 
@@ -138,64 +128,74 @@ impl ZeroCadApp {
             None => return,
         };
 
-        // If an arc-fillet refine is still in flight, finish it synchronously so
-        // the embedded thumbnail and mesh cache persist the final geometry, not
-        // the faceted draft.
-        if self.eval_pending {
-            self.reevaluate_geometry_blocking();
-        }
-
         let ext = state.save_format.extension();
         let file_name = format!("{}.{ext}", state.project_title);
         let path = state.save_dir.join(&file_name);
-        let embed_mesh = state.save_format == SaveFormat::ZcadFull;
-
-        // A PNG preview rendered from the current bodies, embedded so the file
-        // carries its own thumbnail (portable across machines).
-        let thumbnail_png = if self.body_meshes.is_empty() {
-            None
+        self.pending_save = Some(PendingSave {
+            path,
+            embed_hydrated: state.save_format == SaveFormat::ZcadFull,
+            started: std::time::Instant::now(),
+            dispatched: false,
+        });
+        self.status_msg = if self.eval_pending {
+            "Save queued — waiting for the current model update…".to_string()
         } else {
-            let (w, h, rgba) = thumbnail::render_thumbnail(&self.body_meshes, 256);
-            thumbnail::encode_png(w, h, &rgba)
+            "Saving design…".to_string()
         };
+        self.poll_document_worker();
+    }
 
-        // For the mesh cache, exclude hidden bodies so they stay hidden on open.
-        let visible_bodies: Vec<(String, MockMesh)> = self
-            .body_meshes
-            .iter()
-            .filter(|(id, _)| !self.hidden_nodes.contains(id))
-            .cloned()
-            .collect();
-
-        let doc = zerocad_core::ZcadDocument {
-            graph: &self.graph,
-            thumbnail_png,
-            mesh_cache: if embed_mesh {
-                Some(&visible_bodies)
-            } else {
-                None
-            },
-            units: self.current_unit,
-            bbox: Self::bodies_bbox(&self.body_meshes),
-            created_unix: self.doc_created_unix,
-            hidden_nodes: self.hidden_nodes.clone(),
-        };
-
-        let bytes = match zerocad_core::write_zcad(&doc) {
-            Ok(b) => b,
-            Err(e) => {
-                self.status_msg = format!("Save failed: {e}");
-                return;
+    pub(crate) fn poll_document_worker(&mut self) {
+        let should_dispatch = self
+            .pending_save
+            .as_ref()
+            .is_some_and(|save| !save.dispatched && !self.eval_pending);
+        if should_dispatch {
+            let save = self.pending_save.as_mut().expect("pending save vanished");
+            self.document_worker.submit(document_worker::SaveRequest {
+                path: save.path.clone(),
+                graph: self.graph.clone_document(),
+                bodies: self.body_meshes.clone(),
+                embed_hydrated: save.embed_hydrated,
+                units: self.current_unit,
+                created_unix: self.doc_created_unix,
+                hidden_nodes: self.hidden_nodes.clone(),
+                cache: self.graph.evaluation_cache_snapshot(),
+                hydrated_cache_limit: if self.hydrated_cache_mb == 0 {
+                    usize::MAX
+                } else {
+                    self.hydrated_cache_mb as usize * 1024 * 1024
+                },
+            });
+            save.dispatched = true;
+            self.status_msg = "Saving design…".to_string();
+        }
+        if let Some(done) = self.document_worker.try_recv() {
+            self.pending_save = None;
+            match done.result {
+                Ok(()) => {
+                    let how = if done.embed_hydrated {
+                        ""
+                    } else {
+                        " (lightweight)"
+                    };
+                    self.status_msg = format!("Design saved to {}{how}", done.path.display());
+                    self.recent_files.record(&done.path);
+                    self.defer_onboarding_texture_eviction(&done.path);
+                }
+                Err(error) => self.status_msg = format!("Save failed: {error}"),
             }
+        }
+        let completions = {
+            let mut queue = self
+                .export_completions
+                .lock()
+                .expect("export queue poisoned");
+            std::mem::take(&mut *queue)
         };
-        match std::fs::write(&path, bytes) {
-            Ok(()) => {
-                log::info!("Design saved to {:?}", path);
-                let how = if embed_mesh { "" } else { " (lightweight)" };
-                self.status_msg = format!("Design saved to {}{how}", path.display());
-                self.remember_project(&path);
-            }
-            Err(e) => self.status_msg = format!("Save failed: {e}"),
+        if let Some(done) = completions.into_iter().last() {
+            self.status_msg = done.message.clone();
+            self.error_msg = done.error.then_some(done.message);
         }
     }
 
@@ -332,28 +332,6 @@ impl ZeroCadApp {
         }
     }
 
-    /// Axis-aligned bounding box `[min_x, min_y, min_z, max_x, max_y, max_z]` of
-    /// every body's vertices (interleaved `[x,y,z,nx,ny,nz]`), or all-zero when
-    /// there is no geometry.
-    pub(crate) fn bodies_bbox(bodies: &[(String, MockMesh)]) -> [f32; 6] {
-        let mut lo = [f32::MAX; 3];
-        let mut hi = [f32::MIN; 3];
-        let mut any = false;
-        for (_, m) in bodies {
-            for v in m.vertices.chunks_exact(6) {
-                for k in 0..3 {
-                    lo[k] = lo[k].min(v[k]);
-                    hi[k] = hi[k].max(v[k]);
-                }
-                any = true;
-            }
-        }
-        if !any {
-            return [0.0; 6];
-        }
-        [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]
-    }
-
     /// Record `path` in the recent-projects list and (re)bake a thumbnail of the
     /// currently-evaluated bodies for the onboarding screen. Called after a
     /// successful save/open, when `body_meshes` reflects `path`'s model.
@@ -363,8 +341,23 @@ impl ZeroCadApp {
             let (w, h, rgba) = thumbnail::render_thumbnail(&self.body_meshes, 256);
             settings::save_thumb(path, w, h, &rgba);
         }
-        // Drop any stale cached texture so the next onboarding render reloads it.
-        self.onboarding_textures.remove(path);
+        // Reload this thumbnail on a later frame. It may already have been
+        // painted this frame when the project was opened from its Recent card.
+        self.defer_onboarding_texture_eviction(path);
+    }
+
+    /// Mark a stale onboarding thumbnail for release at the start of the next
+    /// frame. Dropping the last handle in the frame that painted it can make
+    /// egui-wgpu destroy the texture before wgpu submits that frame.
+    fn defer_onboarding_texture_eviction(&mut self, path: &Path) {
+        self.pending_onboarding_texture_evictions
+            .insert(path.to_path_buf());
+    }
+
+    pub(crate) fn flush_onboarding_texture_evictions(&mut self) {
+        for path in self.pending_onboarding_texture_evictions.drain() {
+            self.onboarding_textures.remove(&path);
+        }
     }
 
     /// Fetch (uploading once, then caching) the egui texture for a project's
@@ -693,6 +686,10 @@ impl ZeroCadApp {
 
         self.push_undo();
         self.graph = loaded.graph;
+        // Feature ids share one monotonic numeric suffix, which is also the
+        // evaluator's creation-order key. Continue after the loaded document's
+        // largest suffix so a new Pattern cannot sort before its source body.
+        self.reseed_id_counter_from_graph();
         // Preserve the original creation time for legacy/unknown files we stamp anew.
         self.doc_created_unix = (!loaded.was_legacy_json && loaded.metadata.created_unix != 0)
             .then_some(loaded.metadata.created_unix);
@@ -708,12 +705,21 @@ impl ZeroCadApp {
         self.hidden_nodes = loaded.hidden_nodes;
         self.extrude_op = None;
         self.edge_mod_op = None;
+        self.body_clipboard = None;
+        self.move_op = None;
+        self.combine_op = None;
+        self.move_preview_bodies = None;
 
         // Show the embedded geometry cache immediately (instant open). It's only
         // present when fresh (its hash matched the loaded graph), so it's safe to
         // display; `reevaluate_geometry` then swaps in freshly-computed bodies.
+        let had_mesh_cache = loaded.mesh_cache.is_some();
         if let Some(cache) = loaded.mesh_cache {
             self.set_body_meshes(cache);
+        }
+        let had_evaluation_cache = loaded.evaluation_cache.is_some();
+        if let Some(cache) = loaded.evaluation_cache {
+            self.graph.install_evaluation_cache(cache);
         }
         // Seed the onboarding thumbnail cache from the file's embedded preview so
         // a `.zcad` from another machine shows its real thumbnail even if it has
@@ -721,14 +727,16 @@ impl ZeroCadApp {
         if let Some(png) = &loaded.thumbnail_png {
             if let Some((w, h, rgba)) = thumbnail::decode_png(png) {
                 settings::save_thumb(&path, w, h, &rgba);
-                self.onboarding_textures.remove(path.as_path());
+                self.defer_onboarding_texture_eviction(&path);
             }
         }
 
         // Regenerate from the recipe (authoritative). On failure, the cached
         // bodies above remain on screen so the model is never lost.
         self.pending_visual = None;
-        self.reevaluate_geometry();
+        if !(had_mesh_cache && had_evaluation_cache) {
+            self.reevaluate_geometry();
+        }
         self.status_msg = format!("Design loaded from {}", path.display());
         self.remember_project(&path);
     }
@@ -743,7 +751,8 @@ impl ZeroCadApp {
         }
         // Export the final arc geometry, not a faceted draft mid-refine.
         if self.eval_pending {
-            self.reevaluate_geometry_blocking();
+            self.status_msg = "Export waits for the current model update to finish.".to_string();
+            return;
         }
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export STL")
@@ -752,15 +761,28 @@ impl ZeroCadApp {
         else {
             return;
         };
-        let bytes = zerocad_core::meshes_to_binary_stl(self.body_meshes.iter().map(|(_, m)| m));
-        let tris = bytes.len().saturating_sub(84) / 50;
-        match std::fs::write(&path, bytes) {
-            Ok(()) => {
-                log::info!("Exported STL to {:?} ({tris} triangles)", path);
-                self.status_msg = format!("Exported {tris} triangles to {}", path.display());
+        let bodies = self.body_meshes.clone();
+        let completions = self.export_completions.clone();
+        let repaint = self.egui_ctx.clone();
+        self.status_msg = "Exporting STL…".to_string();
+        std::thread::spawn(move || {
+            let bytes = zerocad_core::meshes_to_binary_stl(bodies.iter().map(|(_, m)| m));
+            let tris = bytes.len().saturating_sub(84) / 50;
+            let (message, error) = match std::fs::write(&path, bytes) {
+                Ok(()) => (
+                    format!("Exported {tris} triangles to {}", path.display()),
+                    false,
+                ),
+                Err(error) => (format!("STL export failed: {error}"), true),
+            };
+            completions
+                .lock()
+                .expect("export queue poisoned")
+                .push(ExportCompletion { message, error });
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
             }
-            Err(e) => self.status_msg = format!("STL export failed: {e}"),
-        }
+        });
     }
 
     /// Prompt for a path and write all current bodies as a 3MF package (one
@@ -772,7 +794,8 @@ impl ZeroCadApp {
             return;
         }
         if self.eval_pending {
-            self.reevaluate_geometry_blocking();
+            self.status_msg = "Export waits for the current model update to finish.".to_string();
+            return;
         }
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export 3MF")
@@ -798,22 +821,30 @@ impl ZeroCadApp {
                 (name, i)
             })
             .collect();
-        let bytes = zerocad_core::meshes_to_3mf(
-            names
-                .iter()
-                .map(|(name, i)| (name.as_str(), &self.body_meshes[*i].1)),
-        );
-        match std::fs::write(&path, bytes) {
-            Ok(()) => {
-                log::info!("Exported 3MF to {:?}", path);
-                self.status_msg = format!(
-                    "Exported {} bodies to {}",
-                    self.body_meshes.len(),
-                    path.display()
-                );
+        let bodies = self.body_meshes.clone();
+        let body_count = bodies.len();
+        let completions = self.export_completions.clone();
+        let repaint = self.egui_ctx.clone();
+        self.status_msg = "Exporting 3MF…".to_string();
+        std::thread::spawn(move || {
+            let bytes = zerocad_core::meshes_to_3mf(
+                names.iter().map(|(name, i)| (name.as_str(), &bodies[*i].1)),
+            );
+            let (message, error) = match std::fs::write(&path, bytes) {
+                Ok(()) => (
+                    format!("Exported {body_count} bodies to {}", path.display()),
+                    false,
+                ),
+                Err(error) => (format!("3MF export failed: {error}"), true),
+            };
+            completions
+                .lock()
+                .expect("export queue poisoned")
+                .push(ExportCompletion { message, error });
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
             }
-            Err(e) => self.status_msg = format!("3MF export failed: {e}"),
-        }
+        });
     }
 
     /// Prompt for a STEP file and add it to the design as an Import feature

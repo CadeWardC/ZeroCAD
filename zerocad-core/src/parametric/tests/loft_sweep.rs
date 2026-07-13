@@ -16,8 +16,18 @@ fn shifted_xy(z: f32) -> CoordinateSystem {
 #[test]
 fn loft_two_squares_is_a_frustum() {
     let mut g = ParametricGraph::new();
-    add_sketch_cs(&mut g, "sketch_1", shifted_xy(0.0), rect_sketch((0.0, 0.0), (4.0, 4.0)));
-    add_sketch_cs(&mut g, "sketch_2", shifted_xy(10.0), rect_sketch((1.0, 1.0), (3.0, 3.0)));
+    add_sketch_cs(
+        &mut g,
+        "sketch_1",
+        shifted_xy(0.0),
+        rect_sketch((0.0, 0.0), (4.0, 4.0)),
+    );
+    add_sketch_cs(
+        &mut g,
+        "sketch_2",
+        shifted_xy(10.0),
+        rect_sketch((1.0, 1.0), (3.0, 3.0)),
+    );
     g.add_feature(FeatureNode {
         id: "loft_3".to_string(),
         name: "Loft".to_string(),
@@ -37,13 +47,21 @@ fn loft_two_squares_is_a_frustum() {
     // Frustum 4×4 → 2×2 over height 10: h/3·(A0 + A1 + √(A0·A1)).
     let exact = 10.0 / 3.0 * (16.0 + 4.0 + 8.0);
     let v = volume(&bodies[0].1);
-    assert!((v - exact).abs() / exact < 0.02, "loft volume {v} vs {exact}");
+    assert!(
+        (v - exact).abs() / exact < 0.02,
+        "loft volume {v} vs {exact}"
+    );
 }
 
 #[test]
 fn loft_needs_two_sections() {
     let mut g = ParametricGraph::new();
-    add_sketch_cs(&mut g, "sketch_1", shifted_xy(0.0), rect_sketch((0.0, 0.0), (4.0, 4.0)));
+    add_sketch_cs(
+        &mut g,
+        "sketch_1",
+        shifted_xy(0.0),
+        rect_sketch((0.0, 0.0), (4.0, 4.0)),
+    );
     g.add_feature(FeatureNode {
         id: "loft_2".to_string(),
         name: "Loft".to_string(),
@@ -58,13 +76,22 @@ fn loft_needs_two_sections() {
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
     assert!(bodies.is_empty());
-    assert!(warnings.iter().any(|w| w.contains("loft_2")), "warnings: {warnings:?}");
+    assert!(
+        warnings.iter().any(|w| w.contains("loft_2")),
+        "warnings: {warnings:?}"
+    );
 }
 
 // ---- Sweep ---------------------------------------------------------------
 
 /// A path sketch holding one straight open segment.
-fn straight_path_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, a: (f32, f32), b: (f32, f32)) {
+fn straight_path_sketch(
+    g: &mut ParametricGraph,
+    id: &str,
+    cs: CoordinateSystem,
+    a: (f32, f32),
+    b: (f32, f32),
+) {
     let mut curves = SketchCurves::new();
     curves.add_line(a, b);
     add_sketch_cs(g, id, cs, curves);
@@ -74,9 +101,20 @@ fn straight_path_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem,
 fn sweep_square_along_straight_path_is_a_prism() {
     let mut g = ParametricGraph::new();
     // Profile: 2×2 square centered, on XY (normal +Z).
-    add_sketch_cs(&mut g, "profile", CoordinateSystem::XY, rect_sketch((-1.0, -1.0), (1.0, 1.0)));
+    add_sketch_cs(
+        &mut g,
+        "profile",
+        CoordinateSystem::XY,
+        rect_sketch((-1.0, -1.0), (1.0, 1.0)),
+    );
     // Path: a line along world +Z, drawn on the XZ plane (u=X, v=Z).
-    straight_path_sketch(&mut g, "path", CoordinateSystem::XZ, (0.0, 0.0), (0.0, 10.0));
+    straight_path_sketch(
+        &mut g,
+        "path",
+        CoordinateSystem::XZ,
+        (0.0, 0.0),
+        (0.0, 10.0),
+    );
     g.add_feature(FeatureNode {
         id: "sweep_1".to_string(),
         name: "Sweep".to_string(),
@@ -103,7 +141,12 @@ fn sweep_square_along_straight_path_is_a_prism() {
 #[test]
 fn sweep_along_bent_path_is_watertight() {
     let mut g = ParametricGraph::new();
-    add_sketch_cs(&mut g, "profile", CoordinateSystem::XY, rect_sketch((-0.5, -0.5), (0.5, 0.5)));
+    add_sketch_cs(
+        &mut g,
+        "profile",
+        CoordinateSystem::XY,
+        rect_sketch((-0.5, -0.5), (0.5, 0.5)),
+    );
     // L-path on the XZ plane: up 8 then across 6.
     let mut curves = SketchCurves::new();
     curves.add_line((0.0, 0.0), (0.0, 8.0));
@@ -129,13 +172,22 @@ fn sweep_along_bent_path_is_watertight() {
     assert_eq!(bodies.len(), 1);
     let mp = bodies[0].1.mass_properties().expect("closed swept mesh");
     // 1×1 profile over a ~14mm path ≈ 14mm³, minus a little at the miter.
-    assert!(mp.volume > 10.0 && mp.volume < 15.0, "swept volume {}", mp.volume);
+    assert!(
+        mp.volume > 10.0 && mp.volume < 15.0,
+        "swept volume {}",
+        mp.volume
+    );
 }
 
 #[test]
 fn sweep_rejects_branching_path() {
     let mut g = ParametricGraph::new();
-    add_sketch_cs(&mut g, "profile", CoordinateSystem::XY, rect_sketch((-0.5, -0.5), (0.5, 0.5)));
+    add_sketch_cs(
+        &mut g,
+        "profile",
+        CoordinateSystem::XY,
+        rect_sketch((-0.5, -0.5), (0.5, 0.5)),
+    );
     // A "T" — three segments meeting at a point: not a single open chain.
     let mut curves = SketchCurves::new();
     curves.add_line((0.0, 0.0), (0.0, 5.0));
@@ -159,5 +211,8 @@ fn sweep_rejects_branching_path() {
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
     assert!(bodies.is_empty());
-    assert!(warnings.iter().any(|w| w.contains("sweep_1")), "warnings: {warnings:?}");
+    assert!(
+        warnings.iter().any(|w| w.contains("sweep_1")),
+        "warnings: {warnings:?}"
+    );
 }

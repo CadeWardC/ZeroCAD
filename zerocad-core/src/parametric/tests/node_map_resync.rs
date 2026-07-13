@@ -9,10 +9,7 @@ use std::collections::HashSet;
 
 fn body_count(g: &ParametricGraph) -> usize {
     let (bodies, _) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
-    bodies
-        .iter()
-        .filter(|(_, m)| !m.indices.is_empty())
-        .count()
+    bodies.iter().filter(|(_, m)| !m.indices.is_empty()).count()
 }
 
 /// GUI undo path: the snapshot is a serde round-trip, which drops `node_map`.

@@ -20,6 +20,8 @@ pub enum ShortcutAction {
     ExportStl,
     Undo,
     Redo,
+    CopyBody,
+    PasteBody,
     DeleteSelection,
     ToggleTheme,
     OpenSettings,
@@ -34,6 +36,8 @@ impl ShortcutAction {
         ShortcutAction::ExportStl,
         ShortcutAction::Undo,
         ShortcutAction::Redo,
+        ShortcutAction::CopyBody,
+        ShortcutAction::PasteBody,
         ShortcutAction::DeleteSelection,
         ShortcutAction::ToggleTheme,
         ShortcutAction::OpenSettings,
@@ -48,6 +52,8 @@ impl ShortcutAction {
             ShortcutAction::ExportStl => "Export STL",
             ShortcutAction::Undo => "Undo",
             ShortcutAction::Redo => "Redo",
+            ShortcutAction::CopyBody => "Copy Body",
+            ShortcutAction::PasteBody => "Paste Body",
             ShortcutAction::DeleteSelection => "Delete Selection",
             ShortcutAction::ToggleTheme => "Toggle Dark Mode",
             ShortcutAction::OpenSettings => "Open Settings",
@@ -64,6 +70,8 @@ impl ShortcutAction {
             ExportStl => Hotkey::ctrl(egui::Key::E),
             Undo => Hotkey::ctrl(egui::Key::Z),
             Redo => Hotkey::ctrl(egui::Key::Y),
+            CopyBody => Hotkey::ctrl(egui::Key::C),
+            PasteBody => Hotkey::ctrl(egui::Key::V),
             DeleteSelection => Hotkey::plain(egui::Key::Delete),
             ToggleTheme => Hotkey::ctrl(egui::Key::D),
             OpenSettings => Hotkey::ctrl(egui::Key::Comma),
@@ -130,6 +138,18 @@ impl Hotkey {
             let cmd = m.command || m.ctrl; // platform Ctrl, or ⌘ on Mac
             cmd == self.ctrl && m.shift == self.shift && m.alt == self.alt
         })
+    }
+
+    /// Consume this exact shortcut press so a focused widget cannot also act
+    /// on it later in the same frame.
+    pub fn consume_if_pressed(&self, ctx: &egui::Context) -> bool {
+        if !self.pressed(ctx) {
+            return false;
+        }
+        let Some(key) = self.egui_key() else {
+            return false;
+        };
+        ctx.input_mut(|input| input.consume_key(input.modifiers, key))
     }
 
     /// Human-readable form, e.g. "Ctrl+Shift+S" or "Delete".

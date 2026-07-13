@@ -5,8 +5,11 @@
 use openrcad_algo::boolean::point_in_solid;
 use openrcad_algo::{boolean, chamfer_edges, fillet_edges, BooleanOp};
 use openrcad_foundation::Pnt;
+use openrcad_geom::{GeomSurface, Surface};
+use openrcad_mesh::tessellate;
 use openrcad_primitives::make_box;
 use openrcad_topo::{Edge, Solid};
+use std::collections::HashMap;
 
 /// 20×20×10 block with a 10×10 pocket sunk 6 deep from the top (floor z=4).
 /// The pocket's inner corners are at (5,5), (15,5), (15,15), (5,15).
@@ -21,6 +24,188 @@ fn pocketed_block() -> Solid {
 /// The pocket's inner vertical edge at (5,5), z 4..10.
 fn pocket_corner_edge() -> Edge {
     Edge::between_points(Pnt::new(5.0, 5.0, 4.0), Pnt::new(5.0, 5.0, 10.0))
+}
+
+/// One edge of the pocket opening. On the block's top face this edge belongs to
+/// an inner wire (the pocket hole), not the face's outer box boundary.
+fn pocket_top_rim_edge() -> Edge {
+    Edge::between_points(Pnt::new(5.0, 5.0, 10.0), Pnt::new(15.0, 5.0, 10.0))
+}
+
+type MeshKey = (i64, i64, i64);
+
+fn mesh_edge_health(solid: &Solid) -> (usize, usize) {
+    let mesh = tessellate(solid, 0.05, 0.5);
+    let gpu = mesh.gpu_mesh();
+    let q = |i: usize| -> MeshKey {
+        let b = i * 3;
+        let g = |v: f32| (v as f64 * 1.0e4).round() as i64;
+        (
+            g(gpu.positions[b]),
+            g(gpu.positions[b + 1]),
+            g(gpu.positions[b + 2]),
+        )
+    };
+    let mut edges: HashMap<(MeshKey, MeshKey), u32> = HashMap::new();
+    for triangle in gpu.indices.chunks_exact(3) {
+        for &(a, b) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+            let (ka, kb) = (q(triangle[a] as usize), q(triangle[b] as usize));
+            let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+    (
+        edges.values().filter(|&&count| count == 1).count(),
+        edges.values().filter(|&&count| count > 2).count(),
+    )
+}
+
+fn sequential_pocket_miter(vertical_first: bool, radius: f64) -> Solid {
+    let body = pocketed_block();
+    let (first, second) = if vertical_first {
+        (pocket_corner_edge(), pocket_top_rim_edge())
+    } else {
+        (pocket_top_rim_edge(), pocket_corner_edge())
+    };
+    let once = fillet_edges(&body, &[first], radius).expect("first concave fillet");
+    fillet_edges(&once, &[second], radius).expect("adjacent concave fillet must miter")
+}
+
+fn assert_concave_miter(label: &str, solid: &Solid) {
+    assert!(solid.is_watertight(), "{label} must be watertight");
+    assert!(
+        solid.health_report().is_healthy(),
+        "{label} must be topologically healthy"
+    );
+    let miter_patches = solid
+        .shell()
+        .faces()
+        .iter()
+        .filter(|face| matches!(face.surface(), Some(GeomSurface::Ruled(_))))
+        .count();
+    assert_eq!(
+        miter_patches, 1,
+        "{label} must replace the flat junction with one concave ruled miter"
+    );
+    let (cracks, nonmanifold) = mesh_edge_health(solid);
+    assert_eq!(cracks, 0, "{label} display mesh must be crack-free");
+    assert_eq!(
+        nonmanifold, 0,
+        "{label} display mesh must not contain coincident membranes"
+    );
+    assert_eq!(
+        solid
+            .shell()
+            .faces()
+            .iter()
+            .filter(|face| matches!(face.surface(), Some(GeomSurface::Sphere(_))))
+            .count(),
+        0,
+        "{label} is a two-edge miter, not a spherical three-edge corner"
+    );
+
+    let (lo, hi) = solid
+        .bounding_box()
+        .corners()
+        .expect("mitered pocket must have bounds");
+    assert!(
+        lo.x() >= -1.0e-6
+            && lo.y() >= -1.0e-6
+            && lo.z() >= -1.0e-6
+            && hi.x() <= 20.0 + 1.0e-6
+            && hi.y() <= 20.0 + 1.0e-6
+            && hi.z() <= 10.0 + 1.0e-6,
+        "{label} must add material only into the pocket, never outside the block"
+    );
+    assert!(
+        point_in_solid(&Pnt::new(5.2, 5.4, 8.2), solid),
+        "{label} must fill the inward corner next to the miter"
+    );
+    assert!(
+        !point_in_solid(&Pnt::new(8.0, 8.0, 8.0), solid),
+        "{label} must leave the interior of the pocket empty"
+    );
+}
+
+#[test]
+fn equal_radius_concave_fillets_miter_in_both_orders() {
+    let vertical_then_top = sequential_pocket_miter(true, 2.0);
+    let top_then_vertical = sequential_pocket_miter(false, 2.0);
+    assert_concave_miter("vertical->top", &vertical_then_top);
+    assert_concave_miter("top->vertical", &top_then_vertical);
+
+    let signature = |solid: &Solid| {
+        let cylinders = solid
+            .shell()
+            .faces()
+            .iter()
+            .filter(|face| matches!(face.surface(), Some(GeomSurface::Cylinder(_))))
+            .count();
+        (
+            solid.vertex_count(),
+            solid.edge_count(),
+            solid.face_count(),
+            cylinders,
+        )
+    };
+    assert_eq!(
+        signature(&vertical_then_top),
+        signature(&top_then_vertical),
+        "concave miter topology must not depend on edge application order"
+    );
+
+    let ruled = |solid: &Solid| {
+        solid
+            .shell()
+            .faces()
+            .iter()
+            .find_map(|face| match face.surface() {
+                Some(GeomSurface::Ruled(surface)) => Some(surface.clone()),
+                _ => None,
+            })
+    };
+    let forward_seam = ruled(&vertical_then_top).expect("forward miter surface");
+    let reverse_seam = ruled(&top_then_vertical).expect("reverse miter surface");
+    for u in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        for v in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!(
+                forward_seam
+                    .point(u, v)
+                    .distance(&reverse_seam.point(u, 1.0 - v))
+                    <= 1.0e-8,
+                "miter surface geometry must not depend on application order"
+            );
+        }
+    }
+    for sample in [
+        Pnt::new(5.2, 5.2, 9.0),
+        Pnt::new(5.8, 5.4, 9.4),
+        Pnt::new(6.4, 5.8, 8.6),
+    ] {
+        assert_eq!(
+            point_in_solid(&sample, &vertical_then_top),
+            point_in_solid(&sample, &top_then_vertical),
+            "concave miter material differs by application order at {sample:?}"
+        );
+    }
+}
+
+#[test]
+fn pocket_top_inner_wire_edge_fillet_succeeds() {
+    let body = pocketed_block();
+    let result = fillet_edges(&body, &[pocket_top_rim_edge()], 1.5)
+        .expect("filleting a pocket rim stored in the top face's inner wire must succeed");
+    assert!(result.is_watertight());
+    assert!(result.health_report().is_healthy());
+}
+
+#[test]
+fn pocket_top_inner_wire_edge_chamfer_succeeds() {
+    let body = pocketed_block();
+    let result = chamfer_edges(&body, &[pocket_top_rim_edge()], 1.5)
+        .expect("chamfering a pocket rim stored in the top face's inner wire must succeed");
+    assert!(result.is_watertight());
+    assert!(result.health_report().is_healthy());
 }
 
 #[test]
@@ -63,10 +248,7 @@ fn concave_fillet_adds_rounded_corner_material() {
     assert!(!point_in_solid(&Pnt::new(10.0, 10.0, 7.0), &s));
     // And the fillet added nothing outside the original bounds.
     let (lo, hi) = (Pnt::new(-0.1, -0.1, -0.1), Pnt::new(20.1, 20.1, 10.1));
-    let (bmin, bmax) = s
-        .bounding_box()
-        .corners()
-        .expect("result must have bounds");
+    let (bmin, bmax) = s.bounding_box().corners().expect("result must have bounds");
     assert!(
         bmin.x() >= lo.x()
             && bmin.y() >= lo.y()
@@ -115,7 +297,10 @@ fn concave_fillet_on_flush_cut_pocket() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let tool = make_box(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 6.0);
     let body = boolean(&block, &tool, BooleanOp::Cut);
-    assert!(body.is_watertight(), "flush pocket fixture must be watertight");
+    assert!(
+        body.is_watertight(),
+        "flush pocket fixture must be watertight"
+    );
 
     let edge = pocket_corner_edge();
     let r = fillet_edges(&body, std::slice::from_ref(&edge), 2.0);

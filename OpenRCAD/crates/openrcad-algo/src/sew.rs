@@ -311,14 +311,25 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
     }
     let debug = std::env::var_os("OPENRCAD_SEW_DEBUG").is_some();
 
-    // 1. Merge all faces into a single BRep.
+    // 1. Merge all faces into a single BRep. Distinct source arenas are merged
+    // in ONE `merge_many` pass so the dedup indexes are built once, not per
+    // face (thousands of tiny per-face arenas made serial `merge` quadratic).
     let mut brep = BRep::new();
     let mut face_ids = Vec::with_capacity(faces.len());
-    let mut merged = HashMap::new();
+    let mut arena_order: Vec<&BRep> = Vec::new();
+    let mut arena_idx: HashMap<usize, usize> = HashMap::new();
+    for face in faces {
+        let ptr = Arc::as_ptr(face.brep()) as usize;
+        arena_idx.entry(ptr).or_insert_with(|| {
+            arena_order.push(face.brep());
+            arena_order.len() - 1
+        });
+    }
+    let maps = brep.merge_many(&arena_order);
 
     for face in faces {
         let ptr = Arc::as_ptr(face.brep()) as usize;
-        let map = merged.entry(ptr).or_insert_with(|| brep.merge(face.brep()));
+        let map = &maps[arena_idx[&ptr]];
         let new_face_id = map.faces[&face.id()];
 
         // Sync face's orientation in BRep data to match handle
@@ -388,29 +399,63 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
         }
     }
 
-    for i in 0..n_vertices {
+    // Spatial-hash the boundary vertices so clustering is O(n) instead of the
+    // former all-pairs O(n²) scan (a skinned solid easily has 10⁴+ boundary
+    // vertices; the quadratic pass dominated sew by minutes). Cell size covers
+    // the largest possible merge radius, so candidates never straddle more than
+    // one neighbouring cell; the exact per-pair tolerance test is unchanged.
+    let boundary_idx: Vec<usize> = (0..n_vertices)
+        .filter(|&i| boundary_vertices.contains(&vertex_keys[i]))
+        .collect();
+    let max_vtol = boundary_idx
+        .iter()
+        .map(|&i| brep.vertices[vertex_keys[i]].tolerance)
+        .fold(0.0_f64, f64::max);
+    let cell = tol.max(2.0 * max_vtol).max(1e-12);
+    let key_of = |p: openrcad_foundation::Pnt| -> (i64, i64, i64) {
+        (
+            (p.x() / cell).floor() as i64,
+            (p.y() / cell).floor() as i64,
+            (p.z() / cell).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for &i in &boundary_idx {
+        grid.entry(key_of(brep.vertices[vertex_keys[i]].point))
+            .or_default()
+            .push(i);
+    }
+    for &i in &boundary_idx {
         let v1_id = vertex_keys[i];
-        if !boundary_vertices.contains(&v1_id) {
-            continue;
-        }
         let p1 = brep.vertices[v1_id].point;
-        for j in (i + 1)..n_vertices {
-            let v2_id = vertex_keys[j];
-            if !boundary_vertices.contains(&v2_id) {
-                continue;
-            }
-            let p2 = brep.vertices[v2_id].point;
-            // Tolerant modeling (CLAUDE.md principle #4): two boundary vertices
-            // coincide if they are within the *global* sewing tolerance OR within
-            // the sum of their own per-entity uncertainty radii. The latter lets
-            // "dirty" imported geometry — whose vertices carry large local
-            // tolerances — heal even under a tight global `tol`, while clean
-            // geometry (CONFUSION-tolerance vertices) is unaffected.
-            let t1 = brep.vertices[v1_id].tolerance;
-            let t2 = brep.vertices[v2_id].tolerance;
-            let merge_tol = tol.max(t1 + t2);
-            if p1.distance(&p2) <= merge_tol {
-                union(i, j, &mut parent);
+        let t1 = brep.vertices[v1_id].tolerance;
+        let (kx, ky, kz) = key_of(p1);
+        for dx in -1..=1_i64 {
+            for dy in -1..=1_i64 {
+                for dz in -1..=1_i64 {
+                    let Some(bucket) = grid.get(&(kx + dx, ky + dy, kz + dz)) else {
+                        continue;
+                    };
+                    for &j in bucket {
+                        if j <= i {
+                            continue;
+                        }
+                        let v2_id = vertex_keys[j];
+                        let p2 = brep.vertices[v2_id].point;
+                        // Tolerant modeling (CLAUDE.md principle #4): two boundary
+                        // vertices coincide if they are within the *global* sewing
+                        // tolerance OR within the sum of their own per-entity
+                        // uncertainty radii. The latter lets "dirty" imported
+                        // geometry — whose vertices carry large local tolerances —
+                        // heal even under a tight global `tol`, while clean
+                        // geometry (CONFUSION-tolerance vertices) is unaffected.
+                        let t2 = brep.vertices[v2_id].tolerance;
+                        let merge_tol = tol.max(t1 + t2);
+                        if p1.distance(&p2) <= merge_tol {
+                            union(i, j, &mut parent);
+                        }
+                    }
+                }
             }
         }
     }
@@ -501,86 +546,102 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
     let mut e_parent: Vec<usize> = (0..n_edges).collect();
     let mut reverse_merge = vec![false; n_edges]; // Track if merged reversed
 
-    for i in 0..n_edges {
-        let e1_id = edge_keys[i];
-        let e1 = &brep.edges[e1_id];
-        let count1 = *edge_counts.entry(e1_id).or_insert(0);
+    // Only edges sharing BOTH representative endpoints can merge, so bucket by
+    // the unordered endpoint pair and compare within buckets — O(n) overall
+    // instead of the former all-pairs O(n²) scan (which dominated sewing of
+    // skinned/faceted solids with 10⁴+ edges by minutes).
+    let mut pair_buckets: HashMap<(VertexId, VertexId), Vec<usize>> = HashMap::new();
+    for (i, &e_id) in edge_keys.iter().enumerate() {
+        let e = &brep.edges[e_id];
+        let key = if e.start <= e.end {
+            (e.start, e.end)
+        } else {
+            (e.end, e.start)
+        };
+        pair_buckets.entry(key).or_default().push(i);
+    }
+    for bucket in pair_buckets.values() {
+        for (bi, &i) in bucket.iter().enumerate() {
+            let e1_id = edge_keys[i];
+            let e1 = &brep.edges[e1_id];
+            let count1 = *edge_counts.entry(e1_id).or_insert(0);
 
-        for j in (i + 1)..n_edges {
-            let e2_id = edge_keys[j];
-            let e2 = &brep.edges[e2_id];
-            let count2 = *edge_counts.entry(e2_id).or_insert(0);
+            for &j in &bucket[bi + 1..] {
+                let e2_id = edge_keys[j];
+                let e2 = &brep.edges[e2_id];
+                let count2 = *edge_counts.entry(e2_id).or_insert(0);
 
-            // Merge if edges are identical, or if both are free boundaries.
-            let both_free = count1 <= 1 && count2 <= 1;
-            let endpoints_match_same = e1.start == e2.start && e1.end == e2.end;
-            let endpoints_match_opp = e1.start == e2.end && e1.end == e2.start;
-            if debug && both_free && !(endpoints_match_same || endpoints_match_opp) {
-                let a1 = brep.vertices[e1.start].point;
-                let b1 = brep.vertices[e1.end].point;
-                let a2 = brep.vertices[e2.start].point;
-                let b2 = brep.vertices[e2.end].point;
-                let same = a1.distance(&a2).max(b1.distance(&b2));
-                let opp = a1.distance(&b2).max(b1.distance(&a2));
-                let near = same.min(opp);
-                if near < 1e-2 {
-                    eprintln!(
+                // Merge if edges are identical, or if both are free boundaries.
+                let both_free = count1 <= 1 && count2 <= 1;
+                let endpoints_match_same = e1.start == e2.start && e1.end == e2.end;
+                let endpoints_match_opp = e1.start == e2.end && e1.end == e2.start;
+                if debug && both_free && !(endpoints_match_same || endpoints_match_opp) {
+                    let a1 = brep.vertices[e1.start].point;
+                    let b1 = brep.vertices[e1.end].point;
+                    let a2 = brep.vertices[e2.start].point;
+                    let b2 = brep.vertices[e2.end].point;
+                    let same = a1.distance(&a2).max(b1.distance(&b2));
+                    let opp = a1.distance(&b2).max(b1.distance(&a2));
+                    let near = same.min(opp);
+                    if near < 1e-2 {
+                        eprintln!(
                         "sew near free endpoints {:?}/{:?} near={near:.8} same={same:.8} opp={opp:.8} tol={tol:.8}",
                         e1_id, e2_id
                     );
-                }
-            }
-
-            if endpoints_match_same || endpoints_match_opp {
-                // If they are not free boundaries, only merge if they are exact duplicates in same direction.
-                if !both_free && !endpoints_match_same {
-                    continue;
-                }
-
-                // Check curve compatibility within tolerance.
-                let mut curve_mismatch = None;
-                let curves_match = match (&e1.curve, &e2.curve) {
-                    (None, None) => true,
-                    (Some(c1), Some(c2)) => {
-                        // Sample start, mid, end.
-                        let t1_mid = 0.5 * (e1.first + e1.last);
-                        let t2_mid = 0.5 * (e2.first + e2.last);
-                        let p1_start = c1.point(e1.first);
-                        let p1_mid = c1.point(t1_mid);
-                        let p1_end = c1.point(e1.last);
-
-                        let (p2_start, p2_mid, p2_end) = if endpoints_match_same {
-                            (c2.point(e2.first), c2.point(t2_mid), c2.point(e2.last))
-                        } else {
-                            (c2.point(e2.last), c2.point(t2_mid), c2.point(e2.first))
-                        };
-
-                        let d_start = p1_start.distance(&p2_start);
-                        let d_mid = p1_mid.distance(&p2_mid);
-                        let d_end = p1_end.distance(&p2_end);
-                        curve_mismatch = Some((d_start, d_mid, d_end, tol));
-                        d_start <= tol && d_mid <= tol && d_end <= tol
                     }
-                    _ => false,
-                };
-                if debug && both_free && !curves_match {
-                    if let Some((d_start, d_mid, d_end, curve_tol)) = curve_mismatch {
-                        if d_start.min(d_mid).min(d_end) < 1e-2 {
-                            eprintln!(
+                }
+
+                if endpoints_match_same || endpoints_match_opp {
+                    // If they are not free boundaries, only merge if they are exact duplicates in same direction.
+                    if !both_free && !endpoints_match_same {
+                        continue;
+                    }
+
+                    // Check curve compatibility within tolerance.
+                    let mut curve_mismatch = None;
+                    let curves_match = match (&e1.curve, &e2.curve) {
+                        (None, None) => true,
+                        (Some(c1), Some(c2)) => {
+                            // Sample start, mid, end.
+                            let t1_mid = 0.5 * (e1.first + e1.last);
+                            let t2_mid = 0.5 * (e2.first + e2.last);
+                            let p1_start = c1.point(e1.first);
+                            let p1_mid = c1.point(t1_mid);
+                            let p1_end = c1.point(e1.last);
+
+                            let (p2_start, p2_mid, p2_end) = if endpoints_match_same {
+                                (c2.point(e2.first), c2.point(t2_mid), c2.point(e2.last))
+                            } else {
+                                (c2.point(e2.last), c2.point(t2_mid), c2.point(e2.first))
+                            };
+
+                            let d_start = p1_start.distance(&p2_start);
+                            let d_mid = p1_mid.distance(&p2_mid);
+                            let d_end = p1_end.distance(&p2_end);
+                            curve_mismatch = Some((d_start, d_mid, d_end, tol));
+                            d_start <= tol && d_mid <= tol && d_end <= tol
+                        }
+                        _ => false,
+                    };
+                    if debug && both_free && !curves_match {
+                        if let Some((d_start, d_mid, d_end, curve_tol)) = curve_mismatch {
+                            if d_start.min(d_mid).min(d_end) < 1e-2 {
+                                eprintln!(
                                 "sew free curve mismatch {:?}/{:?} ds={d_start:.8} dm={d_mid:.8} de={d_end:.8} tol={curve_tol:.8}",
                                 e1_id, e2_id
                             );
+                            }
                         }
                     }
-                }
 
-                if curves_match {
-                    let root_i = find_no_compress(i, &e_parent);
-                    let root_j = find_no_compress(j, &e_parent);
-                    if root_i != root_j {
-                        e_parent[root_i] = root_j;
-                        if endpoints_match_opp {
-                            reverse_merge[root_i] = !reverse_merge[root_i];
+                    if curves_match {
+                        let root_i = find_no_compress(i, &e_parent);
+                        let root_j = find_no_compress(j, &e_parent);
+                        if root_i != root_j {
+                            e_parent[root_i] = root_j;
+                            if endpoints_match_opp {
+                                reverse_merge[root_i] = !reverse_merge[root_i];
+                            }
                         }
                     }
                 }

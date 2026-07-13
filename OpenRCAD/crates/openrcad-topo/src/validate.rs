@@ -457,8 +457,8 @@ mod tests {
         // twice → watertight. This is what let revolve drop the full-turn-thirds
         // workaround (a full circle needs only two half-arcs, not three thirds).
         use crate::vertex::Vertex;
-        use openrcad_geom::{Circle, GeomCurve};
         use openrcad_foundation::{Ax3, Dir};
+        use openrcad_geom::{Circle, GeomCurve};
         let circle = Circle::new(Ax3::new(Pnt::origin(), Dir::dz()), 2.0);
         let pi = std::f64::consts::PI;
         let arc = |t0: f64, t1: f64| {
@@ -470,15 +470,13 @@ mod tests {
                 Vertex::new(circle.point(t1)),
             )
         };
-        let disc = || {
-            Face::new(
-                None,
-                Wire::from_edges([arc(0.0, pi), arc(pi, 2.0 * pi)]),
-            )
-        };
+        let disc = || Face::new(None, Wire::from_edges([arc(0.0, pi), arc(pi, 2.0 * pi)]));
         let s = Solid::new(Shell::from_faces([disc(), disc()]));
         let m = s.manifold_report();
-        assert_eq!(m.total_edges, 2, "two semicircles must be two distinct edges; got {m:?}");
+        assert_eq!(
+            m.total_edges, 2,
+            "two semicircles must be two distinct edges; got {m:?}"
+        );
         assert_eq!(m.free_edges, 0);
         assert_eq!(m.nonmanifold_edges, 0);
         assert!(s.is_watertight());

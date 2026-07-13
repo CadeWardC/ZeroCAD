@@ -1,5 +1,48 @@
 use crate::*;
 
+/// The outcome of a sketch-point snap: the snapped position, what it locked
+/// onto (for the glyph), any dashed inference-guide segments to draw this frame,
+/// and a guide to wake if the cursor landed on a segment midpoint.
+pub(crate) struct SnapResult {
+    pub pos: (f32, f32),
+    pub kind: Option<SnapKind>,
+    pub guides_used: Vec<((f32, f32), (f32, f32))>,
+    pub woke: Option<MidlineGuide>,
+}
+
+/// Intersection of two infinite lines given as (point, direction). `None` when
+/// the lines are (near-)parallel.
+fn line_intersection(
+    p1: (f32, f32),
+    d1: (f32, f32),
+    p2: (f32, f32),
+    d2: (f32, f32),
+) -> Option<(f32, f32)> {
+    let denom = d1.0 * d2.1 - d1.1 * d2.0;
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let (dx, dy) = (p2.0 - p1.0, p2.1 - p1.1);
+    let t = (dx * d2.1 - dy * d2.0) / denom;
+    Some((p1.0 + d1.0 * t, p1.1 + d1.1 * t))
+}
+
+/// Keep a line's cursor distance while rounding its direction to the nearest
+/// 15-degree increment.
+pub(crate) fn snap_line_angle(start: (f32, f32), cursor: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (cursor.0 - start.0, cursor.1 - start.1);
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f32::EPSILON {
+        return cursor;
+    }
+    let increment = 15.0_f32.to_radians();
+    let angle = (dy.atan2(dx) / increment).round() * increment;
+    (
+        start.0 + length * angle.cos(),
+        start.1 + length * angle.sin(),
+    )
+}
+
 impl ZeroCadApp {
     /// Enter sketch mode on coordinate system `cs`: save the current camera,
     /// animate to look straight at the plane, switch to orthographic, and clear
@@ -41,12 +84,13 @@ impl ZeroCadApp {
             return;
         };
         let vars = self.graph.variable_map();
-        let (cs, shapes, corner_mods, on_face, entity_ids, next_id, solver) =
+        let (cs, shapes, corner_mods, mirrors, on_face, entity_ids, next_id, solver) =
             match &self.graph.graph[idx].feature {
                 FeatureType::Sketch {
                     cs,
                     shapes,
                     corner_mods,
+                    mirrors,
                     on_face,
                     entity_ids,
                     next_entity_id,
@@ -56,6 +100,7 @@ impl ZeroCadApp {
                     *cs,
                     shapes.clone(),
                     corner_mods.clone(),
+                    mirrors.clone(),
                     *on_face,
                     entity_ids.clone(),
                     *next_entity_id,
@@ -80,6 +125,7 @@ impl ZeroCadApp {
         self.sketch_entity_ids =
             zerocad_core::sketch::effective_shape_ids(shapes.len(), &entity_ids);
         self.sketch_corner_mods = corner_mods;
+        self.sketch_mirrors = mirrors;
         // Editing means constraints: promote a legacy shapes sketch to the
         // entity model (geometry-lossless, provenance preserved via
         // `derived_from`); an already-promoted sketch loads as-is.
@@ -157,12 +203,18 @@ impl ZeroCadApp {
     /// Snap a raw sketch-plane point, returning only the snapped position.
     /// Thin wrapper over [`snap_sketch_point_kind`] for callers that don't need
     /// to know which feature was hit (e.g. committing a click).
-    pub(crate) fn snap_sketch_point(&self, raw: (f32, f32), scale: f32, shift: bool) -> (f32, f32) {
-        self.snap_sketch_point_kind(raw, scale, shift).0
+    pub(crate) fn snap_sketch_point(
+        &self,
+        raw: (f32, f32),
+        scale: f32,
+        suppress_snap: bool,
+    ) -> (f32, f32) {
+        self.snap_sketch_point_kind(raw, scale, suppress_snap).pos
     }
 
-    /// Snap a raw sketch-plane point and report *what* it snapped onto. With
-    /// Shift held, returns it unchanged with no snap kind (free placement).
+    /// Snap a raw sketch-plane point and report *what* it snapped onto. When
+    /// snapping is suppressed (Ctrl while drawing), returns it unchanged with
+    /// no snap kind.
     /// Otherwise it prefers, in order: a nearby endpoint / circle-centre /
     /// segment-midpoint (each distinguished so the viewport can draw its glyph),
     /// then the nearest point on a segment, then a fine 0.2-unit grid. `scale`
@@ -172,76 +224,177 @@ impl ZeroCadApp {
         &self,
         raw: (f32, f32),
         scale: f32,
-        shift: bool,
-    ) -> ((f32, f32), Option<SnapKind>) {
-        if shift {
-            return (raw, None);
+        suppress_snap: bool,
+    ) -> SnapResult {
+        if suppress_snap {
+            return SnapResult {
+                pos: raw,
+                kind: None,
+                guides_used: Vec::new(),
+                woke: None,
+            };
         }
         let tol = 9.0 / scale.max(1e-4); // ~9 px in world units
+        let tol2 = tol * tol;
         let dist2 = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2);
+        // Straight segments that participate in snapping: drawn curves plus the
+        // projected face boundary (sketch-on-face). Snapping onto the body's
+        // edges/corners is what lets a drawn profile land on the face outline.
+        let seg_iter = || {
+            self.sketch_curves
+                .segments
+                .iter()
+                .chain(self.active_face_boundary.segments.iter())
+        };
+        // Perpendicular (midline) unit direction of a segment, if non-degenerate.
+        let seg_perp = |s: &LineSegment| {
+            let (dx, dy) = (s.b.0 - s.a.0, s.b.1 - s.a.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            (len > 1e-6).then(|| (-dy / len, dx / len))
+        };
+        let seg_mid = |s: &LineSegment| ((s.a.0 + s.b.0) * 0.5, (s.a.1 + s.b.1) * 0.5);
 
-        // 1. Snap points: endpoints, midpoints, circle centres. The closest one
-        // wins, and it carries the kind so the caller draws the matching glyph.
-        let mut best_pt: Option<((f32, f32), SnapKind, f32)> = None;
-        let mut consider = |p: (f32, f32), kind: SnapKind| {
+        // 1. Snap points: endpoints, midpoints, circle centres, the plane origin,
+        // and (once guides are woken) midline intersections. The closest one wins
+        // and carries the kind so the caller draws the matching glyph. A midpoint
+        // winner also carries the perpendicular so the caller can wake its guide.
+        let mut best_pt: Option<((f32, f32), SnapKind, f32, Option<(f32, f32)>)> = None;
+        let mut consider = |p: (f32, f32), kind: SnapKind, perp: Option<(f32, f32)>| {
             let d = dist2(p, raw);
-            if d < tol * tol && best_pt.map_or(true, |(_, _, bd)| d < bd) {
-                best_pt = Some((p, kind, d));
+            if d < tol2 && best_pt.map_or(true, |(_, _, bd, _)| d < bd) {
+                best_pt = Some((p, kind, d, perp));
             }
         };
-        // Drawn segments plus the projected face boundary (sketch-on-face):
-        // snapping onto the body's edges/corners is what lets a drawn profile
-        // land exactly on the face outline.
-        for s in self
-            .sketch_curves
-            .segments
-            .iter()
-            .chain(self.active_face_boundary.segments.iter())
-        {
-            consider(s.a, SnapKind::Endpoint);
-            consider(s.b, SnapKind::Endpoint);
-            consider(
-                ((s.a.0 + s.b.0) * 0.5, (s.a.1 + s.b.1) * 0.5),
-                SnapKind::Midpoint,
-            );
+
+        // Plane origin first, so it wins ties against a coincident endpoint.
+        consider((0.0, 0.0), SnapKind::Origin, None);
+
+        for s in seg_iter() {
+            consider(s.a, SnapKind::Endpoint, None);
+            consider(s.b, SnapKind::Endpoint, None);
+            consider(seg_mid(s), SnapKind::Midpoint, seg_perp(s));
         }
         for c in &self.sketch_curves.circles {
-            consider(c.center, SnapKind::Center);
+            consider(c.center, SnapKind::Center, None);
         }
         // Fillet arcs: their endpoints act as the new corners where the arc meets
         // the straight edges, and their centre is a genuine centre to snap onto.
         for a in &self.sketch_curves.arcs {
-            consider(a.start, SnapKind::Endpoint);
-            consider(a.end, SnapKind::Endpoint);
-            consider(a.center, SnapKind::Center);
+            consider(a.start, SnapKind::Endpoint, None);
+            consider(a.end, SnapKind::Endpoint, None);
+            consider(a.center, SnapKind::Center, None);
         }
-        if let Some((p, kind, _)) = best_pt {
-            return (p, Some(kind));
-        }
-
-        // 2. Snap to the nearest point on a segment (drawn or face boundary).
-        let mut best_line: Option<((f32, f32), f32)> = None;
-        for s in self
-            .sketch_curves
-            .segments
-            .iter()
-            .chain(self.active_face_boundary.segments.iter())
-        {
-            let proj = project_point_on_segment(raw, s.a, s.b);
-            let d = dist2(proj, raw);
-            if d < tol * tol && best_line.map_or(true, |(_, bd)| d < bd) {
-                best_line = Some((proj, d));
+        // Midline intersections (e.g. a rectangle centre): each woken guide
+        // crossed with every OTHER segment's midline, plus the other guide.
+        for g in &self.snap_guides {
+            for s in seg_iter() {
+                let mid = seg_mid(s);
+                if dist2(mid, g.origin) < 1e-8 {
+                    continue; // the guide's own owning midpoint
+                }
+                if let Some(perp) = seg_perp(s) {
+                    if let Some(ix) = line_intersection(g.origin, g.dir, mid, perp) {
+                        consider(ix, SnapKind::MidlineCenter, None);
+                    }
+                }
+            }
+            for g2 in &self.snap_guides {
+                if dist2(g.origin, g2.origin) < 1e-8 {
+                    continue;
+                }
+                if let Some(ix) = line_intersection(g.origin, g.dir, g2.origin, g2.dir) {
+                    consider(ix, SnapKind::MidlineCenter, None);
+                }
             }
         }
-        if let Some((p, _)) = best_line {
-            return (p, Some(SnapKind::OnLine));
+
+        if let Some((p, kind, _, perp)) = best_pt {
+            let woke = (kind == SnapKind::Midpoint)
+                .then(|| perp.map(|dir| MidlineGuide { origin: p, dir }))
+                .flatten();
+            // A centre snap draws a dashed guide from each contributing midpoint.
+            let guides_used = if kind == SnapKind::MidlineCenter {
+                self.snap_guides.iter().map(|g| (g.origin, p)).collect()
+            } else {
+                Vec::new()
+            };
+            return SnapResult {
+                pos: p,
+                kind: Some(kind),
+                guides_used,
+                woke,
+            };
+        }
+
+        // 2. Nearest point on a segment (drawn or face boundary), or the
+        // projection onto a woken guide line — whichever is closer.
+        let mut best_line: Option<((f32, f32), f32, Option<(f32, f32)>)> = None;
+        for s in seg_iter() {
+            let proj = project_point_on_segment(raw, s.a, s.b);
+            let d = dist2(proj, raw);
+            if d < tol2 && best_line.map_or(true, |(_, bd, _)| d < bd) {
+                best_line = Some((proj, d, None));
+            }
+        }
+        for g in &self.snap_guides {
+            let w = (raw.0 - g.origin.0, raw.1 - g.origin.1);
+            let t = w.0 * g.dir.0 + w.1 * g.dir.1;
+            let proj = (g.origin.0 + g.dir.0 * t, g.origin.1 + g.dir.1 * t);
+            let d = dist2(proj, raw);
+            if d < tol2 && best_line.map_or(true, |(_, bd, _)| d < bd) {
+                best_line = Some((proj, d, Some(g.origin)));
+            }
+        }
+        if let Some((p, _, anchor)) = best_line {
+            return match anchor {
+                Some(a) => SnapResult {
+                    pos: p,
+                    kind: Some(SnapKind::Midline),
+                    guides_used: vec![(a, p)],
+                    woke: None,
+                },
+                None => SnapResult {
+                    pos: p,
+                    kind: Some(SnapKind::OnLine),
+                    guides_used: Vec::new(),
+                    woke: None,
+                },
+            };
         }
 
         // 3. Fine grid snap (0.2 units).
-        (
-            ((raw.0 * 5.0).round() / 5.0, (raw.1 * 5.0).round() / 5.0),
-            Some(SnapKind::Grid),
-        )
+        SnapResult {
+            pos: ((raw.0 * 5.0).round() / 5.0, (raw.1 * 5.0).round() / 5.0),
+            kind: Some(SnapKind::Grid),
+            guides_used: Vec::new(),
+            woke: None,
+        }
+    }
+
+    /// Wake/expire the midline inference guides after a snap. A midpoint snap
+    /// wakes a guide (dedup by origin, cap 2, evict oldest); a guide expires once
+    /// the cursor drifts beyond `2×tol` of its line and off its origin midpoint.
+    pub(crate) fn update_snap_guides(&mut self, result: &SnapResult, raw: (f32, f32), tol: f32) {
+        if let Some(g) = result.woke {
+            let dup = self.snap_guides.iter().any(|e| {
+                (e.origin.0 - g.origin.0).abs() < 1e-5 && (e.origin.1 - g.origin.1).abs() < 1e-5
+            });
+            if !dup {
+                if self.snap_guides.len() >= 2 {
+                    self.snap_guides.remove(0);
+                }
+                self.snap_guides.push(g);
+            }
+        }
+        let band = 2.0 * tol;
+        self.snap_guides.retain(|g| {
+            let w = (raw.0 - g.origin.0, raw.1 - g.origin.1);
+            let t = w.0 * g.dir.0 + w.1 * g.dir.1;
+            let proj = (g.origin.0 + g.dir.0 * t, g.origin.1 + g.dir.1 * t);
+            let perp_d = ((raw.0 - proj.0).powi(2) + (raw.1 - proj.1).powi(2)).sqrt();
+            let origin_d = ((raw.0 - g.origin.0).powi(2) + (raw.1 - g.origin.1).powi(2)).sqrt();
+            perp_d <= band || origin_d < tol
+        });
     }
 
     /// Refresh the live (unlocked, untyped) dimension fields from the current
@@ -260,6 +413,9 @@ impl ZeroCadApp {
             SketchTool::Rectangle => vec![dx.abs(), dy.abs()],
             SketchTool::RectangleCenter => vec![2.0 * dx.abs(), 2.0 * dy.abs()],
             SketchTool::Circle => vec![2.0 * (dx * dx + dy * dy).sqrt()],
+            SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => {
+                vec![2.0 * (dx * dx + dy * dy).sqrt()]
+            }
             SketchTool::Line => vec![(dx * dx + dy * dy).sqrt(), dy.atan2(dx).to_degrees()],
             // 3-point tools draw without inline dimension fields.
             _ => vec![],
@@ -274,8 +430,8 @@ impl ZeroCadApp {
     }
 
     /// Build a parametric [`Dimension`] for dimension field `i`: it captures the
-    /// raw expression text when it references a variable (so the dimension
-    /// follows that variable), else a plain literal. `fallback` (the
+    /// raw expression text for arithmetic or variable expressions, else a plain
+    /// literal. `fallback` (the
     /// cursor-derived value) is used when the field is empty or invalid.
     pub(crate) fn dim_param(&self, i: usize, fallback: f32) -> Dimension {
         let text = self
@@ -284,7 +440,7 @@ impl ZeroCadApp {
             .and_then(|d| d.fields.get(i))
             .map(|f| f.value.clone());
         match text {
-            Some(t) if zerocad_core::expr::references_variable(&t) => Dimension {
+            Some(t) if zerocad_core::expr::preserves_source(&t) => Dimension {
                 value: self.eval_dim(&t).unwrap_or(fallback),
                 expr: Some(t.trim().to_string()),
             },
@@ -386,8 +542,7 @@ impl ZeroCadApp {
 
     /// Build the **parametric record** for the in-progress shape from the placed
     /// points + `last`. Dimensioned 2-point tools capture their dimension
-    /// expressions (so they follow variables); point-driven tools are baked into
-    /// [`SketchShape::Raw`].
+    /// expressions; point-driven tools are baked into [`SketchShape::Raw`].
     pub(crate) fn shape_record_from_points(&self, last: (f32, f32)) -> Option<SketchShape> {
         let tool = self.active_tool?;
         let &p0 = self.sketch_points.first()?;
@@ -420,12 +575,19 @@ impl ZeroCadApp {
                 center: p0,
                 diameter: self.dim_param(0, 2.0 * (dx * dx + dy * dy).sqrt()),
             },
+            SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => {
+                SketchShape::RegularPolygon {
+                    center: p0,
+                    sides: self.polygon_sides.clamp(3, 64),
+                    diameter: self.dim_param(0, 2.0 * (dx * dx + dy * dy).sqrt()),
+                    rotation_deg: dy.atan2(dx).to_degrees(),
+                    circumscribed: tool == SketchTool::PolygonCircumscribed,
+                }
+            }
             SketchTool::RectangleThreePoint
             | SketchTool::ThreePointCircle
             | SketchTool::Ellipse
-            | SketchTool::ThreePointEllipse
-            | SketchTool::PolygonInscribed
-            | SketchTool::PolygonCircumscribed => SketchShape::Raw {
+            | SketchTool::ThreePointEllipse => SketchShape::Raw {
                 curves: self.raw_curves_from_points(tool, p0, p1, last),
             },
             // Mirror reflects existing geometry across its 2-click axis; it's
@@ -585,9 +747,9 @@ impl ZeroCadApp {
                 self.sketch_temp_start = Some(endpoint);
                 self.dim_input = Some(DimInput {
                     fields: dim_fields_for(SketchTool::Line),
-                    focus_request: Some(0),
+                    focus_request: None,
                     active_field: 0,
-                    select_all: true,
+                    editing_field: None,
                 });
                 self.status_msg =
                     "Segment added — click the next point, or click the start to close (Esc to finish)."
@@ -641,6 +803,14 @@ impl ZeroCadApp {
                         mode: ExtrudeMode::NewBody,
                         ..
                     }
+                    | FeatureType::Pattern {
+                        kind: zerocad_core::PatternKind::Linear { .. }
+                            | zerocad_core::PatternKind::Circular { .. }
+                            | zerocad_core::PatternKind::Mirror { join: false, .. },
+                        ..
+                    }
+                    | FeatureType::BodyJoin { .. }
+                    | FeatureType::BodyCut { .. }
             )
         });
         format!("Body_{}", n)
@@ -660,9 +830,112 @@ impl ZeroCadApp {
         format!("{}_{}", prefix, n)
     }
 
+    pub(crate) fn next_body_join_name(&self) -> String {
+        let n = self.next_feature_index(|f| matches!(f, FeatureType::BodyJoin { .. }));
+        format!("Join_{}", n)
+    }
+
+    pub(crate) fn next_body_cut_name(&self) -> String {
+        let n = self.next_feature_index(|f| matches!(f, FeatureType::BodyCut { .. }));
+        format!("Cut_{}", n)
+    }
+
     /// Display name for the next variable set (VariableSet_1, VariableSet_2, …).
     pub(crate) fn next_variable_set_name(&self) -> String {
         let n = self.next_feature_index(|f| matches!(f, FeatureType::VariableSet { .. }));
         format!("VariableSet_{}", n)
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+
+    /// A 4×2 rectangle centred at (3, 3), as the four segments the rectangle
+    /// tool would commit. Corners (1,2)-(5,2)-(5,4)-(1,4); centre (3,3).
+    fn rect_app() -> ZeroCadApp {
+        let mut app = ZeroCadApp::new();
+        let seg = |a, b| LineSegment { a, b };
+        app.sketch_curves.segments = vec![
+            seg((1.0, 2.0), (5.0, 2.0)), // bottom, midpoint (3,2)
+            seg((5.0, 2.0), (5.0, 4.0)), // right,  midpoint (5,3)
+            seg((5.0, 4.0), (1.0, 4.0)), // top,    midpoint (3,4)
+            seg((1.0, 4.0), (1.0, 2.0)), // left,   midpoint (1,3)
+        ];
+        app
+    }
+
+    // scale = 100 px/unit ⇒ tol = 0.09 units.
+    const SCALE: f32 = 100.0;
+
+    #[test]
+    fn snaps_to_plane_origin() {
+        let app = ZeroCadApp::new();
+        let res = app.snap_sketch_point_kind((0.04, -0.03), SCALE, false);
+        assert_eq!(res.kind, Some(SnapKind::Origin));
+        assert_eq!(res.pos, (0.0, 0.0));
+    }
+
+    #[test]
+    fn midpoint_wakes_perpendicular_guide() {
+        let app = rect_app();
+        // Near the bottom edge's midpoint (3,2); its midline is vertical.
+        let res = app.snap_sketch_point_kind((3.02, 2.01), SCALE, false);
+        assert_eq!(res.kind, Some(SnapKind::Midpoint));
+        let g = res.woke.expect("midpoint should wake a guide");
+        assert!((g.origin.0 - 3.0).abs() < 1e-4 && (g.origin.1 - 2.0).abs() < 1e-4);
+        // Perpendicular to a horizontal edge is vertical (±(0,1)).
+        assert!(g.dir.0.abs() < 1e-4 && (g.dir.1.abs() - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn woken_guide_snaps_rectangle_centre() {
+        let mut app = rect_app();
+        // Wake the bottom-edge guide (vertical through (3,2)).
+        app.snap_guides = vec![MidlineGuide {
+            origin: (3.0, 2.0),
+            dir: (0.0, 1.0),
+        }];
+        // Hover near the centre (3,3): the guide crosses the left/right midlines.
+        let res = app.snap_sketch_point_kind((3.03, 2.98), SCALE, false);
+        assert_eq!(res.kind, Some(SnapKind::MidlineCenter));
+        assert!((res.pos.0 - 3.0).abs() < 1e-4 && (res.pos.1 - 3.0).abs() < 1e-4);
+        assert!(!res.guides_used.is_empty());
+    }
+
+    #[test]
+    fn woken_guide_snaps_along_midline() {
+        let mut app = rect_app();
+        app.snap_guides = vec![MidlineGuide {
+            origin: (3.0, 2.0),
+            dir: (0.0, 1.0),
+        }];
+        // Off to the side of the vertical guide, away from any centre/point.
+        let res = app.snap_sketch_point_kind((3.04, 2.5), SCALE, false);
+        assert_eq!(res.kind, Some(SnapKind::Midline));
+        // Projected back onto the guide's x = 3 line.
+        assert!((res.pos.0 - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ctrl_suppresses_all_snapping() {
+        let app = rect_app();
+        let res = app.snap_sketch_point_kind((3.02, 2.01), SCALE, true);
+        assert_eq!(res.kind, None);
+        assert_eq!(res.pos, (3.02, 2.01));
+    }
+
+    #[test]
+    fn line_angle_rounds_to_nearest_fifteen_degrees_without_changing_length() {
+        let start = (2.0, -1.0);
+        let cursor = (11.0, 3.2); // about 25 degrees: should round to 30
+        let snapped = snap_line_angle(start, cursor);
+        let dx = snapped.0 - start.0;
+        let dy = snapped.1 - start.1;
+        assert!((dy.atan2(dx).to_degrees() - 30.0).abs() < 1e-4);
+
+        let original_length = ((cursor.0 - start.0).powi(2) + (cursor.1 - start.1).powi(2)).sqrt();
+        let snapped_length = (dx * dx + dy * dy).sqrt();
+        assert!((snapped_length - original_length).abs() < 1e-4);
     }
 }
