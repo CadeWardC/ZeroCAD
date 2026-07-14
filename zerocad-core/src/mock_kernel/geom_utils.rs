@@ -77,9 +77,9 @@ pub fn components_form_connected_material(parts: &[KernelSolid]) -> bool {
     reached[0] = true;
     let mut pending = vec![0usize];
     while let Some(current) = pending.pop() {
-        for candidate in 0..parts.len() {
-            if !reached[candidate] && touches(current, candidate) {
-                reached[candidate] = true;
+        for (candidate, connected) in reached.iter_mut().enumerate() {
+            if !*connected && touches(current, candidate) {
+                *connected = true;
                 pending.push(candidate);
             }
         }

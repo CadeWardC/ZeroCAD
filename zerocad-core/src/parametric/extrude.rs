@@ -1088,9 +1088,7 @@ pub(crate) fn fuse_overlapping_solids(parts: Vec<KernelSolid>) -> Vec<KernelSoli
                         if let Some(aggregate) =
                             crate::mock_kernel::aggregate_solid_components(&components)
                         {
-                            if aggregate.is_watertight()
-                                && aggregate.health_report().is_healthy()
-                            {
+                            if aggregate.is_watertight() && aggregate.health_report().is_healthy() {
                                 *existing = aggregate;
                                 merged = true;
                                 break;
