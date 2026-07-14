@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 
-use openrcad_foundation::{Ax3, Dir, Pnt};
+use openrcad_foundation::{Ax22d, Ax3, Dir, Dir2d, Pnt, Pnt2d, TolerancePolicy};
 use openrcad_geom::{GeomCurve, GeomSurface};
-use openrcad_topo::Solid;
+use openrcad_geom2d::{BSplineCurve2d, Curve2d, GeomCurve2d};
+use openrcad_topo::{PcurveData, Solid};
 
 struct StepWriter {
     next_id: u32,
@@ -74,6 +75,188 @@ impl StepWriter {
                 loc_id, axis_id, ref_dir_id
             ),
         );
+        id
+    }
+
+    fn write_point2d(&mut self, point: Pnt2d) -> u32 {
+        let id = self.alloc_id();
+        self.write_line(
+            id,
+            format!("CARTESIAN_POINT('', ({}, {}))", f(point.x()), f(point.y())),
+        );
+        id
+    }
+
+    fn write_direction2d(&mut self, direction: Dir2d) -> u32 {
+        let id = self.alloc_id();
+        self.write_line(
+            id,
+            format!(
+                "DIRECTION('', ({}, {}))",
+                f(direction.x()),
+                f(direction.y())
+            ),
+        );
+        id
+    }
+
+    fn write_vector2d(&mut self, direction: Dir2d) -> u32 {
+        let direction_id = self.write_direction2d(direction);
+        let id = self.alloc_id();
+        self.write_line(id, format!("VECTOR('', #{direction_id}, 1.0)"));
+        id
+    }
+
+    fn write_axis2_placement_2d(&mut self, position: Ax22d) -> u32 {
+        let location = self.write_point2d(position.location());
+        let reference = self.write_direction2d(position.x_direction());
+        let id = self.alloc_id();
+        self.write_line(
+            id,
+            format!("AXIS2_PLACEMENT_2D('', #{location}, #{reference})"),
+        );
+        id
+    }
+
+    fn write_bspline_curve2d(&mut self, curve: &BSplineCurve2d) -> u32 {
+        let poles = curve
+            .poles()
+            .iter()
+            .map(|point| self.write_point2d(*point))
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let multiplicities = curve
+            .multiplicities()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let knots = curve
+            .knots()
+            .iter()
+            .map(|value| f(*value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let id = self.alloc_id();
+        if let Some(weights) = curve.weights() {
+            let weights = weights
+                .iter()
+                .map(|value| f(*value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.write_line(
+                id,
+                format!(
+                    "(B_SPLINE_CURVE({}, ({}), .UNSPECIFIED., .F., .F.) B_SPLINE_CURVE_WITH_KNOTS(({}), ({}), .UNSPECIFIED.) BOUNDED_CURVE() CURVE() GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(({})) REPRESENTATION_ITEM())",
+                    curve.degree(), poles, multiplicities, knots, weights
+                ),
+            );
+        } else {
+            self.write_line(
+                id,
+                format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('', {}, ({}), .UNSPECIFIED., .F., .F., ({}), ({}), .UNSPECIFIED.)",
+                    curve.degree(), poles, multiplicities, knots
+                ),
+            );
+        }
+        id
+    }
+
+    fn write_curve2d(&mut self, curve: &GeomCurve2d, range: (f64, f64)) -> (u32, f64) {
+        match curve {
+            GeomCurve2d::Line(line) => {
+                let location = self.write_point2d(line.location());
+                let vector = self.write_vector2d(line.direction());
+                let id = self.alloc_id();
+                self.write_line(id, format!("LINE('', #{location}, #{vector})"));
+                (id, 1.0)
+            }
+            GeomCurve2d::Circle(circle) => {
+                let axis = self.write_axis2_placement_2d(circle.position());
+                let id = self.alloc_id();
+                self.write_line(
+                    id,
+                    format!("CIRCLE('', #{axis}, {})", f(circle.radius())),
+                );
+                let canonical_y = circle.position().x_direction().rotated_90();
+                let parameter_scale = if canonical_y.dot(&circle.position().y_direction()) >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                (id, parameter_scale)
+            }
+            GeomCurve2d::Ellipse(ellipse) => {
+                let axis = self.write_axis2_placement_2d(ellipse.position());
+                let id = self.alloc_id();
+                self.write_line(
+                    id,
+                    format!(
+                        "ELLIPSE('', #{axis}, {}, {})",
+                        f(ellipse.major_radius()),
+                        f(ellipse.minor_radius())
+                    ),
+                );
+                let canonical_y = ellipse.position().x_direction().rotated_90();
+                let parameter_scale =
+                    if canonical_y.dot(&ellipse.position().y_direction()) >= 0.0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                (id, parameter_scale)
+            }
+            GeomCurve2d::BSpline(curve) => (self.write_bspline_curve2d(curve), 1.0),
+            // STEP readers in the supported subset do not agree on analytic
+            // 2D conics beyond circles/ellipses. Preserve the stored interval
+            // as a deterministic degree-1 curve instead.
+            GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => {
+                let count = 65;
+                let poles = (0..count)
+                    .map(|index| {
+                        let fraction = index as f64 / (count - 1) as f64;
+                        curve.point(range.0 + fraction * (range.1 - range.0))
+                    })
+                    .collect::<Vec<_>>();
+                let knots = (0..count).map(|index| index as f64).collect::<Vec<_>>();
+                let multiplicities = (0..count)
+                    .map(|index| if index == 0 || index == count - 1 { 2 } else { 1 })
+                    .collect::<Vec<_>>();
+                (
+                    self.write_bspline_curve2d(&BSplineCurve2d::new(
+                        1,
+                        poles,
+                        None,
+                        knots,
+                        multiplicities,
+                    )),
+                    1.0,
+                )
+            }
+        }
+    }
+
+    fn write_pcurve(&mut self, surface: u32, pcurve: &PcurveData) -> u32 {
+        let (basis, parameter_scale) =
+            self.write_curve2d(&pcurve.curve, (pcurve.first, pcurve.last));
+        let trimmed = self.alloc_id();
+        self.write_line(
+            trimmed,
+            format!(
+                "TRIMMED_CURVE('', #{basis}, (PARAMETER_VALUE({})), (PARAMETER_VALUE({})), .T., .PARAMETER.)",
+                f(parameter_scale * pcurve.first),
+                f(parameter_scale * pcurve.last)
+            ),
+        );
+        let representation = self.alloc_id();
+        self.write_line(
+            representation,
+            format!("DEFINITIONAL_REPRESENTATION('', (#{trimmed}), $)"),
+        );
+        let id = self.alloc_id();
+        self.write_line(id, format!("PCURVE('', #{surface}, #{representation})"));
         id
     }
 
@@ -383,6 +566,16 @@ fn f(val: f64) -> String {
 
 /// Write `solid` to `path` as a STEP file (AP242 B-Rep).
 pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
+    solid
+        .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let health = solid.health_report_with_policy(&TolerancePolicy::STANDARD);
+    if !health.is_healthy() || !solid.is_watertight_with_policy(&TolerancePolicy::STANDARD) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("STEP output requires a healthy watertight solid: {health:?}"),
+        ));
+    }
     let mut writer = StepWriter::new();
     let brep = solid.brep();
 
@@ -391,6 +584,7 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     let mut loop_map = HashMap::new();
     let mut face_map = HashMap::new();
     let mut shell_map = HashMap::new();
+    let mut surface_map = HashMap::new();
 
     // 1. Write vertices
     for (v_id, v_data) in &brep.vertices {
@@ -400,11 +594,46 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         vertex_map.insert(v_id, v_step_id);
     }
 
-    // 2. Write edges
+    // 2. Write carrying surfaces first so each edge can reference every
+    // face-local PCURVE associated with its 3D curve.
+    for (face_id, face) in &brep.faces {
+        let surface = face.surface.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("STEP face {face_id:?} has no carrying surface"),
+            )
+        })?;
+        surface_map.insert(face_id, writer.write_surface(surface));
+    }
+
+    let mut edge_pcurves = HashMap::<_, Vec<(u32, _)>>::new();
+    for (face_id, face) in &brep.faces {
+        let surface = surface_map[&face_id];
+        for loop_id in face
+            .outer_wire
+            .into_iter()
+            .chain(face.inner_wires.iter().copied())
+        {
+            for coedge in &brep.loops[loop_id].edges {
+                let pcurve = coedge.pcurve.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("STEP coedge {:?} has no pcurve", coedge.id),
+                    )
+                })?;
+                edge_pcurves
+                    .entry(coedge.id)
+                    .or_default()
+                    .push((surface, pcurve));
+            }
+        }
+    }
+
+    // 3. Write 3D edges with their stored 2D representations.
     for (e_id, e_data) in &brep.edges {
         let start_v = vertex_map[&e_data.start];
         let end_v = vertex_map[&e_data.end];
-        let curve_id = if let Some(ref c) = e_data.curve {
+        let curve_3d = if let Some(ref c) = e_data.curve {
             writer.write_curve_ranged(c, Some((e_data.first, e_data.last)))
         } else {
             // Degenerate edge: write a dummy line at start point
@@ -414,6 +643,31 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
             let line_id = writer.alloc_id();
             writer.write_line(line_id, format!("LINE('', #{}, #{})", loc_id, vec_id));
             line_id
+        };
+        let associations = edge_pcurves.get(&e_id).cloned().unwrap_or_default();
+        let curve_id = if associations.is_empty() {
+            curve_3d
+        } else {
+            let pcurves = associations
+                .iter()
+                .map(|(surface, pcurve)| writer.write_pcurve(*surface, &brep.pcurves[*pcurve]))
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let is_seam = associations.iter().enumerate().any(|(index, item)| {
+                associations[..index]
+                    .iter()
+                    .any(|previous| previous.0 == item.0)
+            });
+            let id = writer.alloc_id();
+            writer.write_line(
+                id,
+                format!(
+                    "{}('', #{curve_3d}, ({pcurves}), .PCURVE_S1.)",
+                    if is_seam { "SEAM_CURVE" } else { "SURFACE_CURVE" }
+                ),
+            );
+            id
         };
 
         // EDGE_CURVE same_sense reflects whether the edge runs along the curve's
@@ -435,7 +689,7 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         edge_map.insert(e_id, edge_step_id);
     }
 
-    // 3. Write loops
+    // 4. Write loops
     for (l_id, l_data) in &brep.loops {
         let mut oriented_edge_ids = Vec::new();
         for oe in &l_data.edges {
@@ -463,14 +717,9 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         loop_map.insert(l_id, loop_step_id);
     }
 
-    // 4. Write faces
+    // 5. Write faces
     for (f_id, f_data) in &brep.faces {
-        let surface_id = if let Some(ref s) = f_data.surface {
-            writer.write_surface(s)
-        } else {
-            let plane = openrcad_geom::Plane::new(Ax3::new(Pnt::origin(), Dir::new(0.0, 0.0, 1.0)));
-            writer.write_surface(&GeomSurface::Plane(plane))
-        };
+        let surface_id = surface_map[&f_id];
 
         let mut bound_ids = Vec::new();
         if let Some(outer_l) = f_data.outer_wire {
@@ -510,7 +759,7 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         face_map.insert(f_id, face_step_id);
     }
 
-    // 5. Write shells
+    // 6. Write shells
     for (sh_id, sh_data) in &brep.shells {
         let face_list = sh_data
             .faces
@@ -523,7 +772,7 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         shell_map.insert(sh_id, shell_step_id);
     }
 
-    // 6. Write solids
+    // 7. Write solids
     let solid_data = &brep.solids[solid.id()];
     let shell_step_id = shell_map[&solid_data.shells[0]];
     let solid_step_id = writer.alloc_id();

@@ -4,6 +4,9 @@ pub const SMALL_CORPUS: &str = "small_part";
 pub const HUNDRED_FEATURE_CORPUS: &str = "dependent_100_feature";
 pub const FIVE_HUNDRED_FEATURE_CORPUS: &str = "dependent_500_feature";
 pub const IMPORTED_STEP_CORPUS: &str = "imported_step_box";
+#[cfg(test)]
+#[allow(dead_code)]
+pub const EXTERNAL_STEP_CORPUS: &str = "external_nist_bracket";
 pub const DIFFICULT_KERNEL_CORPUS: &str = "difficult_through_hole";
 
 fn add_feature(graph: &mut ParametricGraph, id: &str, name: &str, feature: FeatureType) {
@@ -130,6 +133,26 @@ pub fn imported_step_history() -> ParametricGraph {
         FeatureType::Import {
             step_data: box_step_data(),
             label: "phase0_imported_box.step".to_string(),
+        },
+    );
+    graph
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn external_step_history() -> ParametricGraph {
+    let mut graph = ParametricGraph::new();
+    add_feature(
+        &mut graph,
+        "external_import_1",
+        "NIST AP203 bracket",
+        FeatureType::Import {
+            step_data: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/step/nist-bracket1-part.stp"
+            ))
+            .to_string(),
+            label: "nist-bracket1-part.stp".to_string(),
         },
     );
     graph

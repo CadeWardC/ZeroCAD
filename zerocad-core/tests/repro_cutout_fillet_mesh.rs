@@ -14,6 +14,10 @@ use zerocad_core::{
 };
 
 const MESH_CHORD_ERR: f64 = 0.05;
+// The known-good trimmed face currently peaks near 20.73. Keep modest headroom
+// for platform-level floating-point variation while still rejecting the long
+// diagonal/sliver that originally crossed the cylindrical display face.
+const MAX_TRIMMED_CYLINDER_TRIANGLE_ASPECT: f64 = 25.0;
 
 #[test]
 fn cutout_fillet_cylinder_mesh_has_no_visual_diagonal() {
@@ -122,6 +126,12 @@ fn cutout_fillet_cylinder_mesh_has_no_visual_diagonal() {
             stats.max_edge_sagitta <= MESH_CHORD_ERR * 1.25,
             "cylinder face {fid} has an edge whose cylinder sagitta exceeds tolerance: {}",
             stats.max_edge_sagitta
+        );
+        assert!(
+            stats.max_triangle_aspect <= MAX_TRIMMED_CYLINDER_TRIANGLE_ASPECT,
+            "cylinder face {fid} contains an elongated display triangle: aspect {} > {}",
+            stats.max_triangle_aspect,
+            MAX_TRIMMED_CYLINDER_TRIANGLE_ASPECT
         );
     }
 
@@ -234,6 +244,7 @@ struct CylinderStats {
     max_non_axial_surface_edge_hoop: f64,
     max_non_axial_surface_edge_axial: f64,
     max_edge_sagitta: f64,
+    max_triangle_aspect: f64,
     radial_samples: usize,
     radial_alignment_sum: f64,
     min_radial_alignment: f64,
@@ -251,6 +262,7 @@ impl Default for CylinderStats {
             max_non_axial_surface_edge_hoop: 0.0,
             max_non_axial_surface_edge_axial: 0.0,
             max_edge_sagitta: 0.0,
+            max_triangle_aspect: 0.0,
             radial_samples: 0,
             radial_alignment_sum: 0.0,
             min_radial_alignment: f64::INFINITY,
@@ -283,6 +295,9 @@ fn cylinder_face_stats(mesh: &MockMesh, fid: u32, cyl: CylindricalSurface) -> Cy
         }
 
         stats.triangles += 1;
+        stats.max_triangle_aspect = stats
+            .max_triangle_aspect
+            .max(display_triangle_aspect(mesh, tri));
         for &vi in tri {
             let p = pos(mesh, vi);
             let n = normal(mesh, vi);
@@ -323,6 +338,26 @@ fn cylinder_face_stats(mesh: &MockMesh, fid: u32, cyl: CylindricalSurface) -> Cy
     }
 
     stats
+}
+
+/// Normalized longest-edge/area aspect ratio for one display triangle.
+/// An equilateral triangle is 1.0; increasingly long, skinny diagonals grow
+/// without bound. This measures the emitted display mesh directly rather than
+/// inferring quality from pcurves or B-Rep manifold checks.
+fn display_triangle_aspect(mesh: &MockMesh, tri: &[u32]) -> f64 {
+    let p0 = pos(mesh, tri[0]);
+    let p1 = pos(mesh, tri[1]);
+    let p2 = pos(mesh, tri[2]);
+    let e01 = p1 - p0;
+    let e02 = p2 - p0;
+    let e12 = p2 - p1;
+    let longest_squared = e01.dot(&e01).max(e02.dot(&e02)).max(e12.dot(&e12));
+    let double_area = e01.cross(&e02).magnitude();
+    if double_area <= 1.0e-12 {
+        f64::INFINITY
+    } else {
+        (3.0_f64.sqrt() * 0.5) * longest_squared / double_area
+    }
 }
 
 type MeshEdgeKey = ((i64, i64, i64), (i64, i64, i64));

@@ -26,7 +26,26 @@ is retained as-is so later work is compared against the real starting point.
 
 ## Kernel and document workloads
 
-The reproducible runner is:
+The frozen machine-readable values are committed in
+`benchmarks/phase0-baseline.json`. The complete Windows measurement and
+comparison command is:
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File benchmarks/check-phase0.ps1
+```
+
+It rebuilds the release GUI, measures startup and memory, runs the core corpus
+runner, and fails if a measured time, footprint, or file size is more than 10%
+above the committed baseline. A 0.5 ms absolute noise floor applies only to the
+short core timers; file sizes and application measurements keep the strict
+relative threshold. Use `-SkipGui` for a core-only check and
+`-OutputPath target/phase0-current.json` to retain a fresh report. The script
+refuses to overwrite the frozen baseline; changes to that file require an
+explicit, reviewed edit with the correctness justification recorded alongside
+it. A retained report can be checked again without remeasuring by passing
+`-CurrentReportPath target/phase0-current.json`.
+
+The core-only reproducible runner is:
 
 ```text
 cargo run --release -p zerocad-core --example phase0_baseline
@@ -54,6 +73,15 @@ dimensions, and feature counts are pinned by
 3. `dependent_500_feature`
 4. `imported_step_box`
 5. `difficult_through_hole`
+
+The historical `imported_step_box` performance row remains the writer/reader
+round-trip workload used when these numbers were captured. Import correctness
+is additionally gated by the committed externally authored NIST AP203 bracket
+at `zerocad-core/tests/fixtures/step/nist-bracket1-part.stp`; the Phase 0 corpus
+tests drive it through the importer and lock in the current explicit,
+deterministic `INTERSECTION_CURVE` unsupported-entity diagnostic. Once that
+curve type is supported, the same immutable fixture becomes a successful-import
+health and repeatability gate.
 
 The Criterion benchmark in `zerocad-core/benches/modeling_pipeline.rs` consumes
 the same constructors, preventing benchmark and regression workloads from

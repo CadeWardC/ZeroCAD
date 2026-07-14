@@ -1620,6 +1620,7 @@ fn representation_curve2d_reference(
 fn parse_associated_pcurve(
     surface_curve: u32,
     surface_ref: u32,
+    occurrence: usize,
     surface: &GeomSurface,
     edge_start: Pnt,
     edge_end: Pnt,
@@ -1634,6 +1635,7 @@ fn parse_associated_pcurve(
     };
     let periodicity = periodicity_for_surface(surface);
 
+    let mut candidates = Vec::new();
     for associated_geometry in associated {
         let StepValue::Ref(pcurve_ref) = associated_geometry else {
             continue;
@@ -1696,10 +1698,10 @@ fn parse_associated_pcurve(
         }
         let pcurve = PcurveData::new(curve, first, last).with_periodicity(periodicity);
         if pcurve.is_valid() {
-            return Some(pcurve);
+            candidates.push(pcurve);
         }
     }
-    None
+    (!candidates.is_empty()).then(|| candidates[occurrence % candidates.len()].clone())
 }
 
 fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result<Solid, String> {
@@ -1709,6 +1711,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
     let mut edge_map = HashMap::new();
     let mut loop_map = HashMap::new();
     let mut face_map = HashMap::new();
+    let mut pcurve_occurrences = HashMap::<(u32, u32), usize>::new();
 
     let shell_ent = entities
         .get(&shell_id)
@@ -1990,13 +1993,25 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
 
                         let curve = parse_curve(curve_ref, &entities)?;
                         let first = project_on_curve(&curve, brep.vertices[start_v_id].point);
-                        let last = project_on_curve(&curve, brep.vertices[end_v_id].point);
+                        let mut last = project_on_curve(&curve, brep.vertices[end_v_id].point);
+                        if curve.is_periodic() {
+                            let period = curve.period();
+                            if curve_same_sense {
+                                while last <= first {
+                                    last += period;
+                                }
+                            } else {
+                                while last >= first {
+                                    last -= period;
+                                }
+                            }
+                        }
 
                         // The edge is stored in its natural sense (start -> end with the
-                        // projected first/last params). The EDGE_CURVE `same_sense` flag is
-                        // recovered on export from whether `first <= last`; loop-traversal
-                        // orientation lives per-use in each ORIENTED_EDGE.
-                        let _ = curve_same_sense;
+                        // projected first/last params). On periodic curves the
+                        // EDGE_CURVE sense selects the correct unwrapped branch
+                        // (for example 0 -> -pi/2 instead of 0 -> 3pi/2).
+                        // Loop-traversal orientation remains per ORIENTED_EDGE.
                         let e_id = brep.edges.insert(EdgeData {
                             curve: Some(curve),
                             first,
@@ -2019,15 +2034,20 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                         _ => return Err(format!("Expected EDGE_CURVE at #{edge_ref}")),
                     };
                     let edge_data = &brep.edges[e_id];
+                    let occurrence = pcurve_occurrences
+                        .entry((surface_curve_ref, surface_ref))
+                        .or_default();
                     let pcurve = parse_associated_pcurve(
                         surface_curve_ref,
                         surface_ref,
+                        *occurrence,
                         &surface,
                         brep.vertices[edge_data.start].point,
                         brep.vertices[edge_data.end].point,
                         &entities,
                     )
                     .map(|data| brep.pcurves.insert(data));
+                    *occurrence += 1;
 
                     oriented_edges.push(OrientedEdge {
                         id: e_id,
@@ -2078,16 +2098,16 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
 }
 
 /// Read a STEP file at `path` into a [`Solid`] (AP242 B-Rep).
-pub fn read_step(path: &str) -> io::Result<Solid> {
+pub(crate) fn read_step_unchecked(path: &str) -> io::Result<Solid> {
     let content = fs::read_to_string(path)?;
-    read_step_str(&content)
+    read_step_str_unchecked(&content)
 }
 
 /// Parse STEP file text into a [`Solid`] (AP242 B-Rep).
 ///
-/// Same semantics as [`read_step`], but takes the file contents directly so
+/// Same parser semantics as [`read_step_unchecked`], but takes the file contents directly so
 /// callers that embed STEP data (e.g. a document format) avoid the filesystem.
-pub fn read_step_str(content: &str) -> io::Result<Solid> {
+pub(crate) fn read_step_str_unchecked(content: &str) -> io::Result<Solid> {
     let stripped = strip_comments(content);
 
     let data_start = stripped

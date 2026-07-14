@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "profile": "cargo run --release -p zerocad-core --example phase0_baseline",
+  "captured_on": "2026-07-14",
+  "reference_machine": {
+    "os": "Microsoft Windows 11 Home 10.0.26200",
+    "cpu": "AMD Ryzen 7 7840HS with Radeon 780M Graphics",
+    "memory_bytes": 16309932032,
+    "rust": "rustc 1.94.0 (4a4ef493e 2026-03-02)"
+  },
+  "application": {
+    "binary_bytes": 21829120,
+    "cold_start_ms": 1022.4,
+    "idle_working_set_bytes": 130306048,
+    "peak_startup_working_set_bytes": 154341376
+  },
+  "tessellation_ms": 1.8,
+  "tessellation_triangles": 192,
+  "corpora": [
+    {
+      "name": "small_part",
+      "feature_count": 4,
+      "body_count": 1,
+      "triangle_count": 4816,
+      "cold_rebuild_ms": 183.802,
+      "warm_rebuild_ms": 58.257,
+      "compact_save_ms": 2.555,
+      "compact_open_ms": 0.349,
+      "compact_bytes": 586,
+      "hydrated_bytes": 138383
+    },
+    {
+      "name": "dependent_100_feature",
+      "feature_count": 100,
+      "body_count": 1,
+      "triangle_count": 12,
+      "cold_rebuild_ms": 42.222,
+      "warm_rebuild_ms": 1.291,
+      "compact_save_ms": 2.737,
+      "compact_open_ms": 0.443,
+      "compact_bytes": 1350,
+      "hydrated_bytes": 17894
+    },
+    {
+      "name": "dependent_500_feature",
+      "feature_count": 500,
+      "body_count": 1,
+      "triangle_count": 12,
+      "cold_rebuild_ms": 212.891,
+      "warm_rebuild_ms": 31.073,
+      "compact_save_ms": 4.268,
+      "compact_open_ms": 1.712,
+      "compact_bytes": 4193,
+      "hydrated_bytes": 22665
+    },
+    {
+      "name": "imported_step_box",
+      "feature_count": 1,
+      "body_count": 1,
+      "triangle_count": 12,
+      "cold_rebuild_ms": 1.208,
+      "warm_rebuild_ms": 0.17,
+      "compact_save_ms": 3.303,
+      "compact_open_ms": 0.157,
+      "compact_bytes": 2055,
+      "hydrated_bytes": 5608
+    },
+    {
+      "name": "difficult_through_hole",
+      "feature_count": 4,
+      "body_count": 1,
+      "triangle_count": 6928,
+      "cold_rebuild_ms": 219.346,
+      "warm_rebuild_ms": 70.467,
+      "compact_save_ms": 2.356,
+      "compact_open_ms": 0.101,
+      "compact_bytes": 608,
+      "hydrated_bytes": 180385
+    }
+  ]
+}
