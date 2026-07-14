@@ -134,7 +134,6 @@ fn append_tangent_line_edges(solid: &KernelSolid, chain: &mut Vec<Edge>) {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn circle_edge_requests(solid: &KernelSolid, hint: &EdgeCurveHint) -> Option<Vec<Edge>> {
     let EdgeCurveHint::Circle {
         center,

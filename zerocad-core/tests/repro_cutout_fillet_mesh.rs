@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashSet};
 use openrcad::foundation::{Pnt, Vec as GeomVec};
 use openrcad::geom::{CylindricalSurface, GeomSurface};
 use zerocad_core::{
-    CoordinateSystem, CornerKind, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
-    MockMesh, ParametricGraph, SketchCurves, Vec3,
+    CoordinateSystem, CornerKind, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, MockMesh,
+    ParametricGraph, SketchCurves, Vec3,
 };
 
 const MESH_CHORD_ERR: f64 = 0.05;
@@ -189,7 +189,6 @@ fn cutout_fillet_repro_graph() -> ParametricGraph {
             },
             dist: 3.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },

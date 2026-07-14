@@ -276,12 +276,67 @@ fn disjoint_shapes_are_not_booleaned() {
         warnings.is_empty(),
         "disjoint extrude is clean, got {warnings:?}"
     );
+    assert_eq!(
+        bodies.len(),
+        2,
+        "disconnected New Body regions must be independent bodies"
+    );
     let vol: f32 = bodies.iter().map(|(_, m)| mesh_volume(&m)).sum();
     // 100·10 + (π·16)·10 ≈ 1000 + 503 = 1503; neither shape is cut by the other.
     assert!(
         vol > 1430.0 && vol < 1560.0,
         "both shapes present (no cut), volume ≈1503, got {vol}"
     );
+}
+
+#[test]
+fn concentric_disjoint_regions_stay_separate_valid_parts() {
+    // Two selected annuli have nested AABBs but a real radial gap. The kernel
+    // may represent their union as one Solid containing two shells; New Body
+    // must keep those shells as separate connected parts instead of letting the
+    // evaluator reject the feature as disconnected topology.
+    let mut curves = SketchCurves::new();
+    for radius in [10.0, 8.0, 5.0, 3.0] {
+        curves.add_circle((0.0, 0.0), radius);
+    }
+    let regions = crate::sketch::detect_regions(&curves);
+    let selected: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, region)| region.contains((9.0, 0.0)) || region.contains((4.0, 0.0)))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(selected.len(), 2, "expected the two annular regions");
+
+    let mut graph = ParametricGraph::new();
+    add_sketch(&mut graph, "sketch_1", curves);
+    add_extrude_sel(
+        &mut graph,
+        "extrude_2",
+        "sketch_1",
+        6.0,
+        ExtrudeMode::NewBody,
+        selected,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&HashSet::new())
+        .expect("evaluate two-ring extrusion");
+    assert!(
+        warnings.is_empty(),
+        "two disconnected New Body regions are valid: {warnings:?}"
+    );
+    assert_eq!(bodies.len(), 2, "the two annuli must be separate bodies");
+    assert_eq!(bodies[0].0, "extrude_2");
+    assert_eq!(bodies[1].0, "extrude_2::body:2");
+    let solids = graph
+        .debug_kernel_solids(&HashSet::new())
+        .expect("inspect two-ring extrusion");
+    assert_eq!(solids.len(), 2);
+    assert!(solids
+        .iter()
+        .flat_map(|(_, parts)| parts)
+        .all(|part| part.split_disconnected().len() == 1));
 }
 
 #[test]

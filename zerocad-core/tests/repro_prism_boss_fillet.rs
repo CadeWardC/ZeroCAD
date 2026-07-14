@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 
 use zerocad_core::{
-    CoordinateSystem, CornerKind, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
-    ParametricGraph, SketchCurves, Vec3,
+    CoordinateSystem, CornerKind, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, ParametricGraph,
+    SketchCurves, Vec3,
 };
 
 const PRISM_H: f32 = 20.0;
@@ -231,7 +231,6 @@ fn fillet_boss_plane_seam_edge() {
             },
             dist: 3.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },
@@ -344,7 +343,6 @@ fn fillet_really_sharp_prism_corner_edge_gui_path() {
             },
             dist: 3.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },
@@ -379,7 +377,6 @@ fn fillet_acute_prism_corner_edge_gui_path() {
             },
             dist: 3.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },
@@ -414,7 +411,6 @@ fn fillet_prism_top_edge_with_boss_bite() {
             },
             dist: 3.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },

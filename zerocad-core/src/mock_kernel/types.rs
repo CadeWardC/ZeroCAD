@@ -85,6 +85,9 @@ pub struct MeshFaceRef {
 pub struct MeshTopologyFaceRef {
     #[serde(default)]
     pub body_id: Option<String>,
+    /// Canonical identity of the connected solid component that owns this face.
+    #[serde(default)]
+    pub component_id: Option<String>,
     #[serde(default)]
     pub topology_version: Option<u64>,
     /// Stable face name (its "owner"), e.g. `sketch:extrude_3:region:0:face:top`.

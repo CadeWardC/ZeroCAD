@@ -1,6 +1,3 @@
-#[allow(unused_imports)]
-use super::*;
-
 /// Number of segments used to draw a smooth circular wireframe outline.
 pub(crate) const CYL_WIRE_SEGS: usize = crate::CIRCLE_SEGS;
 

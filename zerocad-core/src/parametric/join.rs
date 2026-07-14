@@ -116,9 +116,13 @@ fn try_body_union(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
     }
     let unioned = crate::mock_kernel::union(a, b)?;
     let ubb = crate::mock_kernel::solid_aabb(&unioned)?;
+    let connected = unioned.split_disconnected().len() <= 1;
     (crate::mock_kernel::aabb_contains(&ubb, &abb, 0.05)
-        && crate::mock_kernel::aabb_contains(&ubb, &bbb, 0.05))
-    .then_some(unioned)
+        && crate::mock_kernel::aabb_contains(&ubb, &bbb, 0.05)
+        && unioned.is_watertight()
+        && unioned.health_report().is_healthy()
+        && connected)
+        .then_some(unioned)
 }
 
 /// How far a tool overshoots the sketch plane to break coplanarity, in mm.
@@ -203,13 +207,9 @@ pub(crate) fn overshoot_depth(depth: f32, ends: f32) -> f32 {
     depth + depth.signum() * ends * CUT_OVERSHOOT
 }
 
-/// Apply a Join extrude: union each tool into the first existing body it
-/// overlaps. For each candidate body it tries the exact tool first (perfect
-/// geometry), then the dipped tool (breaks coplanar faces). A tool that joins
-/// nothing — exact or dipped — becomes a standalone new body under the
-/// extrude's id, matching Fusion's "join with nothing creates a body"; that
-/// outcome is surfaced as a warning since the user asked to *join*, not to
-/// create a separate lump.
+/// Apply a Join extrude as an atomic feature transaction. Every tool region must
+/// produce a connected, valid union. A failed Join never degrades into a
+/// separate body or an unfused component hidden inside the target body.
 ///
 /// `draft` is set for live drag previews: joining onto a threaded body then
 /// skips replaying the (expensive) helical thread so the preview stays fast —
@@ -223,172 +223,162 @@ pub(crate) fn apply_join(
     draft: bool,
     warnings: &mut Vec<String>,
 ) {
-    let mut orphans: Vec<KernelSolid> = Vec::new();
-    for tool in tools {
-        // Bounding box from whichever variant exists, for the overlap pre-test.
-        let tbb = tool
-            .smooth
-            .as_ref()
-            .or(tool.exact.as_ref())
-            .or(tool.dipped.as_ref())
-            .and_then(crate::mock_kernel::solid_aabb);
-
+    // Join is a feature-level transaction. Every region must fuse successfully;
+    // otherwise none of them are committed. This prevents a visually plausible
+    // but topologically false body containing overlapping, unfused solids.
+    let original = live.clone();
+    for tool in &tools {
         let mut merged = false;
-        if let Some(tbb) = tbb {
-            'bodies: for body in live.iter_mut() {
-                // Named targeting: only the pinned body may receive the boss.
-                if boolean_target.is_some_and(|t| t != body.id) {
-                    continue;
-                }
-                // Threaded body: a boolean against the helical bands is not viable
-                // (neither robust nor fast). Union the boss into the smooth
-                // pre-thread base instead, then replay the thread steps so the
-                // shaft stays threaded and the boss stays smooth. A miss falls
-                // through so the boss can still become its own body, never vanish.
-                if body.thread_replay.is_some() {
-                    if join_into_threaded_base(body, &tool, !draft) {
-                        merged = true;
-                        break 'bodies;
-                    }
-                    continue;
-                }
-                // Snapshot the input body's named mesh before mutating any part, so a
-                // captured face can survive the join's boolean (single-part case).
-                let input_mesh = if body.parts.len() == 1 {
-                    body.pristine.clone()
-                } else {
-                    None
-                };
-                // Exact-history plumbing: input face names per shell position.
-                // Join intentionally allows coplanar result faces to merge into
-                // one continuous face; the history assigns that merged face its
-                // surviving object-side identity.
-                let input_names: Option<Vec<Option<String>>> = match (&input_mesh, &body.parts[..])
-                {
-                    (Some(mesh), [part]) => {
-                        Some(crate::mock_kernel::input_shell_face_names(mesh, part))
-                    }
-                    _ => None,
-                };
-                let body_id = body.id.clone();
-                for part in body.parts.iter_mut() {
-                    let overlaps = crate::mock_kernel::solid_aabb(part).map_or(true, |pbb| {
-                        crate::mock_kernel::aabbs_overlap(&pbb, &tbb, 0.05)
-                    });
-                    if !overlaps {
-                        continue;
-                    }
-                    // Smooth analytic cylinder first (round boss), then the faceted
-                    // prism variants as robustness fallbacks. With a named input,
-                    // run through the history-emitting kernel entry so the union
-                    // gets exact face provenance + owner-aware merging.
-                    let try_union = |t: &KernelSolid| -> Option<(
-                        KernelSolid,
-                        Option<crate::mock_kernel::BooleanFaceHistory>,
-                    )> {
-                        if input_names.is_some() {
-                            // No owner classes for Fuse: different historical
-                            // owners must not leave a seam between coplanar faces.
-                            crate::mock_kernel::union_with_history(part, t, None)
-                                .map(|(u, h)| (u, Some(h)))
-                        } else {
-                            crate::mock_kernel::union(part, t).map(|u| (u, None))
-                        }
-                    };
-                    let unioned = tool
-                        .smooth
-                        .as_ref()
-                        .and_then(&try_union)
-                        .or_else(|| tool.exact.as_ref().and_then(&try_union))
-                        .or_else(|| tool.dipped.as_ref().and_then(&try_union));
-                    if let Some((u, history)) = unioned {
-                        // A join must never destroy existing material: `a ∪ b`
-                        // always contains `a`. truck can still hand back a
-                        // degenerate solid (e.g. an inverted tool that subtracts
-                        // the body) whose bounds no longer enclose the original —
-                        // reject those and leave the body untouched so the join
-                        // can only ever add, never remove.
-                        let keeps_body = match (
-                            crate::mock_kernel::solid_aabb(part),
-                            crate::mock_kernel::solid_aabb(&u),
-                        ) {
-                            (Some(pbb), Some(ubb)) => {
-                                crate::mock_kernel::aabb_contains(&ubb, &pbb, 0.05)
-                            }
-                            _ => true,
-                        };
-                        if keeps_body {
-                            // Propagate face names from the object body to the union
-                            // result. With an exact kernel history the boss's own new
-                            // faces ALSO get durable generated names
-                            // (`join:{node}:tool-face:{i}`); the matcher path leaves
-                            // them unnamed.
-                            let named = match (&history, &input_names, &input_mesh) {
-                                (Some(history), Some(names), Some(m)) => {
-                                    Some(crate::mock_kernel::propagate_face_names_via_history(
-                                        m,
-                                        names,
-                                        &u,
-                                        history,
-                                        &body_id,
-                                        &format!("join:{extrude_id}"),
-                                    ))
-                                }
-                                _ => input_mesh.as_ref().map(|m| {
-                                    crate::mock_kernel::propagate_face_names(m, &u, &body_id)
-                                }),
-                            };
-                            *part = u;
-                            body.pristine = named.map(std::sync::Arc::new);
-                            body.sketch_source = None;
-                            body.cut_replay = None;
-                            body.edge_mod_cut_history_path_used = false;
-                            merged = true;
-                            break 'bodies;
-                        }
-                    }
-                    if let Some(fallback) = tool
-                        .smooth
-                        .as_ref()
-                        .or(tool.exact.as_ref())
-                        .or(tool.dipped.as_ref())
-                        .cloned()
-                    {
-                        body.parts.push(fallback);
-                        body.pristine = None;
-                        body.sketch_source = None;
-                        body.cut_replay = None;
-                        body.edge_mod_cut_history_path_used = false;
-                        merged = true;
-                        break 'bodies;
-                    }
-                }
+        for body in live.iter_mut() {
+            if boolean_target.is_some_and(|target| target != body.id) {
+                continue;
+            }
+
+            let mut candidate = body.clone();
+            let success = if candidate.thread_replay.is_some() {
+                join_into_threaded_base(&mut candidate, tool, !draft)
+            } else {
+                join_tool_into_body(&mut candidate, tool, extrude_id)
+            };
+            if success {
+                *body = candidate;
+                merged = true;
+                break;
             }
         }
+
         if !merged {
-            // Joined nothing — keep the (preferably smooth) un-dipped volume as its
-            // own body.
-            if let Some(s) = tool.smooth.or(tool.exact).or(tool.dipped) {
-                warnings.push(format!(
-                    "Join '{extrude_id}': the extruded volume didn't overlap an \
-                     existing body, so it became a separate body."
-                ));
-                orphans.push(s);
-            }
+            *live = original;
+            warnings.push(format!(
+                "Join '{extrude_id}' could not produce one valid fused solid; \
+                 the feature was not applied and its input bodies were left unchanged."
+            ));
+            return;
         }
     }
-    if !orphans.is_empty() {
-        live.push(LiveBody {
-            id: extrude_id.to_string(),
-            parts: orphans,
-            pristine: None,
-            sketch_source: None,
-            cut_tools: Vec::new(),
-            cut_replay: None,
-            edge_mod_cut_history_path_used: false,
-            thread_replay: None,
-        });
+}
+
+/// Transactionally union one Join tool into a non-threaded body. All tool
+/// variants are tried against a clone; no body state changes until a validated,
+/// connected union exists. If the tool bridges multiple body components, the
+/// newly fused result is repeatedly unioned with every component it now touches.
+fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -> bool {
+    let input_mesh = (body.parts.len() == 1)
+        .then(|| body.pristine.clone())
+        .flatten();
+    let input_names = match (&input_mesh, &body.parts[..]) {
+        (Some(mesh), [part]) => Some(crate::mock_kernel::input_shell_face_names(mesh, part)),
+        _ => None,
+    };
+
+    for variant in [
+        tool.smooth.as_ref(),
+        tool.exact.as_ref(),
+        tool.dipped.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some((parts, history)) =
+            union_variant_into_parts(&body.parts, variant, input_names.is_some())
+        else {
+            continue;
+        };
+
+        let named = match (&history, &input_names, &input_mesh, parts.as_slice()) {
+            (Some(history), Some(names), Some(mesh), [part]) => {
+                Some(crate::mock_kernel::propagate_face_names_via_history(
+                    mesh,
+                    names,
+                    part,
+                    history,
+                    &body.id,
+                    &format!("join:{extrude_id}"),
+                ))
+            }
+            (_, _, Some(mesh), [part]) => Some(crate::mock_kernel::propagate_face_names(
+                mesh, part, &body.id,
+            )),
+            _ => None,
+        };
+
+        body.parts = parts;
+        body.pristine = named.map(std::sync::Arc::new);
+        body.sketch_source = None;
+        body.cut_replay = None;
+        body.edge_mod_cut_history_path_used = false;
+        return true;
     }
+    false
+}
+
+/// Fuse `tool` into a cloned part set and normalize the connected component it
+/// enters. The returned history is valid only for the single-part first union.
+fn union_variant_into_parts(
+    source_parts: &[KernelSolid],
+    tool: &KernelSolid,
+    capture_history: bool,
+) -> Option<(
+    Vec<KernelSolid>,
+    Option<crate::mock_kernel::BooleanFaceHistory>,
+)> {
+    let tool_bb = crate::mock_kernel::solid_aabb(tool)?;
+    for start in 0..source_parts.len() {
+        let part_bb = crate::mock_kernel::solid_aabb(&source_parts[start])?;
+        if !crate::mock_kernel::aabbs_overlap(&part_bb, &tool_bb, 0.05) {
+            continue;
+        }
+
+        let (mut merged, history) = if capture_history && source_parts.len() == 1 {
+            let (unioned, history) =
+                crate::mock_kernel::union_with_history(&source_parts[start], tool, None)?;
+            if !valid_union_result(&source_parts[start], tool, &unioned) {
+                continue;
+            }
+            (unioned, Some(history))
+        } else {
+            let Some(unioned) = try_body_union(&source_parts[start], tool) else {
+                continue;
+            };
+            (unioned, None)
+        };
+
+        let mut remaining: Vec<KernelSolid> = source_parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != start)
+            .map(|(_, part)| part.clone())
+            .collect();
+        let mut index = 0;
+        while index < remaining.len() {
+            if let Some(unioned) = try_body_union(&merged, &remaining[index]) {
+                merged = unioned;
+                remaining.remove(index);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        remaining.push(merged);
+        remaining.sort_by_key(crate::mock_kernel::part_key);
+        return Some((remaining, history));
+    }
+    None
+}
+
+fn valid_union_result(a: &KernelSolid, b: &KernelSolid, result: &KernelSolid) -> bool {
+    let (Some(abb), Some(bbb), Some(rbb)) = (
+        crate::mock_kernel::solid_aabb(a),
+        crate::mock_kernel::solid_aabb(b),
+        crate::mock_kernel::solid_aabb(result),
+    ) else {
+        return false;
+    };
+    crate::mock_kernel::aabb_contains(&rbb, &abb, 0.05)
+        && crate::mock_kernel::aabb_contains(&rbb, &bbb, 0.05)
+        && result.is_watertight()
+        && result.health_report().is_healthy()
+        && result.split_disconnected().len() <= 1
 }
 
 /// Union `tool` into a threaded body via its smooth pre-thread base
@@ -405,53 +395,19 @@ fn join_into_threaded_base(body: &mut LiveBody, tool: &JoinTool, rethread: bool)
     let Some(replay) = body.thread_replay.as_mut() else {
         return false;
     };
-    let Some(tbb) = tool
-        .smooth
-        .as_ref()
-        .or(tool.exact.as_ref())
-        .or(tool.dipped.as_ref())
-        .and_then(crate::mock_kernel::solid_aabb)
-    else {
+    let joined = [
+        tool.smooth.as_ref(),
+        tool.exact.as_ref(),
+        tool.dipped.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|variant| union_variant_into_parts(&replay.base_parts, variant, false))
+    .map(|(parts, _)| parts);
+    let Some(joined) = joined else {
         return false;
     };
-
-    // Union into the first smooth base part the boss overlaps. The base is a
-    // plain cylinder + rim blends, so this boolean is the robust one the
-    // helical geometry never was. `keeps_body` guards against a degenerate
-    // union that would remove material (a join must only ever add).
-    let mut joined = false;
-    for base in replay.base_parts.iter_mut() {
-        let overlaps = crate::mock_kernel::solid_aabb(base).map_or(true, |pbb| {
-            crate::mock_kernel::aabbs_overlap(&pbb, &tbb, 0.05)
-        });
-        if !overlaps {
-            continue;
-        }
-        let try_union = |t: &KernelSolid| crate::mock_kernel::union(base, t);
-        let unioned = tool
-            .smooth
-            .as_ref()
-            .and_then(&try_union)
-            .or_else(|| tool.exact.as_ref().and_then(&try_union))
-            .or_else(|| tool.dipped.as_ref().and_then(&try_union));
-        if let Some(u) = unioned {
-            let keeps_body = match (
-                crate::mock_kernel::solid_aabb(base),
-                crate::mock_kernel::solid_aabb(&u),
-            ) {
-                (Some(pbb), Some(ubb)) => crate::mock_kernel::aabb_contains(&ubb, &pbb, 0.05),
-                _ => true,
-            };
-            if keeps_body {
-                *base = u;
-                joined = true;
-                break;
-            }
-        }
-    }
-    if !joined {
-        return false;
-    }
+    replay.base_parts = joined;
 
     // Rebuild the displayed geometry from the (now boss-joined) smooth base and
     // replay every thread step on top. `body.parts` gets its own copy so the

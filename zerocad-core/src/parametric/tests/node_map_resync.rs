@@ -90,3 +90,26 @@ fn sole_sketch_parents_reports_consumed_sketch() {
     assert!(g.sole_sketch_parents("extrude_2").is_empty());
     assert!(g.sole_sketch_parents("missing").is_empty());
 }
+
+#[test]
+fn generated_body_output_dependency_resolves_to_owning_feature() {
+    let mut g = ParametricGraph::new();
+    add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (10.0, 10.0)));
+    add_extrude(&mut g, "extrude_2", "sketch_1", 5.0, ExtrudeMode::NewBody);
+    g.add_feature(FeatureNode {
+        id: "move_3".to_string(),
+        name: "Move".to_string(),
+        feature: FeatureType::BodyTransform {
+            source: body_output_id("extrude_2", 1),
+            translation: [1.0, 0.0, 0.0],
+            copy: true,
+        },
+    });
+    g.add_dependency("extrude_2::body:2", "move_3");
+
+    let owner = g.node_map["extrude_2"];
+    let child = g.node_map["move_3"];
+    assert!(g.graph.find_edge(owner, child).is_some());
+    assert_eq!(body_output_owner_id("extrude_2::body:2"), "extrude_2");
+    assert_eq!(body_output_index("extrude_2::body:2"), 1);
+}

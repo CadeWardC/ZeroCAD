@@ -28,7 +28,6 @@ mod arc_display;
 mod blend;
 mod boolean;
 mod circle_geom;
-mod edge_ops;
 mod geom_utils;
 mod history;
 mod mesh_topology;
@@ -42,7 +41,6 @@ pub(crate) use arc_display::*;
 pub use blend::*;
 pub use boolean::*;
 pub use circle_geom::*;
-pub use edge_ops::*;
 pub use geom_utils::*;
 #[allow(unused_imports)]
 pub use history::*;

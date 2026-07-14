@@ -15,7 +15,7 @@ use zerocad_core::{Region, SketchCurves};
 /// highlighted orange; everything else stays faint so picking one element never
 /// recolors the whole sketch. Edge indices are `segment i` for i < segment
 /// count, else `circle (i - segment count)`.
-pub fn draw_sketch_geometry(
+pub(crate) fn draw_sketch_geometry(
     painter: &egui::Painter,
     curves: &SketchCurves,
     regions: &[Region],
@@ -161,7 +161,11 @@ pub fn draw_sketch_geometry(
 
 /// The circle through three points (center, radius), or `None` if they are
 /// (near-)collinear. Used by the 3-point circle tool.
-pub fn circumcircle(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<((f32, f32), f32)> {
+pub(crate) fn circumcircle(
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+) -> Option<((f32, f32), f32)> {
     let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
     if d.abs() < 1e-6 {
         return None;
@@ -177,7 +181,7 @@ pub fn circumcircle(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<((f32
 }
 
 /// Closest point on segment AB to P (clamped to the segment).
-pub fn project_point_on_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+pub(crate) fn project_point_on_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
     let abx = b.0 - a.0;
     let aby = b.1 - a.1;
     let len2 = abx * abx + aby * aby;
@@ -189,7 +193,7 @@ pub fn project_point_on_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> 
 }
 
 /// Distance in screen space from point `p` to segment `a`-`b`.
-pub fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+pub(crate) fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let proj = project_point_on_segment((p.x, p.y), (a.x, a.y), (b.x, b.y));
     ((p.x - proj.0).powi(2) + (p.y - proj.1).powi(2)).sqrt()
 }
@@ -517,7 +521,7 @@ mod tests {
 }
 
 /// Standalone geometric helper to check if a point lies inside a convex 2D quad
-pub fn is_point_in_quad(p: egui::Pos2, quad: &[egui::Pos2; 4]) -> bool {
+pub(crate) fn is_point_in_quad(p: egui::Pos2, quad: &[egui::Pos2; 4]) -> bool {
     let side_test = |p1: egui::Pos2, p2: egui::Pos2, p: egui::Pos2| -> bool {
         (p2.x - p1.x) * (p.y - p1.y) - (p2.y - p1.y) * (p.x - p1.x) >= 0.0
     };

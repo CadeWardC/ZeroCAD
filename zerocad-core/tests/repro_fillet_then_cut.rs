@@ -4,8 +4,8 @@ use openrcad::foundation::Dir;
 use openrcad::geom::GeomSurface;
 use openrcad::topo::Solid;
 use zerocad_core::{
-    CoordinateSystem, CornerKind, EdgeModReplayIntent, EdgeModScope, EdgeRef, ExtrudeMode,
-    FeatureNode, FeatureType, MockMesh, ParametricGraph, SketchCurves, Vec3,
+    CoordinateSystem, CornerKind, EdgeModReplayIntent, EdgeRef, ExtrudeMode, FeatureNode,
+    FeatureType, MockMesh, ParametricGraph, SketchCurves, Vec3,
 };
 
 const BOX_W: f32 = 40.0;
@@ -44,7 +44,6 @@ fn add_front_top_fillet(g: &mut ParametricGraph) {
             },
             dist: FILLET_R as f32,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind: CornerKind::Fillet,
         },

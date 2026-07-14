@@ -260,7 +260,7 @@ impl SketchTool {
     }
 
     /// The icon representing this mode.
-    pub fn icon(self) -> icons::Icon {
+    pub(crate) fn icon(self) -> icons::Icon {
         match self {
             SketchTool::Line => icons::Icon::Line,
             SketchTool::Rectangle => icons::Icon::Rectangle,
@@ -368,6 +368,36 @@ pub enum BodyPick {
     Edge(u32),
     Vertex(u32),
     Whole,
+}
+
+/// Browser label for one runtime body emitted by a feature. The first output
+/// keeps the feature's label; numbered `Body_N` labels continue naturally for
+/// later disconnected outputs (Body_1, Body_2, ...).
+pub(crate) fn body_output_label(feature_label: &str, body_id: &str) -> String {
+    let output_index = zerocad_core::body_output_index(body_id);
+    if output_index == 0 {
+        return feature_label.to_string();
+    }
+
+    if let Some((prefix, number)) = feature_label.rsplit_once('_') {
+        if let Ok(number) = number.parse::<usize>() {
+            return format!("{prefix}_{}", number + output_index);
+        }
+    }
+
+    format!("{feature_label} ({})", output_index + 1)
+}
+
+#[cfg(test)]
+mod body_output_label_tests {
+    use super::body_output_label;
+
+    #[test]
+    fn disconnected_outputs_receive_separate_body_numbers() {
+        assert_eq!(body_output_label("Body_1", "extrude_5"), "Body_1");
+        assert_eq!(body_output_label("Body_1", "extrude_5::body:2"), "Body_2");
+        assert_eq!(body_output_label("Body_1", "extrude_5::body:3"), "Body_3");
+    }
 }
 
 /// What the Datum toolbar menu creates (see `app::datum::create_datum`).
@@ -747,11 +777,11 @@ struct ZeroCadApp {
     /// Debounce for exact Cut/Join previews. The lightweight ghost updates every
     /// frame; B-Rep work starts only after this key stays unchanged for 100 ms.
     extrude_preview_settle: Option<(u64, std::time::Instant)>,
-    /// Memoized live edge fillet/chamfer preview: `(input hash, bodies)`. Like
-    /// `extrude_preview_cache`, the underlying `preview_edge_mod_bodies` clones the
-    /// graph and re-runs every truck boolean — far too slow to redo on every
-    /// repaint while the size box is open or the handle is dragged. Recomputed only
-    /// when the size/kind/target actually change. Cleared when the op ends.
+    /// Memoized live edge fillet/chamfer preview: `(input hash, bodies)`. The
+    /// shared evaluator resolves the temporary edge-mod node in the background;
+    /// this cache avoids repeating that solve on every repaint while the size box
+    /// is open or the handle is dragged. Recomputed only when the
+    /// size/kind/target actually change. Cleared when the op ends.
     edge_mod_preview_cache: Option<(u64, SharedBodyMeshes)>,
     /// Memoized lightweight edge fillet/chamfer overlay mesh shown immediately
     /// while the exact worker-computed preview bodies are still pending.

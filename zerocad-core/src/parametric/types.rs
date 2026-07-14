@@ -17,6 +17,48 @@ impl Default for ExtrudeMode {
     }
 }
 
+/// Separator used for additional solid-body outputs owned by one feature.
+/// The first output keeps the feature id for backward compatibility; later
+/// outputs use `feature_id::body:N` with a one-based display number.
+const BODY_OUTPUT_SEPARATOR: &str = "::body:";
+
+/// Stable runtime id for one solid-body output of a feature.
+///
+/// Output index zero deliberately returns `feature_id` unchanged so existing
+/// documents and downstream references keep targeting the first body. Additional
+/// disconnected outputs receive deterministic ids such as `extrude_5::body:2`.
+pub fn body_output_id(feature_id: &str, output_index: usize) -> String {
+    if output_index == 0 {
+        feature_id.to_string()
+    } else {
+        format!("{feature_id}{BODY_OUTPUT_SEPARATOR}{}", output_index + 1)
+    }
+}
+
+/// Owning feature id for a runtime body id created by [`body_output_id`].
+pub fn body_output_owner_id(body_id: &str) -> &str {
+    let Some((owner, suffix)) = body_id.rsplit_once(BODY_OUTPUT_SEPARATOR) else {
+        return body_id;
+    };
+    if suffix.parse::<usize>().is_ok_and(|number| number >= 2) {
+        owner
+    } else {
+        body_id
+    }
+}
+
+/// Zero-based output index encoded in a runtime body id.
+pub fn body_output_index(body_id: &str) -> usize {
+    let Some((_, suffix)) = body_id.rsplit_once(BODY_OUTPUT_SEPARATOR) else {
+        return 0;
+    };
+    suffix
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number >= 2)
+        .map_or(0, |number| number - 1)
+}
+
 /// A single named, dimensioned value inside a [`FeatureType::VariableSet`].
 /// `value` is expressed in `unit` (the same units offered in Settings), so the
 /// UI can display it directly and convert to the base unit when needed.
@@ -66,9 +108,9 @@ pub struct TopologyEdgeRef {
 
 /// A solid edge captured geometrically for a 3D fillet/chamfer. The endpoints
 /// and the two adjacent face normals are recorded in **world space** at
-/// selection time (read straight from the body's wireframe — see
-/// `MockMesh::edge_vertices` / `edge_face_normals`), which is all
-/// [`crate::mock_kernel::edge_corner_cutter`] needs to orient its cutter.
+/// selection time (read straight from the body's wireframe; see
+/// `MockMesh::edge_vertices` / `edge_face_normals`). The evaluator uses that
+/// captured geometry when a persistent topology name cannot be resolved.
 ///
 /// The topology field lets an `EdgeMod` follow equivalent upstream dimension
 /// edits. If the stable identity no longer resolves, the captured world-space
@@ -93,6 +135,11 @@ pub struct EdgeRef {
 pub struct TopologyFaceRef {
     #[serde(default)]
     pub body_id: Option<String>,
+    /// Stable identity of the connected solid component inside the body. This
+    /// prevents a face name shared by two severed lumps from resolving against
+    /// whichever lump happens to enumerate first.
+    #[serde(default)]
+    pub component_id: Option<String>,
     #[serde(default)]
     pub topology_version: Option<u64>,
     /// The face's durable name (its "owner"), e.g.
@@ -160,19 +207,6 @@ impl EdgeModReplayIntent {
             selected_span: Some(edge),
         }
     }
-}
-
-/// Legacy serialized edge-mod span. The current fillet/chamfer tool no longer
-/// exposes or evaluates separate full/partial modes; this remains only so older
-/// `.zcad` documents with a `scope` field can still load.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum EdgeModScope {
-    #[default]
-    FullEdge,
-    Partial {
-        start_t: f32,
-        end_t: f32,
-    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -280,10 +314,6 @@ pub enum FeatureType {
         /// re-evaluated every build. `dist` holds the last resolved value.
         #[serde(default)]
         dist_expr: Option<String>,
-        /// Legacy field kept so older documents deserialize. New fillet/chamfer
-        /// edits always use the selected edge as captured.
-        #[serde(default)]
-        scope: EdgeModScope,
         /// Construction-replay intent for fillets through earlier cuts.
         #[serde(default)]
         replay: EdgeModReplayIntent,

@@ -8,9 +8,7 @@
 
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
-use zerocad_core::{
-    CornerKind, EdgeModReplayIntent, EdgeModScope, EdgeRef, FeatureNode, FeatureType, MockMesh,
-};
+use zerocad_core::{CornerKind, EdgeModReplayIntent, EdgeRef, FeatureNode, FeatureType, MockMesh};
 
 use crate::{PendingCommitVisual, PendingVisualMode, SharedBodyMeshes, ZeroCadApp};
 
@@ -588,7 +586,6 @@ mod tests {
                     edge: edge.clone(),
                     dist,
                     dist_expr: None,
-                    scope: Default::default(),
                     replay,
                     kind,
                 },
@@ -1193,7 +1190,6 @@ impl ZeroCadApp {
                     edge: edge.clone(),
                     dist,
                     dist_expr: None,
-                    scope: EdgeModScope::default(),
                     replay,
                     kind: op.kind,
                 },
@@ -1288,31 +1284,9 @@ impl ZeroCadApp {
         self.spawn_edge_mod_arc_eval(ctx, key);
     }
 
-    /// Synchronous exact preview builder retained for diagnostics. Interactive
-    /// preview uses [`EdgeModOp::immediate_preview_mesh`] immediately and refines
-    /// through [`tick_speculative_edge_mod`](Self::tick_speculative_edge_mod).
-    #[allow(dead_code)]
-    pub(crate) fn preview_edge_mod_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
-        let op = self.edge_mod_op.as_ref()?;
-        let mut graph = self.graph.clone();
-        // Temp ids past the live counter — never persisted.
-        self.append_edge_mod_chain(&mut graph, op, op.dist.max(0.05), "preview");
-        // The preview fillet is appended as a trailing node, so the parametric
-        // graph's per-node geometry cache (carried by the clone above) reuses the
-        // committed prefix — the upstream booleans (e.g. a box∪boss union) are NOT
-        // re-solved each frame; only this one edge-mod runs. The native rolling-ball
-        // fillet is exact, so draft and commit already match (the `draft` flag is a
-        // no-op); it is kept only for API symmetry with the extrude preview.
-        graph.evaluate_bodies_draft(&self.hidden_nodes).ok()
-    }
-
-    /// Memoized [`preview_edge_mod_bodies`]. egui repaints continuously while the
-    /// inline size box is focused or the handle is dragged. This GUI-level cache
-    /// recomputes only when the size (quantized to a sub-visible step), kind, or
-    /// target change, so idle frames and the still points of a slow drag are free;
-    /// the parametric graph's per-node cache then keeps the recompute cheap on the
-    /// frames that *do* change (the upstream booleans are reused, only the fillet
-    /// re-runs). Mirrors `cached_preview_extrude_bodies`.
+    /// Select the best available edge-mod preview: an exact worker result for the
+    /// current size when ready, otherwise a cached lightweight overlay. Exact
+    /// results are retained by size so scrubbing back does not launch a new solve.
     pub(crate) fn cached_preview_edge_mod_bodies(&mut self) -> Option<SharedBodyMeshes> {
         use std::hash::{Hash, Hasher};
         let Some(op) = self.edge_mod_op.as_ref() else {
@@ -1461,7 +1435,6 @@ impl ZeroCadApp {
                     edge,
                     dist,
                     dist_expr: dist_expr.clone(),
-                    scope: EdgeModScope::default(),
                     replay,
                     kind: op.kind,
                 },

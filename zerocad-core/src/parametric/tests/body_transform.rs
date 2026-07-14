@@ -72,6 +72,51 @@ fn body_move_consumes_source_and_keeps_volume() {
 }
 
 #[test]
+fn second_disconnected_extrude_body_can_be_transformed_independently() {
+    let mut curves = SketchCurves::new();
+    curves.add_rectangle((0.0, 0.0), (5.0, 5.0));
+    curves.add_rectangle((20.0, 0.0), (25.0, 5.0));
+
+    let mut graph = ParametricGraph::new();
+    add_sketch(&mut graph, "sketch_1", curves);
+    add_extrude(
+        &mut graph,
+        "extrude_2",
+        "sketch_1",
+        4.0,
+        ExtrudeMode::NewBody,
+    );
+    graph.add_feature(FeatureNode {
+        id: "transform_3".to_string(),
+        name: "Move second body".to_string(),
+        feature: FeatureType::BodyTransform {
+            source: body_output_id("extrude_2", 1),
+            translation: [100.0, 0.0, 0.0],
+            copy: true,
+        },
+    });
+    graph.add_dependency("extrude_2::body:2", "transform_3");
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.iter().any(|(id, _)| id == "extrude_2"));
+    let second = bodies
+        .iter()
+        .find(|(id, _)| id == "extrude_2::body:2")
+        .expect("second extrusion body");
+    let moved = bodies
+        .iter()
+        .find(|(id, _)| id == "transform_3")
+        .expect("independent transformed copy");
+    let (second_min, _) = bounds(&second.1);
+    let (moved_min, _) = bounds(&moved.1);
+    assert!((moved_min[0] - second_min[0] - 100.0).abs() < 1e-3);
+}
+
+#[test]
 fn missing_transform_source_warns_without_panicking() {
     let mut graph = ParametricGraph::new();
     graph.add_feature(FeatureNode {

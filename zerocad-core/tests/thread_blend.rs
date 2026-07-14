@@ -12,8 +12,7 @@ use zerocad_core::mock_kernel::{
 };
 use zerocad_core::parametric::FaceRef;
 use zerocad_core::{
-    CornerKind, EdgeModReplayIntent, EdgeModScope, EdgeRef, FeatureNode, FeatureType,
-    ParametricGraph,
+    CornerKind, EdgeModReplayIntent, EdgeRef, FeatureNode, FeatureType, ParametricGraph,
 };
 
 /// Cylinder primitive: +Y axis, base at origin.
@@ -58,7 +57,6 @@ fn add_rim_blend(
             edge: rim,
             dist: 1.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind,
         },
@@ -466,7 +464,6 @@ fn internal_thread_keeps_the_countersink() {
                 edge: rim,
                 dist: 1.0,
                 dist_expr: None,
-                scope: EdgeModScope::FullEdge,
                 replay: EdgeModReplayIntent::default(),
                 kind: CornerKind::Chamfer,
             },

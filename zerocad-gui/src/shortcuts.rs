@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// [`default_hotkey`](ShortcutAction::default_hotkey), and handle it in
 /// `ZeroCadApp::run_shortcut`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ShortcutAction {
+pub(crate) enum ShortcutAction {
     NewDesign,
     OpenDesign,
     SaveDesign,
@@ -29,7 +29,7 @@ pub enum ShortcutAction {
 
 impl ShortcutAction {
     /// All actions, in the order they appear in the Shortcuts settings tab.
-    pub const ALL: &'static [ShortcutAction] = &[
+    pub(crate) const ALL: &'static [ShortcutAction] = &[
         ShortcutAction::NewDesign,
         ShortcutAction::OpenDesign,
         ShortcutAction::SaveDesign,
@@ -44,7 +44,7 @@ impl ShortcutAction {
     ];
 
     /// Human-readable name shown in the settings list.
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             ShortcutAction::NewDesign => "New Design",
             ShortcutAction::OpenDesign => "Open Design",
@@ -61,7 +61,7 @@ impl ShortcutAction {
     }
 
     /// The factory-default binding, used on first run and by "Reset to defaults".
-    pub fn default_hotkey(self) -> Hotkey {
+    pub(crate) fn default_hotkey(self) -> Hotkey {
         use ShortcutAction::*;
         match self {
             NewDesign => Hotkey::ctrl(egui::Key::N),
@@ -83,12 +83,12 @@ impl ShortcutAction {
 /// binding round-trips through JSON without depending on egui's optional serde
 /// feature. `ctrl` means the platform command key (Ctrl on Win/Linux, ⌘ on Mac).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hotkey {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
+pub(crate) struct Hotkey {
+    pub(crate) ctrl: bool,
+    pub(crate) shift: bool,
+    pub(crate) alt: bool,
     /// egui `Key::name()`, e.g. "S", "Delete", "Comma".
-    pub key: String,
+    pub(crate) key: String,
 }
 
 impl Hotkey {
@@ -111,7 +111,7 @@ impl Hotkey {
     }
 
     /// Build from a captured key event's key + modifier state.
-    pub fn from_event(key: egui::Key, mods: egui::Modifiers) -> Self {
+    pub(crate) fn from_event(key: egui::Key, mods: egui::Modifiers) -> Self {
         Hotkey {
             ctrl: mods.command || mods.ctrl,
             shift: mods.shift,
@@ -126,7 +126,7 @@ impl Hotkey {
 
     /// True only on the frame this exact combo is freshly pressed. Modifiers are
     /// matched exactly so Ctrl+Z does not also fire on Ctrl+Shift+Z.
-    pub fn pressed(&self, ctx: &egui::Context) -> bool {
+    pub(crate) fn pressed(&self, ctx: &egui::Context) -> bool {
         let Some(k) = self.egui_key() else {
             return false;
         };
@@ -142,7 +142,7 @@ impl Hotkey {
 
     /// Consume this exact shortcut press so a focused widget cannot also act
     /// on it later in the same frame.
-    pub fn consume_if_pressed(&self, ctx: &egui::Context) -> bool {
+    pub(crate) fn consume_if_pressed(&self, ctx: &egui::Context) -> bool {
         if !self.pressed(ctx) {
             return false;
         }
@@ -153,7 +153,7 @@ impl Hotkey {
     }
 
     /// Human-readable form, e.g. "Ctrl+Shift+S" or "Delete".
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         let mut s = String::new();
         if self.ctrl {
             s.push_str("Ctrl+");
@@ -188,7 +188,7 @@ fn pretty_key(k: egui::Key) -> String {
 /// The full set of action bindings. Stored as an ordered list (the action set is
 /// tiny) so it serializes without needing string map keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Keymap {
+pub(crate) struct Keymap {
     bindings: Vec<(ShortcutAction, Hotkey)>,
 }
 
@@ -205,7 +205,7 @@ impl Default for Keymap {
 
 impl Keymap {
     /// The combo currently bound to `action`, if any.
-    pub fn get(&self, action: ShortcutAction) -> Option<&Hotkey> {
+    pub(crate) fn get(&self, action: ShortcutAction) -> Option<&Hotkey> {
         self.bindings
             .iter()
             .find(|(a, _)| *a == action)
@@ -214,18 +214,18 @@ impl Keymap {
 
     /// Bind `hotkey` to `action`. Any other action already using the same combo
     /// is unbound, so a combo always maps to exactly one action.
-    pub fn set(&mut self, action: ShortcutAction, hotkey: Hotkey) {
+    pub(crate) fn set(&mut self, action: ShortcutAction, hotkey: Hotkey) {
         self.bindings.retain(|(a, h)| *a != action && *h != hotkey);
         self.bindings.push((action, hotkey));
     }
 
     /// Remove `action`'s binding entirely (the action becomes unbound).
-    pub fn unbind(&mut self, action: ShortcutAction) {
+    pub(crate) fn unbind(&mut self, action: ShortcutAction) {
         self.bindings.retain(|(a, _)| *a != action);
     }
 
     /// Restore the factory defaults.
-    pub fn reset_to_defaults(&mut self) {
+    pub(crate) fn reset_to_defaults(&mut self) {
         *self = Keymap::default();
     }
 
@@ -244,7 +244,7 @@ impl Keymap {
     }
 
     /// Load from the config file, falling back to defaults on any error.
-    pub fn load() -> Self {
+    pub(crate) fn load() -> Self {
         let mut km = config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<Keymap>(&s).ok())
@@ -254,7 +254,7 @@ impl Keymap {
     }
 
     /// Persist to the config file (best-effort; errors are logged, not fatal).
-    pub fn save(&self) {
+    pub(crate) fn save(&self) {
         let Some(path) = config_path() else {
             return;
         };

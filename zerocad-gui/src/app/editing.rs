@@ -812,7 +812,11 @@ impl ZeroCadApp {
                     | FeatureType::BodyJoin { .. }
                     | FeatureType::BodyCut { .. }
             )
-        });
+        }) + self
+            .body_meshes
+            .iter()
+            .filter(|(body_id, _)| zerocad_core::body_output_index(body_id) > 0)
+            .count();
         format!("Body_{}", n)
     }
 
@@ -850,6 +854,26 @@ impl ZeroCadApp {
 #[cfg(test)]
 mod snap_tests {
     use super::*;
+
+    #[test]
+    fn disconnected_outputs_advance_the_next_body_number() {
+        let mut app = ZeroCadApp::new();
+        app.graph.add_feature(FeatureNode {
+            id: "extrude_5".to_string(),
+            name: "Body_1".to_string(),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
+        });
+        app.body_meshes = std::sync::Arc::new(vec![
+            ("extrude_5".to_string(), MockMesh::empty()),
+            ("extrude_5::body:2".to_string(), MockMesh::empty()),
+        ]);
+
+        assert_eq!(app.next_body_name(), "Body_3");
+    }
 
     /// A 4×2 rectangle centred at (3, 3), as the four segments the rectangle
     /// tool would commit. Corners (1,2)-(5,2)-(5,4)-(1,4); centre (3,3).

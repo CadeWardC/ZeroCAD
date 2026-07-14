@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 use zerocad_core::mock_kernel::{EdgeCurveHint, MockMesh};
 use zerocad_core::{
-    CoordinateSystem, CornerKind, EdgeModReplayIntent, EdgeModScope, EdgeRef, ExtrudeMode,
-    FeatureNode, FeatureType, ParametricGraph, SketchCurves,
+    CoordinateSystem, CornerKind, EdgeModReplayIntent, EdgeRef, ExtrudeMode, FeatureNode,
+    FeatureType, ParametricGraph, SketchCurves,
 };
 
 const R: f32 = 4.0;
@@ -141,7 +141,6 @@ fn rim_blend_commits(kind: CornerKind, dist: f32) {
             edge: rim,
             dist,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind,
         },

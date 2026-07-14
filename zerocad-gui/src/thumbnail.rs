@@ -22,7 +22,10 @@ const YAW: f32 = 0.7;
 ///
 /// Empty / triangle-less input yields a plain background tile (the caller skips
 /// caching in that case, but this never panics).
-pub fn render_thumbnail(meshes: &[(String, MockMesh)], size: usize) -> (usize, usize, Vec<u8>) {
+pub(crate) fn render_thumbnail(
+    meshes: &[(String, MockMesh)],
+    size: usize,
+) -> (usize, usize, Vec<u8>) {
     const BG: [u8; 3] = [243, 245, 248]; // matches the onboarding card surface
     const BASE: [f32; 3] = [168.0, 180.0, 198.0]; // slate-blue body color
     const MARGIN: f32 = 0.12; // fraction of the frame left as padding
@@ -111,7 +114,7 @@ pub fn render_thumbnail(meshes: &[(String, MockMesh)], size: usize) -> (usize, u
 
 /// PNG-encode a `w`×`h` RGBA buffer for embedding inside a `.zcad` file.
 /// Returns `None` if encoding fails (so the caller can save without a preview).
-pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     if w == 0 || h == 0 || rgba.len() != w * h * 4 {
         return None;
     }
@@ -128,7 +131,7 @@ pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
 
 /// Decode an RGBA8 PNG (as produced by [`encode_png`]) back into
 /// `(width, height, rgba)`. Returns `None` on any malformed/unsupported input.
-pub fn decode_png(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+pub(crate) fn decode_png(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     let decoder = png::Decoder::new(bytes);
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()];

@@ -218,14 +218,19 @@ are left-handed, and a negative extrude depth also flips winding.
 winding exactly when needed, and `enforce_outward_normals` re-signs mesh normals
 after tessellation as a backstop (one centroid–normal dot test per shell).
 
-### Join must never delete material
-`a ∪ b` always contains `a`, but a solver can hand back a degenerate union (e.g.
-an inverted tool that *subtracts*). `apply_join` guards every union with an
-AABB-containment check (`aabb_contains`) and rejects any result that no longer
-encloses the original body. A cut that fails on every tool variant likewise keeps
-the original part intact rather than dropping a valid body; the edge-mod path
-similarly rejects any "fillet" result that adds material or extends beyond the
-pre-edit body.
+### Join is a transactional solid operation
+`a ∪ b` always contains both inputs and, for a modeling Join, must produce one
+valid solid. `apply_join` accepts a result only when it encloses both operands,
+is healthy and watertight, and has one connected component. It then repeatedly
+merges any additional body parts that the new result touches, so a bridge feature
+cannot leave an order-dependent collection of overlapping parts behind.
+
+A multi-region Join is atomic: if any region cannot produce a valid fused solid,
+the entire feature is rolled back and marked unresolved. It never appends the
+failed tool as a visually coincident second part. A cut that fails on every tool
+variant likewise keeps the original part intact rather than dropping a valid
+body; the edge-mod path similarly rejects any "fillet" result that adds material
+or extends beyond the pre-edit body.
 
 ---
 
@@ -235,7 +240,8 @@ A boolean that doesn't do what the user asked used to fail silently. Evaluation
 now returns a `Vec<String>` of **non-fatal** warnings alongside the meshes:
 
 - A **Cut** whose solver fails on a body it overlaps (material left intact).
-- A **Join** that overlapped nothing and became a separate body.
+- A **Join** that could not fuse every tool region into one valid solid (the
+  entire feature is rolled back).
 - An **EdgeMod** whose fillet/chamfer could not be applied (edge not found on the
   rebuilt body, radius infeasible, result not subtractive).
 
@@ -273,8 +279,12 @@ on the rebuilt body. ZeroCAD is moving from purely geometric re-selection toward
 - **A sketch on a body face** stores a `FaceRef`/`TopologyFaceRef` in
   `ParametricGraph::sketch_face_refs`; on rebuild the sketch's plane is re-derived
   from wherever that face now is, so a sketch-on-face follows the body.
-- **Part identity** for severing cuts is a quantized AABB corner key (`part_key`),
-  stable across rebuilds so the split lumps keep a deterministic order.
+- **Component identity** is stamped onto every selectable face from a stable,
+  quantized solid key. Face references therefore identify both their owning body
+  and their solid component. Downstream features such as Thread resolve that
+  component first instead of depending on whichever internal part happens to be
+  visited first. If an edit changes the component's bounds, durable face naming
+  and nearest-geometry matching provide the controlled reattachment fallback.
 - **Fail loud.** A feature that cannot reattach its reference is marked
   `Unresolved` (surfaced in the tree and status bar) instead of silently applying
   to the wrong entity.
@@ -443,10 +453,10 @@ the same value live (and the inline dialog can still toggle Fillet ↔ Chamfer):
 - **Floating size box** — type a value (`mm`/`in`/`m`, or a variable expression)
   and toggle Fillet ↔ Chamfer.
 
-**Enter / ✓ OK** commits, **Esc / Cancel** aborts. The preview re-evaluates the
-model with a temporary node exactly like the Cut/Join extrude preview
-([`preview_edge_mod_bodies`](zerocad-gui/src/edgemod.rs), mirroring
-[`preview_extrude_bodies`](zerocad-gui/src/extrude.rs)). Committing adds a
+**Enter / ✓ OK** commits, **Esc / Cancel** aborts. The preview uses an immediate
+lightweight overlay, then submits a temporary-node evaluation to the shared
+background worker and caches the exact result (`cached_preview_edge_mod_bodies`,
+mirroring `cached_preview_extrude_bodies`). Committing adds a
 `FeatureType::EdgeMod { target, edge, dist, dist_expr, kind, replay }` to the
 history; its distance and type stay editable in the property panel and the
 distance can follow a variable.
@@ -457,10 +467,10 @@ is a **true geometric round**, not a boolean approximation.
 edge in each part's B-Rep (by its endpoints, then by the reattachment path above)
 and calls OpenRCAD's `fillet_edges` (via `mock_kernel::fillet_edge`) to replace it
 with a real cylindrical fillet face — or `chamfer_edge` for a bevel. There is no
-draft/commit split: the live preview and the committed model are identical, so
-`draft` is retained only for API compatibility. Radius feasibility is delegated to
-the exact kernel solve rather than a conservative app-side estimate, and every
-candidate is validated to be **local and subtractive** — a result that refills a
+edge-mod draft/commit split: the background preview and committed model use the
+same operation. Radius feasibility is delegated to the exact kernel solve rather
+than a conservative app-side estimate, and every candidate is validated to be
+**local and subtractive** — a result that refills a
 cut void or adds visible material is rejected and the body left unchanged with a
 warning.
 
@@ -469,17 +479,9 @@ edge that a later cut passes through be reconstructed correctly: imprint the fil
 before the cut, or re-apply the cut history after the fillet, whichever validates.
 Circular rim edges use native-only mode (no construction replay).
 
-**Boolean-cutter fallback.** For the difficult cases the native solve rejects,
-[`edge_corner_cutter`](zerocad-core/src/mock_kernel/edge_ops.rs) remains as a
-last-resort fallback: it sweeps a corner cross-section (a right triangle for a
-chamfer, or that triangle minus a faceted circular segment for a fillet) along the
-edge and subtracts it through the guarded `difference`. It grows the cross-section
-outward (`EDGE_MOD_GROW`) via a proper per-edge polygon offset so its tangent edges
-lift *off* the body faces and the cut is transversal rather than tangent.
-
 **One smooth face.** The native fillet is a single analytic cylindrical/toroidal
-face, so it is smooth by construction. Where a curved face is still tessellated
-into facets (the fallback cutter, or a many-sided extruded wall), three mechanisms
+face, so it is smooth by construction. Where another curved face is tessellated
+into facets (for example, a many-sided extruded wall), three mechanisms
 make it read as one continuous surface: adaptive arc tessellation for a smooth
 silhouette; [`smooth_vertex_normals`](zerocad-core/src/mock_kernel/tessellation.rs)
 blending facet normals across shallow creases (`SHADE_CREASE_COS`, ~30°) for
@@ -525,11 +527,11 @@ A saved model is a binary `.zcad` container (`zerocad-core/src/zcad_format.rs`),
 not plain JSON. The layout is a fixed 32-byte header + a section table + section
 payloads, all little-endian, with CRC32 integrity checks:
 
-- **Header** — magic `ZCAD`, `format_version` (`CURRENT_VERSION = 3`), section
+- **Header** — magic `ZCAD`, `format_version` (`CURRENT_VERSION = 4`), section
   count, and a CRC32 over the header.
 - **Sections** (each CRC32-checked, individually codec-tagged as stored or
   zstd-compressed): **metadata** (uncompressed, written first so a browser can
-  read it without inflating the file), **recipe** (`DocumentRecipeV1` as
+  read it without inflating the file), **recipe** (`DocumentRecipeV2` as
   zstd-compressed CBOR), an optional PNG **thumbnail**, an optional **mesh
   cache** (precomputed body meshes tagged with the BLAKE3 recipe digest and
   discarded on mismatch so stale geometry is
@@ -539,7 +541,7 @@ payloads, all little-endian, with CRC32 integrity checks:
   `read_zcad(&[u8]) -> Result<LoadedZcad, ZcadError>` are the API.
   `ZcadMetadata` carries the format/app version, created/modified timestamps,
   units, feature count, and bounding box.
-- The authoritative payload is `DocumentRecipeV1`: sorted feature records,
+- The authoritative payload is `DocumentRecipeV2`: sorted feature records,
   explicit dependency pairs, and sorted attachment maps. It does not serialize
   petgraph's arena/index representation. Derived mesh caches are accepted only
   when their BLAKE3 digest matches the exact recipe bytes.
@@ -552,10 +554,10 @@ payloads, all little-endian, with CRC32 integrity checks:
   temporary file, preserves the previous document during replacement, and
   restores it if the final rename fails.
 - **Robustness.** Corruption is caught per-section by CRC and by a
-  decompressed-length check; a newer `format_version` is best-effort parsed
-  (unknown sections skipped) or reported `UnsupportedVersion`. **Legacy plain-JSON
-  `.zcad` files still load** (detected by a leading `{`), setting
-  `was_legacy_json = true`.
+  decompressed-length check. The reader requires the exact binary format version;
+  older or newer formats are reported as `UnsupportedVersion`, and plain-JSON
+  input is rejected. This deliberate version-4 contract keeps component-aware
+  topology and caches from being interpreted with an older document schema.
 
 The GUI's **Recent projects** onboarding screen shows each file's thumbnail. The
 thumbnail is a small CPU-rasterized 3/4-isometric preview of the evaluated meshes
@@ -577,8 +579,9 @@ and embedded in the file's thumbnail section.
   `repro_cutout_fillet_mesh.rs`, `repro_miter_render.rs`, `smooth_cylinder.rs`,
   `sketch_fillet_extrude.rs`, `primitive_equals_extrude.rs`, plus
   `bool_matrix.rs`, `cylinder_tests.rs`, `parametric_tests.rs`.
-- `tests/serialization.rs` and `tests/zcad_format.rs` — `.zcad` round-trip
-  (binary + legacy JSON) and graceful handling of a corrupt document.
+- `tests/serialization.rs` and `tests/zcad_format.rs` — `.zcad` binary
+  round-trip, exact-version enforcement, and graceful handling of corrupt or
+  non-binary documents.
   `stl::tests` covers binary STL export.
 
 `benches/modeling_pipeline.rs` tracks cold, warm, and hydrated-open long-history

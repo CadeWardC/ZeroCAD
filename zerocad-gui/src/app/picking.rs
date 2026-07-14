@@ -923,6 +923,7 @@ impl ZeroCadApp {
             normal: f.normal,
             topology: Some(zerocad_core::parametric::TopologyFaceRef {
                 body_id: Some(node_id.to_string()),
+                component_id: f.topology.as_ref().and_then(|t| t.component_id.clone()),
                 topology_version: f.topology.as_ref().and_then(|t| t.topology_version),
                 face_id: f.topology.as_ref().and_then(|t| t.face_id.clone()),
                 surface_kind: f.topology.as_ref().and_then(|t| t.surface_kind.clone()),

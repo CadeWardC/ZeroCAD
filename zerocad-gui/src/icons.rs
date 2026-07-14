@@ -19,36 +19,39 @@
 use eframe::egui;
 
 // Embedded at compile time so the binary needs no icon files at runtime.
-pub const LINE: &str = include_str!("../../icons/sketch/line.svg");
-pub const RECTANGLE: &str = include_str!("../../icons/sketch/square-corner-to-corner.svg");
-pub const CIRCLE: &str = include_str!("../../icons/sketch/one-point-circle.svg");
-pub const RECTANGLE_FROM_CENTER: &str = include_str!("../../icons/sketch/square3d-from-center.svg");
-pub const RECTANGLE_THREE_POINTS: &str =
+pub(crate) const LINE: &str = include_str!("../../icons/sketch/line.svg");
+pub(crate) const RECTANGLE: &str = include_str!("../../icons/sketch/square-corner-to-corner.svg");
+pub(crate) const CIRCLE: &str = include_str!("../../icons/sketch/one-point-circle.svg");
+pub(crate) const RECTANGLE_FROM_CENTER: &str =
+    include_str!("../../icons/sketch/square3d-from-center.svg");
+pub(crate) const RECTANGLE_THREE_POINTS: &str =
     include_str!("../../icons/sketch/square3d-three-points.svg");
-pub const THREE_POINT_CIRCLE: &str = include_str!("../../icons/sketch/three-points-circle.svg");
-pub const ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d.svg");
-pub const THREE_POINT_ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d-three-points.svg");
-pub const FILLET: &str = include_str!("../../icons/sketch/fillet3d.svg");
-pub const CHAMFER: &str = include_str!("../../icons/sketch/chamfer3d.svg");
-pub const POLYGON: &str = include_str!("../../icons/sketch/polygon.svg");
-pub const MIRROR: &str = include_str!("../../icons/sketch/mirror.svg");
-pub const SKETCH: &str = include_str!("../../icons/sketch/sketch.svg");
-pub const EXTRUDE: &str = include_str!("../../icons/3d/extrude.svg");
-pub const CHECK: &str = include_str!("../../icons/general/check.svg");
-pub const EYE_OPEN: &str = include_str!("../../icons/general/eye-solid.svg");
-pub const EYE_CLOSED: &str = include_str!("../../icons/general/eye-closed.svg");
-pub const TRASH: &str = include_str!("../../icons/general/trash.svg");
-pub const SAVE: &str = include_str!("../../icons/general/floppy-disk-arrow-out.svg");
-pub const DOWNLOAD: &str = include_str!("../../icons/general/download.svg");
-pub const SETTINGS: &str = include_str!("../../icons/general/settings.svg");
-pub const FOLDER: &str = include_str!("../../icons/general/folder.svg");
-pub const LOG_OUT: &str = include_str!("../../icons/general/log-out.svg");
-pub const NEW_DESIGN: &str = include_str!("../../icons/general/new-design.svg");
+pub(crate) const THREE_POINT_CIRCLE: &str =
+    include_str!("../../icons/sketch/three-points-circle.svg");
+pub(crate) const ELLIPSE: &str = include_str!("../../icons/sketch/ellipse3d.svg");
+pub(crate) const THREE_POINT_ELLIPSE: &str =
+    include_str!("../../icons/sketch/ellipse3d-three-points.svg");
+pub(crate) const FILLET: &str = include_str!("../../icons/sketch/fillet3d.svg");
+pub(crate) const CHAMFER: &str = include_str!("../../icons/sketch/chamfer3d.svg");
+pub(crate) const POLYGON: &str = include_str!("../../icons/sketch/polygon.svg");
+pub(crate) const MIRROR: &str = include_str!("../../icons/sketch/mirror.svg");
+pub(crate) const SKETCH: &str = include_str!("../../icons/sketch/sketch.svg");
+pub(crate) const EXTRUDE: &str = include_str!("../../icons/3d/extrude.svg");
+pub(crate) const CHECK: &str = include_str!("../../icons/general/check.svg");
+pub(crate) const EYE_OPEN: &str = include_str!("../../icons/general/eye-solid.svg");
+pub(crate) const EYE_CLOSED: &str = include_str!("../../icons/general/eye-closed.svg");
+pub(crate) const TRASH: &str = include_str!("../../icons/general/trash.svg");
+pub(crate) const SAVE: &str = include_str!("../../icons/general/floppy-disk-arrow-out.svg");
+pub(crate) const DOWNLOAD: &str = include_str!("../../icons/general/download.svg");
+pub(crate) const SETTINGS: &str = include_str!("../../icons/general/settings.svg");
+pub(crate) const FOLDER: &str = include_str!("../../icons/general/folder.svg");
+pub(crate) const LOG_OUT: &str = include_str!("../../icons/general/log-out.svg");
+pub(crate) const NEW_DESIGN: &str = include_str!("../../icons/general/new-design.svg");
 
 /// Unified icon registry. Adding or replacing an icon is as simple as updating
 /// this enum and its path mapping in `svg()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Icon {
+pub(crate) enum Icon {
     Line,
     Rectangle,
     RectangleFromCenter,
@@ -77,7 +80,7 @@ pub enum Icon {
 
 impl Icon {
     /// Return the raw SVG string for this icon.
-    pub fn svg(&self) -> &'static str {
+    pub(crate) fn svg(&self) -> &'static str {
         match self {
             Icon::Line => LINE,
             Icon::Rectangle => RECTANGLE,
@@ -107,12 +110,12 @@ impl Icon {
     }
 
     /// Draw the icon with the painter at `rect` in the specified `color`.
-    pub fn draw(&self, painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    pub(crate) fn draw(&self, painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         draw(painter, rect, color, self.svg());
     }
 
     /// Draw a premium pill button containing this icon and a text label.
-    pub fn labeled_button(
+    pub(crate) fn labeled_button(
         &self,
         ui: &mut egui::Ui,
         label: &str,
@@ -125,7 +128,7 @@ impl Icon {
     }
 
     /// Draw a compact square button containing only this icon.
-    pub fn icon_button(
+    pub(crate) fn icon_button(
         &self,
         ui: &mut egui::Ui,
         bg: egui::Color32,
@@ -136,7 +139,7 @@ impl Icon {
     }
 
     /// Draw a premium dropdown menu button containing this icon and a text label.
-    pub fn menu_button(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
+    pub(crate) fn menu_button(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
         let h = 24.0f32;
         let w = ui.available_width().max(140.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
@@ -173,7 +176,12 @@ impl Icon {
     /// Like [`menu_button`](Self::menu_button) but with a right-aligned, dimmed
     /// keyboard-shortcut hint (e.g. "Ctrl+S"). An empty `hint` renders the same
     /// as a plain menu button.
-    pub fn menu_button_hint(&self, ui: &mut egui::Ui, label: &str, hint: &str) -> egui::Response {
+    pub(crate) fn menu_button_hint(
+        &self,
+        ui: &mut egui::Ui,
+        label: &str,
+        hint: &str,
+    ) -> egui::Response {
         let h = 24.0f32;
         let w = ui.available_width().max(140.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
@@ -257,7 +265,7 @@ fn parsed_icon(svg: &str) -> std::rc::Rc<ParsedIcon> {
 /// Draw an embedded SVG into `rect`, stroking (or filling) every path in `color`.
 /// The 24×24 viewBox is mapped uniformly into `rect`; stroke width tracks the
 /// icon size so it reads the same as the rest of the UI.
-pub fn draw(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, svg: &str) {
+pub(crate) fn draw(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, svg: &str) {
     let sx = rect.width() / 24.0;
     let sy = rect.height() / 24.0;
     let origin = rect.left_top();
@@ -283,7 +291,7 @@ pub fn draw(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, svg
 /// A pill button: SVG icon + label, auto-sized to the text, matching the sketch
 /// toolbar's look. `accent` colors the icon, label and outline; `bg`/`hover` the
 /// fill. Returns the click response so callers handle `.clicked()`/`.on_hover`.
-pub fn labeled_button(
+pub(crate) fn labeled_button(
     ui: &mut egui::Ui,
     icon: Icon,
     label: &str,
@@ -320,7 +328,7 @@ pub fn labeled_button(
 }
 
 /// A compact square icon-only button (e.g. the browser's show/hide eye).
-pub fn icon_button(
+pub(crate) fn icon_button(
     ui: &mut egui::Ui,
     icon: Icon,
     bg: egui::Color32,

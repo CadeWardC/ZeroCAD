@@ -11,6 +11,7 @@ mod circular_bite;
 mod circular_bite_helpers;
 mod common;
 mod concave_edge_mod;
+mod construction_equivalence;
 mod datum_attach;
 mod edge_mods;
 mod extrude_modes;

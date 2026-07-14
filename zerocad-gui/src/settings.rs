@@ -39,7 +39,7 @@ fn now_secs() -> u64 {
 /// can't initialize, the app falls back to the glow (OpenGL) renderer with the
 /// CPU viewport rather than failing to start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphicsBackend {
+pub(crate) enum GraphicsBackend {
     #[default]
     Auto,
     Vulkan,
@@ -50,14 +50,14 @@ pub enum GraphicsBackend {
 }
 
 impl GraphicsBackend {
-    pub const ALL: [GraphicsBackend; 4] = [
+    pub(crate) const ALL: [GraphicsBackend; 4] = [
         GraphicsBackend::Auto,
         GraphicsBackend::Vulkan,
         GraphicsBackend::Dx12,
         GraphicsBackend::OpenGl,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             GraphicsBackend::Auto => "Auto (recommended)",
             GraphicsBackend::Vulkan => "Vulkan",
@@ -71,7 +71,7 @@ impl GraphicsBackend {
 /// render pipelines are rebuilt on change. 8× falls back to 4× on adapters
 /// that don't support it for the surface format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MsaaLevel {
+pub(crate) enum MsaaLevel {
     Off,
     #[default]
     X4,
@@ -79,9 +79,9 @@ pub enum MsaaLevel {
 }
 
 impl MsaaLevel {
-    pub const ALL: [MsaaLevel; 3] = [MsaaLevel::Off, MsaaLevel::X4, MsaaLevel::X8];
+    pub(crate) const ALL: [MsaaLevel; 3] = [MsaaLevel::Off, MsaaLevel::X4, MsaaLevel::X8];
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             MsaaLevel::Off => "Off",
             MsaaLevel::X4 => "4× (recommended)",
@@ -90,7 +90,7 @@ impl MsaaLevel {
     }
 
     /// The wgpu sample count this level asks for.
-    pub fn samples(self) -> u32 {
+    pub(crate) fn samples(self) -> u32 {
         match self {
             MsaaLevel::Off => 1,
             MsaaLevel::X4 => 4,
@@ -102,26 +102,26 @@ impl MsaaLevel {
 /// Preferences that should survive a restart. Anything the Settings window or a
 /// preference toggle edits and the user expects to "stick" belongs here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppSettings {
+pub(crate) struct AppSettings {
     /// Whether the onboarding (Welcome) screen pops up on startup.
-    pub show_onboarding: bool,
+    pub(crate) show_onboarding: bool,
     /// Dark theme on/off.
-    pub dark_mode: bool,
+    pub(crate) dark_mode: bool,
     /// Default measurement unit.
-    pub unit: Unit,
+    pub(crate) unit: Unit,
     /// GPU-accelerated 3D viewport on/off (falls back to the CPU software
     /// renderer when off). Defaults on; `serde(default)` keeps older
     /// settings.json files loading.
     #[serde(default = "default_true")]
-    pub gpu_render: bool,
+    pub(crate) gpu_render: bool,
     /// Requested wgpu backend for the GPU viewport (see [`GraphicsBackend`]).
     #[serde(default)]
-    pub backend: GraphicsBackend,
+    pub(crate) backend: GraphicsBackend,
     /// Anti-aliasing quality of the GPU viewport (see [`MsaaLevel`]).
     #[serde(default)]
-    pub msaa: MsaaLevel,
+    pub(crate) msaa: MsaaLevel,
     #[serde(default = "default_hydrated_cache_mb")]
-    pub hydrated_cache_mb: u32,
+    pub(crate) hydrated_cache_mb: u32,
 }
 
 fn default_true() -> bool {
@@ -153,7 +153,7 @@ impl AppSettings {
 
     /// Load preferences, falling back to defaults on any error (missing file,
     /// older/corrupt JSON).
-    pub fn load() -> Self {
+    pub(crate) fn load() -> Self {
         Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<AppSettings>(&s).ok())
@@ -161,7 +161,7 @@ impl AppSettings {
     }
 
     /// Persist preferences (best-effort; errors are logged, not fatal).
-    pub fn save(&self) {
+    pub(crate) fn save(&self) {
         let Some(path) = Self::path() else {
             return;
         };
@@ -185,17 +185,17 @@ impl AppSettings {
 
 /// One entry in the recent-projects list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentEntry {
-    pub path: PathBuf,
+pub(crate) struct RecentEntry {
+    pub(crate) path: PathBuf,
     /// Unix seconds of the last save/open, newest first in the list.
-    pub last_opened: u64,
+    pub(crate) last_opened: u64,
 }
 
 /// The recent-projects list, newest first. Capped so the file stays small; the
 /// onboarding screen shows only the first few.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RecentFiles {
-    pub entries: Vec<RecentEntry>,
+pub(crate) struct RecentFiles {
+    pub(crate) entries: Vec<RecentEntry>,
 }
 
 /// Max entries kept on disk (the onboarding screen shows fewer).
@@ -208,7 +208,7 @@ impl RecentFiles {
 
     /// Load the list and drop any entry whose file no longer exists, so the
     /// onboarding screen never offers a dead link.
-    pub fn load() -> Self {
+    pub(crate) fn load() -> Self {
         let mut rf = Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<RecentFiles>(&s).ok())
@@ -219,7 +219,7 @@ impl RecentFiles {
 
     /// Record `path` as the most-recently-used project: move it to the front
     /// (de-duplicated), stamp it now, and cap the list. Persists immediately.
-    pub fn record(&mut self, path: &Path) {
+    pub(crate) fn record(&mut self, path: &Path) {
         let path = path.to_path_buf();
         self.entries.retain(|e| e.path != path);
         self.entries.insert(
@@ -252,7 +252,7 @@ impl RecentFiles {
 
     /// De-duplicated parent directories from the recent entries list (newest
     /// first), for populating the save dialog's "Recent Folders" section.
-    pub fn recent_folders(&self) -> Vec<PathBuf> {
+    pub(crate) fn recent_folders(&self) -> Vec<PathBuf> {
         let mut seen = std::collections::HashSet::new();
         let mut folders = Vec::new();
         for entry in &self.entries {
@@ -296,7 +296,7 @@ fn thumb_path(file: &Path) -> Option<PathBuf> {
 
 /// Cache an RGBA thumbnail for `file`. Format is dependency-free raw bytes:
 /// `[w: u32 LE][h: u32 LE][rgba bytes]`. Best-effort; errors are logged.
-pub fn save_thumb(file: &Path, w: usize, h: usize, rgba: &[u8]) {
+pub(crate) fn save_thumb(file: &Path, w: usize, h: usize, rgba: &[u8]) {
     let Some(path) = thumb_path(file) else {
         return;
     };
@@ -314,7 +314,7 @@ pub fn save_thumb(file: &Path, w: usize, h: usize, rgba: &[u8]) {
 
 /// Load a cached thumbnail for `file` as `(width, height, rgba)`, or `None` if
 /// absent or malformed.
-pub fn load_thumb(file: &Path) -> Option<(usize, usize, Vec<u8>)> {
+pub(crate) fn load_thumb(file: &Path) -> Option<(usize, usize, Vec<u8>)> {
     let bytes = std::fs::read(thumb_path(file)?).ok()?;
     if bytes.len() < 8 {
         return None;

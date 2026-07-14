@@ -208,6 +208,7 @@ pub fn propagate_face_names(
         {
             face_ref.topology = Some(MeshTopologyFaceRef {
                 body_id: Some(body_id.to_string()),
+                component_id: None,
                 topology_version: Some(0),
                 face_id: Some(name),
                 surface_kind: None,
@@ -299,7 +300,7 @@ fn distance_to_mesh_face_triangles(mesh: &MockMesh, mesh_face_id: u32, p: [f32; 
 
 /// Euclidean distance from a point to a triangle (Ericson, *Real-Time
 /// Collision Detection* §5.1.5 closest-point construction).
-fn point_triangle_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+pub(crate) fn point_triangle_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
     let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
     let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
     let ab = sub(b, a);
@@ -432,6 +433,7 @@ pub fn propagate_face_names_via_history(
         if let Some(name) = name {
             face_ref.topology = Some(MeshTopologyFaceRef {
                 body_id: Some(body_id.to_string()),
+                component_id: None,
                 topology_version: Some(0),
                 face_id: Some(name),
                 surface_kind: None,
@@ -454,6 +456,69 @@ pub fn part_key(solid: &KernelSolid) -> [i64; 6] {
             [q(mn[0]), q(mn[1]), q(mn[2]), q(mx[0]), q(mx[1]), q(mx[2])]
         }
         None => [0; 6],
+    }
+}
+
+/// Serialized, deterministic identity for one connected component of a body.
+/// The component key is deliberately geometry-derived: cuts already sort their
+/// severed results by this same quantized AABB, so selection and evaluation use
+/// one canonical notion of component identity rather than vector position.
+pub fn component_id(solid: &KernelSolid) -> String {
+    let key = part_key(solid);
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        key[0], key[1], key[2], key[3], key[4], key[5]
+    )
+}
+
+/// Attach body + connected-component provenance to every selectable face in a
+/// per-solid mesh without disturbing its durable design face name.
+pub fn stamp_face_component(mesh: &mut MockMesh, body_id: &str, solid: &KernelSolid) {
+    let component_id = component_id(solid);
+    for face in &mut mesh.face_refs {
+        let topology = face
+            .topology
+            .get_or_insert_with(MeshTopologyFaceRef::default);
+        topology.body_id = Some(body_id.to_string());
+        topology.component_id = Some(component_id.clone());
+    }
+}
+
+/// Stamp a mesh that may already combine several disconnected body parts. Face
+/// centroids are assigned to the nearest part AABB (zero distance when inside).
+/// This is used for pristine analytic meshes whose face names predate the final
+/// body assembly, and makes their selection metadata match kernel tessellation.
+pub fn stamp_body_face_components(mesh: &mut MockMesh, body_id: &str, parts: &[KernelSolid]) {
+    let components: Vec<([f32; 3], [f32; 3], String)> = parts
+        .iter()
+        .filter_map(|part| {
+            crate::mock_kernel::solid_aabb(part).map(|(min, max)| (min, max, component_id(part)))
+        })
+        .collect();
+    for face in &mut mesh.face_refs {
+        let nearest = components.iter().min_by(|a, b| {
+            let distance = |(min, max, _): &([f32; 3], [f32; 3], String)| {
+                (0..3)
+                    .map(|axis| {
+                        if face.centroid[axis] < min[axis] {
+                            (min[axis] - face.centroid[axis]).powi(2)
+                        } else if face.centroid[axis] > max[axis] {
+                            (face.centroid[axis] - max[axis]).powi(2)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f32>()
+            };
+            distance(a)
+                .partial_cmp(&distance(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let topology = face
+            .topology
+            .get_or_insert_with(MeshTopologyFaceRef::default);
+        topology.body_id = Some(body_id.to_string());
+        topology.component_id = nearest.map(|(_, _, id)| id.clone());
     }
 }
 
@@ -558,6 +623,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             topology: Some(MeshTopologyFaceRef {
                 body_id: Some("b".to_string()),
+                component_id: None,
                 topology_version: Some(0),
                 face_id: Some(name.to_string()),
                 surface_kind: None,

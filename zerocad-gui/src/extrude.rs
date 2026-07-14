@@ -364,30 +364,9 @@ impl ZeroCadApp {
         Some(graph)
     }
 
-    /// Evaluate the model as if the active extrude had already been committed.
-    /// Used for live Cut/Join previews so the viewport shows the resulting body
-    /// instead of an additive orange tool volume.
-    #[allow(dead_code)]
-    pub(crate) fn preview_extrude_bodies(&self) -> Option<Vec<(String, MockMesh)>> {
-        let op = self.extrude_op.as_ref()?;
-        if op.depth.abs() < 0.01 {
-            return Some((*self.body_meshes).clone());
-        }
-
-        let graph = self.build_preview_extrude_graph()?;
-
-        // Draft eval: this re-solves the whole model every preview frame, so any
-        // already-committed fillet uses its fast faceted cutter rather than the
-        // ~50× slower analytic-arc one (which would freeze the extrude preview).
-        graph.evaluate_bodies_draft(&self.hidden_nodes).ok()
-    }
-
-    /// Memoized [`preview_extrude_bodies`]. The underlying call clones the whole
-    /// parametric graph and re-runs every truck boolean — far too slow to redo on
-    /// every frame the Cut/Join dialog is open (egui repaints continuously while a
-    /// field is focused or the depth is dragged). This caches the result and only
-    /// recomputes when the depth (quantized to a sub-visible step), mode, or
-    /// targets actually change, so idle frames and slow drags are nearly free.
+    /// Exact Cut/Join preview evaluated by the background worker. The result is
+    /// cached and recomputed only when the depth (quantized to a sub-visible
+    /// step), mode, or targets change, so idle frames and slow drags are cheap.
     pub(crate) fn cached_preview_extrude_bodies(&mut self) -> Option<SharedBodyMeshes> {
         let Some(depth) = self.extrude_op.as_ref().map(|op| op.depth) else {
             self.clear_extrude_preview_eval();

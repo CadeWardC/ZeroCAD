@@ -173,7 +173,6 @@ fn fillet_runs_into_corner_bite() {
             edge,
             dist: 1.5,
             dist_expr: None,
-            scope: zerocad_core::EdgeModScope::FullEdge,
             replay,
             kind: zerocad_core::CornerKind::Fillet,
         },

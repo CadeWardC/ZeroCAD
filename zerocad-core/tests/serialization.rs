@@ -3,8 +3,8 @@
 //! (an `Err`, never a panic) so the GUI can surface it.
 
 use zerocad_core::{
-    CornerKind, EdgeModReplayIntent, EdgeModReplayMode, EdgeModScope, EdgeRef, FeatureNode,
-    FeatureType, ParametricGraph,
+    CornerKind, EdgeModReplayIntent, EdgeModReplayMode, EdgeRef, FeatureNode, FeatureType,
+    ParametricGraph,
 };
 
 fn box_graph() -> ParametricGraph {
@@ -80,7 +80,6 @@ fn edge_mod_replay_metadata_survives_json_round_trip() {
             edge,
             dist: 3.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: replay.clone(),
             kind: CornerKind::Fillet,
         },

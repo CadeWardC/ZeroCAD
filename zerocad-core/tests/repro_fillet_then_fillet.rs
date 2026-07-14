@@ -7,8 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 use zerocad_core::{
-    CoordinateSystem, CornerKind, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
-    MockMesh, ParametricGraph, SketchCurves, Vec3,
+    CoordinateSystem, CornerKind, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, MockMesh,
+    ParametricGraph, SketchCurves, Vec3,
 };
 
 fn add_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: SketchCurves) {
@@ -174,7 +174,6 @@ fn fillet_then_larger_fillet_perpendicular_edge() {
             },
             dist: 4.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },
@@ -204,7 +203,6 @@ fn fillet_then_larger_fillet_perpendicular_edge() {
             edge: edge2,
             dist: 6.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },

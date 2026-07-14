@@ -642,7 +642,6 @@ fn add_replay_fillet_with_intent(
             edge,
             dist: radius,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay,
             kind: crate::sketch::CornerKind::Fillet,
         },

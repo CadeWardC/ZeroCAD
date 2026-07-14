@@ -8,8 +8,8 @@
 use std::collections::HashSet;
 use std::time::Instant;
 use zerocad_core::{
-    CoordinateSystem, CornerKind, EdgeModScope, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
-    MockMesh, ParametricGraph, SketchCurves, Vec3,
+    CoordinateSystem, CornerKind, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, MockMesh,
+    ParametricGraph, SketchCurves, Vec3,
 };
 
 fn add_sketch(g: &mut ParametricGraph, id: &str, cs: CoordinateSystem, curves: SketchCurves) {
@@ -212,7 +212,6 @@ fn extruded_box_fillet_succeeds_and_is_fast() {
             edge,
             dist: 4.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: Default::default(),
             kind: CornerKind::Fillet,
         },
@@ -465,7 +464,6 @@ fn fillet_preview_drag_is_responsive() {
                 edge: edge.clone(),
                 dist: r,
                 dist_expr: None,
-                scope: EdgeModScope::FullEdge,
                 replay: Default::default(),
                 kind: CornerKind::Fillet,
             },

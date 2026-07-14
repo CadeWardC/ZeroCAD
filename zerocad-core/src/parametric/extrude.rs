@@ -111,6 +111,7 @@ pub(crate) fn stamp_sketch_extrude_face_refs(
     for (i, face_ref) in mesh.face_refs.iter_mut().enumerate() {
         face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: assigned[i].take(),
             surface_kind: None,
@@ -145,6 +146,7 @@ pub(crate) fn stamp_box_face_refs(mesh: &mut MockMesh, body_id: &str) {
         };
         face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some(format!("box_{body_id}:face:{role}")),
             surface_kind: Some("plane".to_string()),
@@ -166,6 +168,7 @@ pub(crate) fn stamp_import_face_refs(mesh: &mut MockMesh, body_id: &str) {
     for (k, &i) in order.iter().enumerate() {
         mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some(format!("import:{body_id}:face:{k}")),
             surface_kind: None,
@@ -189,6 +192,7 @@ pub(crate) fn stamp_revolve_face_refs(mesh: &mut MockMesh, body_id: &str, region
     for (k, &i) in order.iter().enumerate() {
         mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some(format!("revolve:{body_id}:region:{region_index}:face:{k}")),
             surface_kind: None,
@@ -210,6 +214,7 @@ pub(crate) fn stamp_pattern_face_refs(mesh: &mut MockMesh, body_id: &str, instan
     for (j, &i) in order.iter().enumerate() {
         mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some(format!("pattern:{body_id}:inst:{instance}:face:{j}")),
             surface_kind: None,
@@ -237,6 +242,7 @@ pub(crate) fn stamp_cylinder_face_refs(mesh: &mut MockMesh, body_id: &str) {
         };
         face_ref.topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some(format!("cyl_{body_id}:face:{role}")),
             surface_kind: Some(kind.to_string()),
@@ -1064,9 +1070,33 @@ pub(crate) fn fuse_overlapping_solids(parts: Vec<KernelSolid>) -> Vec<KernelSoli
             };
             if touch {
                 if let Some(u) = crate::mock_kernel::union(existing, &part) {
-                    *existing = u;
-                    merged = true;
-                    break;
+                    // Nested AABBs do not imply connected material (two
+                    // concentric rings are the common case). Some kernels
+                    // legitimately return that union as one `Solid` with two
+                    // disconnected shells. Keep the original inputs as separate
+                    // body parts unless the boolean actually fused them into one
+                    // connected component.
+                    let components = u.split_disconnected();
+                    if crate::mock_kernel::components_form_connected_material(&components) {
+                        *existing = u;
+                        merged = true;
+                        break;
+                    }
+                } else {
+                    let components = [existing.clone(), part.clone()];
+                    if crate::mock_kernel::components_form_connected_material(&components) {
+                        if let Some(aggregate) =
+                            crate::mock_kernel::aggregate_solid_components(&components)
+                        {
+                            if aggregate.is_watertight()
+                                && aggregate.health_report().is_healthy()
+                            {
+                                *existing = aggregate;
+                                merged = true;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }

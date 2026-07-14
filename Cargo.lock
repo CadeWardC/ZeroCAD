@@ -4976,9 +4976,7 @@ dependencies = [
 name = "zerocad-gui"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "eframe",
- "egui",
  "egui-wgpu",
  "env_logger",
  "log",

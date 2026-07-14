@@ -84,6 +84,7 @@ fn face_outline_rederives_when_the_body_changes() {
         normal: top.normal,
         topology: top.topology.clone().map(|t| TopologyFaceRef {
             body_id: t.body_id.or_else(|| Some("base".to_string())),
+            component_id: t.component_id,
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,

@@ -25,6 +25,79 @@ pub fn aabb_contains(outer: &([f32; 3], [f32; 3]), inner: &([f32; 3], [f32; 3]),
     (0..3).all(|k| outer.0[k] - eps <= inner.0[k] && inner.1[k] <= outer.1[k] + eps)
 }
 
+/// Whether topology-separated solid components still form one physically
+/// connected piece of material by sharing boundary vertices. Boolean union can
+/// retain a seam between tangent/adjacent sketch regions (for example a capsule
+/// made from a rectangle and circle), even though those regions are one body.
+/// A genuinely separated pair such as concentric rings has no shared boundary
+/// point and remains multiple bodies.
+pub fn components_form_connected_material(parts: &[KernelSolid]) -> bool {
+    if parts.len() <= 1 {
+        return true;
+    }
+
+    let vertices: Vec<_> = parts.iter().map(KernelSolid::vertices).collect();
+    let meshes: Vec<_> = parts.iter().map(MockMesh::from_solid).collect();
+    let vertex_near_surface = |vertex_mesh: &MockMesh, surface_mesh: &MockMesh| {
+        vertex_mesh.vertices.chunks_exact(6).any(|vertex| {
+            let point = [vertex[0], vertex[1], vertex[2]];
+            surface_mesh.indices.chunks_exact(3).any(|triangle| {
+                let position = |index: u32| {
+                    let offset = index as usize * 6;
+                    [
+                        surface_mesh.vertices[offset],
+                        surface_mesh.vertices[offset + 1],
+                        surface_mesh.vertices[offset + 2],
+                    ]
+                };
+                crate::mock_kernel::point_triangle_distance(
+                    point,
+                    position(triangle[0]),
+                    position(triangle[1]),
+                    position(triangle[2]),
+                ) <= 1.0e-4
+            })
+        })
+    };
+    let touches = |a: usize, b: usize| {
+        let aabb_overlap = match (solid_aabb(&parts[a]), solid_aabb(&parts[b])) {
+            (Some(a), Some(b)) => aabbs_overlap(&a, &b, 1.0e-4),
+            _ => false,
+        };
+        aabb_overlap
+            && (vertices[a].iter().any(|va| {
+                vertices[b]
+                    .iter()
+                    .any(|vb| va.point().distance(&vb.point()) <= 1.0e-4)
+            }) || vertex_near_surface(&meshes[a], &meshes[b])
+                || vertex_near_surface(&meshes[b], &meshes[a]))
+    };
+
+    let mut reached = vec![false; parts.len()];
+    reached[0] = true;
+    let mut pending = vec![0usize];
+    while let Some(current) = pending.pop() {
+        for candidate in 0..parts.len() {
+            if !reached[candidate] && touches(current, candidate) {
+                reached[candidate] = true;
+                pending.push(candidate);
+            }
+        }
+    }
+    reached.into_iter().all(|connected| connected)
+}
+
+/// Package several already-validated components into one solid container. This
+/// is the honest fallback when a boolean union cannot sew tangent components:
+/// their individual shells remain intact, while evaluation can still retain
+/// their one-body material connectivity and tessellate the shared seam away.
+pub fn aggregate_solid_components(parts: &[KernelSolid]) -> Option<KernelSolid> {
+    (!parts.is_empty()).then(|| {
+        let faces = parts.iter().flat_map(|part| part.shell().faces());
+        KernelSolid::new(openrcad::topo::Shell::from_faces(faces))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // openrcad Solid builders
 // ---------------------------------------------------------------------------

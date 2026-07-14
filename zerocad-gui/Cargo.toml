@@ -8,16 +8,13 @@ repository = "https://github.com/CadeWardC/ZeroCAD"
 
 [dependencies]
 zerocad-core = { path = "../zerocad-core" }
-egui.workspace = true
 # The workspace viewport renders its 3D scene on the GPU: eframe runs on the
 # wgpu backend, egui-wgpu registers the offscreen scene texture, and
-# openrcad-render's `RenderCore` does the actual drawing. wgpu/bytemuck are
-# named directly so the GUI can build the view-projection uniform and bridge
-# `MockMesh` into `openrcad_mesh::GpuMesh`.
+# openrcad-render's `RenderCore` does the actual drawing. The GUI uses egui
+# through eframe's public re-export.
 eframe = { workspace = true, features = ["wgpu"] }
 egui-wgpu.workspace = true
 wgpu.workspace = true
-bytemuck.workspace = true
 openrcad-render.workspace = true
 # serde / serde_json are kept for the in-progress Save / Export feature.
 serde.workspace = true

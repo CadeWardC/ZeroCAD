@@ -55,12 +55,14 @@ impl ZeroCadApp {
     }
 
     fn combine_body_label(&self, id: &str) -> String {
+        let owner_id = zerocad_core::body_output_owner_id(id);
         self.graph
             .graph
             .node_indices()
             .find_map(|index| {
                 let node = &self.graph.graph[index];
-                (node.id == id).then(|| format!("{} ({id})", node.name))
+                (node.id == owner_id)
+                    .then(|| format!("{} ({id})", body_output_label(&node.name, id)))
             })
             .unwrap_or_else(|| id.to_string())
     }

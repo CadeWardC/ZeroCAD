@@ -8,8 +8,8 @@ use zerocad_core::mock_kernel::{
     chamfer_edge_with_hint, cylinder_solid, fillet_edge_with_hint, EdgeCurveHint, KernelSolid,
 };
 use zerocad_core::{
-    detect_regions, CoordinateSystem, EdgeModReplayIntent, EdgeModScope, EdgeRef, ExtrudeMode,
-    FeatureNode, FeatureType, ParametricGraph, SketchCurves, Vec3,
+    detect_regions, CoordinateSystem, EdgeModReplayIntent, EdgeRef, ExtrudeMode, FeatureNode,
+    FeatureType, ParametricGraph, SketchCurves, Vec3,
 };
 
 /// The cylinder primitive is built about the +Y axis, so its top rim sits at
@@ -131,7 +131,6 @@ fn rim_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
             edge: rim,
             dist: 1.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind,
         },
@@ -199,7 +198,6 @@ fn rim_edge_mod_reaches_native_solver_and_degrades_safely() {
             edge: rim,
             dist: 1.0,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind: zerocad_core::CornerKind::Fillet,
         },
@@ -556,7 +554,6 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
             edge: arc,
             dist: 1.5,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind,
         },
@@ -643,7 +640,6 @@ fn sketch_extrude_edge_mod(
             edge,
             dist,
             dist_expr: None,
-            scope: EdgeModScope::FullEdge,
             replay: EdgeModReplayIntent::default(),
             kind,
         },
@@ -875,7 +871,6 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
                 edge,
                 dist,
                 dist_expr: None,
-                scope: EdgeModScope::FullEdge,
                 replay: EdgeModReplayIntent::default(),
                 kind: zerocad_core::CornerKind::Fillet,
             },

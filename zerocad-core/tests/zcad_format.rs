@@ -1,10 +1,12 @@
 //! `.zcad` container guarantees: a document round-trips through the binary
-//! format, corruption is detected (never a panic), old plain-JSON files still
-//! load, and unknown sections/fields are tolerated for forward compatibility.
+//! format, corruption is detected (never a panic), incompatible prototype files
+//! are rejected, and unknown container sections remain safely skippable.
 
 use std::collections::HashSet;
+use zerocad_core::parametric::{FaceRef, TopologyFaceRef};
 use zerocad_core::zcad_format::{
-    read_zcad, read_zcad_file, write_zcad, write_zcad_file, ZcadDocument, ZcadError, MAGIC,
+    read_zcad, read_zcad_file, write_zcad, write_zcad_file, ZcadDocument, ZcadError,
+    CURRENT_VERSION, MAGIC,
 };
 use zerocad_core::{FeatureNode, FeatureType, ParametricGraph, Unit};
 
@@ -47,9 +49,13 @@ fn round_trip_recipe_only() {
     let pg = sample_graph();
     let bytes = write_zcad(&doc_for(&pg)).expect("write");
     assert_eq!(&bytes[0..4], MAGIC, "file must start with the magic bytes");
+    assert_eq!(
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        CURRENT_VERSION,
+        "writer must stamp the current geometry-semantics contract"
+    );
 
     let loaded = read_zcad(&bytes).expect("read");
-    assert!(!loaded.was_legacy_json);
     assert!(loaded.mesh_cache.is_none());
     assert_eq!(loaded.metadata.feature_count, pg.graph.node_count() as u32);
 
@@ -58,6 +64,54 @@ fn round_trip_recipe_only() {
     let after = loaded.graph.evaluate().expect("eval restored");
     assert_eq!(before.indices.len(), after.indices.len());
     assert_eq!(before.vertices.len(), after.vertices.len());
+}
+
+#[test]
+fn connected_component_face_identity_round_trips() {
+    let mut pg = sample_graph();
+    pg.sketch_face_refs.insert(
+        "attached_sketch".to_string(),
+        FaceRef {
+            centroid: [4.0, 5.0, 6.0],
+            normal: [1.0, 0.0, 0.0],
+            topology: Some(TopologyFaceRef {
+                body_id: Some("box1".to_string()),
+                component_id: Some("0:0:0:400000:200000:300000".to_string()),
+                topology_version: Some(0),
+                face_id: Some("box_box1:face:+x".to_string()),
+                surface_kind: Some("plane".to_string()),
+            }),
+        },
+    );
+
+    let bytes = write_zcad(&doc_for(&pg)).expect("write component-aware document");
+    let loaded = read_zcad(&bytes).expect("read component-aware document");
+    let component_id = loaded
+        .graph
+        .sketch_face_refs
+        .get("attached_sketch")
+        .and_then(|face| face.topology.as_ref())
+        .and_then(|topology| topology.component_id.as_deref());
+    assert_eq!(
+        component_id,
+        Some("0:0:0:400000:200000:300000"),
+        "component identity is authoritative recipe data"
+    );
+}
+
+#[test]
+fn incompatible_binary_contract_is_rejected() {
+    let pg = sample_graph();
+    let mut bytes = write_zcad(&doc_for(&pg)).expect("write");
+    let obsolete = CURRENT_VERSION - 1;
+    bytes[4..6].copy_from_slice(&obsolete.to_le_bytes());
+    let checksum = crc32fast::hash(&bytes[0..12]);
+    bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
+
+    assert!(
+        matches!(read_zcad(&bytes), Err(ZcadError::UnsupportedVersion(v)) if v == obsolete),
+        "old geometry semantics must not be loaded as though they were current"
+    );
 }
 
 #[test]
@@ -379,15 +433,13 @@ fn truncated_file_is_an_error() {
 }
 
 #[test]
-fn legacy_json_still_loads() {
+fn legacy_json_is_rejected_by_the_new_contract() {
     let pg = sample_graph();
     let json = serde_json::to_string_pretty(&pg).expect("json");
-    let loaded = read_zcad(json.as_bytes()).expect("read legacy");
-    assert!(loaded.was_legacy_json);
-    assert_eq!(
-        loaded.graph.evaluate().unwrap().indices.len(),
-        pg.evaluate().unwrap().indices.len()
-    );
+    assert!(matches!(
+        read_zcad(json.as_bytes()),
+        Err(ZcadError::NotZcad)
+    ));
 }
 
 #[test]

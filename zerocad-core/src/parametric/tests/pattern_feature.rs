@@ -149,6 +149,7 @@ fn mirror_can_follow_a_planar_body_face() {
         normal: top.normal,
         topology: Some(TopologyFaceRef {
             body_id: Some("box_1".to_string()),
+            component_id: top.topology.as_ref().and_then(|t| t.component_id.clone()),
             topology_version: top.topology.as_ref().and_then(|t| t.topology_version),
             face_id: top.topology.as_ref().and_then(|t| t.face_id.clone()),
             surface_kind: top.topology.as_ref().and_then(|t| t.surface_kind.clone()),
@@ -226,6 +227,7 @@ fn mirror_join_unions_connected_copy_into_source_body() {
         normal: side.normal,
         topology: Some(TopologyFaceRef {
             body_id: Some("box_1".to_string()),
+            component_id: side.topology.as_ref().and_then(|t| t.component_id.clone()),
             topology_version: side.topology.as_ref().and_then(|t| t.topology_version),
             face_id: side.topology.as_ref().and_then(|t| t.face_id.clone()),
             surface_kind: side.topology.as_ref().and_then(|t| t.surface_kind.clone()),

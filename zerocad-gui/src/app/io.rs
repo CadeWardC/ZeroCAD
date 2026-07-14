@@ -690,14 +690,11 @@ impl ZeroCadApp {
         // evaluator's creation-order key. Continue after the loaded document's
         // largest suffix so a new Pattern cannot sort before its source body.
         self.reseed_id_counter_from_graph();
-        // Preserve the original creation time for legacy/unknown files we stamp anew.
-        self.doc_created_unix = (!loaded.was_legacy_json && loaded.metadata.created_unix != 0)
-            .then_some(loaded.metadata.created_unix);
-        // Restore the document's display unit (binary files only; legacy JSON has
-        // no metadata, so we keep the user's current preference).
-        if !loaded.was_legacy_json {
-            self.current_unit = loaded.metadata.units;
-        }
+        // Preserve the original creation time. A zero timestamp is the explicit
+        // "unknown" value and is replaced on the next save.
+        self.doc_created_unix =
+            (loaded.metadata.created_unix != 0).then_some(loaded.metadata.created_unix);
+        self.current_unit = loaded.metadata.units;
         self.selected_node_id = None;
         self.selected_faces.clear();
         self.selected_edges.clear();

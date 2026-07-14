@@ -109,13 +109,16 @@ fn external_thread_feature_evaluates_and_keeps_body() {
 }
 
 #[test]
-fn thread_targets_clicked_cylinder_across_multipart_join_result() {
-    // A failed/touching Join fallback can leave a visually continuous body as
-    // [wide, short flange, tall shaft]. The clicked shaft wall belongs to the
-    // second part. Thread evaluation must not stop at the flange merely because
-    // it is the first part containing a cylindrical face.
+fn thread_targets_clicked_cylinder_across_multipart_body() {
+    // A severing operation can intentionally leave several disconnected parts
+    // under one feature body. The clicked shaft wall belongs to the second part.
+    // Thread must use component identity/selection location, not vector order.
     let flange = crate::mock_kernel::cylinder_solid(12.0, 1.0).expect("short flange");
-    let shaft = crate::mock_kernel::cylinder_solid(8.0, 14.0).expect("tall shaft");
+    let shaft = crate::mock_kernel::cylinder_solid(8.0, 14.0)
+        .expect("tall shaft")
+        .transformed(&openrcad::foundation::Trsf::translation(
+            openrcad::foundation::Vec::new(30.0, 0.0, 0.0),
+        ));
     let flange_bounds = crate::mock_kernel::solid_aabb(&flange).expect("flange bounds");
     let plain_shaft_volume = MockMesh::from_solid(&shaft)
         .mass_properties()
@@ -133,7 +136,7 @@ fn thread_targets_clicked_cylinder_across_multipart_join_result() {
     };
     let step = ThreadReplayStep {
         face: FaceRef {
-            centroid: [8.0, 7.0, 0.0],
+            centroid: [38.0, 7.0, 0.0],
             normal: [1.0, 0.0, 0.0],
             topology: None,
         },

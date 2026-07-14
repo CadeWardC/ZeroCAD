@@ -24,7 +24,9 @@ impl ZeroCadApp {
                     // on its own so it can't be mistaken for either group.
                     let mut origin: Option<(String, String)> = None;
                     let mut sketches: Vec<(String, String)> = Vec::new();
-                    let mut bodies: Vec<(String, String)> = Vec::new();
+                    // `(runtime body id, owning feature id, display label)`.
+                    // One New Body feature can emit several disconnected bodies.
+                    let mut bodies: Vec<(String, String, String)> = Vec::new();
                     let mut operations: Vec<(String, String)> = Vec::new();
                     let mut datums: Vec<(String, String)> = Vec::new();
                     let mut variable_sets: Vec<(String, String)> = Vec::new();
@@ -60,7 +62,31 @@ impl ZeroCadApp {
                                     | zerocad_core::PatternKind::Mirror { join: false, .. },
                                 ..
                             }
-                            | FeatureType::BodyTransform { .. } => bodies.push(entry),
+                            | FeatureType::BodyTransform { .. } => {
+                                // Keep the feature's original output visible even
+                                // when a later operation has consumed it, matching
+                                // the history behavior that existed for one-output
+                                // features. Add every currently evaluated extra
+                                // output as its own browser body.
+                                let mut output_ids = vec![node.id.clone()];
+                                output_ids.extend(
+                                    self.body_meshes
+                                        .iter()
+                                        .map(|(body_id, _)| body_id)
+                                        .filter(|body_id| {
+                                            zerocad_core::body_output_owner_id(body_id) == node.id
+                                        })
+                                        .cloned(),
+                                );
+                                output_ids.sort_by_key(|body_id| {
+                                    zerocad_core::body_output_index(body_id)
+                                });
+                                output_ids.dedup();
+                                for body_id in output_ids {
+                                    let label = body_output_label(&node.name, &body_id);
+                                    bodies.push((body_id, node.id.clone(), label));
+                                }
+                            }
                             FeatureType::Extrude { .. }
                             | FeatureType::Revolve { .. }
                             | FeatureType::Loft { .. }
@@ -141,13 +167,13 @@ impl ZeroCadApp {
                                 if bodies.is_empty() {
                                     ui.weak("No bodies yet — add a primitive or Extrude a sketch.");
                                 }
-                                for (id, name) in &bodies {
-                                    let hidden = self.hidden_nodes.contains(id);
+                                for (id, owner_id, name) in &bodies {
+                                    let hidden = self.hidden_nodes.contains(owner_id);
                                     match self.feature_tree_row(ui, id, name, hidden, false, false)
                                     {
-                                        RowAction::Delete => id_to_delete = Some(id.clone()),
+                                        RowAction::Delete => id_to_delete = Some(owner_id.clone()),
                                         RowAction::ToggleVisibility => {
-                                            id_to_toggle = Some(id.clone())
+                                            id_to_toggle = Some(owner_id.clone())
                                         }
                                         RowAction::None => {}
                                         RowAction::AddVariable => {}
@@ -326,7 +352,9 @@ impl ZeroCadApp {
         let mut action = RowAction::None;
         // A feature whose reference/boolean didn't resolve on the last rebuild is
         // flagged here so it's visible in the tree, not just a global warning.
-        let unresolved = self.unresolved_features.get(id).cloned();
+        let owner_id = zerocad_core::body_output_owner_id(id).to_string();
+        let is_live_body = self.body_meshes.iter().any(|(body_id, _)| body_id == id);
+        let unresolved = self.unresolved_features.get(&owner_id).cloned();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
 
@@ -371,7 +399,15 @@ impl ZeroCadApp {
                 ui.add_space(24.0);
             }
 
-            let is_selected = self.selected_node_id.as_deref() == Some(id);
+            let is_selected = if is_live_body {
+                self.selected_body
+                    .contains(&(id.to_string(), BodyPick::Whole))
+                    || (self.selected_body.is_empty()
+                        && zerocad_core::body_output_index(id) == 0
+                        && self.selected_node_id.as_deref() == Some(owner_id.as_str()))
+            } else {
+                self.selected_node_id.as_deref() == Some(owner_id.as_str())
+            };
 
             // Inline rename: a text field replaces the label for the node being
             // renamed. Commits on Enter / click-away, cancels on Escape.
@@ -392,7 +428,7 @@ impl ZeroCadApp {
                     let new_name = self.rename_buffer.trim().to_string();
                     if !new_name.is_empty() {
                         for idx in self.graph.graph.node_indices() {
-                            if self.graph.graph[idx].id == id {
+                            if self.graph.graph[idx].id == owner_id {
                                 self.graph.graph[idx].name = new_name.clone();
                                 break;
                             }
@@ -426,8 +462,14 @@ impl ZeroCadApp {
                 self.rename_buffer = name.to_string();
                 self.rename_focus_pending = true;
             } else if response.clicked() {
-                self.selected_node_id = Some(id.to_string());
-                log::info!("Selected browser node: {}", id);
+                self.selected_node_id = Some(owner_id.clone());
+                if is_live_body {
+                    self.selected_faces.clear();
+                    self.selected_edges.clear();
+                    self.selected_body.clear();
+                    self.selected_body.insert((id.to_string(), BodyPick::Whole));
+                }
+                log::info!("Selected browser body/node: {}", id);
             }
 
             response.context_menu(|ui| {

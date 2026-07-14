@@ -7,19 +7,19 @@ use eframe::egui;
 /// Semantic text colors that adapt to the active (light/dark) theme, so panel
 /// labels stay readable in both. Mirrors the slate ramp used throughout the UI.
 #[derive(Clone, Copy)]
-pub struct Palette {
+pub(crate) struct Palette {
     /// Headings, logo, emphasized labels (light: slate-900).
-    pub text_strong: egui::Color32,
+    pub(crate) text_strong: egui::Color32,
     /// Primary body text (light: slate-600/700).
-    pub text_body: egui::Color32,
+    pub(crate) text_body: egui::Color32,
     /// Secondary / metadata text (light: slate-500).
-    pub text_muted: egui::Color32,
+    pub(crate) text_muted: egui::Color32,
     /// Hints and disabled-looking text (light: slate-400).
-    pub text_faint: egui::Color32,
+    pub(crate) text_faint: egui::Color32,
 }
 
 impl Palette {
-    pub fn light() -> Self {
+    pub(crate) fn light() -> Self {
         Self {
             text_strong: egui::Color32::from_rgb(15, 23, 42), // slate-900
             text_body: egui::Color32::from_rgb(71, 85, 105),  // slate-600
@@ -28,7 +28,7 @@ impl Palette {
         }
     }
 
-    pub fn dark() -> Self {
+    pub(crate) fn dark() -> Self {
         Self {
             text_strong: egui::Color32::from_rgb(241, 245, 249), // slate-100
             text_body: egui::Color32::from_rgb(203, 213, 225),   // slate-300
@@ -38,7 +38,7 @@ impl Palette {
     }
 }
 
-pub fn apply_premium_light_theme(ctx: &egui::Context) {
+pub(crate) fn apply_premium_light_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::light();
 
     // Core panels color palette (clean slates and white papers)
@@ -81,7 +81,7 @@ pub fn apply_premium_light_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-pub fn apply_premium_dark_theme(ctx: &egui::Context) {
+pub(crate) fn apply_premium_dark_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
 
     // Core panels color palette (deep slate surfaces).

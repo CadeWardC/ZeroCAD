@@ -458,6 +458,7 @@ fn cut_walls_carry_generated_names_and_survive_upstream_edit() {
         normal: wall.normal,
         topology: wall.topology.as_ref().map(|t| TopologyFaceRef {
             body_id: t.body_id.clone().or_else(|| Some("extrude_3".to_string())),
+            component_id: t.component_id.clone(),
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
             surface_kind: t.surface_kind.clone(),
@@ -718,6 +719,7 @@ fn captured_face_follows_its_own_lump_through_a_sever() {
         normal: right_bottom.normal,
         topology: right_bottom.topology.clone().map(|t| TopologyFaceRef {
             body_id: t.body_id.or_else(|| Some("extrude_2".to_string())),
+            component_id: t.component_id,
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
@@ -901,6 +903,7 @@ fn face_reattaches_to_same_span_after_width_edit() {
         normal: captured.normal,
         topology: captured.topology.as_ref().map(|t| TopologyFaceRef {
             body_id: t.body_id.clone().or_else(|| Some("extrude_3".to_string())),
+            component_id: t.component_id.clone(),
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
             surface_kind: t.surface_kind.clone(),
@@ -944,6 +947,7 @@ fn face_name_absent_reports_none_rather_than_wrong_face() {
         normal: [0.0, 0.0, 1.0],
         topology: Some(TopologyFaceRef {
             body_id: Some("extrude_3".to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some("sketch:extrude_3:region:0:face:does-not-exist".to_string()),
             surface_kind: None,
@@ -978,6 +982,7 @@ fn face_reattaches_through_added_cut() {
         normal: captured.normal,
         topology: captured.topology.clone().map(|t| TopologyFaceRef {
             body_id: t.body_id.or_else(|| Some("extrude_3".to_string())),
+            component_id: t.component_id,
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
@@ -1033,6 +1038,7 @@ fn face_survives_a_severing_cut() {
         normal: bottom.normal,
         topology: bottom.topology.clone().map(|t| TopologyFaceRef {
             body_id: t.body_id.or_else(|| Some("bar".to_string())),
+            component_id: t.component_id,
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
@@ -1090,6 +1096,7 @@ fn sketch_on_face_plane_follows_the_body() {
         normal: top.normal,
         topology: top.topology.clone().map(|t| TopologyFaceRef {
             body_id: t.body_id.or_else(|| Some("base".to_string())),
+            component_id: t.component_id,
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
@@ -1167,6 +1174,7 @@ fn face_reattaches_through_join() {
         normal: captured.normal,
         topology: captured.topology.clone().map(|t| TopologyFaceRef {
             body_id: t.body_id.or_else(|| Some("extrude_2".to_string())),
+            component_id: t.component_id,
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,

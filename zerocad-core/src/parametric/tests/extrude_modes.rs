@@ -70,10 +70,9 @@ fn join_negative_depth_into_body_keeps_it() {
 }
 
 #[test]
-fn join_with_no_overlap_warns_and_makes_separate_body() {
-    // A box, then a join far away that overlaps nothing. It still produces a
-    // body (Fusion semantics) but the user asked to *join*, so evaluation
-    // must surface a warning explaining the stray body.
+fn join_with_no_overlap_is_atomic_and_does_not_create_a_body() {
+    // A box, then a join far away that overlaps nothing. Join is strict: the
+    // feature stays unresolved and the pre-feature body remains unchanged.
     let mut g = ParametricGraph::new();
     add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (10.0, 10.0)));
     add_extrude(&mut g, "extrude_2", "sketch_1", 10.0, ExtrudeMode::NewBody);
@@ -82,10 +81,78 @@ fn join_with_no_overlap_warns_and_makes_separate_body() {
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
-    assert_eq!(bodies.len(), 2, "non-overlapping join still yields a body");
+    assert_eq!(
+        bodies.len(),
+        1,
+        "a failed Join must not create a stray body"
+    );
     assert!(
-        warnings.iter().any(|w| w.contains("separate body")),
-        "expected a 'became a separate body' warning, got {warnings:?}"
+        warnings.iter().any(|w| w.contains("was not applied")),
+        "expected an atomic Join failure warning, got {warnings:?}"
+    );
+}
+
+#[test]
+fn multi_region_join_rolls_back_when_any_region_cannot_fuse() {
+    use crate::geometry::Vec3;
+
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".to_string(),
+        name: "box_1".to_string(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let mut curves = SketchCurves::new();
+    curves.add_circle((5.0, 5.0), 2.0); // fuses to the box
+    curves.add_circle((30.0, 30.0), 2.0); // intentionally misses
+    add_sketch_cs(
+        &mut graph,
+        "sketch_2",
+        CoordinateSystem::new(Vec3::new(0.0, 0.0, 10.0), Vec3::X, Vec3::Y),
+        curves,
+    );
+    graph.add_feature(FeatureNode {
+        id: "extrude_3".to_string(),
+        name: "extrude_3".to_string(),
+        feature: FeatureType::Extrude {
+            target: Some("box_1".to_string()),
+            depth: 5.0,
+            region_indices: Vec::new(),
+            mode: ExtrudeMode::Join,
+            depth_expr: None,
+        },
+    });
+    graph.add_dependency("sketch_2", "extrude_3");
+    graph.add_dependency("box_1", "extrude_3");
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&Default::default())
+        .expect("evaluate atomic multi-region Join");
+    assert_eq!(bodies.len(), 1, "failed Join must not create another body");
+    let max_z = bodies[0]
+        .1
+        .vertices
+        .chunks_exact(6)
+        .map(|vertex| vertex[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        (max_z - 10.0).abs() < 0.05,
+        "the first region must be rolled back with the failed second region, max z={max_z}"
+    );
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("was not applied")));
+    let solids = graph
+        .debug_kernel_solids(&Default::default())
+        .expect("inspect rolled-back Join");
+    assert_eq!(
+        solids[0].1.len(),
+        1,
+        "no unfused tool may hide in body.parts"
     );
 }
 
@@ -137,7 +204,6 @@ fn edge_mod_on_sketched_prism_applies() {
                 },
                 dist: 2.11,
                 dist_expr: None,
-                scope: EdgeModScope::FullEdge,
                 replay: Default::default(),
                 kind,
             },

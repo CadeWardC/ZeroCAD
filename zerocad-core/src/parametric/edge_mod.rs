@@ -1,26 +1,7 @@
 use super::*;
 
-/// Edge-cutter facet cap for the boolean fallback. Native
-/// fillet/chamfer edits call this path only after native failure. The cutter
-/// tessellates adaptively (~3.6°/segment) up to this cap, so a right-angle edge
-/// rounds with ~24 facets — smooth enough that, with the facet-boundary lines
-/// suppressed (see `mesh_feature_edges`), the fillet reads as one curved face —
-/// while keeping truck's boolean cutter face count bounded.
-#[allow(dead_code)]
-pub(crate) const EDGE_FILLET_SEGS: usize = 24;
-
-/// Robust fallback edge-cutter grow amount. Must clear `BOOL_TOL`
-/// (0.05mm) by a healthy margin so the cutter's tangent edges read as cleanly
-/// *outside* the body faces rather than tangent — the configuration truck's
-/// boolean solver rejects. Costs up to this much chamfer/fillet size in the
-/// fallback path, the price of a boolean that resolves at all.
+/// Numerical margin used by blend containment and locality validation.
 pub(crate) const EDGE_MOD_GROW: f32 = 0.2;
-
-/// Robust fallback cutter overshoot past each selected edge endpoint. The exact
-/// fallback tries no overshoot first; this second pass clears endpoint caps and
-/// curved-wall runout tangencies.
-#[allow(dead_code)]
-pub(crate) const EDGE_MOD_END_OVERSHOOT: f32 = 1.0;
 
 /// A fillet/chamfer is subtractive, but B-Rep kernels can occasionally return a
 /// topologically valid-looking result that renders new material. Permit only a
@@ -58,18 +39,15 @@ fn edge_mod_timing(label: impl AsRef<str>, started: std::time::Instant) {
 /// proves the edit is local and subtractive; if a candidate refills a cut void or
 /// adds visible material, the body is left unchanged with a warning.
 ///
-/// `draft` is retained for API compatibility but no longer changes the result:
-/// edge modifiers resolve in a single pass, so the live preview and
-/// the committed model are identical.
+/// Edge modifiers resolve in a single pass, so the background preview and the
+/// committed model use the same operation.
 pub(crate) fn apply_edge_mod(
     mod_id: &str,
     target: &str,
     edge: &EdgeRef,
-    _scope: &EdgeModScope,
     replay: &EdgeModReplayIntent,
     dist: f32,
     kind: crate::sketch::CornerKind,
-    _draft: bool,
     live: &mut [LiveBody],
     warnings: &mut Vec<String>,
 ) {
@@ -277,10 +255,19 @@ pub(crate) fn edge_ref_from_mesh_candidate(
 /// name is gone we return `None` so the caller reports the feature **unresolved**
 /// rather than silently retargeting the wrong face (the "suspend, don't
 /// substitute" rule). A face with no name falls back to nearest-by-geometry.
-// Consumed by the Phase 1 reattachment tests today; wired into sketch-on-face and
-// cut/join targeting in Phase 4.
-#[allow(dead_code)]
 pub(crate) fn resolve_face_ref_by_topology(body: &LiveBody, face: &FaceRef) -> Option<FaceRef> {
+    resolve_face_on_body(body, face).map(|resolved| resolved.face)
+}
+
+/// One authoritative face-resolution result shared by face-driven features.
+/// Besides the reattached face it identifies the connected component that owns
+/// it, so downstream operations never scan a body's unrelated parts again.
+pub(crate) struct ResolvedBodyFace {
+    pub(crate) face: FaceRef,
+    pub(crate) component_index: usize,
+}
+
+pub(crate) fn resolve_face_on_body(body: &LiveBody, face: &FaceRef) -> Option<ResolvedBodyFace> {
     if let Some(requested) = face.topology.as_ref() {
         if let Some(requested_face_id) = requested.face_id.as_deref() {
             if requested
@@ -296,19 +283,50 @@ pub(crate) fn resolve_face_ref_by_topology(body: &LiveBody, face: &FaceRef) -> O
             // same principle as `part_key`): pick the candidate nearest the
             // captured centroid so the reference follows its own lump instead
             // of whichever match enumerates first.
-            let pick = |mesh: &MockMesh| -> Option<FaceRef> {
-                mesh.face_refs
+            let pick = |mesh: &MockMesh| -> Option<ResolvedBodyFace> {
+                let named: Vec<&crate::mock_kernel::MeshFaceRef> = mesh
+                    .face_refs
                     .iter()
                     .filter(|c| topology_face_id(c) == Some(requested_face_id))
+                    .collect();
+                let exact_component: Vec<&crate::mock_kernel::MeshFaceRef> = requested
+                    .component_id
+                    .as_deref()
+                    .map(|component_id| {
+                        named
+                            .iter()
+                            .copied()
+                            .filter(|candidate| {
+                                candidate
+                                    .topology
+                                    .as_ref()
+                                    .and_then(|topology| topology.component_id.as_deref())
+                                    == Some(component_id)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let candidates = if exact_component.is_empty() {
+                    named
+                } else {
+                    exact_component
+                };
+                candidates
+                    .into_iter()
                     .min_by(|a, b| {
                         let d = |c: &crate::mock_kernel::MeshFaceRef| {
                             distance3(c.centroid, face.centroid)
                         };
                         d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
                     })
-                    .map(|c| face_ref_from_mesh_face(body, c, requested))
+                    .and_then(|c| resolved_face_from_mesh_face(body, c, requested))
             };
-            if let Some(resolved) = body.pristine.as_deref().and_then(pick) {
+            let pristine = body.pristine.as_deref().map(|mesh| {
+                let mut mesh = mesh.clone();
+                crate::mock_kernel::stamp_body_face_components(&mut mesh, &body.id, &body.parts);
+                mesh
+            });
+            if let Some(resolved) = pristine.as_ref().and_then(pick) {
                 return Some(resolved);
             }
             return pick(&edge_mod_reference_mesh(body));
@@ -319,39 +337,41 @@ pub(crate) fn resolve_face_ref_by_topology(body: &LiveBody, face: &FaceRef) -> O
     resolve_face_ref_by_geometry(body, face)
 }
 
-#[allow(dead_code)]
 pub(crate) fn topology_face_id(face: &crate::mock_kernel::MeshFaceRef) -> Option<&str> {
     face.topology
         .as_ref()
         .and_then(|topology| topology.face_id.as_deref())
 }
 
-#[allow(dead_code)]
-fn face_ref_from_mesh_face(
+fn resolved_face_from_mesh_face(
     body: &LiveBody,
     candidate: &crate::mock_kernel::MeshFaceRef,
     requested: &TopologyFaceRef,
-) -> FaceRef {
+) -> Option<ResolvedBodyFace> {
     let topology = candidate
         .topology
         .as_ref()
         .map(|t| TopologyFaceRef {
             body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
+            component_id: t.component_id.clone(),
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
             surface_kind: t.surface_kind.clone(),
         })
         .or_else(|| Some(requested.clone()));
-    FaceRef {
-        centroid: candidate.centroid,
-        normal: candidate.normal,
-        topology,
-    }
+    let component_index = component_index_for_face(body, candidate)?;
+    Some(ResolvedBodyFace {
+        face: FaceRef {
+            centroid: candidate.centroid,
+            normal: candidate.normal,
+            topology,
+        },
+        component_index,
+    })
 }
 
-#[allow(dead_code)]
-fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<FaceRef> {
-    let pick = |mesh: &MockMesh| -> Option<FaceRef> {
+fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<ResolvedBodyFace> {
+    let pick = |mesh: &MockMesh| -> Option<ResolvedBodyFace> {
         mesh.face_refs
             .iter()
             .filter(|c| dot3(c.normal, face.normal) >= 0.7)
@@ -360,21 +380,70 @@ fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<FaceR
                     .partial_cmp(&distance3(b.centroid, face.centroid))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|c| FaceRef {
-                centroid: c.centroid,
-                normal: c.normal,
-                topology: c.topology.as_ref().map(|t| TopologyFaceRef {
-                    body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
-                    topology_version: t.topology_version,
-                    face_id: t.face_id.clone(),
-                    surface_kind: t.surface_kind.clone(),
-                }),
+            .and_then(|c| {
+                let requested = c
+                    .topology
+                    .as_ref()
+                    .map(|t| TopologyFaceRef {
+                        body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
+                        component_id: t.component_id.clone(),
+                        topology_version: t.topology_version,
+                        face_id: t.face_id.clone(),
+                        surface_kind: t.surface_kind.clone(),
+                    })
+                    .unwrap_or_default();
+                resolved_face_from_mesh_face(body, c, &requested)
             })
     };
-    body.pristine
-        .as_deref()
+    let pristine = body.pristine.as_deref().map(|mesh| {
+        let mut mesh = mesh.clone();
+        crate::mock_kernel::stamp_body_face_components(&mut mesh, &body.id, &body.parts);
+        mesh
+    });
+    pristine
+        .as_ref()
         .and_then(pick)
         .or_else(|| pick(&edge_mod_reference_mesh(body)))
+}
+
+fn component_index_for_face(
+    body: &LiveBody,
+    face: &crate::mock_kernel::MeshFaceRef,
+) -> Option<usize> {
+    if let Some(component_id) = face
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.component_id.as_deref())
+    {
+        if let Some(index) = body
+            .parts
+            .iter()
+            .position(|part| crate::mock_kernel::component_id(part) == component_id)
+        {
+            return Some(index);
+        }
+    }
+    body.parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            crate::mock_kernel::solid_aabb(part).map(|(min, max)| {
+                let distance = (0..3)
+                    .map(|axis| {
+                        if face.centroid[axis] < min[axis] {
+                            (min[axis] - face.centroid[axis]).powi(2)
+                        } else if face.centroid[axis] > max[axis] {
+                            (face.centroid[axis] - max[axis]).powi(2)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f32>();
+                (index, distance)
+            })
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(index, _)| index)
 }
 
 pub(crate) fn mesh_candidate_matches_captured_edge(
@@ -1880,229 +1949,6 @@ pub(crate) fn loop_bounds_2d(points: &[(f32, f32)]) -> Option<((f32, f32), (f32,
     any.then_some(((min_x, min_y), (max_x, max_y)))
 }
 
-#[allow(dead_code)]
-pub(crate) fn edge_mod_fallback_cut(
-    part: &KernelSolid,
-    edge: &EdgeRef,
-    dist: f32,
-    kind: crate::sketch::CornerKind,
-    reference_mesh: &MockMesh,
-    alternate_parts: &[(&'static str, KernelSolid)],
-) -> Result<KernelSolid, String> {
-    let mut failures = Vec::new();
-    match edge_mod_fallback_cut_against_part(part, part, edge, dist, kind, reference_mesh, "") {
-        Ok(result) => return Ok(result),
-        Err(reason) => failures.push(reason),
-    }
-    for (label, alternate_part) in alternate_parts {
-        let prefix = format!("{label} ");
-        match edge_mod_fallback_cut_against_part(
-            alternate_part,
-            part,
-            edge,
-            dist,
-            kind,
-            reference_mesh,
-            &prefix,
-        ) {
-            Ok(result) => return Ok(result),
-            Err(reason) => failures.push(reason),
-        }
-    }
-
-    Err(if failures.is_empty() {
-        "no fallback candidate was produced".to_string()
-    } else {
-        failures.join("; ")
-    })
-}
-
-#[allow(dead_code)]
-pub(crate) fn edge_mod_fallback_cut_against_part(
-    cut_part: &KernelSolid,
-    original_part: &KernelSolid,
-    edge: &EdgeRef,
-    dist: f32,
-    kind: crate::sketch::CornerKind,
-    reference_mesh: &MockMesh,
-    label_prefix: &str,
-) -> Result<KernelSolid, String> {
-    edge_mod_fallback_cut_candidates_against_part(
-        cut_part,
-        original_part,
-        edge,
-        dist,
-        kind,
-        reference_mesh,
-        label_prefix,
-        |_label, candidate, _failures| Some(candidate),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn edge_mod_fallback_cut_candidates_against_part<T>(
-    cut_part: &KernelSolid,
-    original_part: &KernelSolid,
-    edge: &EdgeRef,
-    dist: f32,
-    kind: crate::sketch::CornerKind,
-    reference_mesh: &MockMesh,
-    label_prefix: &str,
-    mut try_candidate: impl FnMut(&str, KernelSolid, &mut Vec<String>) -> Option<T>,
-) -> Result<T, String> {
-    let fillet = matches!(kind, crate::sketch::CornerKind::Fillet);
-    let robust_overshoot = EDGE_MOD_END_OVERSHOOT;
-    let mut failures = Vec::new();
-    for (orientation, cutter_edge) in [
-        ("", edge.clone()),
-        (" reversed", reversed_edge_ref_for_cutter(edge)),
-    ] {
-        for (label, grow, end_overshoot) in [
-            ("exact cutter", 0.0, 0.0),
-            ("grown cutter", EDGE_MOD_GROW, 0.0),
-            ("overshot cutter", 0.0, robust_overshoot),
-            ("robust cutter", EDGE_MOD_GROW, robust_overshoot),
-        ] {
-            let label = format!("{label_prefix}{label}{orientation}");
-            let Some(cutter) = crate::mock_kernel::edge_corner_cutter(
-                cutter_edge.p0,
-                cutter_edge.p1,
-                cutter_edge.n1,
-                cutter_edge.n2,
-                dist,
-                fillet,
-                EDGE_FILLET_SEGS,
-                grow,
-                end_overshoot,
-            ) else {
-                failures.push(format!("{label} could not be built"));
-                continue;
-            };
-            let Some(result) = crate::mock_kernel::difference(cut_part, &cutter) else {
-                failures.push(format!("{label} boolean failed"));
-                continue;
-            };
-            match edge_mod_accept_candidate(reference_mesh, original_part, result) {
-                Ok(result) => {
-                    if let Some(accepted) = try_candidate(&label, result, &mut failures) {
-                        return Ok(accepted);
-                    }
-                }
-                Err(reason) => failures.push(format!("{label} rejected: {reason}")),
-            }
-        }
-
-        if fillet {
-            for (label, grow, end_overshoot) in [
-                ("piecewise exact cutter", 0.0, 0.0),
-                ("piecewise grown cutter", EDGE_MOD_GROW, 0.0),
-                ("piecewise robust cutter", EDGE_MOD_GROW, robust_overshoot),
-            ] {
-                let label = format!("{label_prefix}{label}{orientation}");
-                let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
-                    cutter_edge.p0,
-                    cutter_edge.p1,
-                    cutter_edge.n1,
-                    cutter_edge.n2,
-                    dist,
-                    true,
-                    EDGE_FILLET_SEGS,
-                    grow,
-                    end_overshoot,
-                ) else {
-                    failures.push(format!("{label} could not be built"));
-                    continue;
-                };
-
-                let mut result = cut_part.clone();
-                let mut failed = None;
-                for cutter in pieces {
-                    match crate::mock_kernel::difference(&result, &cutter) {
-                        Some(next) => result = next,
-                        None => {
-                            failed = Some(format!("{label} boolean failed"));
-                            break;
-                        }
-                    }
-                }
-                if let Some(reason) = failed {
-                    failures.push(reason);
-                    continue;
-                }
-
-                match edge_mod_accept_candidate(reference_mesh, original_part, result) {
-                    Ok(result) => {
-                        if let Some(accepted) = try_candidate(&label, result, &mut failures) {
-                            return Ok(accepted);
-                        }
-                    }
-                    Err(reason) => failures.push(format!("{label} rejected: {reason}")),
-                }
-            }
-
-            for trim in [0.05, EDGE_MOD_GROW, 0.5] {
-                let label =
-                    format!("{label_prefix}trimmed piecewise cutter {trim:.2}{orientation}");
-                let Some(trimmed) = trimmed_edge_ref(&cutter_edge, trim) else {
-                    failures.push(format!("{label} could not be built"));
-                    continue;
-                };
-                let Some(pieces) = crate::mock_kernel::edge_corner_cutter_pieces(
-                    trimmed.p0,
-                    trimmed.p1,
-                    trimmed.n1,
-                    trimmed.n2,
-                    dist,
-                    true,
-                    EDGE_FILLET_SEGS,
-                    EDGE_MOD_GROW,
-                    0.0,
-                ) else {
-                    failures.push(format!("{label} could not be built"));
-                    continue;
-                };
-
-                let mut result = cut_part.clone();
-                let mut failed = None;
-                for cutter in pieces {
-                    match crate::mock_kernel::difference(&result, &cutter) {
-                        Some(next) => result = next,
-                        None => {
-                            failed = Some(format!("{label} boolean failed"));
-                            break;
-                        }
-                    }
-                }
-                if let Some(reason) = failed {
-                    failures.push(reason);
-                    continue;
-                }
-
-                match edge_mod_accept_candidate(reference_mesh, original_part, result) {
-                    Ok(result) => {
-                        if let Some(accepted) = try_candidate(&label, result, &mut failures) {
-                            return Ok(accepted);
-                        }
-                    }
-                    Err(reason) => failures.push(format!("{label} rejected: {reason}")),
-                }
-            }
-        }
-    }
-
-    Err(if failures.is_empty() {
-        "no fallback candidate was produced".to_string()
-    } else {
-        failures.join("; ")
-    })
-}
-
-pub(crate) fn reversed_edge_ref_for_cutter(edge: &EdgeRef) -> EdgeRef {
-    let mut reversed = edge.clone();
-    std::mem::swap(&mut reversed.p0, &mut reversed.p1);
-    reversed
-}
-
 pub(crate) fn sketch_source_alternate_parts(
     source: &SketchExtrudeSource,
     part_index: usize,
@@ -2141,48 +1987,12 @@ pub(crate) fn sketch_source_alternate_parts(
     out
 }
 
-#[allow(dead_code)]
-pub(crate) fn trimmed_edge_ref(edge: &EdgeRef, trim: f32) -> Option<EdgeRef> {
-    trimmed_edge_ref_asymmetric(edge, trim, trim)
-}
-
-pub(crate) fn trimmed_edge_ref_asymmetric(
-    edge: &EdgeRef,
-    start_trim: f32,
-    end_trim: f32,
-) -> Option<EdgeRef> {
-    let d = [
-        edge.p1[0] - edge.p0[0],
-        edge.p1[1] - edge.p0[1],
-        edge.p1[2] - edge.p0[2],
-    ];
-    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    if len <= start_trim + end_trim + 1.0e-4 {
-        return None;
-    }
-    let t = [d[0] / len, d[1] / len, d[2] / len];
-    Some(EdgeRef {
-        p0: [
-            edge.p0[0] + t[0] * start_trim,
-            edge.p0[1] + t[1] * start_trim,
-            edge.p0[2] + t[2] * start_trim,
-        ],
-        p1: [
-            edge.p1[0] - t[0] * end_trim,
-            edge.p1[1] - t[1] * end_trim,
-            edge.p1[2] - t[2] * end_trim,
-        ],
-        n1: edge.n1,
-        n2: edge.n2,
-        curve: None,
-        topology: None,
-    })
-}
-
 pub(crate) fn edge_mod_reference_mesh(body: &LiveBody) -> MockMesh {
     let mut mesh = MockMesh::empty();
     for part in &body.parts {
-        mesh.append(MockMesh::from_solid(part));
+        let mut part_mesh = MockMesh::from_solid(part);
+        crate::mock_kernel::stamp_face_component(&mut part_mesh, &body.id, part);
+        mesh.append(part_mesh);
     }
     if !mesh.indices.is_empty() {
         mesh
@@ -3212,15 +3022,6 @@ pub(crate) fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
 
-pub(crate) fn edge_mod_accept_candidate(
-    reference_mesh: &MockMesh,
-    original_part: &KernelSolid,
-    candidate: KernelSolid,
-) -> Result<KernelSolid, String> {
-    edge_mod_accept_candidate_with_mesh(reference_mesh, original_part, candidate)
-        .map(|(candidate, _)| candidate)
-}
-
 /// Permission for a fillet/chamfer candidate to ADD material: granted only
 /// when the selected straight edge's material wedge is reflex (a concave
 /// inner corner), where the blend fills the corner void instead of carving
@@ -3297,14 +3098,6 @@ fn edge_mod_additive_mesh_is_local(
         }
     }
     Ok(())
-}
-
-pub(crate) fn edge_mod_accept_candidate_with_mesh(
-    reference_mesh: &MockMesh,
-    original_part: &KernelSolid,
-    candidate: KernelSolid,
-) -> Result<(KernelSolid, Option<MockMesh>), String> {
-    edge_mod_accept_candidate_with_mesh_gated(reference_mesh, original_part, candidate, None)
 }
 
 pub(crate) fn edge_mod_accept_candidate_with_mesh_gated(

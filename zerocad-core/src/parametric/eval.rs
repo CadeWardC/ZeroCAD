@@ -71,9 +71,14 @@ impl ParametricGraph {
 
     /// Establish a directional dependency (e.g. Extrude depends on Sketch)
     pub fn add_dependency(&mut self, parent_id: &str, child_id: &str) {
-        if let (Some(parent_idx), Some(child_idx)) =
-            (self.resolve_node(parent_id), self.resolve_node(child_id))
-        {
+        // A single New Body feature may emit several independently selectable
+        // runtime bodies. Downstream features target the exact output id, but
+        // the dependency graph still points to the one feature that owns it.
+        let parent_feature_id = body_output_owner_id(parent_id);
+        if let (Some(parent_idx), Some(child_idx)) = (
+            self.resolve_node(parent_feature_id),
+            self.resolve_node(child_id),
+        ) {
             self.graph.add_edge(parent_idx, child_idx, ());
         }
     }
@@ -245,10 +250,9 @@ impl ParametricGraph {
     }
 
     /// Like [`evaluate_bodies`], but also returns any **non-fatal** warnings
-    /// raised while assembling the model — e.g. a Cut whose boolean the solver
-    /// could not resolve (so material was left intact) or a Join that overlapped
-    /// nothing (so it became a separate body). These are results the user did
-    /// *not* ask for, so the GUI surfaces them rather than letting the model
+    /// raised while assembling the model — e.g. a Cut or Join whose boolean the
+    /// solver could not resolve, so the feature was left unapplied. These are
+    /// results the user did *not* ask for, so the GUI surfaces them rather than
     /// quietly come out wrong. Successful coplanarity fallbacks are **not**
     /// warned about: they produce the geometry the user drew, so they're noise.
     ///
@@ -541,6 +545,7 @@ impl ParametricGraph {
             let feature_started = std::time::Instant::now();
             let node = &self.graph[idx];
             let warn_before = warnings.len();
+            let live_before_feature = live.clone();
             if !hidden.contains(&node.id) {
                 match &node.feature {
                     FeatureType::Box { w, h, d } => {
@@ -882,7 +887,6 @@ impl ParametricGraph {
                         edge,
                         dist,
                         dist_expr,
-                        scope,
                         replay,
                         kind,
                     } => {
@@ -904,16 +908,22 @@ impl ParametricGraph {
                             &node.id,
                             target,
                             edge,
-                            scope,
                             replay,
                             eff_dist,
                             *kind,
-                            draft,
                             &mut live,
                             &mut warnings,
                         );
                     }
                     _ => {}
+                }
+                if let Err(reason) = validate_live_body_state(&live) {
+                    live = live_before_feature;
+                    warnings.push(format!(
+                        "Feature '{}' produced invalid solid topology ({reason}); \
+                         the feature was not applied.",
+                        node.id
+                    ));
                 }
                 // Per-feature resolution status: this node is Unresolved iff it
                 // raised a warning while being applied — each warning names its own
@@ -985,12 +995,12 @@ impl ParametricGraph {
     /// is identical, which is what makes reusing a cached checkpoint sound.
     /// Hashing only — no geometry is built here.
     ///
-    /// NOTE: the `draft` flag is deliberately NOT folded in — it is currently a
-    /// no-op (`apply_edge_mod` ignores it), so draft previews and committed
-    /// rebuilds produce identical geometry and should share cached checkpoints. If
-    /// `draft` is ever made to change geometry again (e.g. a faceted draft fillet),
-    /// it MUST be folded into the seed here, or a draft preview would serve a
-    /// committed body's cached result (and vice versa).
+    /// NOTE: evaluation quality is deliberately not folded into these graph-input
+    /// keys. Edge modifiers use the same geometry in both qualities. Cut and Join
+    /// do use `draft` to defer expensive thread replay, but interactive evaluation
+    /// runs on a throwaway graph clone, so those draft checkpoints never populate
+    /// the authoritative graph's cache. If previews ever share their checkpoint
+    /// cache with committed evaluation, quality must be folded into the seed.
     pub(crate) fn eval_prefix_keys(
         &self,
         nodes: &[NodeIndex],
@@ -1418,6 +1428,7 @@ impl ParametricGraph {
             regions: Vec::new(),
         };
         let mut newbody_mesh = MockMesh::empty();
+        let mut newbody_part_meshes: Vec<([i64; 6], MockMesh)> = Vec::new();
         let mut newbody_body_count = 0usize;
         let mut newbody_cut_replay: Option<CutReplayHistory> = None;
 
@@ -1684,6 +1695,10 @@ impl ParametricGraph {
                     );
                     stamp_sketch_extrude_face_refs(&mut region_mesh, node_id, i, cs, depth);
                     crate::mock_kernel::populate_edge_adjacent_face_names(&mut region_mesh);
+                    if let Some(part) = region_part.as_ref() {
+                        newbody_part_meshes
+                            .push((crate::mock_kernel::part_key(part), region_mesh.clone()));
+                    }
                     newbody_mesh.append(region_mesh);
                 }
                 ExtrudeMode::Cut => {
@@ -1778,8 +1793,25 @@ impl ParametricGraph {
                     // boundary becomes internal topology.
                     newbody_tools = fuse_overlapping_solids(newbody_tools);
                 }
+                // A kernel union can package multiple shells into one `Solid`.
+                // New Body semantics are one independently selectable body per
+                // connected component, so normalize every result before assigning
+                // stable output ids. The position key makes Body_1/Body_2 ordering
+                // deterministic across rebuilds.
+                newbody_tools = newbody_tools
+                    .into_iter()
+                    .flat_map(|solid| {
+                        let components = solid.split_disconnected();
+                        if crate::mock_kernel::components_form_connected_material(&components) {
+                            vec![solid]
+                        } else {
+                            components
+                        }
+                    })
+                    .collect();
+                newbody_tools.sort_by_key(crate::mock_kernel::part_key);
                 let merged_regions = newbody_tools.len() < before_fuse;
-                if !newbody_tools.is_empty() {
+                if newbody_tools.len() == 1 {
                     live.push(LiveBody {
                         id: node_id.to_string(),
                         parts: newbody_tools,
@@ -1796,6 +1828,88 @@ impl ParametricGraph {
                         edge_mod_cut_history_path_used: false,
                         thread_replay: None,
                     });
+                } else {
+                    // The feature owns several bodies. Keep the first output id
+                    // backward-compatible (`extrude_N`) and suffix later bodies.
+                    // Each receives its own mesh so viewport picking, selection,
+                    // targeting, and export all see distinct bodies.
+                    for (output_index, part) in newbody_tools.into_iter().enumerate() {
+                        let output_id = body_output_id(node_id, output_index);
+                        let part_key = crate::mock_kernel::part_key(&part);
+                        let part_source_regions: Vec<SketchExtrudeRegionSource> = sketch_source
+                            .regions
+                            .iter()
+                            .filter(|source| {
+                                let source_solid = source
+                                    .rect_circle
+                                    .as_ref()
+                                    .and_then(|canonical| canonical.body.clone())
+                                    .or_else(|| {
+                                        crate::mock_kernel::extruded_region_solid(
+                                            &source.boundary,
+                                            &source.holes,
+                                            source.depth,
+                                            &source.cs,
+                                        )
+                                    });
+                                source_solid.as_ref().is_some_and(|source_part| {
+                                    crate::mock_kernel::part_key(source_part) == part_key
+                                })
+                            })
+                            .cloned()
+                            .collect();
+
+                        // Preserve the per-region pristine mesh whenever this
+                        // output is an unfused sketch region. It carries the
+                        // durable shape/edge provenance used for reattachment;
+                        // rebuilding it generically here would reduce a real
+                        // Body_2 to anonymous tessellation edges.
+                        let mut mesh = newbody_part_meshes
+                            .iter()
+                            .position(|(key, _)| *key == part_key)
+                            .map(|index| newbody_part_meshes.remove(index).1)
+                            .unwrap_or_else(|| {
+                                let mut mesh = MockMesh::from_solid(&part);
+                                let (mesh_cs, mesh_depth) = part_source_regions
+                                    .first()
+                                    .map(|source| (source.cs, source.depth))
+                                    .unwrap_or((*cs, depth));
+                                stamp_sketch_extrude_face_refs(
+                                    &mut mesh,
+                                    &output_id,
+                                    output_index,
+                                    &mesh_cs,
+                                    mesh_depth,
+                                );
+                                crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+                                mesh
+                            });
+                        for edge in &mut mesh.edge_refs {
+                            if let Some(topology) = edge.topology.as_mut() {
+                                topology.body_id = Some(output_id.clone());
+                            }
+                        }
+                        crate::mock_kernel::stamp_face_component(&mut mesh, &output_id, &part);
+
+                        live.push(LiveBody {
+                            id: output_id,
+                            parts: vec![part],
+                            pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
+                            sketch_source: (!part_source_regions.is_empty()).then_some(
+                                SketchExtrudeSource {
+                                    regions: part_source_regions,
+                                },
+                            ),
+                            // Canonical circular-bite replay metadata is assembled
+                            // feature-wide above. It cannot safely be shared across
+                            // independently targeted bodies; native body operations
+                            // remain available and clear/rebuild this state normally.
+                            cut_tools: Vec::new(),
+                            cut_replay: None,
+                            edge_mod_cut_history_path_used: false,
+                            thread_replay: None,
+                        });
+                    }
                 }
             }
             ExtrudeMode::Join | ExtrudeMode::Cut => {
@@ -2296,6 +2410,7 @@ fn stamp_generated_face_refs(mesh: &mut MockMesh, body_id: &str, kind: &str) {
     for (k, &i) in order.iter().enumerate() {
         mesh.face_refs[i].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
             body_id: Some(body_id.to_string()),
+            component_id: None,
             topology_version: Some(0),
             face_id: Some(format!("{kind}:{body_id}:face:{k}")),
             surface_kind: None,
@@ -2590,8 +2705,8 @@ pub(crate) fn thread_one(
     body: &mut LiveBody,
     step: &ThreadReplayStep,
 ) -> Result<(), ThreadFailure> {
-    // Resolve the selected cylindrical face and which part it belongs to. A
-    // single LiveBody may contain several disjoint/boolean-fallback parts. Do
+    // Resolve the selected cylindrical face and which component it belongs to.
+    // A LiveBody may intentionally contain several parts after a severing cut. Do
     // not stop at the first part that happens to contain a cylinder: the thread
     // preview captured a real point on the picked wall, so rank the best
     // cylinder from EVERY part by its distance from that point. The axial term
@@ -2623,10 +2738,12 @@ pub(crate) fn thread_one(
         };
         radial_error.hypot(axial_error)
     };
+    let component = resolve_face_on_body(body, &step.face).map(|resolved| resolved.component_index);
     let resolved = body
         .parts
         .iter()
         .enumerate()
+        .filter(|(index, _)| component.is_none_or(|component| *index == component))
         .filter_map(|(pi, part)| {
             crate::mock_kernel::cylinder_face_near(part, step.face.centroid).map(|info| (pi, info))
         })
@@ -3757,6 +3874,49 @@ pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> 
     tessellate_bodies_with_cancel(live, None).expect("uncancellable tessellation cannot cancel")
 }
 
+/// Global evaluator invariant: every runtime part is exactly one connected,
+/// watertight, healthy B-Rep component. Features are evaluated against a cloned
+/// pre-state and rolled back if this check fails, so invalid kernel output can
+/// never poison later history or be serialized into a hydrated checkpoint.
+fn validate_live_body_state(live: &[LiveBody]) -> Result<(), String> {
+    let validate_parts = |owner: &str, parts: &[KernelSolid]| -> Result<(), String> {
+        for (index, part) in parts.iter().enumerate() {
+            if !part.is_watertight() {
+                return Err(format!("{owner} part {index} is not watertight"));
+            }
+            if !part.health_report().is_healthy() {
+                return Err(format!("{owner} part {index} is topologically unhealthy"));
+            }
+            let components = part.split_disconnected();
+            if components.len() > 1
+                && !crate::mock_kernel::components_form_connected_material(&components)
+            {
+                return Err(format!(
+                    "{owner} part {index} contains multiple disconnected components"
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    for body in live {
+        validate_parts(&format!("body '{}'", body.id), &body.parts)?;
+        if let Some(replay) = &body.thread_replay {
+            validate_parts(
+                &format!("body '{}' thread replay", body.id),
+                &replay.base_parts,
+            )?;
+        }
+        if let Some(replay) = &body.cut_replay {
+            validate_parts(
+                &format!("body '{}' cut replay", body.id),
+                &replay.base_parts,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn tessellate_bodies_with_cancel(
     live: Vec<LiveBody>,
     cancellation: Option<&EvaluationCancellation>,
@@ -3767,15 +3927,20 @@ fn tessellate_bodies_with_cancel(
             return Err(EvaluationError::Cancelled);
         }
         let mesh = match body.pristine {
-            Some(m) => (*m).clone(),
+            Some(m) => {
+                let mut mesh = (*m).clone();
+                crate::mock_kernel::stamp_body_face_components(&mut mesh, &body.id, &body.parts);
+                mesh
+            }
             None => {
                 let mut m = MockMesh::empty();
                 for part in &body.parts {
-                    let part_mesh = match cancellation {
+                    let mut part_mesh = match cancellation {
                         Some(cancel) => MockMesh::from_solid_with_cancel(part, cancel)
                             .map_err(|_| EvaluationError::Cancelled)?,
                         None => MockMesh::from_solid(part),
                     };
+                    crate::mock_kernel::stamp_face_component(&mut part_mesh, &body.id, part);
                     m.append(part_mesh);
                 }
                 m

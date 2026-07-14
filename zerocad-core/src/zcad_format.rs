@@ -29,11 +29,11 @@
 //! it regenerates all geometry. The thumbnail and the optional mesh cache are
 //! conveniences: a self-contained preview and an instant-open / fallback render.
 //!
-//! Forward compatibility comes from two independent mechanisms:
+//! Container extensibility comes from two independent mechanisms:
 //! * **Container level** — unknown `section_id`s are skipped using their
 //!   `offset`/`stored_len`, so an old reader tolerates new sections.
-//! * **Payload level** — sections are CBOR (self-describing), so `#[serde(default)]`
-//!   fields decode exactly as they do on the legacy JSON path.
+//! * **Payload level** — sections are self-describing CBOR. The document contract
+//!   version still has to match exactly because topology semantics are authoritative.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -50,10 +50,12 @@ use crate::EvaluationCacheSnapshot;
 
 /// Magic bytes at the start of every binary `.zcad` file.
 pub const MAGIC: &[u8; 4] = b"ZCAD";
-/// Current container framing version. Bumped only when the header/table/section
-/// framing changes — never for payload schema changes (those are absorbed by
-/// serde `#[serde(default)]`).
-pub const CURRENT_VERSION: u16 = 3;
+/// Current document contract. Version 4 introduces explicit connected-component
+/// identity for persistent face references and strict transactional Join
+/// semantics. Readers intentionally require an exact match rather than guessing
+/// across incompatible geometry semantics.
+pub const CURRENT_VERSION: u16 = 4;
+const DOCUMENT_RECIPE_SCHEMA: u16 = 2;
 
 const HEADER_LEN: usize = 32;
 const TABLE_ENTRY_LEN: usize = 32;
@@ -65,9 +67,9 @@ const SEC_THUMBNAIL: u16 = 3;
 const SEC_MESH_CACHE: u16 = 4;
 const SEC_HIDDEN_NODES: u16 = 5;
 const SEC_HYDRATED_CHECKPOINTS: u16 = 6;
-const HYDRATED_CACHE_SCHEMA: u16 = 1;
+const HYDRATED_CACHE_SCHEMA: u16 = 2;
 const OPENRCAD_CACHE_ABI: u16 = 2;
-const MESH_CACHE_ABI: u16 = 2;
+const MESH_CACHE_ABI: u16 = 3;
 pub const DEFAULT_HYDRATED_CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
 // Codecs.
@@ -133,8 +135,6 @@ pub struct LoadedZcad {
     /// Present and fresh only when the embedded cache's `graph_hash` matches the
     /// graph that was loaded; a stale cache is discarded (left `None`).
     pub mesh_cache: Option<Vec<(String, MockMesh)>>,
-    /// True when the file was an old plain-JSON `.zcad` loaded via the legacy path.
-    pub was_legacy_json: bool,
     /// Node ids that were hidden when the file was saved.
     pub hidden_nodes: HashSet<String>,
     pub evaluation_cache: Option<EvaluationCacheSnapshot>,
@@ -144,7 +144,7 @@ pub struct LoadedZcad {
 /// petgraph's arena/index representation: node records and dependencies are
 /// explicit, sorted, and independently migratable in future schema versions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DocumentRecipeV1 {
+pub struct DocumentRecipeV2 {
     pub schema_version: u16,
     pub features: Vec<RecipeFeature>,
     pub dependencies: Vec<RecipeDependency>,
@@ -168,7 +168,7 @@ pub struct RecipeDependency {
     pub child: String,
 }
 
-impl DocumentRecipeV1 {
+impl DocumentRecipeV2 {
     pub fn from_graph(graph: &ParametricGraph) -> Self {
         use petgraph::visit::EdgeRef as _;
 
@@ -228,7 +228,7 @@ impl DocumentRecipeV1 {
         sketch_face_boundaries.sort_by(|a, b| a.0.cmp(&b.0));
 
         Self {
-            schema_version: 1,
+            schema_version: DOCUMENT_RECIPE_SCHEMA,
             features,
             dependencies,
             sketch_face_refs,
@@ -238,7 +238,7 @@ impl DocumentRecipeV1 {
     }
 
     pub fn into_graph(self) -> Result<ParametricGraph, ZcadError> {
-        if self.schema_version != 1 {
+        if self.schema_version != DOCUMENT_RECIPE_SCHEMA {
             return Err(ZcadError::Decode(format!(
                 "unsupported document recipe schema {}",
                 self.schema_version
@@ -268,7 +268,7 @@ impl DocumentRecipeV1 {
 
 #[derive(Debug)]
 pub enum ZcadError {
-    /// Not a `.zcad` file (no magic bytes and not legacy JSON).
+    /// Not a `.zcad` file (no binary magic bytes).
     NotZcad,
     /// The file ends before a declared structure — truncated or partial write.
     Truncated,
@@ -505,7 +505,7 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
     let mut sections: Vec<StagedSection> = Vec::new();
 
     // --- GRAPH (source of truth) ---
-    let recipe_cbor = cbor_to_vec(&DocumentRecipeV1::from_graph(doc.graph))?;
+    let recipe_cbor = cbor_to_vec(&DocumentRecipeV2::from_graph(doc.graph))?;
     let recipe_hash = recipe_hash(&recipe_cbor);
     let recipe_uncompressed = recipe_cbor.len();
     let recipe_stored = zstd_compress(&recipe_cbor, GRAPH_LEVEL)?;
@@ -713,28 +713,11 @@ pub fn read_zcad_file(path: impl AsRef<Path>) -> Result<LoadedZcad, ZcadError> {
     read_zcad(&bytes)
 }
 
-/// Parse a `.zcad` file. Accepts the binary container, an old plain-JSON
-/// `.zcad`, and rejects anything else with [`ZcadError::NotZcad`].
+/// Parse a version-4 binary `.zcad` file. Earlier binary contracts and the old
+/// plain-JSON prototype format are intentionally rejected.
 pub fn read_zcad(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
     if bytes.len() >= 4 && &bytes[0..4] == MAGIC {
         return read_binary(bytes);
-    }
-    // Legacy plain-JSON `.zcad` files start with `{` (after optional whitespace).
-    if let Some(&b) = bytes.iter().find(|b| !b.is_ascii_whitespace()) {
-        if b == b'{' {
-            let mut graph: ParametricGraph =
-                serde_json::from_slice(bytes).map_err(|e| ZcadError::Decode(e.to_string()))?;
-            graph.rebuild_node_map();
-            return Ok(LoadedZcad {
-                graph,
-                metadata: ZcadMetadata::default(),
-                thumbnail_png: None,
-                mesh_cache: None,
-                was_legacy_json: true,
-                hidden_nodes: HashSet::new(),
-                evaluation_cache: None,
-            });
-        }
     }
     Err(ZcadError::NotZcad)
 }
@@ -766,13 +749,8 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
         return Err(ZcadError::BadChecksum { section: 0 });
     }
     let format_version = le_u16(&bytes[4..6]);
-    if format_version > CURRENT_VERSION {
-        // Best-effort: a strictly-newer framing may not be parseable. We attempt
-        // it anyway (unknown sections are skipped), but if the table doesn't fit
-        // we surface the version rather than a confusing truncation error.
-        if bytes.len() < HEADER_LEN + (bytes[8] as usize) * TABLE_ENTRY_LEN {
-            return Err(ZcadError::UnsupportedVersion(format_version));
-        }
+    if format_version != CURRENT_VERSION {
+        return Err(ZcadError::UnsupportedVersion(format_version));
     }
     let section_count = bytes[8] as usize;
     let table_end = HEADER_LEN + section_count * TABLE_ENTRY_LEN;
@@ -809,7 +787,7 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
 
     // Decode each section into its slot. Unknown ids are skipped silently.
     let mut metadata = ZcadMetadata::default();
-    let mut recipe: Option<DocumentRecipeV1> = None;
+    let mut recipe: Option<DocumentRecipeV2> = None;
     let mut recipe_bytes: Option<Vec<u8>> = None;
     let mut thumbnail_png: Option<Vec<u8>> = None;
     let mut mesh_payload: Option<MeshCachePayload> = None;
@@ -921,7 +899,6 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
         metadata,
         thumbnail_png,
         mesh_cache,
-        was_legacy_json: false,
         hidden_nodes,
         evaluation_cache,
     })
@@ -947,7 +924,7 @@ mod tests {
             name: "B".into(),
             feature: FeatureType::Box { w, h: 1.0, d: 1.0 },
         });
-        cbor_to_vec(&DocumentRecipeV1::from_graph(&pg)).unwrap()
+        cbor_to_vec(&DocumentRecipeV2::from_graph(&pg)).unwrap()
     }
 
     #[test]

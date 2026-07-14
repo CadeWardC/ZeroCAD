@@ -205,10 +205,10 @@ fn test_parametric_graph_sketch_extrude() {
 }
 
 #[test]
-fn test_overlapping_rectangles_yield_three_extruded_regions() {
-    // The headline Fusion-style behavior: two overlapping rectangles in a
-    // sketch produce 3 detected regions, and an Extrude that selects all
-    // of them yields 3× the triangle count of a single-region extrude.
+fn test_overlapping_rectangles_fuse_into_one_extruded_body() {
+    // Two overlapping rectangles produce three detected sketch regions, but
+    // selecting all of them for New Body must fuse the touching material into
+    // one clean 15×10 prism rather than retain internal region seams.
     let mut pg = ParametricGraph::new();
     let mut curves = SketchCurves::new();
     curves.add_rectangle((0.0, 0.0), (10.0, 10.0));
@@ -275,14 +275,20 @@ fn test_overlapping_rectangles_yield_three_extruded_regions() {
     pg2.add_dependency("s2", "e2");
     let mesh_single = pg2.evaluate().unwrap();
 
-    // Three sub-regions ≈ 3× triangles of one region. Allow some slack since
-    // each region has the same per-region face count (top/bottom + sides).
-    assert!(
-        mesh_multi.indices.len() >= mesh_single.indices.len() * 3 - 12,
-        "expected ~3× triangle count, got {} vs single {}",
+    assert_eq!(
         mesh_multi.indices.len(),
-        mesh_single.indices.len()
+        mesh_single.indices.len(),
+        "the fused rectangular prism should have no internal region faces"
     );
+    let (min_x, max_x) = mesh_multi
+        .vertices
+        .chunks_exact(6)
+        .map(|vertex| vertex[0])
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), x| {
+            (min.min(x), max.max(x))
+        });
+    assert!((min_x - 0.0).abs() < 1.0e-3);
+    assert!((max_x - 15.0).abs() < 1.0e-3);
 }
 
 #[test]

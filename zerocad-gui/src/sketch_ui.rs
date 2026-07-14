@@ -9,11 +9,6 @@ use crate::{SketchTool, ZeroCadApp};
 /// One editable dimension field in the shape-creation dialog.
 #[derive(Debug, Clone)]
 pub(crate) struct DimField {
-    /// Human label for the dimension ("Width", "Diameter", …). Set by
-    /// [`dim_fields_for`]; retained for tooltips/labels even though the compact
-    /// inline box doesn't render it today.
-    #[allow(dead_code)]
-    pub(crate) label: &'static str,
     pub(crate) value: String,
     /// Angle fields use degrees; every other sketch dimension follows the
     /// document's selected length unit.
@@ -103,15 +98,11 @@ impl DimInput {
 
 /// Build the dimension fields for a tool.
 pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
-    let fields: &[(&'static str, bool)] = match tool {
-        SketchTool::Rectangle | SketchTool::RectangleCenter => {
-            &[("Width", false), ("Height", false)]
-        }
-        SketchTool::Circle => &[("Diameter", false)],
-        SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => {
-            &[("Guide diameter", false)]
-        }
-        SketchTool::Line => &[("Length", false), ("Angle (°)", true)],
+    let fields: &[bool] = match tool {
+        SketchTool::Rectangle | SketchTool::RectangleCenter => &[false, false],
+        SketchTool::Circle => &[false],
+        SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => &[false],
+        SketchTool::Line => &[false, true],
         // 3-point tools (rotated rectangle, 3-point circle, ellipses) draw by
         // clicking points; the corner tools (fillet/chamfer) take their radius
         // from the toolbar. None use inline dimension fields.
@@ -125,8 +116,7 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
     };
     fields
         .iter()
-        .map(|&(label, is_angle)| DimField {
-            label,
+        .map(|&is_angle| DimField {
             value: String::new(),
             is_angle,
             locked: false,
@@ -360,13 +350,12 @@ impl ZeroCadApp {
 mod tests {
     use super::{dim_fields_for, DimField, DimInput};
     use crate::{SketchTool, ZeroCadApp};
+    use eframe::egui;
 
     fn dimension_input(focus_request: Option<usize>) -> DimInput {
         DimInput {
-            fields: ["Width", "Height"]
-                .into_iter()
-                .map(|label| DimField {
-                    label,
+            fields: (0..2)
+                .map(|_| DimField {
                     value: "12.34".to_string(),
                     is_angle: false,
                     locked: false,
@@ -452,14 +441,13 @@ mod tests {
     }
 
     #[test]
-    fn polygon_uses_one_guide_diameter_field() {
+    fn polygon_uses_one_length_field() {
         for tool in [
             SketchTool::PolygonInscribed,
             SketchTool::PolygonCircumscribed,
         ] {
             let fields = dim_fields_for(tool);
             assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0].label, "Guide diameter");
             assert!(!fields[0].is_angle);
         }
     }
