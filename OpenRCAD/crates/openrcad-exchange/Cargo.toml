@@ -20,6 +20,7 @@ parallel = ["openrcad-mesh/parallel"]
 [dependencies]
 openrcad-foundation.workspace = true
 openrcad-geom.workspace = true
+openrcad-geom2d.workspace = true
 openrcad-topo.workspace = true
 openrcad-mesh.workspace = true
 serde.workspace = true

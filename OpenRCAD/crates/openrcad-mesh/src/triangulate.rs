@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::TriangleMesh;
 use openrcad_foundation::{tolerance::CONFUSION, Pnt, Pnt2d, Vec as GeomVec};
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Surface};
-use openrcad_topo::{orientation::Orientation, Face};
+use openrcad_topo::{orientation::Orientation, Face, PcurveData};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tri {
@@ -705,6 +705,42 @@ pub fn unwrap_coordinate(val: f64, prev: f64, period: f64) -> f64 {
         .unwrap()
 }
 
+/// Resolve one boundary sample in the face's parameter space.
+///
+/// Stored coedge pcurves are the only boundary representation consumed by the
+/// tessellator. Legacy topology must first pass through the mesh crate's named
+/// compatibility adapter, which attaches and validates pcurves. Periodic values
+/// are aligned to the previous sample without destroying an explicitly
+/// unwrapped pcurve range.
+fn boundary_uv(
+    surface: &GeomSurface,
+    pcurve: &PcurveData,
+    natural_fraction: f64,
+    previous: Option<(f64, f64)>,
+) -> Pnt2d {
+    let uv = pcurve.point_at_fraction(natural_fraction);
+    let (mut u, mut v) = (uv.x(), uv.y());
+
+    if let Some((previous_u, previous_v)) = previous {
+        let u_period = pcurve
+            .periodicity
+            .u_period
+            .or_else(|| surface.is_uclosed().then_some(core::f64::consts::TAU));
+        let v_period = pcurve
+            .periodicity
+            .v_period
+            .or_else(|| surface.is_vclosed().then_some(core::f64::consts::TAU));
+        if let Some(period) = u_period {
+            u = unwrap_coordinate(u, previous_u, period);
+        }
+        if let Some(period) = v_period {
+            v = unwrap_coordinate(v, previous_v, period);
+        }
+    }
+
+    Pnt2d::new(u, v)
+}
+
 /// Sample interior (u, v) points to represent surface curvature.
 pub fn sample_interior_points(
     surf: &GeomSurface,
@@ -1134,15 +1170,25 @@ fn is_untrimmed_cylinder_patch(
     sides.into_iter().all(|present| present)
 }
 
-/// Triangulate an untrimmed cylinder parameter rectangle as the minimal strip
-/// between its two already-discretized rim arcs. Returns `None` if the two rims
-/// do not carry matching samples, in which case the caller uses generic
-/// constrained Delaunay triangulation.
-fn untrimmed_cylinder_strip_tris(points: &[Pnt2d], outer_indices: &[usize]) -> Option<Vec<Tri>> {
+/// Triangulate an untrimmed cylinder parameter rectangle as a regular strip
+/// between its two already-discretized rim arcs. Long patches reuse the axial
+/// samples already established by the edge-first pass, keeping diagonals short
+/// without introducing unmatched boundary vertices on adjacent faces.
+///
+/// Returns `None` if the two rims do not carry matching samples, in which case
+/// the caller uses generic constrained Delaunay triangulation.
+fn untrimmed_cylinder_strip_tris(
+    points_2d: &mut Vec<Pnt2d>,
+    points_3d: &mut Vec<Pnt>,
+    surface: &GeomSurface,
+    outer_indices: &[usize],
+    chord_err: f64,
+    bound_diagonals: bool,
+) -> Option<Vec<Tri>> {
     let (v_min, v_max) = outer_indices
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &index| {
-            (lo.min(points[index].y()), hi.max(points[index].y()))
+            (lo.min(points_2d[index].y()), hi.max(points_2d[index].y()))
         });
     let v_span = v_max - v_min;
     if v_span <= 1.0e-9 {
@@ -1152,14 +1198,14 @@ fn untrimmed_cylinder_strip_tris(points: &[Pnt2d], outer_indices: &[usize]) -> O
     let mut lower: Vec<(f64, usize)> = outer_indices
         .iter()
         .copied()
-        .filter(|&index| (points[index].y() - v_min).abs() <= v_tol)
-        .map(|index| (points[index].x(), index))
+        .filter(|&index| (points_2d[index].y() - v_min).abs() <= v_tol)
+        .map(|index| (points_2d[index].x(), index))
         .collect();
     let mut upper: Vec<(f64, usize)> = outer_indices
         .iter()
         .copied()
-        .filter(|&index| (points[index].y() - v_max).abs() <= v_tol)
-        .map(|index| (points[index].x(), index))
+        .filter(|&index| (points_2d[index].y() - v_max).abs() <= v_tol)
+        .map(|index| (points_2d[index].x(), index))
         .collect();
     lower.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     upper.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1178,14 +1224,83 @@ fn untrimmed_cylinder_strip_tris(points: &[Pnt2d], outer_indices: &[usize]) -> O
         return None;
     }
 
-    let mut tris = Vec::with_capacity((lower.len() - 1) * 2);
-    for i in 0..lower.len() - 1 {
-        let a = lower[i].1;
-        let b = lower[i + 1].1;
-        let c = upper[i].1;
-        let d = upper[i + 1].1;
-        tris.push(Tri { a, b, c });
-        tris.push(Tri { a: b, b: d, c });
+    let use_axial_rows = if bound_diagonals {
+        let target_len = cylinder_uv_target_len(surface, chord_err)?;
+        // Extra rows are a display safeguard for genuinely long, slender
+        // patches. Keeping ordinary cylinders on their two exact rim rows
+        // preserves compact meshes and the tangent-seam normal treatment used
+        // by short rounds and capsule profiles.
+        const LONG_STRIP_MIN_TARGET_SPANS: f64 = 6.0;
+        v_span > target_len * LONG_STRIP_MIN_TARGET_SPANS
+    } else {
+        false
+    };
+
+    let lower_row = lower.iter().map(|(_, index)| *index).collect::<Vec<_>>();
+    let upper_row = upper.iter().map(|(_, index)| *index).collect::<Vec<_>>();
+    let mut rows = vec![lower_row];
+    if use_axial_rows {
+        let u_min = lower.first()?.0;
+        let u_max = lower.last()?.0;
+        let mut left: Vec<(f64, usize)> = outer_indices
+            .iter()
+            .copied()
+            .filter(|&index| (points_2d[index].x() - u_min).abs() <= u_tol)
+            .map(|index| (points_2d[index].y(), index))
+            .collect();
+        let mut right: Vec<(f64, usize)> = outer_indices
+            .iter()
+            .copied()
+            .filter(|&index| (points_2d[index].x() - u_max).abs() <= u_tol)
+            .map(|index| (points_2d[index].y(), index))
+            .collect();
+        let by_v = |a: &(f64, usize), b: &(f64, usize)| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        left.sort_by(by_v);
+        right.sort_by(by_v);
+        left.dedup_by_key(|(_, index)| *index);
+        right.dedup_by_key(|(_, index)| *index);
+        if left.len() < 2
+            || left.len() != right.len()
+            || left
+                .iter()
+                .zip(&right)
+                .any(|((left_v, _), (right_v, _))| (left_v - right_v).abs() > v_tol)
+        {
+            return None;
+        }
+
+        for ((v, left_index), (_, right_index)) in left
+            .iter()
+            .zip(&right)
+            .skip(1)
+            .take(left.len().saturating_sub(2))
+        {
+            let mut indices = Vec::with_capacity(lower.len());
+            indices.push(*left_index);
+            for &(u, _) in lower.iter().skip(1).take(lower.len().saturating_sub(2)) {
+                let index = points_2d.len();
+                points_2d.push(Pnt2d::new(u, *v));
+                points_3d.push(surface.point(u, *v));
+                indices.push(index);
+            }
+            indices.push(*right_index);
+            rows.push(indices);
+        }
+    }
+    rows.push(upper_row);
+
+    let mut tris = Vec::with_capacity((lower.len() - 1) * (rows.len() - 1) * 2);
+    for rows in rows.windows(2) {
+        for i in 0..lower.len() - 1 {
+            let a = rows[0][i];
+            let b = rows[0][i + 1];
+            let c = rows[1][i];
+            let d = rows[1][i + 1];
+            tris.push(Tri { a, b, c });
+            tris.push(Tri { a: b, b: d, c });
+        }
     }
     Some(tris)
 }
@@ -1808,6 +1923,15 @@ pub fn discretize_edge_curve_budget(
 /// midpoint distinguishes the two arcs that can join one vertex pair.
 pub type SharedEdgeKey = ((i64, i64, i64), (i64, i64, i64), (i64, i64, i64));
 
+/// One canonical sample of a solid-wide shared edge polyline.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedEdgeSample {
+    /// Exact 3D boundary point shared by adjacent faces.
+    pub point: Pnt,
+    /// Normalized progress from the canonical first endpoint to the last.
+    pub canonical_fraction: f64,
+}
+
 fn shared_key_point(p: Pnt) -> (i64, i64, i64) {
     (
         (p.x() * 1e6).round() as i64,
@@ -1844,7 +1968,7 @@ pub fn shared_edge_polylines(
     faces: &[Face],
     chord_err: f64,
     angle_err: f64,
-) -> HashMap<SharedEdgeKey, Vec<Pnt>> {
+) -> HashMap<SharedEdgeKey, Vec<SharedEdgeSample>> {
     // The native cylinder primitive is exactly two planar caps plus three
     // cylindrical 120° wall patches. Its binary arc subdivision sits on a
     // numerical cliff at common round budgets (0.13 rad is intended as 48
@@ -1862,7 +1986,7 @@ pub fn shared_edge_polylines(
             .filter(|face| matches!(face.surface(), Some(GeomSurface::Plane(_))))
             .count()
             == 2;
-    let mut map: HashMap<SharedEdgeKey, Vec<Pnt>> = HashMap::new();
+    let mut map: HashMap<SharedEdgeKey, Vec<SharedEdgeSample>> = HashMap::new();
     for face in faces {
         let surface = match face.surface() {
             Some(s) => s,
@@ -1894,7 +2018,11 @@ pub fn shared_edge_polylines(
                     edge_angle,
                 );
                 let params = refine_surface_edge_params(surface, curve, &params, chord_err);
-                let mut pts: Vec<Pnt> = params.iter().map(|&t| curve.point(t)).collect();
+                let span = edge.last() - edge.first();
+                let mut pts: Vec<(Pnt, f64)> = params
+                    .iter()
+                    .map(|&t| (curve.point(t), (t - edge.first()) / span))
+                    .collect();
                 if pts.len() < 2 {
                     continue;
                 }
@@ -1906,18 +2034,30 @@ pub fn shared_edge_polylines(
                 // leave hairline index-level cracks at every shared corner.
                 let n = pts.len();
                 let (vs, ve) = (edge.start().point(), edge.end().point());
-                if pts[0].distance(&vs) <= pts[0].distance(&ve) {
-                    pts[0] = vs;
-                    pts[n - 1] = ve;
+                if pts[0].0.distance(&vs) <= pts[0].0.distance(&ve) {
+                    pts[0].0 = vs;
+                    pts[n - 1].0 = ve;
                 } else {
-                    pts[0] = ve;
-                    pts[n - 1] = vs;
+                    pts[0].0 = ve;
+                    pts[n - 1].0 = vs;
                 }
-                let k_first = shared_key_point(pts[0]);
-                let k_last = shared_key_point(*pts.last().unwrap());
-                if k_first > k_last {
+                let k_first = shared_key_point(pts[0].0);
+                let k_last = shared_key_point(pts.last().unwrap().0);
+                let reversed = k_first > k_last;
+                if reversed {
                     pts.reverse();
                 }
+                let pts: Vec<SharedEdgeSample> = pts
+                    .into_iter()
+                    .map(|(point, natural_fraction)| SharedEdgeSample {
+                        point,
+                        canonical_fraction: if reversed {
+                            1.0 - natural_fraction
+                        } else {
+                            natural_fraction
+                        },
+                    })
+                    .collect();
                 match map.entry(key) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         if pts.len() > e.get().len() {
@@ -1953,7 +2093,18 @@ pub fn tessellate_face_budget(
     chord_err: f64,
     angle_err: f64,
     face_index: u32,
-    shared: Option<&HashMap<SharedEdgeKey, Vec<Pnt>>>,
+    shared: Option<&HashMap<SharedEdgeKey, Vec<SharedEdgeSample>>>,
+) -> TriangleMesh {
+    tessellate_face_budget_configured(face, chord_err, angle_err, face_index, shared, false)
+}
+
+pub(crate) fn tessellate_face_budget_configured(
+    face: &Face,
+    chord_err: f64,
+    angle_err: f64,
+    face_index: u32,
+    shared: Option<&HashMap<SharedEdgeKey, Vec<SharedEdgeSample>>>,
+    bound_cylinder_diagonals: bool,
 ) -> TriangleMesh {
     let surface = match face.surface() {
         Some(s) => s,
@@ -2003,41 +2154,31 @@ pub fn tessellate_face_budget(
         }
 
         for (edge_idx, edge) in edges.iter().enumerate() {
+            let pcurve = wire
+                .pcurve(edge_idx)
+                .expect("strict tessellation requires a pcurve on every surface coedge");
             let p_start = edge.start().point();
             let p_end = edge.end().point();
             let is_collapsed = p_start.distance(&p_end) <= 1e-5;
 
             if is_collapsed {
-                let (u_start, v_pole) = if let Some((pu, pv)) = prev_hint {
-                    (pu, pv)
-                } else {
-                    let u = find_prev_non_collapsed_u(&edges, edge_idx, surface, p_start)
-                        .unwrap_or(0.0);
-                    let (_, v) = project_point(surface, p_start, None);
-                    (u, v)
-                };
-
-                let u_next = find_next_non_collapsed_u(&edges, edge_idx, surface, p_start)
-                    .unwrap_or(u_start);
-                let u_next = if surface.is_uclosed() {
-                    unwrap_coordinate(u_next, u_start, 2.0 * std::f64::consts::PI)
-                } else {
-                    u_next
-                };
-
+                let reversed = !edge.orientation().is_forward();
                 let n_points = 5;
                 for i in 0..n_points {
-                    let frac = i as f64 / (n_points - 1) as f64;
-                    let u = u_start + frac * (u_next - u_start);
-                    let v = v_pole;
+                    let directed_fraction = i as f64 / (n_points - 1) as f64;
+                    let natural_fraction = if reversed {
+                        1.0 - directed_fraction
+                    } else {
+                        directed_fraction
+                    };
+                    let uv = boundary_uv(surface, pcurve, natural_fraction, prev_hint);
                     loop_samples.push(BoundarySample {
-                        uv: Pnt2d::new(u, v),
+                        uv,
                         point: p_start,
-                        on_seam: false,
+                        on_seam: pcurve.crosses_u_seam() || pcurve.crosses_v_seam(),
                     });
-                    prev_hint = Some((u, v));
+                    prev_hint = Some((uv.x(), uv.y()));
                 }
-
                 if loop_samples.len() > 1 {
                     loop_samples.pop();
                 }
@@ -2045,25 +2186,26 @@ pub fn tessellate_face_budget(
             }
 
             let curve = match edge.curve() {
-                Some(c) => c,
+                Some(curve) => curve,
                 None => {
-                    // Fallback degenerate edge
-                    let p3d = edge.start().point();
-                    let (mut u, mut v) = project_point(surface, p3d, prev_hint);
-                    if let Some((pu, pv)) = prev_hint {
-                        if surface.is_uclosed() {
-                            u = unwrap_coordinate(u, pu, 2.0 * std::f64::consts::PI);
-                        }
-                        if surface.is_vclosed() {
-                            v = unwrap_coordinate(v, pv, 2.0 * std::f64::consts::PI);
-                        }
+                    let reversed = !edge.orientation().is_forward();
+                    let samples = if reversed {
+                        [(p_end, 1.0), (p_start, 0.0)]
+                    } else {
+                        [(p_start, 0.0), (p_end, 1.0)]
+                    };
+                    for (point, fraction) in samples {
+                        let uv = boundary_uv(surface, pcurve, fraction, prev_hint);
+                        loop_samples.push(BoundarySample {
+                            uv,
+                            point,
+                            on_seam: pcurve.crosses_u_seam() || pcurve.crosses_v_seam(),
+                        });
+                        prev_hint = Some((uv.x(), uv.y()));
                     }
-                    loop_samples.push(BoundarySample {
-                        uv: Pnt2d::new(u, v),
-                        point: p3d,
-                        on_seam: false,
-                    });
-                    prev_hint = Some((u, v));
+                    if loop_samples.len() > 1 {
+                        loop_samples.pop();
+                    }
                     continue;
                 }
             };
@@ -2075,18 +2217,33 @@ pub fn tessellate_face_budget(
             // adjacent faces then sample identical boundary points); otherwise
             // discretize locally as before.
             let shared_pts = shared.and_then(|m| shared_edge_key(edge).and_then(|k| m.get(&k)));
-            let pts_directed: Vec<Pnt> = if let Some(sp) = shared_pts {
+            let samples_directed: Vec<(Pnt, f64)> = if let Some(sp) = shared_pts {
                 let t_start = if is_reversed {
                     edge.last()
                 } else {
                     edge.first()
                 };
                 let start_pt = curve.point(t_start);
-                if sp[0].distance(&start_pt) <= sp[sp.len() - 1].distance(&start_pt) {
-                    sp.clone()
+                let natural_start_is_canonical = sp[0].point.distance(&edge.start().point())
+                    <= sp[sp.len() - 1].point.distance(&edge.start().point());
+                let directed: Vec<_> = if sp[0].point.distance(&start_pt)
+                    <= sp[sp.len() - 1].point.distance(&start_pt)
+                {
+                    sp.to_vec()
                 } else {
                     sp.iter().rev().copied().collect()
-                }
+                };
+                directed
+                    .into_iter()
+                    .map(|sample| {
+                        let fraction = if natural_start_is_canonical {
+                            sample.canonical_fraction
+                        } else {
+                            1.0 - sample.canonical_fraction
+                        };
+                        (sample.point, fraction)
+                    })
+                    .collect()
             } else {
                 // Same miter-seam exemption as the shared pass: elliptical
                 // tangent seams keep chordal-only density.
@@ -2108,44 +2265,36 @@ pub fn tessellate_face_budget(
                 } else {
                     params
                 };
-                let mut pts: Vec<Pnt> = params_directed.iter().map(|&t| curve.point(t)).collect();
+                let span = edge.last() - edge.first();
+                let mut samples: Vec<(Pnt, f64)> = params_directed
+                    .iter()
+                    .map(|&t| (curve.point(t), (t - edge.first()) / span))
+                    .collect();
                 // Same vertex snap as the shared pass: adjacent faces meet
                 // bit-exactly at topological vertices even without a shared
                 // polyline (see shared_edge_polylines).
-                if pts.len() >= 2 {
-                    let n = pts.len();
+                if samples.len() >= 2 {
+                    let n = samples.len();
                     let (vs, ve) = (edge.start().point(), edge.end().point());
-                    if pts[0].distance(&vs) <= pts[0].distance(&ve) {
-                        pts[0] = vs;
-                        pts[n - 1] = ve;
+                    if samples[0].0.distance(&vs) <= samples[0].0.distance(&ve) {
+                        samples[0].0 = vs;
+                        samples[n - 1].0 = ve;
                     } else {
-                        pts[0] = ve;
-                        pts[n - 1] = vs;
+                        samples[0].0 = ve;
+                        samples[n - 1].0 = vs;
                     }
                 }
-                pts
+                samples
             };
 
-            for &p3d in &pts_directed {
-                let (mut u, mut v) = project_point(surface, p3d, prev_hint);
-
-                // Periodic Seam coordinate unwrapping
-                if let Some((pu, pv)) = prev_hint {
-                    if surface.is_uclosed() {
-                        u = unwrap_coordinate(u, pu, 2.0 * std::f64::consts::PI);
-                    }
-                    if surface.is_vclosed() {
-                        v = unwrap_coordinate(v, pv, 2.0 * std::f64::consts::PI);
-                    }
-                }
-
-                let p2d = Pnt2d::new(u, v);
+            for &(p3d, natural_fraction) in &samples_directed {
+                let p2d = boundary_uv(surface, pcurve, natural_fraction, prev_hint);
                 loop_samples.push(BoundarySample {
                     uv: p2d,
                     point: p3d,
                     on_seam,
                 });
-                prev_hint = Some((u, v));
+                prev_hint = Some((p2d.x(), p2d.y()));
             }
 
             // Remove duplicated adjacent endpoint when moving to next edge
@@ -2213,7 +2362,14 @@ pub fn tessellate_face_budget(
         .collect();
     let compact_cylinder = is_untrimmed_cylinder_patch(surface, &outer_pts, &inner_pts_list);
     if compact_cylinder {
-        if let Some(tris) = untrimmed_cylinder_strip_tris(&all_points_2d, &loops_2d[0]) {
+        if let Some(tris) = untrimmed_cylinder_strip_tris(
+            &mut all_points_2d,
+            &mut all_points_3d,
+            surface,
+            &loops_2d[0],
+            chord_err,
+            bound_cylinder_diagonals,
+        ) {
             let wants_ccw = face.orientation() != Orientation::Reversed;
             return mesh_from_uv_tris(
                 &all_points_2d,
@@ -2942,78 +3098,13 @@ fn point_line_distance_3d(p: Pnt, origin: Pnt, dir: openrcad_foundation::Dir) ->
     (v - along).magnitude()
 }
 
-fn find_next_non_collapsed_u(
-    edges: &[openrcad_topo::Edge],
-    curr_idx: usize,
-    surface: &GeomSurface,
-    pole_pt: Pnt,
-) -> Option<f64> {
-    let n = edges.len();
-    for offset in 1..=n {
-        let idx = (curr_idx + offset) % n;
-        let next_edge = &edges[idx];
-        if let Some(curve) = next_edge.curve() {
-            let t0 = next_edge.first();
-            let t1 = next_edge.last();
-            let n_samples = 5;
-            for i in 0..=n_samples {
-                let t = t0 + (t1 - t0) * (i as f64) / (n_samples as f64);
-                let p = curve.point(t);
-                if p.distance(&pole_pt) > 1e-5 {
-                    let (u, _) = project_point(surface, p, None);
-                    return Some(u);
-                }
-            }
-        } else {
-            let p = next_edge.start().point();
-            if p.distance(&pole_pt) > 1e-5 {
-                let (u, _) = project_point(surface, p, None);
-                return Some(u);
-            }
-        }
-    }
-    None
-}
-
-fn find_prev_non_collapsed_u(
-    edges: &[openrcad_topo::Edge],
-    curr_idx: usize,
-    surface: &GeomSurface,
-    pole_pt: Pnt,
-) -> Option<f64> {
-    let n = edges.len();
-    for offset in 1..=n {
-        let idx = (curr_idx + n - offset) % n;
-        let prev_edge = &edges[idx];
-        if let Some(curve) = prev_edge.curve() {
-            let t0 = prev_edge.first();
-            let t1 = prev_edge.last();
-            let n_samples = 5;
-            for i in (0..=n_samples).rev() {
-                let t = t0 + (t1 - t0) * (i as f64) / (n_samples as f64);
-                let p = curve.point(t);
-                if p.distance(&pole_pt) > 1e-5 {
-                    let (u, _) = project_point(surface, p, None);
-                    return Some(u);
-                }
-            }
-        } else {
-            let p = prev_edge.start().point();
-            if p.distance(&pole_pt) > 1e-5 {
-                let (u, _) = project_point(surface, p, None);
-                return Some(u);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openrcad_foundation::{Ax3, Dir, Pnt};
+    use openrcad_foundation::{Ax3, Dir, Dir2d, Pnt, Pnt2d};
     use openrcad_geom::{CylindricalSurface, GeomSurface, Plane};
-    use openrcad_topo::{Edge, Face, Orientation, Wire};
+    use openrcad_geom2d::{GeomCurve2d, Line2d};
+    use openrcad_topo::{Edge, Face, Orientation, PcurveData, SurfacePeriodicity, Wire};
 
     fn square_face(z: f64, orientation: Orientation) -> Face {
         let wire = Wire::from_edges([
@@ -3099,6 +3190,41 @@ mod tests {
         assert_eq!(clamp_to_ordered_bounds(2.12, 2.14, 2.09), 2.12);
         assert_eq!(clamp_to_ordered_bounds(2.00, 2.14, 2.09), 2.09);
         assert_eq!(clamp_to_ordered_bounds(2.20, 2.14, 2.09), 2.14);
+    }
+
+    #[test]
+    fn boundary_sampling_uses_the_coedge_pcurve_exactly() {
+        let surface = GeomSurface::plane(Plane::from_point_normal(Pnt::origin(), Dir::dz()));
+        let pcurve = PcurveData::new(
+            GeomCurve2d::line(Line2d::from_point_dir(Pnt2d::new(10.0, 20.0), Dir2d::dx())),
+            0.0,
+            2.0,
+        );
+
+        let uv = boundary_uv(&surface, &pcurve, 0.25, None);
+
+        assert_eq!(uv, Pnt2d::new(10.5, 20.0));
+    }
+
+    #[test]
+    fn boundary_sampling_preserves_an_unwrapped_periodic_range() {
+        let surface = test_cylinder_surface(2.0);
+        let pcurve = PcurveData::new(
+            GeomCurve2d::line(Line2d::from_point_dir(Pnt2d::new(5.8, 3.0), Dir2d::dx())),
+            0.0,
+            1.0,
+        )
+        .with_periodicity(SurfacePeriodicity::u_periodic(core::f64::consts::TAU));
+
+        let uv = boundary_uv(
+            &surface,
+            &pcurve,
+            0.8,
+            Some((6.4, 3.0)),
+        );
+
+        assert!((uv.x() - 6.6).abs() < 1e-12);
+        assert_eq!(uv.y(), 3.0);
     }
 
     #[test]

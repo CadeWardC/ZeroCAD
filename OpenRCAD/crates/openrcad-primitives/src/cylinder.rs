@@ -12,11 +12,11 @@ use openrcad_foundation::{Ax2, Ax3, Vec as FVec};
 use openrcad_geom::{Circle, Curve, CylindricalSurface, GeomSurface};
 use openrcad_topo::{Edge, Face, Shell, Solid, Wire};
 
-use crate::common::{arc_edges, plane_at};
+use crate::common::{angular_pcurve, arc_edges, axial_pcurve, planar_face, plane_at};
 
 /// Build a cylinder of `radius` and `height` along the main direction of `axis`,
 /// based at `axis.location()`.
-pub fn make_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
+pub(crate) fn build_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
     assert!(radius > 0.0, "make_cylinder: radius must be positive");
     assert!(height > 0.0, "make_cylinder: height must be positive");
 
@@ -42,14 +42,11 @@ pub fn make_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
         .map(|&u| Edge::between_points(base_circle.point(u), top_circle.point(u)))
         .collect();
 
-    let bottom = Face::new(
-        Some(plane_at(base, zdir.reversed())),
+    let bottom = planar_face(
+        plane_at(base, zdir.reversed()),
         Wire::from_edges(base_arcs.clone()),
     );
-    let top_face = Face::new(
-        Some(plane_at(top, zdir)),
-        Wire::from_edges(top_arcs.clone()),
-    );
+    let top_face = planar_face(plane_at(top, zdir), Wire::from_edges(top_arcs.clone()));
 
     let lateral = GeomSurface::cylinder(CylindricalSurface::new(base_frame, radius));
     let mut faces = vec![bottom, top_face];
@@ -61,7 +58,16 @@ pub fn make_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
             top_arcs[i].reversed(),
             seams[i].reversed(),
         ]);
-        faces.push(Face::new(Some(lateral.clone()), wire));
+        let pcurves = vec![
+            angular_pcurve(thirds[i], thirds[i + 1], 0.0),
+            axial_pcurve(seam_params[next], 0.0, height),
+            angular_pcurve(thirds[i], thirds[i + 1], height),
+            axial_pcurve(seam_params[i], 0.0, height),
+        ];
+        faces.push(
+            Face::with_pcurves(lateral.clone(), wire, pcurves)
+                .expect("valid cylinder pcurves"),
+        );
     }
 
     Solid::new(Shell::from_faces(faces))
@@ -71,6 +77,12 @@ pub fn make_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
 mod tests {
     use super::*;
     use openrcad_foundation::{Dir, Pnt};
+
+    fn make_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
+        crate::make_cylinder_operation(axis, radius, height)
+            .unwrap()
+            .value
+    }
 
     fn unit_cylinder() -> Solid {
         make_cylinder(&Ax2::new(Pnt::origin(), Dir::dz()), 2.0, 5.0)

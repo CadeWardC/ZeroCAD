@@ -27,7 +27,11 @@ pub mod builder;
 pub mod containment;
 pub mod edge;
 pub mod face;
+pub mod history;
+pub mod operation;
 pub mod orientation;
+pub mod pcurve;
+pub mod pcurve_build;
 pub mod shape;
 pub mod shell;
 pub mod solid;
@@ -35,12 +39,22 @@ pub mod validate;
 pub mod vertex;
 pub mod wire;
 
-pub use arena::{BRep, EdgeId, FaceId, LoopId, ShellId, SolidId, VertexId};
-pub use builder::BRepBuilder;
+pub use arena::{BRep, Coedge, EdgeId, FaceId, LoopId, PcurveId, ShellId, SolidId, VertexId};
+pub use builder::{BRepBuilder, PcurveAttachmentError};
 
 pub use edge::Edge;
-pub use face::Face;
+pub use face::{Face, FaceBuildError};
+pub use history::{
+    HistoryCoverage, HistoryStage, InputTopologyRef, TopologyChange, TopologyHistory,
+    TopologyHistoryChain, TopologyHistoryError, TopologyKind, TopologyRef,
+};
+pub use operation::{
+    Diagnostic, DiagnosticSeverity, OperationResult, RecoveryAction, RecoveryReport,
+    ValidationReport,
+};
 pub use orientation::Orientation;
+pub use pcurve::{PcurveData, SurfacePeriodicity};
+pub use pcurve_build::PcurveBuildError;
 pub use shape::Shape;
 pub use shell::Shell;
 pub use solid::Solid;

@@ -88,7 +88,10 @@ fn mesh_stats(m: &zerocad_core::MockMesh) -> (usize, usize, usize) {
     (cracks, nonmanifold, disagree)
 }
 
-fn one_extrude(curves: SketchCurves, region_indices: Vec<usize>) -> zerocad_core::MockMesh {
+fn extrude_display_mesh(
+    curves: SketchCurves,
+    region_indices: Vec<usize>,
+) -> zerocad_core::MockMesh {
     let mut g = ParametricGraph::new();
     g.add_feature(FeatureNode {
         id: "sketch_1".into(),
@@ -118,8 +121,16 @@ fn one_extrude(curves: SketchCurves, region_indices: Vec<usize>) -> zerocad_core
     });
     g.add_dependency("sketch_1", "extrude_2");
     let bodies = g.evaluate_bodies(&HashSet::new()).unwrap();
-    assert_eq!(bodies.len(), 1, "one extrude => one body");
-    bodies.into_iter().next().unwrap().1
+    assert!(!bodies.is_empty(), "extrude must produce display geometry");
+
+    // New Body normalizes disconnected components into independently
+    // selectable bodies. This regression is about rendering every component
+    // produced by the feature, so inspect their combined display mesh.
+    let mut combined = zerocad_core::MockMesh::empty();
+    for (_, mesh) in bodies {
+        combined.append(mesh);
+    }
+    combined
 }
 
 fn separate_rect_and_circle() -> SketchCurves {
@@ -151,7 +162,7 @@ fn extrude_only_selected_region() {
         })
         .expect("a rectangle region");
 
-    let m = one_extrude(curves, vec![rect_idx]);
+    let m = extrude_display_mesh(curves, vec![rect_idx]);
     let min_y = m
         .vertices
         .chunks(6)
@@ -170,9 +181,10 @@ fn extrude_only_selected_region() {
 
 #[test]
 fn extrude_separate_shapes_together_is_clean() {
-    // Both shapes (separate) as one new body — a clean closed manifold.
+    // Both shapes from one extrude feature become separate selectable bodies;
+    // their combined display geometry must still be a clean closed manifold.
     let curves = separate_rect_and_circle();
-    let m = one_extrude(curves, vec![]);
+    let m = extrude_display_mesh(curves, vec![]);
     let (cracks, nm, inward) = mesh_stats(&m);
     println!("rect+circle together: cracks={cracks}, nonmanifold={nm}, inward={inward}");
     assert_eq!(inward, 0, "no back-face-culled triangles");
@@ -189,7 +201,7 @@ fn extrude_single_nonconvex_region_has_no_disappearing_faces() {
     let regions = detect_regions(&curves);
     assert!(regions.len() >= 2, "overlap splits into multiple regions");
 
-    let m = one_extrude(curves, vec![0]);
+    let m = extrude_display_mesh(curves, vec![0]);
     let (cracks, nm, inward) = mesh_stats(&m);
     println!("non-convex region 0: cracks={cracks}, nonmanifold={nm}, inward={inward}");
     assert_eq!(
@@ -210,7 +222,7 @@ fn extrude_whole_overlapping_sketch_has_no_disappearing_faces() {
     // Post-fix: zero inward faces — every surface triangle faces outward, so the
     // body reads solid (internal tile walls are interior and occluded).
     let curves = overlapping_rect_and_circle();
-    let m = one_extrude(curves, vec![]);
+    let m = extrude_display_mesh(curves, vec![]);
     let (cracks, nm, inward) = mesh_stats(&m);
     println!("whole overlapping sketch: cracks={cracks}, nonmanifold={nm}, inward={inward}");
     assert_eq!(

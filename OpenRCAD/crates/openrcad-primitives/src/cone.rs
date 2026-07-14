@@ -15,12 +15,12 @@ use openrcad_foundation::{Ax2, Ax3, Vec as FVec};
 use openrcad_geom::{Circle, ConicalSurface, Curve, GeomSurface};
 use openrcad_topo::{Edge, Face, Shell, Solid, Vertex, Wire};
 
-use crate::common::{arc_edges, plane_at};
+use crate::common::{angular_pcurve, arc_edges, axial_pcurve, planar_face, plane_at};
 
 /// Build a (truncated) cone along the main direction of `axis`, with base radius
 /// `r1` at `axis.location()` and top radius `r2` at height `height`. Set
 /// `r2 = 0` for a sharp apex.
-pub fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
+pub(crate) fn build_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
     assert!(
         r1 >= 0.0 && r2 >= 0.0,
         "make_cone: radii must be non-negative"
@@ -44,8 +44,8 @@ pub fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
     let base_circle = Circle::new(base_frame, r1);
     let base_arcs = arc_edges(base_circle, &thirds);
 
-    let bottom = Face::new(
-        Some(plane_at(base, zdir.reversed())),
+    let bottom = planar_face(
+        plane_at(base, zdir.reversed()),
         Wire::from_edges(base_arcs.clone()),
     );
     let mut faces = vec![bottom];
@@ -60,8 +60,8 @@ pub fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
             .map(|&u| Edge::between_points(base_circle.point(u), top_circle.point(u)))
             .collect();
 
-        faces.push(Face::new(
-            Some(plane_at(top, zdir)),
+        faces.push(planar_face(
+            plane_at(top, zdir),
             Wire::from_edges(top_arcs.clone()),
         ));
         for i in 0..3 {
@@ -72,7 +72,16 @@ pub fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
                 top_arcs[i].reversed(),
                 seams[i].reversed(),
             ]);
-            faces.push(Face::new(Some(lateral.clone()), wire));
+            let pcurves = vec![
+                angular_pcurve(thirds[i], thirds[i + 1], 0.0),
+                axial_pcurve(seam_params[next], 0.0, height),
+                angular_pcurve(thirds[i], thirds[i + 1], height),
+                axial_pcurve(seam_params[i], 0.0, height),
+            ];
+            faces.push(
+                Face::with_pcurves(lateral.clone(), wire, pcurves)
+                    .expect("valid cone pcurves"),
+            );
         }
     } else {
         // Sharp apex: three triangular wall faces meeting at the tip.
@@ -96,7 +105,15 @@ pub fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
                 seams[next].clone(),
                 seams[i].reversed(),
             ]);
-            faces.push(Face::new(Some(lateral.clone()), wire));
+            let pcurves = vec![
+                angular_pcurve(thirds[i], thirds[i + 1], 0.0),
+                axial_pcurve(seam_params[next], 0.0, height),
+                axial_pcurve(seam_params[i], 0.0, height),
+            ];
+            faces.push(
+                Face::with_pcurves(lateral.clone(), wire, pcurves)
+                    .expect("valid apex-cone pcurves"),
+            );
         }
     }
 
@@ -107,6 +124,12 @@ pub fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
 mod tests {
     use super::*;
     use openrcad_foundation::{Dir, Pnt};
+
+    fn make_cone(axis: &Ax2, r1: f64, r2: f64, height: f64) -> Solid {
+        crate::make_cone_operation(axis, r1, r2, height)
+            .unwrap()
+            .value
+    }
 
     #[test]
     fn truncated_cone_counts_and_euler() {

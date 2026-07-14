@@ -1,0 +1,202 @@
+//! Parametric curves attached to individual coedges.
+//!
+//! A 3D edge may be shared by several faces, but its representation in each
+//! face's `(u, v)` parameter space is face-specific. [`PcurveData`] therefore
+//! belongs to an oriented edge-use (a coedge), not to [`EdgeData`](crate::arena::EdgeData).
+
+use openrcad_foundation::Pnt2d;
+use openrcad_geom2d::{Curve2d, GeomCurve2d};
+use serde::{Deserialize, Serialize};
+
+/// Periods of the carrying surface's parametric directions.
+///
+/// Pcurve coordinates are stored unwrapped. A curve crossing a cylindrical U
+/// seam may therefore run from `u = 5.8` to `u = 6.7`; wrapping is performed
+/// only when a consumer explicitly requests it. This avoids artificial jumps
+/// at periodic seams during interpolation, splitting, and tessellation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SurfacePeriodicity {
+    /// U period, or `None` when U is not periodic.
+    pub u_period: Option<f64>,
+    /// V period, or `None` when V is not periodic.
+    pub v_period: Option<f64>,
+}
+
+impl SurfacePeriodicity {
+    /// A non-periodic parameter space.
+    pub const NONE: Self = Self {
+        u_period: None,
+        v_period: None,
+    };
+
+    /// Construct periodicity metadata for a U-periodic surface.
+    #[inline]
+    pub const fn u_periodic(period: f64) -> Self {
+        Self {
+            u_period: Some(period),
+            v_period: None,
+        }
+    }
+
+    /// True when every declared period is finite and strictly positive.
+    #[inline]
+    pub fn is_valid(self) -> bool {
+        [self.u_period, self.v_period]
+            .into_iter()
+            .flatten()
+            .all(|period| period.is_finite() && period > 0.0)
+    }
+}
+
+/// A bounded 2D curve representing one coedge on its carrying face.
+///
+/// The pcurve has its own parameter interval; it does not need to match the 3D
+/// edge's curve parameters. Both intervals are related by normalized progress.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PcurveData {
+    /// Supporting curve in the face's parameter space.
+    pub curve: GeomCurve2d,
+    /// First pcurve parameter, corresponding to the 3D edge's natural start.
+    pub first: f64,
+    /// Last pcurve parameter, corresponding to the 3D edge's natural end.
+    pub last: f64,
+    /// Periodic directions of the carrying surface.
+    #[serde(default)]
+    pub periodicity: SurfacePeriodicity,
+}
+
+impl PcurveData {
+    /// Construct a bounded pcurve in a non-periodic parameter space.
+    #[inline]
+    pub fn new(curve: GeomCurve2d, first: f64, last: f64) -> Self {
+        Self {
+            curve,
+            first,
+            last,
+            periodicity: SurfacePeriodicity::NONE,
+        }
+    }
+
+    /// Attach surface-periodicity metadata.
+    #[inline]
+    pub fn with_periodicity(mut self, periodicity: SurfacePeriodicity) -> Self {
+        self.periodicity = periodicity;
+        self
+    }
+
+    /// True when the parameter interval and periodicity metadata are usable.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.first.is_finite()
+            && self.last.is_finite()
+            && self.first != self.last
+            && self.periodicity.is_valid()
+    }
+
+    /// Pcurve parameter at normalized edge progress `fraction`.
+    #[inline]
+    pub fn parameter_at_fraction(&self, fraction: f64) -> f64 {
+        self.first + (self.last - self.first) * fraction
+    }
+
+    /// Evaluate the pcurve without wrapping periodic coordinates.
+    #[inline]
+    pub fn point_at_fraction(&self, fraction: f64) -> Pnt2d {
+        self.curve.point(self.parameter_at_fraction(fraction))
+    }
+
+    /// Evaluate and wrap coordinates into each declared base period.
+    #[inline]
+    pub fn wrapped_point_at_fraction(&self, fraction: f64) -> Pnt2d {
+        let point = self.point_at_fraction(fraction);
+        Pnt2d::new(
+            wrap_if_periodic(point.x(), self.periodicity.u_period),
+            wrap_if_periodic(point.y(), self.periodicity.v_period),
+        )
+    }
+
+    /// Split this pcurve at normalized edge progress `fraction`.
+    ///
+    /// The curve and seam metadata are preserved while each result receives
+    /// the appropriate independent parameter subrange.
+    pub fn split_at_fraction(&self, fraction: f64) -> Option<(Self, Self)> {
+        if !self.is_valid() || !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            return None;
+        }
+        let middle = self.parameter_at_fraction(fraction);
+        if middle == self.first || middle == self.last {
+            return None;
+        }
+        let mut first = self.clone();
+        first.last = middle;
+        let mut second = self.clone();
+        second.first = middle;
+        Some((first, second))
+    }
+
+    /// True when the unwrapped pcurve crosses a U seam.
+    pub fn crosses_u_seam(&self) -> bool {
+        crosses_periodic_seam(
+            self.point_at_fraction(0.0).x(),
+            self.point_at_fraction(1.0).x(),
+            self.periodicity.u_period,
+        )
+    }
+
+    /// True when the unwrapped pcurve crosses a V seam.
+    pub fn crosses_v_seam(&self) -> bool {
+        crosses_periodic_seam(
+            self.point_at_fraction(0.0).y(),
+            self.point_at_fraction(1.0).y(),
+            self.periodicity.v_period,
+        )
+    }
+}
+
+fn wrap_if_periodic(value: f64, period: Option<f64>) -> f64 {
+    period.map_or(value, |period| value.rem_euclid(period))
+}
+
+fn crosses_periodic_seam(first: f64, last: f64, period: Option<f64>) -> bool {
+    let Some(period) = period.filter(|period| period.is_finite() && *period > 0.0) else {
+        return false;
+    };
+    (first / period).floor() != (last / period).floor()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openrcad_foundation::{Dir2d, Pnt2d};
+    use openrcad_geom2d::Line2d;
+
+    fn u_line(origin: f64) -> PcurveData {
+        PcurveData::new(
+            GeomCurve2d::line(Line2d::from_point_dir(Pnt2d::new(origin, 2.0), Dir2d::dx())),
+            0.0,
+            1.0,
+        )
+    }
+
+    #[test]
+    fn periodic_seam_keeps_an_unwrapped_curve_continuous() {
+        let pcurve =
+            u_line(5.8).with_periodicity(SurfacePeriodicity::u_periodic(core::f64::consts::TAU));
+        assert!(pcurve.crosses_u_seam());
+        assert_eq!(pcurve.point_at_fraction(1.0), Pnt2d::new(6.8, 2.0));
+        let wrapped = pcurve.wrapped_point_at_fraction(1.0);
+        assert!((wrapped.x() - (6.8 - core::f64::consts::TAU)).abs() < 1e-12);
+        assert_eq!(wrapped.y(), 2.0);
+    }
+
+    #[test]
+    fn splitting_preserves_independent_ranges_and_periodicity() {
+        let pcurve =
+            u_line(5.8).with_periodicity(SurfacePeriodicity::u_periodic(core::f64::consts::TAU));
+        let (first, second) = pcurve.split_at_fraction(0.25).unwrap();
+        assert_eq!((first.first, first.last), (0.0, 0.25));
+        assert_eq!((second.first, second.last), (0.25, 1.0));
+        assert_eq!(first.periodicity, pcurve.periodicity);
+        assert_eq!(second.periodicity, pcurve.periodicity);
+    }
+}

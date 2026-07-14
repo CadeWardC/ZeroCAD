@@ -21,10 +21,10 @@
 //! [`Solid::assert_valid`] is the panicking wrapper for `debug_assert!`-style use
 //! in tests and debug builds.
 
-use openrcad_foundation::{tolerance, Pnt};
-use openrcad_geom::Curve;
+use openrcad_foundation::{Pnt, TolerancePolicy};
+use openrcad_geom::{Curve, GeomSurface, Surface};
 
-use crate::arena::{BRep, EdgeId, FaceId, LoopId, OrientedEdge, ShellId, VertexId};
+use crate::arena::{BRep, EdgeId, FaceId, LoopId, OrientedEdge, PcurveId, ShellId, VertexId};
 use crate::orientation::Orientation;
 use crate::solid::Solid;
 
@@ -83,10 +83,42 @@ pub enum ValidationError {
     DanglingLoop(LoopId),
     /// An edge referenced by a loop is missing from the arena.
     DanglingEdge { loop_id: LoopId, edge: EdgeId },
+    /// A pcurve referenced by a coedge is missing from the arena.
+    DanglingPcurve {
+        loop_id: LoopId,
+        edge: EdgeId,
+        pcurve: PcurveId,
+    },
     /// A vertex referenced by an edge is missing from the arena.
     DanglingVertex { edge: EdgeId },
     /// A loop carries no edges.
     EmptyLoop(LoopId),
+    /// A coedge has a pcurve, but its face has no supporting surface.
+    PcurveWithoutSurface {
+        face: FaceId,
+        loop_id: LoopId,
+        edge: EdgeId,
+    },
+    /// A surface-backed coedge has no face-specific pcurve.
+    MissingPcurve {
+        face: FaceId,
+        loop_id: LoopId,
+        edge: EdgeId,
+    },
+    /// A pcurve has an invalid range or invalid periodicity metadata.
+    InvalidPcurve {
+        loop_id: LoopId,
+        edge: EdgeId,
+        pcurve: PcurveId,
+    },
+    /// A pcurve lifted through its surface diverges from its 3D edge curve.
+    PcurveMismatch {
+        face: FaceId,
+        loop_id: LoopId,
+        edge: EdgeId,
+        max_deviation: f64,
+        tolerance: f64,
+    },
     /// Consecutive edges in a loop do not meet (or the loop does not close): the
     /// gap between one edge's traversal-end and the next's traversal-start
     /// exceeds the endpoints' combined tolerance.
@@ -102,10 +134,52 @@ impl core::fmt::Display for ValidationError {
             ValidationError::DanglingEdge { loop_id, edge } => {
                 write!(f, "loop {loop_id:?} references missing edge {edge:?}")
             }
+            ValidationError::DanglingPcurve {
+                loop_id,
+                edge,
+                pcurve,
+            } => write!(
+                f,
+                "loop {loop_id:?} edge {edge:?} references missing pcurve {pcurve:?}"
+            ),
             ValidationError::DanglingVertex { edge } => {
                 write!(f, "edge {edge:?} references a missing vertex")
             }
             ValidationError::EmptyLoop(id) => write!(f, "loop {id:?} has no edges"),
+            ValidationError::PcurveWithoutSurface {
+                face,
+                loop_id,
+                edge,
+            } => write!(
+                f,
+                "face {face:?} loop {loop_id:?} edge {edge:?} has a pcurve but no surface"
+            ),
+            ValidationError::MissingPcurve {
+                face,
+                loop_id,
+                edge,
+            } => write!(
+                f,
+                "face {face:?} loop {loop_id:?} edge {edge:?} has no pcurve"
+            ),
+            ValidationError::InvalidPcurve {
+                loop_id,
+                edge,
+                pcurve,
+            } => write!(
+                f,
+                "loop {loop_id:?} edge {edge:?} has invalid pcurve {pcurve:?}"
+            ),
+            ValidationError::PcurveMismatch {
+                face,
+                loop_id,
+                edge,
+                max_deviation,
+                tolerance,
+            } => write!(
+                f,
+                "face {face:?} loop {loop_id:?} edge {edge:?} pcurve deviates by {max_deviation:e} (tolerance {tolerance:e})"
+            ),
             ValidationError::LoopNotContiguous { loop_id, gap } => {
                 write!(f, "loop {loop_id:?} is not contiguous (gap {gap:e})")
             }
@@ -143,7 +217,13 @@ fn oriented_endpoints(
     })
 }
 
-fn validate_loop(brep: &BRep, loop_id: LoopId) -> Result<(), ValidationError> {
+fn validate_loop(
+    brep: &BRep,
+    face_id: FaceId,
+    surface: Option<&GeomSurface>,
+    loop_id: LoopId,
+    policy: &TolerancePolicy,
+) -> Result<(), ValidationError> {
     let loop_data = brep
         .loops
         .get(loop_id)
@@ -157,6 +237,7 @@ fn validate_loop(brep: &BRep, loop_id: LoopId) -> Result<(), ValidationError> {
     let mut ends: Vec<(Pnt, Pnt, f64, f64)> = Vec::with_capacity(n);
     for oe in &loop_data.edges {
         ends.push(oriented_endpoints(brep, oe, loop_id)?);
+        validate_pcurve(brep, face_id, surface, loop_id, oe, policy)?;
     }
 
     // Each edge's traversal-end must meet the next edge's traversal-start; the
@@ -167,10 +248,79 @@ fn validate_loop(brep: &BRep, loop_id: LoopId) -> Result<(), ValidationError> {
         let gap = cur_end.distance(&next_start);
         // Honour the meeting vertices' own uncertainty radii, with a small floor
         // so exact (zero-gap) primitive geometry is never rejected.
-        let tol = (cur_end_tol + next_start_tol).max(tolerance::CONFUSION * 16.0);
+        let tol = (cur_end_tol + next_start_tol).max(policy.linear * 16.0);
         if gap > tol {
             return Err(ValidationError::LoopNotContiguous { loop_id, gap });
         }
+    }
+    Ok(())
+}
+
+fn validate_pcurve(
+    brep: &BRep,
+    face_id: FaceId,
+    surface: Option<&GeomSurface>,
+    loop_id: LoopId,
+    coedge: &OrientedEdge,
+    policy: &TolerancePolicy,
+) -> Result<(), ValidationError> {
+    let Some(pcurve_id) = coedge.pcurve else {
+        return Ok(());
+    };
+    let pcurve = brep
+        .pcurves
+        .get(pcurve_id)
+        .ok_or(ValidationError::DanglingPcurve {
+            loop_id,
+            edge: coedge.id,
+            pcurve: pcurve_id,
+        })?;
+    if !pcurve.is_valid() {
+        return Err(ValidationError::InvalidPcurve {
+            loop_id,
+            edge: coedge.id,
+            pcurve: pcurve_id,
+        });
+    }
+    let surface = surface.ok_or(ValidationError::PcurveWithoutSurface {
+        face: face_id,
+        loop_id,
+        edge: coedge.id,
+    })?;
+    let edge = brep
+        .edges
+        .get(coedge.id)
+        .ok_or(ValidationError::DanglingEdge {
+            loop_id,
+            edge: coedge.id,
+        })?;
+    let Some(curve) = edge.curve.as_ref() else {
+        // Degenerate seam/pole edges may legitimately have only a pcurve.
+        return Ok(());
+    };
+
+    let mut max_deviation = 0.0_f64;
+    for sample in 0..=8 {
+        let fraction = f64::from(sample) / 8.0;
+        let uv = pcurve.point_at_fraction(fraction);
+        let lifted = surface.point(uv.x(), uv.y());
+        let edge_parameter = edge.first + (edge.last - edge.first) * fraction;
+        let deviation = lifted.distance(&curve.point(edge_parameter));
+        if !deviation.is_finite() {
+            max_deviation = f64::INFINITY;
+            break;
+        }
+        max_deviation = max_deviation.max(deviation);
+    }
+    let tolerance = policy.pcurve_consistency.max(edge.tolerance);
+    if max_deviation > tolerance {
+        return Err(ValidationError::PcurveMismatch {
+            face: face_id,
+            loop_id,
+            edge: coedge.id,
+            max_deviation,
+            tolerance,
+        });
     }
     Ok(())
 }
@@ -179,6 +329,13 @@ impl Solid {
     /// Verify the solid's structural topological invariants (see the
     /// [module docs](crate::validate)). Returns the first violation found.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        self.validate_with_policy(&TolerancePolicy::STANDARD)
+    }
+
+    /// Verify structural invariants using the supplied document tolerance
+    /// policy. Operation entry points validate the policy before calling this
+    /// method.
+    pub fn validate_with_policy(&self, policy: &TolerancePolicy) -> Result<(), ValidationError> {
         let brep = self.brep.as_ref();
         // The solid's own id is guaranteed present (we hold a handle to it).
         for &shell_id in &brep.solids[self.id].shells {
@@ -192,14 +349,74 @@ impl Solid {
                     .get(face_id)
                     .ok_or(ValidationError::DanglingFace(face_id))?;
                 if let Some(outer) = face.outer_wire {
-                    validate_loop(brep, outer)?;
+                    validate_loop(brep, face_id, face.surface.as_ref(), outer, policy)?;
                 }
                 for &inner in &face.inner_wires {
-                    validate_loop(brep, inner)?;
+                    validate_loop(brep, face_id, face.surface.as_ref(), inner, policy)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Strict Phase 1 validation. In addition to structural validity, every
+    /// coedge on a surface-backed face must carry a pcurve.
+    pub fn validate_strict_with_policy(
+        &self,
+        policy: &TolerancePolicy,
+    ) -> Result<(), ValidationError> {
+        self.validate_with_policy(policy)?;
+        let brep = self.brep.as_ref();
+        for &shell_id in &brep.solids[self.id].shells {
+            let shell = &brep.shells[shell_id];
+            for &face_id in &shell.faces {
+                let face = &brep.faces[face_id];
+                if face.surface.is_none() {
+                    continue;
+                }
+                let loops = face
+                    .outer_wire
+                    .into_iter()
+                    .chain(face.inner_wires.iter().copied());
+                for loop_id in loops {
+                    for coedge in &brep.loops[loop_id].edges {
+                        if coedge.pcurve.is_none() {
+                            return Err(ValidationError::MissingPcurve {
+                                face: face_id,
+                                loop_id,
+                                edge: coedge.id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True when every surface-backed coedge carries a pcurve.
+    pub fn has_complete_pcurves(&self) -> bool {
+        let brep = self.brep.as_ref();
+        brep.solids.get(self.id).is_some_and(|solid| {
+            solid.shells.iter().all(|shell_id| {
+                brep.shells.get(*shell_id).is_some_and(|shell| {
+                    shell.faces.iter().all(|face_id| {
+                        brep.faces.get(*face_id).is_some_and(|face| {
+                            face.surface.is_none()
+                                || face
+                                    .outer_wire
+                                    .into_iter()
+                                    .chain(face.inner_wires.iter().copied())
+                                    .all(|loop_id| {
+                                        brep.loops.get(loop_id).is_some_and(|wire| {
+                                            wire.edges.iter().all(|coedge| coedge.pcurve.is_some())
+                                        })
+                                    })
+                        })
+                    })
+                })
+            })
+        })
     }
 
     /// Panic if [`validate`](Solid::validate) reports a violation. Intended for
@@ -221,8 +438,14 @@ impl Solid {
     /// algorithmic checks), but it gives booleans, importers, and renderers a
     /// shared diagnostic hook.
     pub fn health_report(&self) -> HealthReport {
+        self.health_report_with_policy(&TolerancePolicy::STANDARD)
+    }
+
+    /// Audit structural and basic geometric health under a document tolerance
+    /// policy.
+    pub fn health_report_with_policy(&self, policy: &TolerancePolicy) -> HealthReport {
         let mut report = HealthReport::default();
-        if let Err(err) = self.validate() {
+        if let Err(err) = self.validate_with_policy(policy) {
             report.errors.push(HealthError::Validation(err));
         }
 
@@ -250,7 +473,7 @@ impl Solid {
                 continue;
             };
             let length = start.point.distance(&end.point);
-            let tol = edge.tolerance.max(tolerance::CONFUSION);
+            let tol = edge.tolerance.max(policy.linear);
             if length <= tol {
                 report.errors.push(HealthError::DegenerateEdge {
                     edge: edge_id,
@@ -285,7 +508,7 @@ impl Solid {
                 .push(HealthWarning::SuspiciousEulerCharacteristic { value: euler });
         }
 
-        let manifold = self.manifold_report();
+        let manifold = self.manifold_report_with_policy(policy);
         if manifold.nonmanifold_edges > 0 {
             report.warnings.push(HealthWarning::NonManifoldEdges {
                 count: manifold.nonmanifold_edges,
@@ -310,14 +533,20 @@ impl Solid {
     /// fine grid) and counts how many faces use each: a closed two-manifold
     /// solid shares every edge by exactly two faces.
     pub fn manifold_report(&self) -> ManifoldReport {
+        self.manifold_report_with_policy(&TolerancePolicy::STANDARD)
+    }
+
+    /// Tally boundary-edge sharing using the supplied policy's approximation
+    /// tolerance as the positional matching grid.
+    pub fn manifold_report_with_policy(&self, policy: &TolerancePolicy) -> ManifoldReport {
         // Quantize a point to a fine integer grid so coincident endpoints from
         // independently-built edges hash together.
-        const GRID: f64 = 1.0e6;
+        let grid = 1.0 / policy.approximation;
         let q = |p: &Pnt| -> QuantPoint {
             (
-                (p.x() * GRID).round() as i64,
-                (p.y() * GRID).round() as i64,
-                (p.z() * GRID).round() as i64,
+                (p.x() * grid).round() as i64,
+                (p.y() * grid).round() as i64,
+                (p.z() * grid).round() as i64,
             )
         };
         let mut counts: std::collections::HashMap<EdgeKey, u32> = std::collections::HashMap::new();
@@ -368,13 +597,23 @@ impl Solid {
     /// the structural half of "watertight" — what booleans, sewing, and STL
     /// export must produce.
     pub fn is_watertight(&self) -> bool {
-        let m = self.manifold_report();
+        self.is_watertight_with_policy(&TolerancePolicy::STANDARD)
+    }
+
+    /// True when the boundary is closed and two-manifold under `policy`.
+    pub fn is_watertight_with_policy(&self, policy: &TolerancePolicy) -> bool {
+        let m = self.manifold_report_with_policy(policy);
         m.free_edges == 0 && m.nonmanifold_edges == 0 && m.total_edges > 0
     }
 
     /// True when no edge is shared by three or more faces (open shells allowed).
     pub fn is_manifold(&self) -> bool {
-        self.manifold_report().nonmanifold_edges == 0
+        self.is_manifold_with_policy(&TolerancePolicy::STANDARD)
+    }
+
+    /// True when no edge is shared by three or more faces under `policy`.
+    pub fn is_manifold_with_policy(&self, policy: &TolerancePolicy) -> bool {
+        self.manifold_report_with_policy(policy).nonmanifold_edges == 0
     }
 }
 
@@ -402,8 +641,64 @@ mod tests {
     use super::*;
     use crate::edge::Edge;
     use crate::face::Face;
+    use crate::pcurve::PcurveData;
     use crate::shell::Shell;
     use crate::wire::Wire;
+    use crate::BRepBuilder;
+    use openrcad_foundation::{Dir2d, Pnt2d};
+    use openrcad_geom::{GeomSurface, Plane};
+    use openrcad_geom2d::{GeomCurve2d, Line2d};
+
+    fn square_with_pcurves(offset_y: f64) -> Solid {
+        let face = Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                openrcad_foundation::Dir::dz(),
+            ))),
+            Wire::from_edges([
+                Edge::between_points(Pnt::new(0.0, 0.0, 0.0), Pnt::new(1.0, 0.0, 0.0)),
+                Edge::between_points(Pnt::new(1.0, 0.0, 0.0), Pnt::new(1.0, 1.0, 0.0)),
+                Edge::between_points(Pnt::new(1.0, 1.0, 0.0), Pnt::new(0.0, 1.0, 0.0)),
+                Edge::between_points(Pnt::new(0.0, 1.0, 0.0), Pnt::new(0.0, 0.0, 0.0)),
+            ]),
+        );
+        let mut builder = BRepBuilder::from_brep((*face.brep).clone());
+        let face_id = builder.brep().faces.keys().next().unwrap();
+        let loop_id = builder.brep().faces[face_id].outer_wire.unwrap();
+        let edge_ids: Vec<_> = builder.brep().loops[loop_id]
+            .edges
+            .iter()
+            .map(|coedge| coedge.id)
+            .collect();
+        for (index, edge_id) in edge_ids.into_iter().enumerate() {
+            let (start, end) = {
+                let edge = &builder.brep().edges[edge_id];
+                (
+                    builder.brep().vertices[edge.start].point,
+                    builder.brep().vertices[edge.end].point,
+                )
+            };
+            let dx = end.x() - start.x();
+            let dy = end.y() - start.y();
+            let length = dx.hypot(dy);
+            let pcurve = PcurveData::new(
+                GeomCurve2d::line(Line2d::from_point_dir(
+                    Pnt2d::new(start.x(), start.y() + offset_y),
+                    Dir2d::new(dx / length, dy / length),
+                )),
+                0.0,
+                length,
+            );
+            builder.attach_pcurve(loop_id, index, pcurve).unwrap();
+        }
+        let shell_id = builder.brep_mut().shells.insert(crate::arena::ShellData {
+            faces: vec![face_id],
+        });
+        let solid_id = builder.brep_mut().solids.insert(crate::arena::SolidData {
+            shells: vec![shell_id],
+        });
+        Solid::from_id(builder.build(), solid_id)
+    }
 
     fn square_face(z: f64) -> Face {
         let w = Wire::from_edges([
@@ -423,6 +718,24 @@ mod tests {
         // One open square: V−E+F = 4−4+1 = 1.
         assert_eq!(s.euler_characteristic(), 1);
         assert!(s.health_report().is_healthy());
+    }
+
+    #[test]
+    fn consistent_face_pcurves_pass_validation() {
+        let solid = square_with_pcurves(0.0);
+        assert!(solid.validate().is_ok());
+    }
+
+    #[test]
+    fn pcurve_surface_edge_mismatch_is_rejected() {
+        let solid = square_with_pcurves(0.01);
+        assert!(matches!(
+            solid.validate(),
+            Err(ValidationError::PcurveMismatch {
+                max_deviation,
+                ..
+            }) if max_deviation > 0.009
+        ));
     }
 
     #[test]

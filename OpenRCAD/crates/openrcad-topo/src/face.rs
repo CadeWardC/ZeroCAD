@@ -9,9 +9,43 @@ use openrcad_geom::GeomSurface;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::arena::{BRep, FaceData, FaceId};
+use crate::arena::{BRep, FaceData, FaceId, LoopId};
 use crate::orientation::Orientation;
+use crate::pcurve::PcurveData;
 use crate::wire::Wire;
+
+/// Why a face and its per-coedge pcurves could not be assembled atomically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaceBuildError {
+    MissingSurface,
+    PcurveCount {
+        wire: usize,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidPcurve { wire: usize, coedge: usize },
+}
+
+impl core::fmt::Display for FaceBuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingSurface => write!(f, "pcurve-backed faces require a surface"),
+            Self::PcurveCount {
+                wire,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "wire {wire} has {expected} coedges but {actual} pcurves"
+            ),
+            Self::InvalidPcurve { wire, coedge } => {
+                write!(f, "wire {wire} coedge {coedge} has an invalid pcurve")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FaceBuildError {}
 
 /// A face: a trimmed patch of a surface.
 #[derive(Clone, Debug)]
@@ -61,6 +95,76 @@ impl Face {
             id,
             orientation: Orientation::Forward,
         }
+    }
+
+    /// Build a surface-backed face while atomically binding one pcurve to each
+    /// outer coedge.
+    pub fn with_pcurves(
+        surface: GeomSurface,
+        outer_wire: Wire,
+        outer_pcurves: Vec<PcurveData>,
+    ) -> Result<Self, FaceBuildError> {
+        Self::with_wires_and_pcurves(
+            Some(surface),
+            Some((outer_wire, outer_pcurves)),
+            Vec::new(),
+            Orientation::Forward,
+        )
+    }
+
+    /// Build a face and all of its face-specific trimming curves as one
+    /// transaction. No partially-populated face is returned on error.
+    pub fn with_wires_and_pcurves(
+        surface: Option<GeomSurface>,
+        outer_wire: Option<(Wire, Vec<PcurveData>)>,
+        inner_wires: Vec<(Wire, Vec<PcurveData>)>,
+        orientation: Orientation,
+    ) -> Result<Self, FaceBuildError> {
+        if surface.is_none() && (outer_wire.is_some() || !inner_wires.is_empty()) {
+            return Err(FaceBuildError::MissingSurface);
+        }
+        let mut wires = Vec::with_capacity(usize::from(outer_wire.is_some()) + inner_wires.len());
+        if let Some(outer) = outer_wire {
+            wires.push(outer);
+        }
+        wires.extend(inner_wires);
+        for (wire_index, (wire, pcurves)) in wires.iter().enumerate() {
+            if wire.len() != pcurves.len() {
+                return Err(FaceBuildError::PcurveCount {
+                    wire: wire_index,
+                    expected: wire.len(),
+                    actual: pcurves.len(),
+                });
+            }
+            if let Some(coedge) = pcurves.iter().position(|pcurve| !pcurve.is_valid()) {
+                return Err(FaceBuildError::InvalidPcurve {
+                    wire: wire_index,
+                    coedge,
+                });
+            }
+        }
+
+        let mut brep = BRep::new();
+        let mut loop_ids = Vec::with_capacity(wires.len());
+        for (wire, pcurves) in wires {
+            let map = brep.merge(&wire.brep);
+            let loop_id = map.loops[&wire.id];
+            attach_loop_pcurves(&mut brep, loop_id, pcurves);
+            loop_ids.push(loop_id);
+        }
+        let outer_wire = loop_ids.first().copied();
+        let inner_wires = loop_ids.into_iter().skip(1).collect();
+        let id = brep.faces.insert(FaceData {
+            surface,
+            outer_wire,
+            inner_wires,
+            orientation,
+        });
+        Ok(Self {
+            brep: Arc::new(brep),
+            id,
+            orientation,
+        })
     }
 
     /// A face with explicit wires and orientation.
@@ -158,6 +262,12 @@ impl Face {
             id: self.id,
             orientation: self.orientation.reversed(),
         }
+    }
+}
+
+fn attach_loop_pcurves(brep: &mut BRep, loop_id: LoopId, pcurves: Vec<PcurveData>) {
+    for (coedge, pcurve) in brep.loops[loop_id].edges.iter_mut().zip(pcurves) {
+        coedge.pcurve = Some(brep.pcurves.insert(pcurve));
     }
 }
 

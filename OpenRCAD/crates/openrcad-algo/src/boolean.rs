@@ -1,13 +1,21 @@
 use crate::BooleanOp;
 use core::f64::consts::TAU;
-use openrcad_foundation::{CancellationProbe, NeverCancelled};
+use openrcad_foundation::{
+    CancellationProbe, NeverCancelled, TolerancePolicy, TolerancePolicyError,
+};
 use openrcad_foundation::{Dir, Pnt, Trsf, Vec as GeomVec};
 use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Surface};
 use openrcad_topo::arena::EdgeId;
-use openrcad_topo::{BRepBuilder, Face, FaceId, HealthReport, Solid, Wire};
+use openrcad_topo::{
+    BRepBuilder, Face, FaceId, HealthReport, InputTopologyRef, PcurveBuildError, Solid,
+    TopologyHistory, TopologyRef, Wire,
+};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::bvh::Bvh;
+use crate::operation::{
+    Diagnostic, OperationResult, RecoveryAction, RecoveryReport, ValidationReport,
+};
 use crate::sew::sew;
 
 /// Which input face a boolean-result face came from. `usize` is the face's
@@ -45,6 +53,72 @@ impl BooleanFaceHistory {
     pub fn source_of(&self, i: usize) -> Option<BooleanFaceSource> {
         self.face_source.get(i).copied().flatten()
     }
+
+    /// Convert the legacy face correspondence into the kernel-wide topology
+    /// history contract. Operand 0 is the object and operand 1 is the tool.
+    pub fn topology_history(
+        &self,
+        op: BooleanOp,
+        object_face_count: usize,
+        tool_face_count: usize,
+    ) -> TopologyHistory {
+        let mut history = TopologyHistory::default();
+        let mut descendants = [
+            vec![Vec::<TopologyRef>::new(); object_face_count],
+            vec![Vec::<TopologyRef>::new(); tool_face_count],
+        ];
+
+        for (result_index, source) in self.face_source.iter().enumerate() {
+            let result = TopologyRef::face(result_index);
+            match source {
+                Some(BooleanFaceSource::Object(index)) if *index < object_face_count => {
+                    descendants[0][*index].push(result);
+                }
+                Some(BooleanFaceSource::Tool(index)) if *index < tool_face_count => {
+                    descendants[1][*index].push(result);
+                }
+                _ => history.generated([], result),
+            }
+        }
+
+        for (operand, by_source) in descendants.iter().enumerate() {
+            for (source_index, results) in by_source.iter().enumerate() {
+                let source = InputTopologyRef::face(operand, source_index);
+                if results.is_empty() {
+                    history.deleted(source);
+                } else if operand == 1 && op == BooleanOp::Cut {
+                    for &result in results {
+                        history.generated([source], result);
+                    }
+                } else if results.len() == 1 {
+                    history.modified(source, results[0]);
+                } else {
+                    history.split(source, results.iter().copied());
+                }
+            }
+        }
+
+        let object_shell =
+            InputTopologyRef::new(0, TopologyRef::new(openrcad_topo::TopologyKind::Shell, 0));
+        let tool_shell =
+            InputTopologyRef::new(1, TopologyRef::new(openrcad_topo::TopologyKind::Shell, 0));
+        let result_shell = TopologyRef::new(openrcad_topo::TopologyKind::Shell, 0);
+        let object_solid =
+            InputTopologyRef::new(0, TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0));
+        let tool_solid =
+            InputTopologyRef::new(1, TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0));
+        let result_solid = TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0);
+        if op == BooleanOp::Cut {
+            history.modified(object_shell, result_shell);
+            history.deleted(tool_shell);
+            history.modified(object_solid, result_solid);
+            history.deleted(tool_solid);
+        } else {
+            history.merged([object_shell, tool_shell], result_shell);
+            history.merged([object_solid, tool_solid], result_solid);
+        }
+        history
+    }
 }
 
 /// Which operand failed preflight validation for a boolean operation.
@@ -59,6 +133,10 @@ pub enum BooleanInput {
 /// Structured boolean failure for applications that need recoverable modeling.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BooleanError {
+    /// The supplied document tolerance policy is not usable.
+    InvalidTolerancePolicy(TolerancePolicyError),
+    /// A face-local pcurve could not be constructed consistently.
+    PcurveBuild(PcurveBuildError),
     /// The caller superseded this operation. No partial result is returned.
     Cancelled,
     /// One of the input solids is structurally invalid or not watertight.
@@ -95,6 +173,10 @@ pub enum BooleanError {
 impl core::fmt::Display for BooleanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::InvalidTolerancePolicy(error) => {
+                write!(f, "invalid boolean tolerance policy: {error}")
+            }
+            Self::PcurveBuild(error) => write!(f, "boolean pcurve construction failed: {error}"),
             Self::Cancelled => write!(f, "boolean operation cancelled"),
             Self::InvalidInput { input, report } => {
                 write!(f, "invalid boolean {input:?} input: {report:?}")
@@ -122,12 +204,98 @@ impl std::error::Error for BooleanError {}
 /// outputs. This is the preferred entry point for CAD applications, where a
 /// failed feature should be diagnosable instead of cached as a bad body.
 pub fn boolean_checked(object: &Solid, tool: &Solid, op: BooleanOp) -> Result<Solid, BooleanError> {
-    validate_operand(BooleanInput::Object, object)?;
-    validate_operand(BooleanInput::Tool, tool)?;
+    boolean_checked_with_policy(object, tool, op, &TolerancePolicy::STANDARD)
+}
 
-    let result = catch_unwind(AssertUnwindSafe(|| boolean(object, tool, op)))
-        .map_err(|_| BooleanError::Panicked)?;
-    validate_output(result)
+/// Checked boolean using one explicit document-wide tolerance policy for
+/// intersection, reconstruction, sewing, recovery, and validation.
+pub fn boolean_checked_with_policy(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BooleanError> {
+    boolean_operation_with_policy(object, tool, op, policy).map(|result| result.value)
+}
+
+/// Boolean operation using the shared structured result contract.
+pub fn boolean_operation(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+) -> Result<OperationResult<Solid>, BooleanError> {
+    boolean_operation_with_policy(object, tool, op, &TolerancePolicy::STANDARD)
+}
+
+/// Structured boolean operation under an explicit document tolerance policy.
+pub fn boolean_operation_with_policy(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    policy: &TolerancePolicy,
+) -> Result<OperationResult<Solid>, BooleanError> {
+    policy
+        .validate()
+        .map_err(BooleanError::InvalidTolerancePolicy)?;
+    validate_operand(BooleanInput::Object, object, policy)?;
+    validate_operand(BooleanInput::Tool, tool, policy)?;
+
+    let (result, face_history, mut recovery) = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(
+            object,
+            tool,
+            op,
+            BooleanOptions {
+                obj_classes: None,
+                tool_classes: None,
+                want_history: true,
+                policy,
+                cancel: &NeverCancelled,
+            },
+        )
+    }))
+    .map_err(|_| BooleanError::Panicked)?
+    .expect("NeverCancelled cannot cancel");
+    let (value, reconstructed) = repair_boolean_output(result, policy)?;
+    if reconstructed > 0 {
+        recovery
+            .actions
+            .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
+    }
+    let face_history = face_history.unwrap_or_default();
+    let mut history = face_history.topology_history(op, object.face_count(), tool.face_count());
+    let unattributed = history.complete_unattributed_results(&value);
+    debug_assert!(history.validate().is_ok());
+    let mut diagnostics: Vec<_> = face_history
+        .face_source
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| source.is_none())
+        .map(|(index, _)| {
+            Diagnostic::warning(
+                "openrcad.history.unattributed-face",
+                "boolean result face could not be attributed to an input face",
+                Some(TopologyRef::face(index)),
+            )
+        })
+        .collect();
+    diagnostics.extend(unattributed.into_iter().map(|entity| {
+        Diagnostic::info(
+            "openrcad.history.conservative-generated",
+            "result topology has no proven Phase 1 lineage and is explicitly marked generated",
+            Some(entity),
+        )
+    }));
+    let validation = ValidationReport::for_solid(&value, policy);
+    debug_assert!(validation.is_valid());
+
+    Ok(OperationResult {
+        value,
+        history,
+        diagnostics,
+        recovery,
+        validation,
+    })
 }
 
 /// Cancellable checked boolean. Existing callers can continue to use
@@ -138,13 +306,38 @@ pub fn boolean_checked_with_cancel(
     op: BooleanOp,
     cancel: &dyn CancellationProbe,
 ) -> Result<Solid, BooleanError> {
+    boolean_checked_with_policy_and_cancel(object, tool, op, &TolerancePolicy::STANDARD, cancel)
+}
+
+/// Cancellable checked boolean under an explicit tolerance policy.
+pub fn boolean_checked_with_policy_and_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<Solid, BooleanError> {
+    policy
+        .validate()
+        .map_err(BooleanError::InvalidTolerancePolicy)?;
     cancel
         .check_cancelled()
         .map_err(|_| BooleanError::Cancelled)?;
-    validate_operand(BooleanInput::Object, object)?;
-    validate_operand(BooleanInput::Tool, tool)?;
+    validate_operand(BooleanInput::Object, object, policy)?;
+    validate_operand(BooleanInput::Tool, tool, policy)?;
     let result = catch_unwind(AssertUnwindSafe(|| {
-        boolean_impl(object, tool, op, None, None, false, cancel)
+        boolean_impl(
+            object,
+            tool,
+            op,
+            BooleanOptions {
+                obj_classes: None,
+                tool_classes: None,
+                want_history: false,
+                policy,
+                cancel,
+            },
+        )
     }))
     .map_err(|_| BooleanError::Panicked)?
     .map_err(|_| BooleanError::Cancelled)?
@@ -152,7 +345,7 @@ pub fn boolean_checked_with_cancel(
     cancel
         .check_cancelled()
         .map_err(|_| BooleanError::Cancelled)?;
-    validate_output(result)
+    repair_boolean_output(result, policy).map(|(solid, _)| solid)
 }
 
 /// Apply `op`, then split a result that severed the body into one solid per
@@ -176,29 +369,52 @@ pub fn boolean_checked_bodies(
     tool: &Solid,
     op: BooleanOp,
 ) -> Result<Vec<Solid>, BooleanError> {
-    validate_operand(BooleanInput::Object, object)?;
-    validate_operand(BooleanInput::Tool, tool)?;
+    boolean_checked_bodies_with_policy(object, tool, op, &TolerancePolicy::STANDARD)
+}
 
-    let result = catch_unwind(AssertUnwindSafe(|| boolean(object, tool, op)))
-        .map_err(|_| BooleanError::Panicked)?;
+/// Checked multi-body boolean under an explicit tolerance policy.
+pub fn boolean_checked_bodies_with_policy(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    policy: &TolerancePolicy,
+) -> Result<Vec<Solid>, BooleanError> {
+    policy
+        .validate()
+        .map_err(BooleanError::InvalidTolerancePolicy)?;
+    validate_operand(BooleanInput::Object, object, policy)?;
+    validate_operand(BooleanInput::Tool, tool, policy)?;
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(
+            object,
+            tool,
+            op,
+            BooleanOptions {
+                obj_classes: None,
+                tool_classes: None,
+                want_history: false,
+                policy,
+                cancel: &NeverCancelled,
+            },
+        )
+    }))
+    .map_err(|_| BooleanError::Panicked)?
+    .expect("NeverCancelled cannot cancel")
+    .0;
+    let (result, _) = repair_boolean_output(result, policy)?;
     let bodies = result.split_disconnected();
     for body in &bodies {
-        let report = body.health_report();
-        if !report.is_healthy() {
-            return Err(BooleanError::InvalidOutput { report });
-        }
-        if !body.is_watertight() {
-            return Err(BooleanError::NonWatertightOutput { report });
-        }
+        validate_output(body.clone(), policy)?;
     }
     Ok(bodies)
 }
 
 /// Apply `op` between `object` and `tool`.
 pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
-    boolean_impl(object, tool, op, None, None, false, &NeverCancelled)
-        .expect("NeverCancelled cannot cancel")
-        .0
+    boolean_operation(object, tool, op)
+        .unwrap_or_else(|error| panic!("boolean: {error}"))
+        .value
 }
 
 /// [`boolean`] plus the exact face correspondence ([`BooleanFaceHistory`]).
@@ -215,16 +431,21 @@ pub fn boolean_with_history(
     obj_classes: Option<&[Option<u64>]>,
     tool_classes: Option<&[Option<u64>]>,
 ) -> (Solid, BooleanFaceHistory) {
-    let (solid, history) = boolean_impl(
+    let (solid, history, _) = boolean_impl(
         object,
         tool,
         op,
-        obj_classes,
-        tool_classes,
-        true,
-        &NeverCancelled,
+        BooleanOptions {
+            obj_classes,
+            tool_classes,
+            want_history: true,
+            policy: &TolerancePolicy::STANDARD,
+            cancel: &NeverCancelled,
+        },
     )
     .expect("NeverCancelled cannot cancel");
+    let (solid, _) = repair_boolean_output(solid, &TolerancePolicy::STANDARD)
+        .unwrap_or_else(|error| panic!("boolean_with_history: {error}"));
     (solid, history.unwrap_or_default())
 }
 
@@ -237,15 +458,49 @@ pub fn boolean_checked_with_history(
     obj_classes: Option<&[Option<u64>]>,
     tool_classes: Option<&[Option<u64>]>,
 ) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
-    validate_operand(BooleanInput::Object, object)?;
-    validate_operand(BooleanInput::Tool, tool)?;
+    boolean_checked_with_history_and_policy(
+        object,
+        tool,
+        op,
+        obj_classes,
+        tool_classes,
+        &TolerancePolicy::STANDARD,
+    )
+}
 
-    let (result, history) = catch_unwind(AssertUnwindSafe(|| {
-        boolean_with_history(object, tool, op, obj_classes, tool_classes)
+/// Checked history-producing boolean under an explicit tolerance policy.
+pub fn boolean_checked_with_history_and_policy(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    policy: &TolerancePolicy,
+) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
+    policy
+        .validate()
+        .map_err(BooleanError::InvalidTolerancePolicy)?;
+    validate_operand(BooleanInput::Object, object, policy)?;
+    validate_operand(BooleanInput::Tool, tool, policy)?;
+
+    let (result, history, _) = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(
+            object,
+            tool,
+            op,
+            BooleanOptions {
+                obj_classes,
+                tool_classes,
+                want_history: true,
+                policy,
+                cancel: &NeverCancelled,
+            },
+        )
     }))
-    .map_err(|_| BooleanError::Panicked)?;
-    let result = validate_output(result)?;
-    Ok((result, history))
+    .map_err(|_| BooleanError::Panicked)?
+    .expect("NeverCancelled cannot cancel");
+    let (result, _) = repair_boolean_output(result, policy)?;
+    Ok((result, history.unwrap_or_default()))
 }
 
 pub fn boolean_checked_with_history_cancel(
@@ -256,39 +511,92 @@ pub fn boolean_checked_with_history_cancel(
     tool_classes: Option<&[Option<u64>]>,
     cancel: &dyn CancellationProbe,
 ) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
+    boolean_checked_with_history_policy_and_cancel(
+        object,
+        tool,
+        op,
+        obj_classes,
+        tool_classes,
+        &TolerancePolicy::STANDARD,
+        cancel,
+    )
+}
+
+/// Cancellable history-producing boolean under an explicit tolerance policy.
+pub fn boolean_checked_with_history_policy_and_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
+    policy
+        .validate()
+        .map_err(BooleanError::InvalidTolerancePolicy)?;
     cancel
         .check_cancelled()
         .map_err(|_| BooleanError::Cancelled)?;
-    validate_operand(BooleanInput::Object, object)?;
-    validate_operand(BooleanInput::Tool, tool)?;
-    let (result, history) = catch_unwind(AssertUnwindSafe(|| {
-        boolean_impl(object, tool, op, obj_classes, tool_classes, true, cancel)
+    validate_operand(BooleanInput::Object, object, policy)?;
+    validate_operand(BooleanInput::Tool, tool, policy)?;
+    let (result, history, _) = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(
+            object,
+            tool,
+            op,
+            BooleanOptions {
+                obj_classes,
+                tool_classes,
+                want_history: true,
+                policy,
+                cancel,
+            },
+        )
     }))
     .map_err(|_| BooleanError::Panicked)?
     .map_err(|_| BooleanError::Cancelled)?;
-    let result = validate_output(result)?;
+    let (result, _) = repair_boolean_output(result, policy)?;
     Ok((result, history.unwrap_or_default()))
+}
+
+struct BooleanOptions<'a> {
+    obj_classes: Option<&'a [Option<u64>]>,
+    tool_classes: Option<&'a [Option<u64>]>,
+    want_history: bool,
+    policy: &'a TolerancePolicy,
+    cancel: &'a dyn CancellationProbe,
 }
 
 fn boolean_impl(
     object: &Solid,
     tool: &Solid,
     op: BooleanOp,
-    obj_classes: Option<&[Option<u64>]>,
-    tool_classes: Option<&[Option<u64>]>,
-    want_history: bool,
-    cancel: &dyn CancellationProbe,
-) -> Result<(Solid, Option<BooleanFaceHistory>), openrcad_foundation::Cancelled> {
+    options: BooleanOptions<'_>,
+) -> Result<(Solid, Option<BooleanFaceHistory>, RecoveryReport), openrcad_foundation::Cancelled> {
+    let BooleanOptions {
+        obj_classes,
+        tool_classes,
+        want_history,
+        policy,
+        cancel,
+    } = options;
     cancel.check_cancelled()?;
-    let tol = 1e-5;
+    let tol = policy.intersection;
 
     // 0. Fuzzy pre-snap: nudge the tool so a near-coincident, overlapping planar
     //    face becomes exactly coincident with the object's. This collapses the
     //    near-miss / flush cut onto the boolean's clean coincident-face path,
     //    preventing the watertight "sliver" that would otherwise break a later
     //    fillet. Narrow and size-relative, so a real clearance is never snapped.
-    let fuzz = (bbox_diag(object) * SNAP_REL).clamp(1e-12, SNAP_CAP);
-    let snapped = snap_tool_to_object(object, tool, fuzz);
+    let fuzz = policy.snap_tolerance(bbox_diag(object));
+    let (snapped, snap_distance) = snap_tool_to_object(object, tool, fuzz, policy.resolution);
+    let mut recovery = RecoveryReport::default();
+    if let Some(distance) = snap_distance {
+        recovery
+            .actions
+            .push(RecoveryAction::NearCoincidentSnap { distance });
+    }
     let tool = &snapped;
 
     // 1. Build staging builders
@@ -330,7 +638,7 @@ fn boolean_impl(
                                     e_obj.first(),
                                     e_obj.last(),
                                     &pt,
-                                    tol,
+                                    policy,
                                 );
                                 try_split_edge(
                                     &mut builder_tool,
@@ -339,7 +647,7 @@ fn boolean_impl(
                                     e_tool.first(),
                                     e_tool.last(),
                                     &pt,
-                                    tol,
+                                    policy,
                                 );
                             }
                         }
@@ -548,6 +856,7 @@ fn boolean_impl(
     }
 
     // 3. Classify all split faces
+    let class_tol = policy.classification;
     let mut kept_faces = Vec::new();
     // Parallel to `kept_faces`: which INPUT face (by shell position) each kept
     // split face descends from — read straight from the split bookkeeping
@@ -607,7 +916,7 @@ fn boolean_impl(
             let ft_data = &brep_tool.faces[ft_id];
             let face_t = Face::from_id(brep_tool.clone(), ft_id, ft_data.orientation);
             if let (Some(s_obj), Some(s_tool)) = (face.surface(), face_t.surface()) {
-                if surfaces_are_coplanar(s_obj, s_tool, tol) {
+                if surfaces_are_coplanar(s_obj, s_tool, class_tol) {
                     let (u, v) =
                         crate::intersect::search_nearest_parameter(s_tool, &pos, (0.0, 0.0));
                     if crate::intersect::is_inside_trimming_loops(u, v, &face_t) {
@@ -684,7 +993,7 @@ fn boolean_impl(
             let fo_data = &brep_obj.faces[fo_id];
             let face_o = Face::from_id(brep_obj.clone(), fo_id, fo_data.orientation);
             if let (Some(s_obj), Some(s_tool)) = (face_o.surface(), face.surface()) {
-                if surfaces_are_coplanar(s_obj, s_tool, tol) {
+                if surfaces_are_coplanar(s_obj, s_tool, class_tol) {
                     let (u, v) =
                         crate::intersect::search_nearest_parameter(s_obj, &pos, (0.0, 0.0));
                     if crate::intersect::is_inside_trimming_loops(u, v, &face_o) {
@@ -719,7 +1028,7 @@ fn boolean_impl(
 
     // 4. Sew kept faces together
     cancel.check_cancelled()?;
-    let shell = sew(&kept_faces, tol);
+    let shell = sew(&kept_faces, policy.sewing);
     let solid = Solid::new(shell);
 
     // 4b. Heal T-junctions: an imprint can split one face's boundary edge at a
@@ -727,7 +1036,11 @@ fn boolean_impl(
     //     face (e.g. a boss footprint straddling a box edge), leaving the shell
     //     open. Split such edges at the stray interior vertex so the coincident
     //     edges share endpoints. A no-op (and skipped) when already watertight.
-    let solid = crate::merge::heal_tjunctions(&solid, tol);
+    let unhealed = solid;
+    let solid = crate::merge::heal_tjunctions_with_policy(&unhealed, policy);
+    if !std::sync::Arc::ptr_eq(unhealed.brep(), solid.brep()) {
+        recovery.actions.push(RecoveryAction::HealTJunctions);
+    }
 
     // History/owner plumbing. `sew`/`heal`/`merge` each re-key FaceIds, so
     // origins are not threaded through them — they are *resolved*: every stage's
@@ -737,7 +1050,7 @@ fn boolean_impl(
     // signatures).
     let has_classes = obj_classes.is_some() || tool_classes.is_some();
     let class_map = if has_classes {
-        let origins = resolve_face_origins(&solid, &kept_faces, &kept_sources, tol);
+        let origins = resolve_face_origins(&solid, &kept_faces, &kept_sources, policy);
         let mut map: std::collections::HashMap<FaceId, u64> = std::collections::HashMap::new();
         for (face, origin) in solid.shell().faces().iter().zip(&origins) {
             // Tag the side into the class key so an object class value can
@@ -767,14 +1080,38 @@ fn boolean_impl(
     //    unless it produces a watertight, healthy, smaller solid. When owner
     //    classes are supplied, faces of different owners are never merged (the
     //    merge would erase the identity the history just preserved).
-    let solid = crate::merge::merge_coplanar_faces_classed(&solid, class_map.as_ref());
-    let solid = crate::merge::merge_cocylindrical_faces_classed(&solid, class_map.as_ref());
+    let before_coplanar = solid;
+    let before_count = before_coplanar.face_count();
+    let solid = crate::merge::merge_coplanar_faces_classed_with_policy(
+        &before_coplanar,
+        class_map.as_ref(),
+        policy,
+    );
+    if !std::sync::Arc::ptr_eq(before_coplanar.brep(), solid.brep()) {
+        recovery.actions.push(RecoveryAction::MergeCoplanarFaces {
+            removed_faces: before_count.saturating_sub(solid.face_count()),
+        });
+    }
+    let before_cocylindrical = solid;
+    let before_count = before_cocylindrical.face_count();
+    let solid = crate::merge::merge_cocylindrical_faces_classed_with_policy(
+        &before_cocylindrical,
+        class_map.as_ref(),
+        policy,
+    );
+    if !std::sync::Arc::ptr_eq(before_cocylindrical.brep(), solid.brep()) {
+        recovery
+            .actions
+            .push(RecoveryAction::MergeCocylindricalFaces {
+                removed_faces: before_count.saturating_sub(solid.face_count()),
+            });
+    }
 
     let history = want_history
-        .then(|| resolve_face_origins(&solid, &kept_faces, &kept_sources, tol))
+        .then(|| resolve_face_origins(&solid, &kept_faces, &kept_sources, policy))
         .map(|face_source| BooleanFaceHistory { face_source });
     cancel.check_cancelled()?;
-    Ok((solid, history))
+    Ok((solid, history, recovery))
 }
 
 /// For each face of `solid` (in shell order), the kept split face it descends
@@ -786,9 +1123,9 @@ fn resolve_face_origins(
     solid: &Solid,
     kept_faces: &[Face],
     kept_sources: &[Option<BooleanFaceSource>],
-    tol: f64,
+    policy: &TolerancePolicy,
 ) -> Vec<Option<BooleanFaceSource>> {
-    let surf_tol = (tol * 10.0).max(1e-6);
+    let surf_tol = (policy.classification * 10.0).max(policy.pcurve_consistency);
     solid
         .shell()
         .faces()
@@ -838,27 +1175,54 @@ fn effective_normal_uv(face: &Face, u: f64, v: f64) -> Option<Dir> {
     Some(dir)
 }
 
-fn validate_operand(input: BooleanInput, solid: &Solid) -> Result<(), BooleanError> {
-    let report = solid.health_report();
-    if !report.is_healthy() || !solid.is_watertight() {
+fn validate_operand(
+    input: BooleanInput,
+    solid: &Solid,
+    policy: &TolerancePolicy,
+) -> Result<(), BooleanError> {
+    let mut report = solid.health_report_with_policy(policy);
+    if let Err(error) = solid.validate_strict_with_policy(policy) {
+        let strict = openrcad_topo::HealthError::Validation(error);
+        if !report.errors.contains(&strict) {
+            report.errors.push(strict);
+        }
+    }
+    if !report.is_healthy() || !solid.is_watertight_with_policy(policy) {
         return Err(BooleanError::InvalidInput { input, report });
     }
     Ok(())
 }
 
-fn validate_output(solid: Solid) -> Result<Solid, BooleanError> {
-    let report = solid.health_report();
+fn validate_output(solid: Solid, policy: &TolerancePolicy) -> Result<Solid, BooleanError> {
+    let mut report = solid.health_report_with_policy(policy);
+    if let Err(error) = solid.validate_strict_with_policy(policy) {
+        let strict = openrcad_topo::HealthError::Validation(error);
+        if !report.errors.contains(&strict) {
+            report.errors.push(strict);
+        }
+    }
     if !report.is_healthy() {
         return Err(BooleanError::InvalidOutput { report });
     }
-    if !solid.is_watertight() {
+    if !solid.is_watertight_with_policy(policy) {
         return Err(BooleanError::NonWatertightOutput { report });
     }
-    let sliver_tol = (bbox_diag(&solid) * SLIVER_REL).clamp(1e-12, SLIVER_CAP);
-    if let Some(thickness) = degenerate_sliver_thickness(&solid, sliver_tol) {
+    let sliver_tol = policy.sliver_tolerance(bbox_diag(&solid));
+    if let Some(thickness) = degenerate_sliver_thickness(&solid, sliver_tol, policy.resolution) {
         return Err(BooleanError::DegenerateSliver { thickness });
     }
     Ok(solid)
+}
+
+fn repair_boolean_output(
+    solid: Solid,
+    policy: &TolerancePolicy,
+) -> Result<(Solid, usize), BooleanError> {
+    let (solid, reconstructed) = solid
+        .repair_pcurves(policy)
+        .map_err(BooleanError::PcurveBuild)?;
+    let solid = validate_output(solid, policy)?;
+    Ok((solid, reconstructed))
 }
 
 // ---- Fuzzy coincidence handling (snap + sliver gate) -----------------------
@@ -873,15 +1237,6 @@ fn validate_output(solid: Solid) -> Result<Solid, BooleanError> {
 //      overlapping face pair exactly coincident (`snap_tool_to_object`);
 //   2. a post-boolean gate that rejects any residual sliver
 //      (`degenerate_sliver_thickness`, wired into `validate_output`).
-
-/// Relative pre-boolean snap fuzz (× bbox diagonal), hard-capped. Only gaps below
-/// this — numerical near-coincidences, not real clearances — are snapped.
-const SNAP_REL: f64 = 1e-7;
-const SNAP_CAP: f64 = 1e-4;
-/// Relative sliver-rejection tolerance (× bbox diagonal), hard-capped. A wall
-/// thinner than this that survived snapping is rejected as degenerate.
-const SLIVER_REL: f64 = 1e-6;
-const SLIVER_CAP: f64 = 1e-3;
 
 /// A planar face reduced to its plane frame and outer-wire vertices.
 struct PlanarFaceInfo {
@@ -982,7 +1337,12 @@ fn overlap_in_plane(a: &PlanarFaceInfo, b: &PlanarFaceInfo) -> bool {
 /// whole tool so those pairs become exactly coincident — but only if a single
 /// translation satisfies *every* detected pair. A conflicting multi-coincidence
 /// (which one translation can't resolve) is left for the sliver gate.
-fn snap_tool_to_object(object: &Solid, tool: &Solid, fuzz: f64) -> Solid {
+fn snap_tool_to_object(
+    object: &Solid,
+    tool: &Solid,
+    fuzz: f64,
+    resolution: f64,
+) -> (Solid, Option<f64>) {
     let obj_planes = planar_faces(object);
     let tool_planes = planar_faces(tool);
     // One required translation per near-coincident, overlapping pair.
@@ -1003,7 +1363,7 @@ fn snap_tool_to_object(object: &Solid, tool: &Solid, fuzz: f64) -> Solid {
         }
     }
     if reqs.is_empty() {
-        return tool.clone();
+        return (tool.clone(), None);
     }
     // Compose one translation; orthogonal requirements add, a real conflict fails.
     let mut t = GeomVec::new(0.0, 0.0, 0.0);
@@ -1013,20 +1373,21 @@ fn snap_tool_to_object(object: &Solid, tool: &Solid, fuzz: f64) -> Solid {
     for &(n, s) in &reqs {
         let achieved = n.x() * t.x() + n.y() * t.y() + n.z() * t.z();
         if (achieved - s).abs() > fuzz * 0.5 {
-            return tool.clone(); // conflicting coincidences — let the gate handle it
+            return (tool.clone(), None); // conflicting coincidences — let the gate handle it
         }
     }
-    if t.magnitude() < 1e-12 {
-        return tool.clone();
+    if t.magnitude() < resolution {
+        return (tool.clone(), None);
     }
-    tool.transformed(&Trsf::translation(t))
+    let distance = t.magnitude();
+    (tool.transformed(&Trsf::translation(t)), Some(distance))
 }
 
 /// Smallest wall thickness of a degenerate sliver in `solid`: two planar faces
 /// that are parallel, within `tol` of coincident, and overlap in projection.
 /// `None` if no sliver. (Exactly-coincident faces, `d ≈ 0`, are excluded — those
 /// surface as non-manifold/non-watertight and are caught earlier.)
-fn degenerate_sliver_thickness(solid: &Solid, tol: f64) -> Option<f64> {
+fn degenerate_sliver_thickness(solid: &Solid, tol: f64, resolution: f64) -> Option<f64> {
     let planes = planar_faces(solid);
     let mut found: Option<f64> = None;
     for i in 0..planes.len() {
@@ -1036,7 +1397,7 @@ fn degenerate_sliver_thickness(solid: &Solid, tol: f64) -> Option<f64> {
                 continue;
             }
             let d = plane_dist(a, b.verts[0]).abs();
-            if d <= 1e-12 || d >= tol {
+            if d <= resolution || d >= tol {
                 continue;
             }
             if !overlap_in_plane(a, b) {
@@ -1059,19 +1420,19 @@ fn try_split_edge(
     first: f64,
     last: f64,
     pt: &Pnt,
-    tol: f64,
+    policy: &TolerancePolicy,
 ) {
     if !builder.brep().edges.contains_key(edge_id) {
         return;
     }
     let t = project_point_on_curve(pt, curve, first, last);
-    if curve.point(t).distance(pt) > 1e-6 {
+    if curve.point(t).distance(pt) > policy.pcurve_consistency {
         return; // off the finite segment
     }
     let ed = &builder.brep().edges[edge_id];
     let s_pt = builder.brep().vertices[ed.start].point;
     let e_pt = builder.brep().vertices[ed.end].point;
-    if pt.distance(&s_pt) < tol || pt.distance(&e_pt) < tol {
+    if pt.distance(&s_pt) < policy.intersection || pt.distance(&e_pt) < policy.intersection {
         return; // coincides with an endpoint — no real split
     }
     let v = builder
@@ -1079,7 +1440,7 @@ fn try_split_edge(
         .vertices
         .insert(openrcad_topo::arena::VertexData {
             point: *pt,
-            tolerance: openrcad_foundation::tolerance::CONFUSION,
+            tolerance: policy.linear,
         });
     builder.split_edge(edge_id, v, t);
 }
@@ -1278,83 +1639,100 @@ fn point_on_face(face: &Face) -> Pnt {
     }
 }
 
-fn is_point_inside_solid(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
-    // A "generic" irrational-ish direction: a symmetric diagonal like (1,1,1)
-    // skewers the corners/edges of axis-aligned boxes, defeating the parity
-    // test. This direction avoids hitting integer-coordinate vertices/edges.
-    let mut ray_dir = Dir::new(0.182_321, 0.523_157, 0.832_511);
-    let mut rng: u64 = 42;
+fn point_outside_solid_bounds(p: &Pnt, bvh: &Bvh) -> bool {
+    // Solid::bounding_box covers vertices only and can under-approximate curved
+    // edges. The BVH root also samples boundary curves (and includes B-spline
+    // poles), making it the appropriate broad-phase bound for classification.
+    if let Some((lo, hi)) = bvh.nodes.first().and_then(|node| node.bounds.corners()) {
+        const BOUNDS_TOL: f64 = 1.0e-7;
+        p.x() < lo.x() - BOUNDS_TOL
+            || p.x() > hi.x() + BOUNDS_TOL
+            || p.y() < lo.y() - BOUNDS_TOL
+            || p.y() > hi.y() + BOUNDS_TOL
+            || p.z() < lo.z() - BOUNDS_TOL
+            || p.z() > hi.z() + BOUNDS_TOL
+    } else {
+        false
+    }
+}
 
-    // Cap the perturbation retries: a point that stubbornly grazes boundaries
-    // should not spin forever. After the cap we accept the last parity reading.
-    for _attempt in 0..32 {
+/// Cast one ray-parity direction, perturbing it when a hit grazes a topological
+/// boundary. `None` means every permitted perturbation remained ambiguous.
+fn cast_ray_parity(
+    p: &Pnt,
+    solid: &Solid,
+    bvh: &Bvh,
+    base: Dir,
+    seed: u64,
+    max_attempts: usize,
+) -> Option<bool> {
+    let mut ray_dir = base;
+    let mut rng = seed;
+    for _ in 0..max_attempts {
         let mut intersection_count = 0;
         let mut hit_boundary = false;
-
         let ray_dir_vec = GeomVec::from_dir(ray_dir);
 
-        // Only test faces whose AABB the ray actually crosses. The BVH prunes
-        // the rest, so each cast is O(log F + hits) instead of O(F), and we
-        // reconstruct only the hit faces (via Face::from_id) rather than
-        // materializing the whole shell's face list on every call.
-        let candidate_face_ids = bvh.ray_cast(p, &ray_dir_vec);
-
-        'faces: for fid in candidate_face_ids {
+        // Only test faces whose AABB the ray crosses (BVH prunes the rest), so
+        // each cast is O(log F + hits) and only hit faces are reconstructed.
+        'faces: for fid in bvh.ray_cast(p, &ray_dir_vec) {
             let orientation = solid.brep().faces[fid].orientation;
             let face = Face::from_id(solid.brep().clone(), fid, orientation);
             for hit in crate::intersect::ray_face_all(p, &ray_dir_vec, &face, 1e-7) {
-                let mut on_boundary = false;
-                for wire in face.wires() {
-                    for edge in wire.edges() {
-                        let dist_to_edge = distance_point_to_edge(&hit, &edge);
-                        if dist_to_edge < 1e-5 {
-                            on_boundary = true;
-                            break;
-                        }
-                    }
-                    if on_boundary {
-                        break;
-                    }
-                }
-
+                let on_boundary = face.wires().iter().any(|wire| {
+                    wire.edges()
+                        .iter()
+                        .any(|edge| distance_point_to_edge(&hit, edge) < 1e-5)
+                });
                 if on_boundary {
                     hit_boundary = true;
                     break 'faces;
                 }
-
                 intersection_count += 1;
             }
         }
 
-        if hit_boundary {
-            rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            let rx = ((rng & 0xff) as f64 / 255.0) - 0.5;
-            rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            let ry = ((rng & 0xff) as f64 / 255.0) - 0.5;
-            rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            let rz = ((rng & 0xff) as f64 / 255.0) - 0.5;
-
-            ray_dir =
-                Dir::from_vec(&(ray_dir_vec + GeomVec::new(rx, ry, rz) * 0.1)).unwrap_or(ray_dir);
-            continue;
+        if !hit_boundary {
+            return Some((intersection_count % 2) == 1);
         }
 
-        return (intersection_count % 2) == 1;
+        let mut next_offset = || {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345) & 0x7fff_ffff;
+            ((rng & 0xff) as f64 / 255.0) - 0.5
+        };
+        let offset = GeomVec::new(next_offset(), next_offset(), next_offset()) * 0.1;
+        ray_dir = Dir::from_vec(&(ray_dir_vec + offset)).unwrap_or(ray_dir);
     }
+    None
+}
 
-    // Retries exhausted: fall back to a final parity reading without the
-    // boundary veto so we always return a definite answer.
-    let ray_dir_vec = GeomVec::from_dir(ray_dir);
+fn unchecked_ray_parity(p: &Pnt, solid: &Solid, bvh: &Bvh, ray_dir: GeomVec) -> bool {
     let mut count = 0;
-    for fid in bvh.ray_cast(p, &ray_dir_vec) {
+    for fid in bvh.ray_cast(p, &ray_dir) {
         let orientation = solid.brep().faces[fid].orientation;
         let face = Face::from_id(solid.brep().clone(), fid, orientation);
-        count += crate::intersect::ray_face_all(p, &ray_dir_vec, &face, 1e-7).len();
+        count += crate::intersect::ray_face_all(p, &ray_dir, &face, 1e-7).len();
     }
     (count % 2) == 1
 }
 
+/// Fast classifier used for the many split-face decisions inside a boolean.
+/// The curve-aware bounds rejection handles exterior points before the bounded,
+/// boundary-aware parity cast.
+fn is_point_inside_solid(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
+    if point_outside_solid_bounds(p, bvh) {
+        return false;
+    }
+    let ray_dir = Dir::new(0.182_321, 0.523_157, 0.832_511);
+    cast_ray_parity(p, solid, bvh, ray_dir, 42, 32)
+        .unwrap_or_else(|| unchecked_ray_parity(p, solid, bvh, GeomVec::from_dir(ray_dir)))
+}
+
 fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
+    if point_outside_solid_bounds(p, bvh) {
+        return false;
+    }
+
     // Parity of ray-surface crossings along one direction (`true` => odd => inside),
     // skipping any cast whose hit grazes a face boundary edge (an unreliable count).
     // Returns `None` if every perturbation of this direction kept grazing.
@@ -1363,56 +1741,6 @@ fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
     // exits right at a cap/wall rim is dropped by the face-containment test, turning
     // an even count odd. So the caller votes across several independent directions:
     // an occasional miss is outvoted instead of flipping the classification.
-    let cast_parity = |base: Dir, seed: u64| -> Option<bool> {
-        let mut ray_dir = base;
-        let mut rng: u64 = seed;
-        for _attempt in 0..16 {
-            let mut intersection_count = 0;
-            let mut hit_boundary = false;
-            let ray_dir_vec = GeomVec::from_dir(ray_dir);
-
-            // Only test faces whose AABB the ray crosses (BVH prunes the rest), so
-            // each cast is O(log F + hits) and only hit faces are reconstructed.
-            'faces: for fid in bvh.ray_cast(p, &ray_dir_vec) {
-                let orientation = solid.brep().faces[fid].orientation;
-                let face = Face::from_id(solid.brep().clone(), fid, orientation);
-                for hit in crate::intersect::ray_face_all(p, &ray_dir_vec, &face, 1e-7) {
-                    let mut on_boundary = false;
-                    for wire in face.wires() {
-                        for edge in wire.edges() {
-                            if distance_point_to_edge(&hit, &edge) < 1e-5 {
-                                on_boundary = true;
-                                break;
-                            }
-                        }
-                        if on_boundary {
-                            break;
-                        }
-                    }
-                    if on_boundary {
-                        hit_boundary = true;
-                        break 'faces;
-                    }
-                    intersection_count += 1;
-                }
-            }
-
-            if hit_boundary {
-                rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                let rx = ((rng & 0xff) as f64 / 255.0) - 0.5;
-                rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                let ry = ((rng & 0xff) as f64 / 255.0) - 0.5;
-                rng = rng.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                let rz = ((rng & 0xff) as f64 / 255.0) - 0.5;
-                ray_dir = Dir::from_vec(&(ray_dir_vec + GeomVec::new(rx, ry, rz) * 0.1))
-                    .unwrap_or(ray_dir);
-                continue;
-            }
-            return Some((intersection_count % 2) == 1);
-        }
-        None
-    };
-
     // A spread of "generic" irrational-ish directions: a symmetric diagonal like
     // (1,1,1) skewers the corners/edges of axis-aligned boxes, defeating parity, so
     // every direction avoids integer-coordinate alignments. Voting across them makes
@@ -1431,7 +1759,7 @@ fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
         let Some(dir) = Dir::from_vec(&GeomVec::new(x, y, z)) else {
             continue;
         };
-        if let Some(parity) = cast_parity(dir, 42 + i as u64) {
+        if let Some(parity) = cast_ray_parity(p, solid, bvh, dir, 42 + i as u64, 16) {
             total += 1;
             if parity {
                 inside_votes += 1;
@@ -1442,14 +1770,7 @@ fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
     if total == 0 {
         // Every direction kept grazing: fall back to one no-veto parity reading so
         // we always return a definite answer.
-        let ray_dir_vec = GeomVec::new(0.182_321, 0.523_157, 0.832_511);
-        let mut count = 0;
-        for fid in bvh.ray_cast(p, &ray_dir_vec) {
-            let orientation = solid.brep().faces[fid].orientation;
-            let face = Face::from_id(solid.brep().clone(), fid, orientation);
-            count += crate::intersect::ray_face_all(p, &ray_dir_vec, &face, 1e-7).len();
-        }
-        return (count % 2) == 1;
+        return unchecked_ray_parity(p, solid, bvh, GeomVec::new(0.182_321, 0.523_157, 0.832_511));
     }
 
     // Majority vote (ties -> inside is false, matching a strict-majority "inside").
@@ -1458,10 +1779,10 @@ fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
 
 /// Whether `p` lies inside `solid` (ray-parity test).
 ///
-/// Public wrapper over [`is_point_inside_solid`] that builds the face BVH the
-/// same way the boolean engine does. Useful to classify a probe point against a
-/// body — e.g. the rolling-ball fillet distinguishing a concave cut wall
-/// (material outside the cylinder) from a convex prior-blend cylinder (inside).
+/// Public robust point classifier that builds the face BVH the same way the
+/// boolean engine does. Useful to classify a probe point against a body — e.g.
+/// the rolling-ball fillet distinguishing a concave cut wall (material outside
+/// the cylinder) from a convex prior-blend cylinder (inside).
 pub fn point_in_solid(p: &Pnt, solid: &Solid) -> bool {
     let bvh = Bvh::build(&solid.shell().faces());
     is_point_inside_solid_robust(p, solid, &bvh)
@@ -1579,6 +1900,74 @@ mod tests {
             boolean_checked_with_cancel(&object, &tool, BooleanOp::Fuse, &token),
             Err(BooleanError::Cancelled)
         );
+    }
+
+    #[test]
+    fn explicit_standard_policy_preserves_checked_boolean_result() {
+        let object = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let implicit = boolean_checked(&object, &tool, BooleanOp::Fuse).unwrap();
+        let explicit = boolean_checked_with_policy(
+            &object,
+            &tool,
+            BooleanOp::Fuse,
+            &TolerancePolicy::STANDARD,
+        )
+        .unwrap();
+
+        assert_eq!(implicit.face_count(), explicit.face_count());
+        assert_eq!(
+            implicit.bounding_box().corners(),
+            explicit.bounding_box().corners()
+        );
+        assert!(explicit
+            .health_report_with_policy(&TolerancePolicy::STANDARD)
+            .is_healthy());
+        assert!(explicit.is_watertight_with_policy(&TolerancePolicy::STANDARD));
+    }
+
+    #[test]
+    fn checked_boolean_rejects_invalid_policy_before_modeling() {
+        let object = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let invalid = TolerancePolicy {
+            intersection: f64::NAN,
+            ..TolerancePolicy::STANDARD
+        };
+
+        assert!(matches!(
+            boolean_checked_with_policy(&object, &tool, BooleanOp::Fuse, &invalid),
+            Err(BooleanError::InvalidTolerancePolicy(_))
+        ));
+    }
+
+    #[test]
+    fn structured_boolean_result_carries_history_recovery_and_validation() {
+        let object = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let result = boolean_operation(&object, &tool, BooleanOp::Fuse).unwrap();
+
+        assert!(result.validation.is_valid());
+        assert!(result.history.validate().is_ok());
+        assert_eq!(
+            result
+                .history
+                .sources_of(TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0)),
+            vec![
+                InputTopologyRef::new(0, TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0)),
+                InputTopologyRef::new(1, TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0)),
+            ]
+        );
+        assert!(result.history.coverage_for_solid(&result.value).is_complete());
+        assert!(result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != openrcad_topo::DiagnosticSeverity::Error));
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "openrcad.history.conservative-generated"));
+        assert!(result.recovery.was_modified());
     }
 
     /// Shell position of the input/result face whose plane has |normal·axis|≈1
@@ -1781,11 +2170,12 @@ mod tests {
     #[test]
     fn snap_fires_for_tiny_gap_but_preserves_real_clearance() {
         let (cube, _) = box_and_gap_cut(0.0);
-        let fuzz = (bbox_diag(&cube) * SNAP_REL).clamp(1e-12, SNAP_CAP);
+        let fuzz = TolerancePolicy::STANDARD.snap_tolerance(bbox_diag(&cube));
 
         // A tiny numerical gap (sub-fuzz) snaps: the tool is nudged.
         let (cube, tool) = box_and_gap_cut(1e-7);
-        let snapped = snap_tool_to_object(&cube, &tool, fuzz);
+        let (snapped, _) =
+            snap_tool_to_object(&cube, &tool, fuzz, TolerancePolicy::STANDARD.resolution);
         assert!(
             max_vertex_shift(&tool, &snapped) > 0.0,
             "a sub-fuzz near-coincidence should snap"
@@ -1794,7 +2184,8 @@ mod tests {
         // A deliberate 0.1 mm clearance is far above the fuzz: the tool must NOT
         // move — the snap is not "CAD autocorrect with opinions".
         let (cube, tool) = box_and_gap_cut(0.1);
-        let snapped = snap_tool_to_object(&cube, &tool, fuzz);
+        let (snapped, _) =
+            snap_tool_to_object(&cube, &tool, fuzz, TolerancePolicy::STANDARD.resolution);
         assert_eq!(
             max_vertex_shift(&tool, &snapped),
             0.0,
@@ -1814,8 +2205,9 @@ mod tests {
         let cap_y = back - 1e-7;
         let axis = Ax2::new_axes(Pnt::new(100.0, cap_y - 23.0, 100.0), Dir::dy(), Dir::dx());
         let tool = make_cylinder(&axis, 2.0, 23.0);
-        let fuzz = (bbox_diag(&cube) * SNAP_REL).clamp(1e-12, SNAP_CAP);
-        let snapped = snap_tool_to_object(&cube, &tool, fuzz);
+        let fuzz = TolerancePolicy::STANDARD.snap_tolerance(bbox_diag(&cube));
+        let (snapped, _) =
+            snap_tool_to_object(&cube, &tool, fuzz, TolerancePolicy::STANDARD.resolution);
         assert_eq!(
             max_vertex_shift(&tool, &snapped),
             0.0,
@@ -1959,6 +2351,34 @@ mod tests {
             }
         }
         assert!(result.is_watertight(), "drilled solid must be watertight");
+    }
+
+    #[test]
+    fn scaled_box_minus_cylinder_drills_watertight_hole() {
+        use openrcad_foundation::{Ax2, Dir};
+        use openrcad_primitives::make_cylinder;
+
+        // Regression dimensions minimized from ZeroCAD's bounded property test.
+        // The same central through-cut worked on a 10 mm cube but left a free
+        // circular boundary at ordinary part scale.
+        let width: f64 = 50.453_704_715_724_64;
+        let depth: f64 = 58.851_514_652_451_65;
+        let height: f64 = 28.052_053_118_610_065;
+        let radius = width.min(depth) * 0.254_935_325_547_562_9;
+        let object = make_box(&Pnt::origin(), width, depth, height);
+        let tool = make_cylinder(
+            &Ax2::new(Pnt::new(width * 0.5, depth * 0.5, -1.0), Dir::dz()),
+            radius,
+            height + 2.0,
+        );
+
+        let result = boolean(&object, &tool, BooleanOp::Cut);
+        assert!(
+            result.is_watertight(),
+            "scaled central through-hole must be watertight: {:?}",
+            result.manifold_report()
+        );
+        assert!(result.health_report().is_healthy());
     }
 
     /// The curved-boolean engine completes without hanging (the historical

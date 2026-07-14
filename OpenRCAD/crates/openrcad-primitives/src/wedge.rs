@@ -11,7 +11,7 @@ use crate::common::quad_face;
 
 /// Build a wedge with base extents `dx`, `dy`, `dz` and top X-extent `ltx`
 /// (`0 < ltx ≤ dx` gives the classic wedge; `ltx = dx` degenerates to a box).
-pub fn make_wedge(dx: f64, dy: f64, dz: f64, ltx: f64) -> Solid {
+pub(crate) fn build_wedge(dx: f64, dy: f64, dz: f64, ltx: f64) -> Solid {
     assert!(
         dx > 0.0 && dy > 0.0 && dz > 0.0,
         "make_wedge: extents must be positive"
@@ -43,6 +43,10 @@ pub fn make_wedge(dx: f64, dy: f64, dz: f64, ltx: f64) -> Solid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_wedge(dx: f64, dy: f64, dz: f64, ltx: f64) -> Solid {
+        crate::make_wedge_operation(dx, dy, dz, ltx).unwrap().value
+    }
 
     #[test]
     fn wedge_counts_and_euler() {

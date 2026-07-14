@@ -12,10 +12,10 @@ use openrcad_foundation::{Ax3, Pnt, Vec as FVec};
 use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, SphericalSurface};
 use openrcad_topo::{Edge, Face, Shell, Solid, Vertex, Wire};
 
-use crate::common::arc_edges;
+use crate::common::{angular_pcurve, arc_edges, axial_pcurve};
 
 /// Build a sphere of `radius` centered at `center`.
-pub fn make_sphere(center: &Pnt, radius: f64) -> Solid {
+pub(crate) fn build_sphere(center: &Pnt, radius: f64) -> Solid {
     assert!(radius > 0.0, "make_sphere: radius must be positive");
 
     let frame = Ax3::new(*center, openrcad_foundation::Dir::dz());
@@ -69,15 +69,35 @@ pub fn make_sphere(center: &Pnt, radius: f64) -> Solid {
     for i in 0..4 {
         let next = (i + 1) % 4;
         // Upper triangle: e_i → e_{i+1} → N → e_i.
-        faces.push(Face::new(
-            Some(surf.clone()),
-            Wire::from_edges([eq[i].clone(), upper[next].clone(), upper[i].reversed()]),
-        ));
+        let upper_wire =
+            Wire::from_edges([eq[i].clone(), upper[next].clone(), upper[i].reversed()]);
+        faces.push(
+            Face::with_pcurves(
+                surf.clone(),
+                upper_wire,
+                vec![
+                    angular_pcurve(i as f64 * PI / 2.0, (i + 1) as f64 * PI / 2.0, 0.0),
+                    axial_pcurve(next as f64 * PI / 2.0, 0.0, PI / 2.0),
+                    axial_pcurve(i as f64 * PI / 2.0, 0.0, PI / 2.0),
+                ],
+            )
+            .expect("valid upper-sphere pcurves"),
+        );
         // Lower triangle: e_i → S → e_{i+1} → e_i.
-        faces.push(Face::new(
-            Some(surf.clone()),
-            Wire::from_edges([lower[i].clone(), lower[next].reversed(), eq[i].reversed()]),
-        ));
+        let lower_wire =
+            Wire::from_edges([lower[i].clone(), lower[next].reversed(), eq[i].reversed()]);
+        faces.push(
+            Face::with_pcurves(
+                surf.clone(),
+                lower_wire,
+                vec![
+                    axial_pcurve(i as f64 * PI / 2.0, 0.0, -PI / 2.0),
+                    axial_pcurve(next as f64 * PI / 2.0, 0.0, -PI / 2.0),
+                    angular_pcurve(i as f64 * PI / 2.0, (i + 1) as f64 * PI / 2.0, 0.0),
+                ],
+            )
+            .expect("valid lower-sphere pcurves"),
+        );
     }
 
     Solid::new(Shell::from_faces(faces))
@@ -86,6 +106,10 @@ pub fn make_sphere(center: &Pnt, radius: f64) -> Solid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_sphere(center: &Pnt, radius: f64) -> Solid {
+        crate::make_sphere_operation(center, radius).unwrap().value
+    }
 
     #[test]
     fn sphere_counts_and_euler() {

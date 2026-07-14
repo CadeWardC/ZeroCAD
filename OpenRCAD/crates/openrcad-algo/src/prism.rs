@@ -6,29 +6,56 @@
 
 use core::fmt;
 
-use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, Trsf, Vec as GeomVec};
+use openrcad_foundation::{
+    tolerance, Ax3, Dir, Pnt, TolerancePolicy, TolerancePolicyError, Trsf, Vec as GeomVec,
+};
 use openrcad_geom::{Curve, CylindricalSurface, GeomCurve, GeomSurface, Line, Plane, RuledSurface};
-use openrcad_topo::{Edge, Face, Orientation, Solid, Wire};
+use openrcad_topo::{
+    Edge, Face, HealthReport, OperationResult, Orientation, PcurveBuildError, RecoveryAction,
+    RecoveryReport, Solid, TopologyHistory, ValidationReport, Wire,
+};
 
 use crate::sew::sew;
 
 /// Errors reported by prism/extrusion sweeping.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SweepError {
+    /// The supplied document tolerance policy is invalid.
+    InvalidTolerancePolicy(TolerancePolicyError),
+    /// A face-local pcurve could not be constructed consistently.
+    PcurveBuild(PcurveBuildError),
     /// The sweep vector has no usable length.
     DegenerateVector,
     /// The source face has no outer boundary.
     MissingOuterWire,
     /// A boundary wire is not closed.
     OpenWire,
+    /// The sweep assembled a solid that failed the Phase 1 representation gate.
+    InvalidOutput {
+        report: HealthReport,
+        watertight: bool,
+        pcurves_complete: bool,
+    },
 }
 
 impl fmt::Display for SweepError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidTolerancePolicy(error) => {
+                write!(f, "prism: invalid tolerance policy: {error}")
+            }
+            Self::PcurveBuild(error) => write!(f, "prism: pcurve construction failed: {error}"),
             Self::DegenerateVector => f.write_str("prism: sweep vector must be non-zero"),
             Self::MissingOuterWire => f.write_str("prism: source face has no outer wire"),
             Self::OpenWire => f.write_str("prism: every swept wire must be closed"),
+            Self::InvalidOutput {
+                report,
+                watertight,
+                pcurves_complete,
+            } => write!(
+                f,
+                "prism: invalid output (watertight={watertight}, pcurves_complete={pcurves_complete}): {report:?}"
+            ),
         }
     }
 }
@@ -41,7 +68,7 @@ impl std::error::Error for SweepError {}
 /// plane normal is parallel to the sweep vector generate cylindrical faces.
 /// Other curves generate ruled lateral faces between the base and translated
 /// edge, which covers NURBS/B-spline boundaries and skew circular sweeps.
-pub fn prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
+fn build_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
     if vector.magnitude() <= tolerance::CONFUSION {
         return Err(SweepError::DegenerateVector);
     }
@@ -78,10 +105,66 @@ pub fn prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
     Ok(Solid::new(sew(&faces, tolerance::CONFUSION * 10.0)))
 }
 
+/// Sweep a face and return the solid together with validation, recovery, and
+/// complete generated-topology history.
+pub fn prism_operation(
+    face: &Face,
+    vector: GeomVec,
+) -> Result<OperationResult<Solid>, SweepError> {
+    prism_operation_with_policy(face, vector, &TolerancePolicy::STANDARD)
+}
+
+/// Policy-aware canonical prism operation.
+pub fn prism_operation_with_policy(
+    face: &Face,
+    vector: GeomVec,
+    policy: &TolerancePolicy,
+) -> Result<OperationResult<Solid>, SweepError> {
+    policy
+        .validate()
+        .map_err(SweepError::InvalidTolerancePolicy)?;
+    let solid = build_prism(face, vector)?;
+    let (solid, reconstructed) = solid
+        .repair_pcurves(policy)
+        .map_err(SweepError::PcurveBuild)?;
+    let validation = ValidationReport::for_solid(&solid, policy);
+    if !validation.is_valid() || solid.validate_strict_with_policy(policy).is_err() {
+        return Err(SweepError::InvalidOutput {
+            report: validation.health,
+            watertight: validation.watertight,
+            pcurves_complete: validation.pcurves_complete,
+        });
+    }
+    let mut recovery = RecoveryReport::default();
+    if reconstructed > 0 {
+        recovery
+            .actions
+            .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
+    }
+    let history = TopologyHistory::generated_solid(&solid);
+    Ok(OperationResult {
+        value: solid,
+        history,
+        diagnostics: Vec::new(),
+        recovery,
+        validation,
+    })
+}
+
+/// Compatibility prism wrapper.
+///
+/// This delegates to [`prism_operation`] and discards validation, recovery,
+/// diagnostics, and topology history.
+#[deprecated(note = "use prism_operation; this wrapper discards operation metadata")]
+pub fn prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
+    prism_operation(face, vector).map(|result| result.value)
+}
+
 /// Alias matching the OpenCASCADE class name in user-facing docs.
 #[inline]
+#[deprecated(note = "use prism_operation; this wrapper discards operation metadata")]
 pub fn sweep_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
-    prism(face, vector)
+    prism_operation(face, vector).map(|result| result.value)
 }
 
 fn lateral_face(edge: &Edge, translation: &Trsf, vector: GeomVec) -> Face {

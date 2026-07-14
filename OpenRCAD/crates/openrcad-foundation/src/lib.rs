@@ -50,6 +50,7 @@ pub use frame::{Ax2, Ax22d, Ax2d, Ax3};
 pub use interval::{Interval, Interval2, Interval3};
 pub use mat::{Mat, Mat2d};
 pub use pnt::{Pnt, Pnt2d};
+pub use tolerance::{ToleranceField, TolerancePolicy, TolerancePolicyError};
 pub use trsf::{GTrsf, Trsf, TrsfForm};
 pub use vec::{Vec, Vec2d};
 pub use xyz::{Xy, Xyz};

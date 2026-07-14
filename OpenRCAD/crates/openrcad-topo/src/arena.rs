@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use slotmap::{new_key_type, SlotMap};
 
 use crate::orientation::Orientation;
+use crate::pcurve::PcurveData;
 use openrcad_foundation::Pnt;
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Surface};
 
@@ -17,6 +18,8 @@ new_key_type! {
     pub struct VertexId;
     /// Generational index for an Edge.
     pub struct EdgeId;
+    /// Generational index for a face-specific parametric curve.
+    pub struct PcurveId;
     /// Generational index for a Loop (Wire).
     pub struct LoopId;
     /// Generational index for a Face.
@@ -66,7 +69,32 @@ pub struct OrientedEdge {
     pub id: EdgeId,
     /// The traversal orientation relative to the edge's natural direction.
     pub orientation: Orientation,
+    /// Face-specific 2D representation of this edge-use.
+    #[serde(default)]
+    pub pcurve: Option<PcurveId>,
 }
+
+impl OrientedEdge {
+    /// Construct an edge-use without a parametric curve.
+    #[inline]
+    pub const fn new(id: EdgeId, orientation: Orientation) -> Self {
+        Self {
+            id,
+            orientation,
+            pcurve: None,
+        }
+    }
+
+    /// Attach a face-specific parametric curve to this edge-use.
+    #[inline]
+    pub const fn with_pcurve(mut self, pcurve: PcurveId) -> Self {
+        self.pcurve = Some(pcurve);
+        self
+    }
+}
+
+/// Explicit name for an oriented, face-specific use of a 3D edge.
+pub type Coedge = OrientedEdge;
 
 /// The ordered list of edges forming a Loop (Wire) in the B-Rep.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,6 +137,9 @@ pub struct BRep {
     pub vertices: SlotMap<VertexId, VertexData>,
     /// All edges.
     pub edges: SlotMap<EdgeId, EdgeData>,
+    /// Face-specific parametric curves referenced by coedges.
+    #[serde(default)]
+    pub pcurves: SlotMap<PcurveId, PcurveData>,
     /// All loops.
     pub loops: SlotMap<LoopId, LoopData>,
     /// All faces.
@@ -270,6 +301,13 @@ impl BRep {
                 map.edges.insert(e_id, new_id);
             }
 
+            // Pcurves are owned by coedges, so they remain face-specific even
+            // when their corresponding 3D edges are deduplicated.
+            for (pcurve_id, pcurve) in &other.pcurves {
+                let new_id = self.pcurves.insert(pcurve.clone());
+                map.pcurves.insert(pcurve_id, new_id);
+            }
+
             // 3. Merge loops
             for (l_id, l_data) in &other.loops {
                 let new_edges: Vec<OrientedEdge> = l_data
@@ -278,6 +316,7 @@ impl BRep {
                     .map(|&oe| OrientedEdge {
                         id: map.edges[&oe.id],
                         orientation: oe.orientation,
+                        pcurve: oe.pcurve.map(|id| map.pcurves[&id]),
                     })
                     .collect();
                 let new_id = self.loops.insert(LoopData { edges: new_edges });
@@ -348,9 +387,11 @@ impl BRep {
         }
 
         let mut keep_edges: HashSet<EdgeId> = HashSet::new();
+        let mut keep_pcurves: HashSet<PcurveId> = HashSet::new();
         for &l in &keep_loops {
             if let Some(ld) = self.loops.get(l) {
                 keep_edges.extend(ld.edges.iter().map(|oe| oe.id));
+                keep_pcurves.extend(ld.edges.iter().filter_map(|oe| oe.pcurve));
             }
         }
 
@@ -364,6 +405,7 @@ impl BRep {
 
         self.faces.retain(|id, _| keep_faces.contains(&id));
         self.loops.retain(|id, _| keep_loops.contains(&id));
+        self.pcurves.retain(|id, _| keep_pcurves.contains(&id));
         self.edges.retain(|id, _| keep_edges.contains(&id));
         self.vertices.retain(|id, _| keep_verts.contains(&id));
 
@@ -402,6 +444,8 @@ pub struct MergeMap {
     pub vertices: std::collections::HashMap<VertexId, VertexId>,
     /// Edge mapping
     pub edges: std::collections::HashMap<EdgeId, EdgeId>,
+    /// Pcurve mapping
+    pub pcurves: std::collections::HashMap<PcurveId, PcurveId>,
     /// Loop mapping
     pub loops: std::collections::HashMap<LoopId, LoopId>,
     /// Face mapping
@@ -417,6 +461,7 @@ impl MergeMap {
         Self {
             vertices: std::collections::HashMap::new(),
             edges: std::collections::HashMap::new(),
+            pcurves: std::collections::HashMap::new(),
             loops: std::collections::HashMap::new(),
             faces: std::collections::HashMap::new(),
             shells: std::collections::HashMap::new(),

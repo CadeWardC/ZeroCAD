@@ -11,9 +11,14 @@ pub mod facade;
 pub mod imprint;
 pub mod intersect;
 pub mod merge;
+pub mod operation;
 
 pub use blend::BlendError;
 pub use facade::SolidExt;
+pub use operation::{
+    Diagnostic, DiagnosticSeverity, OperationResult, RecoveryAction, RecoveryReport,
+    ValidationReport,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +37,10 @@ pub enum BooleanOp {
 
 pub mod boolean;
 pub use boolean::{
-    boolean_checked_with_cancel, boolean_checked_with_history, boolean_checked_with_history_cancel,
+    boolean_checked_bodies_with_policy, boolean_checked_with_cancel, boolean_checked_with_history,
+    boolean_checked_with_history_and_policy, boolean_checked_with_history_cancel,
+    boolean_checked_with_history_policy_and_cancel, boolean_checked_with_policy,
+    boolean_checked_with_policy_and_cancel, boolean_operation, boolean_operation_with_policy,
     boolean_with_history, BooleanError, BooleanFaceHistory, BooleanFaceSource, BooleanInput,
 };
 pub mod contour;
@@ -141,8 +149,12 @@ pub fn shell_solid(
 pub mod revolve;
 pub mod sew;
 pub mod skin;
-pub use prism::{prism, sweep_prism, SweepError};
-pub use revolve::{revolve, RevolveError};
+pub use prism::{
+    prism, prism_operation, prism_operation_with_policy, sweep_prism, SweepError,
+};
+pub use revolve::{
+    revolve, revolve_operation, revolve_operation_with_policy, RevolveError,
+};
 pub use rolling_ball::{
     chamfer_circular_edge_chain, chamfer_tangent_edge_chain, edge_material_wedge_is_concave,
     fillet_circular_edge_chain, fillet_edges, fillet_planar_edge, fillet_tangent_edge_chain,

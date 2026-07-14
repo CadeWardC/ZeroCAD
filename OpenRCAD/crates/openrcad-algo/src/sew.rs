@@ -104,6 +104,7 @@ fn rethread_loop(brep: &BRep, edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge
                     OrientedEdge {
                         id: oe.id,
                         orientation: Orientation::Forward,
+                        pcurve: oe.pcurve,
                     },
                     ee,
                 ));
@@ -114,6 +115,7 @@ fn rethread_loop(brep: &BRep, edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge
                     OrientedEdge {
                         id: oe.id,
                         orientation: Orientation::Reversed,
+                        pcurve: oe.pcurve,
                     },
                     es,
                 ));

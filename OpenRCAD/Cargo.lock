@@ -1273,6 +1273,7 @@ version = "0.1.0"
 dependencies = [
  "openrcad-foundation",
  "openrcad-geom",
+ "openrcad-geom2d",
  "openrcad-mesh",
  "openrcad-primitives",
  "openrcad-topo",
@@ -1321,6 +1322,7 @@ version = "0.1.0"
 dependencies = [
  "openrcad-foundation",
  "openrcad-geom",
+ "openrcad-geom2d",
  "openrcad-topo",
  "serde",
  "serde_json",

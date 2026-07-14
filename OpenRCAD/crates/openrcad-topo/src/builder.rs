@@ -3,9 +3,12 @@
 //! Enables local Euler operators (e.g. splitting edges and faces)
 //! on a mutable BRep state, which can then be sealed into an immutable Arc<BRep>.
 
-use crate::arena::{BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, VertexId};
+use crate::arena::{
+    BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, LoopId, OrientedEdge, PcurveId, VertexId,
+};
 use crate::containment::point_in_polygon_2d;
 use crate::orientation::Orientation;
+use crate::pcurve::PcurveData;
 use core::f64::consts::PI;
 use openrcad_geom::{Curve, GeomSurface, Surface};
 use std::sync::Arc;
@@ -179,6 +182,32 @@ pub struct BRepBuilder {
     brep: BRep,
 }
 
+/// Why a pcurve could not be attached to a coedge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcurveAttachmentError {
+    /// The requested loop does not exist.
+    MissingLoop(LoopId),
+    /// The coedge index is outside the loop.
+    MissingCoedge { loop_id: LoopId, index: usize },
+    /// The pcurve has a non-finite, zero-length, or otherwise invalid range.
+    InvalidPcurve,
+}
+
+impl core::fmt::Display for PcurveAttachmentError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingLoop(id) => write!(f, "cannot attach pcurve: loop {id:?} is missing"),
+            Self::MissingCoedge { loop_id, index } => write!(
+                f,
+                "cannot attach pcurve: loop {loop_id:?} has no coedge at index {index}"
+            ),
+            Self::InvalidPcurve => write!(f, "cannot attach an invalid pcurve"),
+        }
+    }
+}
+
+impl std::error::Error for PcurveAttachmentError {}
+
 impl BRepBuilder {
     /// Create an empty BRep staging builder.
     #[inline]
@@ -208,6 +237,49 @@ impl BRepBuilder {
     #[inline]
     pub fn brep_mut(&mut self) -> &mut BRep {
         &mut self.brep
+    }
+
+    /// Attach a face-specific pcurve to one coedge in a loop.
+    ///
+    /// Replacing an existing pcurve also removes the old arena entry when no
+    /// other coedge references it.
+    pub fn attach_pcurve(
+        &mut self,
+        loop_id: LoopId,
+        coedge_index: usize,
+        pcurve: PcurveData,
+    ) -> Result<PcurveId, PcurveAttachmentError> {
+        if !pcurve.is_valid() {
+            return Err(PcurveAttachmentError::InvalidPcurve);
+        }
+        let loop_data = self
+            .brep
+            .loops
+            .get(loop_id)
+            .ok_or(PcurveAttachmentError::MissingLoop(loop_id))?;
+        let old_pcurve = loop_data
+            .edges
+            .get(coedge_index)
+            .ok_or(PcurveAttachmentError::MissingCoedge {
+                loop_id,
+                index: coedge_index,
+            })?
+            .pcurve;
+
+        let pcurve_id = self.brep.pcurves.insert(pcurve);
+        self.brep.loops[loop_id].edges[coedge_index].pcurve = Some(pcurve_id);
+
+        if let Some(old_id) = old_pcurve {
+            let still_used = self.brep.loops.values().any(|data| {
+                data.edges
+                    .iter()
+                    .any(|coedge| coedge.pcurve == Some(old_id))
+            });
+            if !still_used {
+                self.brep.pcurves.remove(old_id);
+            }
+        }
+        Ok(pcurve_id)
     }
 
     /// Split an edge into two edges at a parameter `t` using an existing or new vertex `new_v`.
@@ -243,6 +315,7 @@ impl BRepBuilder {
 
         let e1_id = self.brep.edges.insert(e1_data);
         let e2_id = self.brep.edges.insert(e2_data);
+        let split_fraction = (t - orig.first) / (orig.last - orig.first);
 
         // 2. Replace the original edge in every loop with its two sub-edges, in
         //    the order that keeps that *specific* loop connected.
@@ -261,6 +334,7 @@ impl BRepBuilder {
             .filter(|(_, l)| l.edges.iter().any(|oe| oe.id == edge_id))
             .map(|(id, _)| id)
             .collect();
+        let mut replaced_pcurves = std::collections::HashSet::new();
         for lid in loop_ids {
             let old = self.brep.loops[lid].edges.clone();
             let n = old.len();
@@ -270,27 +344,48 @@ impl BRepBuilder {
                     new_edges.push(oe);
                     continue;
                 }
-                if oe.orientation == Orientation::Reversed {
-                    new_edges.push(OrientedEdge {
-                        id: e2_id,
-                        orientation: Orientation::Reversed,
-                    });
-                    new_edges.push(OrientedEdge {
-                        id: e1_id,
-                        orientation: Orientation::Reversed,
-                    });
+                let (pcurve1, pcurve2) = if let Some(pcurve_id) = oe.pcurve {
+                    let pcurve = self
+                        .brep
+                        .pcurves
+                        .get(pcurve_id)
+                        .expect("split_edge: coedge pcurve not found")
+                        .clone();
+                    let (first, second) = pcurve
+                        .split_at_fraction(split_fraction)
+                        .expect("split_edge: split parameter is outside pcurve range");
+                    replaced_pcurves.insert(pcurve_id);
+                    (
+                        Some(self.brep.pcurves.insert(first)),
+                        Some(self.brep.pcurves.insert(second)),
+                    )
                 } else {
-                    new_edges.push(OrientedEdge {
-                        id: e1_id,
-                        orientation: Orientation::Forward,
-                    });
-                    new_edges.push(OrientedEdge {
-                        id: e2_id,
-                        orientation: Orientation::Forward,
-                    });
+                    (None, None)
+                };
+                let first = OrientedEdge::new(e1_id, oe.orientation);
+                let second = OrientedEdge::new(e2_id, oe.orientation);
+                let first = pcurve1.map_or(first, |id| first.with_pcurve(id));
+                let second = pcurve2.map_or(second, |id| second.with_pcurve(id));
+                if oe.orientation == Orientation::Reversed {
+                    new_edges.push(second);
+                    new_edges.push(first);
+                } else {
+                    new_edges.push(first);
+                    new_edges.push(second);
                 }
             }
             self.brep.loops[lid].edges = new_edges;
+        }
+
+        for pcurve_id in replaced_pcurves {
+            let still_used = self.brep.loops.values().any(|data| {
+                data.edges
+                    .iter()
+                    .any(|coedge| coedge.pcurve == Some(pcurve_id))
+            });
+            if !still_used {
+                self.brep.pcurves.remove(pcurve_id);
+            }
         }
 
         // 3. Remove the original edge.
@@ -341,17 +436,11 @@ impl BRepBuilder {
         let last_split_edge = splitting_edges[splitting_edges.len() - 1];
         let (v_a, _) = get_edge_endpoints(
             &self.brep,
-            OrientedEdge {
-                id: first_split_edge,
-                orientation: Orientation::Forward,
-            },
+            OrientedEdge::new(first_split_edge, Orientation::Forward),
         );
         let (_, v_b) = get_edge_endpoints(
             &self.brep,
-            OrientedEdge {
-                id: last_split_edge,
-                orientation: Orientation::Forward,
-            },
+            OrientedEdge::new(last_split_edge, Orientation::Forward),
         );
 
         let idx_a = outer_vertices
@@ -385,18 +474,12 @@ impl BRepBuilder {
         // 3. Connect split loops using the splitting path.
         // Loop 1 needs to go from v_b back to v_a: add reversed splitting edges.
         for &e_id in splitting_edges.iter().rev() {
-            loop1_edges.push(OrientedEdge {
-                id: e_id,
-                orientation: Orientation::Reversed,
-            });
+            loop1_edges.push(OrientedEdge::new(e_id, Orientation::Reversed));
         }
 
         // Loop 2 needs to go from v_a to v_b: add forward splitting edges.
         for &e_id in splitting_edges {
-            loop2_edges.push(OrientedEdge {
-                id: e_id,
-                orientation: Orientation::Forward,
-            });
+            loop2_edges.push(OrientedEdge::new(e_id, Orientation::Forward));
         }
 
         // 4. Create new LoopIds in the BRep.
@@ -523,13 +606,7 @@ impl BRepBuilder {
             for &e_id in splitting_edges {
                 eprintln!(
                     "  split {}",
-                    edge_debug_line(
-                        &self.brep,
-                        OrientedEdge {
-                            id: e_id,
-                            orientation: Orientation::Forward,
-                        }
-                    )
+                    edge_debug_line(&self.brep, OrientedEdge::new(e_id, Orientation::Forward))
                 );
             }
         }
@@ -550,14 +627,8 @@ impl BRepBuilder {
 
         let mut half_edges = Vec::new();
         for e_id in edges_pool {
-            half_edges.push(OrientedEdge {
-                id: e_id,
-                orientation: Orientation::Forward,
-            });
-            half_edges.push(OrientedEdge {
-                id: e_id,
-                orientation: Orientation::Reversed,
-            });
+            half_edges.push(OrientedEdge::new(e_id, Orientation::Forward));
+            half_edges.push(OrientedEdge::new(e_id, Orientation::Reversed));
         }
 
         // 2. Build adjacency mapping of outgoing half-edges from each vertex.
@@ -678,6 +749,7 @@ impl BRepBuilder {
                 let opp = OrientedEdge {
                     id: curr_he.id,
                     orientation: curr_he.orientation.reversed(),
+                    pcurve: curr_he.pcurve,
                 };
 
                 // Find the index of opp in the sorted outgoing list at end_v.
@@ -987,8 +1059,9 @@ mod tests {
     use crate::edge::Edge;
     use crate::face::Face;
     use crate::wire::Wire;
-    use openrcad_foundation::Pnt;
+    use openrcad_foundation::{Dir2d, Pnt, Pnt2d};
     use openrcad_geom::{GeomSurface, Plane};
+    use openrcad_geom2d::{GeomCurve2d, Line2d};
 
     #[test]
     fn ordered_clamp_accepts_reversed_surface_bounds() {
@@ -1034,6 +1107,39 @@ mod tests {
     }
 
     #[test]
+    fn split_edge_splits_each_coedges_independent_pcurve_range() {
+        let edge = Edge::between_points(Pnt::origin(), Pnt::new(10.0, 0.0, 0.0));
+        let face = Face::new(None, Wire::from_edges([edge]));
+        let mut builder = BRepBuilder::from_brep((*face.brep).clone());
+        let edge_id = builder.brep.edges.keys().next().unwrap();
+        let loop_id = builder.brep.loops.keys().next().unwrap();
+        let old_pcurve = builder
+            .attach_pcurve(
+                loop_id,
+                0,
+                PcurveData::new(
+                    GeomCurve2d::line(Line2d::from_point_dir(Pnt2d::origin(), Dir2d::dx())),
+                    20.0,
+                    40.0,
+                ),
+            )
+            .unwrap();
+        let middle = builder.brep.vertices.insert(crate::arena::VertexData {
+            point: Pnt::new(2.5, 0.0, 0.0),
+            tolerance: openrcad_foundation::tolerance::CONFUSION,
+        });
+
+        builder.split_edge(edge_id, middle, 2.5);
+
+        let coedges = &builder.brep.loops[loop_id].edges;
+        let first = &builder.brep.pcurves[coedges[0].pcurve.unwrap()];
+        let second = &builder.brep.pcurves[coedges[1].pcurve.unwrap()];
+        assert_eq!((first.first, first.last), (20.0, 25.0));
+        assert_eq!((second.first, second.last), (25.0, 40.0));
+        assert!(!builder.brep.pcurves.contains_key(old_pcurve));
+    }
+
+    #[test]
     fn split_edge_keeps_both_loops_contiguous_across_a_shared_seam() {
         // A single edge `e` (a -> b) shared by two triangular loops, used in
         // OPPOSITE senses: Forward in loop1 (a,b,c), Reversed in loop2 (b,a,d).
@@ -1071,14 +1177,8 @@ mod tests {
         let ad = mk_e(&mut brep, a, d);
         let db = mk_e(&mut brep, d, b);
 
-        let fwd = |id| OrientedEdge {
-            id,
-            orientation: Orientation::Forward,
-        };
-        let rev = |id| OrientedEdge {
-            id,
-            orientation: Orientation::Reversed,
-        };
+        let fwd = |id| OrientedEdge::new(id, Orientation::Forward);
+        let rev = |id| OrientedEdge::new(id, Orientation::Reversed);
         let loop1 = brep.loops.insert(LoopData {
             edges: vec![fwd(e), fwd(bc), fwd(ca)],
         });

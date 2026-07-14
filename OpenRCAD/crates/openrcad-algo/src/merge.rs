@@ -20,28 +20,24 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openrcad_foundation::{Pnt, Vec as FVec};
+use openrcad_foundation::{Pnt, TolerancePolicy, Vec as FVec};
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Line};
 use openrcad_topo::arena::{
     BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, ShellData, VertexId,
 };
 use openrcad_topo::{BRepBuilder, Orientation, Shell, Solid};
 
-/// Quantization used by the boolean-healing/merge passes. This matches the
-/// boolean solver's 1e-5 modeling tolerance: independently sewn copies of one
-/// seam may differ by a few floating-point ulps but still represent one edge.
-const MERGE_GRID: f64 = 1.0e5;
-
 /// A point quantized to the merge tolerance so coincident positions compare equal.
 type QPoint = (i64, i64, i64);
 /// Five ordered curve samples, canonicalized against traversal reversal.
 type EdgeGeomKey = (QPoint, QPoint, QPoint, QPoint, QPoint);
 
-fn quantize(p: &Pnt) -> QPoint {
+fn quantize(p: &Pnt, policy: &TolerancePolicy) -> QPoint {
+    let grid = 1.0 / policy.intersection;
     (
-        (p.x() * MERGE_GRID).round() as i64,
-        (p.y() * MERGE_GRID).round() as i64,
-        (p.z() * MERGE_GRID).round() as i64,
+        (p.x() * grid).round() as i64,
+        (p.y() * grid).round() as i64,
+        (p.z() * grid).round() as i64,
     )
 }
 
@@ -50,7 +46,7 @@ fn quantize(p: &Pnt) -> QPoint {
 /// Returns a solid with the merge applied when it is watertight, healthy, and has
 /// strictly fewer faces; otherwise returns `solid` unchanged.
 pub fn merge_coplanar_faces(solid: &Solid) -> Solid {
-    merge_coplanar_faces_classed(solid, None)
+    merge_coplanar_faces_classed_with_policy(solid, None, &TolerancePolicy::STANDARD)
 }
 
 /// [`merge_coplanar_faces`] with **owner classes**: faces carrying different
@@ -62,11 +58,20 @@ pub fn merge_coplanar_faces_classed(
     solid: &Solid,
     classes: Option<&HashMap<FaceId, u64>>,
 ) -> Solid {
+    merge_coplanar_faces_classed_with_policy(solid, classes, &TolerancePolicy::STANDARD)
+}
+
+/// Policy-aware [`merge_coplanar_faces_classed`].
+pub fn merge_coplanar_faces_classed_with_policy(
+    solid: &Solid,
+    classes: Option<&HashMap<FaceId, u64>>,
+    policy: &TolerancePolicy,
+) -> Solid {
     let mut brep = (**solid.brep()).clone();
     let mut face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
     let original_count = face_ids.len();
 
-    do_merge(&mut brep, &mut face_ids, classes);
+    do_merge(&mut brep, &mut face_ids, classes, policy);
 
     if face_ids.len() >= original_count {
         return solid.clone();
@@ -82,7 +87,9 @@ pub fn merge_coplanar_faces_classed(
     let shell_id = brep.shells.insert(ShellData { faces: face_ids });
     let merged = Solid::new(Shell::from_id(Arc::new(brep), shell_id));
 
-    if merged.is_watertight() && merged.health_report().is_healthy() {
+    if merged.is_watertight_with_policy(policy)
+        && merged.health_report_with_policy(policy).is_healthy()
+    {
         merged
     } else {
         solid.clone()
@@ -102,7 +109,7 @@ pub fn merge_coplanar_faces_classed(
 /// fewer faces; otherwise returns `solid` unchanged — so it can only ever improve a
 /// boolean result.
 pub fn merge_cocylindrical_faces(solid: &Solid) -> Solid {
-    merge_cocylindrical_faces_classed(solid, None)
+    merge_cocylindrical_faces_classed_with_policy(solid, None, &TolerancePolicy::STANDARD)
 }
 
 /// [`merge_cocylindrical_faces`] with owner classes — see
@@ -111,11 +118,20 @@ pub fn merge_cocylindrical_faces_classed(
     solid: &Solid,
     classes: Option<&HashMap<FaceId, u64>>,
 ) -> Solid {
+    merge_cocylindrical_faces_classed_with_policy(solid, classes, &TolerancePolicy::STANDARD)
+}
+
+/// Policy-aware [`merge_cocylindrical_faces_classed`].
+pub fn merge_cocylindrical_faces_classed_with_policy(
+    solid: &Solid,
+    classes: Option<&HashMap<FaceId, u64>>,
+    policy: &TolerancePolicy,
+) -> Solid {
     let mut brep = (**solid.brep()).clone();
     let mut face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
     let original_count = face_ids.len();
 
-    do_merge_cocylindrical(&mut brep, &mut face_ids, classes);
+    do_merge_cocylindrical(&mut brep, &mut face_ids, classes, policy);
 
     if face_ids.len() >= original_count {
         return solid.clone();
@@ -129,7 +145,9 @@ pub fn merge_cocylindrical_faces_classed(
     let shell_id = brep.shells.insert(ShellData { faces: face_ids });
     let merged = Solid::new(Shell::from_id(Arc::new(brep), shell_id));
 
-    if merged.is_watertight() && merged.health_report().is_healthy() {
+    if merged.is_watertight_with_policy(policy)
+        && merged.health_report_with_policy(policy).is_healthy()
+    {
         merged
     } else {
         solid.clone()
@@ -150,9 +168,18 @@ pub fn merge_cocylindrical_faces_classed(
 /// Safety-gated like the merges: returned only when it makes the solid watertight
 /// and healthy; otherwise the input is returned unchanged, so it can only help.
 pub fn heal_tjunctions(solid: &Solid, tol: f64) -> Solid {
+    heal_tjunctions_impl(solid, tol, &TolerancePolicy::STANDARD)
+}
+
+/// Heal T-junctions using the sewing and validation tolerances from `policy`.
+pub fn heal_tjunctions_with_policy(solid: &Solid, policy: &TolerancePolicy) -> Solid {
+    heal_tjunctions_impl(solid, policy.sewing, policy)
+}
+
+fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> Solid {
     // Only relevant when the shell is open; a watertight solid has no T-junctions
     // to heal, and re-running the scan would be wasted work on every boolean.
-    if solid.is_watertight() {
+    if solid.is_watertight_with_policy(policy) {
         return solid.clone();
     }
 
@@ -225,7 +252,9 @@ pub fn heal_tjunctions(solid: &Solid, tol: f64) -> Solid {
         .insert(ShellData { faces: face_ids });
     let healed = Solid::new(Shell::from_id(builder.build(), shell_id));
 
-    if healed.is_watertight() && healed.health_report().is_healthy() {
+    if healed.is_watertight_with_policy(policy)
+        && healed.health_report_with_policy(policy).is_healthy()
+    {
         healed
     } else {
         solid.clone()
@@ -238,8 +267,10 @@ fn do_merge_cocylindrical(
     brep: &mut BRep,
     face_ids: &mut Vec<FaceId>,
     classes: Option<&HashMap<FaceId, u64>>,
+    policy: &TolerancePolicy,
 ) {
-    let qf = |x: f64| (x * 1.0e6).round() as i64;
+    let grid = 1.0 / policy.approximation;
+    let qf = |x: f64| (x * grid).round() as i64;
     // (axis location, axis direction, radius, orientation side, owner class).
     type CylKey = (i64, i64, i64, i64, i64, i64, i64, u8, Option<u64>);
     let mut groups: HashMap<CylKey, Vec<FaceId>> = HashMap::new();
@@ -286,7 +317,7 @@ fn do_merge_cocylindrical(
             result.extend(members);
             continue;
         }
-        match try_merge_cyl_group(brep, &members) {
+        match try_merge_cyl_group(brep, &members, policy) {
             Some(new_faces) => result.extend(new_faces),
             None => result.extend(members),
         }
@@ -298,7 +329,11 @@ fn do_merge_cocylindrical(
 /// boundary into a single loop, and rebuild one face. Returns `None` (keep the
 /// originals) for anything but the clean, single-loop, non-periodic case — the
 /// safety gate in the caller absorbs anything this conservatively skips.
-fn try_merge_cyl_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
+fn try_merge_cyl_group(
+    brep: &mut BRep,
+    members: &[FaceId],
+    policy: &TolerancePolicy,
+) -> Option<Vec<FaceId>> {
     let rep = brep.faces.get(members[0])?.clone();
 
     // 1. Count co-edge usage across member loops; an edge used twice is the shared
@@ -331,7 +366,7 @@ fn try_merge_cyl_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId
 
     // 2. Re-trace the boundary into closed loops; require exactly one (a partial
     //    cut wall). Holes / multi-loop cases are left to the safety gate.
-    let loops = retrace_loops(brep, &boundary)?;
+    let loops = retrace_loops(brep, &boundary, policy)?;
     if loops.len() != 1 {
         return None;
     }
@@ -357,10 +392,16 @@ fn try_merge_cyl_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId
 
 /// Group planar faces by support plane + outward side, merge each group, and
 /// rewrite `face_ids` with the merged faces (curved/lone faces pass through).
-fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>, classes: Option<&HashMap<FaceId, u64>>) {
+fn do_merge(
+    brep: &mut BRep,
+    face_ids: &mut Vec<FaceId>,
+    classes: Option<&HashMap<FaceId, u64>>,
+    policy: &TolerancePolicy,
+) {
     // Key a face by its effective outward normal, signed plane offset, and
     // owner class (different owners must never merge; None = wildcard group).
-    let qf = |x: f64| (x * MERGE_GRID).round() as i64;
+    let grid = 1.0 / policy.intersection;
+    let qf = |x: f64| (x * grid).round() as i64;
     let mut groups: HashMap<(i64, i64, i64, i64, Option<u64>), Vec<FaceId>> = HashMap::new();
     let mut passthrough: Vec<FaceId> = Vec::new();
 
@@ -401,7 +442,7 @@ fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>, classes: Option<&HashMa
         // Merge each connected island independently. A malformed or merely
         // disjoint face elsewhere on the same support plane must not prevent a
         // valid adjacent island from consolidating.
-        let Some(components) = planar_face_components(brep, &members) else {
+        let Some(components) = planar_face_components(brep, &members, policy) else {
             result.extend(members);
             continue;
         };
@@ -410,7 +451,7 @@ fn do_merge(brep: &mut BRep, face_ids: &mut Vec<FaceId>, classes: Option<&HashMa
                 result.extend(component);
                 continue;
             }
-            match try_merge_group(brep, &component) {
+            match try_merge_group(brep, &component, policy) {
                 Some(new_faces) => result.extend(new_faces),
                 None => result.extend(component),
             }
@@ -599,6 +640,7 @@ fn apply_collinear_merge(
             } else {
                 Orientation::Reversed
             },
+            pcurve: None,
         };
         let new_edges: Vec<OrientedEdge> = (0..n)
             .filter_map(|k| {
@@ -650,7 +692,7 @@ fn oriented_points(brep: &BRep, oe: &OrientedEdge) -> Option<(Pnt, Pnt)> {
 /// Orientation-independent geometric identity for an edge span. Five samples
 /// distinguish curved alternatives sharing endpoints (semicircles, periodic
 /// arcs) and tolerate separate but coincident B-Rep edge copies.
-fn edge_geom_key(brep: &BRep, id: EdgeId) -> Option<EdgeGeomKey> {
+fn edge_geom_key(brep: &BRep, id: EdgeId, policy: &TolerancePolicy) -> Option<EdgeGeomKey> {
     let edge = brep.edges.get(id)?;
     let (start, end) = edge_endpoints(brep, id)?;
     let point_at = |fraction: f64| {
@@ -665,11 +707,11 @@ fn edge_geom_key(brep: &BRep, id: EdgeId) -> Option<EdgeGeomKey> {
             |curve| curve.point(edge.first + (edge.last - edge.first) * fraction),
         )
     };
-    let a = quantize(&start);
-    let q1 = quantize(&point_at(0.25));
-    let q2 = quantize(&point_at(0.5));
-    let q3 = quantize(&point_at(0.75));
-    let b = quantize(&end);
+    let a = quantize(&start, policy);
+    let q1 = quantize(&point_at(0.25), policy);
+    let q2 = quantize(&point_at(0.5), policy);
+    let q3 = quantize(&point_at(0.75), policy);
+    let b = quantize(&end, policy);
     let forward = (a, q1, q2, q3, b);
     let reverse = (b, q3, q2, q1, a);
     Some(forward.min(reverse))
@@ -678,7 +720,11 @@ fn edge_geom_key(brep: &BRep, id: EdgeId) -> Option<EdgeGeomKey> {
 /// Partition same-plane faces into islands connected by coincident boundary
 /// spans. This makes merging local: one bad island falls back without blocking
 /// every other valid merge on that plane.
-fn planar_face_components(brep: &BRep, members: &[FaceId]) -> Option<Vec<Vec<FaceId>>> {
+fn planar_face_components(
+    brep: &BRep,
+    members: &[FaceId],
+    policy: &TolerancePolicy,
+) -> Option<Vec<Vec<FaceId>>> {
     fn root(parent: &mut [usize], mut index: usize) -> usize {
         while parent[index] != index {
             parent[index] = parent[parent[index]];
@@ -699,7 +745,7 @@ fn planar_face_components(brep: &BRep, members: &[FaceId]) -> Option<Vec<Vec<Fac
         let mut face_keys = std::collections::HashSet::new();
         for wire in wires {
             for edge in &brep.loops.get(wire)?.edges {
-                face_keys.insert(edge_geom_key(brep, edge.id)?);
+                face_keys.insert(edge_geom_key(brep, edge.id, policy)?);
             }
         }
         for key in face_keys {
@@ -727,7 +773,11 @@ fn planar_face_components(brep: &BRep, members: &[FaceId]) -> Option<Vec<Vec<Fac
 
 /// Attempt to merge one coplanar group. Returns the merged face id(s), or `None`
 /// if the boundary cannot be cleanly re-traced (caller keeps the originals).
-fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
+fn try_merge_group(
+    brep: &mut BRep,
+    members: &[FaceId],
+    policy: &TolerancePolicy,
+) -> Option<Vec<FaceId>> {
     let rep = brep.faces.get(members[0])?.clone();
     let GeomSurface::Plane(plane) = rep.surface.as_ref()? else {
         return None;
@@ -754,14 +804,15 @@ fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
                     let oe = OrientedEdge {
                         id: oe.id,
                         orientation: oe.orientation.reversed(),
+                        pcurve: oe.pcurve,
                     };
-                    let key = edge_geom_key(brep, oe.id)?;
+                    let key = edge_geom_key(brep, oe.id, policy)?;
                     *count.entry(key).or_insert(0) += 1;
                     all.push((oe, key));
                 }
             } else {
                 for &oe in &l.edges {
-                    let key = edge_geom_key(brep, oe.id)?;
+                    let key = edge_geom_key(brep, oe.id, policy)?;
                     *count.entry(key).or_insert(0) += 1;
                     all.push((oe, key));
                 }
@@ -777,7 +828,7 @@ fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
     }
 
     // 2. Re-trace the boundary co-edges into closed loops.
-    let loops = retrace_loops(brep, &boundary)?;
+    let loops = retrace_loops(brep, &boundary, policy)?;
 
     // 3. Project each loop to the plane's UV and classify outer-vs-hole by
     //    containment nesting (frame-independent: a box plane's Ax3 can be
@@ -870,13 +921,17 @@ fn try_merge_group(brep: &mut BRep, members: &[FaceId]) -> Option<Vec<FaceId>> {
 /// co-edge's traversal-end to the next's traversal-start (matched by quantized
 /// position). Returns `None` if the boundary is not a disjoint union of simple
 /// cycles (a vertex with more than one outgoing co-edge, or an open chain).
-fn retrace_loops(brep: &BRep, oedges: &[OrientedEdge]) -> Option<Vec<Vec<OrientedEdge>>> {
+fn retrace_loops(
+    brep: &BRep,
+    oedges: &[OrientedEdge],
+    policy: &TolerancePolicy,
+) -> Option<Vec<Vec<OrientedEdge>>> {
     let n = oedges.len();
     let mut ends: Vec<(QPoint, QPoint)> = Vec::with_capacity(n);
     let mut by_start: HashMap<QPoint, Vec<usize>> = HashMap::new();
     for (i, oe) in oedges.iter().enumerate() {
         let (s, e) = oriented_points(brep, oe)?;
-        let (qs, qe) = (quantize(&s), quantize(&e));
+        let (qs, qe) = (quantize(&s, policy), quantize(&e, policy));
         ends.push((qs, qe));
         by_start.entry(qs).or_default().push(i);
     }

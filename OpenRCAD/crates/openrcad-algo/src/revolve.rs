@@ -17,18 +17,27 @@
 use core::f64::consts::{PI, TAU};
 use core::fmt;
 
-use openrcad_foundation::{tolerance, Ax1, Ax3, Dir, Pnt, Trsf, Vec as GeomVec};
+use openrcad_foundation::{
+    tolerance, Ax1, Ax3, Dir, Pnt, TolerancePolicy, TolerancePolicyError, Trsf, Vec as GeomVec,
+};
 use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane,
     SphericalSurface, ToroidalSurface,
 };
-use openrcad_topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
+use openrcad_topo::{
+    Edge, Face, HealthReport, OperationResult, Orientation, PcurveBuildError, RecoveryAction,
+    RecoveryReport, Solid, TopologyHistory, ValidationReport, Vertex, Wire,
+};
 
 use crate::sew::sew;
 
 /// Errors reported by [`revolve`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RevolveError {
+    /// The supplied document tolerance policy is invalid.
+    InvalidTolerancePolicy(TolerancePolicyError),
+    /// A face-local pcurve could not be constructed consistently.
+    PcurveBuild(PcurveBuildError),
     /// The angle is not in `(0, 2π]`.
     InvalidAngle,
     /// The source face has no outer boundary.
@@ -44,11 +53,21 @@ pub enum RevolveError {
     /// A profile boundary curve has no analytic surface of revolution
     /// (ellipse/B-spline profiles are not supported yet).
     UnsupportedProfileCurve,
+    /// The revolution assembled a solid that failed the representation gate.
+    InvalidOutput {
+        report: HealthReport,
+        watertight: bool,
+        pcurves_complete: bool,
+    },
 }
 
 impl fmt::Display for RevolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidTolerancePolicy(error) => {
+                write!(f, "revolve: invalid tolerance policy: {error}")
+            }
+            Self::PcurveBuild(error) => write!(f, "revolve: pcurve construction failed: {error}"),
             Self::InvalidAngle => f.write_str("revolve: angle must be in (0, 2π]"),
             Self::MissingOuterWire => f.write_str("revolve: source face has no outer wire"),
             Self::OpenWire => f.write_str("revolve: every profile wire must be closed"),
@@ -62,6 +81,14 @@ impl fmt::Display for RevolveError {
             Self::UnsupportedProfileCurve => f.write_str(
                 "revolve: only line and circular-arc profile edges are supported (no splines yet)",
             ),
+            Self::InvalidOutput {
+                report,
+                watertight,
+                pcurves_complete,
+            } => write!(
+                f,
+                "revolve: invalid output (watertight={watertight}, pcurves_complete={pcurves_complete}): {report:?}"
+            ),
         }
     }
 }
@@ -70,7 +97,7 @@ impl std::error::Error for RevolveError {}
 
 /// Revolve `face` by `angle` radians about the axis through `axis_point`
 /// along `axis_dir`, and return a sewn solid.
-pub fn revolve(
+fn build_revolve(
     face: &Face,
     axis_point: Pnt,
     axis_dir: Dir,
@@ -201,6 +228,75 @@ pub fn revolve(
     }
 
     Ok(Solid::new(sew(&faces, tolerance::CONFUSION * 10.0)))
+}
+
+/// Revolve a planar profile and return the solid with its complete Phase 1
+/// operation metadata.
+pub fn revolve_operation(
+    face: &Face,
+    axis_point: Pnt,
+    axis_dir: Dir,
+    angle: f64,
+) -> Result<OperationResult<Solid>, RevolveError> {
+    revolve_operation_with_policy(
+        face,
+        axis_point,
+        axis_dir,
+        angle,
+        &TolerancePolicy::STANDARD,
+    )
+}
+
+/// Policy-aware canonical revolution operation.
+pub fn revolve_operation_with_policy(
+    face: &Face,
+    axis_point: Pnt,
+    axis_dir: Dir,
+    angle: f64,
+    policy: &TolerancePolicy,
+) -> Result<OperationResult<Solid>, RevolveError> {
+    policy
+        .validate()
+        .map_err(RevolveError::InvalidTolerancePolicy)?;
+    let solid = build_revolve(face, axis_point, axis_dir, angle)?;
+    let (solid, reconstructed) = solid
+        .repair_pcurves(policy)
+        .map_err(RevolveError::PcurveBuild)?;
+    let validation = ValidationReport::for_solid(&solid, policy);
+    if !validation.is_valid() || solid.validate_strict_with_policy(policy).is_err() {
+        return Err(RevolveError::InvalidOutput {
+            report: validation.health,
+            watertight: validation.watertight,
+            pcurves_complete: validation.pcurves_complete,
+        });
+    }
+    let mut recovery = RecoveryReport::default();
+    if reconstructed > 0 {
+        recovery
+            .actions
+            .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
+    }
+    let history = TopologyHistory::generated_solid(&solid);
+    Ok(OperationResult {
+        value: solid,
+        history,
+        diagnostics: Vec::new(),
+        recovery,
+        validation,
+    })
+}
+
+/// Compatibility revolution wrapper.
+///
+/// This delegates to [`revolve_operation`] and discards operation metadata.
+#[deprecated(note = "use revolve_operation; this wrapper discards operation metadata")]
+pub fn revolve(
+    face: &Face,
+    axis_point: Pnt,
+    axis_dir: Dir,
+    angle: f64,
+) -> Result<Solid, RevolveError> {
+    revolve_operation(face, axis_point, axis_dir, angle).map(|result| result.value)
 }
 
 fn plane_point(plane: &Plane) -> Pnt {

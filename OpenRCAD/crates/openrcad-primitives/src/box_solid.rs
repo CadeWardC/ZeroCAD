@@ -7,8 +7,10 @@
 //! enforce normal agreement.
 
 use openrcad_foundation::{Dir, Pnt};
-use openrcad_geom::{GeomSurface, Plane};
+use openrcad_geom::GeomSurface;
 use openrcad_topo::{Edge, Face, Shell, Solid, Wire};
+
+use crate::common::{planar_face, plane_at};
 
 /// Build an axis-aligned box with one corner at `corner` and extents `dx`, `dy`,
 /// `dz` along +X, +Y, +Z.
@@ -26,7 +28,7 @@ use openrcad_topo::{Edge, Face, Shell, Solid, Wire};
 /// // A closed box satisfies Euler–Poincaré: V − E + F = 2.
 /// assert_eq!(b.euler_characteristic(), 2);
 /// ```
-pub fn make_box(corner: &Pnt, dx: f64, dy: f64, dz: f64) -> Solid {
+pub(crate) fn build_box(corner: &Pnt, dx: f64, dy: f64, dz: f64) -> Solid {
     assert!(dx > 0.0, "make_box: dx must be positive");
     assert!(dy > 0.0, "make_box: dy must be positive");
     assert!(dz > 0.0, "make_box: dz must be positive");
@@ -80,18 +82,17 @@ fn rect_face(a: Pnt, b: Pnt, c: Pnt, d: Pnt, surf: GeomSurface) -> Face {
         Edge::between_points(c, d),
         Edge::between_points(d, a),
     ]);
-    Face::new(Some(surf), wire)
-}
-
-/// A plane through `p` with outward normal `n`.
-fn plane_at(p: Pnt, n: Dir) -> GeomSurface {
-    GeomSurface::plane(Plane::from_point_normal(p, n))
+    planar_face(surf, wire)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use openrcad_foundation::{Ax1, Trsf};
+
+    fn make_box(corner: &Pnt, dx: f64, dy: f64, dz: f64) -> Solid {
+        crate::make_box_operation(corner, dx, dy, dz).unwrap().value
+    }
 
     #[test]
     fn box_topology_counts() {

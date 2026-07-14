@@ -12,7 +12,7 @@ use openrcad_geom::{
     GregorySurface, Plane, RuledSurface, SphericalSurface, Surface, ToroidalSurface,
 };
 use openrcad_mesh::tessellate;
-use openrcad_primitives::make_cylinder;
+use openrcad_primitives::make_cylinder_operation;
 use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
 
 use crate::sew::sew;
@@ -745,11 +745,13 @@ fn accept_subtractive_blend_result(
         let dir = axis.direction();
         let base = axis.location() + GeomVec::from_dir(dir) * (guard.v_min - 0.25);
         let cutter_axis = Ax2::new_axes(base, dir, axis.x_direction());
-        let cutter = make_cylinder(
+        let cutter = make_cylinder_operation(
             &cutter_axis,
             guard.cyl.radius(),
             (guard.v_max - guard.v_min).abs() + 0.5,
-        );
+        )
+        .ok()?
+        .value;
         clipped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::boolean_checked(&clipped, &cutter, crate::BooleanOp::Cut)
         }))

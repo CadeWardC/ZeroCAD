@@ -473,10 +473,7 @@ fn cut_hole(
 
     let inner_edges: Vec<_> = arc_ids
         .iter()
-        .map(|&id| OrientedEdge {
-            id,
-            orientation: Orientation::Forward,
-        })
+        .map(|&id| OrientedEdge::new(id, Orientation::Forward))
         .collect();
     let disk_edges: Vec<_> = inner_edges
         .iter()
@@ -484,6 +481,7 @@ fn cut_hole(
         .map(|oe| OrientedEdge {
             id: oe.id,
             orientation: oe.orientation.reversed(),
+            pcurve: oe.pcurve,
         })
         .collect();
 

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::arena::{BRep, LoopData, LoopId, OrientedEdge};
 use crate::edge::Edge;
+use crate::pcurve::PcurveData;
 
 /// An ordered list of [`Edge`]s forming a path or a loop.
 #[derive(Clone, Debug)]
@@ -20,6 +21,18 @@ pub struct Wire {
 }
 
 impl Wire {
+    /// Get the loop ID in the arena.
+    #[inline]
+    pub fn id(&self) -> LoopId {
+        self.id
+    }
+
+    /// Get the underlying B-Rep storage.
+    #[inline]
+    pub fn brep(&self) -> &Arc<BRep> {
+        &self.brep
+    }
+
     /// A wire from an ordered list of edges.
     #[inline]
     pub fn new(edges: Vec<Edge>) -> Self {
@@ -40,10 +53,7 @@ impl Wire {
 
             // The edge is stored once in its natural sense; this *use* of it in the
             // loop carries the traversal orientation (the single source of truth).
-            new_edges.push(OrientedEdge {
-                id: new_edge_id,
-                orientation: edge.orientation,
-            });
+            new_edges.push(OrientedEdge::new(new_edge_id, edge.orientation));
         }
         let id = brep.loops.insert(LoopData { edges: new_edges });
         Self {
@@ -65,6 +75,19 @@ impl Wire {
                 orientation: oe.orientation,
             })
             .collect()
+    }
+
+    /// Face-specific pcurve attached to the coedge at `edge_index`.
+    #[inline]
+    pub fn pcurve(&self, edge_index: usize) -> Option<&PcurveData> {
+        let pcurve_id = self
+            .brep
+            .loops
+            .get(self.id)?
+            .edges
+            .get(edge_index)?
+            .pcurve?;
+        self.brep.pcurves.get(pcurve_id)
     }
 
     /// Number of edges.

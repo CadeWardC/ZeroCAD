@@ -92,10 +92,7 @@ pub fn mev(
         tolerance: openrcad_foundation::tolerance::CONFUSION,
     });
     if let Some(l) = builder.brep_mut().loops.get_mut(loop_id) {
-        l.edges.push(OrientedEdge {
-            id: e,
-            orientation: Orientation::Forward,
-        });
+        l.edges.push(OrientedEdge::new(e, Orientation::Forward));
     }
     (v_new, e)
 }
@@ -170,14 +167,8 @@ pub fn mef(
     });
 
     // The connecting edge closes both loops (shared id — see module docs).
-    path_a.push(OrientedEdge {
-        id: e,
-        orientation: Orientation::Reversed,
-    });
-    path_b.push(OrientedEdge {
-        id: e,
-        orientation: Orientation::Forward,
-    });
+    path_a.push(OrientedEdge::new(e, Orientation::Reversed));
+    path_b.push(OrientedEdge::new(e, Orientation::Forward));
     let loop1_id = builder.brep_mut().loops.insert(LoopData { edges: path_a });
     let loop2_id = builder.brep_mut().loops.insert(LoopData { edges: path_b });
 

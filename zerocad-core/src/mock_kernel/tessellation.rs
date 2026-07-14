@@ -595,7 +595,7 @@ pub(crate) fn solid_to_flat_mesh_with_cancel(
     // vertex copy belongs to a single triangle, so the per-vertex→face mapping
     // `smooth_vertex_normals` relies on holds.
     let (chord, angle) = active_tess_budget();
-    let mesh = openrcad::mesh::tessellate_with_cancel(solid, chord, angle, cancel)?;
+    let mesh = openrcad::mesh::tessellate_for_display_with_cancel(solid, chord, angle, cancel)?;
     let gpu = mesh.gpu_mesh();
 
     let vcount = gpu.positions.len() / 3;

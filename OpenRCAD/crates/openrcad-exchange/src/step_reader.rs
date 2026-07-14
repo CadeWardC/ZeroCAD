@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 
-use openrcad_foundation::{Ax2, Ax3, Dir, Pnt};
-use openrcad_geom::{BSplineCurve, BSplineSurface, Curve, GeomCurve, GeomSurface};
+use openrcad_foundation::{Ax2, Ax22d, Ax3, Dir, Dir2d, Pnt, Pnt2d};
+use openrcad_geom::{BSplineCurve, BSplineSurface, Curve, GeomCurve, GeomSurface, Surface};
+use openrcad_geom2d::{BSplineCurve2d, Circle2d, Curve2d, Ellipse2d, GeomCurve2d, Line2d};
 use openrcad_topo::{
     arena::{BRep, EdgeData, FaceData, LoopData, OrientedEdge, ShellData, SolidData, VertexData},
     orientation::Orientation,
-    Solid,
+    PcurveData, Solid, SurfacePeriodicity,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -534,10 +535,330 @@ fn parse_axis2(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<Ax3, Stri
     }
 }
 
+fn step_number(value: &StepValue) -> Option<f64> {
+    match value {
+        StepValue::Real(value) => Some(*value),
+        StepValue::Integer(value) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn parse_point2d(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<Pnt2d, String> {
+    let ent = entities
+        .get(&id)
+        .ok_or_else(|| format!("2D point entity #{id} not found"))?;
+    match ent {
+        StepEntity::Simple { name, args } if name == "CARTESIAN_POINT" => {
+            let coordinates = match args.get(1) {
+                Some(StepValue::List(values)) if values.len() >= 2 => values,
+                _ => return Err(format!("invalid 2D CARTESIAN_POINT #{id}")),
+            };
+            let x = step_number(&coordinates[0])
+                .ok_or_else(|| format!("invalid X coordinate in 2D point #{id}"))?;
+            let y = step_number(&coordinates[1])
+                .ok_or_else(|| format!("invalid Y coordinate in 2D point #{id}"))?;
+            Ok(Pnt2d::new(x, y))
+        }
+        _ => Err(format!("expected 2D CARTESIAN_POINT at #{id}")),
+    }
+}
+
+fn parse_dir2d(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<Dir2d, String> {
+    let ent = entities
+        .get(&id)
+        .ok_or_else(|| format!("2D direction entity #{id} not found"))?;
+    match ent {
+        StepEntity::Simple { name, args } if name == "DIRECTION" => {
+            let coordinates = match args.get(1) {
+                Some(StepValue::List(values)) if values.len() >= 2 => values,
+                _ => return Err(format!("invalid 2D DIRECTION #{id}")),
+            };
+            let x = step_number(&coordinates[0])
+                .ok_or_else(|| format!("invalid X coordinate in 2D direction #{id}"))?;
+            let y = step_number(&coordinates[1])
+                .ok_or_else(|| format!("invalid Y coordinate in 2D direction #{id}"))?;
+            Ok(Dir2d::new(x, y))
+        }
+        _ => Err(format!("expected 2D DIRECTION at #{id}")),
+    }
+}
+
+fn parse_vector2d(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<Dir2d, String> {
+    let ent = entities
+        .get(&id)
+        .ok_or_else(|| format!("2D vector entity #{id} not found"))?;
+    match ent {
+        StepEntity::Simple { name, args } if name == "VECTOR" => match args.get(1) {
+            Some(StepValue::Ref(direction)) => parse_dir2d(*direction, entities),
+            _ => Err(format!("invalid 2D VECTOR #{id}")),
+        },
+        _ => Err(format!("expected 2D VECTOR at #{id}")),
+    }
+}
+
+fn parse_axis22d(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<Ax22d, String> {
+    let ent = entities
+        .get(&id)
+        .ok_or_else(|| format!("2D axis entity #{id} not found"))?;
+    match ent {
+        StepEntity::Simple { name, args } if name == "AXIS2_PLACEMENT_2D" => {
+            let location = match args.get(1) {
+                Some(StepValue::Ref(point)) => parse_point2d(*point, entities)?,
+                _ => return Err(format!("invalid 2D axis location #{id}")),
+            };
+            let direction = match args.get(2) {
+                Some(StepValue::Ref(direction)) => parse_dir2d(*direction, entities)?,
+                _ => Dir2d::dx(),
+            };
+            Ok(Ax22d::new(location, direction))
+        }
+        _ => Err(format!("expected AXIS2_PLACEMENT_2D at #{id}")),
+    }
+}
+
+fn parse_bspline_curve2d(
+    degree: usize,
+    poles_values: &[StepValue],
+    multiplicity_values: &[StepValue],
+    knot_values: &[StepValue],
+    weight_values: Option<&[StepValue]>,
+    entities: &HashMap<u32, StepEntity>,
+) -> Result<GeomCurve2d, String> {
+    let poles = poles_values
+        .iter()
+        .map(|value| match value {
+            StepValue::Ref(id) => parse_point2d(*id, entities),
+            _ => Err("invalid 2D B-spline pole".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let multiplicities = multiplicity_values
+        .iter()
+        .map(|value| match value {
+            StepValue::Integer(value) if *value > 0 => Ok(*value as usize),
+            _ => Err("invalid 2D B-spline multiplicity".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let knots = knot_values
+        .iter()
+        .map(|value| step_number(value).ok_or_else(|| "invalid 2D B-spline knot".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let weights = weight_values
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    step_number(value).ok_or_else(|| "invalid 2D B-spline weight".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    if degree == 0
+        || degree > poles.len()
+        || poles.is_empty()
+        || knots.len() != multiplicities.len()
+        || multiplicities.iter().sum::<usize>() != poles.len() + degree + 1
+        || weights
+            .as_ref()
+            .is_some_and(|values| values.len() != poles.len() || values.iter().any(|w| *w <= 0.0))
+    {
+        return Err("inconsistent 2D B-spline data".to_string());
+    }
+    Ok(GeomCurve2d::bspline(BSplineCurve2d::new(
+        degree,
+        poles,
+        weights,
+        knots,
+        multiplicities,
+    )))
+}
+
+fn parse_curve2d(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<GeomCurve2d, String> {
+    let entity = entities
+        .get(&id)
+        .ok_or_else(|| format!("2D curve entity #{id} not found"))?;
+
+    if let StepEntity::Complex(parts) = entity {
+        let base = parts.iter().find(|(name, _)| name == "B_SPLINE_CURVE");
+        let knots = parts
+            .iter()
+            .find(|(name, _)| name == "B_SPLINE_CURVE_WITH_KNOTS");
+        let rational = parts
+            .iter()
+            .find(|(name, _)| name == "RATIONAL_B_SPLINE_CURVE");
+        if let (Some((_, base)), Some((_, knots))) = (base, knots) {
+            let degree = match base.first() {
+                Some(StepValue::Integer(value)) if *value > 0 => *value as usize,
+                _ => return Err(format!("invalid 2D B-spline degree #{id}")),
+            };
+            let poles = match base.get(1) {
+                Some(StepValue::List(values)) => values.as_slice(),
+                _ => return Err(format!("invalid 2D B-spline poles #{id}")),
+            };
+            let multiplicities = match knots.first() {
+                Some(StepValue::List(values)) => values.as_slice(),
+                _ => return Err(format!("invalid 2D B-spline multiplicities #{id}")),
+            };
+            let knot_values = match knots.get(1) {
+                Some(StepValue::List(values)) => values.as_slice(),
+                _ => return Err(format!("invalid 2D B-spline knots #{id}")),
+            };
+            let weights = rational.and_then(|(_, args)| match args.first() {
+                Some(StepValue::List(values)) => Some(values.as_slice()),
+                _ => None,
+            });
+            return parse_bspline_curve2d(
+                degree,
+                poles,
+                multiplicities,
+                knot_values,
+                weights,
+                entities,
+            );
+        }
+    }
+
+    match entity {
+        StepEntity::Simple { name, args } => match name.as_str() {
+            "LINE" => {
+                let point = match args.get(1) {
+                    Some(StepValue::Ref(id)) => parse_point2d(*id, entities)?,
+                    _ => return Err(format!("invalid 2D LINE location #{id}")),
+                };
+                let direction = match args.get(2) {
+                    Some(StepValue::Ref(id)) => parse_vector2d(*id, entities)?,
+                    _ => return Err(format!("invalid 2D LINE direction #{id}")),
+                };
+                Ok(GeomCurve2d::line(Line2d::from_point_dir(point, direction)))
+            }
+            "CIRCLE" => {
+                let axis = match args.get(1) {
+                    Some(StepValue::Ref(id)) => parse_axis22d(*id, entities)?,
+                    _ => return Err(format!("invalid 2D CIRCLE axis #{id}")),
+                };
+                let radius = args
+                    .get(2)
+                    .and_then(step_number)
+                    .ok_or_else(|| format!("invalid 2D CIRCLE radius #{id}"))?;
+                Ok(GeomCurve2d::circle(Circle2d::new(axis, radius)))
+            }
+            "ELLIPSE" => {
+                let axis = match args.get(1) {
+                    Some(StepValue::Ref(id)) => parse_axis22d(*id, entities)?,
+                    _ => return Err(format!("invalid 2D ELLIPSE axis #{id}")),
+                };
+                let major = args
+                    .get(2)
+                    .and_then(step_number)
+                    .ok_or_else(|| format!("invalid 2D ELLIPSE major radius #{id}"))?;
+                let minor = args
+                    .get(3)
+                    .and_then(step_number)
+                    .ok_or_else(|| format!("invalid 2D ELLIPSE minor radius #{id}"))?;
+                Ok(GeomCurve2d::ellipse(Ellipse2d::new(axis, major, minor)))
+            }
+            "B_SPLINE_CURVE_WITH_KNOTS" => {
+                let degree = match args.get(1) {
+                    Some(StepValue::Integer(value)) if *value > 0 => *value as usize,
+                    _ => return Err(format!("invalid 2D B-spline degree #{id}")),
+                };
+                let poles = match args.get(2) {
+                    Some(StepValue::List(values)) => values.as_slice(),
+                    _ => return Err(format!("invalid 2D B-spline poles #{id}")),
+                };
+                let multiplicities = match args.get(6) {
+                    Some(StepValue::List(values)) => values.as_slice(),
+                    _ => return Err(format!("invalid 2D B-spline multiplicities #{id}")),
+                };
+                let knots = match args.get(7) {
+                    Some(StepValue::List(values)) => values.as_slice(),
+                    _ => return Err(format!("invalid 2D B-spline knots #{id}")),
+                };
+                parse_bspline_curve2d(degree, poles, multiplicities, knots, None, entities)
+            }
+            _ => Err(format!("unsupported 2D curve type {name}")),
+        },
+        _ => Err(format!("unsupported 2D curve entity #{id}")),
+    }
+}
+
+fn trim_parameter(value: &StepValue) -> Option<f64> {
+    match value {
+        StepValue::Real(value) => Some(*value),
+        StepValue::Integer(value) => Some(*value as f64),
+        StepValue::Typed(name, value) if name == "PARAMETER_VALUE" => trim_parameter(value),
+        StepValue::List(values) => values.iter().find_map(trim_parameter),
+        _ => None,
+    }
+}
+
+fn parse_curve2d_representation(
+    id: u32,
+    entities: &HashMap<u32, StepEntity>,
+) -> Result<(GeomCurve2d, Option<(f64, f64)>), String> {
+    let Some(StepEntity::Simple { name, args }) = entities.get(&id) else {
+        return parse_curve2d(id, entities).map(|curve| (curve, None));
+    };
+    if name != "TRIMMED_CURVE" {
+        return parse_curve2d(id, entities).map(|curve| (curve, None));
+    }
+
+    let basis = match args.get(1) {
+        Some(StepValue::Ref(curve)) => *curve,
+        _ => return Err(format!("invalid TRIMMED_CURVE basis #{id}")),
+    };
+    let trim1 = args
+        .get(2)
+        .and_then(trim_parameter)
+        .ok_or_else(|| format!("invalid first TRIMMED_CURVE parameter #{id}"))?;
+    let trim2 = args
+        .get(3)
+        .and_then(trim_parameter)
+        .ok_or_else(|| format!("invalid last TRIMMED_CURVE parameter #{id}"))?;
+    let same_sense = matches!(args.get(4), Some(StepValue::Enum(value)) if value == "T");
+    let curve = parse_curve2d(basis, entities)?;
+    Ok((
+        curve,
+        Some(if same_sense {
+            (trim1, trim2)
+        } else {
+            (trim2, trim1)
+        }),
+    ))
+}
+
+fn surface_curve_arguments(entity: &StepEntity) -> Option<&[StepValue]> {
+    match entity {
+        StepEntity::Simple { name, args } if name == "SURFACE_CURVE" || name == "SEAM_CURVE" => {
+            Some(args)
+        }
+        StepEntity::Complex(parts) => parts
+            .iter()
+            .find(|(name, _)| name == "SURFACE_CURVE" || name == "SEAM_CURVE")
+            .map(|(_, args)| args.as_slice()),
+        _ => None,
+    }
+}
+
+fn curve3d_reference(id: u32, entities: &HashMap<u32, StepEntity>) -> u32 {
+    entities
+        .get(&id)
+        .and_then(surface_curve_arguments)
+        .and_then(|args| match args.get(1) {
+            Some(StepValue::Ref(curve)) => Some(*curve),
+            _ => None,
+        })
+        .unwrap_or(id)
+}
+
 fn parse_curve(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<GeomCurve, String> {
     let ent = entities
         .get(&id)
         .ok_or_else(|| format!("Entity #{} not found", id))?;
+
+    let curve3d = curve3d_reference(id, entities);
+    if curve3d != id {
+        return parse_curve(curve3d, entities);
+    }
 
     if let StepEntity::Complex(parts) = ent {
         let bspline_part = parts.iter().find(|(name, _)| name == "B_SPLINE_CURVE");
@@ -1185,6 +1506,202 @@ fn project_on_curve(curve: &GeomCurve, p: Pnt) -> f64 {
     }
 }
 
+fn project_on_curve2d(curve: &GeomCurve2d, point: Pnt2d) -> Option<f64> {
+    match curve {
+        GeomCurve2d::Line(line) => {
+            let delta = point - line.location();
+            let direction = line.direction();
+            Some(delta.x() * direction.x() + delta.y() * direction.y())
+        }
+        GeomCurve2d::Circle(circle) => {
+            let delta = point - circle.center();
+            let x = circle.position().x_direction();
+            let y = circle.position().y_direction();
+            let local_x = delta.x() * x.x() + delta.y() * x.y();
+            let local_y = delta.x() * y.x() + delta.y() * y.y();
+            Some(local_y.atan2(local_x).rem_euclid(core::f64::consts::TAU))
+        }
+        GeomCurve2d::Ellipse(ellipse) => {
+            let delta = point - ellipse.center();
+            let x = ellipse.position().x_direction();
+            let y = ellipse.position().y_direction();
+            let local_x = (delta.x() * x.x() + delta.y() * x.y()) / ellipse.major_radius();
+            let local_y = (delta.x() * y.x() + delta.y() * y.y()) / ellipse.minor_radius();
+            Some(local_y.atan2(local_x).rem_euclid(core::f64::consts::TAU))
+        }
+        _ => {
+            let (first, last) = curve.bounds();
+            if !first.is_finite() || !last.is_finite() || first == last {
+                return None;
+            }
+            let samples = 96;
+            let mut best_parameter = first;
+            let mut best_distance = f64::INFINITY;
+            for index in 0..=samples {
+                let parameter = first + (last - first) * index as f64 / samples as f64;
+                let distance = curve.point(parameter).distance(&point);
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_parameter = parameter;
+                }
+            }
+            let step = (last - first).abs() / samples as f64;
+            let mut left = (best_parameter - step).max(first.min(last));
+            let mut right = (best_parameter + step).min(first.max(last));
+            for _ in 0..24 {
+                let p1 = left + (right - left) / 3.0;
+                let p2 = right - (right - left) / 3.0;
+                if curve.point(p1).distance(&point) <= curve.point(p2).distance(&point) {
+                    right = p2;
+                } else {
+                    left = p1;
+                }
+            }
+            Some(0.5 * (left + right))
+        }
+    }
+}
+
+fn periodicity_for_surface(surface: &GeomSurface) -> SurfacePeriodicity {
+    SurfacePeriodicity {
+        u_period: surface.is_uclosed().then_some(core::f64::consts::TAU),
+        v_period: surface.is_vclosed().then_some(core::f64::consts::TAU),
+    }
+}
+
+fn align_uv_to_pcurve(
+    mut uv: Pnt2d,
+    curve: &GeomCurve2d,
+    periodicity: SurfacePeriodicity,
+) -> Pnt2d {
+    let (first, last) = curve.bounds();
+    let reference_parameter = if first.is_finite() && last.is_finite() {
+        0.5 * (first + last)
+    } else {
+        0.0
+    };
+    let reference = curve.point(reference_parameter);
+    if let Some(period) = periodicity.u_period {
+        uv = Pnt2d::new(
+            uv.x() + ((reference.x() - uv.x()) / period).round() * period,
+            uv.y(),
+        );
+    }
+    if let Some(period) = periodicity.v_period {
+        uv = Pnt2d::new(
+            uv.x(),
+            uv.y() + ((reference.y() - uv.y()) / period).round() * period,
+        );
+    }
+    uv
+}
+
+fn representation_curve2d_reference(
+    representation: u32,
+    entities: &HashMap<u32, StepEntity>,
+) -> Option<u32> {
+    match entities.get(&representation) {
+        Some(StepEntity::Simple { name, args })
+            if name == "DEFINITIONAL_REPRESENTATION" || name == "REPRESENTATION" =>
+        {
+            match args.get(1) {
+                Some(StepValue::List(items)) => items.iter().find_map(|item| match item {
+                    StepValue::Ref(id) => Some(*id),
+                    _ => None,
+                }),
+                _ => None,
+            }
+        }
+        Some(_) => Some(representation),
+        None => None,
+    }
+}
+
+fn parse_associated_pcurve(
+    surface_curve: u32,
+    surface_ref: u32,
+    surface: &GeomSurface,
+    edge_start: Pnt,
+    edge_end: Pnt,
+    entities: &HashMap<u32, StepEntity>,
+) -> Option<PcurveData> {
+    let arguments = entities
+        .get(&surface_curve)
+        .and_then(surface_curve_arguments)?;
+    let associated = match arguments.get(2) {
+        Some(StepValue::List(values)) => values,
+        _ => return None,
+    };
+    let periodicity = periodicity_for_surface(surface);
+
+    for associated_geometry in associated {
+        let StepValue::Ref(pcurve_ref) = associated_geometry else {
+            continue;
+        };
+        let Some(StepEntity::Simple { name, args }) = entities.get(pcurve_ref) else {
+            continue;
+        };
+        if name != "PCURVE" {
+            continue;
+        }
+        let basis_surface = match args.get(1) {
+            Some(StepValue::Ref(id)) => *id,
+            _ => continue,
+        };
+        if basis_surface != surface_ref {
+            continue;
+        }
+        let representation = match args.get(2) {
+            Some(StepValue::Ref(id)) => *id,
+            _ => continue,
+        };
+        let Some(curve_ref) = representation_curve2d_reference(representation, entities) else {
+            continue;
+        };
+        let Ok((curve, exact_range)) = parse_curve2d_representation(curve_ref, entities) else {
+            continue;
+        };
+
+        let (mut first, mut last) = if let Some(range) = exact_range {
+            range
+        } else {
+            let start_uv = openrcad_mesh::triangulate::project_point(surface, edge_start, None);
+            let end_uv =
+                openrcad_mesh::triangulate::project_point(surface, edge_end, Some(start_uv));
+            let start_uv =
+                align_uv_to_pcurve(Pnt2d::new(start_uv.0, start_uv.1), &curve, periodicity);
+            let end_uv = align_uv_to_pcurve(Pnt2d::new(end_uv.0, end_uv.1), &curve, periodicity);
+            let Some(first) = project_on_curve2d(&curve, start_uv) else {
+                continue;
+            };
+            let Some(last) = project_on_curve2d(&curve, end_uv) else {
+                continue;
+            };
+            (first, last)
+        };
+
+        // STEP trim senses describe the pcurve's basis direction. Align the
+        // exact interval with this topological edge's natural start/end.
+        let first_uv = curve.point(first);
+        let last_uv = curve.point(last);
+        let first_point = surface.point(first_uv.x(), first_uv.y());
+        let last_point = surface.point(last_uv.x(), last_uv.y());
+        if first_point.distance(&edge_start) > last_point.distance(&edge_start) {
+            core::mem::swap(&mut first, &mut last);
+        }
+
+        if (last - first).abs() <= openrcad_foundation::tolerance::CONFUSION && curve.is_periodic()
+        {
+            (first, last) = curve.bounds();
+        }
+        let pcurve = PcurveData::new(curve, first, last).with_periodicity(periodicity);
+        if pcurve.is_valid() {
+            return Some(pcurve);
+        }
+    }
+    None
+}
+
 fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result<Solid, String> {
     let mut brep = BRep::new();
 
@@ -1492,6 +2009,26 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                         e_id
                     };
 
+                    let surface_curve_ref = match entities.get(&edge_ref) {
+                        Some(StepEntity::Simple { name, args }) if name == "EDGE_CURVE" => {
+                            match args.get(3) {
+                                Some(StepValue::Ref(curve)) => *curve,
+                                _ => return Err("Invalid edge curve".to_string()),
+                            }
+                        }
+                        _ => return Err(format!("Expected EDGE_CURVE at #{edge_ref}")),
+                    };
+                    let edge_data = &brep.edges[e_id];
+                    let pcurve = parse_associated_pcurve(
+                        surface_curve_ref,
+                        surface_ref,
+                        &surface,
+                        brep.vertices[edge_data.start].point,
+                        brep.vertices[edge_data.end].point,
+                        &entities,
+                    )
+                    .map(|data| brep.pcurves.insert(data));
+
                     oriented_edges.push(OrientedEdge {
                         id: e_id,
                         orientation: if orientation_forward {
@@ -1499,6 +2036,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                         } else {
                             Orientation::Reversed
                         },
+                        pcurve,
                     });
                 }
 
@@ -1607,4 +2145,236 @@ pub fn read_step_str(content: &str) -> io::Result<Solid> {
     let solid = reconstruct_brep(entities, shell_id)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(solid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entity(name: &str, args: Vec<StepValue>) -> StepEntity {
+        StepEntity::Simple {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    fn string() -> StepValue {
+        StepValue::String(String::new())
+    }
+
+    fn numbers(values: &[f64]) -> StepValue {
+        StepValue::List(values.iter().copied().map(StepValue::Real).collect())
+    }
+
+    #[test]
+    fn surface_curve_import_attaches_face_specific_pcurves() {
+        let mut entities = HashMap::new();
+
+        // Shared 3D edge A -> B.
+        entities.insert(
+            1,
+            entity("CARTESIAN_POINT", vec![string(), numbers(&[0.0, 0.0, 0.0])]),
+        );
+        entities.insert(2, entity("VERTEX_POINT", vec![string(), StepValue::Ref(1)]));
+        entities.insert(
+            3,
+            entity("CARTESIAN_POINT", vec![string(), numbers(&[1.0, 0.0, 0.0])]),
+        );
+        entities.insert(4, entity("VERTEX_POINT", vec![string(), StepValue::Ref(3)]));
+        entities.insert(
+            5,
+            entity("DIRECTION", vec![string(), numbers(&[1.0, 0.0, 0.0])]),
+        );
+        entities.insert(
+            6,
+            entity(
+                "VECTOR",
+                vec![string(), StepValue::Ref(5), StepValue::Real(1.0)],
+            ),
+        );
+        entities.insert(
+            7,
+            entity("LINE", vec![string(), StepValue::Ref(1), StepValue::Ref(6)]),
+        );
+
+        // XY carrying plane.
+        entities.insert(
+            20,
+            entity("DIRECTION", vec![string(), numbers(&[0.0, 0.0, 1.0])]),
+        );
+        entities.insert(
+            21,
+            entity("DIRECTION", vec![string(), numbers(&[1.0, 0.0, 0.0])]),
+        );
+        entities.insert(
+            22,
+            entity(
+                "AXIS2_PLACEMENT_3D",
+                vec![
+                    string(),
+                    StepValue::Ref(1),
+                    StepValue::Ref(20),
+                    StepValue::Ref(21),
+                ],
+            ),
+        );
+        entities.insert(23, entity("PLANE", vec![string(), StepValue::Ref(22)]));
+
+        // 2D line pcurve and its STEP representation wrapper.
+        entities.insert(
+            30,
+            entity("CARTESIAN_POINT", vec![string(), numbers(&[0.0, 0.0])]),
+        );
+        entities.insert(
+            31,
+            entity("DIRECTION", vec![string(), numbers(&[1.0, 0.0])]),
+        );
+        entities.insert(
+            32,
+            entity(
+                "VECTOR",
+                vec![string(), StepValue::Ref(31), StepValue::Real(1.0)],
+            ),
+        );
+        entities.insert(
+            33,
+            entity(
+                "LINE",
+                vec![string(), StepValue::Ref(30), StepValue::Ref(32)],
+            ),
+        );
+        entities.insert(
+            34,
+            entity(
+                "DEFINITIONAL_REPRESENTATION",
+                vec![
+                    string(),
+                    StepValue::List(vec![StepValue::Ref(38)]),
+                    StepValue::Omitted,
+                ],
+            ),
+        );
+        entities.insert(
+            38,
+            entity(
+                "TRIMMED_CURVE",
+                vec![
+                    string(),
+                    StepValue::Ref(33),
+                    StepValue::List(vec![StepValue::Typed(
+                        "PARAMETER_VALUE".to_string(),
+                        Box::new(StepValue::Real(0.0)),
+                    )]),
+                    StepValue::List(vec![StepValue::Typed(
+                        "PARAMETER_VALUE".to_string(),
+                        Box::new(StepValue::Real(1.0)),
+                    )]),
+                    StepValue::Enum("T".to_string()),
+                    StepValue::Enum("PARAMETER".to_string()),
+                ],
+            ),
+        );
+        entities.insert(
+            35,
+            entity(
+                "PCURVE",
+                vec![string(), StepValue::Ref(23), StepValue::Ref(34)],
+            ),
+        );
+        entities.insert(
+            36,
+            entity(
+                "SURFACE_CURVE",
+                vec![
+                    string(),
+                    StepValue::Ref(7),
+                    StepValue::List(vec![StepValue::Ref(35)]),
+                    StepValue::Enum("PCURVE_S1".to_string()),
+                ],
+            ),
+        );
+        entities.insert(
+            37,
+            entity(
+                "EDGE_CURVE",
+                vec![
+                    string(),
+                    StepValue::Ref(2),
+                    StepValue::Ref(4),
+                    StepValue::Ref(36),
+                    StepValue::Enum("T".to_string()),
+                ],
+            ),
+        );
+
+        // Use the edge in both directions to form a minimal closed wire.
+        for (id, sense) in [(40, "T"), (41, "F")] {
+            entities.insert(
+                id,
+                entity(
+                    "ORIENTED_EDGE",
+                    vec![
+                        string(),
+                        StepValue::Omitted,
+                        StepValue::Omitted,
+                        StepValue::Ref(37),
+                        StepValue::Enum(sense.to_string()),
+                    ],
+                ),
+            );
+        }
+        entities.insert(
+            42,
+            entity(
+                "EDGE_LOOP",
+                vec![
+                    string(),
+                    StepValue::List(vec![StepValue::Ref(40), StepValue::Ref(41)]),
+                ],
+            ),
+        );
+        entities.insert(
+            43,
+            entity(
+                "FACE_OUTER_BOUND",
+                vec![
+                    string(),
+                    StepValue::Ref(42),
+                    StepValue::Enum("T".to_string()),
+                ],
+            ),
+        );
+        entities.insert(
+            44,
+            entity(
+                "ADVANCED_FACE",
+                vec![
+                    string(),
+                    StepValue::List(vec![StepValue::Ref(43)]),
+                    StepValue::Ref(23),
+                    StepValue::Enum("T".to_string()),
+                ],
+            ),
+        );
+        entities.insert(
+            45,
+            entity(
+                "CLOSED_SHELL",
+                vec![string(), StepValue::List(vec![StepValue::Ref(44)])],
+            ),
+        );
+
+        let solid = reconstruct_brep(entities, 45).expect("reconstruct STEP pcurve fixture");
+
+        assert_eq!(solid.brep().pcurves.len(), 2);
+        let face = solid.shell().faces().remove(0);
+        let wire = face.outer_wire().unwrap();
+        assert!(wire.pcurve(0).is_some());
+        assert!(wire.pcurve(1).is_some());
+        assert_eq!(
+            (wire.pcurve(0).unwrap().first, wire.pcurve(0).unwrap().last),
+            (0.0, 1.0)
+        );
+        assert!(solid.validate().is_ok());
+    }
 }

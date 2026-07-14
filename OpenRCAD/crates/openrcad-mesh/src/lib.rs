@@ -14,7 +14,11 @@ pub mod triangulate;
 
 pub use properties::{mass_properties, MassProperties};
 
-use openrcad_foundation::{BndBox, Pnt, Trsf};
+use openrcad_foundation::{
+    BndBox, CancellationProbe, Cancelled, NeverCancelled, Pnt, TolerancePolicy,
+    TolerancePolicyError, Trsf,
+};
+use openrcad_topo::{HealthReport, PcurveBuildError, ValidationError};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -56,6 +60,57 @@ pub struct GpuMesh {
     /// Per-triangle source face index, for pick/selection buffers.
     /// One entry per triangle (`indices.len() / 3`).
     pub face_ids: Vec<u32>,
+}
+
+/// Failure from strict Phase 1 tessellation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TessellationError {
+    InvalidTolerancePolicy(TolerancePolicyError),
+    InvalidBudget,
+    InvalidTopology(ValidationError),
+    UnhealthySolid(HealthReport),
+    NonWatertightSolid(HealthReport),
+    PcurveBuild(PcurveBuildError),
+    Cancelled,
+    InvalidMesh { degenerate_triangles: usize },
+}
+
+impl core::fmt::Display for TessellationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidTolerancePolicy(error) => {
+                write!(f, "invalid tessellation tolerance policy: {error}")
+            }
+            Self::InvalidBudget => {
+                f.write_str("tessellation chord and angle errors must be finite and positive")
+            }
+            Self::InvalidTopology(error) => write!(f, "invalid tessellation input: {error}"),
+            Self::UnhealthySolid(report) => {
+                write!(f, "unhealthy tessellation input: {report:?}")
+            }
+            Self::NonWatertightSolid(report) => {
+                write!(f, "non-watertight tessellation input: {report:?}")
+            }
+            Self::PcurveBuild(error) => {
+                write!(f, "compatibility pcurve reconstruction failed: {error}")
+            }
+            Self::Cancelled => f.write_str("tessellation cancelled"),
+            Self::InvalidMesh {
+                degenerate_triangles,
+            } => write!(
+                f,
+                "tessellation emitted {degenerate_triangles} degenerate triangles"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TessellationError {}
+
+impl From<Cancelled> for TessellationError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
 }
 
 impl TriangleMesh {
@@ -207,13 +262,86 @@ impl TriangleMesh {
 /// exactly along shared boundaries and the combined mesh has no cracks to
 /// stitch by construction.
 pub fn tessellate(solid: &openrcad_topo::Solid, chord_err: f64, angle_err: f64) -> TriangleMesh {
-    tessellate_with_cancel(
+    tessellate_compatibility_with_policy_and_cancel(
         solid,
         chord_err,
         angle_err,
-        &openrcad_foundation::NeverCancelled,
+        &TolerancePolicy::STANDARD,
+        &NeverCancelled,
     )
-    .expect("NeverCancelled cannot cancel")
+    .unwrap_or_else(|error| panic!("tessellate compatibility wrapper: {error}"))
+}
+
+/// Strict tessellation using the standard document tolerance policy.
+pub fn tessellate_checked(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+) -> Result<TriangleMesh, TessellationError> {
+    tessellate_checked_with_policy(solid, chord_err, angle_err, &TolerancePolicy::STANDARD)
+}
+
+/// Strict policy-aware tessellation. Every surface-backed coedge must already
+/// carry a valid stored pcurve; this function never reconstructs boundaries.
+pub fn tessellate_checked_with_policy(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    policy: &TolerancePolicy,
+) -> Result<TriangleMesh, TessellationError> {
+    tessellate_checked_with_policy_and_cancel(
+        solid,
+        chord_err,
+        angle_err,
+        policy,
+        &NeverCancelled,
+    )
+}
+
+/// Cancellable strict tessellation using the standard tolerance policy.
+pub fn tessellate_checked_with_cancel(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    cancel: &dyn CancellationProbe,
+) -> Result<TriangleMesh, TessellationError> {
+    tessellate_checked_with_policy_and_cancel(
+        solid,
+        chord_err,
+        angle_err,
+        &TolerancePolicy::STANDARD,
+        cancel,
+    )
+}
+
+/// Cancellable strict policy-aware tessellation.
+pub fn tessellate_checked_with_policy_and_cancel(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<TriangleMesh, TessellationError> {
+    validate_tessellation_input(solid, chord_err, angle_err, policy)?;
+    let mesh = tessellate_with_cancel_configured(solid, chord_err, angle_err, cancel, false)?;
+    validate_mesh(mesh, policy)
+}
+
+/// Explicit compatibility adapter for Phase 3 operations that do not yet
+/// store pcurves. Missing or stale pcurves are attached and validated before
+/// the strict tessellator is invoked.
+pub fn tessellate_compatibility_with_policy_and_cancel(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<TriangleMesh, TessellationError> {
+    cancel.check_cancelled()?;
+    let (solid, _) = solid
+        .repair_pcurves(policy)
+        .map_err(TessellationError::PcurveBuild)?;
+    tessellate_checked_with_policy_and_cancel(&solid, chord_err, angle_err, policy, cancel)
 }
 
 /// Cancellable tessellation. Cancellation is checked around shared-boundary
@@ -224,6 +352,135 @@ pub fn tessellate_with_cancel(
     chord_err: f64,
     angle_err: f64,
     cancel: &dyn openrcad_foundation::CancellationProbe,
+) -> Result<TriangleMesh, openrcad_foundation::Cancelled> {
+    match tessellate_compatibility_with_policy_and_cancel(
+        solid,
+        chord_err,
+        angle_err,
+        &TolerancePolicy::STANDARD,
+        cancel,
+    ) {
+        Ok(mesh) => Ok(mesh),
+        Err(TessellationError::Cancelled) => Err(Cancelled),
+        Err(error) => panic!("tessellate_with_cancel compatibility wrapper: {error}"),
+    }
+}
+
+/// Cancellable display tessellation that additionally bounds non-axial
+/// diagonals on long cylindrical strips. This prevents visible diagonal shading
+/// across trimmed cylinders while the standard tessellator remains compact for
+/// geometric analysis and intermediate validation meshes.
+pub fn tessellate_for_display_with_cancel(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    cancel: &dyn openrcad_foundation::CancellationProbe,
+) -> Result<TriangleMesh, openrcad_foundation::Cancelled> {
+    match tessellate_compatibility_for_display_with_policy_and_cancel(
+        solid,
+        chord_err,
+        angle_err,
+        &TolerancePolicy::STANDARD,
+        cancel,
+    ) {
+        Ok(mesh) => Ok(mesh),
+        Err(TessellationError::Cancelled) => Err(Cancelled),
+        Err(error) => panic!("display tessellation compatibility wrapper: {error}"),
+    }
+}
+
+/// Display-density variant of the explicit Phase 3 compatibility adapter.
+pub fn tessellate_compatibility_for_display_with_policy_and_cancel(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<TriangleMesh, TessellationError> {
+    cancel.check_cancelled()?;
+    let (solid, _) = solid
+        .repair_pcurves(policy)
+        .map_err(TessellationError::PcurveBuild)?;
+    validate_tessellation_input(&solid, chord_err, angle_err, policy)?;
+    let mesh = tessellate_with_cancel_configured(
+        &solid,
+        chord_err,
+        angle_err,
+        cancel,
+        true,
+    )?;
+    validate_mesh(mesh, policy)
+}
+
+fn validate_tessellation_input(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    policy: &TolerancePolicy,
+) -> Result<(), TessellationError> {
+    policy
+        .validate()
+        .map_err(TessellationError::InvalidTolerancePolicy)?;
+    if !(chord_err.is_finite() && chord_err > 0.0 && angle_err.is_finite() && angle_err > 0.0) {
+        return Err(TessellationError::InvalidBudget);
+    }
+    solid
+        .validate_strict_with_policy(policy)
+        .map_err(TessellationError::InvalidTopology)?;
+    let health = solid.health_report_with_policy(policy);
+    if !health.is_healthy() {
+        return Err(TessellationError::UnhealthySolid(health));
+    }
+    if !solid.is_watertight_with_policy(policy) {
+        return Err(TessellationError::NonWatertightSolid(health));
+    }
+    Ok(())
+}
+
+fn validate_mesh(
+    mesh: TriangleMesh,
+    policy: &TolerancePolicy,
+) -> Result<TriangleMesh, TessellationError> {
+    let degenerate_triangles = mesh
+        .triangles
+        .iter()
+        .filter(|triangle| {
+            let [a, b, c] = **triangle;
+            let Some(a) = mesh.vertices.get(a as usize) else {
+                return true;
+            };
+            let Some(b) = mesh.vertices.get(b as usize) else {
+                return true;
+            };
+            let Some(c) = mesh.vertices.get(c as usize) else {
+                return true;
+            };
+            !a.x().is_finite()
+                || !a.y().is_finite()
+                || !a.z().is_finite()
+                || !b.x().is_finite()
+                || !b.y().is_finite()
+                || !b.z().is_finite()
+                || !c.x().is_finite()
+                || !c.y().is_finite()
+                || !c.z().is_finite()
+                || (*b - *a).cross(&(*c - *a)).magnitude() <= policy.resolution * policy.resolution
+        })
+        .count();
+    if degenerate_triangles > 0 {
+        return Err(TessellationError::InvalidMesh {
+            degenerate_triangles,
+        });
+    }
+    Ok(mesh)
+}
+
+fn tessellate_with_cancel_configured(
+    solid: &openrcad_topo::Solid,
+    chord_err: f64,
+    angle_err: f64,
+    cancel: &dyn openrcad_foundation::CancellationProbe,
+    bound_cylinder_diagonals: bool,
 ) -> Result<TriangleMesh, openrcad_foundation::Cancelled> {
     cancel.check_cancelled()?;
     let faces = solid.shell().faces();
@@ -239,12 +496,13 @@ pub fn tessellate_with_cancel(
         .enumerate()
         .map(|(i, face)| {
             cancel.check_cancelled()?;
-            Ok(triangulate::tessellate_face_budget(
+            Ok(triangulate::tessellate_face_budget_configured(
                 face,
                 chord_err,
                 angle_err,
                 i as u32,
                 Some(&shared),
+                bound_cylinder_diagonals,
             ))
         })
         .collect();
@@ -254,12 +512,13 @@ pub fn tessellate_with_cancel(
         .enumerate()
         .map(|(i, face)| {
             cancel.check_cancelled()?;
-            Ok(triangulate::tessellate_face_budget(
+            Ok(triangulate::tessellate_face_budget_configured(
                 face,
                 chord_err,
                 angle_err,
                 i as u32,
                 Some(&shared),
+                bound_cylinder_diagonals,
             ))
         })
         .collect();
@@ -282,6 +541,7 @@ mod tests {
     use super::*;
     use openrcad_foundation::{Ax2, Dir, Trsf, Vec};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn cancelled_tessellation_returns_no_partial_mesh() {
@@ -291,6 +551,61 @@ mod tests {
         assert_eq!(
             tessellate_with_cancel(&solid, 0.05, 0.5, &token),
             Err(openrcad_foundation::Cancelled)
+        );
+    }
+
+    #[test]
+    fn strict_tessellation_rejects_missing_pcurve_before_meshing() {
+        let solid = openrcad_primitives::make_box_operation(
+            &Pnt::origin(),
+            10.0,
+            10.0,
+            10.0,
+        )
+        .unwrap()
+        .value;
+        let mut brep = solid.brep().as_ref().clone();
+        let coedge = brep
+            .loops
+            .values_mut()
+            .find_map(|wire| wire.edges.first_mut())
+            .unwrap();
+        coedge.pcurve = None;
+        let legacy = openrcad_topo::Solid::from_id(Arc::new(brep), solid.id());
+
+        assert!(matches!(
+            tessellate_checked(&legacy, 0.05, 0.5),
+            Err(TessellationError::InvalidTopology(
+                ValidationError::MissingPcurve { .. }
+            ))
+        ));
+
+        let repaired = tessellate_compatibility_with_policy_and_cancel(
+            &legacy,
+            0.05,
+            0.5,
+            &TolerancePolicy::STANDARD,
+            &NeverCancelled,
+        )
+        .unwrap();
+        assert!(!repaired.triangles.is_empty());
+    }
+
+    #[test]
+    fn checked_tessellation_cancellation_returns_no_partial_mesh() {
+        let solid = openrcad_primitives::make_box_operation(
+            &Pnt::origin(),
+            10.0,
+            10.0,
+            10.0,
+        )
+        .unwrap()
+        .value;
+        let token = openrcad_foundation::CancellationToken::new();
+        token.cancel();
+        assert_eq!(
+            tessellate_checked_with_cancel(&solid, 0.05, 0.5, &token),
+            Err(TessellationError::Cancelled)
         );
     }
 
