@@ -1,4 +1,6 @@
+pub mod document;
 pub mod expr;
+mod feature_dto;
 pub mod geometry;
 pub mod mock_kernel;
 pub mod parametric;
@@ -14,6 +16,13 @@ pub mod zcad_format;
 pub const CIRCLE_SEGS: usize = 48;
 
 // Re-export common structures for easy access
+pub use document::{
+    BodyId, BodyRecord, Document, DocumentSemantics, DocumentState, FeatureEditorGroup,
+    FeatureEvaluatorKind, FeatureId, FeatureInput, FeatureInputTarget, FeatureKindId,
+    FeatureRegistration, FeatureRegistry, FeatureSemantics, FeatureState, GeometricIntent,
+    SelectionProvenance, SelectionTopology, SelectorResolutionTier, SemanticEntityKind,
+    SemanticSelector, SequenceKey,
+};
 pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
@@ -35,7 +44,11 @@ pub use sketch::{
 };
 pub use stl::{meshes_to_3mf, meshes_to_binary_stl, write_binary_stl};
 pub use units::{Parameter, Unit};
+#[allow(deprecated)]
 pub use zcad_format::{
-    read_zcad, read_zcad_file, write_zcad, write_zcad_file, DocumentRecipeV2, LoadedZcad,
-    RecipeDependency, RecipeFeature, ZcadDocument, ZcadError, ZcadMetadata,
+    read_document, read_document_file, read_document_from_slice, read_zcad, read_zcad_file,
+    write_document, write_document_file, write_document_to_vec, write_zcad, write_zcad_file,
+    DocumentRecipeV3, HydrationBundle, LoadDiagnostic, LoadLimits, LoadOptions, LoadedDocument,
+    LoadedZcad, RecipeDependency, RecipeFeature, SaveOptions, SaveProfile, ZcadDocument, ZcadError,
+    ZcadMetadata,
 };

@@ -22,6 +22,8 @@ ZeroCAD/
 │   ├── expr.rs          # Recursive-descent expression evaluator (shared with the UI).
 │   ├── units.rs         # mm / inch / meter conversions (base unit = mm).
 │   ├── stl.rs           # Binary STL export of tessellated meshes.
+│   ├── document.rs      # Semantic bodies, timelines, inputs, selectors, feature registry.
+│   ├── feature_dto.rs   # Stable numeric-field persistence DTOs for every feature kind.
 │   ├── zcad_format.rs   # The binary `.zcad` document container (read/write).
 │   ├── parametric/      # Feature graph, evaluator, extrude/join/cut/edge-mod logic.
 │   │   ├── types.rs     # FeatureType/FeatureNode, ParametricGraph, EdgeRef/FaceRef,
@@ -58,10 +60,12 @@ the sibling `OpenRCAD/` workspace): `mock_kernel` builds real
 `openrcad::topo::Solid`s, tessellates them with `openrcad::mesh`, and flattens
 the result into the interleaved position+normal buffer the egui painter expects.
 
-Everything in core is `Serialize`/`Deserialize`, so the whole document is one
-serializable graph — the foundation for **Save/Load** (`.zcad` files, see
-[The `.zcad` document format](#the-zcad-document-format)) and the snapshot
-**Undo/Redo** stack, both wired up in the GUI. The same tessellated meshes feed
+The runtime graph is paired with a semantic document sidecar that owns explicit
+bodies, timelines, feature inputs, sequence keys, suppression, units, and
+visibility. Save/Load persists that stable semantic recipe rather than petgraph
+arena indices or Rust enum field names (see
+[The `.zcad` document format](#the-zcad-document-format)). Snapshot
+**Undo/Redo** captures both recipe and presentation state. The same tessellated meshes feed
 **binary STL export** (`zerocad_core::stl`) for handing models to slicers and
 mesh tools.
 
@@ -108,9 +112,10 @@ internally every constructor now drives a real OpenRCAD solid.
 
 ## The evaluation pipeline (`zerocad-core/src/parametric/`)
 
-`ParametricGraph` is a `petgraph::DiGraph<FeatureNode, ()>`. Each node is a
-`FeatureType` (`Origin`, `Box`, `Cylinder`, `Sketch`, `Extrude`, `EdgeMod`,
-`VariableSet`). Edges are dependencies (an `Extrude` depends on its `Sketch`).
+`ParametricGraph` is a `petgraph::DiGraph<FeatureNode, ()>` paired with
+`DocumentSemantics`. Each node has a stable feature-kind id and payload version;
+the semantic sidecar owns its explicit inputs, sequence key, suppression state,
+and body timeline membership. Graph edges remain the runtime dependency index.
 
 `evaluate_bodies_with_warnings()` is the entry point. It is intentionally split
 into small pieces — extend the matching piece, don't grow one function:
@@ -134,14 +139,19 @@ preview path use it.
 ### Adding a new feature type — the checklist
 
 1. Add a variant to `FeatureType` in `zerocad-core/src/parametric/types.rs`.
-2. If it produces a solid, add it to the `matches!` in
+2. Register its stable kind id, payload version, evaluator kind, editor group,
+   and intrinsic inputs in `zerocad-core/src/document.rs`.
+3. Add its numeric-field encode/decode contract in
+   `zerocad-core/src/feature_dto.rs`. Never persist Rust field or enum names as
+   the feature ABI.
+4. If it produces a solid, add it to the `matches!` in
    `body_nodes_in_creation_order` and a match arm in the evaluator.
-3. Add a solid builder under `zerocad-core/src/mock_kernel/` returning a
+5. Add a solid builder under `zerocad-core/src/mock_kernel/` returning a
    `KernelSolid` (an `openrcad::topo::Solid`). **Read the invariants below
    first** — orientation and handedness will bite you.
-4. Add a regression test to `tests/realistic_modes.rs` that asserts the geometry
+6. Add a regression test to `tests/realistic_modes.rs` that asserts the geometry
    actually changed, not just the triangle count.
-5. Add the GUI affordance under `zerocad-gui/src/app/` (state + a `ui/` panel) or
+7. Add the GUI affordance under `zerocad-gui/src/app/` (state + a `ui/` panel) or
    the relevant tool module if it's user-facing.
 
 ---
@@ -203,13 +213,12 @@ is built in ordered variants and tried in turn:
 drew; a fallback runs only when the solver rejects the earlier variant. 0.1 mm is
 comfortably above the solver tolerance yet invisible at part scale.
 
-### Creation order, not topological order
-Bodies are assembled in **creation order** (the trailing numeric suffix of the
-node id, via `creation_key`), *not* topological order. A cut/join extrude or an
-edge mod acts on whatever bodies already exist at its point in history, and there
-is no dependency edge between, say, a `Box` and a later cut `Extrude`. Sketch →
-extrude order is still respected because a sketch's id is always allocated before
-the extrude that consumes it.
+### Explicit sequence, not graph arena or identifier order
+Bodies are assembled by the semantic `SequenceKey`, *not* petgraph insertion
+order or a feature id suffix. A cut/join extrude or edge mod acts on the bodies
+that exist at its point in the explicit timeline. The old numeric-suffix rule is
+only a compatibility fallback while loading in-memory graphs that predate the
+semantic sidecar; normalization immediately records explicit sequence keys.
 
 ### Solid orientation / winding handedness
 Kernel booleans require outward-facing solids. The origin-plane consts (XZ/YZ)
@@ -523,41 +532,41 @@ projector remains the automatic fallback when wgpu is unavailable or disabled.
 
 ## The `.zcad` document format
 
-A saved model is a binary `.zcad` container (`zerocad-core/src/zcad_format.rs`),
-not plain JSON. The layout is a fixed 32-byte header + a section table + section
-payloads, all little-endian, with CRC32 integrity checks:
+A saved model is a binary `.zcad` v5 container
+(`zerocad-core/src/zcad_format.rs`), not plain JSON. Its fixed 32-byte header is
+followed by 48-byte section-table entries and independently stored or
+zstd-compressed payloads. Header and section integrity use truncated BLAKE3
+digests, checked lengths, non-overlap rules, bounded decompression, and explicit
+required/disposable flags.
 
-- **Header** — magic `ZCAD`, `format_version` (`CURRENT_VERSION = 4`), section
-  count, and a CRC32 over the header.
-- **Sections** (each CRC32-checked, individually codec-tagged as stored or
-  zstd-compressed): **metadata** (uncompressed, written first so a browser can
-  read it without inflating the file), **recipe** (`DocumentRecipeV2` as
-  zstd-compressed CBOR), an optional PNG **thumbnail**, an optional **mesh
-  cache** (precomputed body meshes tagged with the BLAKE3 recipe digest and
-  discarded on mismatch so stale geometry is
-  never trusted), an optional **hidden-nodes** set, and optional hydrated
-  **B-Rep checkpoints**.
-- `write_zcad(&ZcadDocument) -> Result<Vec<u8>, ZcadError>` and
-  `read_zcad(&[u8]) -> Result<LoadedZcad, ZcadError>` are the API.
-  `ZcadMetadata` carries the format/app version, created/modified timestamps,
-  units, feature count, and bounding box.
-- The authoritative payload is `DocumentRecipeV2`: sorted feature records,
-  explicit dependency pairs, and sorted attachment maps. It does not serialize
-  petgraph's arena/index representation. Derived mesh caches are accepted only
-  when their BLAKE3 digest matches the exact recipe bytes.
-- `.zcad` is the compact recipe-first form. `.zcadh` carries the same recipe plus
-  display meshes and sparse high-value evaluator/B-Rep checkpoints for instant
-  open and fast first edits. Checkpoints are independently content-hashed,
-  recipe/visibility/ABI-bound, topology-validated, and capped at 128 MiB by
-  default (64/128/256 MiB or unlimited in Settings). Invalid accelerator data is
-  discarded without affecting the recipe. `write_zcad_file` writes and syncs a sibling
-  temporary file, preserves the previous document during replacement, and
-  restores it if the final rename fails.
-- **Robustness.** Corruption is caught per-section by CRC and by a
-  decompressed-length check. The reader requires the exact binary format version;
-  older or newer formats are reported as `UnsupportedVersion`, and plain-JSON
-  input is rejected. This deliberate version-4 contract keeps component-aware
-  topology and caches from being interpreted with an older document schema.
+- The authoritative `DocumentRecipeV3` uses deterministic CBOR maps with numeric
+  keys. Every feature record carries a stable kind id, payload version, numeric
+  field map, explicit inputs, sequence, suppression, and body membership. Large
+  STEP data is a required content-addressed asset, deduplicated by BLAKE3.
+- `write_document[_to_vec|_file]` and
+  `read_document[_from_slice|_file]` are the canonical APIs. The reader and
+  writer process one section at a time; file APIs do not stage a second complete
+  container in memory. Deprecated `write_zcad`/`read_zcad` wrappers remain only
+  for the frozen Phase 0 and explicit compatibility tests.
+- `SaveProfile::Compact` stores the recipe, required assets, manifest, and an
+  optional preview capped at 32 KiB. It never stores meshes, B-Rep checkpoints,
+  or a large preview. `SaveProfile::Hydrated` may add those disposable
+  accelerators within a 64/128/256/512 MiB budget, dropping mesh, then
+  checkpoints, then the large preview as needed.
+- The manifest records container, recipe, feature-payload, required-asset,
+  OpenRCAD, tessellation, and tolerance ABIs. A model hash binds the canonical
+  recipe and sorted required assets; a separate presentation hash binds units
+  and visibility. Visibility never invalidates geometry caches.
+- Optional accelerators are independently digest-checked, ABI-bound,
+  model-bound, and structurally validated. Missing, stale, corrupt, or removable
+  optional sections produce diagnostics and fall back to a deterministic
+  rebuild; they cannot invalidate the authoritative recipe.
+- File writes use a synced sibling temporary file plus backup replacement so a
+  failure leaves either the complete previous document or the complete new one.
+  The loader enforces section-count and decoded-size ceilings before allocation.
+
+The full contract and migration rules are documented in
+[`docs/phase2-document-architecture.md`](docs/phase2-document-architecture.md).
 
 The GUI's **Recent projects** onboarding screen shows each file's thumbnail. The
 thumbnail is a small CPU-rasterized 3/4-isometric preview of the evaluated meshes
@@ -580,8 +589,9 @@ and embedded in the file's thumbnail section.
   `sketch_fillet_extrude.rs`, `primitive_equals_extrude.rs`, plus
   `bool_matrix.rs`, `cylinder_tests.rs`, `parametric_tests.rs`.
 - `tests/serialization.rs` and `tests/zcad_format.rs` — `.zcad` binary
-  round-trip, exact-version enforcement, and graceful handling of corrupt or
-  non-binary documents.
+  round-trip for every feature kind, byte determinism, save-profile enforcement,
+  streaming, atomic replacement, bounded malformed-input handling, and
+  independent optional-cache corruption recovery.
   `stl::tests` covers binary STL export.
 
 `benches/modeling_pipeline.rs` tracks cold, warm, and hydrated-open long-history

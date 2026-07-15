@@ -4963,7 +4963,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ciborium",
- "crc32fast",
  "criterion",
  "log",
  "openrcad",

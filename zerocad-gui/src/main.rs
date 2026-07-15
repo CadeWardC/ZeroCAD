@@ -416,6 +416,10 @@ enum RowAction {
     None,
     Delete,
     ToggleVisibility,
+    /// Toggle whether the feature participates in parametric rebuilds.
+    ToggleSuppression,
+    MoveUp,
+    MoveDown,
     /// Right-clicked "Add Variable" on a variable-set row.
     AddVariable,
     /// Right-clicked "Edit Sketch" on a sketch row.
@@ -465,6 +469,15 @@ impl SaveFormat {
             SaveFormat::ZcadLightweight => "zcad",
         }
     }
+
+    fn profile(self, hydrated_cache_mb: u32) -> zerocad_core::SaveProfile {
+        match self {
+            SaveFormat::ZcadLightweight => zerocad_core::SaveProfile::Compact,
+            SaveFormat::ZcadFull => zerocad_core::SaveProfile::Hydrated {
+                total_accelerator_budget: hydrated_cache_mb as u64 * 1024 * 1024,
+            },
+        }
+    }
 }
 
 /// State for the in-app save dialog modal.
@@ -487,7 +500,7 @@ struct UndoSnapshot {
 
 struct PendingSave {
     path: PathBuf,
-    embed_hydrated: bool,
+    profile: zerocad_core::SaveProfile,
     started: std::time::Instant,
     dispatched: bool,
 }

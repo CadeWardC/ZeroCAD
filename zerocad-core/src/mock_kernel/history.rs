@@ -210,8 +210,10 @@ pub fn propagate_face_names(
                 body_id: Some(body_id.to_string()),
                 component_id: None,
                 topology_version: Some(0),
-                face_id: Some(name),
+                face_id: Some(name.clone()),
                 surface_kind: None,
+                producer_feature_id: current_feature_context(),
+                source_entity_id: Some(name),
             });
         }
     }
@@ -456,8 +458,10 @@ pub fn propagate_face_names_via_history(
                     body_id: Some(body_id.to_string()),
                     component_id: None,
                     topology_version: Some(0),
-                    face_id: Some(name),
+                    face_id: Some(name.clone()),
                     surface_kind: None,
+                    producer_feature_id: current_feature_context(),
+                    source_entity_id: Some(name),
                 });
             }
         }
@@ -650,6 +654,7 @@ mod tests {
                 topology_version: Some(0),
                 face_id: Some(name.to_string()),
                 surface_kind: None,
+                ..MeshTopologyFaceRef::default()
             }),
         });
     }

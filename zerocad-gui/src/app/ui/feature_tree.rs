@@ -1,345 +1,295 @@
 use crate::*;
 
+type BrowserRow = (String, String);
+type BodyBrowserGroup = (String, String, Vec<BrowserRow>, Vec<BrowserRow>);
+
 impl ZeroCadApp {
     pub(crate) fn draw_feature_tree(&mut self, ctx: &egui::Context) {
-        // LEFT PANEL: History Tree & Feature Properties
         egui::SidePanel::left("history_sidebar")
             .resizable(true)
             .default_width(280.0)
             .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Document Browser")
-                            .font(egui::FontId::proportional(14.0))
-                            .strong()
-                            .color(self.pal().text_strong), // Slate-900
-                    );
-                    ui.add_space(4.0);
-                    ui.separator();
-                    ui.add_space(6.0);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Document Browser")
+                        .font(egui::FontId::proportional(14.0))
+                        .strong()
+                        .color(self.pal().text_strong),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(6.0);
 
-                    // Bucket features into Sketches (2D objects) and Bodies
-                    // (solids: boxes, cylinders, extrudes). The Origin is shown
-                    // on its own so it can't be mistaken for either group.
-                    let mut origin: Option<(String, String)> = None;
-                    let mut sketches: Vec<(String, String)> = Vec::new();
-                    // `(runtime body id, owning feature id, display label)`.
-                    // One New Body feature can emit several disconnected bodies.
-                    let mut bodies: Vec<(String, String, String)> = Vec::new();
-                    let mut operations: Vec<(String, String)> = Vec::new();
-                    let mut datums: Vec<(String, String)> = Vec::new();
-                    let mut variable_sets: Vec<(String, String)> = Vec::new();
-                    for idx in self.graph.graph.node_indices() {
-                        let node = &self.graph.graph[idx];
-                        let entry = (node.id.clone(), node.name.clone());
-                        match node.feature {
-                            FeatureType::Origin => origin = Some(entry),
-                            FeatureType::Sketch { .. } => sketches.push(entry),
-                            FeatureType::Box { .. }
-                            | FeatureType::Cylinder { .. }
-                            | FeatureType::Import { .. }
-                            | FeatureType::Extrude {
-                                mode: ExtrudeMode::NewBody,
-                                ..
-                            }
-                            | FeatureType::Revolve {
-                                mode: ExtrudeMode::NewBody,
-                                ..
-                            }
-                            | FeatureType::Loft {
-                                mode: ExtrudeMode::NewBody,
-                                ..
-                            }
-                            | FeatureType::Sweep {
-                                mode: ExtrudeMode::NewBody,
-                                ..
-                            }
-                            | FeatureType::Pattern {
-                                kind:
-                                    zerocad_core::PatternKind::Linear { .. }
-                                    | zerocad_core::PatternKind::Circular { .. }
-                                    | zerocad_core::PatternKind::Mirror { join: false, .. },
-                                ..
-                            }
-                            | FeatureType::BodyTransform { .. } => {
-                                // Keep the feature's original output visible even
-                                // when a later operation has consumed it, matching
-                                // the history behavior that existed for one-output
-                                // features. Add every currently evaluated extra
-                                // output as its own browser body.
-                                let mut output_ids = vec![node.id.clone()];
-                                output_ids.extend(
-                                    self.body_meshes
-                                        .iter()
-                                        .map(|(body_id, _)| body_id)
-                                        .filter(|body_id| {
-                                            zerocad_core::body_output_owner_id(body_id) == node.id
-                                        })
-                                        .cloned(),
-                                );
-                                output_ids.sort_by_key(|body_id| {
-                                    zerocad_core::body_output_index(body_id)
-                                });
-                                output_ids.dedup();
-                                for body_id in output_ids {
-                                    let label = body_output_label(&node.name, &body_id);
-                                    bodies.push((body_id, node.id.clone(), label));
-                                }
-                            }
-                            FeatureType::Extrude { .. }
-                            | FeatureType::Revolve { .. }
-                            | FeatureType::Loft { .. }
-                            | FeatureType::Sweep { .. }
-                            | FeatureType::Hole { .. }
-                            | FeatureType::Shell { .. }
-                            | FeatureType::Thread { .. }
-                            | FeatureType::EdgeMod { .. }
-                            | FeatureType::BodyJoin { .. }
-                            | FeatureType::BodyCut { .. }
-                            | FeatureType::Pattern {
-                                kind: zerocad_core::PatternKind::Mirror { join: true, .. },
-                                ..
-                            } => operations.push(entry),
-                            FeatureType::DatumPlane { .. }
-                            | FeatureType::DatumAxis { .. }
-                            | FeatureType::DatumPoint { .. } => datums.push(entry),
-                            FeatureType::VariableSet { .. } => variable_sets.push(entry),
-                        }
+                let mut origin = None;
+                let mut sketches = Vec::new();
+                let mut datums = Vec::new();
+                let mut variable_sets = Vec::new();
+                let mut names = std::collections::BTreeMap::new();
+                for node in self.graph.graph.node_weights() {
+                    names.insert(node.id.clone(), node.name.clone());
+                    let entry = (node.id.clone(), node.name.clone());
+                    match node.feature {
+                        FeatureType::Origin => origin = Some(entry),
+                        FeatureType::Sketch { .. } => sketches.push(entry),
+                        FeatureType::DatumPlane { .. }
+                        | FeatureType::DatumAxis { .. }
+                        | FeatureType::DatumPoint { .. } => datums.push(entry),
+                        FeatureType::VariableSet { .. } => variable_sets.push(entry),
+                        _ => {}
                     }
+                }
 
-                    let mut id_to_delete: Option<String> = None;
-                    let mut id_to_toggle: Option<String> = None;
-                    let mut id_to_add_var: Option<String> = None;
-                    let mut id_to_edit_sketch: Option<String> = None;
-                    let mut create_var_set = false;
+                // The semantic body records are authoritative. Each group owns
+                // one ordered feature timeline; runtime split outputs are merely
+                // display children and never reconstruct ownership from id text.
+                let body_groups: Vec<BodyBrowserGroup> = self
+                    .graph
+                    .semantics
+                    .bodies
+                    .values()
+                    .map(|body| {
+                        let timeline = body
+                            .timeline
+                            .iter()
+                            .filter_map(|id| {
+                                names
+                                    .get(id.as_str())
+                                    .map(|name| (id.to_string(), name.clone()))
+                            })
+                            .collect();
+                        let mut outputs: Vec<BrowserRow> = self
+                            .body_meshes
+                            .iter()
+                            .filter(|(id, _)| {
+                                id != body.id.as_str()
+                                    && zerocad_core::body_output_owner_id(id) == body.id.as_str()
+                            })
+                            .map(|(id, _)| (id.clone(), body_output_label(&body.name, id)))
+                            .collect();
+                        outputs.sort_by_key(|(id, _)| zerocad_core::body_output_index(id));
+                        (body.id.to_string(), body.name.clone(), timeline, outputs)
+                    })
+                    .collect();
 
-                    egui::ScrollArea::vertical()
-                        .id_salt("tree_scroll")
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            if let Some((id, name)) = &origin {
-                                let hidden = self.hidden_nodes.contains(id);
-                                match self.feature_tree_row(ui, id, name, hidden, false, false) {
-                                    RowAction::Delete => id_to_delete = Some(id.clone()),
-                                    RowAction::ToggleVisibility => id_to_toggle = Some(id.clone()),
-                                    RowAction::None => {}
-                                    RowAction::AddVariable => {}
-                                    RowAction::EditSketch => {}
-                                }
-                            }
+                let mut id_to_delete = None;
+                let mut id_to_toggle = None;
+                let mut id_to_suppress = None;
+                let mut id_to_move = None;
+                let mut id_to_add_var = None;
+                let mut id_to_edit_sketch = None;
+                let mut create_var_set = false;
 
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(format!("Sketches ({})", sketches.len()))
-                                    .font(egui::FontId::proportional(12.5))
-                                    .strong()
-                                    .color(self.pal().text_body), // Slate-600
-                            )
+                macro_rules! capture_action {
+                    ($action:expr, $id:expr) => {
+                        match $action {
+                            RowAction::Delete => id_to_delete = Some($id.to_string()),
+                            RowAction::ToggleVisibility => id_to_toggle = Some($id.to_string()),
+                            RowAction::ToggleSuppression => id_to_suppress = Some($id.to_string()),
+                            RowAction::MoveUp => id_to_move = Some(($id.to_string(), -1)),
+                            RowAction::MoveDown => id_to_move = Some(($id.to_string(), 1)),
+                            RowAction::AddVariable => id_to_add_var = Some($id.to_string()),
+                            RowAction::EditSketch => id_to_edit_sketch = Some($id.to_string()),
+                            RowAction::None => {}
+                        }
+                    };
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt("tree_scroll")
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        if let Some((id, name)) = &origin {
+                            capture_action!(
+                                self.feature_tree_row(ui, id, name, false, false, false, false),
+                                id
+                            );
+                        }
+
+                        egui::CollapsingHeader::new(section_label("Sketches", sketches.len()))
                             .default_open(true)
                             .show(ui, |ui| {
                                 if sketches.is_empty() {
                                     ui.weak("No sketches yet — use Draw Sketch.");
                                 }
                                 for (id, name) in &sketches {
-                                    let hidden = self.hidden_nodes.contains(id);
-                                    match self.feature_tree_row(ui, id, name, hidden, false, true) {
-                                        RowAction::Delete => id_to_delete = Some(id.clone()),
-                                        RowAction::ToggleVisibility => {
-                                            id_to_toggle = Some(id.clone())
-                                        }
-                                        RowAction::EditSketch => {
-                                            id_to_edit_sketch = Some(id.clone())
-                                        }
-                                        RowAction::None => {}
-                                        RowAction::AddVariable => {}
-                                    }
+                                    capture_action!(
+                                        self.feature_tree_row(
+                                            ui,
+                                            id,
+                                            name,
+                                            self.hidden_nodes.contains(id),
+                                            false,
+                                            true,
+                                            false,
+                                        ),
+                                        id
+                                    );
                                 }
                             });
 
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(format!("Bodies ({})", bodies.len()))
-                                    .font(egui::FontId::proportional(12.5))
-                                    .strong()
-                                    .color(self.pal().text_body), // Slate-600
-                            )
+                        egui::CollapsingHeader::new(section_label("Bodies", body_groups.len()))
                             .default_open(true)
                             .show(ui, |ui| {
-                                if bodies.is_empty() {
-                                    ui.weak("No bodies yet — add a primitive or Extrude a sketch.");
+                                if body_groups.is_empty() {
+                                    ui.weak("No bodies yet — add a primitive or extrude a sketch.");
                                 }
-                                for (id, owner_id, name) in &bodies {
-                                    let hidden = self.hidden_nodes.contains(owner_id);
-                                    match self.feature_tree_row(ui, id, name, hidden, false, false)
-                                    {
-                                        RowAction::Delete => id_to_delete = Some(owner_id.clone()),
-                                        RowAction::ToggleVisibility => {
-                                            id_to_toggle = Some(owner_id.clone())
+                                for (body_id, body_name, timeline, outputs) in &body_groups {
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(body_name).strong(),
+                                    )
+                                    .id_salt(("semantic_body", body_id))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for (id, name) in timeline {
+                                            capture_action!(
+                                                self.feature_tree_row(
+                                                    ui,
+                                                    id,
+                                                    name,
+                                                    self.hidden_nodes.contains(id),
+                                                    false,
+                                                    false,
+                                                    true,
+                                                ),
+                                                id
+                                            );
                                         }
-                                        RowAction::None => {}
-                                        RowAction::AddVariable => {}
-                                        RowAction::EditSketch => {}
-                                    }
+                                        for (id, name) in outputs {
+                                            capture_action!(
+                                                self.feature_tree_row(
+                                                    ui,
+                                                    id,
+                                                    name,
+                                                    self.hidden_nodes.contains(body_id),
+                                                    false,
+                                                    false,
+                                                    false,
+                                                ),
+                                                body_id
+                                            );
+                                        }
+                                    });
                                 }
                             });
 
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(format!("Operations ({})", operations.len()))
-                                    .font(egui::FontId::proportional(12.5))
-                                    .strong()
-                                    .color(self.pal().text_body), // Slate-600
-                            )
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                if operations.is_empty() {
-                                    ui.weak("No body operations yet.");
-                                }
-                                for (id, name) in &operations {
-                                    let hidden = self.hidden_nodes.contains(id);
-                                    match self.feature_tree_row(ui, id, name, hidden, false, false)
-                                    {
-                                        RowAction::Delete => id_to_delete = Some(id.clone()),
-                                        RowAction::ToggleVisibility => {
-                                            id_to_toggle = Some(id.clone())
-                                        }
-                                        RowAction::None => {}
-                                        RowAction::AddVariable => {}
-                                        RowAction::EditSketch => {}
-                                    }
-                                }
-                            });
-
-                            if !datums.is_empty() {
-                                egui::CollapsingHeader::new(
-                                    egui::RichText::new(format!("Datums ({})", datums.len()))
-                                        .font(egui::FontId::proportional(12.5))
-                                        .strong()
-                                        .color(self.pal().text_body),
-                                )
+                        if !datums.is_empty() {
+                            egui::CollapsingHeader::new(section_label("Datums", datums.len()))
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     for (id, name) in &datums {
-                                        let hidden = self.hidden_nodes.contains(id);
-                                        match self
-                                            .feature_tree_row(ui, id, name, hidden, false, false)
-                                        {
-                                            RowAction::Delete => id_to_delete = Some(id.clone()),
-                                            RowAction::ToggleVisibility => {
-                                                id_to_toggle = Some(id.clone())
-                                            }
-                                            RowAction::None => {}
-                                            RowAction::AddVariable => {}
-                                            RowAction::EditSketch => {}
-                                        }
+                                        capture_action!(
+                                            self.feature_tree_row(
+                                                ui,
+                                                id,
+                                                name,
+                                                self.hidden_nodes.contains(id),
+                                                false,
+                                                false,
+                                                false,
+                                            ),
+                                            id
+                                        );
                                     }
                                 });
-                            }
-
-                            // Variable Sets: a section title with a "+" on the right
-                            // to create a new set. Each set lives below as a row whose
-                            // right-click menu can add variables.
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Variable Sets ({})",
-                                        variable_sets.len()
-                                    ))
-                                    .font(egui::FontId::proportional(12.5))
-                                    .strong()
-                                    .color(self.pal().text_body), // Slate-600
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("➕").size(12.0),
-                                                )
-                                                .small(),
-                                            )
-                                            .on_hover_text("New variable set")
-                                            .clicked()
-                                        {
-                                            create_var_set = true;
-                                        }
-                                    },
-                                );
-                            });
-                            if variable_sets.is_empty() {
-                                ui.weak("No variable sets yet — click ➕ to add one.");
-                            }
-                            for (id, name) in &variable_sets {
-                                match self.feature_tree_row(ui, id, name, false, true, false) {
-                                    RowAction::Delete => id_to_delete = Some(id.clone()),
-                                    RowAction::AddVariable => id_to_add_var = Some(id.clone()),
-                                    RowAction::ToggleVisibility => {}
-                                    RowAction::None => {}
-                                    RowAction::EditSketch => {}
-                                }
-                            }
-                        });
-
-                    if let Some(toggle_id) = id_to_toggle {
-                        if !self.hidden_nodes.remove(&toggle_id) {
-                            self.hidden_nodes.insert(toggle_id);
                         }
-                        // Bodies are baked into the mesh, so re-evaluate to reflect
-                        // the change; sketches just toggle in the draw pass.
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(section_label("Variable Sets", variable_sets.len()));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("+")
+                                        .on_hover_text("New variable set")
+                                        .clicked()
+                                    {
+                                        create_var_set = true;
+                                    }
+                                },
+                            );
+                        });
+                        if variable_sets.is_empty() {
+                            ui.weak("No variable sets yet — click + to add one.");
+                        }
+                        for (id, name) in &variable_sets {
+                            capture_action!(
+                                self.feature_tree_row(ui, id, name, false, true, false, false),
+                                id
+                            );
+                        }
+                    });
+
+                if let Some(toggle_id) = id_to_toggle {
+                    self.push_undo();
+                    if !self.hidden_nodes.remove(&toggle_id) {
+                        self.hidden_nodes.insert(toggle_id);
+                    }
+                    self.reevaluate_geometry();
+                }
+                if let Some(feature_id) = id_to_suppress {
+                    let suppressed = self.graph.is_feature_suppressed(&feature_id);
+                    self.push_undo();
+                    if self.graph.set_feature_suppressed(&feature_id, !suppressed) {
+                        self.status_msg = if suppressed {
+                            format!("Resumed feature '{feature_id}'.")
+                        } else {
+                            format!("Suppressed feature '{feature_id}'.")
+                        };
                         self.reevaluate_geometry();
                     }
-
-                    if let Some(del_id) = id_to_delete {
-                        self.delete_node_by_id(&del_id);
+                }
+                if let Some((feature_id, offset)) = id_to_move {
+                    self.push_undo();
+                    if self.graph.move_feature_in_timeline(&feature_id, offset) {
+                        self.selected_node_id = Some(feature_id.clone());
+                        self.status_msg =
+                            format!("Moved feature '{feature_id}' in its body timeline.");
+                        self.reevaluate_geometry();
                     }
-
-                    // Right-click "Edit Sketch": re-open the sketch for editing,
-                    // same entry point as the properties-panel button.
-                    if let Some(edit_id) = id_to_edit_sketch {
-                        let now = ctx.input(|i| i.time);
-                        self.edit_sketch(&edit_id, now);
-                    }
-
-                    // Create a new, empty variable set and select it so the user
-                    // can rename it (Label field) and start adding variables.
-                    if create_var_set {
-                        let id = format!("varset_{}", self.next_id());
-                        let name = self.next_variable_set_name();
-                        self.graph.add_feature(FeatureNode {
-                            id: id.clone(),
-                            name,
-                            feature: FeatureType::VariableSet {
-                                variables: Vec::new(),
-                            },
-                        });
-                        self.selected_node_id = Some(id);
-                    }
-
-                    // Append a fresh variable to the targeted set (from a row's
-                    // right-click "Add Variable").
-                    if let Some(set_id) = id_to_add_var {
-                        let unit = self.current_unit;
-                        for idx in self.graph.graph.node_indices() {
-                            if self.graph.graph[idx].id == set_id {
-                                if let FeatureType::VariableSet { variables } =
-                                    &mut self.graph.graph[idx].feature
-                                {
-                                    let n = variables.len() + 1;
-                                    variables.push(Variable::new(format!("var{}", n), unit));
-                                }
-                                break;
+                }
+                if let Some(del_id) = id_to_delete {
+                    self.delete_node_by_id(&del_id);
+                }
+                if let Some(edit_id) = id_to_edit_sketch {
+                    self.edit_sketch(&edit_id, ctx.input(|input| input.time));
+                }
+                if create_var_set {
+                    self.push_undo();
+                    let id = format!("varset_{}", self.next_id());
+                    self.graph.add_feature(FeatureNode {
+                        id: id.clone(),
+                        name: self.next_variable_set_name(),
+                        feature: FeatureType::VariableSet {
+                            variables: Vec::new(),
+                        },
+                    });
+                    self.selected_node_id = Some(id);
+                }
+                if let Some(set_id) = id_to_add_var {
+                    self.push_undo();
+                    let unit = self.current_unit;
+                    for idx in self.graph.graph.node_indices() {
+                        if self.graph.graph[idx].id == set_id {
+                            if let FeatureType::VariableSet { variables } =
+                                &mut self.graph.graph[idx].feature
+                            {
+                                variables.push(Variable::new(
+                                    format!("var{}", variables.len() + 1),
+                                    unit,
+                                ));
                             }
+                            break;
                         }
-                        self.selected_node_id = Some(set_id);
                     }
+                    self.selected_node_id = Some(set_id);
+                }
 
-                    self.draw_selected_feature_properties(ui);
-                });
+                self.draw_selected_feature_properties(ui);
             });
     }
 
-    /// Render one row in the feature tree. Returns what the user did (selecting
-    /// is handled inline). `hidden` controls the eye icon.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn feature_tree_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -348,58 +298,51 @@ impl ZeroCadApp {
         hidden: bool,
         is_var_set: bool,
         is_sketch: bool,
+        allow_reorder: bool,
     ) -> RowAction {
         let mut action = RowAction::None;
-        // A feature whose reference/boolean didn't resolve on the last rebuild is
-        // flagged here so it's visible in the tree, not just a global warning.
         let owner_id = zerocad_core::body_output_owner_id(id).to_string();
+        let suppressed = self.graph.is_feature_suppressed(&owner_id);
         let is_live_body = self.body_meshes.iter().any(|(body_id, _)| body_id == id);
         let unresolved = self.unresolved_features.get(&owner_id).cloned();
+
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-
             if let Some(reason) = &unresolved {
-                ui.label(
-                    egui::RichText::new("⚠")
-                        .color(egui::Color32::from_rgb(220, 38, 38))
-                        .size(13.0),
-                )
-                .on_hover_text(format!("Unresolved: {reason}"));
+                ui.label(egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 38, 38)))
+                    .on_hover_text(format!("Unresolved: {reason}"));
             }
-
             if id != "origin" {
-                let eye_color = if hidden {
-                    egui::Color32::from_rgb(148, 163, 184) // muted slate for hidden
-                } else {
-                    self.pal().text_body
-                };
                 let icon = if hidden {
                     icons::Icon::EyeClosed
                 } else {
                     icons::Icon::EyeOpen
                 };
-                let eye_btn = icon.icon_button(
-                    ui,
-                    egui::Color32::TRANSPARENT,
-                    egui::Color32::from_rgb(226, 232, 240),
-                    eye_color,
-                );
-                if eye_btn
+                if icon
+                    .icon_button(
+                        ui,
+                        egui::Color32::TRANSPARENT,
+                        egui::Color32::from_rgb(226, 232, 240),
+                        if hidden {
+                            egui::Color32::from_rgb(148, 163, 184)
+                        } else {
+                            self.pal().text_body
+                        },
+                    )
                     .on_hover_text(if hidden {
-                        "Show node in 3D View"
+                        "Show in 3D View"
                     } else {
-                        "Hide node from 3D View"
+                        "Hide in 3D View"
                     })
                     .clicked()
                 {
                     action = RowAction::ToggleVisibility;
                 }
             } else {
-                // Spacer to align with eye button
                 ui.add_space(24.0);
             }
 
-            let is_selected = if is_live_body {
+            let selected = if is_live_body {
                 self.selected_body
                     .contains(&(id.to_string(), BodyPick::Whole))
                     || (self.selected_body.is_empty()
@@ -409,57 +352,60 @@ impl ZeroCadApp {
                 self.selected_node_id.as_deref() == Some(owner_id.as_str())
             };
 
-            // Inline rename: a text field replaces the label for the node being
-            // renamed. Commits on Enter / click-away, cancels on Escape.
             if self.renaming_node.as_deref() == Some(id) {
-                let resp = ui.add(
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut self.rename_buffer)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::FontId::proportional(13.0)),
+                        .desired_width(f32::INFINITY),
                 );
                 if self.rename_focus_pending {
-                    resp.request_focus();
+                    response.request_focus();
                     self.rename_focus_pending = false;
                 }
-                let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                if escaped {
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                     self.renaming_node = None;
-                } else if resp.lost_focus() {
-                    let new_name = self.rename_buffer.trim().to_string();
+                } else if response.lost_focus() {
+                    let new_name = self.rename_buffer.trim();
                     if !new_name.is_empty() {
-                        for idx in self.graph.graph.node_indices() {
-                            if self.graph.graph[idx].id == owner_id {
-                                self.graph.graph[idx].name = new_name.clone();
-                                break;
-                            }
+                        if let Some(node) = self
+                            .graph
+                            .graph
+                            .node_weights_mut()
+                            .find(|node| node.id == owner_id)
+                        {
+                            node.name = new_name.to_owned();
+                        }
+                        if let Some(body) = self
+                            .graph
+                            .semantics
+                            .bodies
+                            .get_mut(&zerocad_core::BodyId::from(owner_id.as_str()))
+                        {
+                            body.name = new_name.to_owned();
                         }
                     }
                     self.renaming_node = None;
                 }
-                return; // skip the normal label + context menu this frame
+                return;
             }
 
-            let label_color = if is_selected {
-                egui::Color32::from_rgb(29, 78, 216) // deep blue-700
-            } else if hidden {
-                self.pal().text_faint // muted slate-400
+            let color = if selected {
+                egui::Color32::from_rgb(29, 78, 216)
+            } else if hidden || suppressed {
+                self.pal().text_faint
             } else {
-                self.pal().text_strong // dark slate-800
+                self.pal().text_strong
             };
-
-            let rich_text = egui::RichText::new(name).color(label_color).size(13.0);
-
-            let rich_text = if is_selected {
-                rich_text.strong()
-            } else {
-                rich_text
-            };
-
-            let response = ui.selectable_label(is_selected, rich_text);
+            let mut text = egui::RichText::new(name).color(color).size(13.0);
+            if selected {
+                text = text.strong();
+            }
+            if suppressed {
+                text = text.strikethrough();
+            }
+            let response = ui.selectable_label(selected, text);
             if response.double_clicked() {
-                // Double-click starts an inline rename.
-                self.renaming_node = Some(id.to_string());
-                self.rename_buffer = name.to_string();
+                self.renaming_node = Some(id.to_owned());
+                self.rename_buffer = name.to_owned();
                 self.rename_focus_pending = true;
             } else if response.clicked() {
                 self.selected_node_id = Some(owner_id.clone());
@@ -467,73 +413,82 @@ impl ZeroCadApp {
                     self.selected_faces.clear();
                     self.selected_edges.clear();
                     self.selected_body.clear();
-                    self.selected_body.insert((id.to_string(), BodyPick::Whole));
+                    self.selected_body.insert((id.to_owned(), BodyPick::Whole));
                 }
-                log::info!("Selected browser body/node: {}", id);
             }
 
             response.context_menu(|ui| {
-                let rename_btn = icons::Icon::Sketch.labeled_button(
-                    ui,
-                    "Rename",
-                    egui::Color32::from_rgb(248, 250, 252),
-                    egui::Color32::from_rgb(241, 245, 249),
-                    self.pal().text_body,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240)),
-                );
-                if rename_btn.clicked() {
-                    self.renaming_node = Some(id.to_string());
-                    self.rename_buffer = name.to_string();
+                if ui.button("Rename").clicked() {
+                    self.renaming_node = Some(id.to_owned());
+                    self.rename_buffer = name.to_owned();
                     self.rename_focus_pending = true;
                     ui.close_menu();
                 }
-                if is_sketch {
-                    let edit_btn = icons::Icon::Sketch.labeled_button(
-                        ui,
-                        "Edit Sketch",
-                        egui::Color32::from_rgb(239, 246, 255),
-                        egui::Color32::from_rgb(219, 234, 254),
-                        egui::Color32::from_rgb(29, 78, 216),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(191, 219, 254)),
-                    );
-                    if edit_btn.clicked() {
-                        action = RowAction::EditSketch;
-                        ui.close_menu();
-                        log::info!("Requested edit of sketch: {}", id);
+                if allow_reorder {
+                    let feature_id = zerocad_core::FeatureId::from(owner_id.as_str());
+                    if let Some(body) = self
+                        .graph
+                        .semantics
+                        .bodies
+                        .values()
+                        .find(|body| body.timeline.iter().any(|member| member == &feature_id))
+                    {
+                        let position = body
+                            .timeline
+                            .iter()
+                            .position(|member| member == &feature_id)
+                            .unwrap();
+                        if ui
+                            .add_enabled(position > 0, egui::Button::new("Move Up"))
+                            .clicked()
+                        {
+                            action = RowAction::MoveUp;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                position + 1 < body.timeline.len(),
+                                egui::Button::new("Move Down"),
+                            )
+                            .clicked()
+                        {
+                            action = RowAction::MoveDown;
+                            ui.close_menu();
+                        }
                     }
                 }
-                if is_var_set {
-                    let add_btn = icons::Icon::Sketch.labeled_button(
-                        ui,
-                        "Add Variable",
-                        egui::Color32::from_rgb(239, 246, 255),
-                        egui::Color32::from_rgb(219, 234, 254),
-                        egui::Color32::from_rgb(29, 78, 216),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(191, 219, 254)),
-                    );
-                    if add_btn.clicked() {
-                        action = RowAction::AddVariable;
-                        ui.close_menu();
-                        log::info!("Requested add variable to set: {}", id);
-                    }
+                if id != "origin"
+                    && ui
+                        .button(if suppressed {
+                            "Resume Feature"
+                        } else {
+                            "Suppress Feature"
+                        })
+                        .clicked()
+                {
+                    action = RowAction::ToggleSuppression;
+                    ui.close_menu();
                 }
-                if id != "origin" {
-                    let del_btn = icons::Icon::Trash.labeled_button(
-                        ui,
-                        "Delete Feature",
-                        egui::Color32::from_rgb(254, 242, 242),
-                        egui::Color32::from_rgb(254, 226, 226),
-                        egui::Color32::from_rgb(185, 28, 28),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(252, 165, 165)),
-                    );
-                    if del_btn.clicked() {
-                        action = RowAction::Delete;
-                        ui.close_menu();
-                        log::info!("Requested delete of browser node: {}", id);
-                    }
+                if is_sketch && ui.button("Edit Sketch").clicked() {
+                    action = RowAction::EditSketch;
+                    ui.close_menu();
+                }
+                if is_var_set && ui.button("Add Variable").clicked() {
+                    action = RowAction::AddVariable;
+                    ui.close_menu();
+                }
+                if id != "origin" && ui.button("Delete Feature").clicked() {
+                    action = RowAction::Delete;
+                    ui.close_menu();
                 }
             });
         });
         action
     }
+}
+
+fn section_label(name: &str, count: usize) -> egui::RichText {
+    egui::RichText::new(format!("{name} ({count})"))
+        .font(egui::FontId::proportional(12.5))
+        .strong()
 }

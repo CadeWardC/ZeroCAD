@@ -153,6 +153,14 @@ fn mirror_can_follow_a_planar_body_face() {
             topology_version: top.topology.as_ref().and_then(|t| t.topology_version),
             face_id: top.topology.as_ref().and_then(|t| t.face_id.clone()),
             surface_kind: top.topology.as_ref().and_then(|t| t.surface_kind.clone()),
+            producer_feature_id: top
+                .topology
+                .as_ref()
+                .and_then(|t| t.producer_feature_id.clone()),
+            source_entity_id: top
+                .topology
+                .as_ref()
+                .and_then(|t| t.source_entity_id.clone()),
         }),
     };
     add_pattern(
@@ -231,6 +239,14 @@ fn mirror_join_unions_connected_copy_into_source_body() {
             topology_version: side.topology.as_ref().and_then(|t| t.topology_version),
             face_id: side.topology.as_ref().and_then(|t| t.face_id.clone()),
             surface_kind: side.topology.as_ref().and_then(|t| t.surface_kind.clone()),
+            producer_feature_id: side
+                .topology
+                .as_ref()
+                .and_then(|t| t.producer_feature_id.clone()),
+            source_entity_id: side
+                .topology
+                .as_ref()
+                .and_then(|t| t.source_entity_id.clone()),
         }),
     };
     add_pattern(

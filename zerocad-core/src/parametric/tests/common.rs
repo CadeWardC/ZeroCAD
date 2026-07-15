@@ -58,6 +58,8 @@ pub(super) fn edge_ref_from_mesh_edge(
         adjacent_face_ids: topology.adjacent_face_ids.clone(),
         curve_kind: topology.curve_kind.clone(),
         adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+        producer_feature_id: topology.producer_feature_id.clone(),
+        source_entity_id: topology.source_entity_id.clone(),
     });
     EdgeRef {
         p0: edge.p0,

@@ -24,6 +24,7 @@ mod node_map_resync;
 mod pattern_feature;
 mod reattachment_matrix;
 mod revolve_feature;
+mod semantic_document;
 mod shell_feature;
 mod thread_feature;
 mod thread_join_head;

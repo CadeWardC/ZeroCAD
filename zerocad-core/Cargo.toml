@@ -14,7 +14,6 @@ log.workspace = true
 openrcad.workspace = true
 ciborium.workspace = true
 zstd.workspace = true
-crc32fast.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]

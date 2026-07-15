@@ -127,6 +127,8 @@ impl ZeroCadApp {
                     adjacent_face_ids: topology.adjacent_face_ids.clone(),
                     curve_kind: topology.curve_kind.clone(),
                     adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+                    producer_feature_id: topology.producer_feature_id.clone(),
+                    source_entity_id: topology.source_entity_id.clone(),
                 };
                 if topology.body_id.is_none() {
                     topology.body_id = Some(node_id.to_string());
@@ -927,6 +929,11 @@ impl ZeroCadApp {
                 topology_version: f.topology.as_ref().and_then(|t| t.topology_version),
                 face_id: f.topology.as_ref().and_then(|t| t.face_id.clone()),
                 surface_kind: f.topology.as_ref().and_then(|t| t.surface_kind.clone()),
+                producer_feature_id: f
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.producer_feature_id.clone()),
+                source_entity_id: f.topology.as_ref().and_then(|t| t.source_entity_id.clone()),
             }),
         })
     }

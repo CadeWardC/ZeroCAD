@@ -59,6 +59,10 @@ pub struct MeshTopologyEdgeRef {
     pub curve_kind: Option<String>,
     #[serde(default)]
     pub adjacent_surface_kinds: Vec<String>,
+    #[serde(default)]
+    pub producer_feature_id: Option<String>,
+    #[serde(default)]
+    pub source_entity_id: Option<String>,
 }
 
 /// Selectable/attachable face metadata aligned to a [`MockMesh::face_ids`] value.
@@ -95,6 +99,10 @@ pub struct MeshTopologyFaceRef {
     pub face_id: Option<String>,
     #[serde(default)]
     pub surface_kind: Option<String>,
+    #[serde(default)]
+    pub producer_feature_id: Option<String>,
+    #[serde(default)]
+    pub source_entity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -126,17 +126,16 @@ impl ZeroCadApp {
 
                                         ui.add_space(6.0);
                                         egui::ComboBox::from_label("Hydrated project cache")
-                                            .selected_text(if self.hydrated_cache_mb == 0 {
-                                                "Unlimited".to_string()
-                                            } else {
-                                                format!("{} MB", self.hydrated_cache_mb)
-                                            })
+                                            .selected_text(format!(
+                                                "{} MB",
+                                                self.hydrated_cache_mb
+                                            ))
                                             .show_ui(ui, |ui| {
                                                 for (value, label) in [
                                                     (64, "64 MB"),
                                                     (128, "128 MB (recommended)"),
                                                     (256, "256 MB"),
-                                                    (0, "Unlimited"),
+                                                    (512, "512 MB"),
                                                 ] {
                                                     ui.selectable_value(
                                                         &mut self.hydrated_cache_mb,

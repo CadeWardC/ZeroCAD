@@ -724,10 +724,16 @@ pub(crate) fn populate_edge_adjacent_face_names(mesh: &mut MockMesh) {
         let mut pair = [a, b];
         pair.sort();
         match &mut e.topology {
-            Some(t) => t.adjacent_face_ids = pair.to_vec(),
+            Some(t) => {
+                t.adjacent_face_ids = pair.to_vec();
+                if t.producer_feature_id.is_none() {
+                    t.producer_feature_id = current_feature_context();
+                }
+            }
             None => {
                 e.topology = Some(MeshTopologyEdgeRef {
                     adjacent_face_ids: pair.to_vec(),
+                    producer_feature_id: current_feature_context(),
                     ..Default::default()
                 })
             }
@@ -905,6 +911,7 @@ pub(crate) fn mesh_edge_refs_from_groups(
                 edge_id,
                 curve_kind,
                 adjacent_surface_kinds: vec!["unknown".to_string(), "unknown".to_string()],
+                producer_feature_id: current_feature_context(),
                 ..MeshTopologyEdgeRef::default()
             }),
         });

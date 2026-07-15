@@ -67,6 +67,8 @@ pub(crate) fn stamp_sketch_extrude_edge_refs(
             curve_kind,
             adjacent_surface_kinds: Vec::new(),
             adjacent_face_ids: Vec::new(),
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -115,6 +117,8 @@ pub(crate) fn stamp_sketch_extrude_face_refs(
             topology_version: Some(0),
             face_id: assigned[i].take(),
             surface_kind: None,
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -150,6 +154,8 @@ pub(crate) fn stamp_box_face_refs(mesh: &mut MockMesh, body_id: &str) {
             topology_version: Some(0),
             face_id: Some(format!("box_{body_id}:face:{role}")),
             surface_kind: Some("plane".to_string()),
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -172,6 +178,8 @@ pub(crate) fn stamp_import_face_refs(mesh: &mut MockMesh, body_id: &str) {
             topology_version: Some(0),
             face_id: Some(format!("import:{body_id}:face:{k}")),
             surface_kind: None,
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -196,6 +204,8 @@ pub(crate) fn stamp_revolve_face_refs(mesh: &mut MockMesh, body_id: &str, region
             topology_version: Some(0),
             face_id: Some(format!("revolve:{body_id}:region:{region_index}:face:{k}")),
             surface_kind: None,
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -218,6 +228,8 @@ pub(crate) fn stamp_pattern_face_refs(mesh: &mut MockMesh, body_id: &str, instan
             topology_version: Some(0),
             face_id: Some(format!("pattern:{body_id}:inst:{instance}:face:{j}")),
             surface_kind: None,
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -246,6 +258,8 @@ pub(crate) fn stamp_cylinder_face_refs(mesh: &mut MockMesh, body_id: &str) {
             topology_version: Some(0),
             face_id: Some(format!("cyl_{body_id}:face:{role}")),
             surface_kind: Some(kind.to_string()),
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }

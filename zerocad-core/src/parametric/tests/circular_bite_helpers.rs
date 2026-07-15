@@ -129,6 +129,8 @@ pub(super) fn gui_edge_ref_from_mesh_candidate(
             adjacent_face_ids: topology.adjacent_face_ids.clone(),
             curve_kind: topology.curve_kind.clone(),
             adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+            producer_feature_id: topology.producer_feature_id.clone(),
+            source_entity_id: topology.source_entity_id.clone(),
         };
         if topology.body_id.is_none() {
             topology.body_id = Some(body_id.to_string());

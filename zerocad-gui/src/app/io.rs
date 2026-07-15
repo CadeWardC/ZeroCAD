@@ -133,7 +133,7 @@ impl ZeroCadApp {
         let path = state.save_dir.join(&file_name);
         self.pending_save = Some(PendingSave {
             path,
-            embed_hydrated: state.save_format == SaveFormat::ZcadFull,
+            profile: state.save_format.profile(self.hydrated_cache_mb),
             started: std::time::Instant::now(),
             dispatched: false,
         });
@@ -146,26 +146,28 @@ impl ZeroCadApp {
     }
 
     pub(crate) fn poll_document_worker(&mut self) {
-        let should_dispatch = self
-            .pending_save
-            .as_ref()
-            .is_some_and(|save| !save.dispatched && !self.eval_pending);
+        let should_dispatch = self.pending_save.as_ref().is_some_and(|save| {
+            !save.dispatched
+                && (!self.eval_pending
+                    || matches!(save.profile, zerocad_core::SaveProfile::Compact))
+        });
         if should_dispatch {
+            let created_unix = *self.doc_created_unix.get_or_insert_with(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
             let save = self.pending_save.as_mut().expect("pending save vanished");
             self.document_worker.submit(document_worker::SaveRequest {
                 path: save.path.clone(),
                 graph: self.graph.clone_document(),
                 bodies: self.body_meshes.clone(),
-                embed_hydrated: save.embed_hydrated,
+                profile: save.profile,
                 units: self.current_unit,
-                created_unix: self.doc_created_unix,
                 hidden_nodes: self.hidden_nodes.clone(),
+                created_unix: Some(created_unix),
                 cache: self.graph.evaluation_cache_snapshot(),
-                hydrated_cache_limit: if self.hydrated_cache_mb == 0 {
-                    usize::MAX
-                } else {
-                    self.hydrated_cache_mb as usize * 1024 * 1024
-                },
             });
             save.dispatched = true;
             self.status_msg = "Saving design…".to_string();
@@ -174,10 +176,10 @@ impl ZeroCadApp {
             self.pending_save = None;
             match done.result {
                 Ok(()) => {
-                    let how = if done.embed_hydrated {
-                        ""
+                    let how = if matches!(done.profile, zerocad_core::SaveProfile::Compact) {
+                        " (compact)"
                     } else {
-                        " (lightweight)"
+                        " (hydrated)"
                     };
                     self.status_msg = format!("Design saved to {}{how}", done.path.display());
                     self.recent_files.record(&done.path);
@@ -669,37 +671,27 @@ impl ZeroCadApp {
     /// Selection / preview state is reset to match the new graph. Shared by the
     /// Open dialog and the onboarding Recent list.
     pub(crate) fn load_design_from(&mut self, path: PathBuf) {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.status_msg = format!("Could not read file: {e}");
-                return;
-            }
-        };
-        let loaded = match zerocad_core::read_zcad(&bytes) {
-            Ok(l) => l,
-            Err(e) => {
-                self.status_msg = format!("Load failed: {e}");
-                return;
-            }
-        };
+        let loaded =
+            match zerocad_core::read_document_file(&path, &zerocad_core::LoadOptions::default()) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.status_msg = format!("Load failed: {e}");
+                    return;
+                }
+            };
 
         self.push_undo();
-        self.graph = loaded.graph;
-        // Feature ids share one monotonic numeric suffix, which is also the
-        // evaluator's creation-order key. Continue after the loaded document's
-        // largest suffix so a new Pattern cannot sort before its source body.
+        self.hidden_nodes = loaded.document.hidden_entities();
+        self.current_unit = loaded.document.state.units;
+        self.doc_created_unix = loaded.document.state.created_unix;
+        self.graph = loaded.document.graph;
+        // Continue the user-facing feature id sequence after the largest loaded
+        // suffix. Dependencies and semantic timelines determine evaluation.
         self.reseed_id_counter_from_graph();
-        // Preserve the original creation time. A zero timestamp is the explicit
-        // "unknown" value and is replaced on the next save.
-        self.doc_created_unix =
-            (loaded.metadata.created_unix != 0).then_some(loaded.metadata.created_unix);
-        self.current_unit = loaded.metadata.units;
         self.selected_node_id = None;
         self.selected_faces.clear();
         self.selected_edges.clear();
         self.selected_body.clear();
-        self.hidden_nodes = loaded.hidden_nodes;
         self.extrude_op = None;
         self.edge_mod_op = None;
         self.body_clipboard = None;
@@ -710,18 +702,18 @@ impl ZeroCadApp {
         // Show the embedded geometry cache immediately (instant open). It's only
         // present when fresh (its hash matched the loaded graph), so it's safe to
         // display; `reevaluate_geometry` then swaps in freshly-computed bodies.
-        let had_mesh_cache = loaded.mesh_cache.is_some();
-        if let Some(cache) = loaded.mesh_cache {
+        let had_mesh_cache = loaded.accelerators.display_meshes.is_some();
+        if let Some(cache) = loaded.accelerators.display_meshes {
             self.set_body_meshes(cache);
         }
-        let had_evaluation_cache = loaded.evaluation_cache.is_some();
-        if let Some(cache) = loaded.evaluation_cache {
+        let had_evaluation_cache = loaded.accelerators.evaluation_cache.is_some();
+        if let Some(cache) = loaded.accelerators.evaluation_cache {
             self.graph.install_evaluation_cache(cache);
         }
         // Seed the onboarding thumbnail cache from the file's embedded preview so
         // a `.zcad` from another machine shows its real thumbnail even if it has
         // no geometry to re-render (e.g. evaluation fails).
-        if let Some(png) = &loaded.thumbnail_png {
+        if let Some(png) = &loaded.accelerators.small_preview_png {
             if let Some((w, h, rgba)) = thumbnail::decode_png(png) {
                 settings::save_thumb(&path, w, h, &rgba);
                 self.defer_onboarding_texture_eviction(&path);
@@ -734,7 +726,15 @@ impl ZeroCadApp {
         if !(had_mesh_cache && had_evaluation_cache) {
             self.reevaluate_geometry();
         }
-        self.status_msg = format!("Design loaded from {}", path.display());
+        self.status_msg = if loaded.diagnostics.is_empty() {
+            format!("Design loaded from {}", path.display())
+        } else {
+            format!(
+                "Design loaded from {} with {} recoverable warning(s)",
+                path.display(),
+                loaded.diagnostics.len()
+            )
+        };
         self.remember_project(&path);
     }
 

@@ -4,6 +4,7 @@ impl ParametricGraph {
     pub fn new() -> Self {
         let mut pg = Self {
             graph: DiGraph::new(),
+            semantics: crate::document::DocumentSemantics::default(),
             sketch_face_refs: HashMap::new(),
             sketch_datum_refs: HashMap::new(),
             sketch_face_boundaries: HashMap::new(),
@@ -23,6 +24,7 @@ impl ParametricGraph {
     pub fn clone_document(&self) -> Self {
         let mut graph = Self {
             graph: self.graph.clone(),
+            semantics: self.semantics.clone(),
             sketch_face_refs: self.sketch_face_refs.clone(),
             sketch_datum_refs: self.sketch_datum_refs.clone(),
             sketch_face_boundaries: self.sketch_face_boundaries.clone(),
@@ -59,11 +61,20 @@ impl ParametricGraph {
         };
         let idx = self.graph.add_node(origin);
         self.node_map.insert("origin".to_string(), idx);
+        self.semantics.register(
+            "origin",
+            "Base Origin",
+            &FeatureType::Origin,
+            crate::document::SequenceKey(0),
+        );
     }
 
     /// Add a feature node to the tree
     pub fn add_feature(&mut self, node: FeatureNode) -> NodeIndex {
         let id = node.id.clone();
+        let sequence = self.semantics.next_sequence();
+        self.semantics
+            .register(&node.id, &node.name, &node.feature, sequence);
         let idx = self.graph.add_node(node);
         self.node_map.insert(id, idx);
         idx
@@ -80,6 +91,7 @@ impl ParametricGraph {
             self.resolve_node(child_id),
         ) {
             self.graph.add_edge(parent_idx, child_idx, ());
+            self.semantics.add_dependency(parent_feature_id, child_id);
         }
     }
 
@@ -91,9 +103,111 @@ impl ParametricGraph {
     /// sketch builds no body).
     pub fn rebuild_node_map(&mut self) {
         self.node_map.clear();
+        let records: Vec<(String, String, FeatureType)> = self
+            .graph
+            .node_weights()
+            .map(|node| (node.id.clone(), node.name.clone(), node.feature.clone()))
+            .collect();
+        let live_ids: std::collections::HashSet<&str> =
+            records.iter().map(|(id, _, _)| id.as_str()).collect();
+        self.semantics
+            .features
+            .retain(|id, _| live_ids.contains(id.as_str()));
+        self.semantics.bodies.retain(|_, body| {
+            body.timeline
+                .retain(|member| live_ids.contains(member.as_str()));
+            !body.timeline.is_empty()
+        });
         for idx in self.graph.node_indices() {
             self.node_map.insert(self.graph[idx].id.clone(), idx);
         }
+        for (id, name, feature) in records {
+            if !self
+                .semantics
+                .features
+                .contains_key(&crate::document::FeatureId::from(id.as_str()))
+            {
+                let sequence = if id == "origin" {
+                    crate::document::SequenceKey(0)
+                } else {
+                    self.semantics.next_sequence()
+                };
+                self.semantics.register(&id, &name, &feature, sequence);
+            }
+        }
+    }
+
+    /// Verify that runtime nodes and the stable semantic document describe the
+    /// same feature kinds, versions, inputs, bodies, and timeline order.
+    pub fn validate_semantic_contracts(&self) -> Result<(), String> {
+        let mut node_ids = std::collections::HashSet::new();
+        for node in self.graph.node_weights() {
+            if !node_ids.insert(node.id.as_str()) {
+                return Err(format!("duplicate feature id '{}'", node.id));
+            }
+            let semantic = self
+                .semantics
+                .features
+                .get(&crate::document::FeatureId::from(node.id.as_str()))
+                .ok_or_else(|| format!("feature '{}' has no semantic contract", node.id))?;
+            let registration = crate::document::FeatureRegistry::for_feature(&node.feature);
+            if semantic.kind_id.as_str() != registration.kind_id
+                || semantic.payload_version != registration.payload_version
+            {
+                return Err(format!(
+                    "feature '{}' runtime kind/version disagrees with its semantic contract",
+                    node.id
+                ));
+            }
+            for input in &semantic.inputs {
+                use crate::document::FeatureInputTarget;
+                let target_id = match &input.target {
+                    FeatureInputTarget::Feature(id) => Some(id.as_str()),
+                    FeatureInputTarget::Selection(selector) => selector
+                        .topology
+                        .entity_id
+                        .as_deref()
+                        .or_else(|| selector.provenance.feature.as_ref().map(|id| id.as_str())),
+                };
+                if input.role.is_empty() || target_id.is_none_or(str::is_empty) {
+                    return Err(format!(
+                        "feature '{}' has an invalid semantic input '{}'",
+                        node.id, input.role
+                    ));
+                }
+            }
+        }
+        if self.semantics.features.len() != node_ids.len() {
+            return Err("semantic document contains feature records with no runtime node".into());
+        }
+        for body in self.semantics.bodies.values() {
+            let mut previous = None;
+            let mut members = std::collections::HashSet::new();
+            for member in &body.timeline {
+                if !members.insert(member) {
+                    return Err(format!(
+                        "body '{}' timeline repeats feature '{member}'",
+                        body.id
+                    ));
+                }
+                let feature = self.semantics.features.get(member).ok_or_else(|| {
+                    format!("body '{}' references missing feature '{member}'", body.id)
+                })?;
+                if feature.body.as_ref() != Some(&body.id) {
+                    return Err(format!(
+                        "feature '{member}' is filed under the wrong body timeline"
+                    ));
+                }
+                if previous.is_some_and(|key| key > feature.sequence) {
+                    return Err(format!(
+                        "body '{}' timeline is not sequence ordered",
+                        body.id
+                    ));
+                }
+                previous = Some(feature.sequence);
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a feature id to its current index, self-healing a missing or
@@ -122,6 +236,7 @@ impl ParametricGraph {
         self.sketch_face_refs.remove(id);
         self.sketch_datum_refs.remove(id);
         self.sketch_face_boundaries.remove(id);
+        self.semantics.remove(id);
         self.rebuild_node_map();
         true
     }
@@ -190,7 +305,141 @@ impl ParametricGraph {
     pub fn clear(&mut self) {
         self.graph.clear();
         self.node_map.clear();
+        self.semantics = crate::document::DocumentSemantics::default();
         self.bootstrap_origin();
+    }
+
+    /// Explicit sequence key for one feature. Runtime nodes created before the
+    /// semantic contract was introduced are lazily assigned during rebuild.
+    pub fn feature_sequence(&self, id: &str) -> Option<crate::document::SequenceKey> {
+        self.semantics
+            .features
+            .get(&crate::document::FeatureId::from(id))
+            .map(|feature| feature.sequence)
+    }
+
+    /// Change intended feature order without rewriting IDs. Dependencies are
+    /// still validated independently by the evaluator's cycle check.
+    pub fn set_feature_sequence(
+        &mut self,
+        id: &str,
+        sequence: crate::document::SequenceKey,
+    ) -> bool {
+        let Some(feature) = self
+            .semantics
+            .features
+            .get_mut(&crate::document::FeatureId::from(id))
+        else {
+            return false;
+        };
+        feature.sequence = sequence;
+        for body in self.semantics.bodies.values_mut() {
+            body.timeline.sort_by_key(|member| {
+                self.semantics
+                    .features
+                    .get(member)
+                    .map(|feature| feature.sequence)
+                    .unwrap_or_default()
+            });
+        }
+        self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
+        true
+    }
+
+    /// Move one feature by one slot in its semantic body timeline. This changes
+    /// user intent without rewriting feature ids or dependency edges.
+    pub fn move_feature_in_timeline(&mut self, id: &str, offset: i32) -> bool {
+        if !matches!(offset, -1 | 1) {
+            return false;
+        }
+        let feature_id = crate::document::FeatureId::from(id);
+        let Some((body_id, position)) = self.semantics.bodies.iter().find_map(|(body_id, body)| {
+            body.timeline
+                .iter()
+                .position(|member| member == &feature_id)
+                .map(|position| (body_id.clone(), position))
+        }) else {
+            return false;
+        };
+        let body = &self.semantics.bodies[&body_id];
+        let other_position = if offset < 0 {
+            position.checked_sub(1)
+        } else {
+            position
+                .checked_add(1)
+                .filter(|&next| next < body.timeline.len())
+        };
+        let Some(other_position) = other_position else {
+            return false;
+        };
+        let other_id = body.timeline[other_position].clone();
+        let Some(sequence) = self
+            .semantics
+            .features
+            .get(&feature_id)
+            .map(|feature| feature.sequence)
+        else {
+            return false;
+        };
+        let Some(other_sequence) = self
+            .semantics
+            .features
+            .get(&other_id)
+            .map(|feature| feature.sequence)
+        else {
+            return false;
+        };
+        self.semantics
+            .features
+            .get_mut(&feature_id)
+            .expect("timeline feature vanished")
+            .sequence = other_sequence;
+        self.semantics
+            .features
+            .get_mut(&other_id)
+            .expect("timeline feature vanished")
+            .sequence = sequence;
+        self.semantics
+            .bodies
+            .get_mut(&body_id)
+            .unwrap()
+            .timeline
+            .swap(position, other_position);
+        self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
+        true
+    }
+
+    pub fn feature_state(&self, id: &str) -> Option<crate::document::FeatureState> {
+        self.semantics
+            .features
+            .get(&crate::document::FeatureId::from(id))
+            .map(|feature| feature.state)
+    }
+
+    /// Suppress or resume one feature. This changes evaluation; hiding does not.
+    pub fn set_feature_suppressed(&mut self, id: &str, suppressed: bool) -> bool {
+        let Some(feature) = self
+            .semantics
+            .features
+            .get_mut(&crate::document::FeatureId::from(id))
+        else {
+            return false;
+        };
+        let state = if suppressed {
+            crate::document::FeatureState::Suppressed
+        } else {
+            crate::document::FeatureState::Active
+        };
+        if feature.state == state {
+            return false;
+        }
+        feature.state = state;
+        self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
+        true
+    }
+
+    pub fn is_feature_suppressed(&self, id: &str) -> bool {
+        self.feature_state(id) == Some(crate::document::FeatureState::Suppressed)
     }
 
     /// Every named variable in the document, mapped to its value in the **base
@@ -200,6 +449,9 @@ impl ParametricGraph {
     pub fn variable_map(&self) -> HashMap<String, f64> {
         let mut map = HashMap::new();
         for idx in self.graph.node_indices() {
+            if self.is_feature_suppressed(&self.graph[idx].id) {
+                continue;
+            }
             if let FeatureType::VariableSet { variables } = &self.graph[idx].feature {
                 for v in variables {
                     if !v.name.trim().is_empty() {
@@ -292,7 +544,7 @@ impl ParametricGraph {
             .next()
             .map(|cp| cp.statuses.clone())
             .unwrap_or_default();
-        let bodies = try_tessellate_bodies(live)?;
+        let bodies = try_tessellate_bodies(visible_live_bodies(live, hidden))?;
         Ok((bodies, warnings, statuses))
     }
 
@@ -361,7 +613,10 @@ impl ParametricGraph {
                 })
                 .collect();
             let tess_started = std::time::Instant::now();
-            let bodies = tessellate_bodies_with_cancel(live, Some(cancellation))?;
+            let bodies = tessellate_bodies_with_cancel(
+                visible_live_bodies(live, hidden),
+                Some(cancellation),
+            )?;
             let tessellation = tess_started.elapsed();
             let face_reattach = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
             Ok(EvaluationOutput {
@@ -428,7 +683,10 @@ impl ParametricGraph {
     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
         let run = || -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
             let (live, warnings) = self.build_live(hidden, draft)?;
-            Ok((try_tessellate_bodies(live)?, warnings))
+            Ok((
+                try_tessellate_bodies(visible_live_bodies(live, hidden))?,
+                warnings,
+            ))
         };
         // Draft previews mesh newly-built bodies at the coarse preview budget (a
         // fillet/chamfer/boolean preview lands ~2× faster). Draft evaluation only
@@ -472,8 +730,9 @@ impl ParametricGraph {
         if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
             return Err("model evaluation was superseded".to_string());
         }
-        // Surface circular dependencies (toposort result is otherwise unused,
-        // but a cycle should still fail the whole evaluation).
+        self.validate_semantic_contracts()
+            .map_err(|error| format!("Invalid semantic document: {error}"))?;
+        // Validate the complete graph, including sketch/datum relationships.
         toposort(&self.graph, None)
             .map_err(|_| "Circular dependency detected in history tree!".to_string())?;
 
@@ -497,7 +756,7 @@ impl ParametricGraph {
         // node — dragging a fillet/chamfer radius, say — leaves every earlier key
         // identical, so the matching prefix (and its expensive booleans) is
         // restored from the previous evaluation instead of recomputed.
-        let nodes: Vec<NodeIndex> = self.body_nodes_in_creation_order();
+        let nodes: Vec<NodeIndex> = self.body_nodes_in_evaluation_order()?;
         let keys = self.eval_prefix_keys(&nodes, hidden, &vars);
 
         // A complete checkpoint hit needs only the final assembled state. Keep
@@ -574,390 +833,47 @@ impl ParametricGraph {
             let node = &self.graph[idx];
             crate::mock_kernel::set_feature_context(Some(&node.id));
             let warn_before = warnings.len();
-            let live_before_feature = live.clone();
-            if !hidden.contains(&node.id) {
-                match &node.feature {
-                    FeatureType::Box { w, h, d } => {
-                        let source = SketchExtrudeSource {
-                            regions: vec![SketchExtrudeRegionSource {
-                                boundary: vec![(0.0, 0.0), (*w, 0.0), (*w, *h), (0.0, *h)],
-                                holes: Vec::new(),
-                                depth: *d,
-                                cs: CoordinateSystem::XY,
-                                rect_circle: None,
-                            }],
-                        };
-                        let solid = crate::mock_kernel::extruded_region_solid(
-                            &source.regions[0].boundary,
-                            &source.regions[0].holes,
-                            source.regions[0].depth,
-                            &source.regions[0].cs,
-                        )
-                        .unwrap_or_else(|| crate::mock_kernel::box_solid(*w, *h, *d));
-                        // Derive the display from the part (single source of truth) so a
-                        // primitive box matches a sketched-extruded rectangle exactly;
-                        // the analytic make_box mesh is only the cracked-mesh fallback.
-                        let mut pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
-                            .unwrap_or_else(|| MockMesh::make_box(*w, *h, *d));
-                        stamp_box_face_refs(&mut pristine, &node.id);
-                        crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
-                        live.push(LiveBody {
-                            id: node.id.clone(),
-                            parts: vec![solid],
-                            pristine: Some(pristine.into()),
-                            sketch_source: Some(source),
-                            cut_tools: Vec::new(),
-                            cut_replay: None,
-                            edge_mod_cut_history_path_used: false,
-                            thread_replay: None,
-                        });
+            if self.is_feature_suppressed(&node.id) {
+                statuses.push(FeatureStatus {
+                    feature_id: node.id.clone(),
+                    feature_name: node.name.clone(),
+                    state: ResolutionState::Suppressed,
+                });
+            } else {
+                // Shared contract: resolve registry family -> invoke into a
+                // candidate state -> validate -> record -> commit -> cache.
+                let mut candidate_live = live.clone();
+                let mut feature_warnings = Vec::new();
+                let invocation = match self.resolve_feature_evaluator(node) {
+                    Ok(evaluator) => self.invoke_registered_feature(
+                        idx,
+                        evaluator,
+                        &vars,
+                        &sketch_cache,
+                        &datums,
+                        draft,
+                        &mut candidate_live,
+                        &mut feature_warnings,
+                    ),
+                    Err(error) => Err(error),
+                };
+                match invocation {
+                    Err(error) => {
+                        feature_warnings.push(format!("Feature '{}': {error}", node.id));
                     }
-                    FeatureType::Cylinder { r, h } => {
-                        if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
-                            // Display derives from the part (single source of truth); the
-                            // analytic make_cylinder mesh is the cracked-mesh fallback.
-                            let mut pristine =
-                                crate::mock_kernel::try_display_mesh_from_part(&solid)
-                                    .unwrap_or_else(|| MockMesh::make_cylinder(*r, *h, 32));
-                            stamp_cylinder_face_refs(&mut pristine, &node.id);
-                            crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
-                            live.push(LiveBody {
-                                id: node.id.clone(),
-                                parts: vec![solid],
-                                pristine: Some(pristine.into()),
-                                sketch_source: None,
-                                cut_tools: Vec::new(),
-                                cut_replay: None,
-                                edge_mod_cut_history_path_used: false,
-                                thread_replay: None,
-                            });
+                    Ok(()) => {
+                        if let Err(reason) = validate_live_body_state(&candidate_live) {
+                            feature_warnings.push(format!(
+                                "Feature '{}' produced invalid solid topology ({reason}); \
+                                 the feature was not applied.",
+                                node.id
+                            ));
+                        } else {
+                            live = candidate_live;
                         }
                     }
-                    FeatureType::Import { step_data, label } => {
-                        match crate::mock_kernel::consume_operation(
-                            "STEP import",
-                            openrcad::exchange::read_step_str_operation(step_data),
-                        ) {
-                            Ok(outcome) => {
-                                let solid = outcome.solid;
-                                let mut pristine = MockMesh::from_solid(&solid);
-                                if pristine.indices.is_empty() {
-                                    warnings.push(format!(
-                                        "Import '{}' ({}): STEP body tessellated empty.",
-                                        node.id, label
-                                    ));
-                                }
-                                stamp_import_face_refs(&mut pristine, &node.id);
-                                crate::mock_kernel::populate_edge_adjacent_face_names(
-                                    &mut pristine,
-                                );
-                                live.push(LiveBody {
-                                    id: node.id.clone(),
-                                    parts: vec![solid],
-                                    pristine: Some(pristine.into()),
-                                    sketch_source: None,
-                                    cut_tools: Vec::new(),
-                                    cut_replay: None,
-                                    edge_mod_cut_history_path_used: false,
-                                    thread_replay: None,
-                                });
-                            }
-                            Err(e) => warnings.push(format!(
-                                "Import '{}' ({}): failed to parse STEP data: {}.",
-                                node.id, label, e
-                            )),
-                        }
-                    }
-                    FeatureType::Extrude {
-                        depth,
-                        region_indices,
-                        mode,
-                        depth_expr,
-                        target,
-                    } => {
-                        // An expression that still resolves drives the depth; a
-                        // missing/broken variable falls back to the stored value and
-                        // surfaces a warning (otherwise the model silently builds
-                        // with a stale depth — e.g. after a referenced variable is
-                        // deleted).
-                        let eff_depth = match depth_expr.as_ref() {
-                            Some(e) => match crate::expr::eval(e, &vars) {
-                                Ok(v) => v as f32,
-                                Err(_) => {
-                                    warnings.push(format!(
-                                    "Extrude '{}': depth expression \"{}\" no longer evaluates; \
-                                     using last value {:.3}.",
-                                    node.id, e, depth
-                                ));
-                                    *depth
-                                }
-                            },
-                            None => *depth,
-                        };
-                        self.apply_extrude(
-                            idx,
-                            &node.id,
-                            eff_depth,
-                            region_indices,
-                            *mode,
-                            target.as_deref(),
-                            &sketch_cache,
-                            &datums,
-                            draft,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Revolve {
-                        axis,
-                        angle_deg,
-                        angle_expr,
-                        region_indices,
-                        mode,
-                        target,
-                    } => {
-                        let eff_angle = match angle_expr.as_ref() {
-                            Some(e) => match crate::expr::eval(e, &vars) {
-                                Ok(v) => v as f32,
-                                Err(_) => {
-                                    warnings.push(format!(
-                                        "Revolve '{}': angle expression \"{}\" no longer \
-                                         evaluates; using last value {:.3}.",
-                                        node.id, e, angle_deg
-                                    ));
-                                    *angle_deg
-                                }
-                            },
-                            None => *angle_deg,
-                        };
-                        self.apply_revolve(
-                            idx,
-                            &node.id,
-                            axis,
-                            eff_angle,
-                            region_indices,
-                            *mode,
-                            target.as_deref(),
-                            &sketch_cache,
-                            &datums,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Pattern { source, kind } => {
-                        apply_pattern(
-                            &node.id,
-                            source,
-                            kind,
-                            &vars,
-                            &datums,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::BodyTransform {
-                        source,
-                        translation,
-                        copy,
-                    } => {
-                        apply_body_transform(
-                            &node.id,
-                            source,
-                            *translation,
-                            *copy,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::BodyJoin { sources } => {
-                        apply_body_join(&node.id, sources, &mut live, &mut warnings);
-                    }
-                    FeatureType::BodyCut {
-                        target,
-                        tool,
-                        keep_tool,
-                    } => {
-                        apply_body_cut(
-                            &node.id,
-                            target,
-                            tool,
-                            *keep_tool,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Thread {
-                        target,
-                        face,
-                        internal,
-                        pitch,
-                        depth,
-                        angle_deg,
-                        right_handed,
-                        starts,
-                        length,
-                        flip,
-                        ..
-                    } => {
-                        apply_thread(
-                            &node.id,
-                            target,
-                            face,
-                            *internal,
-                            *pitch,
-                            *depth,
-                            *angle_deg,
-                            *right_handed,
-                            *starts,
-                            *length,
-                            *flip,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Loft {
-                        sections,
-                        mode,
-                        target,
-                    } => {
-                        self.apply_loft(
-                            &node.id,
-                            sections,
-                            *mode,
-                            target.as_deref(),
-                            &sketch_cache,
-                            &datums,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Sweep {
-                        profile_sketch,
-                        profile_region,
-                        path_sketch,
-                        mode,
-                        target,
-                    } => {
-                        self.apply_sweep(
-                            &node.id,
-                            profile_sketch,
-                            *profile_region,
-                            path_sketch,
-                            *mode,
-                            target.as_deref(),
-                            &sketch_cache,
-                            &datums,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Shell {
-                        target,
-                        thickness,
-                        thickness_expr,
-                        open_faces,
-                    } => {
-                        let eff_thickness = match thickness_expr.as_ref() {
-                            Some(e) => match crate::expr::eval(e, &vars) {
-                                Ok(v) => v as f32,
-                                Err(_) => {
-                                    warnings.push(format!(
-                                        "Shell '{}': thickness expression \"{}\" no longer \
-                                         evaluates; using last value {:.3}.",
-                                        node.id, e, thickness
-                                    ));
-                                    *thickness
-                                }
-                            },
-                            None => *thickness,
-                        };
-                        apply_shell(
-                            &node.id,
-                            target,
-                            eff_thickness,
-                            open_faces,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::Hole {
-                        target,
-                        position,
-                        direction,
-                        diameter,
-                        diameter_expr,
-                        depth,
-                        kind,
-                    } => {
-                        let eff_diameter = match diameter_expr.as_ref() {
-                            Some(e) => match crate::expr::eval(e, &vars) {
-                                Ok(v) => v as f32,
-                                Err(_) => {
-                                    warnings.push(format!(
-                                        "Hole '{}': diameter expression \"{}\" no longer \
-                                         evaluates; using last value {:.3}.",
-                                        node.id, e, diameter
-                                    ));
-                                    *diameter
-                                }
-                            },
-                            None => *diameter,
-                        };
-                        apply_hole(
-                            &node.id,
-                            target,
-                            *position,
-                            *direction,
-                            eff_diameter,
-                            *depth,
-                            kind,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    FeatureType::EdgeMod {
-                        target,
-                        edge,
-                        dist,
-                        dist_expr,
-                        replay,
-                        kind,
-                    } => {
-                        let eff_dist = match dist_expr.as_ref() {
-                            Some(e) => match crate::expr::eval(e, &vars) {
-                                Ok(v) => v as f32,
-                                Err(_) => {
-                                    warnings.push(format!(
-                                        "Edge modifier '{}': distance expression \"{}\" no longer \
-                                     evaluates; using last value {:.3}.",
-                                        node.id, e, dist
-                                    ));
-                                    *dist
-                                }
-                            },
-                            None => *dist,
-                        };
-                        apply_edge_mod(
-                            &node.id,
-                            target,
-                            edge,
-                            replay,
-                            eff_dist,
-                            *kind,
-                            &mut live,
-                            &mut warnings,
-                        );
-                    }
-                    _ => {}
                 }
-                if let Err(reason) = validate_live_body_state(&live) {
-                    live = live_before_feature;
-                    warnings.push(format!(
-                        "Feature '{}' produced invalid solid topology ({reason}); \
-                         the feature was not applied.",
-                        node.id
-                    ));
-                }
+                warnings.extend(feature_warnings);
                 // Per-feature resolution status: this node is Unresolved iff it
                 // raised a warning while being applied — each warning names its own
                 // feature and this node's dispatch is the only thing that ran since
@@ -997,6 +913,417 @@ impl ParametricGraph {
         Ok((live, warnings))
     }
 
+    /// Invoke one resolved feature through its registry-selected evaluator
+    /// family. Resolution/validation/recording/commit/cache remain in the shared
+    /// outer pipeline; feature-specific code is isolated here.
+    fn resolve_feature_evaluator(
+        &self,
+        node: &FeatureNode,
+    ) -> Result<crate::document::FeatureEvaluatorKind, String> {
+        let semantic = self
+            .semantics
+            .features
+            .get(&crate::document::FeatureId::from(node.id.as_str()))
+            .ok_or_else(|| "missing semantic feature contract".to_string())?;
+        let registration = crate::document::FeatureRegistry::get(semantic.kind_id.as_str())
+            .ok_or_else(|| format!("unregistered feature kind '{}'", semantic.kind_id))?;
+        if registration.kind_id != node.feature.kind_id()
+            || registration.payload_version != semantic.payload_version
+        {
+            return Err("runtime feature disagrees with its registered semantic contract".into());
+        }
+        Ok(registration.evaluator)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_registered_feature(
+        &self,
+        idx: NodeIndex,
+        evaluator: crate::document::FeatureEvaluatorKind,
+        vars: &HashMap<String, f64>,
+        sketch_cache: &HashMap<NodeIndex, SketchEval>,
+        datums: &HashMap<String, DatumValue>,
+        draft: bool,
+        live: &mut Vec<LiveBody>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let node = &self.graph[idx];
+        let supported = match evaluator {
+            crate::document::FeatureEvaluatorKind::Primitive => {
+                matches!(
+                    node.feature,
+                    FeatureType::Box { .. } | FeatureType::Cylinder { .. }
+                )
+            }
+            crate::document::FeatureEvaluatorKind::Exchange => {
+                matches!(node.feature, FeatureType::Import { .. })
+            }
+            crate::document::FeatureEvaluatorKind::BodyOperation => matches!(
+                node.feature,
+                FeatureType::Extrude { .. }
+                    | FeatureType::Revolve { .. }
+                    | FeatureType::Pattern { .. }
+                    | FeatureType::BodyTransform { .. }
+                    | FeatureType::BodyJoin { .. }
+                    | FeatureType::BodyCut { .. }
+                    | FeatureType::Thread { .. }
+                    | FeatureType::Loft { .. }
+                    | FeatureType::Sweep { .. }
+                    | FeatureType::Shell { .. }
+                    | FeatureType::Hole { .. }
+                    | FeatureType::EdgeMod { .. }
+            ),
+            crate::document::FeatureEvaluatorKind::Infrastructure
+            | crate::document::FeatureEvaluatorKind::Sketch
+            | crate::document::FeatureEvaluatorKind::Datum => false,
+        };
+        if !supported {
+            return Err(format!(
+                "registry evaluator {:?} cannot invoke feature kind '{}'",
+                evaluator,
+                node.feature.kind_id()
+            ));
+        }
+
+        match &node.feature {
+            FeatureType::Box { w, h, d } => {
+                let source = SketchExtrudeSource {
+                    regions: vec![SketchExtrudeRegionSource {
+                        boundary: vec![(0.0, 0.0), (*w, 0.0), (*w, *h), (0.0, *h)],
+                        holes: Vec::new(),
+                        depth: *d,
+                        cs: CoordinateSystem::XY,
+                        rect_circle: None,
+                    }],
+                };
+                let solid = crate::mock_kernel::extruded_region_solid(
+                    &source.regions[0].boundary,
+                    &source.regions[0].holes,
+                    source.regions[0].depth,
+                    &source.regions[0].cs,
+                )
+                .unwrap_or_else(|| crate::mock_kernel::box_solid(*w, *h, *d));
+                // Derive the display from the part (single source of truth) so a
+                // primitive box matches a sketched-extruded rectangle exactly;
+                // the analytic make_box mesh is only the cracked-mesh fallback.
+                let mut pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
+                    .unwrap_or_else(|| MockMesh::make_box(*w, *h, *d));
+                stamp_box_face_refs(&mut pristine, &node.id);
+                crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
+                live.push(LiveBody {
+                    id: node.id.clone(),
+                    parts: vec![solid],
+                    pristine: Some(pristine.into()),
+                    sketch_source: Some(source),
+                    cut_tools: Vec::new(),
+                    cut_replay: None,
+                    edge_mod_cut_history_path_used: false,
+                    thread_replay: None,
+                });
+            }
+            FeatureType::Cylinder { r, h } => {
+                if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
+                    // Display derives from the part (single source of truth); the
+                    // analytic make_cylinder mesh is the cracked-mesh fallback.
+                    let mut pristine = crate::mock_kernel::try_display_mesh_from_part(&solid)
+                        .unwrap_or_else(|| MockMesh::make_cylinder(*r, *h, 32));
+                    stamp_cylinder_face_refs(&mut pristine, &node.id);
+                    crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
+                    live.push(LiveBody {
+                        id: node.id.clone(),
+                        parts: vec![solid],
+                        pristine: Some(pristine.into()),
+                        sketch_source: None,
+                        cut_tools: Vec::new(),
+                        cut_replay: None,
+                        edge_mod_cut_history_path_used: false,
+                        thread_replay: None,
+                    });
+                }
+            }
+            FeatureType::Import { step_data, label } => {
+                match crate::mock_kernel::consume_operation(
+                    "STEP import",
+                    openrcad::exchange::read_step_str_operation(step_data),
+                ) {
+                    Ok(outcome) => {
+                        let solid = outcome.solid;
+                        let mut pristine = MockMesh::from_solid(&solid);
+                        if pristine.indices.is_empty() {
+                            warnings.push(format!(
+                                "Import '{}' ({}): STEP body tessellated empty.",
+                                node.id, label
+                            ));
+                        }
+                        stamp_import_face_refs(&mut pristine, &node.id);
+                        crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
+                        live.push(LiveBody {
+                            id: node.id.clone(),
+                            parts: vec![solid],
+                            pristine: Some(pristine.into()),
+                            sketch_source: None,
+                            cut_tools: Vec::new(),
+                            cut_replay: None,
+                            edge_mod_cut_history_path_used: false,
+                            thread_replay: None,
+                        });
+                    }
+                    Err(e) => warnings.push(format!(
+                        "Import '{}' ({}): failed to parse STEP data: {}.",
+                        node.id, label, e
+                    )),
+                }
+            }
+            FeatureType::Extrude {
+                depth,
+                region_indices,
+                mode,
+                depth_expr,
+                target,
+            } => {
+                // An expression that still resolves drives the depth; a
+                // missing/broken variable falls back to the stored value and
+                // surfaces a warning (otherwise the model silently builds
+                // with a stale depth — e.g. after a referenced variable is
+                // deleted).
+                let eff_depth = match depth_expr.as_ref() {
+                    Some(e) => match crate::expr::eval(e, vars) {
+                        Ok(v) => v as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Extrude '{}': depth expression \"{}\" no longer evaluates; \
+                             using last value {:.3}.",
+                                node.id, e, depth
+                            ));
+                            *depth
+                        }
+                    },
+                    None => *depth,
+                };
+                self.apply_extrude(
+                    idx,
+                    &node.id,
+                    eff_depth,
+                    region_indices,
+                    *mode,
+                    target.as_deref(),
+                    sketch_cache,
+                    datums,
+                    draft,
+                    live,
+                    warnings,
+                );
+            }
+            FeatureType::Revolve {
+                axis,
+                angle_deg,
+                angle_expr,
+                region_indices,
+                mode,
+                target,
+            } => {
+                let eff_angle = match angle_expr.as_ref() {
+                    Some(e) => match crate::expr::eval(e, vars) {
+                        Ok(v) => v as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Revolve '{}': angle expression \"{}\" no longer \
+                                 evaluates; using last value {:.3}.",
+                                node.id, e, angle_deg
+                            ));
+                            *angle_deg
+                        }
+                    },
+                    None => *angle_deg,
+                };
+                self.apply_revolve(
+                    idx,
+                    &node.id,
+                    axis,
+                    eff_angle,
+                    region_indices,
+                    *mode,
+                    target.as_deref(),
+                    sketch_cache,
+                    datums,
+                    live,
+                    warnings,
+                );
+            }
+            FeatureType::Pattern { source, kind } => {
+                apply_pattern(&node.id, source, kind, vars, datums, live, warnings);
+            }
+            FeatureType::BodyTransform {
+                source,
+                translation,
+                copy,
+            } => {
+                apply_body_transform(&node.id, source, *translation, *copy, live, warnings);
+            }
+            FeatureType::BodyJoin { sources } => {
+                apply_body_join(&node.id, sources, live, warnings);
+            }
+            FeatureType::BodyCut {
+                target,
+                tool,
+                keep_tool,
+            } => {
+                apply_body_cut(&node.id, target, tool, *keep_tool, live, warnings);
+            }
+            FeatureType::Thread {
+                target,
+                face,
+                internal,
+                pitch,
+                depth,
+                angle_deg,
+                right_handed,
+                starts,
+                length,
+                flip,
+                ..
+            } => {
+                apply_thread(
+                    &node.id,
+                    target,
+                    face,
+                    *internal,
+                    *pitch,
+                    *depth,
+                    *angle_deg,
+                    *right_handed,
+                    *starts,
+                    *length,
+                    *flip,
+                    live,
+                    warnings,
+                );
+            }
+            FeatureType::Loft {
+                sections,
+                mode,
+                target,
+            } => {
+                self.apply_loft(
+                    &node.id,
+                    sections,
+                    *mode,
+                    target.as_deref(),
+                    sketch_cache,
+                    datums,
+                    live,
+                    warnings,
+                );
+            }
+            FeatureType::Sweep {
+                profile_sketch,
+                profile_region,
+                path_sketch,
+                mode,
+                target,
+            } => {
+                self.apply_sweep(
+                    &node.id,
+                    profile_sketch,
+                    *profile_region,
+                    path_sketch,
+                    *mode,
+                    target.as_deref(),
+                    sketch_cache,
+                    datums,
+                    live,
+                    warnings,
+                );
+            }
+            FeatureType::Shell {
+                target,
+                thickness,
+                thickness_expr,
+                open_faces,
+            } => {
+                let eff_thickness = match thickness_expr.as_ref() {
+                    Some(e) => match crate::expr::eval(e, vars) {
+                        Ok(v) => v as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Shell '{}': thickness expression \"{}\" no longer \
+                                 evaluates; using last value {:.3}.",
+                                node.id, e, thickness
+                            ));
+                            *thickness
+                        }
+                    },
+                    None => *thickness,
+                };
+                apply_shell(&node.id, target, eff_thickness, open_faces, live, warnings);
+            }
+            FeatureType::Hole {
+                target,
+                position,
+                direction,
+                diameter,
+                diameter_expr,
+                depth,
+                kind,
+            } => {
+                let eff_diameter = match diameter_expr.as_ref() {
+                    Some(e) => match crate::expr::eval(e, vars) {
+                        Ok(v) => v as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Hole '{}': diameter expression \"{}\" no longer \
+                                 evaluates; using last value {:.3}.",
+                                node.id, e, diameter
+                            ));
+                            *diameter
+                        }
+                    },
+                    None => *diameter,
+                };
+                apply_hole(
+                    &node.id,
+                    target,
+                    *position,
+                    *direction,
+                    eff_diameter,
+                    *depth,
+                    kind,
+                    live,
+                    warnings,
+                );
+            }
+            FeatureType::EdgeMod {
+                target,
+                edge,
+                dist,
+                dist_expr,
+                replay,
+                kind,
+            } => {
+                let eff_dist = match dist_expr.as_ref() {
+                    Some(e) => match crate::expr::eval(e, vars) {
+                        Ok(v) => v as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Edge modifier '{}': distance expression \"{}\" no longer \
+                             evaluates; using last value {:.3}.",
+                                node.id, e, dist
+                            ));
+                            *dist
+                        }
+                    },
+                    None => *dist,
+                };
+                apply_edge_mod(
+                    &node.id, target, edge, replay, eff_dist, *kind, live, warnings,
+                );
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     pub fn edge_mod_replay_intent_for_edge(
         &self,
         target: &str,
@@ -1023,8 +1350,9 @@ impl ParametricGraph {
 
     /// Cumulative content hash of the geometry inputs for each node in `nodes`,
     /// in order — `keys[i]` covers nodes `0..=i`. Folds `vars` (the seed, so any
-    /// variable change invalidates everything), then per node its id, hidden
-    /// state, feature, and its inputs' features (e.g. an extrude's parent sketch).
+    /// variable change invalidates everything), then per node its id,
+    /// suppression state, feature, and inputs' features. Visibility is excluded
+    /// because it does not change evaluated geometry.
     /// Two evaluations agree on a prefix exactly when the geometry of that prefix
     /// is identical, which is what makes reusing a cached checkpoint sound.
     /// Hashing only — no geometry is built here.
@@ -1038,7 +1366,7 @@ impl ParametricGraph {
     pub(crate) fn eval_prefix_keys(
         &self,
         nodes: &[NodeIndex],
-        hidden: &std::collections::HashSet<String>,
+        _hidden: &std::collections::HashSet<String>,
         vars: &HashMap<String, f64>,
     ) -> Vec<u64> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1067,10 +1395,15 @@ impl ParametricGraph {
                 )
             })
             .collect();
-        datum_nodes.sort_by_key(|&i| creation_key(&self.graph[i].id));
+        datum_nodes.sort_by_key(|&i| {
+            self.feature_sequence(&self.graph[i].id)
+                .map(|key| key.0)
+                .unwrap_or_else(|| creation_key(&self.graph[i].id))
+        });
         for idx in datum_nodes {
             let node = &self.graph[idx];
             h.write(node.id.as_bytes());
+            h.write_u8(self.is_feature_suppressed(&node.id) as u8);
             fold_feature(&mut h, &node.feature);
         }
         let mut datum_refs: Vec<(&String, &String)> = self.sketch_datum_refs.iter().collect();
@@ -1085,7 +1418,7 @@ impl ParametricGraph {
         for &idx in nodes {
             let node = &self.graph[idx];
             h.write(node.id.as_bytes());
-            h.write_u8(hidden.contains(&node.id) as u8);
+            h.write_u8(self.is_feature_suppressed(&node.id) as u8);
             fold_feature(&mut h, &node.feature);
             // An input node's geometry feeds this one (an extrude reads its parent
             // sketch's plane + curves), so a change there must invalidate from here.
@@ -1095,6 +1428,7 @@ impl ParametricGraph {
             {
                 let pn = &self.graph[p];
                 h.write(pn.id.as_bytes());
+                h.write_u8(self.is_feature_suppressed(&pn.id) as u8);
                 fold_feature(&mut h, &pn.feature);
             }
             keys.push(h.finish());
@@ -1108,6 +1442,9 @@ impl ParametricGraph {
     fn sketch_region_cache(&self, vars: &HashMap<String, f64>) -> HashMap<NodeIndex, SketchEval> {
         let mut cache = HashMap::new();
         for idx in self.graph.node_indices() {
+            if self.is_feature_suppressed(&self.graph[idx].id) {
+                continue;
+            }
             if let FeatureType::Sketch {
                 cs,
                 curves,
@@ -1229,7 +1566,13 @@ impl ParametricGraph {
     /// Solid-producing nodes (Box / Cylinder / Extrude) in creation order — the
     /// order booleans must see (see [`evaluate_bodies_with_warnings`]).
     pub(crate) fn body_nodes_in_creation_order(&self) -> Vec<NodeIndex> {
-        let mut nodes: Vec<NodeIndex> = self
+        self.body_nodes_in_evaluation_order().unwrap_or_default()
+    }
+
+    /// Dependency-safe evaluator order. `SequenceKey` is deliberately only a
+    /// tie-breaker among ready nodes, so timeline edits never violate the DAG.
+    fn body_nodes_in_evaluation_order(&self) -> Result<Vec<NodeIndex>, String> {
+        let nodes: Vec<NodeIndex> = self
             .graph
             .node_indices()
             .filter(|&i| {
@@ -1253,8 +1596,47 @@ impl ParametricGraph {
                 )
             })
             .collect();
-        nodes.sort_by_key(|&i| creation_key(&self.graph[i].id));
-        nodes
+        let body_nodes: std::collections::HashSet<NodeIndex> = nodes.iter().copied().collect();
+        let mut indegree: HashMap<NodeIndex, usize> = nodes
+            .iter()
+            .map(|&node| {
+                let count = self
+                    .graph
+                    .neighbors_directed(node, petgraph::Direction::Incoming)
+                    .filter(|parent| body_nodes.contains(parent))
+                    .count();
+                (node, count)
+            })
+            .collect();
+        let order_key = |idx: NodeIndex| {
+            (
+                self.feature_sequence(&self.graph[idx].id)
+                    .map(|key| key.0)
+                    .unwrap_or_else(|| creation_key(&self.graph[idx].id)),
+                self.graph[idx].id.as_str(),
+            )
+        };
+        let mut ordered = Vec::with_capacity(nodes.len());
+        while ordered.len() < nodes.len() {
+            let next = nodes
+                .iter()
+                .copied()
+                .filter(|node| indegree.get(node) == Some(&0))
+                .min_by_key(|node| order_key(*node))
+                .ok_or_else(|| "Circular dependency detected in body timeline!".to_string())?;
+            indegree.remove(&next);
+            ordered.push(next);
+            for child in self
+                .graph
+                .neighbors_directed(next, petgraph::Direction::Outgoing)
+                .filter(|child| body_nodes.contains(child))
+            {
+                if let Some(value) = indegree.get_mut(&child) {
+                    *value = value.saturating_sub(1);
+                }
+            }
+        }
+        Ok(ordered)
     }
 
     /// Evaluate one Extrude node against the bodies assembled so far. Resolves
@@ -2493,6 +2875,8 @@ fn stamp_generated_face_refs(mesh: &mut MockMesh, body_id: &str, kind: &str) {
             topology_version: Some(0),
             face_id: Some(format!("{kind}:{body_id}:face:{k}")),
             surface_kind: None,
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
         });
     }
 }
@@ -3956,6 +4340,22 @@ pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> 
 
 fn try_tessellate_bodies(live: Vec<LiveBody>) -> Result<Vec<(String, MockMesh)>, String> {
     tessellate_bodies_with_cancel(live, None).map_err(|error| error.to_string())
+}
+
+/// Visibility is presentation-only. The complete B-Rep history is built and
+/// cached first; only final display bodies are removed here.
+fn visible_live_bodies(
+    live: Vec<LiveBody>,
+    hidden: &std::collections::HashSet<String>,
+) -> Vec<LiveBody> {
+    if hidden.is_empty() {
+        return live;
+    }
+    live.into_iter()
+        .filter(|body| {
+            !hidden.contains(&body.id) && !hidden.contains(body_output_owner_id(&body.id))
+        })
+        .collect()
 }
 
 /// Global evaluator invariant: every runtime part is exactly one connected,

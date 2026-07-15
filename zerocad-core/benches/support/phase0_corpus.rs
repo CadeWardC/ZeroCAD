@@ -1,4 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use zerocad_core::{FeatureNode, FeatureType, ParametricGraph};
+
+static STEP_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const SMALL_CORPUS: &str = "small_part";
 pub const HUNDRED_FEATURE_CORPUS: &str = "dependent_100_feature";
@@ -115,8 +118,11 @@ pub fn five_hundred_feature_history() -> ParametricGraph {
 fn box_step_data() -> String {
     let solid =
         openrcad::primitives::make_box(&openrcad::foundation::Pnt::origin(), 20.0, 12.0, 8.0);
-    let path =
-        std::env::temp_dir().join(format!("zerocad_phase0_import_{}.step", std::process::id()));
+    let sequence = STEP_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "zerocad_phase0_import_{}_{sequence}.step",
+        std::process::id()
+    ));
     let path_text = path.to_string_lossy().into_owned();
     openrcad::exchange::write_step(&solid, &path_text).expect("write imported STEP corpus");
     let step = std::fs::read_to_string(&path).expect("read imported STEP corpus");

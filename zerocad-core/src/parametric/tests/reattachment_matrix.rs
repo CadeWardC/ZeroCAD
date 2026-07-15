@@ -462,6 +462,8 @@ fn cut_walls_carry_generated_names_and_survive_upstream_edit() {
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
             surface_kind: t.surface_kind.clone(),
+            producer_feature_id: t.producer_feature_id.clone(),
+            source_entity_id: t.source_entity_id.clone(),
         }),
     };
 
@@ -723,6 +725,8 @@ fn captured_face_follows_its_own_lump_through_a_sever() {
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
+            producer_feature_id: t.producer_feature_id,
+            source_entity_id: t.source_entity_id,
         }),
     };
 
@@ -907,6 +911,8 @@ fn face_reattaches_to_same_span_after_width_edit() {
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
             surface_kind: t.surface_kind.clone(),
+            producer_feature_id: t.producer_feature_id.clone(),
+            source_entity_id: t.source_entity_id.clone(),
         }),
     };
     assert!(
@@ -951,6 +957,8 @@ fn face_name_absent_reports_none_rather_than_wrong_face() {
             topology_version: Some(0),
             face_id: Some("sketch:extrude_3:region:0:face:does-not-exist".to_string()),
             surface_kind: None,
+            producer_feature_id: Some("extrude_3".to_string()),
+            source_entity_id: None,
         }),
     };
     assert!(
@@ -986,6 +994,8 @@ fn face_reattaches_through_added_cut() {
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
+            producer_feature_id: t.producer_feature_id,
+            source_entity_id: t.source_entity_id,
         }),
     };
 
@@ -1042,6 +1052,8 @@ fn face_survives_a_severing_cut() {
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
+            producer_feature_id: t.producer_feature_id,
+            source_entity_id: t.source_entity_id,
         }),
     };
 
@@ -1100,6 +1112,8 @@ fn sketch_on_face_plane_follows_the_body() {
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
+            producer_feature_id: t.producer_feature_id,
+            source_entity_id: t.source_entity_id,
         }),
     };
 
@@ -1178,6 +1192,8 @@ fn face_reattaches_through_join() {
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
+            producer_feature_id: t.producer_feature_id,
+            source_entity_id: t.source_entity_id,
         }),
     };
 

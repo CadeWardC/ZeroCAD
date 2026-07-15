@@ -16,7 +16,10 @@ impl ZeroCadApp {
             gpu_render: prefs.gpu_render,
             graphics_backend: prefs.backend,
             msaa_level: prefs.msaa,
-            hydrated_cache_mb: prefs.hydrated_cache_mb,
+            hydrated_cache_mb: match prefs.hydrated_cache_mb {
+                64 | 128 | 256 | 512 => prefs.hydrated_cache_mb,
+                _ => 128,
+            },
             gpu_texture_id: None,
             frame_preview_plan: None,
             evaluator: evaluation_worker::ModelEvaluator::new(),

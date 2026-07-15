@@ -2,24 +2,26 @@ use crate::SharedBodyMeshes;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use zerocad_core::{EvaluationCacheSnapshot, ParametricGraph, Unit, ZcadDocument};
+use zerocad_core::{
+    Document, EvaluationCacheSnapshot, HydrationBundle, ParametricGraph, SaveOptions, SaveProfile,
+    Unit,
+};
 
 pub(crate) struct SaveRequest {
     pub path: PathBuf,
     pub graph: ParametricGraph,
     pub bodies: SharedBodyMeshes,
-    pub embed_hydrated: bool,
+    pub profile: SaveProfile,
     pub units: Unit,
-    pub created_unix: Option<u64>,
     pub hidden_nodes: HashSet<String>,
+    pub created_unix: Option<u64>,
     pub cache: EvaluationCacheSnapshot,
-    pub hydrated_cache_limit: usize,
 }
 
 pub(crate) struct SaveCompletion {
     pub path: PathBuf,
     pub result: Result<(), String>,
-    pub embed_hydrated: bool,
+    pub profile: SaveProfile,
 }
 
 pub(crate) struct DocumentWorker {
@@ -37,12 +39,12 @@ impl DocumentWorker {
                 while let Ok(request) = requests.recv() {
                     let started = std::time::Instant::now();
                     let path = request.path.clone();
-                    let embed_hydrated = request.embed_hydrated;
+                    let profile = request.profile;
                     let result = save(request).map_err(|error| error.to_string());
                     let _ = completed.send(SaveCompletion {
                         path,
                         result,
-                        embed_hydrated,
+                        profile,
                     });
                     log::debug!("document save worker: {:?}", started.elapsed());
                 }
@@ -61,41 +63,53 @@ impl DocumentWorker {
 }
 
 fn save(request: SaveRequest) -> Result<(), zerocad_core::ZcadError> {
-    let thumbnail_png = if request.bodies.is_empty() {
-        None
-    } else {
-        let (w, h, rgba) = crate::thumbnail::render_thumbnail(&request.bodies, 256);
+    let mut document = Document::from_graph(request.graph, request.units);
+    document.state.created_unix = request.created_unix;
+    for hidden in request.hidden_nodes {
+        document.set_visible(hidden, false);
+    }
+
+    let small_preview_png = preview_with_cap(&request.bodies, 128, 96, 32 * 1024);
+    if let Some((w, h, rgba)) = (!request.bodies.is_empty())
+        .then(|| crate::thumbnail::render_thumbnail(&request.bodies, 128))
+    {
         crate::settings::save_thumb(&request.path, w, h, &rgba);
-        crate::thumbnail::encode_png(w, h, &rgba)
+    }
+    let large_preview_png = matches!(request.profile, SaveProfile::Hydrated { .. })
+        .then(|| crate::thumbnail::render_thumbnail(&request.bodies, 256))
+        .and_then(|(w, h, rgba)| crate::thumbnail::encode_png(w, h, &rgba));
+    let accelerators = HydrationBundle {
+        small_preview_png,
+        large_preview_png,
+        display_meshes: Some(request.bodies.as_ref().clone()),
+        evaluation_cache: Some(request.cache),
     };
-    let doc = ZcadDocument {
-        graph: &request.graph,
-        thumbnail_png,
-        mesh_cache: request.embed_hydrated.then_some(request.bodies.as_slice()),
-        units: request.units,
-        bbox: bodies_bbox(&request.bodies),
-        created_unix: request.created_unix,
-        hidden_nodes: request.hidden_nodes,
-        evaluation_cache: request.embed_hydrated.then_some(&request.cache),
-        hydrated_cache_limit: Some(request.hydrated_cache_limit),
-    };
-    zerocad_core::write_zcad_file(&request.path, &doc)
+    zerocad_core::write_document_file(
+        &request.path,
+        &document,
+        &SaveOptions {
+            profile: request.profile,
+        },
+        &accelerators,
+    )
 }
 
-fn bodies_bbox(bodies: &[(String, zerocad_core::MockMesh)]) -> [f32; 6] {
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for (_, mesh) in bodies {
-        for vertex in mesh.vertices.chunks_exact(6) {
-            for axis in 0..3 {
-                min[axis] = min[axis].min(vertex[axis]);
-                max[axis] = max[axis].max(vertex[axis]);
+fn preview_with_cap(
+    bodies: &[(String, zerocad_core::MockMesh)],
+    preferred: usize,
+    fallback: usize,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    if bodies.is_empty() {
+        return None;
+    }
+    for size in [preferred, fallback] {
+        let (w, h, rgba) = crate::thumbnail::render_thumbnail(bodies, size);
+        if let Some(png) = crate::thumbnail::encode_png(w, h, &rgba) {
+            if png.len() <= cap {
+                return Some(png);
             }
         }
     }
-    if min[0].is_finite() {
-        [min[0], min[1], min[2], max[0], max[1], max[2]]
-    } else {
-        [0.0; 6]
-    }
+    None
 }

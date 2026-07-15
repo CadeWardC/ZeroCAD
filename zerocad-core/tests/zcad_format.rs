@@ -5,10 +5,165 @@
 use std::collections::HashSet;
 use zerocad_core::parametric::{FaceRef, TopologyFaceRef};
 use zerocad_core::zcad_format::{
-    read_zcad, read_zcad_file, write_zcad, write_zcad_file, ZcadDocument, ZcadError,
-    CURRENT_VERSION, MAGIC,
+    read_document, read_document_file, read_document_from_slice, read_zcad, read_zcad_file,
+    write_document, write_document_file, write_document_to_vec, write_zcad, write_zcad_file,
+    HydrationBundle, LoadDiagnostic, LoadOptions, SaveOptions, SaveProfile, ZcadDocument,
+    ZcadError, CURRENT_VERSION, MAGIC,
 };
-use zerocad_core::{FeatureNode, FeatureType, ParametricGraph, Unit};
+use zerocad_core::{Document, FeatureNode, FeatureState, FeatureType, ParametricGraph, Unit};
+
+fn feature_payload_corpus() -> Vec<FeatureType> {
+    use zerocad_core::mock_kernel::EdgeCurveHint;
+    use zerocad_core::{
+        AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef,
+        EdgeModReplayIntent, EdgeRef, ExtrudeMode, HoleKind, PatternKind, PlaneBase, SketchCurves,
+        Variable,
+    };
+
+    let face = FaceRef {
+        centroid: [1.0, 2.0, 3.0],
+        normal: [0.0, 0.0, 1.0],
+        topology: None,
+    };
+    vec![
+        FeatureType::Origin,
+        FeatureType::Box {
+            w: 2.0,
+            h: 3.0,
+            d: 4.0,
+        },
+        FeatureType::Cylinder { r: 2.0, h: 5.0 },
+        FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: Vec::new(),
+            corner_mods: Vec::new(),
+            mirrors: Vec::new(),
+            on_face: false,
+            entity_ids: Vec::new(),
+            next_entity_id: 1,
+            solver: None,
+        },
+        FeatureType::Extrude {
+            depth: 6.0,
+            region_indices: vec![0],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            depth_expr: Some("3*2".into()),
+        },
+        FeatureType::EdgeMod {
+            target: "missing_body".into(),
+            edge: EdgeRef {
+                p0: [0.0, 0.0, 0.0],
+                p1: [1.0, 0.0, 0.0],
+                n1: [0.0, 1.0, 0.0],
+                n2: [0.0, 0.0, 1.0],
+                curve: Some(EdgeCurveHint::Line),
+                topology: None,
+            },
+            dist: 0.2,
+            dist_expr: Some("0.1*2".into()),
+            replay: EdgeModReplayIntent::default(),
+            kind: zerocad_core::CornerKind::Chamfer,
+        },
+        FeatureType::VariableSet {
+            variables: vec![Variable::new("width", Unit::Millimeter)],
+        },
+        FeatureType::Import {
+            step_data: "ISO-10303-21;END-ISO-10303-21;".into(),
+            label: "fixture".into(),
+        },
+        FeatureType::Revolve {
+            axis: AxisBase::X,
+            angle_deg: 180.0,
+            angle_expr: Some("90*2".into()),
+            region_indices: vec![0],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+        FeatureType::Loft {
+            sections: vec![("section_a".into(), 0), ("section_b".into(), 1)],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+        FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 0,
+            path_sketch: "path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+        FeatureType::Shell {
+            target: "missing_body".into(),
+            thickness: 0.5,
+            thickness_expr: None,
+            open_faces: vec![face.clone()],
+        },
+        FeatureType::Hole {
+            target: "missing_body".into(),
+            position: [1.0, 1.0, 1.0],
+            direction: [0.0, 0.0, -1.0],
+            diameter: 2.0,
+            diameter_expr: None,
+            depth: Some(4.0),
+            kind: HoleKind::Counterbore {
+                diameter: 4.0,
+                depth: 1.0,
+            },
+        },
+        FeatureType::Pattern {
+            source: "missing_body".into(),
+            kind: PatternKind::Linear {
+                dir: AxisBase::Y,
+                spacing: 3.0,
+                spacing_expr: None,
+                count: 3,
+            },
+        },
+        FeatureType::BodyTransform {
+            source: "missing_body".into(),
+            translation: [1.0, 2.0, 3.0],
+            copy: true,
+        },
+        FeatureType::Thread {
+            target: "missing_body".into(),
+            face,
+            internal: true,
+            pitch: 1.0,
+            depth: 0.3,
+            angle_deg: 60.0,
+            right_handed: true,
+            starts: 2,
+            length: Some(8.0),
+            flip: true,
+            designation: "M6x1".into(),
+        },
+        FeatureType::DatumPlane {
+            def: DatumPlaneDef::Offset {
+                base: PlaneBase::XY,
+                distance: 5.0,
+                distance_expr: None,
+            },
+        },
+        FeatureType::DatumAxis {
+            def: DatumAxisDef::TwoPoints {
+                a: [0.0, 0.0, 0.0],
+                b: [0.0, 0.0, 1.0],
+            },
+        },
+        FeatureType::DatumPoint {
+            def: DatumPointDef::Coords { p: [1.0, 2.0, 3.0] },
+        },
+        FeatureType::BodyJoin {
+            sources: vec!["missing_a".into(), "missing_b".into()],
+        },
+        FeatureType::BodyCut {
+            target: "missing_a".into(),
+            tool: "missing_b".into(),
+            keep_tool: true,
+        },
+    ]
+}
 
 /// A non-trivial document: a box plus a cylinder cut into it.
 fn sample_graph() -> ParametricGraph {
@@ -67,6 +222,417 @@ fn round_trip_recipe_only() {
 }
 
 #[test]
+fn v5_compact_save_is_deterministic_and_strips_accelerators() {
+    let mut graph = sample_graph();
+    assert!(graph.set_feature_suppressed("cyl1", true));
+    let bodies = graph.evaluate_bodies(&HashSet::new()).expect("bodies");
+    let mut document = Document::from_graph(graph, Unit::Millimeter);
+    document.set_visible("box1", false);
+    let accelerators = HydrationBundle {
+        small_preview_png: Some(vec![0x89, b'P', b'N', b'G']),
+        large_preview_png: Some(vec![7; 1024]),
+        display_meshes: Some(bodies),
+        evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+    };
+    let options = SaveOptions {
+        profile: SaveProfile::Compact,
+    };
+
+    let first = write_document_to_vec(&document, &options, &accelerators).expect("first save");
+    let second = write_document_to_vec(&document, &options, &accelerators).expect("second save");
+    assert_eq!(
+        first, second,
+        "identical document state must be byte-stable"
+    );
+
+    let loaded = read_document_from_slice(&first, &LoadOptions::default()).expect("load");
+    assert_eq!(loaded.profile, SaveProfile::Compact);
+    assert!(loaded.accelerators.display_meshes.is_none());
+    assert!(loaded.accelerators.evaluation_cache.is_none());
+    assert!(loaded.accelerators.large_preview_png.is_none());
+    assert!(!loaded.document.is_visible("box1"));
+    assert_eq!(
+        loaded.document.graph.feature_state("cyl1"),
+        Some(FeatureState::Suppressed)
+    );
+}
+
+#[test]
+fn canonical_round_trip_preserves_creation_time_and_prunes_stale_visibility() {
+    let mut document = Document::from_graph(sample_graph(), Unit::Millimeter);
+    document.state.created_unix = Some(1_700_000_123);
+    document.set_visible("box1", false);
+    document.set_visible("deleted_feature", false);
+    let bytes = write_document_to_vec(
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .expect("save");
+    let loaded = read_document_from_slice(&bytes, &LoadOptions::default()).expect("load");
+
+    assert_eq!(loaded.document.state.created_unix, Some(1_700_000_123));
+    assert!(!loaded.document.is_visible("box1"));
+    assert!(loaded.document.is_visible("deleted_feature"));
+    assert!(loaded.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoadDiagnostic::PrunedStaleVisibility { entity_id }
+            if entity_id == "deleted_feature"
+    )));
+
+    let saved_again = write_document_to_vec(
+        &loaded.document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .expect("save again");
+    let reopened = read_document_from_slice(&saved_again, &LoadOptions::default()).expect("reopen");
+    assert_eq!(reopened.document.state.created_unix, Some(1_700_000_123));
+}
+
+#[test]
+fn every_feature_payload_round_trips_and_rebuilds_identically() {
+    for feature in feature_payload_corpus() {
+        let kind_id = feature.kind_id();
+        let mut graph = ParametricGraph::new();
+        let feature_id = if matches!(feature, FeatureType::Origin) {
+            "origin"
+        } else {
+            graph.add_feature(FeatureNode {
+                id: "feature_1".into(),
+                name: kind_id.into(),
+                feature: feature.clone(),
+            });
+            "feature_1"
+        };
+        graph
+            .validate_semantic_contracts()
+            .unwrap_or_else(|error| panic!("{kind_id}: invalid source contract: {error}"));
+        let before = graph
+            .evaluate_bodies_with_warnings(&HashSet::new())
+            .unwrap_or_else(|error| panic!("{kind_id}: source rebuild failed: {error}"));
+        let document = Document::from_graph(graph, Unit::Millimeter);
+        let options = SaveOptions::default();
+        let first = write_document_to_vec(&document, &options, &HydrationBundle::default())
+            .unwrap_or_else(|error| panic!("{kind_id}: save failed: {error}"));
+        let second = write_document_to_vec(&document, &options, &HydrationBundle::default())
+            .unwrap_or_else(|error| panic!("{kind_id}: repeated save failed: {error}"));
+        assert_eq!(first, second, "{kind_id}: compact bytes are not stable");
+
+        let loaded = read_document_from_slice(&first, &LoadOptions::default())
+            .unwrap_or_else(|error| panic!("{kind_id}: load failed: {error}"));
+        let restored = loaded
+            .document
+            .graph
+            .graph
+            .node_weights()
+            .find(|node| node.id == feature_id)
+            .unwrap_or_else(|| panic!("{kind_id}: restored feature is missing"));
+        assert_eq!(restored.feature.kind_id(), kind_id);
+        assert_eq!(
+            serde_json::to_value(&restored.feature).unwrap(),
+            serde_json::to_value(&feature).unwrap(),
+            "{kind_id}: feature payload changed"
+        );
+
+        let after = loaded
+            .document
+            .graph
+            .evaluate_bodies_with_warnings(&HashSet::new())
+            .unwrap_or_else(|error| panic!("{kind_id}: restored rebuild failed: {error}"));
+        assert_eq!(before.1, after.1, "{kind_id}: diagnostics changed");
+        assert_eq!(
+            before.0.len(),
+            after.0.len(),
+            "{kind_id}: body count changed"
+        );
+        for ((before_id, before_mesh), (after_id, after_mesh)) in before.0.iter().zip(&after.0) {
+            assert_eq!(before_id, after_id, "{kind_id}: body identity changed");
+            assert_eq!(
+                before_mesh.vertices, after_mesh.vertices,
+                "{kind_id}: vertices changed"
+            );
+            assert_eq!(
+                before_mesh.indices, after_mesh.indices,
+                "{kind_id}: indices changed"
+            );
+        }
+    }
+}
+
+#[test]
+fn hydrated_budget_is_hard_and_profile_comes_from_content() {
+    let graph = sample_graph();
+    let bodies = graph.evaluate_bodies(&HashSet::new()).expect("bodies");
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    let accelerators = HydrationBundle {
+        small_preview_png: None,
+        large_preview_png: Some(vec![1; 512]),
+        display_meshes: Some(bodies),
+        evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+    };
+    let profile = SaveProfile::Hydrated {
+        total_accelerator_budget: 1,
+    };
+    let bytes = write_document_to_vec(&document, &SaveOptions { profile }, &accelerators)
+        .expect("hydrated save");
+    let loaded = read_document_from_slice(&bytes, &LoadOptions::default()).expect("load");
+    assert_eq!(loaded.profile, profile);
+    assert!(loaded.accelerators.display_meshes.is_none());
+    assert!(loaded.accelerators.evaluation_cache.is_none());
+    assert!(loaded.accelerators.large_preview_png.is_none());
+}
+
+#[test]
+fn compact_profile_has_bounded_overhead_and_no_forbidden_sections() {
+    let document = Document::from_graph(sample_graph(), Unit::Millimeter);
+    let preview = vec![7; 32 * 1024];
+    let bytes = write_document_to_vec(
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle {
+            small_preview_png: Some(preview),
+            large_preview_png: Some(vec![1; 4096]),
+            display_meshes: Some(document.graph.evaluate_bodies(&HashSet::new()).unwrap()),
+            evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+        },
+    )
+    .unwrap();
+    let ids = section_ids(&bytes);
+    assert!(!ids.contains(&4), "compact file contains display meshes");
+    assert!(!ids.contains(&6), "compact file contains checkpoints");
+    assert!(!ids.contains(&7), "compact file contains a large preview");
+
+    let required_payload_bytes: usize = ids
+        .iter()
+        .filter_map(|id| section_entry(&bytes, *id))
+        .filter(|(entry, _, _)| bytes[*entry + 2] & 1 != 0)
+        .map(|(_, _, len)| len)
+        .sum();
+    assert!(
+        bytes.len() - required_payload_bytes <= 40 * 1024,
+        "container framing plus tiny preview exceeds 40 KiB"
+    );
+}
+
+#[test]
+fn streaming_apis_round_trip_without_a_full_file_adapter() {
+    let document = Document::from_graph(sample_graph(), Unit::Millimeter);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    write_document(
+        &mut cursor,
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .unwrap();
+    cursor.set_position(11);
+    let loaded = read_document(&mut cursor, &LoadOptions::default()).unwrap();
+    assert_eq!(loaded.document.graph.graph.node_count(), 3);
+}
+
+#[test]
+fn hydrated_sections_fail_independently_without_losing_the_recipe() {
+    let graph = sample_graph();
+    let bodies = graph.evaluate_bodies(&HashSet::new()).unwrap();
+    let expected = bodies.clone();
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    let bytes = write_document_to_vec(
+        &document,
+        &SaveOptions {
+            profile: SaveProfile::Hydrated {
+                total_accelerator_budget: 128 * 1024 * 1024,
+            },
+        },
+        &HydrationBundle {
+            small_preview_png: None,
+            large_preview_png: Some(vec![3; 4096]),
+            display_meshes: Some(bodies),
+            evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+        },
+    )
+    .unwrap();
+
+    for section in [4u16, 6, 7] {
+        let mut corrupt = bytes.clone();
+        let (_, offset, _) = section_entry(&corrupt, section)
+            .unwrap_or_else(|| panic!("hydrated section {section} was not emitted"));
+        corrupt[offset] ^= 0x80;
+        let loaded = read_document_from_slice(&corrupt, &LoadOptions::default())
+            .unwrap_or_else(|error| panic!("section {section} broke recipe load: {error}"));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            LoadDiagnostic::DiscardedDisposableSection { section: actual, .. }
+                if *actual == section
+        )));
+        let rebuilt = loaded
+            .document
+            .graph
+            .evaluate_bodies(&HashSet::new())
+            .unwrap();
+        assert_eq!(rebuilt.len(), expected.len());
+        for ((expected_id, expected_mesh), (actual_id, actual_mesh)) in
+            expected.iter().zip(&rebuilt)
+        {
+            assert_eq!(expected_id, actual_id);
+            assert_eq!(expected_mesh.vertices, actual_mesh.vertices);
+            assert_eq!(expected_mesh.indices, actual_mesh.indices);
+        }
+    }
+}
+
+#[test]
+fn invalid_mesh_accelerator_is_discarded_by_content_validation() {
+    let document = Document::from_graph(sample_graph(), Unit::Millimeter);
+    let mut invalid = zerocad_core::MockMesh::empty();
+    invalid.vertices = vec![0.0; 6];
+    invalid.indices = vec![0, 1, 0];
+    let bytes = write_document_to_vec(
+        &document,
+        &SaveOptions {
+            profile: SaveProfile::Hydrated {
+                total_accelerator_budget: 1024 * 1024,
+            },
+        },
+        &HydrationBundle {
+            display_meshes: Some(vec![("box1".into(), invalid)]),
+            ..HydrationBundle::default()
+        },
+    )
+    .unwrap();
+    let loaded = read_document_from_slice(&bytes, &LoadOptions::default()).unwrap();
+    assert!(loaded.accelerators.display_meshes.is_none());
+    assert!(loaded.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoadDiagnostic::DiscardedDisposableSection { section: 4, reason }
+            if reason.contains("invalid index")
+    )));
+}
+
+#[test]
+fn extension_mismatch_opens_by_content_and_warns() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("hydrated-content.zcad");
+    let document = Document::from_graph(sample_graph(), Unit::Millimeter);
+    write_document_file(
+        &path,
+        &document,
+        &SaveOptions {
+            profile: SaveProfile::Hydrated {
+                total_accelerator_budget: 64 * 1024 * 1024,
+            },
+        },
+        &HydrationBundle::default(),
+    )
+    .unwrap();
+    let loaded = read_document_file(&path, &LoadOptions::default()).unwrap();
+    assert!(matches!(loaded.profile, SaveProfile::Hydrated { .. }));
+    assert!(loaded
+        .diagnostics
+        .iter()
+        .any(|diagnostic| matches!(diagnostic, LoadDiagnostic::ExtensionProfileMismatch { .. })));
+}
+
+#[test]
+fn failed_atomic_save_preserves_the_previous_complete_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("part.zcad");
+    let original = Document::from_graph(sample_graph(), Unit::Millimeter);
+    write_document_file(
+        &path,
+        &original,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .unwrap();
+
+    let mut invalid_graph = ParametricGraph::new();
+    invalid_graph.add_feature(FeatureNode {
+        id: "invalid".into(),
+        name: "Invalid".into(),
+        feature: FeatureType::Box {
+            w: f32::NAN,
+            h: 1.0,
+            d: 1.0,
+        },
+    });
+    let invalid = Document::from_graph(invalid_graph, Unit::Millimeter);
+    assert!(write_document_file(
+        &path,
+        &invalid,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .is_err());
+
+    let loaded = read_document_file(&path, &LoadOptions::default()).unwrap();
+    assert_eq!(loaded.document.graph.graph.node_count(), 3);
+}
+
+#[test]
+fn non_finite_parameters_are_rejected_before_storage() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "bad".into(),
+        name: "Bad box".into(),
+        feature: FeatureType::Box {
+            w: f32::NAN,
+            h: 1.0,
+            d: 1.0,
+        },
+    });
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    assert!(matches!(
+        write_document_to_vec(&document, &SaveOptions::default(), &HydrationBundle::default()),
+        Err(ZcadError::Decode(message)) if message.contains("non-finite")
+    ));
+}
+
+#[test]
+fn load_limits_fail_before_decoding_large_sections() {
+    let document = Document::from_graph(sample_graph(), Unit::Millimeter);
+    let bytes = write_document_to_vec(
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .unwrap();
+    let mut options = LoadOptions::default();
+    options.limits.max_recipe_bytes = 1;
+    assert!(matches!(
+        read_document_from_slice(&bytes, &options),
+        Err(ZcadError::LimitExceeded {
+            what: "decoded section length",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn corrupt_disposable_preview_is_dropped_with_a_diagnostic() {
+    let graph = sample_graph();
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    let mut bytes = write_document_to_vec(
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle {
+            small_preview_png: Some(vec![0x89, b'P', b'N', b'G', 1, 2, 3]),
+            ..HydrationBundle::default()
+        },
+    )
+    .unwrap();
+    let (_, offset, _) = section_entry(&bytes, 3).expect("preview section");
+    bytes[offset] ^= 0xff;
+
+    let loaded = read_document_from_slice(&bytes, &LoadOptions::default()).expect("recipe loads");
+    assert!(loaded.accelerators.small_preview_png.is_none());
+    assert!(loaded.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoadDiagnostic::DiscardedDisposableSection { section: 3, .. }
+    )));
+}
+
+#[test]
 fn connected_component_face_identity_round_trips() {
     let mut pg = sample_graph();
     pg.sketch_face_refs.insert(
@@ -80,6 +646,8 @@ fn connected_component_face_identity_round_trips() {
                 topology_version: Some(0),
                 face_id: Some("box_box1:face:+x".to_string()),
                 surface_kind: Some("plane".to_string()),
+                producer_feature_id: Some("box1".to_string()),
+                source_entity_id: None,
             }),
         },
     );
@@ -105,8 +673,8 @@ fn incompatible_binary_contract_is_rejected() {
     let mut bytes = write_zcad(&doc_for(&pg)).expect("write");
     let obsolete = CURRENT_VERSION - 1;
     bytes[4..6].copy_from_slice(&obsolete.to_le_bytes());
-    let checksum = crc32fast::hash(&bytes[0..12]);
-    bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
+    let digest = blake3::hash(&bytes[0..12]);
+    bytes[12..28].copy_from_slice(&digest.as_bytes()[..16]);
 
     assert!(
         matches!(read_zcad(&bytes), Err(ZcadError::UnsupportedVersion(v)) if v == obsolete),
@@ -471,12 +1039,107 @@ fn unknown_section_is_skipped() {
     );
 }
 
+#[test]
+fn unknown_required_section_is_rejected() {
+    let pg = sample_graph();
+    let bytes = write_zcad(&doc_for(&pg)).expect("write");
+    let mut spliced = splice_unknown_section(&bytes);
+    let count = u16::from_le_bytes(spliced[8..10].try_into().unwrap()) as usize;
+    let last_entry = 32 + (count - 1) * 48;
+    spliced[last_entry + 2] = 1; // required rather than disposable
+    assert!(matches!(
+        read_zcad(&spliced),
+        Err(ZcadError::UnknownRequiredSection(0xffff))
+    ));
+}
+
+#[test]
+fn duplicate_and_overlapping_sections_are_rejected_before_payload_decode() {
+    let bytes = write_zcad(&doc_for(&sample_graph())).unwrap();
+    let mut duplicate = bytes.clone();
+    let first_id = duplicate[32..34].to_vec();
+    duplicate[32 + 48..32 + 48 + 2].copy_from_slice(&first_id);
+    assert!(matches!(
+        read_zcad(&duplicate),
+        Err(ZcadError::DuplicateSection(_))
+    ));
+
+    let mut overlapping = bytes;
+    let first_offset = overlapping[32 + 4..32 + 12].to_vec();
+    overlapping[32 + 48 + 4..32 + 48 + 12].copy_from_slice(&first_offset);
+    assert!(matches!(
+        read_zcad(&overlapping),
+        Err(ZcadError::OverlappingSections { .. })
+    ));
+}
+
+#[test]
+fn integer_overflow_and_impossible_lengths_are_rejected() {
+    let bytes = write_zcad(&doc_for(&sample_graph())).unwrap();
+    let mut overflow = bytes.clone();
+    overflow[32 + 4..32 + 12].copy_from_slice(&u64::MAX.to_le_bytes());
+    overflow[32 + 12..32 + 20].copy_from_slice(&2u64.to_le_bytes());
+    assert!(matches!(read_zcad(&overflow), Err(ZcadError::Truncated)));
+
+    let mut impossible = bytes;
+    let graph_entry = section_entry(&impossible, 2).unwrap().0;
+    impossible[graph_entry + 20..graph_entry + 28]
+        .copy_from_slice(&(257u64 * 1024 * 1024).to_le_bytes());
+    assert!(matches!(
+        read_zcad(&impossible),
+        Err(ZcadError::LimitExceeded {
+            what: "decoded section length",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn malformed_cbor_and_decompression_length_mismatch_are_rejected() {
+    let bytes = write_zcad(&doc_for(&sample_graph())).unwrap();
+    let mut malformed = bytes.clone();
+    let (metadata_entry, metadata_offset, metadata_len) = section_entry(&malformed, 1).unwrap();
+    malformed[metadata_offset..metadata_offset + metadata_len].fill(0xff);
+    let digest = blake3::hash(&malformed[metadata_offset..metadata_offset + metadata_len]);
+    malformed[metadata_entry + 28..metadata_entry + 44].copy_from_slice(&digest.as_bytes()[..16]);
+    assert!(matches!(read_zcad(&malformed), Err(ZcadError::Decode(_))));
+
+    let mut mismatch = bytes;
+    let graph_entry = section_entry(&mismatch, 2).unwrap().0;
+    mismatch[graph_entry + 20..graph_entry + 28].copy_from_slice(&1u64.to_le_bytes());
+    assert!(matches!(read_zcad(&mismatch), Err(ZcadError::Decode(_))));
+}
+
+fn section_entry(bytes: &[u8], id: u16) -> Option<(usize, usize, usize)> {
+    let count = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as usize;
+    for index in 0..count {
+        let base = 32 + index * 48;
+        let entry_id = u16::from_le_bytes(bytes[base..base + 2].try_into().ok()?);
+        if entry_id == id {
+            let offset = u64::from_le_bytes(bytes[base + 4..base + 12].try_into().ok()?) as usize;
+            let len = u64::from_le_bytes(bytes[base + 12..base + 20].try_into().ok()?) as usize;
+            return Some((base, offset, len));
+        }
+    }
+    None
+}
+
+fn section_ids(bytes: &[u8]) -> Vec<u16> {
+    let count = u16::from_le_bytes(bytes[8..10].try_into().unwrap()) as usize;
+    (0..count)
+        .map(|index| {
+            let base = 32 + index * 48;
+            u16::from_le_bytes(bytes[base..base + 2].try_into().unwrap())
+        })
+        .collect()
+}
+
 /// Insert a fabricated section with id 0xFFFF after the real sections, fixing up
 /// the header section count, the section table, and appending a payload.
 fn splice_unknown_section(bytes: &[u8]) -> Vec<u8> {
     const HEADER_LEN: usize = 32;
-    const ENTRY_LEN: usize = 32;
-    let count = bytes[8] as usize;
+    const ENTRY_LEN: usize = 48;
+    let count = u16::from_le_bytes(bytes[8..10].try_into().unwrap()) as usize;
     let table_end = HEADER_LEN + count * ENTRY_LEN;
 
     // The fabricated payload and where it will live (after all existing data),
@@ -489,9 +1152,9 @@ fn splice_unknown_section(bytes: &[u8]) -> Vec<u8> {
 
     // Header with count+1, and a recomputed header crc over [0..12).
     out.extend_from_slice(&bytes[0..HEADER_LEN]);
-    out[8] = (count + 1) as u8;
-    let crc = crc32fast::hash(&out[0..12]);
-    out[12..16].copy_from_slice(&crc.to_le_bytes());
+    out[8..10].copy_from_slice(&((count + 1) as u16).to_le_bytes());
+    let digest = blake3::hash(&out[0..12]);
+    out[12..28].copy_from_slice(&digest.as_bytes()[..16]);
 
     // Existing table entries, with their payload offsets shifted by `shift`.
     for i in 0..count {
@@ -503,14 +1166,15 @@ fn splice_unknown_section(bytes: &[u8]) -> Vec<u8> {
     }
 
     // The new unknown-section table entry.
-    let checksum = crc32fast::hash(&extra);
+    let digest = blake3::hash(&extra);
     out.extend_from_slice(&0xFFFFu16.to_le_bytes()); // id
+    out.push(2u8); // disposable
     out.push(0u8); // codec = store
-    out.push(0u8); // flags
     out.extend_from_slice(&(new_payload_offset as u64).to_le_bytes());
     out.extend_from_slice(&(extra.len() as u64).to_le_bytes());
     out.extend_from_slice(&(extra.len() as u64).to_le_bytes());
-    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&digest.as_bytes()[..16]);
+    out.extend_from_slice(&[0u8; 4]);
 
     // Existing payloads (everything after the original table), then the new one.
     out.extend_from_slice(&bytes[table_end..]);

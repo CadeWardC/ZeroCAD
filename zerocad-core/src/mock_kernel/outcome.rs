@@ -108,6 +108,10 @@ fn active_feature() -> String {
     ACTIVE_FEATURE.with(|active| active.borrow().clone().unwrap_or_default())
 }
 
+pub(crate) fn current_feature_context() -> Option<String> {
+    ACTIVE_FEATURE.with(|active| active.borrow().clone())
+}
+
 fn record_diagnostic(diagnostic: EvaluationDiagnostic) {
     PENDING_DIAGNOSTICS.with(|pending| pending.borrow_mut().push(diagnostic));
 }

@@ -104,6 +104,12 @@ pub struct TopologyEdgeRef {
     pub curve_kind: Option<String>,
     #[serde(default)]
     pub adjacent_surface_kinds: Vec<String>,
+    /// Feature that produced this exact named topology entity.
+    #[serde(default)]
+    pub producer_feature_id: Option<String>,
+    /// Previous durable entity replaced by the producing feature, when known.
+    #[serde(default)]
+    pub source_entity_id: Option<String>,
 }
 
 /// A solid edge captured geometrically for a 3D fillet/chamfer. The endpoints
@@ -148,6 +154,12 @@ pub struct TopologyFaceRef {
     pub face_id: Option<String>,
     #[serde(default)]
     pub surface_kind: Option<String>,
+    /// Feature that produced this exact named topology entity.
+    #[serde(default)]
+    pub producer_feature_id: Option<String>,
+    /// Previous durable entity replaced by the producing feature, when known.
+    #[serde(default)]
+    pub source_entity_id: Option<String>,
 }
 
 /// A solid face captured for reattachment: its centroid and outward normal in
@@ -658,6 +670,10 @@ pub struct FeatureNode {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParametricGraph {
     pub graph: DiGraph<FeatureNode, ()>,
+    /// Stable document meaning for runtime nodes: explicit sequence, inputs,
+    /// suppression, kind IDs, body identity, and body timelines.
+    #[serde(default)]
+    pub semantics: crate::document::DocumentSemantics,
     /// For a sketch placed on a body face: the durable [`FaceRef`] to that face,
     /// keyed by sketch node id. On rebuild the sketch's plane is re-derived from
     /// wherever the face now is (see `apply_extrude`), so a sketch-on-face follows
@@ -784,6 +800,9 @@ pub struct FeatureTiming {
 pub enum ResolutionState {
     /// The feature resolved its target(s) and applied without complaint.
     Resolved,
+    /// The user intentionally excluded the feature from evaluation. Unlike
+    /// visibility, suppression changes geometry and participates in cache keys.
+    Suppressed,
     /// The feature could not be applied as intended; the string is the reason
     /// (the same message surfaced in the warning list).
     Unresolved(String),
@@ -810,7 +829,7 @@ impl FeatureStatus {
     pub fn reason(&self) -> Option<&str> {
         match &self.state {
             ResolutionState::Unresolved(r) => Some(r.as_str()),
-            ResolutionState::Resolved => None,
+            ResolutionState::Resolved | ResolutionState::Suppressed => None,
         }
     }
 }

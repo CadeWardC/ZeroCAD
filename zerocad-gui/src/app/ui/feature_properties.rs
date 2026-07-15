@@ -65,6 +65,9 @@ impl ZeroCadApp {
                 // `node` holds a mutable borrow of the graph below.
                 let mut extrude_request: Option<String> = None;
                 let mut edit_sketch_request: Option<String> = None;
+                let selected_feature_id = self.graph.graph[idx].id.clone();
+                let feature_suppressed = self.graph.is_feature_suppressed(&selected_feature_id);
+                let mut suppression_request: Option<bool> = None;
                 let mut modified = false;
 
                 // Capture palette + unit + the variable map before
@@ -107,6 +110,22 @@ impl ZeroCadApp {
                                 ui.label(egui::RichText::new("Label:").size(12.0));
                                 ui.text_edit_singleline(&mut node.name);
                             });
+                            if node.id != "origin" {
+                                ui.add_space(4.0);
+                                let mut participates_in_rebuild = !feature_suppressed;
+                                if ui
+                                    .checkbox(
+                                        &mut participates_in_rebuild,
+                                        "Participates in rebuild",
+                                    )
+                                    .on_hover_text(
+                                        "Suppressed features stay in the timeline but do not evaluate",
+                                    )
+                                    .changed()
+                                {
+                                    suppression_request = Some(!participates_in_rebuild);
+                                }
+                            }
                             ui.add_space(8.0);
                             ui.separator();
                             ui.add_space(8.0);
@@ -1168,6 +1187,21 @@ impl ZeroCadApp {
                             }
                         });
                     });
+
+                if let Some(suppressed) = suppression_request {
+                    self.push_undo();
+                    if self
+                        .graph
+                        .set_feature_suppressed(&selected_feature_id, suppressed)
+                    {
+                        self.status_msg = if suppressed {
+                            format!("Suppressed feature '{selected_feature_id}'.")
+                        } else {
+                            format!("Resumed feature '{selected_feature_id}'.")
+                        };
+                        modified = true;
+                    }
+                }
 
                 if modified {
                     self.reevaluate_geometry();

@@ -83,12 +83,9 @@ pub(crate) fn apply_edge_mod(
 }
 
 pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> Option<EdgeRef> {
+    let selector = crate::document::SemanticSelector::from_edge(edge);
     let requested = edge.topology.as_ref()?;
-    if requested
-        .body_id
-        .as_deref()
-        .is_some_and(|body_id| body_id != body.id)
-    {
+    if !selector.applies_to_body(&body.id) {
         return None;
     }
 
@@ -97,7 +94,7 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
     //    carry the same id (a bite cuts the middle out of a rectangle's top
     //    edge), so an id match alone is ambiguous — disambiguate by geometry,
     //    never by enumeration order.
-    if let Some(requested_edge_id) = requested.edge_id.as_deref() {
+    if let Some(requested_edge_id) = selector.topology.entity_id.as_deref() {
         let pick_by_id = |mesh: &MockMesh| -> Option<EdgeRef> {
             let matches: Vec<&crate::mock_kernel::MeshEdgeRef> = mesh
                 .edge_refs
@@ -235,6 +232,8 @@ pub(crate) fn edge_ref_from_mesh_candidate(
         adjacent_face_ids: topology.adjacent_face_ids.clone(),
         curve_kind: topology.curve_kind.clone(),
         adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+        producer_feature_id: topology.producer_feature_id.clone(),
+        source_entity_id: topology.source_entity_id.clone(),
     });
     if topology.is_none() {
         topology = Some(requested.clone());
@@ -268,13 +267,10 @@ pub(crate) struct ResolvedBodyFace {
 }
 
 pub(crate) fn resolve_face_on_body(body: &LiveBody, face: &FaceRef) -> Option<ResolvedBodyFace> {
+    let selector = crate::document::SemanticSelector::from_face(face);
     if let Some(requested) = face.topology.as_ref() {
-        if let Some(requested_face_id) = requested.face_id.as_deref() {
-            if requested
-                .body_id
-                .as_deref()
-                .is_some_and(|body_id| body_id != body.id)
-            {
+        if let Some(requested_face_id) = selector.topology.entity_id.as_deref() {
+            if !selector.applies_to_body(&body.id) {
                 return None;
             }
             // A severing cut can leave SEVERAL faces with the same name — one
@@ -357,6 +353,8 @@ fn resolved_face_from_mesh_face(
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
             surface_kind: t.surface_kind.clone(),
+            producer_feature_id: t.producer_feature_id.clone(),
+            source_entity_id: t.source_entity_id.clone(),
         })
         .or_else(|| Some(requested.clone()));
     let component_index = component_index_for_face(body, candidate)?;
@@ -390,6 +388,8 @@ fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<Resol
                         topology_version: t.topology_version,
                         face_id: t.face_id.clone(),
                         surface_kind: t.surface_kind.clone(),
+                        producer_feature_id: t.producer_feature_id.clone(),
+                        source_entity_id: t.source_entity_id.clone(),
                     })
                     .unwrap_or_default();
                 resolved_face_from_mesh_face(body, c, &requested)

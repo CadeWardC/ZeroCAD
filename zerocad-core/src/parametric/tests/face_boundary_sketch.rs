@@ -88,6 +88,8 @@ fn face_outline_rederives_when_the_body_changes() {
             topology_version: t.topology_version,
             face_id: t.face_id,
             surface_kind: t.surface_kind,
+            producer_feature_id: t.producer_feature_id,
+            source_entity_id: t.source_entity_id,
         }),
     };
     let cs = CoordinateSystem::new(

@@ -97,6 +97,9 @@ impl ParametricGraph {
             .graph
             .node_indices()
             .filter(|&i| {
+                if self.is_feature_suppressed(&self.graph[i].id) {
+                    return false;
+                }
                 matches!(
                     self.graph[i].feature,
                     FeatureType::DatumPlane { .. }
@@ -105,7 +108,11 @@ impl ParametricGraph {
                 )
             })
             .collect();
-        nodes.sort_by_key(|&i| creation_key(&self.graph[i].id));
+        nodes.sort_by_key(|&i| {
+            self.feature_sequence(&self.graph[i].id)
+                .map(|key| key.0)
+                .unwrap_or_else(|| creation_key(&self.graph[i].id))
+        });
 
         let mut resolved: HashMap<String, DatumValue> = HashMap::new();
         for idx in nodes {
