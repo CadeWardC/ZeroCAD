@@ -257,7 +257,10 @@ mod operation_tests {
                 .value
                 .validate_strict_with_policy(&TolerancePolicy::STANDARD)
                 .is_ok());
-            assert!(result.history.coverage_for_solid(&result.value).is_complete());
+            assert!(result
+                .history
+                .coverage_for_solid(&result.value)
+                .is_complete());
         }
     }
 

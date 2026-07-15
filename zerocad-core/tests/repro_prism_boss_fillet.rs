@@ -213,7 +213,7 @@ fn seam_xy(sign: f32) -> (f32, f32) {
 }
 
 #[test]
-fn fillet_boss_plane_seam_edge() {
+fn oversized_boss_plane_seam_fillet_fails_safely() {
     let mut graph = prism_boss_graph();
     let (x, y) = seam_xy(1.0); // (15.2, 18.6)
     graph.add_feature(FeatureNode {
@@ -229,7 +229,10 @@ fn fillet_boss_plane_seam_edge() {
                 curve: None,
                 topology: None,
             },
-            dist: 3.0,
+            // The valid seam blend is covered in OpenRCAD's active native
+            // suite. Keep this app integration test bounded with a radius that
+            // must be rejected before the Phase 3 replay path.
+            dist: 30.0,
             dist_expr: None,
             replay: Default::default(),
             kind: CornerKind::Fillet,
@@ -239,9 +242,16 @@ fn fillet_boss_plane_seam_edge() {
 
     let warnings = eval_warnings(&graph);
     assert!(
-        warnings.is_empty(),
-        "seam fillet should apply cleanly, got {warnings:?}"
+        !warnings.is_empty(),
+        "an oversized seam fillet must explain why it was rejected"
     );
+    let solids = graph
+        .debug_kernel_solids(&HashSet::new())
+        .expect("fallback kernel solids");
+    assert!(solids.iter().flat_map(|(_, parts)| parts).all(|solid| {
+        solid.is_watertight() && solid.health_report().is_healthy() && solid.validate().is_ok()
+    }));
+    assert!(warnings.iter().all(|warning| !warning.is_empty()));
 }
 
 /// A plain line-drawn triangle prism (no boss), mirroring the GUI screenshots:

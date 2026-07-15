@@ -420,25 +420,48 @@ pub fn propagate_face_names_via_history(
     generated_prefix: &str,
 ) -> MockMesh {
     use openrcad::algo::BooleanFaceSource;
-    let mut mesh = MockMesh::from_solid(result_solid);
-    for face_ref in &mut mesh.face_refs {
-        // The mesh's canonical face id IS a result shell-face position.
-        let shell_idx = face_ref.face_id as usize;
-        let name = match history.source_of(shell_idx) {
-            Some(BooleanFaceSource::Object(i)) => input_names.get(i).cloned().flatten(),
-            Some(BooleanFaceSource::Tool(i)) => Some(format!("{generated_prefix}:tool-face:{i}")),
-            None => None,
+    let result_faces = result_solid.shell().faces();
+    let mut mesh = MockMesh::empty();
+
+    // A severing cut temporarily carries several connected components in one
+    // shell so its face-history indices still refer to one canonical result.
+    // Strict tessellation correctly rejects that packed shell. Tessellate each
+    // component independently, then map its structurally preserved faces back
+    // to their positions in the packed result before consuming the history.
+    for component in result_solid.split_disconnected() {
+        let component_faces = component.shell().faces();
+        let result_indices: Vec<Option<usize>> = component_faces
+            .iter()
+            .map(|face| result_faces.iter().position(|candidate| candidate == face))
+            .collect();
+        let mut component_mesh = MockMesh::from_solid(&component);
+        for face_ref in &mut component_mesh.face_refs {
+            // The mesh's canonical face id is a component shell-face position.
+            // Curved sub-faces may share the first position in their group.
+            let shell_idx = result_indices
+                .get(face_ref.face_id as usize)
+                .copied()
+                .flatten();
+            let name = shell_idx
+                .and_then(|index| history.source_of(index))
+                .and_then(|source| match source {
+                    BooleanFaceSource::Object(i) => input_names.get(i).cloned().flatten(),
+                    BooleanFaceSource::Tool(i) => Some(format!("{generated_prefix}:tool-face:{i}")),
+                })
+                .or_else(|| {
+                    matching_input_face_name(input_mesh, face_ref.centroid, face_ref.normal)
+                });
+            if let Some(name) = name {
+                face_ref.topology = Some(MeshTopologyFaceRef {
+                    body_id: Some(body_id.to_string()),
+                    component_id: None,
+                    topology_version: Some(0),
+                    face_id: Some(name),
+                    surface_kind: None,
+                });
+            }
         }
-        .or_else(|| matching_input_face_name(input_mesh, face_ref.centroid, face_ref.normal));
-        if let Some(name) = name {
-            face_ref.topology = Some(MeshTopologyFaceRef {
-                body_id: Some(body_id.to_string()),
-                component_id: None,
-                topology_version: Some(0),
-                face_id: Some(name),
-                surface_kind: None,
-            });
-        }
+        mesh.append(component_mesh);
     }
     populate_edge_adjacent_face_names(&mut mesh);
     mesh

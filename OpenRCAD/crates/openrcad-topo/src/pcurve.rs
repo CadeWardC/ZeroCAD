@@ -134,6 +134,17 @@ impl PcurveData {
         Some((first, second))
     }
 
+    /// Return the same face-local curve with its bounded traversal reversed.
+    /// This is required when sewing chooses an oppositely-oriented 3D edge as
+    /// the representative for a coedge: the pcurve's normalized progress must
+    /// continue to match the representative edge's natural start and end.
+    #[inline]
+    pub fn reversed(&self) -> Self {
+        let mut reversed = self.clone();
+        std::mem::swap(&mut reversed.first, &mut reversed.last);
+        reversed
+    }
+
     /// True when the unwrapped pcurve crosses a U seam.
     pub fn crosses_u_seam(&self) -> bool {
         crosses_periodic_seam(

@@ -20,12 +20,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openrcad_foundation::{Pnt, TolerancePolicy, Vec as FVec};
+use openrcad_foundation::{Dir2d, Pnt, Pnt2d, TolerancePolicy, Vec as FVec};
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Line};
+use openrcad_geom2d::{GeomCurve2d, Line2d};
 use openrcad_topo::arena::{
     BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, ShellData, VertexId,
 };
-use openrcad_topo::{BRepBuilder, Orientation, Shell, Solid};
+use openrcad_topo::{BRepBuilder, Orientation, PcurveData, Shell, Solid};
 
 /// A point quantized to the merge tolerance so coincident positions compare equal.
 type QPoint = (i64, i64, i64);
@@ -86,14 +87,7 @@ pub fn merge_coplanar_faces_classed_with_policy(
     brep.retain_faces(&face_ids);
     let shell_id = brep.shells.insert(ShellData { faces: face_ids });
     let merged = Solid::new(Shell::from_id(Arc::new(brep), shell_id));
-
-    if merged.is_watertight_with_policy(policy)
-        && merged.health_report_with_policy(policy).is_healthy()
-    {
-        merged
-    } else {
-        solid.clone()
-    }
+    strict_repaired_candidate(merged, policy).unwrap_or_else(|| solid.clone())
 }
 
 /// Merge adjacent cocylindrical faces (same axis frame, radius, and orientation)
@@ -144,14 +138,7 @@ pub fn merge_cocylindrical_faces_classed_with_policy(
     brep.retain_faces(&face_ids);
     let shell_id = brep.shells.insert(ShellData { faces: face_ids });
     let merged = Solid::new(Shell::from_id(Arc::new(brep), shell_id));
-
-    if merged.is_watertight_with_policy(policy)
-        && merged.health_report_with_policy(policy).is_healthy()
-    {
-        merged
-    } else {
-        solid.clone()
-    }
+    strict_repaired_candidate(merged, policy).unwrap_or_else(|| solid.clone())
 }
 
 /// Heal T-junctions: split any edge at a vertex that lies in its interior.
@@ -251,13 +238,21 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
         .shells
         .insert(ShellData { faces: face_ids });
     let healed = Solid::new(Shell::from_id(builder.build(), shell_id));
+    strict_repaired_candidate(healed, policy).unwrap_or_else(|| solid.clone())
+}
 
-    if healed.is_watertight_with_policy(policy)
-        && healed.health_report_with_policy(policy).is_healthy()
+/// Repair pcurves affected by a topology rewrite and apply the complete Phase 1
+/// acceptance gate. Merge/healing helpers intentionally return `None` rather
+/// than leaking a partially repaired candidate to their compatibility callers.
+fn strict_repaired_candidate(candidate: Solid, policy: &TolerancePolicy) -> Option<Solid> {
+    let (candidate, _) = candidate.repair_pcurves(policy).ok()?;
+    if candidate.is_watertight_with_policy(policy)
+        && candidate.health_report_with_policy(policy).is_healthy()
+        && candidate.validate_strict_with_policy(policy).is_ok()
     {
-        healed
+        Some(candidate)
     } else {
-        solid.clone()
+        None
     }
 }
 
@@ -526,6 +521,27 @@ fn merge_collinear_edges(brep: &mut BRep, face_ids: &[FaceId]) {
     }
 }
 
+/// Consolidate safe degree-two collinear boundary runs without requiring a
+/// same-domain face merge. The candidate is returned only when it removes edges
+/// and passes the complete strict representation gate.
+pub(crate) fn consolidate_collinear_edges_with_policy(
+    solid: &Solid,
+    policy: &TolerancePolicy,
+) -> Solid {
+    let mut brep = (**solid.brep()).clone();
+    let face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|face| face.id()).collect();
+    let original_edges = brep.edges.len();
+    merge_collinear_edges(&mut brep, &face_ids);
+    if brep.edges.len() >= original_edges {
+        return solid.clone();
+    }
+
+    brep.retain_faces(&face_ids);
+    let shell_id = brep.shells.insert(ShellData { faces: face_ids });
+    let candidate = Solid::new(Shell::from_id(Arc::new(brep), shell_id));
+    strict_repaired_candidate(candidate, policy).unwrap_or_else(|| solid.clone())
+}
+
 /// All loop ids referenced by `face_ids` (outer + inner wires).
 fn relevant_loops(brep: &BRep, face_ids: &[FaceId]) -> Vec<openrcad_topo::arena::LoopId> {
     let mut out = Vec::new();
@@ -587,6 +603,67 @@ fn collinear_merge_endpoints(
     Some((a, b))
 }
 
+fn merged_collinear_pcurve(
+    brep: &BRep,
+    first: OrientedEdge,
+    second: OrientedEdge,
+    new_orientation: Orientation,
+) -> Option<PcurveData> {
+    let first_pcurve = brep.pcurves.get(first.pcurve?)?;
+    let second_pcurve = brep.pcurves.get(second.pcurve?)?;
+    if first_pcurve.periodicity != second_pcurve.periodicity {
+        return None;
+    }
+    let traversal_points = |coedge: OrientedEdge, pcurve: &PcurveData| {
+        if coedge.orientation == Orientation::Reversed {
+            (pcurve.point_at_fraction(1.0), pcurve.point_at_fraction(0.0))
+        } else {
+            (pcurve.point_at_fraction(0.0), pcurve.point_at_fraction(1.0))
+        }
+    };
+    let (start, joint) = traversal_points(first, first_pcurve);
+    let (mut next_start, mut end) = traversal_points(second, second_pcurve);
+    let align = |value: f64, target: f64, period: Option<f64>| {
+        period.map_or(value, |period| {
+            value + ((target - value) / period).round() * period
+        })
+    };
+    let aligned_x = align(
+        next_start.x(),
+        joint.x(),
+        second_pcurve.periodicity.u_period,
+    );
+    let aligned_y = align(
+        next_start.y(),
+        joint.y(),
+        second_pcurve.periodicity.v_period,
+    );
+    let offset_x = aligned_x - next_start.x();
+    let offset_y = aligned_y - next_start.y();
+    next_start = Pnt2d::new(aligned_x, aligned_y);
+    end = Pnt2d::new(end.x() + offset_x, end.y() + offset_y);
+    if next_start.distance(&joint) > 1.0e-6 {
+        return None;
+    }
+    let (natural_start, natural_end) = if new_orientation == Orientation::Reversed {
+        (end, start)
+    } else {
+        (start, end)
+    };
+    let delta_x = natural_end.x() - natural_start.x();
+    let delta_y = natural_end.y() - natural_start.y();
+    let length = delta_x.hypot(delta_y);
+    let direction = Dir2d::try_new(delta_x, delta_y)?;
+    Some(
+        PcurveData::new(
+            GeomCurve2d::line(Line2d::from_point_dir(natural_start, direction)),
+            0.0,
+            length,
+        )
+        .with_periodicity(first_pcurve.periodicity),
+    )
+}
+
 /// Replace edges `e1`,`e2` (meeting at `v`) with one straight edge `a -> b`
 /// across every relevant loop, then delete `e1`, `e2`, and `v`.
 fn apply_collinear_merge(
@@ -633,14 +710,17 @@ fn apply_collinear_merge(
         let j = (i + 1) % n;
         // The merged co-edge runs from the pair's entry vertex to its exit.
         let entry_vid = oriented_start_vertex(brep, &l.edges[i]);
+        let orientation = if entry_vid == a {
+            Orientation::Forward
+        } else {
+            Orientation::Reversed
+        };
+        let pcurve = merged_collinear_pcurve(brep, l.edges[i], l.edges[j], orientation)
+            .map(|pcurve| brep.pcurves.insert(pcurve));
         let oe_new = OrientedEdge {
             id: e_new,
-            orientation: if entry_vid == a {
-                Orientation::Forward
-            } else {
-                Orientation::Reversed
-            },
-            pcurve: None,
+            orientation,
+            pcurve,
         };
         let new_edges: Vec<OrientedEdge> = (0..n)
             .filter_map(|k| {

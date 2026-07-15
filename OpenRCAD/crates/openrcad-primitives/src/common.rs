@@ -35,11 +35,7 @@ pub(crate) fn arc_edges(circle: Circle, breaks: &[f64]) -> Vec<Edge> {
 
 /// A straight pcurve between two UV points. Its parameter interval is arc
 /// length in UV space, independent of the corresponding 3D edge interval.
-pub(crate) fn uv_line(
-    start: Pnt2d,
-    end: Pnt2d,
-    periodicity: SurfacePeriodicity,
-) -> PcurveData {
+pub(crate) fn uv_line(start: Pnt2d, end: Pnt2d, periodicity: SurfacePeriodicity) -> PcurveData {
     let dx = end.x() - start.x();
     let dy = end.y() - start.y();
     let length = dx.hypot(dy);

@@ -17,7 +17,7 @@ use openrcad_geom::{GeomCurve, GeomSurface, Line, Plane, RuledSurface};
 use openrcad_topo::{Edge, Face, Solid, Wire};
 
 use crate::revolve::{loop_agrees_with_surface, reversed_wire};
-use crate::sew::sew;
+use crate::sew::{compatibility_policy, sew_with_policy};
 
 /// Errors reported by [`skin_polygon_rings`].
 #[derive(Clone, Debug, PartialEq)]
@@ -170,7 +170,9 @@ pub fn skin_polygon_rings(rings: &[Vec<Pnt>]) -> Result<Solid, SkinError> {
         ));
     }
 
-    let solid = Solid::new(sew(&faces, tolerance::CONFUSION * 10.0));
+    let policy = compatibility_policy(tolerance::CONFUSION * 10.0);
+    let solid =
+        Solid::new(sew_with_policy(&faces, &policy).expect("compatibility policy is valid"));
     if !solid.is_watertight() {
         return Err(SkinError::NotWatertight);
     }

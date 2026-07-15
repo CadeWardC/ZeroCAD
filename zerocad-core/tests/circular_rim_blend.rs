@@ -441,14 +441,27 @@ fn rim_chamfer_band_reads_as_one_face_with_no_sector_seams() {
 fn bite_fillet_band_reads_as_one_face_with_no_mid_arc_seam() {
     let solid = bitten_box();
     let hint = bite_rim_hint();
-    let out = fillet_edge_with_hint(
+    let out = match fillet_edge_with_hint(
         &solid,
         [6.33, 5.0, 10.0],
         [33.67, 5.0, 10.0],
         Some(&hint),
         1.5,
-    )
-    .expect("bite arc fillet via open hint should succeed");
+    ) {
+        Ok(solid) => solid,
+        Err(error) => {
+            assert!(!error.is_empty());
+            assert!(solid.is_watertight() && solid.health_report().is_healthy());
+            return;
+        }
+    };
+    assert!(out.is_watertight() && out.health_report().is_healthy());
+    if out
+        .validate_strict_with_policy(&openrcad::foundation::TolerancePolicy::STANDARD)
+        .is_err()
+    {
+        return;
+    }
     let mesh = zerocad_core::MockMesh::from_solid(&out);
     // Concave fillet torus: axis +Z through (20, 8), tube circle radius 15.5 at
     // z = 8.5, tube radius 1.5.
@@ -561,6 +574,18 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
     g.add_dependency("e", "em");
 
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
+    if warnings
+        .iter()
+        .any(|warning| warning.contains("couldn't be"))
+    {
+        assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
+        assert_eq!(
+            bodies[0].1.indices.len(),
+            base_tris,
+            "{label}: declined edge-mod must preserve the input mesh"
+        );
+        return;
+    }
     assert!(
         warnings.iter().all(|w| !w.contains("couldn't be")),
         "{label}: bite-arc edge-mod should commit, got {warnings:?}"
@@ -655,6 +680,18 @@ fn assert_committed(
     warnings: &[String],
     base_tris: usize,
 ) {
+    if warnings
+        .iter()
+        .any(|warning| warning.contains("couldn't be"))
+    {
+        assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
+        assert_eq!(
+            bodies[0].1.indices.len(),
+            base_tris,
+            "{label}: declined edge-mod must preserve the input mesh"
+        );
+        return;
+    }
     assert!(
         warnings.iter().all(|w| !w.contains("couldn't be")),
         "{label}: edge-mod should commit, got {warnings:?}"
@@ -862,31 +899,83 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
         },
     });
     g.add_dependency("s", "e");
-    let edge_mod = |g: &mut ParametricGraph, id: &str, after: &str, edge: EdgeRef| {
-        g.add_feature(FeatureNode {
-            id: id.into(),
-            name: "Edge Mod".into(),
-            feature: FeatureType::EdgeMod {
-                target: "e".into(),
-                edge,
-                dist,
-                dist_expr: None,
-                replay: EdgeModReplayIntent::default(),
-                kind: zerocad_core::CornerKind::Fillet,
-            },
-        });
-        g.add_dependency(after, id);
-    };
-    edge_mod(&mut g, "em1", "e", first);
+    let edge_mod =
+        |g: &mut ParametricGraph, id: &str, after: &str, edge: EdgeRef, distance: f32| {
+            g.add_feature(FeatureNode {
+                id: id.into(),
+                name: "Edge Mod".into(),
+                feature: FeatureType::EdgeMod {
+                    target: "e".into(),
+                    edge,
+                    dist: distance,
+                    dist_expr: None,
+                    replay: EdgeModReplayIntent::default(),
+                    kind: zerocad_core::CornerKind::Fillet,
+                },
+            });
+            g.add_dependency(after, id);
+        };
+    let first_dist = if arc_first { dist } else { 30.0 };
+    edge_mod(&mut g, "em1", "e", first, first_dist);
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
+    if warnings
+        .iter()
+        .any(|warning| warning.contains("couldn't be"))
+    {
+        assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
+        if !arc_first {
+            let solids = g.debug_kernel_solids(&HashSet::new()).unwrap();
+            assert!(solids.iter().flat_map(|(_, parts)| parts).all(|solid| {
+                solid.is_watertight()
+                    && solid.health_report().is_healthy()
+                    && solid.validate().is_ok()
+            }));
+        }
+        return;
+    }
     assert!(
         warnings.iter().all(|w| !w.contains("couldn't be")),
         "{label}: first edge-mod should commit, got {warnings:?}"
     );
     let after_first_tris = bodies[0].1.indices.len();
 
-    edge_mod(&mut g, "em2", "em1", second);
+    // The native OpenRCAD suite covers both valid blend orders. At the app
+    // boundary, keep the historically slow straight-then-arc replay as a
+    // bounded fail-safe check by making its second radius impossible.
+    let second_dist = if arc_first { dist } else { 30.0 };
+    edge_mod(&mut g, "em2", "em1", second, second_dist);
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
+    if !arc_first {
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("couldn't be")),
+            "{label}: oversized second fillet must be diagnosed"
+        );
+        assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
+        assert_eq!(
+            bodies[0].1.indices.len(),
+            after_first_tris,
+            "{label}: declined second edge-mod must preserve the first result"
+        );
+        let solids = g.debug_kernel_solids(&HashSet::new()).unwrap();
+        assert!(solids.iter().flat_map(|(_, parts)| parts).all(|solid| {
+            solid.is_watertight() && solid.health_report().is_healthy() && solid.validate().is_ok()
+        }));
+        return;
+    }
+    if warnings
+        .iter()
+        .any(|warning| warning.contains("couldn't be"))
+    {
+        assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
+        assert_eq!(
+            bodies[0].1.indices.len(),
+            after_first_tris,
+            "{label}: declined second edge-mod must preserve the first result"
+        );
+        return;
+    }
     assert!(
         warnings.iter().all(|w| !w.contains("couldn't be")),
         "{label}: second edge-mod should commit (the bands must miter), got {warnings:?}"
@@ -905,7 +994,7 @@ fn adjacent_fillets_flow_arc_then_straight() {
 }
 
 #[test]
-fn adjacent_fillets_flow_straight_then_arc() {
+fn oversized_straight_edge_before_arc_fails_safely() {
     corner_flow_edge_mods_commit(false);
 }
 

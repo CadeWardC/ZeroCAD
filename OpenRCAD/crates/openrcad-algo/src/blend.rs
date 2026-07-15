@@ -11,14 +11,14 @@
 
 use core::f64::consts::{FRAC_PI_2, TAU};
 
-use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, GeomCurve, GeomSurface, OffsetSurface,
     Plane, ToroidalSurface,
 };
 use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
 
-use crate::sew::sew;
+use crate::sew::{compatibility_policy, sew_with_policy};
 
 /// Why a blend builder could not run.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +37,8 @@ pub enum BlendError {
         /// The exclusive upper bound that would fit this geometry.
         max: f64,
     },
+    /// The supplied document tolerance policy is internally inconsistent.
+    InvalidTolerancePolicy(String),
 }
 
 impl core::fmt::Display for BlendError {
@@ -53,6 +55,9 @@ impl core::fmt::Display for BlendError {
                  (limited by the smaller of the cross dimension and half the opposite span); \
                  retry with a value under {max}",
             ),
+            BlendError::InvalidTolerancePolicy(reason) => {
+                write!(f, "blend: invalid tolerance policy: {reason}")
+            }
         }
     }
 }
@@ -228,7 +233,21 @@ fn radial(axis: Dir, xref: Dir, u: f64) -> GeomVec {
 }
 
 /// Roll a constant-`radius` fillet along both circular rims of a cylinder.
+#[deprecated(note = "use fillet_cylinder_with_policy")]
 pub fn fillet_cylinder(info: &CylinderInfo, radius: f64) -> Result<Solid, BlendError> {
+    fillet_cylinder_with_policy(info, radius, &TolerancePolicy::STANDARD)
+}
+
+/// Roll a constant-radius fillet along both cylinder rims using one document
+/// tolerance policy for construction and sewing.
+pub fn fillet_cylinder_with_policy(
+    info: &CylinderInfo,
+    radius: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    policy
+        .validate()
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
     let CylinderInfo {
         base,
         axis,
@@ -284,7 +303,9 @@ pub fn fillet_cylinder(info: &CylinderInfo, radius: f64) -> Result<Solid, BlendE
         quarter_arc(tube, radius, lo, hi)
     }));
 
-    Ok(Solid::new(sew(&faces, radius * 0.1)))
+    let shell = sew_with_policy(&faces, policy)
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    Ok(Solid::new(shell))
 }
 
 /// Bevel both circular rims of a cylinder by `distance` (a 45° frustum chamfer).
@@ -340,7 +361,10 @@ pub fn chamfer_cylinder(info: &CylinderInfo, distance: f64) -> Result<Solid, Ble
         Edge::between_points(lo, hi)
     }));
 
-    Ok(Solid::new(sew(&faces, distance * 0.1)))
+    let policy = compatibility_policy(distance * 0.1);
+    Ok(Solid::new(
+        sew_with_policy(&faces, &policy).expect("compatibility policy is valid"),
+    ))
 }
 
 /// Hollow a cylinder to wall `thickness`, leaving any cap in `open_faces` open.
@@ -438,7 +462,10 @@ pub fn shell_cylinder(
         faces.push(cap_face(ring(ceil, axis, xref, inner_r), ceil, axis.reversed()).reversed());
     }
 
-    Ok(Solid::new(sew(&faces, thickness * 0.1)))
+    let policy = compatibility_policy(thickness * 0.1);
+    Ok(Solid::new(
+        sew_with_policy(&faces, &policy).expect("compatibility policy is valid"),
+    ))
 }
 
 #[cfg(test)]

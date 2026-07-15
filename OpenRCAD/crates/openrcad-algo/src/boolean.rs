@@ -16,7 +16,6 @@ use crate::bvh::Bvh;
 use crate::operation::{
     Diagnostic, OperationResult, RecoveryAction, RecoveryReport, ValidationReport,
 };
-use crate::sew::sew;
 
 /// Which input face a boolean-result face came from. `usize` is the face's
 /// position in the operand's `shell().faces()` — the one face key that is
@@ -203,12 +202,15 @@ impl std::error::Error for BooleanError {}
 /// Apply `op` and reject invalid inputs, panics, or unhealthy/non-watertight
 /// outputs. This is the preferred entry point for CAD applications, where a
 /// failed feature should be diagnosable instead of cached as a bad body.
+#[deprecated(note = "use boolean_operation; this wrapper discards operation metadata")]
 pub fn boolean_checked(object: &Solid, tool: &Solid, op: BooleanOp) -> Result<Solid, BooleanError> {
-    boolean_checked_with_policy(object, tool, op, &TolerancePolicy::STANDARD)
+    boolean_operation_with_policy(object, tool, op, &TolerancePolicy::STANDARD)
+        .map(|result| result.value)
 }
 
 /// Checked boolean using one explicit document-wide tolerance policy for
 /// intersection, reconstruction, sewing, recovery, and validation.
+#[deprecated(note = "use boolean_operation_with_policy; this wrapper discards operation metadata")]
 pub fn boolean_checked_with_policy(
     object: &Solid,
     tool: &Solid,
@@ -234,9 +236,39 @@ pub fn boolean_operation_with_policy(
     op: BooleanOp,
     policy: &TolerancePolicy,
 ) -> Result<OperationResult<Solid>, BooleanError> {
+    boolean_operation_with_policy_and_cancel(object, tool, op, policy, &NeverCancelled)
+}
+
+/// Cancellable canonical boolean operation under an explicit policy. No
+/// partial solid or partial metadata is returned after cancellation.
+pub fn boolean_operation_with_policy_and_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<OperationResult<Solid>, BooleanError> {
+    boolean_operation_with_classes_policy_and_cancel(object, tool, op, None, None, policy, cancel)
+}
+
+/// Canonical boolean operation with owner-aware face merging. This is the
+/// application integration boundary for durable face naming; lineage remains
+/// represented by the shared [`TopologyHistory`] in the returned result.
+pub fn boolean_operation_with_classes_policy_and_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<OperationResult<Solid>, BooleanError> {
     policy
         .validate()
         .map_err(BooleanError::InvalidTolerancePolicy)?;
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
     validate_operand(BooleanInput::Object, object, policy)?;
     validate_operand(BooleanInput::Tool, tool, policy)?;
 
@@ -246,21 +278,24 @@ pub fn boolean_operation_with_policy(
             tool,
             op,
             BooleanOptions {
-                obj_classes: None,
-                tool_classes: None,
+                obj_classes,
+                tool_classes,
                 want_history: true,
                 policy,
-                cancel: &NeverCancelled,
+                cancel,
             },
         )
     }))
     .map_err(|_| BooleanError::Panicked)?
-    .expect("NeverCancelled cannot cancel");
+    .map_err(|_| BooleanError::Cancelled)?;
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
     let (value, reconstructed) = repair_boolean_output(result, policy)?;
     if reconstructed > 0 {
-        recovery
-            .actions
-            .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
+        recovery.actions.push(RecoveryAction::ReconstructPcurves {
+            count: reconstructed,
+        });
     }
     let face_history = face_history.unwrap_or_default();
     let mut history = face_history.topology_history(op, object.face_count(), tool.face_count());
@@ -300,16 +335,23 @@ pub fn boolean_operation_with_policy(
 
 /// Cancellable checked boolean. Existing callers can continue to use
 /// [`boolean_checked`]; interactive schedulers should use this entry point.
+#[deprecated(
+    note = "use boolean_operation_with_policy_and_cancel; this wrapper discards operation metadata"
+)]
 pub fn boolean_checked_with_cancel(
     object: &Solid,
     tool: &Solid,
     op: BooleanOp,
     cancel: &dyn CancellationProbe,
 ) -> Result<Solid, BooleanError> {
-    boolean_checked_with_policy_and_cancel(object, tool, op, &TolerancePolicy::STANDARD, cancel)
+    boolean_operation_with_policy_and_cancel(object, tool, op, &TolerancePolicy::STANDARD, cancel)
+        .map(|result| result.value)
 }
 
 /// Cancellable checked boolean under an explicit tolerance policy.
+#[deprecated(
+    note = "use boolean_operation_with_policy_and_cancel; this wrapper discards operation metadata"
+)]
 pub fn boolean_checked_with_policy_and_cancel(
     object: &Solid,
     tool: &Solid,
@@ -357,13 +399,22 @@ pub fn boolean_checked_with_policy_and_cancel(
 /// multi-body entry point: it returns each connected component separately via
 /// [`Solid::split_disconnected`]. For the common case where the result is one
 /// connected body, the returned vector has a single element.
+#[deprecated(
+    note = "Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata"
+)]
+#[allow(deprecated)]
 pub fn boolean_bodies(object: &Solid, tool: &Solid, op: BooleanOp) -> Vec<Solid> {
-    boolean(object, tool, op).split_disconnected()
+    boolean_checked_bodies(object, tool, op)
+        .unwrap_or_else(|error| panic!("multi-body boolean: {error}"))
 }
 
 /// Checked multi-body boolean: like [`boolean_checked`], but splits a severed
 /// result into separate bodies and validates **each** one. Fails if any body is
 /// unhealthy or non-watertight, so a half-formed sliver can't slip through.
+#[deprecated(
+    note = "Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata"
+)]
+#[allow(deprecated)]
 pub fn boolean_checked_bodies(
     object: &Solid,
     tool: &Solid,
@@ -373,6 +424,9 @@ pub fn boolean_checked_bodies(
 }
 
 /// Checked multi-body boolean under an explicit tolerance policy.
+#[deprecated(
+    note = "Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata"
+)]
 pub fn boolean_checked_bodies_with_policy(
     object: &Solid,
     tool: &Solid,
@@ -402,7 +456,12 @@ pub fn boolean_checked_bodies_with_policy(
     .map_err(|_| BooleanError::Panicked)?
     .expect("NeverCancelled cannot cancel")
     .0;
-    let (result, _) = repair_boolean_output(result, policy)?;
+    // A valid multi-body result is intentionally disconnected before it is
+    // split, so the single-solid strict gate must be applied to each component,
+    // not to the temporary packed shell.
+    let (result, _) = result
+        .repair_pcurves(policy)
+        .map_err(BooleanError::PcurveBuild)?;
     let bodies = result.split_disconnected();
     for body in &bodies {
         validate_output(body.clone(), policy)?;
@@ -411,6 +470,7 @@ pub fn boolean_checked_bodies_with_policy(
 }
 
 /// Apply `op` between `object` and `tool`.
+#[deprecated(note = "use boolean_operation; this wrapper discards metadata and panics on failure")]
 pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
     boolean_operation(object, tool, op)
         .unwrap_or_else(|error| panic!("boolean: {error}"))
@@ -424,6 +484,10 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
 /// refuse to combine result faces descending from different classes, so a
 /// caller's face identities survive the merge (the Bidarra owner-aware-merge
 /// rule). `None` classes ⇒ merges behave exactly as [`boolean`].
+#[deprecated(
+    note = "use boolean_operation_with_classes_policy_and_cancel; this wrapper returns only legacy face history and discards validation, diagnostics, and recovery"
+)]
+#[allow(deprecated)]
 pub fn boolean_with_history(
     object: &Solid,
     tool: &Solid,
@@ -451,6 +515,10 @@ pub fn boolean_with_history(
 
 /// Checked variant of [`boolean_with_history`] — same validation as
 /// [`boolean_checked`].
+#[deprecated(
+    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
+)]
+#[allow(deprecated)]
 pub fn boolean_checked_with_history(
     object: &Solid,
     tool: &Solid,
@@ -469,6 +537,9 @@ pub fn boolean_checked_with_history(
 }
 
 /// Checked history-producing boolean under an explicit tolerance policy.
+#[deprecated(
+    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
+)]
 pub fn boolean_checked_with_history_and_policy(
     object: &Solid,
     tool: &Solid,
@@ -499,10 +570,14 @@ pub fn boolean_checked_with_history_and_policy(
     }))
     .map_err(|_| BooleanError::Panicked)?
     .expect("NeverCancelled cannot cancel");
-    let (result, _) = repair_boolean_output(result, policy)?;
+    let (result, _) = repair_multi_body_boolean_output(result, policy)?;
     Ok((result, history.unwrap_or_default()))
 }
 
+#[deprecated(
+    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
+)]
+#[allow(deprecated)]
 pub fn boolean_checked_with_history_cancel(
     object: &Solid,
     tool: &Solid,
@@ -523,6 +598,9 @@ pub fn boolean_checked_with_history_cancel(
 }
 
 /// Cancellable history-producing boolean under an explicit tolerance policy.
+#[deprecated(
+    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
+)]
 pub fn boolean_checked_with_history_policy_and_cancel(
     object: &Solid,
     tool: &Solid,
@@ -556,7 +634,7 @@ pub fn boolean_checked_with_history_policy_and_cancel(
     }))
     .map_err(|_| BooleanError::Panicked)?
     .map_err(|_| BooleanError::Cancelled)?;
-    let (result, _) = repair_boolean_output(result, policy)?;
+    let (result, _) = repair_multi_body_boolean_output(result, policy)?;
     Ok((result, history.unwrap_or_default()))
 }
 
@@ -1028,7 +1106,8 @@ fn boolean_impl(
 
     // 4. Sew kept faces together
     cancel.check_cancelled()?;
-    let shell = sew(&kept_faces, policy.sewing);
+    let shell = crate::sew::sew_with_policy(&kept_faces, policy)
+        .expect("boolean policy was validated before assembly");
     let solid = Solid::new(shell);
 
     // 4b. Heal T-junctions: an imprint can split one face's boundary edge at a
@@ -1058,7 +1137,7 @@ fn boolean_impl(
             let class = match origin {
                 Some(BooleanFaceSource::Object(i)) => obj_classes
                     .and_then(|c| c.get(*i).copied().flatten())
-                    .map(|cl| (cl << 1) | 0),
+                    .map(|cl| cl << 1),
                 Some(BooleanFaceSource::Tool(i)) => tool_classes
                     .and_then(|c| c.get(*i).copied().flatten())
                     .map(|cl| (cl << 1) | 1),
@@ -1222,6 +1301,28 @@ fn repair_boolean_output(
         .repair_pcurves(policy)
         .map_err(BooleanError::PcurveBuild)?;
     let solid = validate_output(solid, policy)?;
+    Ok((solid, reconstructed))
+}
+
+/// Validate a compatibility result whose face history is indexed against one
+/// packed shell even when the operation severed it into multiple bodies. The
+/// temporary packed shell is intentionally disconnected; strict health and
+/// sliver checks therefore apply to each connected result body independently.
+fn repair_multi_body_boolean_output(
+    solid: Solid,
+    policy: &TolerancePolicy,
+) -> Result<(Solid, usize), BooleanError> {
+    let (solid, reconstructed) = solid
+        .repair_pcurves(policy)
+        .map_err(BooleanError::PcurveBuild)?;
+    let bodies = solid.split_disconnected();
+    if bodies.len() <= 1 {
+        let solid = validate_output(solid, policy)?;
+        return Ok((solid, reconstructed));
+    }
+    for body in bodies {
+        validate_output(body, policy)?;
+    }
     Ok((solid, reconstructed))
 }
 
@@ -1958,7 +2059,10 @@ mod tests {
                 InputTopologyRef::new(1, TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0)),
             ]
         );
-        assert!(result.history.coverage_for_solid(&result.value).is_complete());
+        assert!(result
+            .history
+            .coverage_for_solid(&result.value)
+            .is_complete());
         assert!(result
             .diagnostics
             .iter()
@@ -2432,16 +2536,14 @@ mod tests {
     }
 
     /// A bar cut clean through the middle is severed into two separate bodies.
-    /// `boolean` returns them as one shell (Euler=4); `boolean_bodies` splits it.
+    /// The single-solid Phase 1 gate rejects disconnected shells, so callers use
+    /// the explicit multi-body operation for this case.
     #[test]
     fn cut_severing_a_bar_yields_two_bodies() {
         // A 30×10×10 bar along X, sliced by a tool that fully spans Y and Z and
         // removes x∈[10,20], leaving x∈[0,10] and x∈[20,30].
         let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);
         let knife = make_box(&Pnt::new(10.0, -1.0, -1.0), 10.0, 12.0, 12.0);
-
-        let merged = boolean(&bar, &knife, BooleanOp::Cut);
-        assert!(merged.is_watertight(), "severed cut should be watertight");
 
         let bodies = boolean_bodies(&bar, &knife, BooleanOp::Cut);
         assert_eq!(bodies.len(), 2, "a through-cut must produce two bodies");

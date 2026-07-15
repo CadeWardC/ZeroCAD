@@ -44,7 +44,7 @@ pub(crate) fn build_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
 
     let bottom = planar_face(
         plane_at(base, zdir.reversed()),
-        Wire::from_edges(base_arcs.clone()),
+        Wire::from_edges(base_arcs.iter().rev().map(|edge| edge.reversed())),
     );
     let top_face = planar_face(plane_at(top, zdir), Wire::from_edges(top_arcs.clone()));
 
@@ -65,8 +65,7 @@ pub(crate) fn build_cylinder(axis: &Ax2, radius: f64, height: f64) -> Solid {
             axial_pcurve(seam_params[i], 0.0, height),
         ];
         faces.push(
-            Face::with_pcurves(lateral.clone(), wire, pcurves)
-                .expect("valid cylinder pcurves"),
+            Face::with_pcurves(lateral.clone(), wire, pcurves).expect("valid cylinder pcurves"),
         );
     }
 

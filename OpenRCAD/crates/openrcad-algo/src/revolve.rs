@@ -18,26 +18,28 @@ use core::f64::consts::{PI, TAU};
 use core::fmt;
 
 use openrcad_foundation::{
-    tolerance, Ax1, Ax3, Dir, Pnt, TolerancePolicy, TolerancePolicyError, Trsf, Vec as GeomVec,
+    tolerance, Ax1, Ax3, Dir, Pnt, Pnt2d, TolerancePolicy, TolerancePolicyError, Trsf,
+    Vec as GeomVec,
 };
 use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane,
     SphericalSurface, ToroidalSurface,
 };
 use openrcad_topo::{
-    Edge, Face, HealthReport, OperationResult, Orientation, PcurveBuildError, RecoveryAction,
-    RecoveryReport, Solid, TopologyHistory, ValidationReport, Vertex, Wire,
+    Edge, Face, FaceBuildError, HealthReport, OperationResult, Orientation, RecoveryReport, Solid,
+    TopologyHistory, ValidationReport, Vertex, Wire,
 };
 
-use crate::sew::sew;
+use crate::native_pcurve::{planar_face_with_pcurves, surface_periodicity, unwrap_near, uv_line};
+use crate::sew::sew_with_policy;
 
 /// Errors reported by [`revolve`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RevolveError {
     /// The supplied document tolerance policy is invalid.
     InvalidTolerancePolicy(TolerancePolicyError),
-    /// A face-local pcurve could not be constructed consistently.
-    PcurveBuild(PcurveBuildError),
+    /// A face and its exact construction-time pcurves could not be assembled.
+    FaceBuild(FaceBuildError),
     /// The angle is not in `(0, 2π]`.
     InvalidAngle,
     /// The source face has no outer boundary.
@@ -67,7 +69,7 @@ impl fmt::Display for RevolveError {
             Self::InvalidTolerancePolicy(error) => {
                 write!(f, "revolve: invalid tolerance policy: {error}")
             }
-            Self::PcurveBuild(error) => write!(f, "revolve: pcurve construction failed: {error}"),
+            Self::FaceBuild(error) => write!(f, "revolve: pcurve construction failed: {error}"),
             Self::InvalidAngle => f.write_str("revolve: angle must be in (0, 2π]"),
             Self::MissingOuterWire => f.write_str("revolve: source face has no outer wire"),
             Self::OpenWire => f.write_str("revolve: every profile wire must be closed"),
@@ -102,6 +104,7 @@ fn build_revolve(
     axis_point: Pnt,
     axis_dir: Dir,
     angle: f64,
+    policy: &TolerancePolicy,
 ) -> Result<Solid, RevolveError> {
     if !(angle > tolerance::CONFUSION && angle <= TAU + 1e-9) {
         return Err(RevolveError::InvalidAngle);
@@ -207,7 +210,7 @@ fn build_revolve(
             }
             let surface = lateral_surface(&edge, axis_point, axis_dir)?;
             for w in stations.windows(2) {
-                faces.push(lateral_face(&edge, &axis, w[0], w[1], surface.clone()));
+                faces.push(lateral_face(&edge, &axis, w[0], w[1], surface.clone())?);
             }
         }
     }
@@ -219,15 +222,17 @@ fn build_revolve(
         let rot_end = Trsf::rotation(&axis, angle);
         let n_end = rotate_dir(n_wind, axis_dir, angle);
         if along {
-            faces.push(revolve_cap(face, n_wind.reversed(), None, true));
-            faces.push(revolve_cap(face, n_end, Some(&rot_end), false));
+            faces.push(revolve_cap(face, n_wind.reversed(), None, true)?);
+            faces.push(revolve_cap(face, n_end, Some(&rot_end), false)?);
         } else {
-            faces.push(revolve_cap(face, n_wind, None, false));
-            faces.push(revolve_cap(face, n_end.reversed(), Some(&rot_end), true));
+            faces.push(revolve_cap(face, n_wind, None, false)?);
+            faces.push(revolve_cap(face, n_end.reversed(), Some(&rot_end), true)?);
         }
     }
 
-    Ok(Solid::new(sew(&faces, tolerance::CONFUSION * 10.0)))
+    Ok(Solid::new(
+        sew_with_policy(&faces, policy).map_err(RevolveError::InvalidTolerancePolicy)?,
+    ))
 }
 
 /// Revolve a planar profile and return the solid with its complete Phase 1
@@ -258,10 +263,7 @@ pub fn revolve_operation_with_policy(
     policy
         .validate()
         .map_err(RevolveError::InvalidTolerancePolicy)?;
-    let solid = build_revolve(face, axis_point, axis_dir, angle)?;
-    let (solid, reconstructed) = solid
-        .repair_pcurves(policy)
-        .map_err(RevolveError::PcurveBuild)?;
+    let solid = build_revolve(face, axis_point, axis_dir, angle, policy)?;
     let validation = ValidationReport::for_solid(&solid, policy);
     if !validation.is_valid() || solid.validate_strict_with_policy(policy).is_err() {
         return Err(RevolveError::InvalidOutput {
@@ -270,12 +272,7 @@ pub fn revolve_operation_with_policy(
             pcurves_complete: validation.pcurves_complete,
         });
     }
-    let mut recovery = RecoveryReport::default();
-    if reconstructed > 0 {
-        recovery
-            .actions
-            .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
-    }
+    let recovery = RecoveryReport::default();
     let history = TopologyHistory::generated_solid(&solid);
     Ok(OperationResult {
         value: solid,
@@ -382,7 +379,13 @@ fn revolved_arc(p: Pnt, axis: &Ax1, axis_dir: Dir, t0: f64, t1: f64) -> Option<E
 
 /// One lateral face: the profile edge at `t0`, the arcs its endpoints trace to
 /// `t1`, and the profile edge at `t1`, on the shared analytic `surface`.
-fn lateral_face(edge: &Edge, axis: &Ax1, t0: f64, t1: f64, surface: GeomSurface) -> Face {
+fn lateral_face(
+    edge: &Edge,
+    axis: &Ax1,
+    t0: f64,
+    t1: f64,
+    surface: GeomSurface,
+) -> Result<Face, RevolveError> {
     let axis_dir = axis.direction();
     let rot0 = Trsf::rotation(axis, t0);
     let rot1 = Trsf::rotation(axis, t1);
@@ -425,13 +428,81 @@ fn lateral_face(edge: &Edge, axis: &Ax1, t0: f64, t1: f64, surface: GeomSurface)
     };
     let center = Trsf::rotation(axis, 0.5 * (t0 + t1)).transform_point(&p_mid);
 
+    let wire = Wire::from_edges(edges.clone());
+    let reverse_loop = !loop_agrees_with_surface(&wire, &surface, center);
+    if reverse_loop {
+        edges = edges
+            .into_iter()
+            .rev()
+            .map(|edge| edge.reversed())
+            .collect();
+    }
     let wire = Wire::from_edges(edges);
-    let wire = if loop_agrees_with_surface(&wire, &surface, center) {
-        wire
-    } else {
-        reversed_wire(&wire)
+
+    if let GeomSurface::Plane(plane) = &surface {
+        return planar_face_with_pcurves(*plane, Some(wire), Vec::new(), Orientation::Forward)
+            .map_err(RevolveError::FaceBuild);
+    }
+
+    // Every non-planar surface of revolution uses U for the sweep angle and V
+    // for the original profile coordinate. Those four known coordinate lines
+    // are the exact trimming rectangle; no boundary projection is needed.
+    let periodicity = surface_periodicity(&surface);
+    let natural_point = |fraction: f64| {
+        edge.curve().map_or_else(
+            || {
+                let start = edge.start().point();
+                start + (edge.end().point() - start) * fraction
+            },
+            |curve| curve.point(edge.first() + (edge.last() - edge.first()) * fraction),
+        )
     };
-    Face::new(Some(surface), wire)
+    let start_uv = crate::intersect::uv_of(&surface, &natural_point(0.0));
+    let middle_uv = crate::intersect::uv_of(&surface, &natural_point(0.5));
+    let end_uv = crate::intersect::uv_of(&surface, &natural_point(1.0));
+    let middle_v = unwrap_near(middle_uv.1, start_uv.1, periodicity.v_period);
+    let end_v = unwrap_near(end_uv.1, middle_v, periodicity.v_period);
+    let base_u = middle_uv.0;
+    let u0 = base_u + t0;
+    let u1 = base_u + t1;
+    let source_v = if edge.orientation() == Orientation::Reversed {
+        end_v
+    } else {
+        start_uv.1
+    };
+    let target_v = if edge.orientation() == Orientation::Reversed {
+        start_uv.1
+    } else {
+        end_v
+    };
+    let mut pcurves = vec![uv_line(
+        Pnt2d::new(u0, start_uv.1),
+        Pnt2d::new(u0, end_v),
+        periodicity,
+    )];
+    if revolved_arc(p_src, axis, axis_dir, t0, t1).is_some() {
+        pcurves.push(uv_line(
+            Pnt2d::new(u0, source_v),
+            Pnt2d::new(u1, source_v),
+            periodicity,
+        ));
+    }
+    pcurves.push(uv_line(
+        Pnt2d::new(u1, start_uv.1),
+        Pnt2d::new(u1, end_v),
+        periodicity,
+    ));
+    if revolved_arc(p_tgt, axis, axis_dir, t0, t1).is_some() {
+        pcurves.push(uv_line(
+            Pnt2d::new(u0, target_v),
+            Pnt2d::new(u1, target_v),
+            periodicity,
+        ));
+    }
+    if reverse_loop {
+        pcurves.reverse();
+    }
+    Face::with_pcurves(surface, wire, pcurves).map_err(RevolveError::FaceBuild)
 }
 
 /// Does `wire`'s winding normal agree with `surface`'s intrinsic normal
@@ -591,7 +662,12 @@ pub(crate) fn reversed_wire(wire: &Wire) -> Wire {
     Wire::from_edges(edges)
 }
 
-fn revolve_cap(face: &Face, normal: Dir, rotation: Option<&Trsf>, flip_winding: bool) -> Face {
+fn revolve_cap(
+    face: &Face,
+    normal: Dir,
+    rotation: Option<&Trsf>,
+    flip_winding: bool,
+) -> Result<Face, RevolveError> {
     let transform_wire = |wire: Wire| {
         let w = match rotation {
             Some(t) => wire.transformed(t),
@@ -613,12 +689,13 @@ fn revolve_cap(face: &Face, normal: Dir, rotation: Option<&Trsf>, flip_winding: 
         .as_ref()
         .and_then(|wire| wire.edges().first().map(|edge| edge.source().point()))
         .unwrap_or(Pnt::origin());
-    Face::with_wires(
-        Some(GeomSurface::plane(Plane::from_point_normal(point, normal))),
+    planar_face_with_pcurves(
+        Plane::from_point_normal(point, normal),
         outer,
         inners,
         Orientation::Forward,
     )
+    .map_err(RevolveError::FaceBuild)
 }
 
 #[cfg(test)]
@@ -657,7 +734,13 @@ mod tests {
     fn full_revolve_of_axis_touching_rect_is_cylinder() {
         // Rect from the axis (x=0) out to r=2, height 5 → full cylinder.
         let face = rect_profile(0.0, 0.0, 2.0, 5.0);
-        let solid = revolve(&face, Pnt::origin(), Dir::dz(), TAU).unwrap();
+        let operation = revolve_operation(&face, Pnt::origin(), Dir::dz(), TAU).unwrap();
+        assert!(
+            operation.recovery.actions.is_empty(),
+            "native revolve construction must not reconstruct pcurves"
+        );
+        assert!(operation.value.has_complete_pcurves());
+        let solid = operation.value;
         assert!(
             solid.is_watertight(),
             "cylinder not watertight: {} faces, report: {:?}",
@@ -695,7 +778,13 @@ mod tests {
     #[test]
     fn quarter_revolve_has_caps_and_correct_volume() {
         let face = rect_profile(1.0, 0.0, 2.0, 3.0);
-        let solid = revolve(&face, Pnt::origin(), Dir::dz(), TAU / 4.0).unwrap();
+        let operation = revolve_operation(&face, Pnt::origin(), Dir::dz(), TAU / 4.0).unwrap();
+        assert!(
+            operation.recovery.actions.is_empty(),
+            "partial revolve must bind pcurves during construction"
+        );
+        assert!(operation.value.has_complete_pcurves());
+        let solid = operation.value;
         assert!(solid.is_watertight(), "quarter washer not watertight");
         assert!(solid.health_report().is_healthy());
         let exact = PI * (4.0 - 1.0) * 3.0 / 4.0;

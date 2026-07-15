@@ -153,6 +153,32 @@ impl MockMesh {
         }
     }
 
+    /// Apply a rigid translation directly to display geometry and its picking
+    /// metadata. Normals and connectivity are unchanged by translation.
+    pub(crate) fn translate(&mut self, offset: [f32; 3]) {
+        for vertex in self.vertices.chunks_exact_mut(6) {
+            vertex[0] += offset[0];
+            vertex[1] += offset[1];
+            vertex[2] += offset[2];
+        }
+        for vertex in self.edge_vertices.chunks_exact_mut(3) {
+            vertex[0] += offset[0];
+            vertex[1] += offset[1];
+            vertex[2] += offset[2];
+        }
+        for edge in &mut self.edge_refs {
+            for (axis, delta) in offset.iter().copied().enumerate() {
+                edge.p0[axis] += delta;
+                edge.p1[axis] += delta;
+            }
+        }
+        for face in &mut self.face_refs {
+            for (axis, delta) in offset.iter().copied().enumerate() {
+                face.centroid[axis] += delta;
+            }
+        }
+    }
+
     /// Largest face id currently in this mesh, or `None` when there are no faces.
     fn max_face_id(&self) -> Option<u32> {
         self.face_ids.iter().copied().max()
@@ -211,6 +237,79 @@ impl MockMesh {
             face_ref.face_id += f_offset;
             self.face_refs.push(face_ref);
         }
+    }
+
+    /// Remove display edges duplicated by two separately valid B-Rep parts in
+    /// one material-connected body. Such pairs are the two copies of an
+    /// internal partition seam (for example the tangent line between the
+    /// rectangular and circular regions of a capsule profile), not selectable
+    /// exterior edges. Triangle and face provenance remain unchanged.
+    pub(crate) fn suppress_duplicate_edge_groups(&mut self) {
+        use std::collections::{HashMap, HashSet};
+
+        let endpoint_key = |p0: [f32; 3], p1: [f32; 3]| {
+            let quantize = |p: [f32; 3]| {
+                (
+                    (p[0] as f64 * 10_000.0).round() as i64,
+                    (p[1] as f64 * 10_000.0).round() as i64,
+                    (p[2] as f64 * 10_000.0).round() as i64,
+                )
+            };
+            let mut endpoints = [quantize(p0), quantize(p1)];
+            endpoints.sort_unstable();
+            endpoints
+        };
+
+        let mut counts = HashMap::new();
+        for edge in &self.edge_refs {
+            *counts
+                .entry(endpoint_key(edge.p0, edge.p1))
+                .or_insert(0usize) += 1;
+        }
+        let removed: HashSet<u32> = self
+            .edge_refs
+            .iter()
+            .filter(|edge| counts[&endpoint_key(edge.p0, edge.p1)] > 1)
+            .map(|edge| edge.group)
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut normals = Vec::new();
+        let mut groups = Vec::new();
+        for (segment, &group) in self.edge_groups.iter().enumerate() {
+            if removed.contains(&group) {
+                continue;
+            }
+            let Some((&start, &end)) = self
+                .edge_indices
+                .get(segment * 2)
+                .zip(self.edge_indices.get(segment * 2 + 1))
+            else {
+                continue;
+            };
+            let start = start as usize * 3;
+            let end = end as usize * 3;
+            if end + 3 > self.edge_vertices.len() || start + 3 > self.edge_vertices.len() {
+                continue;
+            }
+            let base = (vertices.len() / 3) as u32;
+            vertices.extend_from_slice(&self.edge_vertices[start..start + 3]);
+            vertices.extend_from_slice(&self.edge_vertices[end..end + 3]);
+            indices.extend_from_slice(&[base, base + 1]);
+            if let Some(slice) = self.edge_face_normals.get(segment * 6..segment * 6 + 6) {
+                normals.extend_from_slice(slice);
+            }
+            groups.push(group);
+        }
+        self.edge_vertices = vertices;
+        self.edge_indices = indices;
+        self.edge_face_normals = normals;
+        self.edge_groups = groups;
+        self.edge_refs.retain(|edge| !removed.contains(&edge.group));
     }
 
     /// Axis-aligned box with one corner at the origin, opposite corner at (w, h, d).
@@ -389,14 +488,27 @@ impl MockMesh {
     /// extracted from the solid's B-Rep edges, and hidden-line normals are left
     /// empty (the renderer then shows every edge).
     pub fn from_solid(solid: &KernelSolid) -> Self {
-        Self::from_solid_with_cancel(solid, &openrcad::foundation::NeverCancelled)
-            .expect("NeverCancelled cannot cancel")
+        Self::try_from_solid(solid)
+            .unwrap_or_else(|reason| panic!("display tessellation compatibility adapter: {reason}"))
     }
 
-    pub(crate) fn from_solid_with_cancel(
+    /// Fallible production entry point for legacy display tessellation. Phase 3
+    /// solids may still need pcurve reconstruction, and a failed reconstruction
+    /// is an ordinary rejected feature result rather than a process panic.
+    pub(crate) fn try_from_solid(solid: &KernelSolid) -> Result<Self, String> {
+        match Self::try_from_solid_with_cancel(solid, &openrcad::foundation::NeverCancelled) {
+            Ok(mesh) => Ok(mesh),
+            Err(DisplayTessellationError::Cancelled) => {
+                unreachable!("NeverCancelled cannot cancel")
+            }
+            Err(DisplayTessellationError::Invalid(reason)) => Err(reason),
+        }
+    }
+
+    pub(crate) fn try_from_solid_with_cancel(
         solid: &KernelSolid,
         cancel: &dyn openrcad::foundation::CancellationProbe,
-    ) -> Result<Self, openrcad::foundation::Cancelled> {
+    ) -> Result<Self, DisplayTessellationError> {
         let (vertices, indices, mut face_ids) =
             solid_to_flat_mesh_with_cancel(solid, true, false, cancel)?;
         // Faces on one analytic cylinder also SELECT as one face: remap each
@@ -526,6 +638,47 @@ impl MockMesh {
             edge_refs,
             face_refs,
         })
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+
+    #[test]
+    fn translation_moves_positions_and_picking_metadata_without_changing_connectivity() {
+        let mut mesh = MockMesh::make_box(2.0, 3.0, 4.0);
+        let original = mesh.clone();
+        let offset = [5.0, -2.0, 7.5];
+
+        mesh.translate(offset);
+
+        assert_eq!(mesh.indices, original.indices);
+        assert_eq!(mesh.edge_indices, original.edge_indices);
+        assert_eq!(mesh.face_ids, original.face_ids);
+        assert_eq!(mesh.edge_groups, original.edge_groups);
+        for (moved, source) in mesh
+            .vertices
+            .chunks_exact(6)
+            .zip(original.vertices.chunks_exact(6))
+        {
+            assert_eq!(&moved[3..], &source[3..]);
+            for (axis, delta) in offset.iter().copied().enumerate() {
+                assert!((moved[axis] - source[axis] - delta).abs() < 1.0e-6);
+            }
+        }
+        for (moved, source) in mesh.face_refs.iter().zip(&original.face_refs) {
+            assert_eq!(moved.normal, source.normal);
+            for (axis, delta) in offset.iter().copied().enumerate() {
+                assert!((moved.centroid[axis] - source.centroid[axis] - delta).abs() < 1.0e-6);
+            }
+        }
+        for (moved, source) in mesh.edge_refs.iter().zip(&original.edge_refs) {
+            for (axis, delta) in offset.iter().copied().enumerate() {
+                assert!((moved.p0[axis] - source.p0[axis] - delta).abs() < 1.0e-6);
+                assert!((moved.p1[axis] - source.p1[axis] - delta).abs() < 1.0e-6);
+            }
+        }
     }
 }
 

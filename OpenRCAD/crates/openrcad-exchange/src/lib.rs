@@ -133,9 +133,7 @@ pub fn read_step_operation_with_policy_and_options(
 }
 
 /// Strict STEP string import using the standard policy.
-pub fn read_step_str_operation(
-    content: &str,
-) -> Result<OperationResult<Solid>, StepImportError> {
+pub fn read_step_str_operation(content: &str) -> Result<OperationResult<Solid>, StepImportError> {
     read_step_str_operation_with_policy(content, &TolerancePolicy::STANDARD)
 }
 
@@ -174,9 +172,9 @@ fn finish_step_import(
                 .repair_pcurves(policy)
                 .map_err(StepImportError::PcurveBuild)?;
             if reconstructed > 0 {
-                recovery
-                    .actions
-                    .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
+                recovery.actions.push(RecoveryAction::ReconstructPcurves {
+                    count: reconstructed,
+                });
                 diagnostics.push(Diagnostic::warning(
                     "openrcad.step.legacy-pcurve-reconstruction",
                     format!("reconstructed and validated {reconstructed} STEP coedge pcurves"),
@@ -209,7 +207,9 @@ fn finish_step_import(
 
 /// Deprecated compatibility reader. It reconstructs legacy missing pcurves and
 /// discards validation, recovery, diagnostics, and topology history.
-#[deprecated(note = "use read_step_operation; this wrapper enables legacy pcurve reconstruction and discards metadata")]
+#[deprecated(
+    note = "use read_step_operation; this wrapper enables legacy pcurve reconstruction and discards metadata"
+)]
 pub fn read_step(path: &str) -> io::Result<Solid> {
     read_step_operation_with_policy_and_options(
         path,
@@ -221,7 +221,9 @@ pub fn read_step(path: &str) -> io::Result<Solid> {
 }
 
 /// String equivalent of [`read_step`].
-#[deprecated(note = "use read_step_str_operation; this wrapper enables legacy pcurve reconstruction and discards metadata")]
+#[deprecated(
+    note = "use read_step_str_operation; this wrapper enables legacy pcurve reconstruction and discards metadata"
+)]
 pub fn read_step_str(content: &str) -> io::Result<Solid> {
     read_step_str_operation_with_policy_and_options(
         content,
@@ -236,9 +238,7 @@ pub fn read_step_str(content: &str) -> io::Result<Solid> {
 mod tests {
     use super::*;
     use openrcad_foundation::{Ax2, Dir, Pnt};
-    use openrcad_primitives::{
-        make_box_operation, make_cylinder_operation, make_sphere_operation,
-    };
+    use openrcad_primitives::{make_box_operation, make_cylinder_operation, make_sphere_operation};
 
     fn assert_close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-5, "Expected {} to be close to {}", a, b);
@@ -260,7 +260,10 @@ mod tests {
 
         // Compare topological counts
         assert!(parsed.validation.is_valid());
-        assert!(parsed.history.coverage_for_solid(&parsed.value).is_complete());
+        assert!(parsed
+            .history
+            .coverage_for_solid(&parsed.value)
+            .is_complete());
         assert!(!parsed.recovery.was_modified());
         let parsed = parsed.value;
         assert_eq!(solid.vertex_count(), parsed.vertex_count());
@@ -287,14 +290,37 @@ mod tests {
     }
 
     #[test]
+    fn step_box_shares_physical_edges_and_restores_exact_linear_pcurves() {
+        let solid = make_box_operation(&Pnt::origin(), 20.0, 12.0, 8.0)
+            .unwrap()
+            .value;
+        let path = std::env::temp_dir().join("openrcad_test_compact_box.stp");
+        write_step(&solid, path.to_str().unwrap()).expect("write compact box");
+        let content = std::fs::read_to_string(&path).expect("read compact box");
+        let parsed = read_step_operation(path.to_str().unwrap())
+            .expect("strict compact-box roundtrip")
+            .value;
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(content.matches("EDGE_CURVE(").count(), 12);
+        assert_eq!(content.matches("SURFACE_CURVE(").count(), 12);
+        assert_eq!(content.matches("PCURVE(").count(), 24);
+        assert!(parsed
+            .brep()
+            .pcurves
+            .values()
+            .all(|pcurve| matches!(&pcurve.curve, openrcad_geom2d::GeomCurve2d::Line(_))));
+        assert!(parsed
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .is_ok());
+    }
+
+    #[test]
     fn step_cylinder_roundtrip() {
-        let s = make_cylinder_operation(
-            &Ax2::new(Pnt::origin(), Dir::new(0.0, 0.0, 1.0)),
-            1.5,
-            5.0,
-        )
-        .unwrap()
-        .value;
+        let s =
+            make_cylinder_operation(&Ax2::new(Pnt::origin(), Dir::new(0.0, 0.0, 1.0)), 1.5, 5.0)
+                .unwrap()
+                .value;
         check_roundtrip(&s, "cylinder");
     }
 
@@ -351,8 +377,9 @@ mod tests {
         .unwrap();
         assert!(recovered.validation.is_valid());
         assert!(recovered.recovery.was_modified());
-        assert!(recovered.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "openrcad.step.legacy-pcurve-reconstruction"
-        }));
+        assert!(recovered
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "openrcad.step.legacy-pcurve-reconstruction" }));
     }
 }

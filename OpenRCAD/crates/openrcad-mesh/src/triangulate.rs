@@ -698,11 +698,10 @@ fn clamp_to_ordered_bounds(value: f64, min: f64, max: f64) -> f64 {
 
 /// Periodic unwrapping to prevent jumps across seams.
 pub fn unwrap_coordinate(val: f64, prev: f64, period: f64) -> f64 {
-    let closure = |i: i32| val + i as f64 * period;
-    (-2..=2)
-        .map(closure)
-        .min_by(|a, b| (a - prev).abs().partial_cmp(&(b - prev).abs()).unwrap())
-        .unwrap()
+    if !val.is_finite() || !prev.is_finite() || !period.is_finite() || period <= 0.0 {
+        return val;
+    }
+    val + ((prev - val) / period).round() * period
 }
 
 /// Resolve one boundary sample in the face's parameter space.
@@ -1406,7 +1405,11 @@ fn refine_cylinder_tris(
     // pass exists to prevent.
     allow_constraint_split: bool,
 ) -> Vec<Tri> {
-    const MAX_ITERS: usize = 16;
+    // Five constrained-Delaunay passes remove the broad cylinder chords. Any
+    // isolated residual edge is handled by the bounded solid-wide refinement
+    // pass after face meshes are combined; repeatedly rebuilding a 1k-point
+    // constrained mesh for the final handful of edges is needlessly quadratic.
+    const MAX_ITERS: usize = 5;
     const MAX_POINTS: usize = 20_000;
 
     // Only cylinders get the iterative interior midpoint-refinement pass —
@@ -1845,18 +1848,37 @@ pub fn discretize_edge_curve_budget(
     // recursion would terminate immediately on a 6-turn rail. Seed quarter-turn
     // cells so every recursion interval is well under one period.
     let mut seeds = vec![first, last];
-    if matches!(curve, GeomCurve::Helix(_)) {
-        let step = std::f64::consts::FRAC_PI_2;
-        let mut t = (first / step).floor() * step + step;
-        while t < last - 1e-9 {
-            if t > first + 1e-9 {
-                seeds.push(t);
+    match curve {
+        GeomCurve::Helix(_) => {
+            let step = std::f64::consts::FRAC_PI_2;
+            let mut t = (first / step).floor() * step + step;
+            while t < last - 1e-9 {
+                if t > first + 1e-9 {
+                    seeds.push(t);
+                }
+                t += step;
             }
-            t += step;
         }
-        seeds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        params.extend(seeds.iter().skip(1).take(seeds.len().saturating_sub(2)));
+        // Respect spline span boundaries before adaptive subdivision. In
+        // particular, a degree-1 intersection polyline has a tangent jump at
+        // each knot; recursively discovering all of those jumps from one large
+        // interval is both slow and needlessly over-refines unrelated spans.
+        GeomCurve::BSpline(spline) => {
+            let lo = first.min(last);
+            let hi = first.max(last);
+            seeds.extend(
+                spline
+                    .knots()
+                    .iter()
+                    .copied()
+                    .filter(|knot| *knot > lo + 1e-9 && *knot < hi - 1e-9),
+            );
+        }
+        _ => {}
     }
+    seeds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    seeds.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    params.extend(seeds.iter().skip(1).take(seeds.len().saturating_sub(2)));
 
     fn tangent_turn(curve: &GeomCurve, t0: f64, t1: f64) -> f64 {
         let (_, d0) = curve.d1(t0);
@@ -3113,15 +3135,31 @@ mod tests {
             Edge::between_points(Pnt::new(1.0, 1.0, z), Pnt::new(0.0, 1.0, z)),
             Edge::between_points(Pnt::new(0.0, 1.0, z), Pnt::new(0.0, 0.0, z)),
         ]);
-        Face::with_wires(
+        let line_pcurve = |point: Pnt2d, direction: Dir2d| {
+            PcurveData::new(
+                GeomCurve2d::line(Line2d::from_point_dir(point, direction)),
+                0.0,
+                1.0,
+            )
+        };
+        Face::with_wires_and_pcurves(
             Some(GeomSurface::plane(Plane::from_point_normal(
-                Pnt::origin(),
+                Pnt::new(0.0, 0.0, z),
                 Dir::dz(),
             ))),
-            Some(wire),
+            Some((
+                wire,
+                vec![
+                    line_pcurve(Pnt2d::new(0.0, 0.0), Dir2d::dx()),
+                    line_pcurve(Pnt2d::new(1.0, 0.0), Dir2d::dy()),
+                    line_pcurve(Pnt2d::new(1.0, 1.0), Dir2d::dx().reversed()),
+                    line_pcurve(Pnt2d::new(0.0, 1.0), Dir2d::dy().reversed()),
+                ],
+            )),
             Vec::new(),
             orientation,
         )
+        .expect("square face pcurves")
     }
 
     fn normal_z(mesh: &TriangleMesh, tri: [u32; 3]) -> f64 {
@@ -3216,15 +3254,31 @@ mod tests {
         )
         .with_periodicity(SurfacePeriodicity::u_periodic(core::f64::consts::TAU));
 
-        let uv = boundary_uv(
-            &surface,
-            &pcurve,
-            0.8,
-            Some((6.4, 3.0)),
-        );
+        let uv = boundary_uv(&surface, &pcurve, 0.8, Some((6.4, 3.0)));
 
         assert!((uv.x() - 6.6).abs() < 1e-12);
         assert_eq!(uv.y(), 3.0);
+    }
+
+    #[test]
+    fn boundary_sampling_unwraps_across_arbitrarily_many_turns() {
+        let surface = test_cylinder_surface(2.0);
+        let principal = 0.9 * core::f64::consts::PI;
+        let pcurve = PcurveData::new(
+            GeomCurve2d::line(Line2d::from_point_dir(
+                Pnt2d::new(principal, 0.0),
+                Dir2d::dy(),
+            )),
+            0.0,
+            1.0,
+        )
+        .with_periodicity(SurfacePeriodicity::u_periodic(core::f64::consts::TAU));
+        let expected = principal + 5.0 * core::f64::consts::TAU;
+
+        let uv = boundary_uv(&surface, &pcurve, 0.5, Some((expected, 0.0)));
+
+        assert!((uv.x() - expected).abs() < 1e-12);
+        assert_eq!(uv.y(), 0.5);
     }
 
     #[test]

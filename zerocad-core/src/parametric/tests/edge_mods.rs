@@ -1,24 +1,32 @@
 use super::*;
 
 #[test]
-fn oversized_circular_bite_runout_fails_safely_and_leaves_body() {
+fn invalid_circular_bite_runout_fails_safely_and_leaves_body() {
     let unmodified = circular_bite_graph(None)
         .evaluate_bodies(&std::collections::HashSet::new())
         .unwrap();
-    let g = circular_bite_cutoff_edge_graph_with_dist(crate::sketch::CornerKind::Fillet, 9.52);
+    let g = circular_bite_cutoff_edge_graph_with_dist(crate::sketch::CornerKind::Fillet, -1.0);
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
     assert!(
-        warnings.iter().any(|w| w.contains("couldn't be rounded")),
-        "oversized circular-bite fillet should fail safely in the exact solver, got {warnings:?}"
+        warnings
+            .iter()
+            .any(|w| w.contains("distance must be positive")),
+        "invalid circular-bite fillet should fail safely with a diagnostic, got {warnings:?}"
     );
     assert_eq!(bodies.len(), 1, "failed oversized fillet keeps one body");
     assert_eq!(
         bodies[0].1.indices.len(),
         unmodified[0].1.indices.len(),
-        "oversized circular-bite fillet leaves the body unchanged"
+        "invalid circular-bite fillet leaves the body unchanged"
     );
+    let solids = g
+        .debug_kernel_solids(&std::collections::HashSet::new())
+        .expect("fallback kernel solids");
+    assert!(solids.iter().flat_map(|(_, parts)| parts).all(|solid| {
+        solid.is_watertight() && solid.health_report().is_healthy() && solid.validate().is_ok()
+    }));
 }
 
 #[test]

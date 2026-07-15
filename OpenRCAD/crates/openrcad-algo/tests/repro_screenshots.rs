@@ -3,7 +3,7 @@
 //! axis-aligned-cube suite never exercises. These document the *current* failure
 //! modes; they are expected to fail until the classifier is made robust.
 
-use openrcad_algo::{boolean, boolean_checked, BooleanOp};
+use openrcad_algo::{boolean, boolean_checked, boolean_checked_bodies, BooleanOp};
 use openrcad_foundation::{Ax1, Dir, Pnt, Trsf};
 use openrcad_primitives::make_box;
 
@@ -39,6 +39,22 @@ fn report_checked(
     }
 }
 
+fn assert_two_sound_bodies(name: &str, bodies: Vec<openrcad_topo::Solid>) {
+    assert_eq!(bodies.len(), 2, "{name} must split into two bodies");
+    for (index, body) in bodies.iter().enumerate() {
+        report(&format!("{name}[{index}]"), body);
+        assert!(
+            body.is_watertight(),
+            "{name} body {index} must be watertight"
+        );
+        assert!(
+            body.health_report().is_healthy(),
+            "{name} body {index} must be healthy: {:?}",
+            body.health_report().errors
+        );
+    }
+}
+
 /// Two thin plates forming an L (like screenshot 4): a 40x40x2 floor plate and a
 /// 40x2x40 wall plate sharing an edge region. Union should be one watertight L.
 #[test]
@@ -69,9 +85,9 @@ fn rotated_box_cut_is_watertight() {
     let rot = Trsf::rotation(&Ax1::new(Pnt::origin(), Dir::dz()), 30f64.to_radians());
     let body = body.transformed(&rot);
     let tool = make_box(&Pnt::new(0.0, -30.0, -5.0), 10.0, 60.0, 20.0);
-    let c = boolean(&body, &tool, BooleanOp::Cut);
-    report("rotated_box_cut", &c);
-    assert!(c.is_watertight(), "rotated box cut must be watertight");
+    let bodies = boolean_checked_bodies(&body, &tool, BooleanOp::Cut)
+        .expect("rotated box cut must produce valid bodies");
+    assert_two_sound_bodies("rotated_box_cut", bodies);
 }
 
 /// Thin plate cut by a thin slot (plate minus plate) — the configuration most
@@ -80,9 +96,9 @@ fn rotated_box_cut_is_watertight() {
 fn thin_plate_slot_cut_is_watertight() {
     let plate = make_box(&Pnt::new(0.0, 0.0, 0.0), 40.0, 40.0, 2.0);
     let slot = make_box(&Pnt::new(15.0, -5.0, -1.0), 10.0, 50.0, 4.0);
-    let c = boolean(&plate, &slot, BooleanOp::Cut);
-    report("thin_plate_slot_cut", &c);
-    assert!(c.is_watertight(), "thin-plate slot cut must be watertight");
+    let bodies = boolean_checked_bodies(&plate, &slot, BooleanOp::Cut)
+        .expect("thin-plate slot cut must produce valid bodies");
+    assert_two_sound_bodies("thin_plate_slot_cut", bodies);
 }
 
 /// Every loop of a boolean result must be a contiguous, consistently-oriented

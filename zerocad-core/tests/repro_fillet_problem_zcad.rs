@@ -21,7 +21,6 @@ use std::collections::HashSet;
 use zerocad_core::read_zcad;
 
 #[test]
-#[ignore = "optional local fillet_problem.zcad fixture; synthetic tangent-wall runout regression covers this path"]
 fn fillet_problem_zcad_fillets_without_warning() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fillet_problem.zcad");
     let Ok(bytes) = std::fs::read(path) else {

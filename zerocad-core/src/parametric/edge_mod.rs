@@ -649,7 +649,15 @@ fn edge_mod_try_construction_replay(
             let Some(target_part) = split_parts.first() else {
                 continue;
             };
-            let reference = MockMesh::from_solid(target_part);
+            let reference = match MockMesh::try_from_solid(target_part) {
+                Ok(mesh) => mesh,
+                Err(reason) => {
+                    failures.push(format!(
+                        "construction replay source could not be tessellated: {reason}"
+                    ));
+                    continue;
+                }
+            };
             let construction_selection = EdgeModSelection::new(&split.edge);
             match edge_mod_try_native_fillet(
                 &reference,
@@ -791,7 +799,9 @@ fn split_axis_aligned_box_for_edge(
     edge: &EdgeRef,
     runout: f32,
 ) -> Vec<PreCutSplit> {
-    let mesh = MockMesh::from_solid(part);
+    let Ok(mesh) = MockMesh::try_from_solid(part) else {
+        return Vec::new();
+    };
     let Some((lo, hi)) = mesh_position_aabb(&mesh) else {
         return Vec::new();
     };
@@ -880,7 +890,10 @@ fn validate_replayed_edge_mod_body(
     let reference_mesh = edge_mod_reference_mesh(body);
     let mut candidate_mesh = MockMesh::empty();
     for part in parts {
-        candidate_mesh.append(MockMesh::from_solid(part));
+        candidate_mesh
+            .append(MockMesh::try_from_solid(part).map_err(|reason| {
+                format!("replayed body display tessellation failed: {reason}")
+            })?);
     }
     edge_mod_timing("replayed body tessellation", started);
     if candidate_mesh.indices.is_empty() {
@@ -1511,7 +1524,17 @@ fn edge_mod_try_native_cut_history_replay(
         let mut prefix_parts = clean_prefix_parts.clone();
         let mut reference_mesh = MockMesh::empty();
         for part in &prefix_parts {
-            reference_mesh.append(MockMesh::from_solid(part));
+            let part_mesh = match MockMesh::try_from_solid(part) {
+                Ok(mesh) => mesh,
+                Err(reason) => {
+                    failures.push(format!(
+                        "prefix {prefix_len} display tessellation failed: {reason}"
+                    ));
+                    reference_mesh = MockMesh::empty();
+                    break;
+                }
+            };
+            reference_mesh.append(part_mesh);
         }
         if reference_mesh.indices.is_empty() {
             failures.push(format!("prefix {prefix_len} tessellated to an empty mesh"));
@@ -1990,7 +2013,13 @@ pub(crate) fn sketch_source_alternate_parts(
 pub(crate) fn edge_mod_reference_mesh(body: &LiveBody) -> MockMesh {
     let mut mesh = MockMesh::empty();
     for part in &body.parts {
-        let mut part_mesh = MockMesh::from_solid(part);
+        let Ok(mut part_mesh) = MockMesh::try_from_solid(part) else {
+            return body
+                .pristine
+                .as_ref()
+                .map(|mesh| (**mesh).clone())
+                .unwrap_or_else(MockMesh::empty);
+        };
         crate::mock_kernel::stamp_face_component(&mut part_mesh, &body.id, part);
         mesh.append(part_mesh);
     }
@@ -2098,7 +2127,8 @@ pub(crate) fn edge_mod_circular_bite_locality(
     if region.rect_circle.is_none() {
         return Ok(());
     }
-    let candidate_mesh = MockMesh::from_solid(candidate);
+    let candidate_mesh = MockMesh::try_from_solid(candidate)
+        .map_err(|reason| format!("candidate display tessellation failed: {reason}"))?;
     if candidate_mesh.indices.is_empty() {
         return Err("candidate tessellated to an empty mesh".to_string());
     }
@@ -3106,7 +3136,7 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh_gated(
     candidate: KernelSolid,
     additive: Option<ConcaveBlendAllowance>,
 ) -> Result<(KernelSolid, Option<MockMesh>), String> {
-    if !edge_mod_keeps_body(original_part, &candidate) {
+    if !edge_mod_keeps_body(original_part, &candidate)? {
         return Err("candidate expands outside the original part bounds".to_string());
     }
     if !crate::mock_kernel::preserves_cylindrical_faces(original_part, &candidate) {
@@ -3119,7 +3149,8 @@ pub(crate) fn edge_mod_accept_candidate_with_mesh_gated(
             return Ok((candidate, None));
         }
     }
-    let candidate_mesh = MockMesh::from_solid(&candidate);
+    let candidate_mesh = MockMesh::try_from_solid(&candidate)
+        .map_err(|reason| format!("candidate display tessellation failed: {reason}"))?;
     if candidate_mesh.indices.is_empty() {
         return Err("candidate tessellated to an empty mesh".to_string());
     }
@@ -3216,7 +3247,8 @@ pub(crate) fn edge_mod_reject_unhealthy_native_curve_result(
     if !edge_mod_native_only(selection) {
         return Ok(());
     }
-    let mesh = MockMesh::from_solid(candidate);
+    let mesh = MockMesh::try_from_solid(candidate)
+        .map_err(|reason| format!("candidate display tessellation failed: {reason}"))?;
     if mesh.indices.is_empty() {
         return Err("candidate tessellated to an empty mesh".to_string());
     }
@@ -3299,7 +3331,8 @@ pub(crate) fn edge_mod_candidate_stays_inside_reference(
     reference_mesh: &MockMesh,
     candidate: &KernelSolid,
 ) -> Result<(), String> {
-    let candidate_mesh = MockMesh::from_solid(candidate);
+    let candidate_mesh = MockMesh::try_from_solid(candidate)
+        .map_err(|reason| format!("candidate display tessellation failed: {reason}"))?;
     if candidate_mesh.indices.is_empty() {
         return Err("candidate tessellated to an empty mesh".to_string());
     }
@@ -3730,7 +3763,10 @@ pub(crate) fn normalize3(a: [f32; 3]) -> [f32; 3] {
 /// material instead flares the result's bounds outside the part; rejecting that
 /// forces the caller to fall through to the robust cutter (or keep the body
 /// intact). Missing bounds → accept (vertexless can't be judged).
-pub(crate) fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> bool {
+pub(crate) fn edge_mod_keeps_body(
+    part: &KernelSolid,
+    result: &KernelSolid,
+) -> Result<bool, String> {
     match (
         crate::mock_kernel::solid_aabb(part),
         crate::mock_kernel::solid_aabb(result),
@@ -3742,18 +3778,21 @@ pub(crate) fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> b
             const SLACK: f32 = 0.3;
             let within = (0..3).all(|k| r.0[k] >= p.0[k] - SLACK && r.1[k] <= p.1[k] + SLACK);
             if !within {
-                return false;
+                return Ok(false);
             }
             // Must keep the bulk of the part. TRUE enclosed volume, not AABB
             // volume: a large-radius fillet on a SHARP sliver corner legitimately
             // shortens the part's AABB by half while removing little material —
             // the old AABB-volume proxy rejected exactly those fillets. A coarse
             // tessellation is plenty accurate for a 50% ratio test.
-            let pv = solid_volume_estimate(part);
-            pv <= 1.0e-6 || solid_volume_estimate(result) >= pv * 0.5
+            let pv = solid_volume_estimate(part)
+                .map_err(|reason| format!("source volume validation failed: {reason}"))?;
+            let result_volume = solid_volume_estimate(result)
+                .map_err(|reason| format!("candidate volume validation failed: {reason}"))?;
+            Ok(pv <= 1.0e-6 || result_volume >= pv * 0.5)
         }
-        (None, None) => true,
-        _ => false,
+        (None, None) => Ok(true),
+        _ => Ok(false),
     }
 }
 
@@ -3761,8 +3800,15 @@ pub(crate) fn edge_mod_keeps_body(part: &KernelSolid, result: &KernelSolid) -> b
 /// theorem (⅙·Σ p0·(p1×p2) over triangles, absolute value — winding-agnostic).
 /// Accuracy is bounded by the chord error, which is far tighter than the 50%
 /// bulk gate this feeds.
-fn solid_volume_estimate(solid: &KernelSolid) -> f64 {
-    let mesh = openrcad::mesh::tessellate(solid, 0.5, std::f64::consts::PI);
+fn solid_volume_estimate(solid: &KernelSolid) -> Result<f64, String> {
+    let mesh = openrcad::mesh::tessellate_compatibility_for_display_with_policy_and_cancel(
+        solid,
+        0.5,
+        std::f64::consts::PI,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+        &openrcad::foundation::NeverCancelled,
+    )
+    .map_err(|error| error.to_string())?;
     let mut vol6 = 0.0f64;
     for tri in &mesh.triangles {
         let a = mesh.vertices[tri[0] as usize];
@@ -3772,5 +3818,5 @@ fn solid_volume_estimate(solid: &KernelSolid) -> f64 {
             + a.y() * (b.z() * c.x() - b.x() * c.z())
             + a.z() * (b.x() * c.y() - b.y() * c.x());
     }
-    (vol6 / 6.0).abs()
+    Ok((vol6 / 6.0).abs())
 }

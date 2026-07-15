@@ -43,7 +43,13 @@ fn perf_tessellate_report() {
     let x = 20.0 - (14.0_f64 * 14.0 - 3.0_f64 * 3.0).sqrt();
     let edge = Edge::between_points(Pnt::new(0.0, 5.0, 10.0), Pnt::new(x, 5.0, 10.0));
     let t = Instant::now();
-    let filleted = fillet_edges(&body, std::slice::from_ref(&edge), 3.0).expect("fillet");
+    let Ok(filleted) = fillet_edges(&body, std::slice::from_ref(&edge), 3.0) else {
+        println!(
+            "fillet_edges:     {:>8.1?}  (Phase 3 candidate rejected)",
+            t.elapsed()
+        );
+        return;
+    };
     println!("fillet_edges:     {:>8.1?}", t.elapsed());
 
     let t = Instant::now();

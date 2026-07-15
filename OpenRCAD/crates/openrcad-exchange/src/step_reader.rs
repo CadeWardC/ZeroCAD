@@ -799,7 +799,32 @@ fn parse_curve2d_representation(
         return parse_curve2d(id, entities).map(|curve| (curve, None));
     };
     if name != "TRIMMED_CURVE" {
-        return parse_curve2d(id, entities).map(|curve| (curve, None));
+        return parse_curve2d(id, entities).map(|mut curve| {
+            // A bounded B-spline's knot interval is an explicit stored trim,
+            // not a projection-based reconstruction. Preserve it as the
+            // authoritative pcurve range on strict import.
+            let range = matches!(&curve, GeomCurve2d::BSpline(_)).then(|| curve.bounds());
+            if let (GeomCurve2d::BSpline(bspline), Some((first, last))) = (&curve, range) {
+                let poles = bspline.poles();
+                if bspline.degree() == 1 && bspline.weights().is_none() && poles.len() == 2 {
+                    let displacement = poles[1] - poles[0];
+                    let length = displacement.magnitude();
+                    let span = (last - first).abs();
+                    if (length - span).abs()
+                        <= openrcad_foundation::tolerance::CONFUSION * length.max(1.0)
+                    {
+                        if let Some(direction) = displacement.normalized() {
+                            let location = Pnt2d::new(
+                                poles[0].x() - direction.x() * first,
+                                poles[0].y() - direction.y() * first,
+                            );
+                            curve = GeomCurve2d::line(Line2d::from_point_dir(location, direction));
+                        }
+                    }
+                }
+            }
+            (curve, range)
+        });
     }
 
     let basis = match args.get(1) {

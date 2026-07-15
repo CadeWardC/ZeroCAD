@@ -22,7 +22,8 @@ use openrcad_geom::GeomSurface;
 use openrcad_topo::{Face, Solid};
 
 use crate::blend::BlendError;
-use crate::{boolean, BooleanOp};
+use crate::boolean::boolean_operation;
+use crate::BooleanOp;
 
 /// Chainable modeling operations on a [`Solid`] — an ergonomic facade over
 /// [`boolean`](crate::boolean), [`fillet`](crate::fillet),
@@ -63,16 +64,26 @@ pub trait SolidExt {
 
 impl SolidExt for Solid {
     fn union(&self, tool: &Solid) -> Solid {
-        boolean::boolean(self, tool, BooleanOp::Fuse)
+        boolean_operation(self, tool, BooleanOp::Fuse)
+            .expect("fluent boolean union")
+            .value
     }
     fn subtract(&self, tool: &Solid) -> Solid {
-        boolean::boolean(self, tool, BooleanOp::Cut)
+        boolean_operation(self, tool, BooleanOp::Cut)
+            .expect("fluent boolean subtraction")
+            .value
     }
     fn intersect(&self, tool: &Solid) -> Solid {
-        boolean::boolean(self, tool, BooleanOp::Common)
+        boolean_operation(self, tool, BooleanOp::Common)
+            .expect("fluent boolean intersection")
+            .value
     }
     fn fillet(&self, radius: f64) -> Result<Solid, BlendError> {
-        crate::fillet(self, radius)
+        crate::fillet_with_policy(
+            self,
+            radius,
+            &openrcad_foundation::TolerancePolicy::STANDARD,
+        )
     }
     fn chamfer(&self, distance: f64) -> Result<Solid, BlendError> {
         crate::chamfer(self, distance)

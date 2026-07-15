@@ -1,6 +1,8 @@
 use core::fmt;
 
-use openrcad_foundation::{tolerance, Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{
+    tolerance, Dir, Pnt, TolerancePolicy, TolerancePolicyError, Vec as GeomVec,
+};
 use openrcad_geom::{CylindricalSurface, GeomCurve, GeomSurface, Plane, RuledSurface};
 use openrcad_topo::{Edge, Face, FaceId, Solid, Vertex, Wire};
 use std::collections::{HashMap, HashSet};
@@ -12,11 +14,13 @@ use crate::rolling_ball::{
     planar_edge_material_wedge_is_concave, planar_outward_normal_checked, polyline_edge,
     relocate_edge, same_face, trim_face_along_spine, trim_face_at_corner, RollingBallError,
 };
-use crate::sew::sew;
+use crate::sew::{compatibility_policy, sew_with_policy};
 
 /// Errors reported by selected-edge chamfer construction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChamferError {
+    /// The supplied document tolerance policy is invalid.
+    InvalidTolerancePolicy(TolerancePolicyError),
     /// Distance must be finite and non-negative.
     InvalidDistance { distance: f64 },
     /// The selected edge is degenerate.
@@ -33,11 +37,21 @@ pub enum ChamferError {
     UnsupportedTrimTopology,
     /// The rebuilt shell was not watertight and healthy.
     InvalidTopology,
+    /// A candidate could not be checked safely and was rejected.
+    CandidateValidation {
+        /// Validation stage that failed.
+        stage: &'static str,
+        /// Underlying validation or tessellation failure.
+        reason: String,
+    },
 }
 
 impl fmt::Display for ChamferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidTolerancePolicy(error) => {
+                write!(f, "chamfer: invalid tolerance policy: {error}")
+            }
             Self::InvalidDistance { distance } => {
                 write!(
                     f,
@@ -64,6 +78,12 @@ impl fmt::Display for ChamferError {
             Self::InvalidTopology => {
                 f.write_str("chamfer: rebuilt body is not watertight and healthy")
             }
+            Self::CandidateValidation { stage, reason } => {
+                write!(
+                    f,
+                    "chamfer: candidate validation failed during {stage}: {reason}"
+                )
+            }
         }
     }
 }
@@ -73,6 +93,9 @@ impl std::error::Error for ChamferError {}
 impl From<RollingBallError> for ChamferError {
     fn from(value: RollingBallError) -> Self {
         match value {
+            RollingBallError::InvalidTolerancePolicy(error) => {
+                ChamferError::InvalidTolerancePolicy(error)
+            }
             RollingBallError::InvalidRadius { radius } => {
                 ChamferError::InvalidDistance { distance: radius }
             }
@@ -85,6 +108,9 @@ impl From<RollingBallError> for ChamferError {
             | RollingBallError::NewtonDiverged { .. }
             | RollingBallError::BlendSurfaceBuild(_) => ChamferError::UnsupportedTrimTopology,
             RollingBallError::InvalidTopology => ChamferError::InvalidTopology,
+            RollingBallError::CandidateValidation { stage, reason } => {
+                ChamferError::CandidateValidation { stage, reason }
+            }
         }
     }
 }
@@ -117,17 +143,30 @@ pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
 /// Unsupported local geometry returns a clean error and leaves upstream callers
 /// free to keep the original body.
 pub fn chamfer_edges(solid: &Solid, edges: &[Edge], distance: f64) -> Result<Solid, ChamferError> {
+    chamfer_edges_with_policy(solid, edges, distance, &TolerancePolicy::STANDARD)
+}
+
+/// Apply planar selected-edge chamfers using one validated document tolerance policy.
+pub fn chamfer_edges_with_policy(
+    solid: &Solid,
+    edges: &[Edge],
+    distance: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, ChamferError> {
+    policy
+        .validate()
+        .map_err(ChamferError::InvalidTolerancePolicy)?;
     if !distance.is_finite() || distance < 0.0 {
         return Err(ChamferError::InvalidDistance { distance });
     }
-    if distance <= tolerance::CONFUSION {
+    if distance <= policy.linear {
         return Ok(solid.clone());
     }
 
     let mut current = solid.clone();
     for edge in edges {
         let target = relocate_edge(&current, edge).ok_or(ChamferError::SpineNotOnFace)?;
-        current = chamfer_planar_edge(&current, &target, distance)?;
+        current = chamfer_planar_edge(&current, &target, distance, policy)?;
     }
     Ok(current)
 }
@@ -150,7 +189,12 @@ enum Endpoint {
     End,
 }
 
-fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Solid, ChamferError> {
+fn chamfer_planar_edge(
+    solid: &Solid,
+    edge: &Edge,
+    distance: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, ChamferError> {
     let mut blend = chamfer_planar_blend(solid, edge, distance)?;
     let start = edge.source().point();
     let end = edge.target().point();
@@ -195,7 +239,8 @@ fn chamfer_planar_edge(solid: &Solid, edge: &Edge, distance: f64) -> Result<Soli
     faces.push(trimmed_b);
     faces.push(blend.chamfer_face);
 
-    let result = Solid::new(sew(&faces, distance * 0.1));
+    let result =
+        Solid::new(sew_with_policy(&faces, policy).map_err(ChamferError::InvalidTolerancePolicy)?);
     let merged =
         crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if merged.is_watertight() && merged.health_report().is_healthy() {
@@ -978,7 +1023,8 @@ fn chamfer_box(
     }
 
     // Sew the 26 faces into a single watertight Shell
-    let shell = sew(&faces, distance * 0.1);
+    let policy = compatibility_policy(distance * 0.1);
+    let shell = sew_with_policy(&faces, &policy).expect("compatibility policy is valid");
     Solid::new(shell)
 }
 

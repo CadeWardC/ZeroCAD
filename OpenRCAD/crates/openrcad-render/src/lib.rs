@@ -87,7 +87,15 @@ mod viewer_app {
     ///
     /// Blocks the calling thread until the window is closed.
     pub fn run_solid(solid: &openrcad_topo::Solid, chord_err: f64) {
-        let mesh = openrcad_mesh::tessellate(solid, chord_err, 0.5).gpu_mesh();
+        let mesh = openrcad_mesh::tessellate_compatibility_with_policy_and_cancel(
+            solid,
+            chord_err,
+            0.5,
+            &openrcad_foundation::TolerancePolicy::STANDARD,
+            &openrcad_foundation::NeverCancelled,
+        )
+        .expect("viewer input must be tessellatable")
+        .gpu_mesh();
         run_gpu_mesh(mesh);
     }
 

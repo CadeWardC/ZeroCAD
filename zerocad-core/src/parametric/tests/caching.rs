@@ -187,6 +187,22 @@ fn checkpoints_share_unchanged_pristine_meshes() {
 }
 
 #[test]
+fn complete_checkpoint_hit_keeps_the_immutable_cache_allocation() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let hidden = std::collections::HashSet::new();
+    graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let before = graph.eval_cache.borrow().clone();
+
+    graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let after = graph.eval_cache.borrow().clone();
+
+    assert!(
+        std::sync::Arc::ptr_eq(&before, &after),
+        "a complete warm hit must not rebuild the checkpoint vector"
+    );
+}
+
+#[test]
 fn superseded_evaluation_exits_without_geometry() {
     let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
     let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));

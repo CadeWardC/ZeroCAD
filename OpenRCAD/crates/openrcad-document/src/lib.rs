@@ -10,9 +10,11 @@ pub mod zcad_format;
 
 use core::fmt;
 
-use openrcad_algo::{boolean_checked, chamfer, fillet, BlendError, BooleanError, BooleanOp};
+use openrcad_algo::{
+    boolean_operation, chamfer, fillet_with_policy, BlendError, BooleanError, BooleanOp,
+};
 use openrcad_foundation::{Ax2, Dir, Pnt};
-use openrcad_primitives::{make_box, make_cylinder};
+use openrcad_primitives::{make_box_operation, make_cylinder_operation};
 use openrcad_sketch::{EntityId, Profile, Sketch, SketchError, SketchPlane};
 use openrcad_topo::{HealthError, HealthReport, Solid};
 use serde::{Deserialize, Serialize};
@@ -380,9 +382,13 @@ impl Document {
                 apply_operation(self, id, tool, operation)
             }
             FeatureKind::Boolean { left, right, op } => {
-                Ok(boolean_checked(self.solid(left)?, self.solid(right)?, op)?)
+                Ok(boolean_operation(self.solid(left)?, self.solid(right)?, op)?.value)
             }
-            FeatureKind::Fillet { input, radius } => Ok(fillet(self.solid(input)?, radius)?),
+            FeatureKind::Fillet { input, radius } => Ok(fillet_with_policy(
+                self.solid(input)?,
+                radius,
+                &openrcad_foundation::TolerancePolicy::STANDARD,
+            )?),
             FeatureKind::Chamfer { input, distance } => Ok(chamfer(self.solid(input)?, distance)?),
         }
     }
@@ -396,21 +402,24 @@ fn apply_operation(
 ) -> Result<Solid, DocumentError> {
     match operation {
         Operation::NewBody => Ok(tool),
-        Operation::Fuse(target) => Ok(boolean_checked(
+        Operation::Fuse(target) => Ok(boolean_operation(
             document.solid_before(target, self_id)?,
             &tool,
             BooleanOp::Fuse,
-        )?),
-        Operation::Cut(target) => Ok(boolean_checked(
+        )?
+        .value),
+        Operation::Cut(target) => Ok(boolean_operation(
             document.solid_before(target, self_id)?,
             &tool,
             BooleanOp::Cut,
-        )?),
-        Operation::Common(target) => Ok(boolean_checked(
+        )?
+        .value),
+        Operation::Common(target) => Ok(boolean_operation(
             document.solid_before(target, self_id)?,
             &tool,
             BooleanOp::Common,
-        )?),
+        )?
+        .value),
     }
 }
 
@@ -434,24 +443,36 @@ fn extrude_profile(plane: SketchPlane, profile: &Profile, depth: f64) -> Solid {
             width,
             height,
         } => match plane {
-            SketchPlane::XY => make_box(
-                &Pnt::new(corner.x(), corner.y(), 0.0),
-                *width,
-                *height,
-                depth,
-            ),
-            SketchPlane::XZ => make_box(
-                &Pnt::new(corner.x(), 0.0, corner.y()),
-                *width,
-                depth,
-                *height,
-            ),
-            SketchPlane::YZ => make_box(
-                &Pnt::new(0.0, corner.x(), corner.y()),
-                depth,
-                *width,
-                *height,
-            ),
+            SketchPlane::XY => {
+                make_box_operation(
+                    &Pnt::new(corner.x(), corner.y(), 0.0),
+                    *width,
+                    *height,
+                    depth,
+                )
+                .expect("validated rectangle extrusion must build")
+                .value
+            }
+            SketchPlane::XZ => {
+                make_box_operation(
+                    &Pnt::new(corner.x(), 0.0, corner.y()),
+                    *width,
+                    depth,
+                    *height,
+                )
+                .expect("validated rectangle extrusion must build")
+                .value
+            }
+            SketchPlane::YZ => {
+                make_box_operation(
+                    &Pnt::new(0.0, corner.x(), corner.y()),
+                    depth,
+                    *width,
+                    *height,
+                )
+                .expect("validated rectangle extrusion must build")
+                .value
+            }
         },
         Profile::Circle { center, radius } => {
             let axis = match plane {
@@ -465,7 +486,9 @@ fn extrude_profile(plane: SketchPlane, profile: &Profile, depth: f64) -> Solid {
                     Ax2::new_axes(Pnt::new(0.0, center.x(), center.y()), Dir::dx(), Dir::dy())
                 }
             };
-            make_cylinder(&axis, *radius, depth)
+            make_cylinder_operation(&axis, *radius, depth)
+                .expect("validated circle extrusion must build")
+                .value
         }
     }
 }

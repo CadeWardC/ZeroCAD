@@ -4,7 +4,7 @@ use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
 use std::collections::HashMap;
 
 use crate::blend::{detect_cylinder, shell_cylinder, BlendError};
-use crate::sew::sew;
+use crate::sew::{compatibility_policy, sew_with_policy};
 
 /// Shell a solid by `thickness`, removing `open_faces`.
 pub fn shell_solid(
@@ -225,7 +225,9 @@ fn shell_planar_general(
         ));
     }
 
-    let shelled = Solid::new(sew(&result, tolerance::CONFUSION * 10.0));
+    let policy = compatibility_policy(tolerance::CONFUSION * 10.0);
+    let shelled =
+        Solid::new(sew_with_policy(&result, &policy).expect("compatibility policy is valid"));
     if !shelled.is_watertight() {
         return Err(BlendError::UnsupportedShape);
     }
@@ -611,7 +613,8 @@ fn shell_box(
     }
 
     // Sew the collection of faces into a watertight shell
-    let shell = sew(&faces, thickness * 0.1);
+    let policy = compatibility_policy(thickness * 0.1);
+    let shell = sew_with_policy(&faces, &policy).expect("compatibility policy is valid");
     Solid::new(shell)
 }
 

@@ -877,6 +877,7 @@ pub struct EvaluationOutput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
+    Info,
     Warning,
     Error,
 }

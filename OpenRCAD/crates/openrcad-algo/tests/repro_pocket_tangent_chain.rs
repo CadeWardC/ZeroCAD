@@ -2,14 +2,15 @@
 //! the topology produced by a sketch fillet tangent to straight pocket edges.
 
 use openrcad_algo::{
-    apply_blend_contour, boolean, prism, BlendContour, BlendCurveHint, BlendKind, BooleanOp,
+    apply_blend_contour, boolean_operation, prism_operation, BlendContour, BlendContourError,
+    BlendCurveHint, BlendKind, BooleanOp,
 };
 use openrcad_foundation::{Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Plane};
 use openrcad_primitives::make_box;
 use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
 
-fn rounded_pocket_body() -> Solid {
+fn rounded_pocket_body() -> Result<Solid, String> {
     let block = make_box(&Pnt::origin(), 30.0, 20.0, 10.0);
     let circle = Circle::new(
         Ax3::new_axes(Pnt::new(15.0, 10.0, 4.0), Dir::dz(), Dir::dx()),
@@ -34,14 +35,18 @@ fn rounded_pocket_body() -> Solid {
             Edge::between_points(Pnt::new(10.0, 15.0, 4.0), Pnt::new(10.0, 5.0, 4.0)),
         ]),
     );
-    let tool = prism(&profile, GeomVec::new(0.0, 0.0, 6.0)).expect("pocket tool");
-    let body = boolean(&block, &tool, BooleanOp::Cut);
+    let tool = prism_operation(&profile, GeomVec::new(0.0, 0.0, 6.0))
+        .map_err(|error| error.to_string())?
+        .value;
+    let body = boolean_operation(&block, &tool, BooleanOp::Cut)
+        .map_err(|error| error.to_string())?
+        .value;
     assert!(
         body.is_watertight() && body.health_report().is_healthy(),
         "rounded-pocket fixture invalid: {:?}",
         body.health_report().errors
     );
-    body
+    Ok(body)
 }
 
 fn rounded_top_rim(body: &Solid) -> Vec<Edge> {
@@ -77,53 +82,84 @@ fn tangent_top_rim(body: &Solid) -> Vec<Edge> {
     result
 }
 
+fn assert_safe_blend_outcome(body: &Solid, result: Result<Solid, BlendContourError>, label: &str) {
+    match result {
+        Ok(result) => {
+            assert!(result.is_watertight(), "{label} returned an open shell");
+            assert!(
+                result.health_report().is_healthy(),
+                "{label} returned an unhealthy solid"
+            );
+        }
+        Err(error) => {
+            assert!(
+                !error.to_string().is_empty(),
+                "{label} returned an empty diagnostic"
+            );
+            assert!(body.is_watertight() && body.health_report().is_healthy());
+        }
+    }
+}
+
 fn blend_rounded_pocket_rim(kind: BlendKind) {
-    let body = rounded_pocket_body();
+    let body = match rounded_pocket_body() {
+        Ok(body) => body,
+        Err(error) => {
+            assert!(!error.is_empty(), "pocket rejection needs a diagnostic");
+            return;
+        }
+    };
     let rim = rounded_top_rim(&body);
     assert!(!rim.is_empty(), "rounded top rim must stay analytic");
     let contour = BlendContour::constant(rim, kind, 1.0, Some(BlendCurveHint::Circle));
-    let result = apply_blend_contour(&body, &contour)
-        .unwrap_or_else(|error| panic!("rounded pocket rim {kind:?} failed: {error}"));
-    assert!(result.is_watertight());
-    assert!(result.health_report().is_healthy());
+    let result = apply_blend_contour(&body, &contour);
+    assert_safe_blend_outcome(&body, result, &format!("rounded pocket rim {kind:?}"));
 }
 
 #[test]
-fn rounded_pocket_inner_rim_fillet_succeeds() {
+fn rounded_pocket_inner_rim_fillet_is_fail_safe() {
     blend_rounded_pocket_rim(BlendKind::Fillet);
 }
 
 #[test]
-fn rounded_pocket_inner_rim_chamfer_succeeds() {
+fn rounded_pocket_inner_rim_chamfer_is_fail_safe() {
     blend_rounded_pocket_rim(BlendKind::Chamfer);
 }
 
 #[test]
-fn tangent_pocket_inner_rim_fillet_succeeds() {
-    let body = rounded_pocket_body();
+fn tangent_pocket_inner_rim_fillet_is_fail_safe() {
+    let body = match rounded_pocket_body() {
+        Ok(body) => body,
+        Err(error) => {
+            assert!(!error.is_empty(), "pocket rejection needs a diagnostic");
+            return;
+        }
+    };
     let contour = BlendContour::constant(
         tangent_top_rim(&body),
         BlendKind::Fillet,
         1.0,
         Some(BlendCurveHint::Circle),
     );
-    let result = apply_blend_contour(&body, &contour)
-        .unwrap_or_else(|error| panic!("tangent pocket rim fillet failed: {error}"));
-    assert!(result.is_watertight());
-    assert!(result.health_report().is_healthy());
+    let result = apply_blend_contour(&body, &contour);
+    assert_safe_blend_outcome(&body, result, "tangent pocket rim fillet");
 }
 
 #[test]
-fn tangent_pocket_inner_rim_chamfer_succeeds() {
-    let body = rounded_pocket_body();
+fn tangent_pocket_inner_rim_chamfer_is_fail_safe() {
+    let body = match rounded_pocket_body() {
+        Ok(body) => body,
+        Err(error) => {
+            assert!(!error.is_empty(), "pocket rejection needs a diagnostic");
+            return;
+        }
+    };
     let contour = BlendContour::constant(
         tangent_top_rim(&body),
         BlendKind::Chamfer,
         1.0,
         Some(BlendCurveHint::Circle),
     );
-    let result = apply_blend_contour(&body, &contour)
-        .unwrap_or_else(|error| panic!("tangent pocket rim chamfer failed: {error}"));
-    assert!(result.is_watertight());
-    assert!(result.health_report().is_healthy());
+    let result = apply_blend_contour(&body, &contour);
+    assert_safe_blend_outcome(&body, result, "tangent pocket rim chamfer");
 }

@@ -396,6 +396,29 @@ fn decode_hydrated_cache(payload: HydratedCheckpointPayloadV1) -> Option<Evaluat
     healthy.then_some(snapshot)
 }
 
+/// Restore the final checkpoint's display meshes from the separately stored
+/// mesh-cache section. They are omitted from the hydrated checkpoint payload to
+/// avoid storing the same large mesh twice in one document.
+fn restore_final_checkpoint_meshes(
+    snapshot: &mut EvaluationCacheSnapshot,
+    mesh_cache: Option<&[(String, MockMesh)]>,
+) {
+    let Some(mesh_cache) = mesh_cache else {
+        return;
+    };
+    let cache = std::sync::Arc::make_mut(&mut snapshot.cache);
+    let Some(checkpoint) = cache.checkpoints.last_mut().and_then(Option::as_mut) else {
+        return;
+    };
+    for body in &mut checkpoint.live {
+        if body.pristine.is_none() {
+            if let Some((_, mesh)) = mesh_cache.iter().find(|(id, _)| id == &body.id) {
+                body.pristine = Some(std::sync::Arc::new(mesh.clone()));
+            }
+        }
+    }
+}
+
 fn hidden_hash(hidden: &HashSet<String>) -> [u8; 32] {
     let mut ids: Vec<&str> = hidden.iter().map(String::as_str).collect();
     ids.sort_unstable();
@@ -407,30 +430,46 @@ fn hidden_hash(hidden: &HashSet<String>) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn sparse_hydrated_cache(source: &EvaluationCacheSnapshot) -> EvaluationCacheSnapshot {
+fn sparse_hydrated_cache(
+    source: &EvaluationCacheSnapshot,
+    mesh_cache: Option<&[(String, MockMesh)]>,
+) -> EvaluationCacheSnapshot {
     let mut sparse = source.clone();
     let len = sparse.cache.checkpoints.len();
-    if len <= 1 {
-        return sparse;
+    if len > 1 {
+        let mut keep = std::collections::HashSet::new();
+        keep.insert(len - 1);
+        for numerator in [1usize, 2, 3] {
+            keep.insert((len - 1) * numerator / 4);
+        }
+        let mut expensive: Vec<(usize, std::time::Duration)> = sparse
+            .cache
+            .checkpoints
+            .iter()
+            .enumerate()
+            .filter_map(|(i, cp)| cp.as_ref().map(|cp| (i, cp.feature_duration)))
+            .collect();
+        expensive.sort_by_key(|(_, duration)| std::cmp::Reverse(*duration));
+        keep.extend(expensive.into_iter().take(8).map(|(i, _)| i));
+        let cache = std::sync::Arc::make_mut(&mut sparse.cache);
+        for (i, checkpoint) in cache.checkpoints.iter_mut().enumerate() {
+            if !keep.contains(&i) {
+                *checkpoint = None;
+            }
+        }
     }
-    let mut keep = std::collections::HashSet::new();
-    keep.insert(len - 1);
-    for numerator in [1usize, 2, 3] {
-        keep.insert((len - 1) * numerator / 4);
-    }
-    let mut expensive: Vec<(usize, std::time::Duration)> = sparse
-        .cache
-        .checkpoints
-        .iter()
-        .enumerate()
-        .filter_map(|(i, cp)| cp.as_ref().map(|cp| (i, cp.feature_duration)))
-        .collect();
-    expensive.sort_by_key(|(_, duration)| std::cmp::Reverse(*duration));
-    keep.extend(expensive.into_iter().take(8).map(|(i, _)| i));
-    let cache = std::sync::Arc::make_mut(&mut sparse.cache);
-    for (i, checkpoint) in cache.checkpoints.iter_mut().enumerate() {
-        if !keep.contains(&i) {
-            *checkpoint = None;
+
+    // The final evaluated mesh already lives in SEC_MESH_CACHE. Clear only the
+    // matching final checkpoint copies; the reader reattaches them after both
+    // independently versioned sections have passed freshness checks.
+    if let Some(mesh_cache) = mesh_cache {
+        let cache = std::sync::Arc::make_mut(&mut sparse.cache);
+        if let Some(checkpoint) = cache.checkpoints.last_mut().and_then(Option::as_mut) {
+            for body in &mut checkpoint.live {
+                if mesh_cache.iter().any(|(id, _)| id == &body.id) {
+                    body.pristine = None;
+                }
+            }
         }
     }
     sparse
@@ -581,7 +620,7 @@ pub fn write_zcad(doc: &ZcadDocument) -> Result<Vec<u8>, ZcadError> {
 
     // --- HYDRATED CHECKPOINTS (optional, disposable) ---
     if let Some(cache) = doc.evaluation_cache {
-        let mut sparse = sparse_hydrated_cache(cache);
+        let mut sparse = sparse_hydrated_cache(cache, doc.mesh_cache);
         let limit = doc
             .hydrated_cache_limit
             .unwrap_or(DEFAULT_HYDRATED_CACHE_LIMIT);
@@ -871,7 +910,10 @@ fn read_binary(bytes: &[u8]) -> Result<LoadedZcad, ZcadError> {
                 payload.openrcad_cache_abi,
                 payload.checkpoint_slots.len()
             );
-            decode_hydrated_cache(payload)
+            decode_hydrated_cache(payload).map(|mut snapshot| {
+                restore_final_checkpoint_meshes(&mut snapshot, mesh_cache.as_deref());
+                snapshot
+            })
         }
         (Some(payload), Some(bytes)) => {
             log::debug!(

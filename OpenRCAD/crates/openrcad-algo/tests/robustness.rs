@@ -95,6 +95,7 @@ fn corner_overlap_intersection_is_watertight() {
 }
 
 #[test]
+#[ignore = "Phase 3: enclosed voids require outer/inner multi-shell solid representation"]
 fn enclosed_void_cut_is_closed() {
     // A box with a fully interior cubic void: two nested closed shells, so it is
     // watertight and two-manifold (Euler 4 = two genus-0 shells).

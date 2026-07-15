@@ -13,13 +13,12 @@
 use std::collections::{HashMap, HashSet};
 
 use openrcad::algo::{
-    apply_blend_contour, boolean_checked, prism, revolve, skin_polygon_rings, BlendContour,
-    BlendCurveHint, BlendKind, BooleanOp,
+    apply_blend_contour_with_policy, skin_polygon_rings, BlendContour, BlendCurveHint, BlendKind,
+    BooleanOp,
 };
 pub use openrcad::algo::{BooleanFaceHistory, BooleanFaceSource};
-use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, Trsf, Vec as GeomVec};
+use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, TolerancePolicy, Trsf, Vec as GeomVec};
 use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
-use openrcad::primitives::{make_box, make_cylinder};
 use openrcad::topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
 use crate::geometry::Vec3;
@@ -31,6 +30,7 @@ mod circle_geom;
 mod geom_utils;
 mod history;
 mod mesh_topology;
+mod outcome;
 mod primitives;
 mod tessellation;
 mod types;
@@ -47,6 +47,7 @@ pub use history::*;
 pub use mesh_topology::mesh_face_boundary_2d;
 #[allow(unused_imports)]
 pub(crate) use mesh_topology::*;
+pub(crate) use outcome::*;
 pub use primitives::*;
 #[allow(unused_imports)]
 pub(crate) use tessellation::*;
@@ -127,9 +128,19 @@ mod wireframe_tests {
         // a notched/faceted circle from the top. They run straight down the wall, so
         // they're vertical struts of the *pocket* depth (6) — assert none survive,
         // while the box's four real 90° corner edges (height 10) still draw.
-        let block = make_box(&Pnt::origin(), 40.0, 20.0, 10.0);
-        let drill = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 4.0), Dir::dz()), 4.0, 6.0);
-        let body = boolean_checked(&block, &drill, BooleanOp::Cut).expect("bore should cut");
+        let block = openrcad::primitives::make_box_operation(&Pnt::origin(), 40.0, 20.0, 10.0)
+            .unwrap()
+            .value;
+        let drill = openrcad::primitives::make_cylinder_operation(
+            &Ax2::new(Pnt::new(20.0, 10.0, 4.0), Dir::dz()),
+            4.0,
+            6.0,
+        )
+        .unwrap()
+        .value;
+        let body = openrcad::algo::boolean_operation(&block, &drill, BooleanOp::Cut)
+            .expect("bore should cut")
+            .value;
         let mesh = MockMesh::from_solid(&body);
         assert_eq!(
             count_struts(&mesh.edge_vertices, &mesh.edge_indices, 6.0),
@@ -204,7 +215,9 @@ mod wireframe_tests {
         // each tessellates into several chords. Those chords must collapse into a
         // single `edge_groups` id apiece, so the viewport selects the whole arc as
         // one curve (the user's request) instead of a lone chord.
-        let solid = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let solid = openrcad::primitives::make_box_operation(&Pnt::origin(), 10.0, 10.0, 10.0)
+            .unwrap()
+            .value;
         let edge = solid
             .edges()
             .into_iter()

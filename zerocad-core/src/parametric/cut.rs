@@ -107,7 +107,22 @@ pub(crate) fn apply_body_cut(
         return;
     }
 
+    // The exact-history path is unambiguous when one target part is cut by one
+    // tool part. Preserve the target's existing face names and give generated
+    // tool faces durable names while the boolean still has its lineage table.
+    // Retaining this mesh also avoids tessellating the unchanged result again
+    // on every checkpoint hit.
+    let input_names: Option<Vec<Option<String>>> =
+        match (&target_body.pristine, &target_body.parts[..]) {
+            (Some(mesh), [part]) => Some(crate::mock_kernel::input_shell_face_names(mesh, part)),
+            _ => None,
+        };
+    let owner_classes = input_names
+        .as_ref()
+        .map(|names| crate::mock_kernel::owner_classes_from_names(names));
+    let exact_history_eligible = target_body.parts.len() == 1 && tool_body.parts.len() == 1;
     let mut result_parts = target_body.parts.clone();
+    let mut cut_trace: Option<(KernelSolid, crate::mock_kernel::BooleanFaceHistory)> = None;
     let mut changed = false;
     for tool_part in &tool_body.parts {
         let mut next = Vec::new();
@@ -116,9 +131,18 @@ pub(crate) fn apply_body_cut(
                 next.push(target_part);
                 continue;
             }
-            match crate::mock_kernel::difference_bodies(&target_part, tool_part) {
-                Some(parts) if cut_parts_changed(&target_part, &parts) => {
+            match crate::mock_kernel::difference_bodies_with_history(
+                &target_part,
+                tool_part,
+                exact_history_eligible
+                    .then_some(owner_classes.as_deref())
+                    .flatten(),
+            ) {
+                Some((parts, combined, history)) if cut_parts_changed(&target_part, &parts) => {
                     changed = true;
+                    if exact_history_eligible {
+                        cut_trace = Some((combined, history));
+                    }
                     next.extend(parts);
                 }
                 _ => next.push(target_part),
@@ -134,6 +158,26 @@ pub(crate) fn apply_body_cut(
         return;
     }
 
+    let pristine = match (&cut_trace, &input_names, target_body.pristine.as_deref()) {
+        (Some((combined, history)), Some(names), Some(input_mesh)) => Some(std::sync::Arc::new(
+            crate::mock_kernel::propagate_face_names_via_history(
+                input_mesh,
+                names,
+                combined,
+                history,
+                node_id,
+                &format!("cut:{node_id}"),
+            ),
+        )),
+        _ => propagate_cut_face_names(
+            &target_body.parts,
+            target_body.pristine.as_deref(),
+            &result_parts,
+            node_id,
+        )
+        .map(std::sync::Arc::new),
+    };
+
     let mut remove = vec![target_index];
     if !keep_tool {
         remove.push(tool_index);
@@ -147,7 +191,7 @@ pub(crate) fn apply_body_cut(
         live.push(LiveBody {
             id: node_id.to_string(),
             parts: result_parts,
-            pristine: None,
+            pristine,
             sketch_source: None,
             cut_tools: Vec::new(),
             cut_replay: None,

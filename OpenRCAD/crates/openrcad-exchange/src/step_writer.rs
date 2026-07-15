@@ -1,18 +1,25 @@
 #![forbid(unsafe_code)]
 //! STEP AP242 (ISO 10303-21) B-Rep Writer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write};
 
 use openrcad_foundation::{Ax22d, Ax3, Dir, Dir2d, Pnt, Pnt2d, TolerancePolicy};
-use openrcad_geom::{GeomCurve, GeomSurface};
+use openrcad_geom::{Curve, GeomCurve, GeomSurface};
 use openrcad_geom2d::{BSplineCurve2d, Curve2d, GeomCurve2d};
 use openrcad_topo::{PcurveData, Solid};
 
 struct StepWriter {
     next_id: u32,
     lines: Vec<String>,
+    points_3d: HashMap<[u64; 3], u32>,
+    directions_3d: HashMap<[u64; 3], u32>,
+    vectors_3d: HashMap<(u32, u64), u32>,
+    points_2d: HashMap<[u64; 2], u32>,
+    directions_2d: HashMap<[u64; 2], u32>,
+    vectors_2d: HashMap<u32, u32>,
+    pcurve_representations: Vec<(PcurveData, u32)>,
 }
 
 impl StepWriter {
@@ -20,6 +27,13 @@ impl StepWriter {
         Self {
             next_id: 1,
             lines: Vec::new(),
+            points_3d: HashMap::new(),
+            directions_3d: HashMap::new(),
+            vectors_3d: HashMap::new(),
+            points_2d: HashMap::new(),
+            directions_2d: HashMap::new(),
+            vectors_2d: HashMap::new(),
+            pcurve_representations: Vec::new(),
         }
     }
 
@@ -30,10 +44,14 @@ impl StepWriter {
     }
 
     fn write_line(&mut self, id: u32, content: String) {
-        self.lines.push(format!("#{} = {};", id, content));
+        self.lines.push(format!("#{}={};", id, content));
     }
 
     fn write_point(&mut self, p: Pnt) -> u32 {
+        let key = [float_key(p.x()), float_key(p.y()), float_key(p.z())];
+        if let Some(&id) = self.points_3d.get(&key) {
+            return id;
+        }
         let id = self.alloc_id();
         self.write_line(
             id,
@@ -44,22 +62,33 @@ impl StepWriter {
                 f(p.z())
             ),
         );
+        self.points_3d.insert(key, id);
         id
     }
 
     fn write_direction(&mut self, d: Dir) -> u32 {
+        let key = [float_key(d.x()), float_key(d.y()), float_key(d.z())];
+        if let Some(&id) = self.directions_3d.get(&key) {
+            return id;
+        }
         let id = self.alloc_id();
         self.write_line(
             id,
             format!("DIRECTION('', ({}, {}, {}))", f(d.x()), f(d.y()), f(d.z())),
         );
+        self.directions_3d.insert(key, id);
         id
     }
 
     fn write_vector(&mut self, d: Dir, mag: f64) -> u32 {
         let dir_id = self.write_direction(d);
+        let key = (dir_id, float_key(mag));
+        if let Some(&id) = self.vectors_3d.get(&key) {
+            return id;
+        }
         let id = self.alloc_id();
         self.write_line(id, format!("VECTOR('', #{}, {})", dir_id, f(mag)));
+        self.vectors_3d.insert(key, id);
         id
     }
 
@@ -79,15 +108,24 @@ impl StepWriter {
     }
 
     fn write_point2d(&mut self, point: Pnt2d) -> u32 {
+        let key = [float_key(point.x()), float_key(point.y())];
+        if let Some(&id) = self.points_2d.get(&key) {
+            return id;
+        }
         let id = self.alloc_id();
         self.write_line(
             id,
             format!("CARTESIAN_POINT('', ({}, {}))", f(point.x()), f(point.y())),
         );
+        self.points_2d.insert(key, id);
         id
     }
 
     fn write_direction2d(&mut self, direction: Dir2d) -> u32 {
+        let key = [float_key(direction.x()), float_key(direction.y())];
+        if let Some(&id) = self.directions_2d.get(&key) {
+            return id;
+        }
         let id = self.alloc_id();
         self.write_line(
             id,
@@ -97,13 +135,18 @@ impl StepWriter {
                 f(direction.y())
             ),
         );
+        self.directions_2d.insert(key, id);
         id
     }
 
     fn write_vector2d(&mut self, direction: Dir2d) -> u32 {
         let direction_id = self.write_direction2d(direction);
+        if let Some(&id) = self.vectors_2d.get(&direction_id) {
+            return id;
+        }
         let id = self.alloc_id();
         self.write_line(id, format!("VECTOR('', #{direction_id}, 1.0)"));
+        self.vectors_2d.insert(direction_id, id);
         id
     }
 
@@ -125,26 +168,26 @@ impl StepWriter {
             .map(|point| self.write_point2d(*point))
             .map(|id| format!("#{id}"))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         let multiplicities = curve
             .multiplicities()
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         let knots = curve
             .knots()
             .iter()
             .map(|value| f(*value))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         let id = self.alloc_id();
         if let Some(weights) = curve.weights() {
             let weights = weights
                 .iter()
                 .map(|value| f(*value))
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join(",");
             self.write_line(
                 id,
                 format!(
@@ -176,10 +219,7 @@ impl StepWriter {
             GeomCurve2d::Circle(circle) => {
                 let axis = self.write_axis2_placement_2d(circle.position());
                 let id = self.alloc_id();
-                self.write_line(
-                    id,
-                    format!("CIRCLE('', #{axis}, {})", f(circle.radius())),
-                );
+                self.write_line(id, format!("CIRCLE('', #{axis}, {})", f(circle.radius())));
                 let canonical_y = circle.position().x_direction().rotated_90();
                 let parameter_scale = if canonical_y.dot(&circle.position().y_direction()) >= 0.0 {
                     1.0
@@ -200,12 +240,11 @@ impl StepWriter {
                     ),
                 );
                 let canonical_y = ellipse.position().x_direction().rotated_90();
-                let parameter_scale =
-                    if canonical_y.dot(&ellipse.position().y_direction()) >= 0.0 {
-                        1.0
-                    } else {
-                        -1.0
-                    };
+                let parameter_scale = if canonical_y.dot(&ellipse.position().y_direction()) >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 (id, parameter_scale)
             }
             GeomCurve2d::BSpline(curve) => (self.write_bspline_curve2d(curve), 1.0),
@@ -222,7 +261,13 @@ impl StepWriter {
                     .collect::<Vec<_>>();
                 let knots = (0..count).map(|index| index as f64).collect::<Vec<_>>();
                 let multiplicities = (0..count)
-                    .map(|index| if index == 0 || index == count - 1 { 2 } else { 1 })
+                    .map(|index| {
+                        if index == 0 || index == count - 1 {
+                            2
+                        } else {
+                            1
+                        }
+                    })
                     .collect::<Vec<_>>();
                 (
                     self.write_bspline_curve2d(&BSplineCurve2d::new(
@@ -239,22 +284,54 @@ impl StepWriter {
     }
 
     fn write_pcurve(&mut self, surface: u32, pcurve: &PcurveData) -> u32 {
-        let (basis, parameter_scale) =
-            self.write_curve2d(&pcurve.curve, (pcurve.first, pcurve.last));
-        let trimmed = self.alloc_id();
-        self.write_line(
-            trimmed,
-            format!(
-                "TRIMMED_CURVE('', #{basis}, (PARAMETER_VALUE({})), (PARAMETER_VALUE({})), .T., .PARAMETER.)",
-                f(parameter_scale * pcurve.first),
-                f(parameter_scale * pcurve.last)
-            ),
-        );
-        let representation = self.alloc_id();
-        self.write_line(
-            representation,
-            format!("DEFINITIONAL_REPRESENTATION('', (#{trimmed}), $)"),
-        );
+        let representation = if let Some(representation) = self
+            .pcurve_representations
+            .iter()
+            .find_map(|(stored, id)| (stored == pcurve).then_some(*id))
+        {
+            representation
+        } else {
+            let curve = match &pcurve.curve {
+                GeomCurve2d::Line(line) => {
+                    // A degree-one B-spline carries its finite parameter bounds in
+                    // its knot vector, so a separate (and very verbose)
+                    // TRIMMED_CURVE is unnecessary. This is especially valuable
+                    // for planar solids, whose many linear coedges remain fully
+                    // authoritative while producing compact STEP payloads.
+                    let first = pcurve.first.min(pcurve.last);
+                    let last = pcurve.first.max(pcurve.last);
+                    self.write_bspline_curve2d(&BSplineCurve2d::new(
+                        1,
+                        vec![line.point(first), line.point(last)],
+                        None,
+                        vec![first, last],
+                        vec![2, 2],
+                    ))
+                }
+                _ => {
+                    let (basis, parameter_scale) =
+                        self.write_curve2d(&pcurve.curve, (pcurve.first, pcurve.last));
+                    let trimmed = self.alloc_id();
+                    self.write_line(
+                        trimmed,
+                        format!(
+                            "TRIMMED_CURVE('', #{basis}, (PARAMETER_VALUE({})), (PARAMETER_VALUE({})), .T., .PARAMETER.)",
+                            f(parameter_scale * pcurve.first),
+                            f(parameter_scale * pcurve.last)
+                        ),
+                    );
+                    trimmed
+                }
+            };
+            let representation = self.alloc_id();
+            self.write_line(
+                representation,
+                format!("DEFINITIONAL_REPRESENTATION('', (#{curve}), $)"),
+            );
+            self.pcurve_representations
+                .push((pcurve.clone(), representation));
+            representation
+        };
         let id = self.alloc_id();
         self.write_line(id, format!("PCURVE('', #{surface}, #{representation})"));
         id
@@ -315,19 +392,19 @@ impl StepWriter {
                     .iter()
                     .map(|id: &u32| format!("#{}", id))
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
                 let mult_str = b
                     .multiplicities()
                     .iter()
                     .map(|m: &usize| m.to_string())
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
                 let knot_str = b
                     .knots()
                     .iter()
                     .map(|k: &f64| f(*k))
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
 
                 let id = self.alloc_id();
                 if let Some(weights) = b.weights() {
@@ -335,7 +412,7 @@ impl StepWriter {
                         .iter()
                         .map(|w: &f64| f(*w))
                         .collect::<Vec<String>>()
-                        .join(", ");
+                        .join(",");
                     let content = format!(
                         "(\n\
                         B_SPLINE_CURVE({}, ({}), .UNSPECIFIED., .F., .F.)\n\
@@ -459,35 +536,35 @@ impl StepWriter {
                             row.iter()
                                 .map(|id: &u32| format!("#{}", id))
                                 .collect::<Vec<String>>()
-                                .join(", ")
+                                .join(",")
                         )
                     })
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
                 let u_mult_str = b
                     .u_multiplicities()
                     .iter()
                     .map(|m: &usize| m.to_string())
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
                 let v_mult_str = b
                     .v_multiplicities()
                     .iter()
                     .map(|m: &usize| m.to_string())
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
                 let u_knot_str = b
                     .u_knots()
                     .iter()
                     .map(|k: &f64| f(*k))
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
                 let v_knot_str = b
                     .v_knots()
                     .iter()
                     .map(|k: &f64| f(*k))
                     .collect::<Vec<String>>()
-                    .join(", ");
+                    .join(",");
 
                 let id = self.alloc_id();
                 if let Some(weights) = b.weights() {
@@ -499,11 +576,11 @@ impl StepWriter {
                                 row.iter()
                                     .map(|w: &f64| f(*w))
                                     .collect::<Vec<String>>()
-                                    .join(", ")
+                                    .join(",")
                             )
                         })
                         .collect::<Vec<String>>()
-                        .join(", ");
+                        .join(",");
                     let content = format!(
                         "(\n\
                         BOUNDED_SURFACE()\n\
@@ -550,6 +627,15 @@ impl StepWriter {
     }
 }
 
+#[inline]
+fn float_key(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else {
+        value.to_bits()
+    }
+}
+
 /// Helper to format float to standard scientific/decimal form.
 fn f(val: f64) -> String {
     if val.is_nan() {
@@ -578,6 +664,96 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     }
     let mut writer = StepWriter::new();
     let brep = solid.brep();
+    let solid_data = &brep.solids[solid.id()];
+
+    // Traverse only this solid's reachable topology. B-Rep arenas may retain
+    // construction intermediates, which are not part of the exported shape.
+    let shell_ids = solid_data.shells.clone();
+    let mut seen_faces = HashSet::new();
+    let face_ids = shell_ids
+        .iter()
+        .flat_map(|shell_id| brep.shells[*shell_id].faces.iter().copied())
+        .filter(|face_id| seen_faces.insert(*face_id))
+        .collect::<Vec<_>>();
+    let mut seen_loops = HashSet::new();
+    let loop_ids = face_ids
+        .iter()
+        .flat_map(|face_id| {
+            let face = &brep.faces[*face_id];
+            face.outer_wire
+                .into_iter()
+                .chain(face.inner_wires.iter().copied())
+        })
+        .filter(|loop_id| seen_loops.insert(*loop_id))
+        .collect::<Vec<_>>();
+    let mut seen_edges = HashSet::new();
+    let edge_ids = loop_ids
+        .iter()
+        .flat_map(|loop_id| brep.loops[*loop_id].edges.iter().map(|coedge| coedge.id))
+        .filter(|edge_id| seen_edges.insert(*edge_id))
+        .collect::<Vec<_>>();
+
+    // The topology layer permits two face-local edge records to represent one
+    // physical shared boundary. STEP models that as one EDGE_CURVE carrying
+    // independent PCURVEs. Group by the same endpoint-plus-midpoint identity
+    // used by strict manifold validation, and remember whether each local
+    // record runs opposite to the chosen representative.
+    let grid = 1.0 / TolerancePolicy::STANDARD.approximation;
+    let quantize = |point: Pnt| {
+        (
+            (point.x() * grid).round() as i64,
+            (point.y() * grid).round() as i64,
+            (point.z() * grid).round() as i64,
+        )
+    };
+    let mut representative_by_key = HashMap::new();
+    let mut edge_group = HashMap::new();
+    let mut representative_edges = Vec::new();
+    for &edge_id in &edge_ids {
+        let edge = &brep.edges[edge_id];
+        let start = brep.vertices[edge.start].point;
+        let end = brep.vertices[edge.end].point;
+        let midpoint = edge.curve.as_ref().map_or_else(
+            || {
+                Pnt::new(
+                    0.5 * (start.x() + end.x()),
+                    0.5 * (start.y() + end.y()),
+                    0.5 * (start.z() + end.z()),
+                )
+            },
+            |curve| curve.point(0.5 * (edge.first + edge.last)),
+        );
+        let natural_start = quantize(start);
+        let natural_end = quantize(end);
+        let middle = quantize(midpoint);
+        let key = if natural_start <= natural_end {
+            (natural_start, natural_end, middle)
+        } else {
+            (natural_end, natural_start, middle)
+        };
+        if let Some(&(representative, representative_start, representative_end)) =
+            representative_by_key.get(&key)
+        {
+            let reversed = natural_start == representative_end
+                && natural_end == representative_start
+                && natural_start != natural_end;
+            edge_group.insert(edge_id, (representative, reversed));
+        } else {
+            representative_by_key.insert(key, (edge_id, natural_start, natural_end));
+            edge_group.insert(edge_id, (edge_id, false));
+            representative_edges.push(edge_id);
+        }
+    }
+
+    let mut seen_vertices = HashSet::new();
+    let vertex_ids = representative_edges
+        .iter()
+        .flat_map(|edge_id| {
+            let edge = &brep.edges[*edge_id];
+            [edge.start, edge.end]
+        })
+        .filter(|vertex_id| seen_vertices.insert(*vertex_id))
+        .collect::<Vec<_>>();
 
     let mut vertex_map = HashMap::new();
     let mut edge_map = HashMap::new();
@@ -587,7 +763,8 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     let mut surface_map = HashMap::new();
 
     // 1. Write vertices
-    for (v_id, v_data) in &brep.vertices {
+    for v_id in vertex_ids {
+        let v_data = &brep.vertices[v_id];
         let pt_id = writer.write_point(v_data.point);
         let v_step_id = writer.alloc_id();
         writer.write_line(v_step_id, format!("VERTEX_POINT('', #{})", pt_id));
@@ -596,7 +773,8 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
 
     // 2. Write carrying surfaces first so each edge can reference every
     // face-local PCURVE associated with its 3D curve.
-    for (face_id, face) in &brep.faces {
+    for &face_id in &face_ids {
+        let face = &brep.faces[face_id];
         let surface = face.surface.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -606,8 +784,9 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         surface_map.insert(face_id, writer.write_surface(surface));
     }
 
-    let mut edge_pcurves = HashMap::<_, Vec<(u32, _)>>::new();
-    for (face_id, face) in &brep.faces {
+    let mut edge_pcurves = HashMap::<_, Vec<(u32, PcurveData)>>::new();
+    for &face_id in &face_ids {
+        let face = &brep.faces[face_id];
         let surface = surface_map[&face_id];
         for loop_id in face
             .outer_wire
@@ -621,8 +800,13 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
                         format!("STEP coedge {:?} has no pcurve", coedge.id),
                     )
                 })?;
+                let (representative, reversed) = edge_group[&coedge.id];
+                let mut pcurve = brep.pcurves[pcurve].clone();
+                if reversed {
+                    pcurve = pcurve.reversed();
+                }
                 edge_pcurves
-                    .entry(coedge.id)
+                    .entry(representative)
                     .or_default()
                     .push((surface, pcurve));
             }
@@ -630,7 +814,9 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     }
 
     // 3. Write 3D edges with their stored 2D representations.
-    for (e_id, e_data) in &brep.edges {
+    let mut representative_step_edges = HashMap::new();
+    for e_id in representative_edges {
+        let e_data = &brep.edges[e_id];
         let start_v = vertex_map[&e_data.start];
         let end_v = vertex_map[&e_data.end];
         let curve_3d = if let Some(ref c) = e_data.curve {
@@ -650,10 +836,10 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         } else {
             let pcurves = associations
                 .iter()
-                .map(|(surface, pcurve)| writer.write_pcurve(*surface, &brep.pcurves[*pcurve]))
+                .map(|(surface, pcurve)| writer.write_pcurve(*surface, pcurve))
                 .map(|id| format!("#{id}"))
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join(",");
             let is_seam = associations.iter().enumerate().any(|(index, item)| {
                 associations[..index]
                     .iter()
@@ -664,7 +850,11 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
                 id,
                 format!(
                     "{}('', #{curve_3d}, ({pcurves}), .PCURVE_S1.)",
-                    if is_seam { "SEAM_CURVE" } else { "SURFACE_CURVE" }
+                    if is_seam {
+                        "SEAM_CURVE"
+                    } else {
+                        "SURFACE_CURVE"
+                    }
                 ),
             );
             id
@@ -686,15 +876,22 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
                 start_v, end_v, curve_id, same_sense
             ),
         );
-        edge_map.insert(e_id, edge_step_id);
+        representative_step_edges.insert(e_id, edge_step_id);
+    }
+    for (edge_id, (representative, reversed)) in edge_group {
+        edge_map.insert(
+            edge_id,
+            (representative_step_edges[&representative], reversed),
+        );
     }
 
     // 4. Write loops
-    for (l_id, l_data) in &brep.loops {
+    for l_id in loop_ids {
+        let l_data = &brep.loops[l_id];
         let mut oriented_edge_ids = Vec::new();
         for oe in &l_data.edges {
-            let edge_step_id = edge_map[&oe.id];
-            let same_sense = if oe.orientation.is_forward() {
+            let (edge_step_id, representative_reversed) = edge_map[&oe.id];
+            let same_sense = if oe.orientation.is_forward() ^ representative_reversed {
                 ".T."
             } else {
                 ".F."
@@ -712,13 +909,14 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
             .iter()
             .map(|id| format!("#{}", id))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         writer.write_line(loop_step_id, format!("EDGE_LOOP('', ({}))", oe_list));
         loop_map.insert(l_id, loop_step_id);
     }
 
     // 5. Write faces
-    for (f_id, f_data) in &brep.faces {
+    for f_id in face_ids {
+        let f_data = &brep.faces[f_id];
         let surface_id = surface_map[&f_id];
 
         let mut bound_ids = Vec::new();
@@ -747,7 +945,7 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
             .iter()
             .map(|id| format!("#{}", id))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         let face_step_id = writer.alloc_id();
         writer.write_line(
             face_step_id,
@@ -760,20 +958,20 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     }
 
     // 6. Write shells
-    for (sh_id, sh_data) in &brep.shells {
+    for sh_id in shell_ids {
+        let sh_data = &brep.shells[sh_id];
         let face_list = sh_data
             .faces
             .iter()
             .map(|f_id| format!("#{}", face_map[f_id]))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         let shell_step_id = writer.alloc_id();
         writer.write_line(shell_step_id, format!("CLOSED_SHELL('', ({}))", face_list));
         shell_map.insert(sh_id, shell_step_id);
     }
 
     // 7. Write solids
-    let solid_data = &brep.solids[solid.id()];
     let shell_step_id = shell_map[&solid_data.shells[0]];
     let solid_step_id = writer.alloc_id();
     writer.write_line(
@@ -785,15 +983,14 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     let mut file = File::create(path)?;
     writeln!(file, "ISO-10303-21;")?;
     writeln!(file, "HEADER;")?;
-    writeln!(file, "FILE_DESCRIPTION(('OpenRCAD STEP Model'),'2;1');")?;
+    writeln!(file, "FILE_DESCRIPTION(('OpenRCAD'),'2;1');")?;
     writeln!(
         file,
-        "FILE_NAME('{}','2026-06-19T00:00:00',('OpenRCAD'),('OpenRCAD team'),'OpenRCAD','OpenRCAD','');",
-        path
+        "FILE_NAME('OpenRCAD.step','2026-06-19T00:00:00',('OpenRCAD'),(''),'OpenRCAD','OpenRCAD','');"
     )?;
     writeln!(
         file,
-        "FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF {{ 1 0 10303 242 1 1 1 }}'));"
+        "FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF'));"
     )?;
     writeln!(file, "ENDSEC;")?;
     writeln!(file, "DATA;")?;

@@ -23,7 +23,10 @@ pub enum FaceBuildError {
         expected: usize,
         actual: usize,
     },
-    InvalidPcurve { wire: usize, coedge: usize },
+    InvalidPcurve {
+        wire: usize,
+        coedge: usize,
+    },
 }
 
 impl core::fmt::Display for FaceBuildError {
@@ -34,10 +37,7 @@ impl core::fmt::Display for FaceBuildError {
                 wire,
                 expected,
                 actual,
-            } => write!(
-                f,
-                "wire {wire} has {expected} coedges but {actual} pcurves"
-            ),
+            } => write!(f, "wire {wire} has {expected} coedges but {actual} pcurves"),
             Self::InvalidPcurve { wire, coedge } => {
                 write!(f, "wire {wire} coedge {coedge} has an invalid pcurve")
             }

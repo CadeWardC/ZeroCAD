@@ -76,7 +76,8 @@ pub fn fillet_edge_with_hint(
                 radius as f64,
                 Some(BlendCurveHint::Circle),
             );
-            return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
+            return apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
+                .map_err(|err| err.to_string());
         }
         let contour = BlendContour::constant(
             chain,
@@ -84,7 +85,8 @@ pub fn fillet_edge_with_hint(
             radius as f64,
             Some(BlendCurveHint::Circle),
         );
-        return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
+        return apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
+            .map_err(|err| err.to_string());
     }
 
     let e = Edge::between_points(
@@ -92,7 +94,8 @@ pub fn fillet_edge_with_hint(
         snap_point_to_topology(solid, p1),
     );
     let contour = BlendContour::constant(vec![e], BlendKind::Fillet, radius as f64, None);
-    apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
+    apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
+        .map_err(|err| err.to_string())
 }
 
 fn append_tangent_line_edges(solid: &KernelSolid, chain: &mut Vec<Edge>) {
@@ -294,7 +297,8 @@ pub fn chamfer_edge_with_hint(
             distance as f64,
             Some(BlendCurveHint::Circle),
         );
-        return apply_blend_contour(solid, &contour).map_err(|err| err.to_string());
+        return apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
+            .map_err(|err| err.to_string());
     }
 
     let e = Edge::between_points(
@@ -302,5 +306,6 @@ pub fn chamfer_edge_with_hint(
         snap_point_to_topology(solid, p1),
     );
     let contour = BlendContour::constant(vec![e], BlendKind::Chamfer, distance as f64, None);
-    apply_blend_contour(solid, &contour).map_err(|err| err.to_string())
+    apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
+        .map_err(|err| err.to_string())
 }

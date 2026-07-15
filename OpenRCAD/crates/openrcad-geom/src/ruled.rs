@@ -50,40 +50,78 @@ impl RuledSurface {
     pub fn helical_uv_hinted(&self, p: Pnt, hint: Option<(f64, f64)>) -> Option<(f64, f64)> {
         use crate::{GeomCurve, Helix};
         const TAU: f64 = core::f64::consts::TAU;
-        let helix: &Helix = match (&self.curve1, &self.curve2) {
-            (GeomCurve::Helix(h), _) => h,
-            (_, GeomCurve::Helix(h)) => h,
-            _ => return None,
-        };
-        let lead_of = |c: &GeomCurve| match c {
-            GeomCurve::Helix(h) => h.lead(),
-            _ => 0.0,
-        };
-        let pos = helix.position();
-        let d = p - pos.location();
-        let dx = d.dot(&Vec::from_dir(pos.x_direction()));
-        let dy = d.dot(&Vec::from_dir(pos.y_direction()));
-        let ang = dy.atan2(dx);
-        let mean_lead = 0.5 * (lead_of(&self.curve1) + lead_of(&self.curve2));
-        let u_est = if let Some((hu, _)) = hint {
-            hu
-        } else if mean_lead.abs() > 1e-9 {
-            d.dot(&Vec::from_dir(pos.direction())) * TAU / mean_lead
-        } else {
-            ang.rem_euclid(TAU)
-        };
-        let k = ((u_est - ang) / TAU).round();
-        let u = ang + TAU * k;
-        let p1 = self.curve1.point(u);
-        let p2 = self.curve2.point(u);
-        let ruling = p2 - p1;
-        let len2 = ruling.dot(&ruling);
-        let v = if len2 > 1e-18 {
-            (p - p1).dot(&ruling) / len2
-        } else {
-            0.5
-        };
-        Some((u, v))
+        let helices: std::vec::Vec<&Helix> = [&self.curve1, &self.curve2]
+            .into_iter()
+            .filter_map(|curve| match curve {
+                GeomCurve::Helix(helix) => Some(helix),
+                _ => None,
+            })
+            .collect();
+        if helices.is_empty() {
+            return None;
+        }
+
+        // Generate absolute-turn candidates from every available invariant.
+        // Lead resolves a multi-turn helix from axial height; taper resolves a
+        // zero-lead spiral from radius; a prior UV remains useful for ordinary
+        // circle-like rails. Each estimate is snapped onto the point's angular
+        // branch in that helix's frame.
+        let mut candidates = std::vec::Vec::new();
+        for helix in helices {
+            let pos = helix.position();
+            let offset = p - pos.location();
+            let x = offset.dot(&Vec::from_dir(pos.x_direction()));
+            let y = offset.dot(&Vec::from_dir(pos.y_direction()));
+            let angle = y.atan2(x);
+            let radius = x.hypot(y);
+            let axial = offset.dot(&Vec::from_dir(pos.direction()));
+            let mut estimates = std::vec::Vec::new();
+            if helix.taper().abs() > 1e-12 {
+                estimates.push((radius - helix.radius()) / helix.taper());
+            }
+            if helix.lead().abs() > 1e-12 {
+                estimates.push(axial * TAU / helix.lead());
+            }
+            if let Some((u, _)) = hint {
+                estimates.push(u);
+            }
+            if estimates.is_empty() {
+                estimates.push(angle);
+            }
+            for estimate in estimates {
+                let u = angle + TAU * ((estimate - angle) / TAU).round();
+                if u.is_finite()
+                    && candidates
+                        .iter()
+                        .all(|candidate: &f64| (*candidate - u).abs() > 1e-10)
+                {
+                    candidates.push(u);
+                }
+            }
+        }
+
+        // Select the branch whose finite ruling segment actually contains the
+        // point. Clamping v for the score prevents an aliased whole-turn branch
+        // from appearing exact only by extrapolating far outside the face.
+        candidates
+            .into_iter()
+            .filter_map(|u| {
+                let p1 = self.curve1.point(u);
+                let p2 = self.curve2.point(u);
+                let ruling = p2 - p1;
+                let len2 = ruling.dot(&ruling);
+                let v = if len2 > 1e-18 {
+                    (p - p1).dot(&ruling) / len2
+                } else {
+                    0.5
+                };
+                let bounded_v = v.clamp(0.0, 1.0);
+                let projected = p1 + ruling * bounded_v;
+                let error = projected.distance(&p);
+                error.is_finite().then_some((error, u, bounded_v))
+            })
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal))
+            .map(|(_, u, v)| (u, v))
     }
 
     /// Analytical derivatives.
@@ -121,5 +159,37 @@ mod tests {
         assert!((pt.y() - 5.0).abs() < 1e-9);
         assert!(du.x() > 0.9); // direction is +X
         assert!(dv.y() > 9.9); // direction is +Y, magnitude 10
+    }
+
+    #[test]
+    fn helical_uv_resolves_long_leaded_and_tapered_rails() {
+        use crate::Helix;
+
+        let frame = openrcad_foundation::Ax3::new(Pnt::origin(), Dir::dz());
+        let leaded = GeomCurve::helix(Helix::new(frame, 3.0, 0.0, 1.0));
+        let shifted = GeomCurve::helix(Helix::new(
+            openrcad_foundation::Ax3::new(Pnt::new(0.0, 0.0, 0.1), Dir::dz()),
+            3.0,
+            0.0,
+            1.0,
+        ));
+        let surface = RuledSurface::new(leaded.clone(), shifted);
+        let point = leaded.point(60.0);
+        let (u, v) = surface.helical_uv_hinted(point, None).unwrap();
+        assert!((u - 60.0).abs() < 1e-9);
+        assert!(v.abs() < 1e-9);
+
+        let tapered = GeomCurve::helix(Helix::new(frame, 4.25, 0.4, 0.0));
+        let circle = GeomCurve::helix(Helix::new(
+            openrcad_foundation::Ax3::new(Pnt::new(0.0, 0.0, -0.75), Dir::dz()),
+            4.0,
+            0.0,
+            0.0,
+        ));
+        let surface = RuledSurface::new(tapered.clone(), circle);
+        let point = tapered.point(-2.0);
+        let (u, v) = surface.helical_uv_hinted(point, None).unwrap();
+        assert!((u + 2.0).abs() < 1e-9);
+        assert!(v.abs() < 1e-9);
     }
 }

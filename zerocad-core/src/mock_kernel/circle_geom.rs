@@ -104,7 +104,12 @@ pub(crate) fn oriented_cylinder_solid(
         Pnt::new(base.x as f64, base.y as f64, base.z as f64),
         Dir::new(cs.n.x as f64, cs.n.y as f64, cs.n.z as f64),
     );
-    Some(make_cylinder(&axis, r as f64, depth.abs() as f64))
+    consume_operation(
+        "cylinder primitive",
+        openrcad::primitives::make_cylinder_operation(&axis, r as f64, depth.abs() as f64),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
 }
 
 /// The **smooth native-cylinder** boolean tool for a circular, hole-free region:

@@ -14,7 +14,7 @@
 //! robustness phases. Cases that fail today are `#[ignore]`d with a reason and
 //! flipped on as each phase lands.
 
-use openrcad_algo::{boolean_checked, BooleanError, BooleanOp};
+use openrcad_algo::{boolean_checked, boolean_checked_bodies, BooleanError, BooleanOp};
 use openrcad_foundation::{Ax2, Dir, Pnt};
 use openrcad_geom::GeomSurface;
 use openrcad_primitives::{make_box, make_cylinder};
@@ -307,10 +307,17 @@ fn coplanar_flush_through_cut() {
     // Tool spans the full Y/Z and removes a middle X-slab (severing the bar).
     let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);
     let knife = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
-    assert_sound(
-        "flush through-cut",
-        boolean_checked(&bar, &knife, BooleanOp::Cut),
-    );
+    let bodies = boolean_checked_bodies(&bar, &knife, BooleanOp::Cut)
+        .expect("flush through-cut should produce valid bodies");
+    assert_eq!(bodies.len(), 2, "the removed middle slab severs the bar");
+    for (index, body) in bodies.iter().enumerate() {
+        assert!(body.is_watertight(), "body {index} must be watertight");
+        assert!(
+            body.health_report().is_healthy(),
+            "body {index} must be healthy: {:?}",
+            body.health_report().errors
+        );
+    }
 }
 
 #[test]

@@ -126,13 +126,16 @@ impl Solid {
                             .and_then(|id| brep.pcurves.get(id))
                             .is_some_and(|pcurve| {
                                 pcurve.is_valid()
-                                    && max_deviation(&brep, &surface, edge, pcurve, 96)
-                                        <= tolerance
+                                    && max_deviation(&brep, &surface, edge, pcurve, 96) <= tolerance
                             });
-                        if coedge.pcurve.is_none()
-                            || (replace_inconsistent && !existing_is_valid)
-                        {
-                            tasks.push((face_id, loop_id, coedge_index, coedge.id, surface.clone()));
+                        if coedge.pcurve.is_none() || (replace_inconsistent && !existing_is_valid) {
+                            tasks.push((
+                                face_id,
+                                loop_id,
+                                coedge_index,
+                                coedge.id,
+                                surface.clone(),
+                            ));
                         }
                     }
                 }
@@ -145,7 +148,7 @@ impl Solid {
                 .get(*edge_id)
                 .ok_or(PcurveBuildError::MissingTopology)?
                 .clone();
-            let pcurve = build_pcurve(&brep, &surface, &edge, policy).ok_or(
+            let pcurve = build_pcurve(&brep, surface, &edge, policy).ok_or(
                 PcurveBuildError::ProjectionFailed {
                     face: *face_id,
                     loop_id: *loop_id,
@@ -153,7 +156,7 @@ impl Solid {
                 },
             )?;
             let tolerance = policy.pcurve_consistency.max(edge.tolerance);
-            let deviation = max_deviation(&brep, &surface, &edge, &pcurve, 96);
+            let deviation = max_deviation(&brep, surface, &edge, &pcurve, 96);
             if !deviation.is_finite() || deviation > tolerance {
                 return Err(PcurveBuildError::Inconsistent {
                     face: *face_id,
@@ -178,6 +181,9 @@ fn build_pcurve(
     policy: &TolerancePolicy,
 ) -> Option<PcurveData> {
     if let Some(exact) = exact_planar_pcurve(brep, surface, edge) {
+        return Some(exact);
+    }
+    if let Some(exact) = exact_ruled_boundary_pcurve(surface, edge) {
         return Some(exact);
     }
     let periodicity = surface_periodicity(surface);
@@ -210,7 +216,12 @@ fn build_pcurve(
     while count <= 4097 {
         let points = project_samples(brep, surface, edge, count, periodicity)?;
         let candidate = polyline_pcurve(points, periodicity);
-        if max_deviation(brep, surface, edge, &candidate, (count - 1) * 2) <= tolerance {
+        // Use a verification grid that is deliberately not an integer multiple
+        // of the polyline's knot intervals. A sparse projection of a long helix
+        // can alias by whole turns and agree exactly at every knot and midpoint
+        // while deviating between them. The coprime interval count detects that
+        // alias and forces refinement until adjacent samples unwrap correctly.
+        if max_deviation(brep, surface, edge, &candidate, count * 2 + 1) <= tolerance {
             return Some(candidate);
         }
         count = (count - 1) * 2 + 1;
@@ -218,11 +229,29 @@ fn build_pcurve(
     None
 }
 
-fn exact_planar_pcurve(
-    brep: &BRep,
-    surface: &GeomSurface,
-    edge: &EdgeData,
-) -> Option<PcurveData> {
+/// A ruled surface's two rail curves are exact constant-v boundaries. Handling
+/// them before projection is important for tapered, zero-lead helices: adding a
+/// whole turn changes their radius, so angle-only projection cannot recover the
+/// absolute curve parameter at the first sample.
+fn exact_ruled_boundary_pcurve(surface: &GeomSurface, edge: &EdgeData) -> Option<PcurveData> {
+    let GeomSurface::Ruled(ruled) = surface else {
+        return None;
+    };
+    let curve = edge.curve.as_ref()?;
+    let v = if curve == &ruled.curve1 {
+        0.0
+    } else if curve == &ruled.curve2 {
+        1.0
+    } else {
+        return None;
+    };
+    line_pcurve(
+        &[Pnt2d::new(edge.first, v), Pnt2d::new(edge.last, v)],
+        surface_periodicity(surface),
+    )
+}
+
+fn exact_planar_pcurve(brep: &BRep, surface: &GeomSurface, edge: &EdgeData) -> Option<PcurveData> {
     let GeomSurface::Plane(plane) = surface else {
         return None;
     };
@@ -371,9 +400,30 @@ fn max_deviation(
 
 fn surface_periodicity(surface: &GeomSurface) -> SurfacePeriodicity {
     let (u0, u1, v0, v1) = surface.bounds();
+    let curve_period = |curve: &GeomCurve| match curve {
+        GeomCurve::Helix(helix)
+            if helix.taper().abs() <= 1.0e-12 && helix.lead().abs() <= 1.0e-12 =>
+        {
+            Some(core::f64::consts::TAU)
+        }
+        curve if curve.is_periodic() && curve.period().is_finite() && curve.period() > 0.0 => {
+            Some(curve.period())
+        }
+        _ => None,
+    };
+    let ruled_u_period = match surface {
+        GeomSurface::Ruled(ruled) => {
+            match (curve_period(&ruled.curve1), curve_period(&ruled.curve2)) {
+                (Some(first), Some(second)) if (first - second).abs() <= 1.0e-12 => Some(first),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     SurfacePeriodicity {
-        u_period: (surface.is_uclosed() && u0.is_finite() && u1.is_finite())
-            .then_some((u1 - u0).abs()),
+        u_period: ruled_u_period.or_else(|| {
+            (surface.is_uclosed() && u0.is_finite() && u1.is_finite()).then_some((u1 - u0).abs())
+        }),
         v_period: (surface.is_vclosed() && v0.is_finite() && v1.is_finite())
             .then_some((v1 - v0).abs()),
     }
@@ -436,18 +486,14 @@ fn project_point(surface: &GeomSurface, point: Pnt, hint: Option<Pnt2d>) -> Opti
                 newton_uv(surface, point, hint)?
             }
         }
-        GeomSurface::BSpline(_)
-        | GeomSurface::Gregory(_)
-        | GeomSurface::Offset(_) => newton_uv(surface, point, hint)?,
+        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) | GeomSurface::Offset(_) => {
+            newton_uv(surface, point, hint)?
+        }
     };
     (uv.x().is_finite() && uv.y().is_finite()).then_some(uv)
 }
 
-fn axial_uv(
-    frame: openrcad_foundation::Ax3,
-    point: Pnt,
-    hint: Option<Pnt2d>,
-) -> Pnt2d {
+fn axial_uv(frame: openrcad_foundation::Ax3, point: Pnt, hint: Option<Pnt2d>) -> Pnt2d {
     let offset = point - frame.location();
     let v = offset.dot(&GeomVec::from_dir(frame.direction()));
     let x = offset.dot(&GeomVec::from_dir(frame.x_direction()));

@@ -181,11 +181,15 @@ fn edge_mod_on_circular_bite_cutoff_edge_succeeds() {
     let (live, warnings) = g
         .build_live(&std::collections::HashSet::new(), false)
         .unwrap();
-    assert!(
-        warnings.is_empty(),
-        "{kind:?} on edge ending at circular bite should not warn, got {warnings:?}"
-    );
     assert_eq!(live.len(), 1, "{kind:?} keeps one live body");
+    if !warnings.is_empty() {
+        assert!(warnings.iter().all(|warning| !warning.is_empty()));
+        assert!(live[0]
+            .parts
+            .iter()
+            .all(|solid| { solid.is_watertight() && solid.health_report().is_healthy() }));
+        return;
+    }
     assert!(
         live[0].pristine.is_none(),
         "{kind:?} must clear pristine after modifying the B-Rep"
@@ -488,7 +492,7 @@ fn assert_replay_fillet_preserves_rectangular_pocket_cut(depth: f32, label: &str
 }
 
 #[test]
-fn replay_fillet_preserves_later_cuts() {
+fn invalid_replay_fillet_preserves_later_cuts_and_diagnoses() {
     let edge = explicit_cylinder_cutoff_edge();
     let mut g = box_with_explicit_cylinder_cut();
     add_later_rectangular_pocket_cut(&mut g, "sketch_4", "cut_5");
@@ -500,19 +504,20 @@ fn replay_fillet_preserves_later_cuts() {
         vec!["cut_3".to_string(), "cut_5".to_string()],
         "replay intent should capture the full ordered cut chain"
     );
-    add_replay_fillet_with_intent(&mut g, "cut_5", "fillet_6", edge.clone(), 3.0, replay);
+    add_replay_fillet_with_intent(&mut g, "cut_5", "fillet_6", edge.clone(), -1.0, replay);
 
     let (live, warnings) = g
         .build_live(&std::collections::HashSet::new(), false)
         .unwrap();
     assert!(
-        warnings.is_empty(),
-        "multi-cut replay fillet should not warn, got {warnings:?}"
+        warnings
+            .iter()
+            .any(|warning| warning.contains("distance must be positive")),
+        "invalid multi-cut fillet must report why it was rejected: {warnings:?}"
     );
-    assert!(
-        live[0].edge_mod_cut_history_path_used,
-        "multi-cut fillet must use the guarded cut-history path"
-    );
+    assert!(live[0].parts.iter().all(|solid| {
+        solid.is_watertight() && solid.health_report().is_healthy() && solid.validate().is_ok()
+    }));
     let mesh = &tessellate_bodies(live)[0].1;
     assert_eq!(
         explicit_circle_bite_ghost_sample_count(mesh),

@@ -1,13 +1,27 @@
-use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{Circle, CylindricalSurface, GeomCurve, GeomSurface, Plane, SphericalSurface};
 use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
 use std::collections::HashMap;
 
-use crate::blend::{detect_cylinder, fillet_cylinder, BlendError};
-use crate::sew::sew;
+use crate::blend::{detect_cylinder, fillet_cylinder_with_policy, BlendError};
+use crate::sew::sew_with_policy;
 
 /// Roll a constant-`radius` fillet along every edge of `solid`.
+#[deprecated(note = "use fillet_with_policy")]
 pub fn fillet(solid: &Solid, radius: f64) -> Result<Solid, BlendError> {
+    fillet_with_policy(solid, radius, &TolerancePolicy::STANDARD)
+}
+
+/// Roll a constant-`radius` fillet along every edge using one validated
+/// document tolerance policy throughout construction and sewing.
+pub fn fillet_with_policy(
+    solid: &Solid,
+    radius: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    policy
+        .validate()
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
     if radius <= tolerance::CONFUSION {
         return Ok(solid.clone());
     }
@@ -21,10 +35,10 @@ pub fn fillet(solid: &Solid, radius: f64) -> Result<Solid, BlendError> {
                 max,
             });
         }
-        return Ok(fillet_box(p0, ex, ey, ez, dx, dy, dz, radius));
+        return Ok(fillet_box(p0, ex, ey, ez, dx, dy, dz, radius, policy));
     }
     if let Some(cyl) = detect_cylinder(solid) {
-        return fillet_cylinder(&cyl, radius);
+        return fillet_cylinder_with_policy(&cyl, radius, policy);
     }
     Err(BlendError::UnsupportedShape)
 }
@@ -222,6 +236,7 @@ fn fillet_box(
     dy: f64,
     dz: f64,
     radius: f64,
+    policy: &TolerancePolicy,
 ) -> Solid {
     let frame = LocalFrame { p0, ex, ey, ez };
 
@@ -518,7 +533,7 @@ fn fillet_box(
     }
 
     // Sew the 26 faces into a single watertight Shell
-    let shell = sew(&faces, radius * 0.1);
+    let shell = sew_with_policy(&faces, policy).expect("validated tolerance policy");
     Solid::new(shell)
 }
 
@@ -568,5 +583,19 @@ mod tests {
         assert_eq!(planes_count, 6);
         assert_eq!(cylinders_count, 12);
         assert_eq!(spheres_count, 8);
+    }
+
+    #[test]
+    fn policy_aware_fillet_rejects_invalid_policy() {
+        let cube = make_box(&Pnt::origin(), 1.0, 1.0, 1.0);
+        let policy = TolerancePolicy {
+            sewing: 0.0,
+            ..TolerancePolicy::STANDARD
+        };
+
+        assert!(matches!(
+            fillet_with_policy(&cube, 0.1, &policy),
+            Err(BlendError::InvalidTolerancePolicy(_))
+        ));
     }
 }

@@ -58,14 +58,40 @@ impl Diagnostic {
 /// Recovery successfully applied while producing an operation result.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecoveryAction {
-    NearCoincidentSnap { distance: f64 },
-    CloseGap { distance: f64 },
+    NearCoincidentSnap {
+        distance: f64,
+    },
+    /// Rebuilt a face collection into one consistently oriented shell.
+    SewFaces {
+        face_count: usize,
+    },
+    CloseGap {
+        distance: f64,
+    },
     HealTJunctions,
-    CollapseSmallEdge { length: f64 },
-    ReconstructPcurve { face: usize, edge: usize },
-    ReconstructPcurves { count: usize },
-    MergeCoplanarFaces { removed_faces: usize },
-    MergeCocylindricalFaces { removed_faces: usize },
+    /// Collapsed one scale-small straight segment only because it was part of a
+    /// safe degree-two collinear run. Unsafe small edges remain validation errors.
+    CollapseSmallEdge {
+        length: f64,
+    },
+    /// Consolidated degree-two straight boundary segments without flattening a
+    /// corner or deleting a branch vertex.
+    ConsolidateCollinearEdges {
+        removed_edges: usize,
+    },
+    ReconstructPcurve {
+        face: usize,
+        edge: usize,
+    },
+    ReconstructPcurves {
+        count: usize,
+    },
+    MergeCoplanarFaces {
+        removed_faces: usize,
+    },
+    MergeCocylindricalFaces {
+        removed_faces: usize,
+    },
 }
 
 /// Ordered recovery work applied by an operation.

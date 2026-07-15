@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use openrcad_foundation::{tolerance, Pnt, Vec as FVec};
+use openrcad_foundation::{tolerance, Pnt, TolerancePolicy, TolerancePolicyError, Vec as FVec};
 use openrcad_geom::{Curve, GeomSurface, Plane};
 use openrcad_topo::arena::{LoopId, OrientedEdge, ShellData};
-use openrcad_topo::{BRep, EdgeId, Face, FaceId, Orientation, Shell, VertexId};
+use openrcad_topo::{BRep, EdgeId, Face, FaceId, Orientation, Shell, Solid, VertexId};
 
 /// A point quantized to a fine integer grid (see [`quantize`]).
 type QPoint = (i64, i64, i64);
@@ -303,14 +303,62 @@ fn canonicalize_shell_orientation(brep: &mut BRep, face_ids: &[FaceId]) {
     }
 }
 
-/// Sew a collection of faces into a single shell, joining edges within `tol`.
+/// Sew faces using one validated tolerance policy for clustering, edge matching,
+/// pcurve preservation, and orientation repair.
+pub fn sew_with_policy(
+    faces: &[Face],
+    policy: &TolerancePolicy,
+) -> Result<Shell, TolerancePolicyError> {
+    policy.validate()?;
+    Ok(sew_impl(faces, policy))
+}
+
+/// Compatibility sewing entry point using a bare vertex/edge merge tolerance.
 ///
-/// Merges vertices within `tol` by clustering them and updating edge endpoints.
-/// Also merges edges that share the same endpoints (in either direction) and have compatible curves.
+/// This delegates to [`sew_with_policy`] after applying `tol` to the standard
+/// policy's sewing field. It therefore cannot carry document-specific values
+/// for pcurve consistency, sliver handling, or other scale-dependent decisions.
+#[deprecated(
+    note = "use sew_with_policy; this wrapper supplies STANDARD for non-sewing tolerances"
+)]
 pub fn sew(faces: &[Face], tol: f64) -> Shell {
+    let policy = compatibility_policy(tol);
+    sew_with_policy(faces, &policy).unwrap_or_else(|_| Shell::default())
+}
+
+/// Preserve a legacy builder's explicit sewing tolerance while making its use
+/// of standard values for every other tolerance visible at the call site.
+/// Phase 3 replaces these compatibility policies with caller-supplied policy.
+pub(crate) fn compatibility_policy(sewing: f64) -> TolerancePolicy {
+    TolerancePolicy {
+        sewing: sewing.max(TolerancePolicy::STANDARD.linear),
+        ..TolerancePolicy::STANDARD
+    }
+}
+
+fn sew_impl(faces: &[Face], policy: &TolerancePolicy) -> Shell {
     if faces.is_empty() {
         return Shell::default();
     }
+    let tol = policy.sewing;
+    // Preserve the strict representation invariant when sewing already-strict
+    // faces. Legacy Phase 3 builders still construct surface faces without
+    // pcurves; eagerly fitting every one of those coedges here is both a hidden
+    // compatibility migration and can make rolling-ball candidates
+    // pathologically expensive. Canonical healing owns that explicit repair.
+    let repair_pcurves_is_bounded = faces.iter().all(|face| {
+        face.surface().is_none()
+            || face.wires().iter().all(|wire| {
+                let edges = wire.edges();
+                (0..wire.len()).all(|index| {
+                    wire.pcurve(index).is_some()
+                        || !matches!(
+                            edges[index].curve(),
+                            Some(openrcad_geom::GeomCurve::BSpline(_))
+                        )
+                })
+            })
+    });
     let debug = std::env::var_os("OPENRCAD_SEW_DEBUG").is_some();
 
     // 1. Merge all faces into a single BRep. Distinct source arenas are merged
@@ -716,7 +764,27 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
         }
     }
 
-    // 6. Update LoopData edge references and invert orientation if merged opposite.
+    // 6. Update LoopData edge references and invert orientation if merged
+    // opposite. A pcurve is parameterized in its 3D edge's natural direction,
+    // so replacing that edge with an opposite representative must reverse the
+    // pcurve range as well as the coedge orientation.
+    let reversed_pcurve_ids: Vec<_> = brep
+        .loops
+        .values()
+        .flat_map(|loop_data| loop_data.edges.iter())
+        .filter(|coedge| edge_reversals[&coedge.id])
+        .filter_map(|coedge| coedge.pcurve)
+        .collect();
+    let mut pcurve_reversals = HashMap::new();
+    for pcurve_id in reversed_pcurve_ids {
+        if pcurve_reversals.contains_key(&pcurve_id) {
+            continue;
+        }
+        if let Some(pcurve) = brep.pcurves.get(pcurve_id).cloned() {
+            let reversed_id = brep.pcurves.insert(pcurve.reversed());
+            pcurve_reversals.insert(pcurve_id, reversed_id);
+        }
+    }
     for (_, l_data) in &mut brep.loops {
         for oe in &mut l_data.edges {
             let orig_id = oe.id;
@@ -724,6 +792,9 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
             oe.id = new_id;
             if edge_reversals[&orig_id] {
                 oe.orientation = oe.orientation.reversed();
+                if let Some(pcurve_id) = oe.pcurve {
+                    oe.pcurve = pcurve_reversals.get(&pcurve_id).copied();
+                }
             }
         }
     }
@@ -889,7 +960,16 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
     // 9. Create the final Shell in the BRep.
     let shell_id = brep.shells.insert(ShellData { faces: face_ids });
 
-    Shell::from_id(Arc::new(brep), shell_id)
+    let shell = Shell::from_id(Arc::new(brep), shell_id);
+    if repair_pcurves_is_bounded {
+        let solid = Solid::new(shell.clone());
+        solid
+            .repair_pcurves(policy)
+            .map(|(repaired, _)| repaired.shell().clone())
+            .unwrap_or(shell)
+    } else {
+        shell
+    }
 }
 
 #[cfg(test)]
@@ -1098,7 +1178,8 @@ mod tests {
         let shell = sew(&faces, openrcad_foundation::tolerance::CONFUSION * 10.0);
         let resewn = Solid::new(shell);
         assert!(resewn.is_watertight());
-        assert!(resewn.health_report().is_healthy());
+        let health = resewn.health_report();
+        assert!(health.is_healthy(), "{health:?}");
         assert_planar_normals_outward(&resewn);
     }
 
@@ -1111,7 +1192,8 @@ mod tests {
         let shell = sew(&inverted, openrcad_foundation::tolerance::CONFUSION * 10.0);
         let fixed = Solid::new(shell);
         assert!(fixed.is_watertight());
-        assert!(fixed.health_report().is_healthy());
+        let health = fixed.health_report();
+        assert!(health.is_healthy(), "{health:?}");
         assert_planar_normals_outward(&fixed);
     }
 

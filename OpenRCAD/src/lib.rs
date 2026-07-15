@@ -42,11 +42,13 @@ pub use openrcad_topo as topo;
 /// # Ok::<(), BlendError>(())
 /// ```
 pub mod prelude {
+    #[allow(deprecated)]
     pub use crate::algo::{
-        boolean, chamfer, chamfer_edges, fillet, fillet_planar_edge, prism,
-        rolling_ball_between_planar_faces, rolling_ball_fillet_edge, sew, shell_solid, sweep_prism,
-        BlendError, BooleanOp, ChamferError, RollingBallBlend, RollingBallError, SolidExt,
-        SweepError,
+        boolean, boolean_operation, boolean_operation_with_policy, chamfer, chamfer_edges, fillet,
+        fillet_planar_edge, prism, prism_operation, prism_operation_with_policy, revolve_operation,
+        revolve_operation_with_policy, rolling_ball_between_planar_faces, rolling_ball_fillet_edge,
+        sew, shell_solid, sweep_prism, BlendError, BooleanOp, ChamferError, RollingBallBlend,
+        RollingBallError, SolidExt, SweepError,
     };
     pub use crate::document::{
         load_zcad, read_zcad, save_zcad, write_zcad, CachedMesh, Document, DocumentError,
@@ -57,7 +59,12 @@ pub mod prelude {
     // the prelude never shadows `std::vec::Vec`.
     pub use crate::foundation::Vec as GeomVec;
     pub use crate::geom::{GeomCurve, GeomSurface};
-    pub use crate::primitives::{make_box, make_cylinder, make_sphere};
+    #[allow(deprecated)]
+    pub use crate::primitives::{
+        make_box, make_box_operation, make_box_operation_with_policy, make_cylinder,
+        make_cylinder_operation, make_cylinder_operation_with_policy, make_sphere,
+        make_sphere_operation, make_sphere_operation_with_policy,
+    };
     pub use crate::sketch::{EntityId, Profile, Sketch, SketchError, SketchPlane};
     pub use crate::topo::{Edge, Face, Shell, Solid, Vertex, Wire};
 }

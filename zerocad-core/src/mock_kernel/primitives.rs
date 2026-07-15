@@ -2,7 +2,12 @@ use super::*;
 
 /// Axis-aligned box solid, one corner at the origin, opposite at (w, h, d).
 pub fn box_solid(w: f32, h: f32, d: f32) -> KernelSolid {
-    make_box(&Pnt::origin(), w as f64, h as f64, d as f64)
+    consume_operation(
+        "box primitive",
+        openrcad::primitives::make_box_operation(&Pnt::origin(), w as f64, h as f64, d as f64),
+    )
+    .expect("positive box dimensions must produce a valid solid")
+    .solid
 }
 
 /// Boolean-ready solid for a cylinder primitive: a **true smooth cylinder**
@@ -159,7 +164,12 @@ pub fn cylinder_tool_at(
         Pnt::new(origin.x as f64, origin.y as f64, origin.z as f64),
         Dir::new(d.x as f64, d.y as f64, d.z as f64),
     );
-    Some(make_cylinder(&axis, radius, length))
+    consume_operation(
+        "cylinder primitive",
+        openrcad::primitives::make_cylinder_operation(&axis, radius, length),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
 }
 
 /// An analytic cone-frustum solid (base radius `r1` at `origin`, `r2` after
@@ -182,7 +192,12 @@ pub fn cone_tool_at(
         Pnt::new(origin.x as f64, origin.y as f64, origin.z as f64),
         Dir::new(d.x as f64, d.y as f64, d.z as f64),
     );
-    Some(openrcad::primitives::make_cone(&axis, r1, r2, length))
+    consume_operation(
+        "cone primitive",
+        openrcad::primitives::make_cone_operation(&axis, r1, r2, length),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
 }
 
 /// Transform a kernel solid. Rigid motions (translation/rotation) map the
@@ -200,7 +215,10 @@ pub fn transformed_solid(solid: &KernelSolid, t: &Trsf, is_reflection: bool) -> 
         .iter()
         .map(|f| f.transformed(t))
         .collect();
-    Solid::new(openrcad::algo::sew::sew(&faces, 1e-6))
+    Solid::new(
+        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
+            .expect("standard tolerance policy is valid"),
+    )
 }
 
 /// Resample a closed 2D polygon to exactly `n` points equally spaced by arc
@@ -2346,7 +2364,10 @@ fn cone_cut_assembly(
 
     faces.extend(bands.faces);
 
-    let mut solid = Solid::new(openrcad::algo::sew(&faces, tolerance::CONFUSION * 10.0));
+    let mut solid = Solid::new(
+        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
+            .expect("standard tolerance policy is valid"),
+    );
     if !solid.is_watertight() {
         solid = openrcad::algo::merge::heal_tjunctions(&solid, tolerance::CONFUSION * 100.0);
     }
@@ -2678,7 +2699,10 @@ pub fn threaded_replace_cylinder_wall(
     faces.extend(wall.faces);
     faces.extend(extra_faces);
 
-    let mut solid = Solid::new(openrcad::algo::sew(&faces, tolerance::CONFUSION * 10.0));
+    let mut solid = Solid::new(
+        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
+            .expect("standard tolerance policy is valid"),
+    );
     if !solid.is_watertight() {
         // Safety net for hosts whose rim vertices don't line up exactly.
         solid = openrcad::algo::merge::heal_tjunctions(&solid, tolerance::CONFUSION * 100.0);
@@ -2705,8 +2729,6 @@ pub fn threaded_cylinder_solid(
     axial_max: f32,
     spec: &ThreadSpec,
 ) -> Option<KernelSolid> {
-    use openrcad::foundation::tolerance;
-
     let origin = Pnt::new(
         axis_origin.x as f64,
         axis_origin.y as f64,
@@ -2739,7 +2761,10 @@ pub fn threaded_cylinder_solid(
         wire_ccw_on(top_wire, &top_plane, (0.0, 0.0)),
     ));
 
-    let solid = Solid::new(openrcad::algo::sew(&faces, tolerance::CONFUSION * 10.0));
+    let solid = Solid::new(
+        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
+            .expect("standard tolerance policy is valid"),
+    );
     if !solid.is_watertight() {
         log::warn!("threaded cylinder wall did not close watertight");
         return None;
@@ -3156,7 +3181,12 @@ pub(crate) fn build_cylinder_solid(r: f64, h: f64) -> Option<KernelSolid> {
     }
     // Base centered at the origin, swept along +Y — the axis the primitive
     // display path (`MockMesh::make_cylinder`) and its wireframe expect.
-    Some(make_cylinder(&Ax2::new(Pnt::origin(), Dir::dy()), r, h))
+    consume_operation(
+        "cylinder primitive",
+        openrcad::primitives::make_cylinder_operation(&Ax2::new(Pnt::origin(), Dir::dy()), r, h),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
 }
 
 // ---------------------------------------------------------------------------

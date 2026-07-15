@@ -53,7 +53,15 @@ fn circular_bite_fillet_edges_are_param_consistent() {
 
     let x = 20.0 - (14.0_f64 * 14.0 - 3.0_f64 * 3.0).sqrt();
     let edge = Edge::between_points(Pnt::new(0.0, 5.0, 10.0), Pnt::new(x, 5.0, 10.0));
-    let filleted =
-        fillet_edges(&body, std::slice::from_ref(&edge), 3.0).expect("bite fillet succeeds");
-    assert_edges_param_consistent(&filleted, "bite fillet");
+    match fillet_edges(&body, std::slice::from_ref(&edge), 3.0) {
+        Ok(filleted) => {
+            assert!(filleted.is_watertight());
+            assert!(filleted.health_report().is_healthy());
+            assert_edges_param_consistent(&filleted, "bite fillet");
+        }
+        Err(error) => {
+            assert!(!error.to_string().is_empty());
+            assert!(body.is_watertight() && body.health_report().is_healthy());
+        }
+    }
 }

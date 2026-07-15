@@ -1077,23 +1077,15 @@ pub(crate) fn fuse_overlapping_solids(parts: Vec<KernelSolid>) -> Vec<KernelSoli
                     // body parts unless the boolean actually fused them into one
                     // connected component.
                     let components = u.split_disconnected();
-                    if crate::mock_kernel::components_form_connected_material(&components) {
+                    if crate::mock_kernel::components_form_connected_material(&components)
+                        && u.validate_strict_with_policy(
+                            &openrcad::foundation::TolerancePolicy::STANDARD,
+                        )
+                        .is_ok()
+                    {
                         *existing = u;
                         merged = true;
                         break;
-                    }
-                } else {
-                    let components = [existing.clone(), part.clone()];
-                    if crate::mock_kernel::components_form_connected_material(&components) {
-                        if let Some(aggregate) =
-                            crate::mock_kernel::aggregate_solid_components(&components)
-                        {
-                            if aggregate.is_watertight() && aggregate.health_report().is_healthy() {
-                                *existing = aggregate;
-                                merged = true;
-                                break;
-                            }
-                        }
                     }
                 }
             }
@@ -1103,4 +1095,38 @@ pub(crate) fn fuse_overlapping_solids(parts: Vec<KernelSolid>) -> Vec<KernelSoli
         }
     }
     out
+}
+
+/// Group independently valid solids that form one connected piece of material
+/// without packing them into an invalid disconnected shell. This is the honest
+/// fallback for tangent profile partitions that the boolean solver cannot sew.
+pub(crate) fn connected_material_groups(parts: Vec<KernelSolid>) -> Vec<Vec<KernelSolid>> {
+    let mut groups: Vec<Vec<KernelSolid>> = Vec::new();
+    for part in parts {
+        let touching: Vec<usize> = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                group
+                    .iter()
+                    .any(|member| {
+                        crate::mock_kernel::components_form_connected_material(&[
+                            member.clone(),
+                            part.clone(),
+                        ])
+                    })
+                    .then_some(index)
+            })
+            .collect();
+        let Some((&first, rest)) = touching.split_first() else {
+            groups.push(vec![part]);
+            continue;
+        };
+        groups[first].push(part);
+        for &index in rest.iter().rev() {
+            let merged = groups.remove(index);
+            groups[first].extend(merged);
+        }
+    }
+    groups
 }

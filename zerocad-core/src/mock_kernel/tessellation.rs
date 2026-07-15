@@ -495,7 +495,12 @@ pub(crate) fn build_extrusion_solid_arcs(
         cs.n.y as f64 * depth,
         cs.n.z as f64 * depth,
     );
-    prism(&face, sweep).ok()
+    consume_operation(
+        "prism extrusion",
+        openrcad::algo::prism::prism_operation(&face, sweep),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
 }
 
 /// Build a solid of revolution for one sketch region: the same arc-refitting
@@ -539,8 +544,11 @@ pub(crate) fn build_revolution_solid(
     );
     let adir =
         GeomVec::new(axis_dir.x as f64, axis_dir.y as f64, axis_dir.z as f64).normalized()?;
-    match revolve(&face, apnt, adir, angle) {
-        Ok(solid) => Some(solid),
+    match consume_operation(
+        "revolve",
+        openrcad::algo::revolve::revolve_operation(&face, apnt, adir, angle),
+    ) {
+        Ok(outcome) => Some(outcome.solid),
         Err(e) => {
             log::warn!("revolve failed: {e}");
             None
@@ -580,7 +588,32 @@ pub(crate) fn solid_to_flat_mesh(
         correct_mixed_triangle_normals,
         &openrcad::foundation::NeverCancelled,
     )
-    .expect("NeverCancelled cannot cancel")
+    .unwrap_or_else(|error| panic!("display tessellation compatibility adapter: {error}"))
+}
+
+/// A display tessellation can either be superseded by a newer evaluation or
+/// reject a legacy solid whose boundary pcurves cannot be reconstructed. Keep
+/// those outcomes distinct so production evaluators can report the latter as a
+/// feature diagnostic instead of panicking.
+#[derive(Debug)]
+pub(crate) enum DisplayTessellationError {
+    Cancelled,
+    Invalid(String),
+}
+
+impl std::fmt::Display for DisplayTessellationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("display tessellation was cancelled"),
+            Self::Invalid(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<openrcad::foundation::Cancelled> for DisplayTessellationError {
+    fn from(_: openrcad::foundation::Cancelled) -> Self {
+        Self::Cancelled
+    }
 }
 
 pub(crate) fn solid_to_flat_mesh_with_cancel(
@@ -588,14 +621,30 @@ pub(crate) fn solid_to_flat_mesh_with_cancel(
     correct_boolean_bevels: bool,
     correct_mixed_triangle_normals: bool,
     cancel: &dyn openrcad::foundation::CancellationProbe,
-) -> Result<(Vec<f32>, Vec<u32>, Vec<u32>), openrcad::foundation::Cancelled> {
+) -> Result<(Vec<f32>, Vec<u32>, Vec<u32>), DisplayTessellationError> {
     // `gpu_mesh` unwelds each triangle into three vertices carrying that
     // triangle's flat face normal, plus a per-triangle source-face id — exactly
     // the interleaved layout (minus the f32 normal smoothing) we want. Each
     // vertex copy belongs to a single triangle, so the per-vertex→face mapping
     // `smooth_vertex_normals` relies on holds.
     let (chord, angle) = active_tess_budget();
-    let mesh = openrcad::mesh::tessellate_for_display_with_cancel(solid, chord, angle, cancel)?;
+    // Phase 3 features can still hand display code a solid built before the
+    // pcurve contract. Keep that migration boundary explicit: the adapter
+    // repairs and validates first, then invokes the strict tessellator. For a
+    // Phase 1 outcome the repair is a no-op.
+    let mesh = match openrcad::mesh::tessellate_compatibility_for_display_with_policy_and_cancel(
+        solid,
+        chord,
+        angle,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+        cancel,
+    ) {
+        Ok(mesh) => mesh,
+        Err(openrcad::mesh::TessellationError::Cancelled) => {
+            return Err(DisplayTessellationError::Cancelled)
+        }
+        Err(error) => return Err(DisplayTessellationError::Invalid(error.to_string())),
+    };
     let gpu = mesh.gpu_mesh();
 
     let vcount = gpu.positions.len() / 3;

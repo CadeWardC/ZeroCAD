@@ -292,7 +292,8 @@ impl ParametricGraph {
             .next()
             .map(|cp| cp.statuses.clone())
             .unwrap_or_default();
-        Ok((tessellate_bodies(live), warnings, statuses))
+        let bodies = try_tessellate_bodies(live)?;
+        Ok((bodies, warnings, statuses))
     }
 
     /// Cancellable, timed evaluator used by interactive schedulers. Existing
@@ -306,6 +307,7 @@ impl ParametricGraph {
         let total_started = std::time::Instant::now();
         let draft = quality == EvaluationQuality::Interactive;
         let run_inner = || {
+            crate::mock_kernel::reset_diagnostics();
             if cancellation.is_cancelled() {
                 return Err(EvaluationError::Cancelled);
             }
@@ -330,19 +332,17 @@ impl ParametricGraph {
                 .next()
                 .map(|cp| cp.statuses.clone())
                 .unwrap_or_default();
-            let diagnostics = statuses
-                .iter()
-                .filter_map(|status| {
-                    status.reason().map(|message| EvaluationDiagnostic {
-                        feature_id: status.feature_id.clone(),
-                        operation: "feature evaluation".to_string(),
-                        failure_class: "unresolved_feature".to_string(),
-                        fallback: Some("kept last valid body".to_string()),
-                        severity: DiagnosticSeverity::Warning,
-                        message: message.to_string(),
-                    })
+            let mut diagnostics = crate::mock_kernel::take_diagnostics();
+            diagnostics.extend(statuses.iter().filter_map(|status| {
+                status.reason().map(|message| EvaluationDiagnostic {
+                    feature_id: status.feature_id.clone(),
+                    operation: "feature evaluation".to_string(),
+                    failure_class: "unresolved_feature".to_string(),
+                    fallback: Some("kept last valid body".to_string()),
+                    severity: DiagnosticSeverity::Warning,
+                    message: message.to_string(),
                 })
-                .collect();
+            }));
             let feature_timings = self
                 .eval_cache
                 .borrow()
@@ -428,7 +428,7 @@ impl ParametricGraph {
     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
         let run = || -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
             let (live, warnings) = self.build_live(hidden, draft)?;
-            Ok((tessellate_bodies(live), warnings))
+            Ok((try_tessellate_bodies(live)?, warnings))
         };
         // Draft previews mesh newly-built bodies at the coarse preview budget (a
         // fillet/chamfer/boolean preview lands ~2× faster). Draft evaluation only
@@ -468,6 +468,7 @@ impl ParametricGraph {
         draft: bool,
         cancellation: Option<&EvaluationCancellation>,
     ) -> Result<(Vec<LiveBody>, Vec<String>), String> {
+        crate::mock_kernel::reset_diagnostics();
         if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
             return Err("model evaluation was superseded".to_string());
         }
@@ -498,6 +499,33 @@ impl ParametricGraph {
         // restored from the previous evaluation instead of recomputed.
         let nodes: Vec<NodeIndex> = self.body_nodes_in_creation_order();
         let keys = self.eval_prefix_keys(&nodes, hidden, &vars);
+
+        // A complete checkpoint hit needs only the final assembled state. Keep
+        // the immutable cache allocation in place instead of cloning every
+        // earlier checkpoint (whose cumulative status vectors make that work
+        // quadratic in the feature count). Partial hits still retain matching
+        // checkpoints below because they are about to replace the invalid
+        // suffix.
+        let fully_reused = {
+            let cache = self.eval_cache.borrow();
+            (cache.checkpoints.len() == keys.len())
+                .then(|| {
+                    cache
+                        .checkpoints
+                        .last()
+                        .and_then(Option::as_ref)
+                        .filter(|checkpoint| keys.last().is_some_and(|key| checkpoint.key == *key))
+                        .map(|checkpoint| (checkpoint.live.clone(), checkpoint.warnings.clone()))
+                })
+                .flatten()
+        };
+        if let Some((live, mut warnings)) = fully_reused {
+            if !datum_warnings.is_empty() {
+                datum_warnings.extend(warnings);
+                warnings = datum_warnings;
+            }
+            return Ok((live, warnings));
+        }
 
         let (mut live, mut warnings, mut statuses, reuse, mut checkpoints) = {
             let cache = self.eval_cache.borrow();
@@ -544,6 +572,7 @@ impl ParametricGraph {
             }
             let feature_started = std::time::Instant::now();
             let node = &self.graph[idx];
+            crate::mock_kernel::set_feature_context(Some(&node.id));
             let warn_before = warnings.len();
             let live_before_feature = live.clone();
             if !hidden.contains(&node.id) {
@@ -605,8 +634,12 @@ impl ParametricGraph {
                         }
                     }
                     FeatureType::Import { step_data, label } => {
-                        match openrcad::exchange::read_step_str(step_data) {
-                            Ok(solid) => {
+                        match crate::mock_kernel::consume_operation(
+                            "STEP import",
+                            openrcad::exchange::read_step_str_operation(step_data),
+                        ) {
+                            Ok(outcome) => {
+                                let solid = outcome.solid;
                                 let mut pristine = MockMesh::from_solid(&solid);
                                 if pristine.indices.is_empty() {
                                     warnings.push(format!(
@@ -952,6 +985,7 @@ impl ParametricGraph {
                 statuses: statuses.clone(),
                 feature_duration: feature_started.elapsed(),
             });
+            crate::mock_kernel::set_feature_context(None);
         }
 
         *self.eval_cache.borrow_mut() = std::sync::Arc::new(EvalCache { checkpoints });
@@ -1810,15 +1844,27 @@ impl ParametricGraph {
                     })
                     .collect();
                 newbody_tools.sort_by_key(crate::mock_kernel::part_key);
-                let merged_regions = newbody_tools.len() < before_fuse;
-                if newbody_tools.len() == 1 {
+                let mut body_groups = connected_material_groups(newbody_tools);
+                body_groups.sort_by_key(|group| {
+                    group
+                        .iter()
+                        .map(crate::mock_kernel::part_key)
+                        .min()
+                        .unwrap_or([0; 6])
+                });
+                if body_groups.len() == 1 {
+                    let parts = body_groups.pop().expect("one connected body group");
+                    let fused_brep = before_fuse > 1 && parts.len() == 1;
+                    if parts.len() > 1 {
+                        newbody_mesh.suppress_duplicate_edge_groups();
+                    }
                     live.push(LiveBody {
                         id: node_id.to_string(),
-                        parts: newbody_tools,
+                        parts,
                         // Per-region meshes retain the shared sketch boundary.
                         // Tessellate the fused B-Rep after a successful union so
                         // a continuous coplanar face has no internal display edge.
-                        pristine: (!merged_regions && !newbody_mesh.indices.is_empty())
+                        pristine: (!fused_brep && !newbody_mesh.indices.is_empty())
                             .then(|| std::sync::Arc::new(newbody_mesh)),
                         sketch_source: (!sketch_source.regions.is_empty()).then_some(sketch_source),
                         cut_tools: newbody_cut_tools,
@@ -1833,9 +1879,10 @@ impl ParametricGraph {
                     // backward-compatible (`extrude_N`) and suffix later bodies.
                     // Each receives its own mesh so viewport picking, selection,
                     // targeting, and export all see distinct bodies.
-                    for (output_index, part) in newbody_tools.into_iter().enumerate() {
+                    for (output_index, parts) in body_groups.into_iter().enumerate() {
                         let output_id = body_output_id(node_id, output_index);
-                        let part_key = crate::mock_kernel::part_key(&part);
+                        let part_keys: Vec<_> =
+                            parts.iter().map(crate::mock_kernel::part_key).collect();
                         let part_source_regions: Vec<SketchExtrudeRegionSource> = sketch_source
                             .regions
                             .iter()
@@ -1853,7 +1900,7 @@ impl ParametricGraph {
                                         )
                                     });
                                 source_solid.as_ref().is_some_and(|source_part| {
-                                    crate::mock_kernel::part_key(source_part) == part_key
+                                    part_keys.contains(&crate::mock_kernel::part_key(source_part))
                                 })
                             })
                             .cloned()
@@ -1864,36 +1911,48 @@ impl ParametricGraph {
                         // durable shape/edge provenance used for reattachment;
                         // rebuilding it generically here would reduce a real
                         // Body_2 to anonymous tessellation edges.
-                        let mut mesh = newbody_part_meshes
-                            .iter()
-                            .position(|(key, _)| *key == part_key)
-                            .map(|index| newbody_part_meshes.remove(index).1)
-                            .unwrap_or_else(|| {
-                                let mut mesh = MockMesh::from_solid(&part);
-                                let (mesh_cs, mesh_depth) = part_source_regions
-                                    .first()
-                                    .map(|source| (source.cs, source.depth))
-                                    .unwrap_or((*cs, depth));
-                                stamp_sketch_extrude_face_refs(
-                                    &mut mesh,
-                                    &output_id,
-                                    output_index,
-                                    &mesh_cs,
-                                    mesh_depth,
-                                );
-                                crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
-                                mesh
-                            });
+                        let mut mesh = MockMesh::empty();
+                        for (part_index, part) in parts.iter().enumerate() {
+                            let part_key = crate::mock_kernel::part_key(part);
+                            let part_mesh = newbody_part_meshes
+                                .iter()
+                                .position(|(key, _)| *key == part_key)
+                                .map(|index| newbody_part_meshes.remove(index).1)
+                                .unwrap_or_else(|| {
+                                    let mut mesh = MockMesh::from_solid(part);
+                                    let (mesh_cs, mesh_depth) = part_source_regions
+                                        .first()
+                                        .map(|source| (source.cs, source.depth))
+                                        .unwrap_or((*cs, depth));
+                                    stamp_sketch_extrude_face_refs(
+                                        &mut mesh,
+                                        &output_id,
+                                        output_index + part_index,
+                                        &mesh_cs,
+                                        mesh_depth,
+                                    );
+                                    crate::mock_kernel::populate_edge_adjacent_face_names(
+                                        &mut mesh,
+                                    );
+                                    mesh
+                                });
+                            mesh.append(part_mesh);
+                        }
+                        if parts.len() > 1 {
+                            mesh.suppress_duplicate_edge_groups();
+                        }
                         for edge in &mut mesh.edge_refs {
                             if let Some(topology) = edge.topology.as_mut() {
                                 topology.body_id = Some(output_id.clone());
                             }
                         }
-                        crate::mock_kernel::stamp_face_component(&mut mesh, &output_id, &part);
+                        crate::mock_kernel::stamp_body_face_components(
+                            &mut mesh, &output_id, &parts,
+                        );
 
                         live.push(LiveBody {
                             id: output_id,
-                            parts: vec![part],
+                            parts,
                             pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
                             sketch_source: (!part_source_regions.is_empty()).then_some(
                                 SketchExtrudeSource {
@@ -1976,13 +2035,33 @@ fn apply_body_transform(
         .iter()
         .map(|part| crate::mock_kernel::transformed_solid(part, &transform, false))
         .collect();
-    let mut mesh = MockMesh::empty();
-    for part in &parts {
-        let mut part_mesh = MockMesh::from_solid(part);
-        stamp_pattern_face_refs(&mut part_mesh, node_id, 0);
-        crate::mock_kernel::populate_edge_adjacent_face_names(&mut part_mesh);
-        mesh.append(part_mesh);
+    let mut mesh = source_body.pristine.as_ref().map_or_else(
+        || {
+            let mut mesh = MockMesh::empty();
+            for part in &parts {
+                mesh.append(MockMesh::from_solid(part));
+            }
+            mesh
+        },
+        |pristine| {
+            let mut mesh = pristine.as_ref().clone();
+            mesh.translate(translation);
+            mesh
+        },
+    );
+    // A body transform is a new feature owner. Rebuild naming metadata while
+    // preserving the already-valid translated triangles, edges, and normals.
+    for face in &mut mesh.face_refs {
+        face.topology = None;
     }
+    for edge in &mut mesh.edge_refs {
+        if let Some(topology) = edge.topology.as_mut() {
+            topology.body_id = None;
+            topology.adjacent_face_ids.clear();
+        }
+    }
+    stamp_pattern_face_refs(&mut mesh, node_id, 0);
+    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
     if !copy {
         live.remove(source_index);
     }
@@ -3870,8 +3949,13 @@ fn cs_from_face(centroid: [f32; 3], normal: [f32; 3]) -> CoordinateSystem {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> {
-    tessellate_bodies_with_cancel(live, None).expect("uncancellable tessellation cannot cancel")
+    try_tessellate_bodies(live).expect("legacy body display tessellation failed")
+}
+
+fn try_tessellate_bodies(live: Vec<LiveBody>) -> Result<Vec<(String, MockMesh)>, String> {
+    tessellate_bodies_with_cancel(live, None).map_err(|error| error.to_string())
 }
 
 /// Global evaluator invariant: every runtime part is exactly one connected,
@@ -3936,9 +4020,24 @@ fn tessellate_bodies_with_cancel(
                 let mut m = MockMesh::empty();
                 for part in &body.parts {
                     let mut part_mesh = match cancellation {
-                        Some(cancel) => MockMesh::from_solid_with_cancel(part, cancel)
-                            .map_err(|_| EvaluationError::Cancelled)?,
-                        None => MockMesh::from_solid(part),
+                        Some(cancel) => MockMesh::try_from_solid_with_cancel(part, cancel)
+                            .map_err(|error| match error {
+                                crate::mock_kernel::DisplayTessellationError::Cancelled => {
+                                    EvaluationError::Cancelled
+                                }
+                                crate::mock_kernel::DisplayTessellationError::Invalid(reason) => {
+                                    EvaluationError::Failed(format!(
+                                        "body '{}' cannot be displayed: {reason}",
+                                        body.id
+                                    ))
+                                }
+                            })?,
+                        None => MockMesh::try_from_solid(part).map_err(|reason| {
+                            EvaluationError::Failed(format!(
+                                "body '{}' cannot be displayed: {reason}",
+                                body.id
+                            ))
+                        })?,
                     };
                     crate::mock_kernel::stamp_face_component(&mut part_mesh, &body.id, part);
                     m.append(part_mesh);
@@ -4023,18 +4122,22 @@ mod mirror_join_display_tests {
 
     #[test]
     fn overlapping_mirror_fallback_is_one_continuous_display_body() {
-        let source = openrcad::primitives::make_box(
+        let source = openrcad::primitives::make_box_operation(
             &openrcad::foundation::Pnt::new(-1.0, 0.0, 0.0),
             4.0,
             2.0,
             1.0,
-        );
-        let mirrored = openrcad::primitives::make_box(
+        )
+        .unwrap()
+        .value;
+        let mirrored = openrcad::primitives::make_box_operation(
             &openrcad::foundation::Pnt::new(-3.0, 0.0, 0.0),
             4.0,
             2.0,
             1.0,
-        );
+        )
+        .unwrap()
+        .value;
         let mesh =
             mirror_join_display_mesh("test_mirror", &[source, mirrored], Vec3::ZERO, Vec3::X);
 

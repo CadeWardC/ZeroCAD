@@ -21,14 +21,26 @@ fn active_cancellation() -> Option<crate::EvaluationCancellation> {
     ACTIVE_CANCELLATION.with(|slot| slot.borrow().clone())
 }
 
-fn checked_boolean(
-    a: &KernelSolid,
-    b: &KernelSolid,
-    op: BooleanOp,
-) -> Result<KernelSolid, openrcad::algo::BooleanError> {
-    match active_cancellation() {
-        Some(cancel) => openrcad::algo::boolean_checked_with_cancel(a, b, op, &cancel),
-        None => boolean_checked(a, b, op),
+fn checked_boolean(a: &KernelSolid, b: &KernelSolid, op: BooleanOp) -> Result<KernelSolid, String> {
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+    let outcome = match active_cancellation() {
+        Some(cancel) => consume_operation(
+            boolean_operation_name(op),
+            openrcad::algo::boolean_operation_with_policy_and_cancel(a, b, op, &policy, &cancel),
+        ),
+        None => consume_operation(
+            boolean_operation_name(op),
+            openrcad::algo::boolean_operation_with_policy(a, b, op, &policy),
+        ),
+    }?;
+    Ok(outcome.solid)
+}
+
+fn boolean_operation_name(op: BooleanOp) -> &'static str {
+    match op {
+        BooleanOp::Fuse => "boolean fuse",
+        BooleanOp::Cut => "boolean cut",
+        BooleanOp::Common => "boolean common",
     }
 }
 
@@ -52,10 +64,7 @@ pub fn union(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
 /// Boolean union that preserves the kernel's failure reason for operation-level
 /// diagnostics. Interactive callers normally use [`union`]; feature evaluators
 /// use this when they can identify the affected node in a useful log message.
-pub(crate) fn union_diagnostic(
-    a: &KernelSolid,
-    b: &KernelSolid,
-) -> Result<KernelSolid, openrcad::algo::BooleanError> {
+pub(crate) fn union_diagnostic(a: &KernelSolid, b: &KernelSolid) -> Result<KernelSolid, String> {
     quiet_panic(|| checked_boolean(a, b, BooleanOp::Fuse))
 }
 
@@ -73,26 +82,34 @@ pub fn union_with_history(
     b: &KernelSolid,
     obj_classes: Option<&[Option<u64>]>,
 ) -> Option<(KernelSolid, openrcad::algo::BooleanFaceHistory)> {
-    quiet_panic(|| match active_cancellation() {
-        Some(cancel) => openrcad::algo::boolean_checked_with_history_cancel(
-            a,
-            b,
-            BooleanOp::Fuse,
-            obj_classes,
-            None,
-            &cancel,
+    quiet_panic(|| {
+        let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+        let never = openrcad::foundation::NeverCancelled;
+        let active = active_cancellation();
+        let cancel: &dyn openrcad::foundation::CancellationProbe =
+            active.as_ref().map_or(&never, |probe| probe);
+        let outcome = consume_operation(
+            "boolean fuse",
+            openrcad::algo::boolean_operation_with_classes_policy_and_cancel(
+                a,
+                b,
+                BooleanOp::Fuse,
+                obj_classes,
+                None,
+                &policy,
+                cancel,
+            ),
         )
-        .ok(),
-        None => {
-            openrcad::algo::boolean_checked_with_history(a, b, BooleanOp::Fuse, obj_classes, None)
-                .ok()
-        }
+        .ok()?;
+        let history = outcome.boolean_face_history();
+        Some((outcome.solid, history))
     })
 }
 
 /// [`difference_bodies`] plus the kernel's exact face history. Returns the
 /// severed parts (canonically ordered), the **combined pre-split result** the
 /// history's face indices refer to, and the history itself.
+#[allow(deprecated)] // Explicit Phase 3 multi-body history compatibility boundary.
 pub fn difference_bodies_with_history(
     a: &KernelSolid,
     b: &KernelSolid,
@@ -142,18 +159,7 @@ pub fn difference_bodies_with_history(
 /// the part intact rather than dropping material). On success the vector always
 /// has at least one element — an un-severed cut yields a single body.
 pub fn difference_bodies(a: &KernelSolid, b: &KernelSolid) -> Option<Vec<KernelSolid>> {
-    let result = difference(a, b)?;
-    let parts = result.split_disconnected();
-    let mut parts = if parts.is_empty() {
-        vec![result]
-    } else {
-        parts
-    };
-    // Order the severed lumps by their canonical position key so the part list is
-    // deterministic and position-based across rebuilds — the basis for a downstream
-    // feature following a specific lump instead of a volatile list index.
-    parts.sort_by_key(part_key);
-    Some(parts)
+    difference_bodies_with_history(a, b, None).map(|(parts, _, _)| parts)
 }
 
 /// Fallback for the common "rectangular pocket clean through an axis-aligned
@@ -231,12 +237,17 @@ pub fn axis_aligned_cut_parts(part: &KernelSolid, tool: &KernelSolid) -> Option<
     let mut push_box = |lo: [f32; 3], hi: [f32; 3]| {
         let d = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
         if d.iter().all(|&v| v > EPS) {
-            pieces.push(make_box(
-                &Pnt::new(lo[0] as f64, lo[1] as f64, lo[2] as f64),
-                d[0] as f64,
-                d[1] as f64,
-                d[2] as f64,
-            ));
+            if let Ok(outcome) = consume_operation(
+                "box cut fallback",
+                openrcad::primitives::make_box_operation(
+                    &Pnt::new(lo[0] as f64, lo[1] as f64, lo[2] as f64),
+                    d[0] as f64,
+                    d[1] as f64,
+                    d[2] as f64,
+                ),
+            ) {
+                pieces.push(outcome.solid);
+            }
         }
     };
 

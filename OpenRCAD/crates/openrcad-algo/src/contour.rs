@@ -6,13 +6,14 @@
 
 use core::fmt;
 
-use openrcad_foundation::Vec as GeomVec;
+use openrcad_foundation::{TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::GeomCurve;
 use openrcad_topo::{Edge, Solid};
 
 use crate::{
-    chamfer_circular_edge_chain, chamfer_edges, chamfer_tangent_edge_chain,
-    fillet_circular_edge_chain, fillet_edges, fillet_tangent_edge_chain, ChamferError,
+    chamfer_circular_edge_chain_with_policy, chamfer_edges_with_policy,
+    chamfer_tangent_edge_chain_with_policy, fillet_circular_edge_chain_with_policy,
+    fillet_edges_with_policy, fillet_tangent_edge_chain_with_policy, ChamferError,
     RollingBallError,
 };
 
@@ -115,6 +116,15 @@ pub fn apply_blend_contour(
     solid: &Solid,
     contour: &BlendContour,
 ) -> Result<Solid, BlendContourError> {
+    apply_blend_contour_with_policy(solid, contour, &TolerancePolicy::STANDARD)
+}
+
+/// Apply one logical blend contour using one document tolerance policy.
+pub fn apply_blend_contour_with_policy(
+    solid: &Solid,
+    contour: &BlendContour,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendContourError> {
     if contour.edges.is_empty() {
         return Err(BlendContourError::EmptyContour);
     }
@@ -126,8 +136,10 @@ pub fn apply_blend_contour(
     let mixed = is_mixed_tangent_chain(&contour.edges);
     if mixed {
         return match contour.kind {
-            BlendKind::Fillet => fillet_tangent_edge_chain(solid, &contour.edges, value)
-                .map_err(BlendContourError::Fillet),
+            BlendKind::Fillet => {
+                fillet_tangent_edge_chain_with_policy(solid, &contour.edges, value, policy)
+                    .map_err(BlendContourError::Fillet)
+            }
             BlendKind::Chamfer => {
                 let circular: Vec<Edge> = contour
                     .edges
@@ -137,7 +149,7 @@ pub fn apply_blend_contour(
                     .collect();
                 let spine =
                     circular_spine_from_chain(&circular).unwrap_or_else(|| circular[0].clone());
-                chamfer_tangent_edge_chain(solid, &contour.edges, &spine, value)
+                chamfer_tangent_edge_chain_with_policy(solid, &contour.edges, &spine, value, policy)
                     .map_err(BlendContourError::Chamfer)
             }
         };
@@ -153,13 +165,20 @@ pub fn apply_blend_contour(
             if matches!(contour.curve_hint, Some(BlendCurveHint::Circle)) {
                 let spine = circular_spine_from_chain(&contour.edges)
                     .unwrap_or_else(|| contour.edges[0].clone());
-                match fillet_circular_edge_chain(solid, &contour.edges, &spine, value) {
+                match fillet_circular_edge_chain_with_policy(
+                    solid,
+                    &contour.edges,
+                    &spine,
+                    value,
+                    policy,
+                ) {
                     Ok(result) => Ok(result),
-                    Err(_) => fillet_edges(solid, &contour.edges, value)
+                    Err(_) => fillet_edges_with_policy(solid, &contour.edges, value, policy)
                         .map_err(BlendContourError::Fillet),
                 }
             } else {
-                fillet_edges(solid, &contour.edges, value).map_err(BlendContourError::Fillet)
+                fillet_edges_with_policy(solid, &contour.edges, value, policy)
+                    .map_err(BlendContourError::Fillet)
             }
         }
         BlendKind::Chamfer => {
@@ -168,13 +187,20 @@ pub fn apply_blend_contour(
             if matches!(contour.curve_hint, Some(BlendCurveHint::Circle)) {
                 let spine = circular_spine_from_chain(&contour.edges)
                     .unwrap_or_else(|| contour.edges[0].clone());
-                match chamfer_circular_edge_chain(solid, &contour.edges, &spine, value) {
+                match chamfer_circular_edge_chain_with_policy(
+                    solid,
+                    &contour.edges,
+                    &spine,
+                    value,
+                    policy,
+                ) {
                     Ok(result) => Ok(result),
-                    Err(_) => chamfer_edges(solid, &contour.edges, value)
+                    Err(_) => chamfer_edges_with_policy(solid, &contour.edges, value, policy)
                         .map_err(BlendContourError::Chamfer),
                 }
             } else {
-                chamfer_edges(solid, &contour.edges, value).map_err(BlendContourError::Chamfer)
+                chamfer_edges_with_policy(solid, &contour.edges, value, policy)
+                    .map_err(BlendContourError::Chamfer)
             }
         }
     }

@@ -7,23 +7,24 @@
 use core::fmt;
 
 use openrcad_foundation::{
-    tolerance, Ax3, Dir, Pnt, TolerancePolicy, TolerancePolicyError, Trsf, Vec as GeomVec,
+    tolerance, Ax3, Dir, Pnt, Pnt2d, TolerancePolicy, TolerancePolicyError, Trsf, Vec as GeomVec,
 };
 use openrcad_geom::{Curve, CylindricalSurface, GeomCurve, GeomSurface, Line, Plane, RuledSurface};
 use openrcad_topo::{
-    Edge, Face, HealthReport, OperationResult, Orientation, PcurveBuildError, RecoveryAction,
-    RecoveryReport, Solid, TopologyHistory, ValidationReport, Wire,
+    Edge, Face, FaceBuildError, HealthReport, OperationResult, Orientation, RecoveryReport, Solid,
+    SurfacePeriodicity, TopologyHistory, ValidationReport, Wire,
 };
 
-use crate::sew::sew;
+use crate::native_pcurve::{analytic_line_pcurve, planar_face_with_pcurves, uv_line};
+use crate::sew::sew_with_policy;
 
 /// Errors reported by prism/extrusion sweeping.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SweepError {
     /// The supplied document tolerance policy is invalid.
     InvalidTolerancePolicy(TolerancePolicyError),
-    /// A face-local pcurve could not be constructed consistently.
-    PcurveBuild(PcurveBuildError),
+    /// A face and its exact construction-time pcurves could not be assembled.
+    FaceBuild(FaceBuildError),
     /// The sweep vector has no usable length.
     DegenerateVector,
     /// The source face has no outer boundary.
@@ -44,7 +45,7 @@ impl fmt::Display for SweepError {
             Self::InvalidTolerancePolicy(error) => {
                 write!(f, "prism: invalid tolerance policy: {error}")
             }
-            Self::PcurveBuild(error) => write!(f, "prism: pcurve construction failed: {error}"),
+            Self::FaceBuild(error) => write!(f, "prism: pcurve construction failed: {error}"),
             Self::DegenerateVector => f.write_str("prism: sweep vector must be non-zero"),
             Self::MissingOuterWire => f.write_str("prism: source face has no outer wire"),
             Self::OpenWire => f.write_str("prism: every swept wire must be closed"),
@@ -68,7 +69,11 @@ impl std::error::Error for SweepError {}
 /// plane normal is parallel to the sweep vector generate cylindrical faces.
 /// Other curves generate ruled lateral faces between the base and translated
 /// edge, which covers NURBS/B-spline boundaries and skew circular sweeps.
-fn build_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
+fn build_prism(
+    face: &Face,
+    vector: GeomVec,
+    policy: &TolerancePolicy,
+) -> Result<Solid, SweepError> {
     if vector.magnitude() <= tolerance::CONFUSION {
         return Err(SweepError::DegenerateVector);
     }
@@ -91,26 +96,25 @@ fn build_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
         .map(|n| GeomVec::from_dir(n).dot(&vector) >= 0.0)
         .unwrap_or(true);
 
-    faces.extend(cap_faces(face, &translation, sweep_points_along_normal));
+    faces.extend(cap_faces(face, &translation, sweep_points_along_normal)?);
 
     for wire in face.wires() {
         for edge in wire.edges() {
             if edge.length() <= tolerance::CONFUSION {
                 continue;
             }
-            faces.push(lateral_face(&edge, &translation, vector));
+            faces.push(lateral_face(&edge, &translation, vector)?);
         }
     }
 
-    Ok(Solid::new(sew(&faces, tolerance::CONFUSION * 10.0)))
+    Ok(Solid::new(
+        sew_with_policy(&faces, policy).map_err(SweepError::InvalidTolerancePolicy)?,
+    ))
 }
 
 /// Sweep a face and return the solid together with validation, recovery, and
 /// complete generated-topology history.
-pub fn prism_operation(
-    face: &Face,
-    vector: GeomVec,
-) -> Result<OperationResult<Solid>, SweepError> {
+pub fn prism_operation(face: &Face, vector: GeomVec) -> Result<OperationResult<Solid>, SweepError> {
     prism_operation_with_policy(face, vector, &TolerancePolicy::STANDARD)
 }
 
@@ -123,10 +127,7 @@ pub fn prism_operation_with_policy(
     policy
         .validate()
         .map_err(SweepError::InvalidTolerancePolicy)?;
-    let solid = build_prism(face, vector)?;
-    let (solid, reconstructed) = solid
-        .repair_pcurves(policy)
-        .map_err(SweepError::PcurveBuild)?;
+    let solid = build_prism(face, vector, policy)?;
     let validation = ValidationReport::for_solid(&solid, policy);
     if !validation.is_valid() || solid.validate_strict_with_policy(policy).is_err() {
         return Err(SweepError::InvalidOutput {
@@ -135,12 +136,7 @@ pub fn prism_operation_with_policy(
             pcurves_complete: validation.pcurves_complete,
         });
     }
-    let mut recovery = RecoveryReport::default();
-    if reconstructed > 0 {
-        recovery
-            .actions
-            .push(RecoveryAction::ReconstructPcurves { count: reconstructed });
-    }
+    let recovery = RecoveryReport::default();
     let history = TopologyHistory::generated_solid(&solid);
     Ok(OperationResult {
         value: solid,
@@ -167,42 +163,72 @@ pub fn sweep_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
     prism_operation(face, vector).map(|result| result.value)
 }
 
-fn lateral_face(edge: &Edge, translation: &Trsf, vector: GeomVec) -> Face {
+fn lateral_face(edge: &Edge, translation: &Trsf, vector: GeomVec) -> Result<Face, SweepError> {
     let p0 = edge.source().point();
     let p1 = edge.target().point();
     let q0 = translation.transform_point(&p0);
     let q1 = translation.transform_point(&p1);
 
     let top_edge = edge.transformed(translation);
-    let wire = Wire::from_edges([
+    let edges = [
         edge.reversed(),
         Edge::between_points(p0, q0),
         top_edge.clone(),
         Edge::between_points(q1, p1),
-    ]);
-
-    Face::new(
-        Some(lateral_surface(edge, p1, p0, vector, translation)),
-        wire,
-    )
+    ];
+    let surface = lateral_surface(edge, p1, p0, vector, translation);
+    let pcurves = if matches!(&surface, GeomSurface::Ruled(_)) {
+        vec![
+            uv_line(
+                Pnt2d::new(edge.first(), 0.0),
+                Pnt2d::new(edge.last(), 0.0),
+                SurfacePeriodicity::NONE,
+            ),
+            uv_line(
+                Pnt2d::new(edge.first(), 0.0),
+                Pnt2d::new(edge.first(), 1.0),
+                SurfacePeriodicity::NONE,
+            ),
+            uv_line(
+                Pnt2d::new(edge.first(), 1.0),
+                Pnt2d::new(edge.last(), 1.0),
+                SurfacePeriodicity::NONE,
+            ),
+            uv_line(
+                Pnt2d::new(edge.last(), 1.0),
+                Pnt2d::new(edge.last(), 0.0),
+                SurfacePeriodicity::NONE,
+            ),
+        ]
+    } else {
+        edges
+            .iter()
+            .map(|edge| analytic_line_pcurve(&surface, edge))
+            .collect()
+    };
+    Face::with_pcurves(surface, Wire::from_edges(edges), pcurves).map_err(SweepError::FaceBuild)
 }
 
-fn cap_faces(face: &Face, translation: &Trsf, sweep_points_along_normal: bool) -> [Face; 2] {
+fn cap_faces(
+    face: &Face,
+    translation: &Trsf,
+    sweep_points_along_normal: bool,
+) -> Result<[Face; 2], SweepError> {
     let top = face.transformed(translation);
     let Some(GeomSurface::Plane(_)) = face.surface() else {
-        return if sweep_points_along_normal {
+        return Ok(if sweep_points_along_normal {
             [face.reversed(), top]
         } else {
             [face.clone(), top.reversed()]
-        };
+        });
     };
 
     let Some(normal) = effective_face_normal(face) else {
-        return if sweep_points_along_normal {
+        return Ok(if sweep_points_along_normal {
             [face.reversed(), top]
         } else {
             [face.clone(), top.reversed()]
-        };
+        });
     };
 
     // The cap that takes `normal.reversed()` faces *opposite* the source face, so
@@ -216,17 +242,18 @@ fn cap_faces(face: &Face, translation: &Trsf, sweep_points_along_normal: bool) -
     // bisector side) and the renderer (back-face-culled / mis-shaded top, the
     // "the top disappears" artifact). Reversing the winding keeps winding and
     // normal consistent, so `sew` leaves the cap outward — matching `make_box`.
-    if sweep_points_along_normal {
+    let caps = if sweep_points_along_normal {
         [
-            planar_cap(face, normal.reversed(), None, true),
-            planar_cap(face, normal, Some(translation), false),
+            planar_cap(face, normal.reversed(), None, true)?,
+            planar_cap(face, normal, Some(translation), false)?,
         ]
     } else {
         [
-            planar_cap(face, normal, None, false),
-            planar_cap(face, normal.reversed(), Some(translation), true),
+            planar_cap(face, normal, None, false)?,
+            planar_cap(face, normal.reversed(), Some(translation), true)?,
         ]
-    }
+    };
+    Ok(caps)
 }
 
 /// Reverse a loop's winding: reverse every edge and their order, so the chain
@@ -237,7 +264,12 @@ fn reversed_wire(wire: &Wire) -> Wire {
     Wire::from_edges(edges)
 }
 
-fn planar_cap(face: &Face, normal: Dir, translation: Option<&Trsf>, flip_winding: bool) -> Face {
+fn planar_cap(
+    face: &Face,
+    normal: Dir,
+    translation: Option<&Trsf>,
+    flip_winding: bool,
+) -> Result<Face, SweepError> {
     let transform_wire = |wire: Wire| {
         let w = match translation {
             Some(t) => wire.transformed(t),
@@ -261,12 +293,13 @@ fn planar_cap(face: &Face, normal: Dir, translation: Option<&Trsf>, flip_winding
         .and_then(|wire| wire.edges().first().map(|edge| edge.source().point()))
         .unwrap_or(Pnt::origin());
 
-    Face::with_wires(
-        Some(GeomSurface::plane(Plane::from_point_normal(point, normal))),
+    planar_face_with_pcurves(
+        Plane::from_point_normal(point, normal),
         outer,
         inners,
         Orientation::Forward,
     )
+    .map_err(SweepError::FaceBuild)
 }
 
 fn lateral_surface(
@@ -408,7 +441,13 @@ mod tests {
             ]),
         );
 
-        let solid = prism(&face, GeomVec::new(0.0, 0.0, 3.0)).unwrap();
+        let operation = prism_operation(&face, GeomVec::new(0.0, 0.0, 3.0)).unwrap();
+        assert!(
+            operation.recovery.actions.is_empty(),
+            "native prism construction must not reconstruct pcurves"
+        );
+        assert!(operation.value.has_complete_pcurves());
+        let solid = operation.value;
         assert_eq!(solid.vertex_count(), 6);
         assert_eq!(solid.edge_count(), 9);
         assert_eq!(solid.face_count(), 5);

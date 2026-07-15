@@ -21,7 +21,9 @@
 //! [`Solid::assert_valid`] is the panicking wrapper for `debug_assert!`-style use
 //! in tests and debug builds.
 
-use openrcad_foundation::{Pnt, TolerancePolicy};
+use std::collections::{HashMap, HashSet};
+
+use openrcad_foundation::{Pnt, Pnt2d, TolerancePolicy};
 use openrcad_geom::{Curve, GeomSurface, Surface};
 
 use crate::arena::{BRep, EdgeId, FaceId, LoopId, OrientedEdge, PcurveId, ShellId, VertexId};
@@ -119,6 +121,22 @@ pub enum ValidationError {
         max_deviation: f64,
         tolerance: f64,
     },
+    /// Consecutive coedge pcurves do not meet in face parameter space.
+    UvLoopNotContiguous { loop_id: LoopId, gap: f64 },
+    /// Two non-adjacent boundary segments cross in face parameter space.
+    UvLoopSelfIntersection { loop_id: LoopId },
+    /// A boundary edge belongs to only one face of a strict solid shell.
+    FreeEdge { loop_id: LoopId, edge: EdgeId },
+    /// A boundary edge is used by more than two faces.
+    NonManifoldEdge { edge: EdgeId, uses: usize },
+    /// The two faces sharing an edge traverse it in the same direction.
+    SameDirectionSharedCoedge {
+        first_loop: LoopId,
+        second_loop: LoopId,
+        edge: EdgeId,
+    },
+    /// One shell contains multiple disconnected face components.
+    DisconnectedShell { shell: ShellId, components: usize },
     /// Consecutive edges in a loop do not meet (or the loop does not close): the
     /// gap between one edge's traversal-end and the next's traversal-start
     /// exceeds the endpoints' combined tolerance.
@@ -179,6 +197,33 @@ impl core::fmt::Display for ValidationError {
             } => write!(
                 f,
                 "face {face:?} loop {loop_id:?} edge {edge:?} pcurve deviates by {max_deviation:e} (tolerance {tolerance:e})"
+            ),
+            ValidationError::UvLoopNotContiguous { loop_id, gap } => write!(
+                f,
+                "loop {loop_id:?} has a UV boundary gap of {gap:e}"
+            ),
+            ValidationError::UvLoopSelfIntersection { loop_id } => {
+                write!(f, "loop {loop_id:?} self-intersects in parameter space")
+            }
+            ValidationError::FreeEdge { loop_id, edge } => write!(
+                f,
+                "strict shell has free boundary edge {edge:?} in loop {loop_id:?}"
+            ),
+            ValidationError::NonManifoldEdge { edge, uses } => write!(
+                f,
+                "strict shell edge {edge:?} has {uses} face uses"
+            ),
+            ValidationError::SameDirectionSharedCoedge {
+                first_loop,
+                second_loop,
+                edge,
+            } => write!(
+                f,
+                "shared edge {edge:?} has the same traversal direction in loops {first_loop:?} and {second_loop:?}"
+            ),
+            ValidationError::DisconnectedShell { shell, components } => write!(
+                f,
+                "shell {shell:?} has {components} disconnected face components"
             ),
             ValidationError::LoopNotContiguous { loop_id, gap } => {
                 write!(f, "loop {loop_id:?} is not contiguous (gap {gap:e})")
@@ -254,6 +299,220 @@ fn validate_loop(
         }
     }
     Ok(())
+}
+
+fn align_periodic(value: f64, target: f64, period: Option<f64>) -> f64 {
+    period.map_or(value, |period| {
+        value + ((target - value) / period).round() * period
+    })
+}
+
+fn validate_uv_loop(
+    brep: &BRep,
+    face_id: FaceId,
+    surface: &GeomSurface,
+    loop_id: LoopId,
+    policy: &TolerancePolicy,
+) -> Result<(), ValidationError> {
+    let wire = brep
+        .loops
+        .get(loop_id)
+        .ok_or(ValidationError::DanglingLoop(loop_id))?;
+    let mut vertices = Vec::<Pnt2d>::with_capacity(wire.edges.len() + 2);
+    let mut first_periodicity = None;
+
+    for coedge in &wire.edges {
+        let pcurve_id = coedge.pcurve.ok_or(ValidationError::MissingPcurve {
+            face: face_id,
+            loop_id,
+            edge: coedge.id,
+        })?;
+        let pcurve = brep
+            .pcurves
+            .get(pcurve_id)
+            .ok_or(ValidationError::DanglingPcurve {
+                loop_id,
+                edge: coedge.id,
+                pcurve: pcurve_id,
+            })?;
+        let (mut start, mut end) = if coedge.orientation == Orientation::Reversed {
+            (pcurve.point_at_fraction(1.0), pcurve.point_at_fraction(0.0))
+        } else {
+            (pcurve.point_at_fraction(0.0), pcurve.point_at_fraction(1.0))
+        };
+        first_periodicity.get_or_insert(pcurve.periodicity);
+        if let Some(&previous) = vertices.last() {
+            let aligned_x = align_periodic(start.x(), previous.x(), pcurve.periodicity.u_period);
+            let aligned_y = align_periodic(start.y(), previous.y(), pcurve.periodicity.v_period);
+            let offset_x = aligned_x - start.x();
+            let offset_y = aligned_y - start.y();
+            start = Pnt2d::new(aligned_x, aligned_y);
+            end = Pnt2d::new(end.x() + offset_x, end.y() + offset_y);
+            let gap = start.distance(&previous);
+            if gap > policy.pcurve_consistency {
+                let lifted_gap = surface
+                    .point(previous.x(), previous.y())
+                    .distance(&surface.point(start.x(), start.y()));
+                if lifted_gap > policy.linear * 16.0 {
+                    return Err(ValidationError::UvLoopNotContiguous { loop_id, gap });
+                }
+                // A surface singularity (for example a cone apex or sphere
+                // pole) can collapse a finite UV connector to one 3D point.
+                // Keep that connector explicit for the self-intersection pass.
+                vertices.push(start);
+            }
+        } else {
+            vertices.push(start);
+        }
+        vertices.push(end);
+    }
+
+    let Some(&last) = vertices.last() else {
+        return Err(ValidationError::EmptyLoop(loop_id));
+    };
+    let first = vertices[0];
+    let first_periodicity = first_periodicity.expect("non-empty loop checked above");
+    let closed = Pnt2d::new(
+        align_periodic(first.x(), last.x(), first_periodicity.u_period),
+        align_periodic(first.y(), last.y(), first_periodicity.v_period),
+    );
+    let closure_gap = last.distance(&closed);
+    if closure_gap > policy.pcurve_consistency {
+        let lifted_gap = surface
+            .point(last.x(), last.y())
+            .distance(&surface.point(closed.x(), closed.y()));
+        if lifted_gap > policy.linear * 16.0 {
+            return Err(ValidationError::UvLoopNotContiguous {
+                loop_id,
+                gap: closure_gap,
+            });
+        }
+        // A singular surface point can require an explicit finite connector in
+        // UV even though both ends lift to the same 3D pole/apex.
+        vertices.push(closed);
+    } else if let Some(last) = vertices.last_mut() {
+        // Snap numerical round-trip noise onto the first point's unwrapped
+        // periodic branch. Appending another nearly-zero closure segment would
+        // make the first and last real segments look non-adjacent to the
+        // self-intersection pass.
+        *last = closed;
+    }
+
+    let segment_count = vertices.len() - 1;
+    for first_index in 0..segment_count {
+        for second_index in (first_index + 1)..segment_count {
+            let adjacent = second_index == first_index + 1
+                || (first_index == 0 && second_index + 1 == segment_count);
+            if adjacent {
+                continue;
+            }
+            if segments_cross(
+                vertices[first_index],
+                vertices[first_index + 1],
+                vertices[second_index],
+                vertices[second_index + 1],
+                policy.pcurve_consistency,
+            ) {
+                return Err(ValidationError::UvLoopSelfIntersection { loop_id });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn segments_cross(a: Pnt2d, b: Pnt2d, c: Pnt2d, d: Pnt2d, tolerance: f64) -> bool {
+    let orient = |p: Pnt2d, q: Pnt2d, r: Pnt2d| {
+        (q.x() - p.x()) * (r.y() - p.y()) - (q.y() - p.y()) * (r.x() - p.x())
+    };
+    let ab_c = orient(a, b, c);
+    let ab_d = orient(a, b, d);
+    let cd_a = orient(c, d, a);
+    let cd_b = orient(c, d, b);
+    ab_c * ab_d < -tolerance * tolerance && cd_a * cd_b < -tolerance * tolerance
+}
+
+#[derive(Clone, Copy)]
+struct StrictEdgeUse {
+    face_index: usize,
+    loop_id: LoopId,
+    edge: EdgeId,
+    traversal_start: QuantPoint,
+    traversal_end: QuantPoint,
+}
+
+fn strict_edge_key(
+    brep: &BRep,
+    coedge: &OrientedEdge,
+    face_orientation: Orientation,
+    loop_id: LoopId,
+    policy: &TolerancePolicy,
+) -> Result<(EdgeKey, QuantPoint, QuantPoint), ValidationError> {
+    let edge = brep
+        .edges
+        .get(coedge.id)
+        .ok_or(ValidationError::DanglingEdge {
+            loop_id,
+            edge: coedge.id,
+        })?;
+    let start = brep
+        .vertices
+        .get(edge.start)
+        .ok_or(ValidationError::DanglingVertex { edge: coedge.id })?
+        .point;
+    let end = brep
+        .vertices
+        .get(edge.end)
+        .ok_or(ValidationError::DanglingVertex { edge: coedge.id })?
+        .point;
+    let midpoint = edge.curve.as_ref().map_or_else(
+        || {
+            Pnt::new(
+                0.5 * (start.x() + end.x()),
+                0.5 * (start.y() + end.y()),
+                0.5 * (start.z() + end.z()),
+            )
+        },
+        |curve| curve.point(0.5 * (edge.first + edge.last)),
+    );
+    let grid = 1.0 / policy.approximation;
+    let quantize = |point: Pnt| {
+        (
+            (point.x() * grid).round() as i64,
+            (point.y() * grid).round() as i64,
+            (point.z() * grid).round() as i64,
+        )
+    };
+    let natural_start = quantize(start);
+    let natural_end = quantize(end);
+    let middle = quantize(midpoint);
+    let key = if natural_start <= natural_end {
+        (natural_start, natural_end, middle)
+    } else {
+        (natural_end, natural_start, middle)
+    };
+    let reversed =
+        (coedge.orientation == Orientation::Reversed) ^ (face_orientation == Orientation::Reversed);
+    let (traversal_start, traversal_end) = if reversed {
+        (natural_end, natural_start)
+    } else {
+        (natural_start, natural_end)
+    };
+    Ok((key, traversal_start, traversal_end))
+}
+
+fn component_root(parents: &mut [usize], index: usize) -> usize {
+    if parents[index] != index {
+        parents[index] = component_root(parents, parents[index]);
+    }
+    parents[index]
+}
+
+fn union_components(parents: &mut [usize], first: usize, second: usize) {
+    let first = component_root(parents, first);
+    let second = component_root(parents, second);
+    if first != second {
+        parents[second] = first;
+    }
 }
 
 fn validate_pcurve(
@@ -369,7 +628,8 @@ impl Solid {
         let brep = self.brep.as_ref();
         for &shell_id in &brep.solids[self.id].shells {
             let shell = &brep.shells[shell_id];
-            for &face_id in &shell.faces {
+            let mut edge_uses = HashMap::<EdgeKey, Vec<StrictEdgeUse>>::new();
+            for (face_index, &face_id) in shell.faces.iter().enumerate() {
                 let face = &brep.faces[face_id];
                 if face.surface.is_none() {
                     continue;
@@ -387,8 +647,64 @@ impl Solid {
                                 edge: coedge.id,
                             });
                         }
+                        let (key, traversal_start, traversal_end) =
+                            strict_edge_key(brep, coedge, face.orientation, loop_id, policy)?;
+                        edge_uses.entry(key).or_default().push(StrictEdgeUse {
+                            face_index,
+                            loop_id,
+                            edge: coedge.id,
+                            traversal_start,
+                            traversal_end,
+                        });
+                    }
+                    validate_uv_loop(
+                        brep,
+                        face_id,
+                        face.surface.as_ref().expect("surface checked above"),
+                        loop_id,
+                        policy,
+                    )?;
+                }
+            }
+
+            let mut parents = (0..shell.faces.len()).collect::<Vec<_>>();
+            for uses in edge_uses.values() {
+                match uses.as_slice() {
+                    [only] => {
+                        return Err(ValidationError::FreeEdge {
+                            loop_id: only.loop_id,
+                            edge: only.edge,
+                        })
+                    }
+                    [first, second] => {
+                        if first.traversal_start != second.traversal_end
+                            || first.traversal_end != second.traversal_start
+                        {
+                            return Err(ValidationError::SameDirectionSharedCoedge {
+                                first_loop: first.loop_id,
+                                second_loop: second.loop_id,
+                                edge: first.edge,
+                            });
+                        }
+                        union_components(&mut parents, first.face_index, second.face_index);
+                    }
+                    many => {
+                        return Err(ValidationError::NonManifoldEdge {
+                            edge: many[0].edge,
+                            uses: many.len(),
+                        })
                     }
                 }
+            }
+            let components = (0..parents.len())
+                .map(|index| component_root(&mut parents, index))
+                .collect::<HashSet<_>>()
+                .len();
+            if components > 1 {
+                return Err(ValidationError::DisconnectedShell {
+                    shell: shell_id,
+                    components,
+                });
             }
         }
         Ok(())
@@ -645,7 +961,7 @@ mod tests {
     use crate::shell::Shell;
     use crate::wire::Wire;
     use crate::BRepBuilder;
-    use openrcad_foundation::{Dir2d, Pnt2d};
+    use openrcad_foundation::{Dir2d, Pnt2d, Trsf, Vec as GeomVec};
     use openrcad_geom::{GeomSurface, Plane};
     use openrcad_geom2d::{GeomCurve2d, Line2d};
 
@@ -735,6 +1051,57 @@ mod tests {
                 max_deviation,
                 ..
             }) if max_deviation > 0.009
+        ));
+    }
+
+    #[test]
+    fn strict_validation_rejects_free_edges() {
+        let solid = square_with_pcurves(0.0);
+        assert!(matches!(
+            solid.validate_strict_with_policy(&TolerancePolicy::STANDARD),
+            Err(ValidationError::FreeEdge { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_validation_rejects_same_direction_shared_coedges() {
+        let face = square_with_pcurves(0.0).shell().faces()[0].clone();
+        let duplicate = face.transformed(&Trsf::IDENTITY);
+        let solid = Solid::new(Shell::from_faces([face, duplicate]));
+        assert!(matches!(
+            solid.validate_strict_with_policy(&TolerancePolicy::STANDARD),
+            Err(ValidationError::SameDirectionSharedCoedge { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_validation_rejects_non_manifold_edge_uses() {
+        let face = square_with_pcurves(0.0).shell().faces()[0].clone();
+        let duplicate = face.transformed(&Trsf::IDENTITY);
+        let third = face.transformed(&Trsf::IDENTITY);
+        let solid = Solid::new(Shell::from_faces([face, duplicate, third]));
+        assert!(matches!(
+            solid.validate_strict_with_policy(&TolerancePolicy::STANDARD),
+            Err(ValidationError::NonManifoldEdge { uses: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn strict_validation_rejects_disconnected_closed_components() {
+        let face = square_with_pcurves(0.0).shell().faces()[0].clone();
+        let opposite = face.transformed(&Trsf::IDENTITY).reversed();
+        let translation = Trsf::translation(GeomVec::new(10.0, 0.0, 0.0));
+        let shifted = face.transformed(&translation);
+        let shifted_opposite = shifted.transformed(&Trsf::IDENTITY).reversed();
+        let solid = Solid::new(Shell::from_faces([
+            face,
+            opposite,
+            shifted,
+            shifted_opposite,
+        ]));
+        assert!(matches!(
+            solid.validate_strict_with_policy(&TolerancePolicy::STANDARD),
+            Err(ValidationError::DisconnectedShell { components: 2, .. })
         ));
     }
 
