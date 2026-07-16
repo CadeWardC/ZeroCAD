@@ -43,7 +43,6 @@ fn add_pocket_corner_edge_mod(g: &mut ParametricGraph, kind: crate::sketch::Corn
             },
             dist,
             dist_expr: None,
-            replay: Default::default(),
             kind,
         },
     });
@@ -199,7 +198,6 @@ fn add_chained_pocket_fillets(g: &mut ParametricGraph, vertical_first: bool) {
                 edge,
                 dist: 2.0,
                 dist_expr: None,
-                replay: Default::default(),
                 kind: crate::sketch::CornerKind::Fillet,
             },
         });

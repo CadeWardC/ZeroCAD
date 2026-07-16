@@ -199,7 +199,6 @@ fn cutout_fillet_repro_graph() -> ParametricGraph {
             },
             dist: 3.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });

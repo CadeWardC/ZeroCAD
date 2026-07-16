@@ -150,11 +150,11 @@ impl ZeroCadApp {
 
                                         ui.add_space(6.0);
                                         egui::ComboBox::from_label("Graphics backend")
-                                            .selected_text(self.graphics_backend.label())
+                                        .selected_text(self.graphics_backend.label())
                                             .show_ui(ui, |ui| {
                                                 for b in settings::GraphicsBackend::ALL {
                                                     ui.selectable_value(
-                                                        &mut self.graphics_backend,
+                                            &mut self.graphics_backend,
                                                         b,
                                                         b.label(),
                                                     );

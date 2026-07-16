@@ -5,8 +5,8 @@
 //! after an upstream edit rebuilds that body. They are deliberately cheap — they
 //! resolve the captured [`EdgeRef`] directly via [`resolve_edge_ref_by_topology`]
 //! rather than running an expensive fillet solve — so the matrix stays fast as it
-//! grows. Cases that only pass once boolean name-propagation lands (Phase 3) are
-//! marked `#[ignore]` with the reason; each later phase flips the ones it fixes.
+//! grows. Phase 3 topology-history cases all run normally; the one ignored
+//! half-space discriminator is explicitly scoped to the Phase 4 selector work.
 //!
 //! They also cover the companion Phase 0 deliverable: the per-feature
 //! [`FeatureStatus`] channel, which reports *which* feature failed to resolve

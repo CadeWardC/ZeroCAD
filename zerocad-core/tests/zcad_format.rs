@@ -15,9 +15,8 @@ use zerocad_core::{Document, FeatureNode, FeatureState, FeatureType, ParametricG
 fn feature_payload_corpus() -> Vec<FeatureType> {
     use zerocad_core::mock_kernel::EdgeCurveHint;
     use zerocad_core::{
-        AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef,
-        EdgeModReplayIntent, EdgeRef, ExtrudeMode, HoleKind, PatternKind, PlaneBase, SketchCurves,
-        Variable,
+        AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeRef,
+        ExtrudeMode, HoleKind, PatternKind, PlaneBase, SketchCurves, Variable,
     };
 
     let face = FaceRef {
@@ -63,7 +62,6 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             },
             dist: 0.2,
             dist_expr: Some("0.1*2".into()),
-            replay: EdgeModReplayIntent::default(),
             kind: zerocad_core::CornerKind::Chamfer,
         },
         FeatureType::VariableSet {
@@ -162,6 +160,22 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             tool: "missing_b".into(),
             keep_tool: true,
         },
+        FeatureType::BodyIntersect {
+            target: "missing_a".into(),
+            tool: "missing_b".into(),
+            keep_tool: true,
+        },
+        FeatureType::BodySplit {
+            target: "missing_a".into(),
+            plane: PlaneBase::Datum("missing_plane".into()),
+            face: None,
+        },
+        FeatureType::BodyScale {
+            source: "missing_a".into(),
+            factor: 2.0,
+            factor_expr: Some("scale_factor".into()),
+            center: [1.0, 2.0, 3.0],
+        },
     ]
 }
 
@@ -232,7 +246,7 @@ fn v5_compact_save_is_deterministic_and_strips_accelerators() {
         small_preview_png: Some(vec![0x89, b'P', b'N', b'G']),
         large_preview_png: Some(vec![7; 1024]),
         display_meshes: Some(bodies),
-        evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+        evaluation_cache: Some(document.evaluation_cache_snapshot()),
     };
     let options = SaveOptions {
         profile: SaveProfile::Compact,
@@ -252,8 +266,33 @@ fn v5_compact_save_is_deterministic_and_strips_accelerators() {
     assert!(loaded.accelerators.large_preview_png.is_none());
     assert!(!loaded.document.is_visible("box1"));
     assert_eq!(
-        loaded.document.graph.feature_state("cyl1"),
+        loaded.document.feature_state("cyl1"),
         Some(FeatureState::Suppressed)
+    );
+}
+
+#[test]
+fn canonical_save_rejects_semantic_dependency_drift() {
+    let mut graph = sample_graph();
+    graph.add_dependency("box1", "cyl1");
+    let cylinder = graph
+        .graph
+        .node_indices()
+        .find(|&index| graph.graph[index].id == "cyl1")
+        .unwrap();
+    graph.graph[cylinder]
+        .inputs
+        .retain(|input| input.role != "dependency");
+
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    let error = write_document_to_vec(
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ZcadError::Decode(message) if message.contains("semantic inputs disagree"))
     );
 }
 
@@ -324,7 +363,6 @@ fn every_feature_payload_round_trips_and_rebuilds_identically() {
         let restored = loaded
             .document
             .graph
-            .graph
             .node_weights()
             .find(|node| node.id == feature_id)
             .unwrap_or_else(|| panic!("{kind_id}: restored feature is missing"));
@@ -337,7 +375,6 @@ fn every_feature_payload_round_trips_and_rebuilds_identically() {
 
         let after = loaded
             .document
-            .graph
             .evaluate_bodies_with_warnings(&HashSet::new())
             .unwrap_or_else(|error| panic!("{kind_id}: restored rebuild failed: {error}"));
         assert_eq!(before.1, after.1, "{kind_id}: diagnostics changed");
@@ -369,7 +406,7 @@ fn hydrated_budget_is_hard_and_profile_comes_from_content() {
         small_preview_png: None,
         large_preview_png: Some(vec![1; 512]),
         display_meshes: Some(bodies),
-        evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+        evaluation_cache: Some(document.evaluation_cache_snapshot()),
     };
     let profile = SaveProfile::Hydrated {
         total_accelerator_budget: 1,
@@ -393,8 +430,8 @@ fn compact_profile_has_bounded_overhead_and_no_forbidden_sections() {
         &HydrationBundle {
             small_preview_png: Some(preview),
             large_preview_png: Some(vec![1; 4096]),
-            display_meshes: Some(document.graph.evaluate_bodies(&HashSet::new()).unwrap()),
-            evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+            display_meshes: Some(document.evaluate_bodies(&HashSet::new()).unwrap()),
+            evaluation_cache: Some(document.evaluation_cache_snapshot()),
         },
     )
     .unwrap();
@@ -428,7 +465,7 @@ fn streaming_apis_round_trip_without_a_full_file_adapter() {
     .unwrap();
     cursor.set_position(11);
     let loaded = read_document(&mut cursor, &LoadOptions::default()).unwrap();
-    assert_eq!(loaded.document.graph.graph.node_count(), 3);
+    assert_eq!(loaded.document.graph.node_count(), 3);
 }
 
 #[test]
@@ -448,7 +485,7 @@ fn hydrated_sections_fail_independently_without_losing_the_recipe() {
             small_preview_png: None,
             large_preview_png: Some(vec![3; 4096]),
             display_meshes: Some(bodies),
-            evaluation_cache: Some(document.graph.evaluation_cache_snapshot()),
+            evaluation_cache: Some(document.evaluation_cache_snapshot()),
         },
     )
     .unwrap();
@@ -465,11 +502,7 @@ fn hydrated_sections_fail_independently_without_losing_the_recipe() {
             LoadDiagnostic::DiscardedDisposableSection { section: actual, .. }
                 if *actual == section
         )));
-        let rebuilt = loaded
-            .document
-            .graph
-            .evaluate_bodies(&HashSet::new())
-            .unwrap();
+        let rebuilt = loaded.document.evaluate_bodies(&HashSet::new()).unwrap();
         assert_eq!(rebuilt.len(), expected.len());
         for ((expected_id, expected_mesh), (actual_id, actual_mesh)) in
             expected.iter().zip(&rebuilt)
@@ -566,7 +599,7 @@ fn failed_atomic_save_preserves_the_previous_complete_file() {
     .is_err());
 
     let loaded = read_document_file(&path, &LoadOptions::default()).unwrap();
-    assert_eq!(loaded.document.graph.graph.node_count(), 3);
+    assert_eq!(loaded.document.graph.node_count(), 3);
 }
 
 #[test]
@@ -961,6 +994,141 @@ fn round_trip_body_transform_keeps_copy_and_translation() {
         .evaluate_bodies(&HashSet::new())
         .expect("evaluate restored transform");
     assert_eq!(bodies.len(), 2);
+}
+
+#[test]
+fn phase35_features_save_load_with_equivalent_outputs_and_provenance() {
+    use zerocad_core::{DatumPlaneDef, PlaneBase};
+
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "intersect_target".into(),
+        name: "Intersect target".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "intersect_tool".into(),
+        name: "Intersect tool".into(),
+        feature: FeatureType::BodyTransform {
+            source: "intersect_target".into(),
+            translation: [5.0, 0.0, 0.0],
+            copy: true,
+        },
+    });
+    graph.add_dependency("intersect_target", "intersect_tool");
+    graph.add_feature(FeatureNode {
+        id: "intersect".into(),
+        name: "Intersect".into(),
+        feature: FeatureType::BodyIntersect {
+            target: "intersect_target".into(),
+            tool: "intersect_tool".into(),
+            keep_tool: false,
+        },
+    });
+    graph.add_dependency("intersect_target", "intersect");
+    graph.add_dependency("intersect_tool", "intersect");
+
+    graph.add_feature(FeatureNode {
+        id: "split_target".into(),
+        name: "Split target".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "split_plane".into(),
+        name: "Split plane".into(),
+        feature: FeatureType::DatumPlane {
+            def: DatumPlaneDef::Offset {
+                base: PlaneBase::XY,
+                distance: 5.0,
+                distance_expr: None,
+            },
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "split".into(),
+        name: "Split".into(),
+        feature: FeatureType::BodySplit {
+            target: "split_target".into(),
+            plane: PlaneBase::Datum("split_plane".into()),
+            face: None,
+        },
+    });
+    graph.add_dependency("split_target", "split");
+    graph.add_dependency("split_plane", "split");
+
+    graph.add_feature(FeatureNode {
+        id: "scale_target".into(),
+        name: "Scale target".into(),
+        feature: FeatureType::Box {
+            w: 4.0,
+            h: 6.0,
+            d: 8.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "scale".into(),
+        name: "Scale".into(),
+        feature: FeatureType::BodyScale {
+            source: "scale_target".into(),
+            factor: 0.5,
+            factor_expr: Some("1/2".into()),
+            center: [2.0, 3.0, 4.0],
+        },
+    });
+    graph.add_dependency("scale_target", "scale");
+
+    // Sequence intent is independent of dependency order. Persist the three
+    // operations ahead of their inputs and prove the DAG still governs safe
+    // evaluation before and after save/load.
+    for (id, sequence) in [
+        ("intersect", 1),
+        ("intersect_target", 2),
+        ("intersect_tool", 3),
+        ("split", 4),
+        ("split_target", 5),
+        ("split_plane", 6),
+        ("scale", 7),
+        ("scale_target", 8),
+    ] {
+        assert!(graph.set_feature_sequence(id, zerocad_core::document::SequenceKey(sequence)));
+    }
+
+    let summarize = |graph: &ParametricGraph| {
+        let mut summary = graph
+            .evaluate_bodies(&HashSet::new())
+            .expect("evaluate Phase 3.5 graph")
+            .into_iter()
+            .map(|(id, mesh)| (id, mesh.mass_properties().unwrap().volume))
+            .collect::<Vec<_>>();
+        summary.sort_by(|left, right| left.0.cmp(&right.0));
+        summary
+    };
+    let before = summarize(&graph);
+    assert_eq!(
+        graph.body_producer_feature_id("split::body:2"),
+        Some("split")
+    );
+
+    let bytes = write_zcad(&doc_for(&graph)).expect("write Phase 3.5 document");
+    let loaded = read_zcad(&bytes).expect("read Phase 3.5 document");
+    let after = summarize(&loaded.graph);
+    assert_eq!(
+        loaded.graph.body_producer_feature_id("split::body:2"),
+        Some("split")
+    );
+    assert_eq!(before.len(), after.len());
+    for ((before_id, before_volume), (after_id, after_volume)) in before.iter().zip(after.iter()) {
+        assert_eq!(before_id, after_id);
+        assert!((before_volume - after_volume).abs() < 1.0e-5);
+    }
 }
 
 #[test]

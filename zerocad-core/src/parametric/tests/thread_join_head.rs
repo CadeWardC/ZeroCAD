@@ -1,7 +1,5 @@
-//! Joining/cutting a plain solid onto a **threaded** body. A boolean against the
-//! analytic helical bands is not viable, so the evaluator routes the boolean
-//! through the body's smooth pre-thread base and replays the thread afterward
-//! (see `ThreadReplay`). Regression for the reported bug: a head extruded from a
+//! Joining/cutting a plain solid onto a **threaded** body using the native
+//! helical B-Rep. Regression for the reported bug: a head extruded from a
 //! threaded shaft's bottom face and set to Join produced no geometry at all —
 //! the union silently dropped the head.
 
@@ -81,6 +79,15 @@ fn join_head_onto_threaded_shaft_fuses_and_keeps_threads() {
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
+    let kernel = g
+        .debug_kernel_solids(&std::collections::HashSet::new())
+        .expect("kernel evaluation succeeds");
+    let (_, solids) = kernel
+        .iter()
+        .find(|(id, _)| id == "cyl_1")
+        .expect("threaded shaft kernel body");
+    let solid_bounds = crate::mock_kernel::solid_aabb(&solids[0]).expect("solid bounds");
+    assert!(solid_bounds.0[1] < -3.0 && solid_bounds.1[1] > h - 0.5);
 
     // The head must have fused INTO the shaft body, not become a separate lump.
     assert_eq!(bodies.len(), 1, "one fused body; got {:?}", ids(&bodies));
@@ -98,7 +105,6 @@ fn join_head_onto_threaded_shaft_fuses_and_keeps_threads() {
     // The head extends the body well below the shaft's original bottom (y=0).
     // Before the fix the head vanished and the min stayed ~0.
     let (lo, hi) = mesh_aabb(mesh);
-    eprintln!("fused AABB y: [{:.3}, {:.3}]", lo[1], hi[1]);
     assert!(
         lo[1] < -3.0,
         "head should extend ~4mm below y=0 (got min y={:.3})",
@@ -117,10 +123,6 @@ fn join_head_onto_threaded_shaft_fuses_and_keeps_threads() {
     let shaft = std::f64::consts::PI * (r as f64).powi(2) * h as f64;
     let head_vol = std::f64::consts::PI * 9.0f64.powi(2) * 4.0;
     let plain_union = shaft + head_vol;
-    eprintln!(
-        "fused volume={:.2} plain_union≈{:.2} shaft_only≈{:.2}",
-        props.volume, plain_union, shaft
-    );
     assert!(
         props.volume > shaft + 0.5 * head_vol,
         "the head's volume must be present: {:.2} vs shaft {:.2}",
@@ -135,14 +137,22 @@ fn join_head_onto_threaded_shaft_fuses_and_keeps_threads() {
     );
 }
 
-/// Symmetric case: a pocket cut into a threaded shaft must remove material and
-/// keep the body whole (the cut routes through the smooth base, then re-threads).
+/// Symmetric case: a pocket cut directly into a threaded shaft must remove
+/// material and keep the body whole.
 #[test]
 fn cut_pocket_into_threaded_shaft_removes_material() {
     let (r, h) = (6.0f32, 10.0f32);
     let mut g = ParametricGraph::new();
     add_cylinder(&mut g, "cyl_1", r, h);
     add_thread(&mut g, "thread_2", "cyl_1", r, h);
+    let (threaded_only, baseline_warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(baseline_warnings.is_empty(), "{baseline_warnings:?}");
+    let threaded_volume = body_mesh(&threaded_only, "cyl_1")
+        .mass_properties()
+        .expect("closed threaded shaft")
+        .volume;
 
     // A small square pocket cut into the top face (y=h), sweeping downward (-Y).
     // u=X, v=Z ⇒ n=-Y at the top; positive depth bores into the shaft.
@@ -155,7 +165,6 @@ fn cut_pocket_into_threaded_shaft_removes_material() {
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
-
     assert_eq!(bodies.len(), 1, "still one body; got {:?}", ids(&bodies));
     let mesh = body_mesh(&bodies, "cyl_1");
     assert!(
@@ -168,13 +177,11 @@ fn cut_pocket_into_threaded_shaft_removes_material() {
     );
 
     let props = mesh.mass_properties().expect("closed pocketed solid");
-    let shaft = std::f64::consts::PI * (r as f64).powi(2) * h as f64;
-    eprintln!("pocketed volume={:.2} shaft≈{:.2}", props.volume, shaft);
     assert!(
-        props.volume < shaft,
-        "the pocket must remove material: {:.2} vs shaft {:.2}",
+        props.volume < threaded_volume - 0.5,
+        "the pocket must remove material: {:.2} vs threaded baseline {:.2}",
         props.volume,
-        shaft
+        threaded_volume
     );
 }
 

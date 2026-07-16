@@ -168,8 +168,8 @@ fn finish_step_import(
     let solid = match options.missing_pcurves {
         MissingPcurveCompatibility::Reject => solid,
         MissingPcurveCompatibility::ReconstructAndValidate => {
-            let (solid, reconstructed) = solid
-                .repair_pcurves(policy)
+            let (solid, reconstructed, promoted_edges, maximum_tolerance) = solid
+                .repair_imported_pcurves_compatibility(policy)
                 .map_err(StepImportError::PcurveBuild)?;
             if reconstructed > 0 {
                 recovery.actions.push(RecoveryAction::ReconstructPcurves {
@@ -178,6 +178,21 @@ fn finish_step_import(
                 diagnostics.push(Diagnostic::warning(
                     "openrcad.step.legacy-pcurve-reconstruction",
                     format!("reconstructed and validated {reconstructed} STEP coedge pcurves"),
+                    None,
+                ));
+            }
+            if promoted_edges > 0 {
+                recovery
+                    .actions
+                    .push(RecoveryAction::PromoteImportedTolerance {
+                        edge_count: promoted_edges,
+                        maximum: maximum_tolerance,
+                    });
+                diagnostics.push(Diagnostic::warning(
+                    "openrcad.step.legacy-tolerance-promotion",
+                    format!(
+                        "promoted {promoted_edges} imported edge tolerances up to {maximum_tolerance:e}"
+                    ),
                     None,
                 ));
             }

@@ -32,8 +32,8 @@ impl ZeroCadApp {
                 if let Some(editing_id) = self.editing_sketch_id.clone() {
                     if !self.sketch_curves.is_empty() {
                         self.push_undo();
-                        for idx in self.graph.graph.node_indices() {
-                            if self.graph.graph[idx].id != editing_id {
+                        for idx in self.document.graph.node_indices() {
+                            if self.document.graph[idx].id != editing_id {
                                 continue;
                             }
                             if let FeatureType::Sketch {
@@ -45,7 +45,7 @@ impl ZeroCadApp {
                                 next_entity_id,
                                 solver,
                                 ..
-                            } = &mut self.graph.graph[idx].feature
+                            } = &mut self.document.graph[idx].feature
                             {
                                 *curves = self.sketch_curves.clone();
                                 *shapes = self.sketch_shapes.clone();
@@ -116,7 +116,7 @@ impl ZeroCadApp {
                     };
 
                     self.push_undo();
-                    self.graph.add_feature(sketch_node);
+                    self.document.add_feature(sketch_node);
                     // A sketch placed on a body face records that face + a dependency
                     // on the body, so on rebuild its plane is re-derived from where
                     // the face now is (the sketch follows the body).
@@ -124,15 +124,17 @@ impl ZeroCadApp {
                         if let Some(body_id) =
                             fref.topology.as_ref().and_then(|t| t.body_id.clone())
                         {
-                            self.graph.add_dependency(&body_id, &sketch_id);
+                            self.document.add_dependency(&body_id, &sketch_id);
                         }
-                        self.graph.sketch_face_refs.insert(sketch_id.clone(), fref);
+                        self.document
+                            .sketch_face_refs
+                            .insert(sketch_id.clone(), fref);
                     }
                     // The projected face outline persists with the sketch so
                     // rebuilds (and later edit sessions) detect the same
                     // boundary-split regions the user saw while drawing.
                     if self.active_sketch_on_face && !self.active_face_boundary.is_empty() {
-                        self.graph
+                        self.document
                             .sketch_face_boundaries
                             .insert(sketch_id.clone(), self.active_face_boundary.clone());
                     }
@@ -140,8 +142,8 @@ impl ZeroCadApp {
                     // dependency, so its plane re-derives from the datum's current
                     // resolution on every rebuild (editing the datum moves it).
                     if let Some(datum_id) = self.active_sketch_datum_ref.take() {
-                        self.graph.add_dependency(&datum_id, &sketch_id);
-                        self.graph
+                        self.document.add_dependency(&datum_id, &sketch_id);
+                        self.document
                             .sketch_datum_refs
                             .insert(sketch_id.clone(), datum_id);
                     }
@@ -515,6 +517,8 @@ impl ZeroCadApp {
             && self.move_op.is_none()
             && self.pattern_op.is_none()
             && self.combine_op.is_none()
+            && self.split_body_op.is_none()
+            && self.scale_body_op.is_none()
         {
             if let Some(sources) = self.selected_bodies_to_combine() {
                 ui.separator();
@@ -527,7 +531,7 @@ impl ZeroCadApp {
                     egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
                 );
                 if join_btn
-                    .on_hover_text("Join touching bodies or cut one overlapping body with another")
+                    .on_hover_text("Join, cut, or keep the common volume of two bodies")
                     .clicked()
                 {
                     self.begin_combine(sources);
@@ -537,7 +541,11 @@ impl ZeroCadApp {
 
         // MOVE: shown only for one fully-selected body. The same command is in
         // the viewport's right-click menu.
-        if !active_sketching && self.move_op.is_none() {
+        if !active_sketching
+            && self.move_op.is_none()
+            && self.split_body_op.is_none()
+            && self.scale_body_op.is_none()
+        {
             if let Some(source) = self.selected_whole_body() {
                 ui.separator();
                 let move_btn = icons::Icon::Mirror.labeled_button(
@@ -552,7 +560,35 @@ impl ZeroCadApp {
                     .on_hover_text("Translate the selected body or align one of its faces")
                     .clicked()
                 {
-                    self.begin_move_body(source);
+                    self.begin_move_body(source.clone());
+                }
+                let split_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Split",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if split_btn
+                    .on_hover_text("Split the selected body with an origin, datum, or planar face")
+                    .clicked()
+                {
+                    self.begin_split_body(source.clone());
+                }
+                let scale_btn = icons::Icon::Mirror.labeled_button(
+                    ui,
+                    "Scale",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if scale_btn
+                    .on_hover_text("Uniformly scale the selected body about an explicit pivot")
+                    .clicked()
+                {
+                    self.begin_scale_body(source);
                 }
             }
         }

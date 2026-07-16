@@ -16,7 +16,7 @@ use openrcad_topo::{
 };
 
 use crate::native_pcurve::{analytic_line_pcurve, planar_face_with_pcurves, uv_line};
-use crate::sew::sew_with_policy;
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Errors reported by prism/extrusion sweeping.
 #[derive(Clone, Debug, PartialEq)]

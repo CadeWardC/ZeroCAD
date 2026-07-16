@@ -1,6 +1,6 @@
 //! Construction of validated face-local pcurves for operation-created edges.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use openrcad_foundation::{
     Ax22d, Dir2d, Pnt, Pnt2d, TolerancePolicy, TolerancePolicyError, Vec as GeomVec,
@@ -66,7 +66,8 @@ impl Solid {
         &self,
         policy: &TolerancePolicy,
     ) -> Result<(Self, usize), PcurveBuildError> {
-        self.complete_pcurves_impl(policy, false)
+        self.complete_pcurves_impl(policy, false, None)
+            .map(|(solid, rebuilt, _, _)| (solid, rebuilt))
     }
 
     /// Return a copy whose missing or stale operation-created pcurves are
@@ -75,14 +76,27 @@ impl Solid {
         &self,
         policy: &TolerancePolicy,
     ) -> Result<(Self, usize), PcurveBuildError> {
-        self.complete_pcurves_impl(policy, true)
+        self.complete_pcurves_impl(policy, true, None)
+            .map(|(solid, rebuilt, _, _)| (solid, rebuilt))
+    }
+
+    /// Explicit legacy-import adapter. Missing/stale pcurves are rebuilt and
+    /// approximate imported edges may have their tolerance promoted, never
+    /// beyond `policy.snap_max`. The returned counts make both repairs visible
+    /// to exchange-layer diagnostics and recovery metadata.
+    pub fn repair_imported_pcurves_compatibility(
+        &self,
+        policy: &TolerancePolicy,
+    ) -> Result<(Self, usize, usize, f64), PcurveBuildError> {
+        self.complete_pcurves_impl(policy, true, Some(policy.snap_max))
     }
 
     fn complete_pcurves_impl(
         &self,
         policy: &TolerancePolicy,
         replace_inconsistent: bool,
-    ) -> Result<(Self, usize), PcurveBuildError> {
+        recovery_tolerance_cap: Option<f64>,
+    ) -> Result<(Self, usize, usize, f64), PcurveBuildError> {
         policy
             .validate()
             .map_err(PcurveBuildError::InvalidTolerancePolicy)?;
@@ -120,15 +134,19 @@ impl Solid {
                             .edges
                             .get(coedge.id)
                             .ok_or(PcurveBuildError::MissingTopology)?;
-                        let tolerance = policy.pcurve_consistency.max(edge.tolerance);
-                        let existing_is_valid = coedge
-                            .pcurve
-                            .and_then(|id| brep.pcurves.get(id))
-                            .is_some_and(|pcurve| {
-                                pcurve.is_valid()
-                                    && max_deviation(&brep, &surface, edge, pcurve, 96) <= tolerance
-                            });
-                        if coedge.pcurve.is_none() || (replace_inconsistent && !existing_is_valid) {
+                        let needs_rebuild = match coedge.pcurve {
+                            None => true,
+                            Some(_) if !replace_inconsistent => false,
+                            Some(id) => {
+                                let tolerance = policy.pcurve_consistency.max(edge.tolerance);
+                                !brep.pcurves.get(id).is_some_and(|pcurve| {
+                                    pcurve.is_valid()
+                                        && max_deviation(&brep, &surface, edge, pcurve, 96)
+                                            <= tolerance
+                                })
+                            }
+                        };
+                        if needs_rebuild {
                             tasks.push((
                                 face_id,
                                 loop_id,
@@ -142,35 +160,49 @@ impl Solid {
             }
         }
 
+        let mut promoted_edges = HashSet::new();
+        let mut maximum_promoted_tolerance = 0.0_f64;
         for (face_id, loop_id, coedge_index, edge_id, surface) in &tasks {
             let edge = brep
                 .edges
                 .get(*edge_id)
                 .ok_or(PcurveBuildError::MissingTopology)?
                 .clone();
-            let pcurve = build_pcurve(&brep, surface, &edge, policy).ok_or(
-                PcurveBuildError::ProjectionFailed {
+            let tolerance = policy.pcurve_consistency.max(edge.tolerance);
+            let allowed_tolerance =
+                recovery_tolerance_cap.map_or(tolerance, |cap| tolerance.max(cap));
+            let pcurve = build_pcurve(&brep, surface, &edge, policy, allowed_tolerance)
+                .ok_or_else(|| PcurveBuildError::ProjectionFailed {
                     face: *face_id,
                     loop_id: *loop_id,
                     edge: *edge_id,
-                },
-            )?;
-            let tolerance = policy.pcurve_consistency.max(edge.tolerance);
+                })?;
             let deviation = max_deviation(&brep, surface, &edge, &pcurve, 96);
-            if !deviation.is_finite() || deviation > tolerance {
+            if !deviation.is_finite() || deviation > allowed_tolerance {
                 return Err(PcurveBuildError::Inconsistent {
                     face: *face_id,
                     loop_id: *loop_id,
                     edge: *edge_id,
                     max_deviation: deviation,
-                    tolerance,
+                    tolerance: allowed_tolerance,
                 });
+            }
+            if deviation > tolerance {
+                let promoted = (deviation + policy.resolution).min(allowed_tolerance);
+                brep.edges[*edge_id].tolerance = brep.edges[*edge_id].tolerance.max(promoted);
+                promoted_edges.insert(*edge_id);
+                maximum_promoted_tolerance = maximum_promoted_tolerance.max(promoted);
             }
             let id = brep.pcurves.insert(pcurve);
             brep.loops[*loop_id].edges[*coedge_index].pcurve = Some(id);
         }
 
-        Ok((Solid::from_id(Arc::new(brep), self.id), tasks.len()))
+        Ok((
+            Solid::from_id(Arc::new(brep), self.id),
+            tasks.len(),
+            promoted_edges.len(),
+            maximum_promoted_tolerance,
+        ))
     }
 }
 
@@ -179,6 +211,7 @@ fn build_pcurve(
     surface: &GeomSurface,
     edge: &EdgeData,
     policy: &TolerancePolicy,
+    allowed_tolerance: f64,
 ) -> Option<PcurveData> {
     if let Some(exact) = exact_planar_pcurve(brep, surface, edge) {
         return Some(exact);
@@ -187,7 +220,7 @@ fn build_pcurve(
         return Some(exact);
     }
     let periodicity = surface_periodicity(surface);
-    let tolerance = policy.pcurve_consistency.max(edge.tolerance);
+    let tolerance = allowed_tolerance;
 
     // Analytic seams, rims, and generators become exact UV lines.
     let samples = project_samples(brep, surface, edge, 9, periodicity)?;
@@ -197,8 +230,15 @@ fn build_pcurve(
         }
     }
 
-    // A collapsed pole/seam use still needs an explicit, evaluable pcurve.
-    if edge_point(brep, edge, 0.0)?.distance(&edge_point(brep, edge, 1.0)?) <= policy.linear {
+    // A truly collapsed pole use still needs an explicit, evaluable pcurve.
+    // Coincident endpoints alone are insufficient: closed circles and closed
+    // B-spline intersection boundaries also start and end at one vertex.
+    let start = edge_point(brep, edge, 0.0)?;
+    let collapsed = [0.25, 0.5, 0.75, 1.0].into_iter().all(|fraction| {
+        edge_point(brep, edge, fraction)
+            .is_some_and(|point| start.distance(&point) <= policy.linear)
+    });
+    if collapsed {
         let uv = samples[0];
         return Some(
             PcurveData::new(
@@ -213,7 +253,11 @@ fn build_pcurve(
     // General curve-on-surface fallback: refine a UV polyline until lifting it
     // through the surface agrees with the 3D edge to policy tolerance.
     let mut count = 17;
-    while count <= 4097 {
+    // Imported intersection curves may be long, closed cubic splines. Their
+    // explicit compatibility reconstruction still has to meet the same strict
+    // pcurve tolerance, so allow enough adaptive refinement to validate them
+    // instead of accepting a coarse approximation.
+    while count <= 32769 {
         let points = project_samples(brep, surface, edge, count, periodicity)?;
         let candidate = polyline_pcurve(points, periodicity);
         // Use a verification grid that is deliberately not an integer multiple
@@ -221,7 +265,8 @@ fn build_pcurve(
         // can alias by whole turns and agree exactly at every knot and midpoint
         // while deviating between them. The coprime interval count detects that
         // alias and forces refinement until adjacent samples unwrap correctly.
-        if max_deviation(brep, surface, edge, &candidate, count * 2 + 1) <= tolerance {
+        let deviation = max_deviation(brep, surface, edge, &candidate, count * 2 + 1);
+        if deviation <= tolerance {
             return Some(candidate);
         }
         count = (count - 1) * 2 + 1;
@@ -355,7 +400,15 @@ fn project_samples(
     periodicity: SurfacePeriodicity,
 ) -> Option<Vec<Pnt2d>> {
     let mut out = Vec::with_capacity(count);
-    let mut hint = None;
+    // At a spherical pole longitude is undefined. Seed projection from the
+    // first interior edge sample so a pole endpoint inherits the longitude of
+    // the great-circle boundary instead of arbitrarily starting at zero.
+    let mut hint = if matches!(surface, GeomSurface::Sphere(_)) && count > 2 {
+        edge_point(brep, edge, 1.0 / (count - 1) as f64)
+            .and_then(|point| project_point(surface, point, None))
+    } else {
+        None
+    };
     for index in 0..count {
         let fraction = index as f64 / (count - 1) as f64;
         let point = edge_point(brep, edge, fraction)?;

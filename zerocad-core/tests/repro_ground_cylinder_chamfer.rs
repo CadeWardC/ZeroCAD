@@ -10,8 +10,7 @@ use std::collections::HashSet;
 use std::f32::consts::TAU;
 use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{
-    CoordinateSystem, EdgeModReplayIntent, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
-    ParametricGraph, SketchCurves,
+    CoordinateSystem, EdgeRef, ExtrudeMode, FeatureNode, FeatureType, ParametricGraph, SketchCurves,
 };
 
 const CX: f32 = 2.2;
@@ -88,7 +87,6 @@ fn ground_cylinder_edge_mod(
             edge: rim,
             dist: 3.0,
             dist_expr: None,
-            replay: EdgeModReplayIntent::default(),
             kind,
         },
     });

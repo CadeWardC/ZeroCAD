@@ -31,7 +31,7 @@ use openrcad_topo::{
 };
 
 use crate::native_pcurve::{planar_face_with_pcurves, surface_periodicity, unwrap_near, uv_line};
-use crate::sew::sew_with_policy;
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Errors reported by [`revolve`].
 #[derive(Clone, Debug, PartialEq)]

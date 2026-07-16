@@ -22,7 +22,7 @@ impl ZeroCadApp {
         if !self.is_sketch_mode || self.sketch_solver_model.is_none() {
             return;
         }
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         // Solve once per frame for the status line + conflict highlight (the
         // model is tiny; the solve is microseconds).
         let report = self

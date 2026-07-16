@@ -10,6 +10,11 @@ human or agent — does not have to reconstruct the non-obvious design decisions
 from comments scattered across the source. Read it before changing the geometry
 engine.
 
+The authoritative delivery roadmap is
+[`docs/part-design-master-plan.md`](docs/part-design-master-plan.md). It records
+completed phase gates, current work, deferred scope, and the acceptance criteria
+for Part Design 1.0.
+
 ---
 
 ## Workspace layout

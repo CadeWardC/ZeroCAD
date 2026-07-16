@@ -474,10 +474,10 @@ impl ZeroCadApp {
             CornerKind::Chamfer => "Chamfer",
         };
         let n = self
-            .graph
+            .document
             .graph
             .node_indices()
-            .filter(|&i| matches!(self.graph.graph[i].feature, FeatureType::EdgeMod { kind: k, .. } if k == kind))
+            .filter(|&i| matches!(self.document.graph[i].feature, FeatureType::EdgeMod { kind: k, .. } if k == kind))
             .count()
             + 1;
         format!("{}_{}", prefix, n)
@@ -506,10 +506,10 @@ impl ZeroCadApp {
     /// counter, but evaluation uses these suffixes as creation order.
     pub(crate) fn reseed_id_counter_from_graph(&mut self) {
         let next = next_id_after(
-            self.graph
+            self.document
                 .graph
                 .node_indices()
-                .map(|i| self.graph.graph[i].id.as_str()),
+                .map(|i| self.document.graph[i].id.as_str()),
         );
         // Never move backwards: undo can restore a graph from before a document
         // load, and ids allocated earlier in this session must remain reserved.

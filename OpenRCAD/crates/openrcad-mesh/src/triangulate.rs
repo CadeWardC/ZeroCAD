@@ -441,6 +441,55 @@ fn recover_constrained_edges(
     tris
 }
 
+/// Split a requested constraint wherever an existing triangulation vertex lies
+/// on its interior. Edge-flip recovery assumes no vertex sits on the target
+/// segment; without this normalization it sees no strictly crossing edge and
+/// leaves the long constraint unrecovered.
+fn split_constraints_at_collinear_points(
+    points: &[Pnt2d],
+    constraints: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut split = Vec::with_capacity(constraints.len());
+    for &(start, end) in constraints {
+        if start == end {
+            continue;
+        }
+        let a = points[start];
+        let b = points[end];
+        let dx = b.x() - a.x();
+        let dy = b.y() - a.y();
+        let length_squared = dx * dx + dy * dy;
+        if length_squared <= 1.0e-24 {
+            continue;
+        }
+        let length = length_squared.sqrt();
+        let mut chain = vec![(0.0, start), (1.0, end)];
+        for (index, point) in points.iter().enumerate() {
+            if index == start || index == end {
+                continue;
+            }
+            let px = point.x() - a.x();
+            let py = point.y() - a.y();
+            let parameter = (px * dx + py * dy) / length_squared;
+            if parameter <= 1.0e-10 || parameter >= 1.0 - 1.0e-10 {
+                continue;
+            }
+            let line_distance = (dx * py - dy * px).abs() / length;
+            if line_distance <= 1.0e-9 {
+                chain.push((parameter, index));
+            }
+        }
+        chain.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        chain.dedup_by_key(|entry| entry.1);
+        split.extend(chain.windows(2).filter_map(|pair| {
+            let a = pair[0].1;
+            let b = pair[1].1;
+            (a != b).then_some((a, b))
+        }));
+    }
+    split
+}
+
 /// Ray-casting point-in-polygon containment test.
 pub fn is_point_in_polygon(p: Pnt2d, loop_pts: &[Pnt2d]) -> bool {
     let q = (p.x(), p.y());
@@ -1340,9 +1389,10 @@ fn trimmed_constrained_tris(
     check_edge_midpoints: bool,
 ) -> Vec<Tri> {
     let dbg = std::env::var("ORC_DEBUG_TRI").is_ok();
-    let tris = recover_constrained_edges(delaunay_triangulate(points), points, constraints);
+    let constraints = split_constraints_at_collinear_points(points, constraints);
+    let tris = recover_constrained_edges(delaunay_triangulate(points), points, &constraints);
     if dbg {
-        for &(a, b) in constraints {
+        for &(a, b) in &constraints {
             if a != b && !mesh_has_edge(&tris, a, b) {
                 eprintln!(
                     "tri dbg: UNRECOVERED constraint ({:.4},{:.4})-({:.4},{:.4})",
@@ -1417,7 +1467,14 @@ fn refine_cylinder_tris(
     // is far cheaper than re-Delaunay-ing a growing point set (a cone's
     // apex-ward facets have a vanishing target length that would drive the
     // iterative pass to explode the vertex count).
-    let check_edge_midpoints = matches!(surface, GeomSurface::Cylinder(_));
+    // A centroid test alone is insufficient for concave trims: a triangle can
+    // have its centroid inside the face while one of its chords bridges across
+    // a re-entrant boundary (for example, the circular bite in a cut plate).
+    // Checking every triangle edge midpoint is cheap compared with the
+    // constrained triangulation and prevents those exterior bridge facets on
+    // planar and curved faces alike.
+    let check_edge_midpoints = true;
+    let refine_curved_edges = matches!(surface, GeomSurface::Cylinder(_));
     let (u_min, u_max) = outer_pts
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
@@ -1434,7 +1491,7 @@ fn refine_cylinder_tris(
         wants_ccw,
         check_edge_midpoints,
     );
-    if !check_edge_midpoints {
+    if !refine_curved_edges {
         return tris;
     }
 
@@ -1954,6 +2011,57 @@ pub struct SharedEdgeSample {
     pub canonical_fraction: f64,
 }
 
+/// Recover the local edge fraction for a sample supplied by another,
+/// geometrically coincident edge. Boolean/healing paths can leave coincident
+/// B-splines with different knot parameterizations; reusing the source edge's
+/// normalized parameter would then pair the shared 3D sample with the wrong
+/// point on this face's pcurve.
+fn closest_curve_fraction(curve: &GeomCurve, first: f64, last: f64, point: Pnt) -> f64 {
+    const COARSE_STEPS: usize = 64;
+    const REFINE_STEPS: usize = 28;
+
+    let distance2 = |fraction: f64| {
+        let parameter = first + (last - first) * fraction;
+        let offset = curve.point(parameter) - point;
+        offset.dot(&offset)
+    };
+
+    let mut best_index = 0;
+    let mut best_distance = f64::INFINITY;
+    for index in 0..=COARSE_STEPS {
+        let fraction = index as f64 / COARSE_STEPS as f64;
+        let distance = distance2(fraction);
+        if distance < best_distance {
+            best_index = index;
+            best_distance = distance;
+        }
+    }
+
+    let mut low = best_index.saturating_sub(1) as f64 / COARSE_STEPS as f64;
+    let mut high = (best_index + 1).min(COARSE_STEPS) as f64 / COARSE_STEPS as f64;
+    let golden = 0.5 * (5.0_f64.sqrt() - 1.0);
+    let mut left = high - golden * (high - low);
+    let mut right = low + golden * (high - low);
+    let mut left_distance = distance2(left);
+    let mut right_distance = distance2(right);
+    for _ in 0..REFINE_STEPS {
+        if left_distance <= right_distance {
+            high = right;
+            right = left;
+            right_distance = left_distance;
+            left = high - golden * (high - low);
+            left_distance = distance2(left);
+        } else {
+            low = left;
+            left = right;
+            left_distance = right_distance;
+            right = low + golden * (high - low);
+            right_distance = distance2(right);
+        }
+    }
+    0.5 * (low + high)
+}
+
 fn shared_key_point(p: Pnt) -> (i64, i64, i64) {
     (
         (p.x() * 1e6).round() as i64,
@@ -2258,11 +2366,22 @@ pub(crate) fn tessellate_face_budget_configured(
                 directed
                     .into_iter()
                     .map(|sample| {
-                        let fraction = if natural_start_is_canonical {
+                        let mut fraction = if natural_start_is_canonical {
                             sample.canonical_fraction
                         } else {
                             1.0 - sample.canonical_fraction
                         };
+                        let parameter = edge.first() + (edge.last() - edge.first()) * fraction;
+                        if curve.point(parameter).distance(&sample.point)
+                            > edge.tolerance().max(1.0e-7)
+                        {
+                            fraction = closest_curve_fraction(
+                                curve,
+                                edge.first(),
+                                edge.last(),
+                                sample.point,
+                            );
+                        }
                         (sample.point, fraction)
                     })
                     .collect()
@@ -3221,6 +3340,20 @@ mod tests {
         let recovered = recover_constrained_edges(tris, &points, &[(1, 3)]);
 
         assert!(mesh_has_edge(&recovered, 1, 3));
+    }
+
+    #[test]
+    fn constraint_is_split_at_existing_collinear_vertex() {
+        let points = vec![
+            Pnt2d::new(0.0, 0.0),
+            Pnt2d::new(2.0, 0.0),
+            Pnt2d::new(1.0, 0.0),
+            Pnt2d::new(0.0, 1.0),
+        ];
+        assert_eq!(
+            split_constraints_at_collinear_points(&points, &[(0, 1)]),
+            vec![(0, 2), (2, 1)]
+        );
     }
 
     #[test]

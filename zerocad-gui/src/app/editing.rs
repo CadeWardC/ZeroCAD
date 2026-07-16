@@ -76,16 +76,16 @@ impl ZeroCadApp {
     /// reference through the edit.
     pub(crate) fn edit_sketch(&mut self, node_id: &str, now: f64) {
         let Some(idx) = self
-            .graph
+            .document
             .graph
             .node_indices()
-            .find(|&i| self.graph.graph[i].id == node_id)
+            .find(|&i| self.document.graph[i].id == node_id)
         else {
             return;
         };
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         let (cs, shapes, corner_mods, mirrors, on_face, entity_ids, next_id, solver) =
-            match &self.graph.graph[idx].feature {
+            match &self.document.graph[idx].feature {
                 FeatureType::Sketch {
                     cs,
                     shapes,
@@ -111,11 +111,11 @@ impl ZeroCadApp {
 
         self.begin_sketch_on(cs, now); // clears sketch state; set ours after
         self.active_sketch_on_face = on_face;
-        self.active_sketch_face_ref = self.graph.sketch_face_refs.get(node_id).cloned();
+        self.active_sketch_face_ref = self.document.sketch_face_refs.get(node_id).cloned();
         // Restore the projected face outline so it re-joins region detection
         // (and rendering/snapping) for the whole edit session.
         self.active_face_boundary = self
-            .graph
+            .document
             .sketch_face_boundaries
             .get(node_id)
             .cloned()
@@ -603,7 +603,7 @@ impl ZeroCadApp {
     /// preview and the committed geometry, so they can never diverge.
     pub(crate) fn shape_from_points(&self, last: (f32, f32)) -> SketchCurves {
         match self.shape_record_from_points(last) {
-            Some(shape) => shape.build(&self.graph.variable_map()),
+            Some(shape) => shape.build(&self.document.variable_map()),
             None => SketchCurves::new(),
         }
     }
@@ -645,7 +645,7 @@ impl ZeroCadApp {
             // inject a zero-length line or a false loop close, and capture the
             // true endpoint (for a typed-dimension segment it differs from `last`).
             if is_line {
-                if let Some(s) = shape.build(&self.graph.variable_map()).segments.last() {
+                if let Some(s) = shape.build(&self.document.variable_map()).segments.last() {
                     let len2 = (s.b.0 - s.a.0).powi(2) + (s.b.1 - s.a.1).powi(2);
                     if len2 < 1.0e-8 {
                         return;
@@ -654,7 +654,7 @@ impl ZeroCadApp {
                 }
             }
             if self.sketch_solver_model.is_some() {
-                let vars = self.graph.variable_map();
+                let vars = self.document.variable_map();
                 let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);
                 let (addition, next) =
                     zerocad_core::sketch::constraints::promote_shapes_to_entities(
@@ -778,10 +778,10 @@ impl ZeroCadApp {
     /// Count graph features matching `pred`, then add one — the 1-based index
     /// for the next feature of that kind. Shared by the `next_*_name` helpers.
     pub(crate) fn next_feature_index(&self, pred: impl Fn(&FeatureType) -> bool) -> usize {
-        self.graph
+        self.document
             .graph
             .node_indices()
-            .filter(|&i| pred(&self.graph.graph[i].feature))
+            .filter(|&i| pred(&self.document.graph[i].feature))
             .count()
             + 1
     }
@@ -811,6 +811,9 @@ impl ZeroCadApp {
                     }
                     | FeatureType::BodyJoin { .. }
                     | FeatureType::BodyCut { .. }
+                    | FeatureType::BodyIntersect { .. }
+                    | FeatureType::BodySplit { .. }
+                    | FeatureType::BodyScale { .. }
             )
         }) + self
             .body_meshes
@@ -844,6 +847,21 @@ impl ZeroCadApp {
         format!("Cut_{}", n)
     }
 
+    pub(crate) fn next_body_intersect_name(&self) -> String {
+        let n = self.next_feature_index(|f| matches!(f, FeatureType::BodyIntersect { .. }));
+        format!("Intersect_{}", n)
+    }
+
+    pub(crate) fn next_body_split_name(&self) -> String {
+        let n = self.next_feature_index(|f| matches!(f, FeatureType::BodySplit { .. }));
+        format!("Split_{}", n)
+    }
+
+    pub(crate) fn next_body_scale_name(&self) -> String {
+        let n = self.next_feature_index(|f| matches!(f, FeatureType::BodyScale { .. }));
+        format!("Scale_{}", n)
+    }
+
     /// Display name for the next variable set (VariableSet_1, VariableSet_2, …).
     pub(crate) fn next_variable_set_name(&self) -> String {
         let n = self.next_feature_index(|f| matches!(f, FeatureType::VariableSet { .. }));
@@ -858,7 +876,7 @@ mod snap_tests {
     #[test]
     fn disconnected_outputs_advance_the_next_body_number() {
         let mut app = ZeroCadApp::new();
-        app.graph.add_feature(FeatureNode {
+        app.document.add_feature(FeatureNode {
             id: "extrude_5".to_string(),
             name: "Body_1".to_string(),
             feature: FeatureType::Box {

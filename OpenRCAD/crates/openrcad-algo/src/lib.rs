@@ -15,6 +15,7 @@ pub mod intersect;
 pub mod merge;
 mod native_pcurve;
 pub mod operation;
+pub mod plane_split;
 
 pub use blend::BlendError;
 pub use facade::SolidExt;
@@ -23,6 +24,11 @@ pub use operation::{
     Diagnostic, DiagnosticSeverity, OperationResult, RecoveryAction, RecoveryReport,
     ValidationReport,
 };
+pub use plane_split::{
+    split_solid_by_plane_operation, split_solid_by_plane_operation_with_policy, PlaneSplitBodies,
+    PlaneSplitError,
+};
+pub use sew::SewError;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,13 +48,12 @@ pub enum BooleanOp {
 pub mod boolean;
 #[allow(deprecated)]
 pub use boolean::{
-    boolean_checked_bodies_with_policy, boolean_checked_with_cancel, boolean_checked_with_history,
-    boolean_checked_with_history_and_policy, boolean_checked_with_history_cancel,
-    boolean_checked_with_history_policy_and_cancel, boolean_checked_with_policy,
+    boolean_bodies_operation_with_classes_policy_and_cancel, boolean_checked_bodies_with_policy,
+    boolean_checked_with_cancel, boolean_checked_with_policy,
     boolean_checked_with_policy_and_cancel, boolean_operation,
     boolean_operation_with_classes_policy_and_cancel, boolean_operation_with_policy,
-    boolean_operation_with_policy_and_cancel, boolean_with_history, BooleanError,
-    BooleanFaceHistory, BooleanFaceSource, BooleanInput,
+    boolean_operation_with_policy_and_cancel, BooleanBodies, BooleanError, BooleanFaceHistory,
+    BooleanFaceSource, BooleanInput,
 };
 pub mod contour;
 pub use contour::{
@@ -164,8 +169,21 @@ pub fn fillet_with_policy(
 ///
 /// Handles a single box or cylinder primitive at any orientation; see [`fillet`]
 /// for the error cases.
+#[deprecated(note = "use chamfer_with_policy")]
 pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
-    chamfer::chamfer(solid, distance)
+    chamfer::chamfer_with_policy(
+        solid,
+        distance,
+        &openrcad_foundation::TolerancePolicy::STANDARD,
+    )
+}
+
+pub fn chamfer_with_policy(
+    solid: &Solid,
+    distance: f64,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    chamfer::chamfer_with_policy(solid, distance, policy)
 }
 
 /// Hollow out `solid` by `thickness` while leaving `open_faces` removed
@@ -173,12 +191,27 @@ pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
 ///
 /// Handles a single box or cylinder primitive at any orientation; see [`fillet`]
 /// for the error cases.
+#[deprecated(note = "use shell_solid_with_policy")]
 pub fn shell_solid(
     solid: &Solid,
     thickness: f64,
     open_faces: &[Face],
 ) -> Result<Solid, BlendError> {
-    offset::shell_solid(solid, thickness, open_faces)
+    offset::shell_solid_with_policy(
+        solid,
+        thickness,
+        open_faces,
+        &openrcad_foundation::TolerancePolicy::STANDARD,
+    )
+}
+
+pub fn shell_solid_with_policy(
+    solid: &Solid,
+    thickness: f64,
+    open_faces: &[Face],
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    offset::shell_solid_with_policy(solid, thickness, open_faces, policy)
 }
 
 pub mod revolve;
@@ -199,7 +232,214 @@ pub use rolling_ball::{
     rolling_ball_between_planar_faces_with_policy, rolling_ball_fillet_edge,
     rolling_ball_fillet_edge_with_policy, RollingBallBlend, RollingBallError,
 };
-pub use skin::{skin_polygon_rings, SkinError};
+#[allow(deprecated)]
+pub use skin::{skin_polygon_rings, skin_polygon_rings_with_policy, SkinError};
+
+/// Error shared by canonical unary modeling-operation entry points.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelingOperationError {
+    Build(String),
+    PcurveBuild(String),
+    InvalidOutput(openrcad_topo::ValidationReport),
+}
+
+impl core::fmt::Display for ModelingOperationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Build(reason) => write!(f, "operation construction failed: {reason}"),
+            Self::PcurveBuild(reason) => {
+                write!(f, "operation pcurve construction failed: {reason}")
+            }
+            Self::InvalidOutput(report) => {
+                write!(f, "operation returned invalid topology: {report:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModelingOperationError {}
+
+fn finish_unary_operation(
+    input: &Solid,
+    value: Solid,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    policy
+        .validate()
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    let (value, reconstructed) = value
+        .repair_pcurves(policy)
+        .map_err(|error| ModelingOperationError::PcurveBuild(error.to_string()))?;
+    let (value, mut recovery) = normalize_operation_result(value, policy);
+    let validation = openrcad_topo::ValidationReport::for_solid(&value, policy);
+    if !validation.is_valid() || value.validate_strict_with_policy(policy).is_err() {
+        return Err(ModelingOperationError::InvalidOutput(validation));
+    }
+    if reconstructed > 0 {
+        recovery
+            .actions
+            .push(openrcad_topo::RecoveryAction::ReconstructPcurves {
+                count: reconstructed,
+            });
+    }
+    Ok(openrcad_topo::OperationResult {
+        history: openrcad_topo::TopologyHistory::conservative_unary(input, &value),
+        value,
+        diagnostics: Vec::new(),
+        recovery,
+        validation,
+    })
+}
+
+fn finish_generated_operation(
+    value: Solid,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    policy
+        .validate()
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    let (value, reconstructed) = value
+        .repair_pcurves(policy)
+        .map_err(|error| ModelingOperationError::PcurveBuild(error.to_string()))?;
+    let (value, mut recovery) = normalize_operation_result(value, policy);
+    let validation = openrcad_topo::ValidationReport::for_solid(&value, policy);
+    if !validation.is_valid() || value.validate_strict_with_policy(policy).is_err() {
+        return Err(ModelingOperationError::InvalidOutput(validation));
+    }
+    if reconstructed > 0 {
+        recovery
+            .actions
+            .push(openrcad_topo::RecoveryAction::ReconstructPcurves {
+                count: reconstructed,
+            });
+    }
+    Ok(openrcad_topo::OperationResult {
+        history: openrcad_topo::TopologyHistory::generated_solid(&value),
+        value,
+        diagnostics: Vec::new(),
+        recovery,
+        validation,
+    })
+}
+
+fn normalize_operation_result(
+    value: Solid,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> (Solid, openrcad_topo::RecoveryReport) {
+    let mut recovery = openrcad_topo::RecoveryReport::default();
+    let before = value;
+    let before_count = before.face_count();
+    let value = merge::merge_coplanar_faces_classed_with_policy(&before, None, policy);
+    if !std::sync::Arc::ptr_eq(before.brep(), value.brep()) {
+        recovery
+            .actions
+            .push(openrcad_topo::RecoveryAction::MergeCoplanarFaces {
+                removed_faces: before_count.saturating_sub(value.face_count()),
+            });
+    }
+    let before = value;
+    let before_count = before.face_count();
+    let value = merge::merge_cocylindrical_faces_classed_with_policy(&before, None, policy);
+    if !std::sync::Arc::ptr_eq(before.brep(), value.brep()) {
+        recovery
+            .actions
+            .push(openrcad_topo::RecoveryAction::MergeCocylindricalFaces {
+                removed_faces: before_count.saturating_sub(value.face_count()),
+            });
+    }
+    (value, recovery)
+}
+
+pub fn fillet_operation_with_policy(
+    solid: &Solid,
+    radius: f64,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = fillet_with_policy(solid, radius, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_unary_operation(solid, value, policy)
+}
+
+pub fn chamfer_operation_with_policy(
+    solid: &Solid,
+    distance: f64,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = chamfer_with_policy(solid, distance, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_unary_operation(solid, value, policy)
+}
+
+pub fn shell_solid_operation_with_policy(
+    solid: &Solid,
+    thickness: f64,
+    open_faces: &[Face],
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = shell_solid_with_policy(solid, thickness, open_faces, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_unary_operation(solid, value, policy)
+}
+
+pub fn blend_contour_operation_with_policy(
+    solid: &Solid,
+    contour: &BlendContour,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = apply_blend_contour_with_policy(solid, contour, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_unary_operation(solid, value, policy)
+}
+
+pub fn skin_polygon_rings_operation_with_policy(
+    rings: &[Vec<openrcad_foundation::Pnt>],
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = skin_polygon_rings_with_policy(rings, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_generated_operation(value, policy)
+}
+
+pub fn transform_operation_with_policy(
+    solid: &Solid,
+    transform: &openrcad_foundation::Trsf,
+    is_reflection: bool,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let scale = transform.scale_factor();
+    if !scale.is_finite() || scale.abs() <= policy.resolution {
+        return Err(ModelingOperationError::Build(
+            "transform scale must be finite and greater than policy resolution".into(),
+        ));
+    }
+    let reverses_orientation = transform.reverses_orientation();
+    if is_reflection != reverses_orientation {
+        return Err(ModelingOperationError::Build(format!(
+            "transform orientation flag ({is_reflection}) disagrees with its linear determinant ({})",
+            transform.linear_determinant()
+        )));
+    }
+    let value = if reverses_orientation {
+        let shells = solid
+            .shells()
+            .into_iter()
+            .map(|shell| {
+                let faces: Vec<Face> = shell
+                    .faces()
+                    .iter()
+                    .map(|face| face.transformed(transform))
+                    .collect();
+                sew::sew_shell_with_policy(&faces, policy)
+                    .map_err(|error| ModelingOperationError::Build(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Solid::from_shells(shells)
+            .ok_or_else(|| ModelingOperationError::Build("reflection lost all shells".into()))?
+    } else {
+        solid.transformed(transform)
+    };
+    finish_unary_operation(solid, value, policy)
+}
 
 /// Sew a collection of faces into a single shell, joining edges within `tol`
 /// (OCCT `BRepBuilderAPI_Sewing`).
@@ -215,6 +455,6 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
 pub fn sew_with_policy(
     faces: &[Face],
     policy: &openrcad_foundation::TolerancePolicy,
-) -> Result<Shell, openrcad_foundation::TolerancePolicyError> {
+) -> Result<openrcad_topo::OperationResult<Shell>, SewError> {
     sew::sew_with_policy(faces, policy)
 }

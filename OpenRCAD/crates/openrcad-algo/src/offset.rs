@@ -1,27 +1,42 @@
-use openrcad_foundation::{tolerance, Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{tolerance, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{GeomCurve, GeomSurface, OffsetSurface, Plane, Surface};
 use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
 use std::collections::HashMap;
 
-use crate::blend::{detect_cylinder, shell_cylinder, BlendError};
-use crate::sew::{compatibility_policy, sew_with_policy};
+use crate::blend::{detect_cylinder, shell_cylinder_with_policy, BlendError};
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Shell a solid by `thickness`, removing `open_faces`.
+#[deprecated(note = "use shell_solid_with_policy")]
 pub fn shell_solid(
     solid: &Solid,
     thickness: f64,
     open_faces: &[Face],
 ) -> Result<Solid, BlendError> {
-    if thickness.abs() <= tolerance::CONFUSION {
+    shell_solid_with_policy(solid, thickness, open_faces, &TolerancePolicy::STANDARD)
+}
+
+pub fn shell_solid_with_policy(
+    solid: &Solid,
+    thickness: f64,
+    open_faces: &[Face],
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    policy
+        .validate()
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    if thickness.abs() <= policy.linear {
         return Ok(solid.clone());
     }
     if let Some((p0, ex, ey, ez, dx, dy, dz)) = detect_box(solid) {
-        return Ok(shell_box(p0, ex, ey, ez, dx, dy, dz, thickness, open_faces));
+        return Ok(shell_box(
+            p0, ex, ey, ez, dx, dy, dz, thickness, open_faces, policy,
+        ));
     }
     if let Some(cyl) = detect_cylinder(solid) {
-        return shell_cylinder(&cyl, thickness, open_faces);
+        return shell_cylinder_with_policy(&cyl, thickness, open_faces, policy);
     }
-    shell_planar_general(solid, thickness, open_faces)
+    shell_planar_general(solid, thickness, open_faces, policy)
 }
 
 /// General shell for arbitrary PLANAR-faced solids with straight edges (any
@@ -41,6 +56,7 @@ fn shell_planar_general(
     solid: &Solid,
     thickness: f64,
     open_faces: &[Face],
+    policy: &TolerancePolicy,
 ) -> Result<Solid, BlendError> {
     if open_faces.is_empty() {
         return Err(BlendError::UnsupportedShape);
@@ -225,10 +241,11 @@ fn shell_planar_general(
         ));
     }
 
-    let policy = compatibility_policy(tolerance::CONFUSION * 10.0);
-    let shelled =
-        Solid::new(sew_with_policy(&result, &policy).expect("compatibility policy is valid"));
-    if !shelled.is_watertight() {
+    let shelled = Solid::new(
+        sew_with_policy(&result, policy)
+            .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?,
+    );
+    if !shelled.is_watertight_with_policy(policy) {
         return Err(BlendError::UnsupportedShape);
     }
     Ok(shelled)
@@ -367,6 +384,7 @@ fn shell_box(
     dz: f64,
     thickness: f64,
     open_faces: &[Face],
+    policy: &TolerancePolicy,
 ) -> Solid {
     let frame = LocalFrame { p0, ex, ey, ez };
 
@@ -613,8 +631,8 @@ fn shell_box(
     }
 
     // Sew the collection of faces into a watertight shell
-    let policy = compatibility_policy(thickness * 0.1);
-    let shell = sew_with_policy(&faces, &policy).expect("compatibility policy is valid");
+    let shell =
+        sew_with_policy(&faces, policy).expect("policy was validated by shell_solid_with_policy");
     Solid::new(shell)
 }
 

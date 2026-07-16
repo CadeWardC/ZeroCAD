@@ -77,7 +77,10 @@ impl Surface for SphericalSurface {
     }
 
     fn transformed(&self, t: &Trsf) -> Self {
-        Self::new(self.pos.transformed(t), self.radius)
+        Self::new(
+            self.pos.transformed(t),
+            self.radius * t.scale_factor().abs(),
+        )
     }
 }
 

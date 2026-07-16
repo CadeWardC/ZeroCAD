@@ -54,7 +54,7 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("loft_{n}");
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Loft {n}"),
             feature: FeatureType::Loft {
@@ -64,7 +64,7 @@ impl ZeroCadApp {
             },
         });
         for (sketch_id, _) in &sections {
-            self.graph.add_dependency(sketch_id, &id);
+            self.document.add_dependency(sketch_id, &id);
             self.hidden_nodes.insert(sketch_id.clone());
         }
         self.selected_faces.clear();
@@ -100,11 +100,11 @@ impl ZeroCadApp {
         };
         // Candidate path sketches: every sketch except the profile's.
         let sketches: Vec<(String, String)> = self
-            .graph
+            .document
             .graph
             .node_indices()
             .filter_map(|i| {
-                let node = &self.graph.graph[i];
+                let node = &self.document.graph[i];
                 (matches!(node.feature, FeatureType::Sketch { .. }) && node.id != op.profile_sketch)
                     .then(|| (node.id.clone(), node.name.clone()))
             })
@@ -194,7 +194,7 @@ impl ZeroCadApp {
         };
         // Cut/Join from a face-attached profile targets that body.
         let target = if matches!(op.mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
-            self.graph
+            self.document
                 .sketch_face_refs
                 .get(&op.profile_sketch)
                 .and_then(|fref| fref.topology.as_ref())
@@ -205,7 +205,7 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("sweep_{n}");
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Sweep {n}"),
             feature: FeatureType::Sweep {
@@ -216,8 +216,8 @@ impl ZeroCadApp {
                 target,
             },
         });
-        self.graph.add_dependency(&op.profile_sketch, &id);
-        self.graph.add_dependency(&path_sketch, &id);
+        self.document.add_dependency(&op.profile_sketch, &id);
+        self.document.add_dependency(&path_sketch, &id);
         self.hidden_nodes.insert(op.profile_sketch.clone());
         self.selected_faces.clear();
         self.selected_node_id = Some(id);

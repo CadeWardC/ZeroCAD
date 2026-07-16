@@ -11,8 +11,7 @@
 //!
 //! The narrative regressions (`repro_circular_bite`, `repro_cylinder`,
 //! `repro_screenshots`) stay as-is; this is the breadth gate that drives the
-//! robustness phases. Cases that fail today are `#[ignore]`d with a reason and
-//! flipped on as each phase lands.
+//! robustness phases. Every Phase 3 case runs in the ordinary test suite.
 
 use openrcad_algo::{boolean_checked, boolean_checked_bodies, BooleanError, BooleanOp};
 use openrcad_foundation::{Ax2, Dir, Pnt};
@@ -23,8 +22,8 @@ use openrcad_topo::Solid;
 // ---- shared assertions -----------------------------------------------------
 
 /// Run the boolean and assert the result is structurally sound: watertight and
-/// healthy. `health_report` already validates Euler–Poincaré consistency
-/// (`SuspiciousEulerCharacteristic`), correctly accounting for ring-bearing
+/// healthy. `health_report` already validates Euler–Poincaré consistency,
+/// correctly accounting for ring-bearing
 /// faces — a boss or blind pocket leaves an annular face whose proper Euler
 /// value is `V−E+F = 2 + rings`, so a blanket `== 2` would wrongly reject valid
 /// holed bodies. Each connected body must also be watertight on its own.
@@ -139,6 +138,40 @@ fn cyl_cut_through_drill() {
 }
 
 #[test]
+fn cyl_cut_scaled_through_hole_regression() {
+    // Exact kernel property-corpus regression. The cylinder is centered on the
+    // XY cross-section, aligned with +Z, and extends one unit
+    // beyond both box faces. This scale/radius combination previously left one
+    // circular boundary with three uses (a non-manifold edge).
+    // Keep the source values as `f32`: ZeroCAD feature parameters are `f32`,
+    // and the exact rounded product is part of this regression.
+    let width = 63.78_f32;
+    let depth = 66.26_f32;
+    let height = 23.47_f32;
+    let radius_ratio = 0.2585_f32;
+    let radius = width.min(depth) * radius_ratio;
+    let block = make_box(&Pnt::origin(), width as f64, depth as f64, height as f64);
+    let drill = make_cylinder(
+        &Ax2::new(
+            Pnt::new((width * 0.5) as f64, (depth * 0.5) as f64, -1.0),
+            Dir::dz(),
+        ),
+        radius as f64,
+        (height + 2.0) as f64,
+    );
+
+    let result = assert_sound(
+        "scaled-through-hole",
+        boolean_checked(&block, &drill, BooleanOp::Cut),
+    );
+    assert!(
+        analytic_cylinder_count(&result, radius as f64, Dir::dz()) > 0,
+        "scaled through-hole must preserve an analytic cylindrical wall"
+    );
+    assert_deterministic("scaled-through-hole", &block, &drill, BooleanOp::Cut);
+}
+
+#[test]
 fn cyl_cut_blind_pocket() {
     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
     let blind = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 5.0), Dir::dz()), 3.0, 8.0);
@@ -149,6 +182,20 @@ fn cyl_cut_blind_pocket() {
     assert!(
         analytic_cylinder_count(&s, 3.0, Dir::dz()) > 0,
         "blind pocket must keep an analytic cylindrical wall"
+    );
+}
+
+#[test]
+fn cyl_cut_blind_pocket_with_flush_tool_cap() {
+    let block = make_box(&Pnt::origin(), 40.0, 20.0, 10.0);
+    let blind = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 4.0), Dir::dz()), 4.0, 6.0);
+    let s = assert_sound(
+        "blind-pocket-flush-tool-cap",
+        boolean_checked(&block, &blind, BooleanOp::Cut),
+    );
+    assert!(
+        analytic_cylinder_count(&s, 4.0, Dir::dz()) > 0,
+        "a cutter cap coincident with the block top must leave one analytic pocket wall"
     );
 }
 
@@ -256,16 +303,6 @@ fn coaxial_recut_existing_hole() {
 }
 
 #[test]
-#[ignore = "engulfed-fragment removal on a periodic wall. Diagnosis (2026-07-05): \
-            the drilled block's bore wall is 3 cylinder thirds; the counterbore's \
-            flat bottom (z=7) correctly imprints the r=2 circle as its inner \
-            annulus, but the bore-wall thirds ABOVE z=7 (r=2, engulfed by the r=4 \
-            counterbore volume) are NOT classified out — so each of the 3 arcs at \
-            z=7 is shared 3x (cap annulus + lower wall + un-removed upper fragment) \
-            → Euler 4, 3 non-manifold edges. Fixing it robustly is a split+classify \
-            interaction in the boolean core (high blast radius on fillet/blend \
-            tests). ZeroCAD's Hole feature avoids it by cutting the head BEFORE the \
-            bore (also the natural machining order); see apply_hole's ordering note."]
 fn blind_counterbore_over_through_bore() {
     // A block with a narrow through-bore, then a WIDE BLIND counterbore cut
     // from the top: its flat bottom sits inside the block. That bottom cap

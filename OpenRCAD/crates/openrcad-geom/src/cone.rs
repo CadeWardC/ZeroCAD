@@ -93,7 +93,11 @@ impl Surface for ConicalSurface {
     }
 
     fn transformed(&self, t: &Trsf) -> Self {
-        Self::new(self.pos.transformed(t), self.radius, self.semi_angle)
+        Self::new(
+            self.pos.transformed(t),
+            self.radius * t.scale_factor().abs(),
+            self.semi_angle,
+        )
     }
 }
 

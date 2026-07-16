@@ -41,26 +41,26 @@ fn phase2_production_code_uses_the_semantic_document_apis() {
 
     assert!(
         violations.is_empty(),
-        "Phase 2 production paths must use read_document/write_document APIs; legacy wrappers are reserved for frozen compatibility tests and benchmarks:\n{}",
+        "production paths must use read_document/write_document APIs:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn phase2_body_evaluation_has_one_registry_dispatch_boundary() {
-    let eval =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/parametric/eval.rs"))
-            .expect("evaluator source must be readable");
+fn phase3_body_evaluation_has_one_exact_registry_transaction_boundary() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let eval = fs::read_to_string(root.join("src/parametric/eval.rs"))
+        .expect("evaluator source must be readable");
     assert_eq!(
         eval.matches("match &node.feature {").count(),
-        1,
-        "feature-specific dispatch must stay isolated in invoke_registered_feature"
+        0,
+        "registry dispatch must not regress to one central FeatureType family match"
     );
-    let invoke = eval
-        .find("fn invoke_registered_feature(")
-        .expect("registry-driven invocation boundary");
-    let feature_match = eval.find("match &node.feature {").unwrap();
-    assert!(feature_match > invoke);
+    assert_eq!(
+        eval.matches("match evaluator {").count(),
+        1,
+        "exact registered evaluator dispatch must remain isolated"
+    );
     for stage in [
         "resolve_feature_evaluator(node)",
         "let mut candidate_live = live.clone()",
@@ -71,6 +71,119 @@ fn phase2_body_evaluation_has_one_registry_dispatch_boundary() {
         assert!(
             eval.contains(stage),
             "shared evaluator stage missing: {stage}"
+        );
+    }
+
+    let module = fs::read_to_string(root.join("src/parametric/mod.rs"))
+        .expect("parametric module must be readable");
+    assert!(module.contains("fn apply_new(live: &mut Vec<LiveBody>, body: LiveBody)"));
+    for file in ["eval.rs", "join.rs", "cut.rs"] {
+        let source = fs::read_to_string(root.join("src/parametric").join(file))
+            .expect("body operation source must be readable");
+        assert!(
+            !source.contains("live.push(LiveBody {"),
+            "{file} bypasses the shared New-body operation"
+        );
+    }
+}
+
+#[test]
+fn phase3_closes_the_document_deviation_ledger_and_keeps_guards() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("zerocad-core must be inside the workspace");
+    let ledger = fs::read_to_string(workspace.join("docs/phase2-document-architecture.md"))
+        .expect("document architecture ledger must be readable");
+    for debt in ["P2-D1", "P2-D2", "P2-D3", "P2-D4"] {
+        assert_eq!(
+            ledger.matches(debt).count(),
+            1,
+            "closed Phase 2 deviation must have exactly one ledger entry: {debt}"
+        );
+    }
+    assert_eq!(ledger.matches("**Phase 3 closure:**").count(), 4);
+    assert!(
+        !ledger.contains("**Phase 3 removal gate:**"),
+        "closed Phase 2 debt must not retain an open Phase 3 gate"
+    );
+
+    let document =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/document.rs"))
+            .expect("document model source must be readable");
+    for contract in [
+        "pub struct Document {",
+        "runtime: ParametricGraph",
+        "pub fn evaluator_graph(&self)",
+        "pub fn evaluator_graph_mut(&mut self)",
+    ] {
+        assert!(
+            document.contains(contract),
+            "Document ownership contract missing: {contract}"
+        );
+    }
+
+    let types =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/parametric/types.rs"))
+            .expect("feature record source must be readable");
+    for field in [
+        "pub struct FeatureRecord",
+        "pub kind_id:",
+        "pub payload_version:",
+        "pub sequence:",
+        "pub inputs:",
+        "pub state:",
+        "pub body:",
+    ] {
+        assert!(
+            types.contains(field),
+            "authoritative feature field missing: {field}"
+        );
+    }
+
+    let eval =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/parametric/eval.rs"))
+            .expect("evaluator source must be readable");
+    for guard in [
+        "feature_inputs_for_runtime",
+        "runtime body ownership disagrees",
+        "must appear exactly once in body",
+        "semantics.body_outputs",
+        "ensure_body_output_reference",
+    ] {
+        assert!(
+            eval.contains(guard),
+            "semantic integrity guard missing: {guard}"
+        );
+    }
+
+    let format =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/zcad_format.rs"))
+            .expect("document decoder source must be readable");
+    let canonical_tail = format
+        .split("graph.semantics.bodies = body_records;")
+        .nth(1)
+        .expect("canonical body-record installation boundary");
+    let validation = canonical_tail
+        .find("validate_semantic_contracts")
+        .expect("canonical semantic validation");
+    let recovery = canonical_tail
+        .find("rebuild_node_map")
+        .expect("legacy node-map recovery boundary");
+    assert!(
+        validation < recovery,
+        "canonical documents must be validated before legacy recovery"
+    );
+
+    for gui_file in [
+        "src/main.rs",
+        "src/document_worker.rs",
+        "src/evaluation_worker.rs",
+    ] {
+        let source = fs::read_to_string(workspace.join("zerocad-gui").join(gui_file))
+            .expect("GUI document owner source must be readable");
+        assert!(
+            source.contains("document: Document"),
+            "{gui_file} must be rooted in Document"
         );
     }
 }

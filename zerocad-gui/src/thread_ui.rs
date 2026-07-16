@@ -350,7 +350,7 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("thread_{n}");
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Thread {n} ({designation})"),
             feature: FeatureType::Thread {
@@ -367,7 +367,7 @@ impl ZeroCadApp {
                 designation,
             },
         });
-        self.graph.add_dependency(&op.target, &id);
+        self.document.add_dependency(&op.target, &id);
         self.selected_body.clear();
         self.selected_node_id = Some(id);
         self.thread_op = None;

@@ -24,6 +24,23 @@ pub(crate) struct KernelOutcome {
     pub history: TopologyHistory,
 }
 
+/// Canonical connected boolean results plus face lineage local to each solid.
+#[must_use]
+pub(crate) struct KernelBooleanBodiesOutcome {
+    pub bodies: Vec<Solid>,
+    pub face_history: Vec<BooleanFaceHistory>,
+}
+
+/// Canonical two-sided planar split consumed at ZeroCAD's single kernel
+/// outcome boundary.
+#[must_use]
+pub(crate) struct KernelPlaneSplitOutcome {
+    pub negative: Vec<Solid>,
+    pub positive: Vec<Solid>,
+    pub negative_face_history: Vec<BooleanFaceHistory>,
+    pub positive_face_history: Vec<BooleanFaceHistory>,
+}
+
 impl KernelOutcome {
     /// Translate shared topology lineage into ZeroCAD's current face naming map.
     pub fn boolean_face_history(&self) -> BooleanFaceHistory {
@@ -57,7 +74,156 @@ pub(crate) fn consume_operation<E: Display>(
         ));
     }
 
-    for diagnostic in result.diagnostics {
+    record_kernel_metadata(operation, result.diagnostics, result.recovery);
+
+    Ok(KernelOutcome {
+        solid: result.value,
+        history: result.history,
+    })
+}
+
+/// Wrap a validated local unary builder in the same canonical result contract
+/// used by OpenRCAD entry points. ZeroCAD still owns a few domain-specific
+/// constructors (notably modeled threads), but they must not bypass history or
+/// representation validation at the evaluator boundary.
+pub(crate) fn consume_local_unary_operation(
+    operation: &str,
+    input: &Solid,
+    value: Solid,
+    policy: &openrcad::foundation::TolerancePolicy,
+) -> Result<KernelOutcome, String> {
+    let (value, reconstructed) = value
+        .repair_pcurves(policy)
+        .map_err(|error| format!("{operation}: pcurve construction failed: {error}"))?;
+    let validation = openrcad::topo::ValidationReport::for_solid(&value, policy);
+    let mut recovery = openrcad::topo::RecoveryReport::default();
+    if reconstructed > 0 {
+        recovery
+            .actions
+            .push(openrcad::topo::RecoveryAction::ReconstructPcurves {
+                count: reconstructed,
+            });
+    }
+    consume_operation::<String>(
+        operation,
+        Ok(OperationResult {
+            history: TopologyHistory::conservative_unary(input, &value),
+            value,
+            diagnostics: Vec::new(),
+            recovery,
+            validation,
+        }),
+    )
+}
+
+/// Consume a canonical multi-body boolean result at the same application
+/// boundary used by every single-solid operation.
+pub(crate) fn consume_boolean_bodies_operation<E: Display>(
+    operation: &str,
+    result: Result<OperationResult<openrcad::algo::BooleanBodies>, E>,
+) -> Result<KernelBooleanBodiesOutcome, String> {
+    let result = result.map_err(|error| format!("{operation}: {error}"))?;
+    if !result.validation.is_valid() {
+        return Err(format!(
+            "{operation}: kernel returned invalid connected results ({:?})",
+            result.validation
+        ));
+    }
+    if result.value.bodies.is_empty()
+        || result.value.bodies.len() != result.value.face_history.len()
+        || result
+            .value
+            .bodies
+            .iter()
+            .zip(&result.value.face_history)
+            .any(|(body, history)| history.face_source.len() != body.face_count())
+    {
+        return Err(format!(
+            "{operation}: kernel returned incomplete per-body face history"
+        ));
+    }
+    result
+        .history
+        .validate()
+        .map_err(|error| format!("{operation}: invalid topology history: {error}"))?;
+    record_kernel_metadata(operation, result.diagnostics, result.recovery);
+    Ok(KernelBooleanBodiesOutcome {
+        bodies: result.value.bodies,
+        face_history: result.value.face_history,
+    })
+}
+
+pub(crate) fn consume_plane_split_operation<E: Display>(
+    operation: &str,
+    result: Result<OperationResult<openrcad::algo::PlaneSplitBodies>, E>,
+) -> Result<KernelPlaneSplitOutcome, String> {
+    let result = result.map_err(|error| format!("{operation}: {error}"))?;
+    if !result.validation.is_valid() {
+        return Err(format!(
+            "{operation}: kernel returned invalid split results ({:?})",
+            result.validation
+        ));
+    }
+    let all = result
+        .value
+        .negative
+        .iter()
+        .chain(&result.value.positive)
+        .cloned()
+        .collect::<Vec<_>>();
+    if result.value.negative.is_empty()
+        || result.value.positive.is_empty()
+        || result.value.negative.len() != result.value.negative_face_history.len()
+        || result.value.positive.len() != result.value.positive_face_history.len()
+    {
+        return Err(format!(
+            "{operation}: kernel returned an incomplete two-sided split"
+        ));
+    }
+    let histories_complete = result
+        .value
+        .negative
+        .iter()
+        .zip(&result.value.negative_face_history)
+        .chain(
+            result
+                .value
+                .positive
+                .iter()
+                .zip(&result.value.positive_face_history),
+        )
+        .all(|(solid, history)| solid.face_count() == history.face_source.len());
+    if !histories_complete {
+        return Err(format!(
+            "{operation}: kernel returned incomplete per-body face history"
+        ));
+    }
+    result
+        .history
+        .validate()
+        .map_err(|error| format!("{operation}: invalid topology history: {error}"))?;
+    let coverage = result.history.coverage_for_solids(&all);
+    if !coverage.is_complete() {
+        return Err(format!(
+            "{operation}: topology history omitted result entities: {:?}",
+            coverage.missing_results
+        ));
+    }
+    record_kernel_metadata(operation, result.diagnostics, result.recovery);
+    Ok(KernelPlaneSplitOutcome {
+        negative: result.value.negative,
+        positive: result.value.positive,
+        negative_face_history: result.value.negative_face_history,
+        positive_face_history: result.value.positive_face_history,
+    })
+}
+
+fn record_kernel_metadata(
+    operation: &str,
+    diagnostics: Vec<openrcad::topo::Diagnostic>,
+    recovery: openrcad::topo::RecoveryReport,
+) {
+    for diagnostic in diagnostics {
         let severity = match diagnostic.severity {
             KernelSeverity::Info => DiagnosticSeverity::Info,
             KernelSeverity::Warning => DiagnosticSeverity::Warning,
@@ -72,7 +238,7 @@ pub(crate) fn consume_operation<E: Display>(
             message: diagnostic.message,
         });
     }
-    for action in result.recovery.actions {
+    for action in recovery.actions {
         record_diagnostic(EvaluationDiagnostic {
             feature_id: active_feature(),
             operation: operation.to_string(),
@@ -82,11 +248,6 @@ pub(crate) fn consume_operation<E: Display>(
             message: format!("OpenRCAD applied recovery: {action:?}"),
         });
     }
-
-    Ok(KernelOutcome {
-        solid: result.value,
-        history: result.history,
-    })
 }
 
 pub(crate) fn set_feature_context(feature_id: Option<&str>) {

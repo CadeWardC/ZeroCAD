@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{
-    detect_regions, CoordinateSystem, CornerKind, CornerMod, Dimension, EdgeRef, ExtrudeMode,
-    FeatureNode, FeatureType, LineSegment, MockMesh, ParametricGraph, Region, SketchCurves,
+    detect_regions, CoordinateSystem, CornerKind, CornerMod, Dimension, Document, EdgeRef,
+    ExtrudeMode, FeatureNode, FeatureType, LineSegment, MockMesh, Region, SketchCurves,
     SketchPlane, SketchShape, Unit, Variable, Vec3,
 };
 
@@ -27,6 +27,7 @@ mod icons;
 mod loft_sweep_ui;
 mod move_ui;
 mod pattern_ui;
+mod phase35_ui;
 mod render;
 mod revolve_ui;
 mod settings;
@@ -45,6 +46,7 @@ use hole_ui::HoleOp;
 use loft_sweep_ui::SweepOp;
 use move_ui::{BodyClipboard, MoveOp};
 use pattern_ui::PatternOp;
+use phase35_ui::{ScaleBodyOp, SplitBodyOp};
 use revolve_ui::RevolveOp;
 use shell_ui::ShellOp;
 use shortcuts::{Keymap, ShortcutAction};
@@ -494,8 +496,7 @@ type SharedBodyMeshes = std::sync::Arc<Vec<(String, MockMesh)>>;
 
 #[derive(Debug, Clone)]
 struct UndoSnapshot {
-    graph: zerocad_core::ParametricGraph,
-    hidden_nodes: HashSet<String>,
+    document: Document,
 }
 
 struct PendingSave {
@@ -527,7 +528,9 @@ pub(crate) struct PendingCommitVisual {
 
 struct ZeroCadApp {
     pending_visual: Option<PendingCommitVisual>,
-    graph: ParametricGraph,
+    /// Authoritative editable project. The runtime graph is an evaluator
+    /// projection owned by this document rather than the application root.
+    document: Document,
     selected_node_id: Option<String>,
     /// One mesh per solid body (node id + mesh), so faces/edges/points can be
     /// picked per body. Replaces the old single combined `current_mesh`.
@@ -744,6 +747,10 @@ struct ZeroCadApp {
     move_op: Option<MoveOp>,
     /// Active two-body Join/Cut dialog.
     combine_op: Option<CombineOp>,
+    /// Active planar split dialog.
+    split_body_op: Option<SplitBodyOp>,
+    /// Active positive uniform scale dialog.
+    scale_body_op: Option<ScaleBodyOp>,
     /// Cheap translated body-set preview shared by CPU and GPU renderers.
     move_preview_bodies: Option<SharedBodyMeshes>,
     /// Depth used by the Extrude action.

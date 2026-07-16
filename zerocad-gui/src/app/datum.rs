@@ -34,19 +34,19 @@ impl ZeroCadApp {
     }
 
     fn resolved_datums(&self) -> Vec<(String, String, DatumValue)> {
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         let mut warnings = Vec::new();
-        let datums = self.graph.resolve_datums(&vars, &mut warnings);
+        let datums = self.document.resolve_datums(&vars, &mut warnings);
         datums
             .into_iter()
             .filter(|(id, _)| !self.hidden_nodes.contains(id))
             .map(|(id, v)| {
                 let name = self
-                    .graph
+                    .document
                     .graph
                     .node_indices()
-                    .find(|&i| self.graph.graph[i].id == id)
-                    .map(|i| self.graph.graph[i].name.clone())
+                    .find(|&i| self.document.graph[i].id == id)
+                    .map(|i| self.document.graph[i].name.clone())
                     .unwrap_or_else(|| id.clone());
                 (id, name, v)
             })
@@ -131,7 +131,7 @@ impl ZeroCadApp {
                 },
             ),
         };
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: name.clone(),
             feature,

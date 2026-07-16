@@ -1,4 +1,4 @@
-//! Two-body Combine UI: strict Join or target/tool Cut.
+//! Two-body Combine UI: strict Join, Cut, or Intersect.
 
 use crate::*;
 
@@ -6,6 +6,7 @@ use crate::*;
 pub(crate) enum CombineMode {
     Join,
     Cut,
+    Intersect,
 }
 
 #[derive(Debug, Clone)]
@@ -55,12 +56,12 @@ impl ZeroCadApp {
     }
 
     fn combine_body_label(&self, id: &str) -> String {
-        let owner_id = zerocad_core::body_output_owner_id(id);
-        self.graph
+        let owner_id = self.document.body_producer_feature_id(id).unwrap_or(id);
+        self.document
             .graph
             .node_indices()
             .find_map(|index| {
-                let node = &self.graph.graph[index];
+                let node = &self.document.graph[index];
                 (node.id == owner_id)
                     .then(|| format!("{} ({id})", body_output_label(&node.name, id)))
             })
@@ -93,6 +94,7 @@ impl ZeroCadApp {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut next.mode, CombineMode::Join, "Join");
                         ui.selectable_value(&mut next.mode, CombineMode::Cut, "Cut");
+                        ui.selectable_value(&mut next.mode, CombineMode::Intersect, "Intersect");
                     });
                     ui.separator();
                     match next.mode {
@@ -107,18 +109,37 @@ impl ZeroCadApp {
                             ui.label(&labels[0]);
                             ui.label(&labels[1]);
                         }
-                        CombineMode::Cut => {
+                        CombineMode::Cut | CombineMode::Intersect => {
                             let tool_index = 1 - next.target_index;
                             ui.label(format!("Target: {}", labels[next.target_index]));
-                            ui.label(format!("Cutting body: {}", labels[tool_index]));
-                            if ui.button("Swap target and cutting body").clicked() {
+                            ui.label(format!(
+                                "{}: {}",
+                                if next.mode == CombineMode::Cut {
+                                    "Cutting body"
+                                } else {
+                                    "Intersecting body"
+                                },
+                                labels[tool_index]
+                            ));
+                            if ui.button("Swap target and tool body").clicked() {
                                 next.target_index = tool_index;
                             }
-                            ui.checkbox(&mut next.keep_tool, "Keep cutting body after cut");
+                            ui.checkbox(
+                                &mut next.keep_tool,
+                                if next.mode == CombineMode::Cut {
+                                    "Keep cutting body after cut"
+                                } else {
+                                    "Keep tool body after intersect"
+                                },
+                            );
                             ui.label(
-                                egui::RichText::new("The bodies must overlap.")
-                                    .size(11.0)
-                                    .color(self.pal().text_muted),
+                                egui::RichText::new(if next.mode == CombineMode::Cut {
+                                    "The bodies must overlap."
+                                } else {
+                                    "Only their positive overlapping volume is kept."
+                                })
+                                .size(11.0)
+                                .color(self.pal().text_muted),
                             );
                         }
                     }
@@ -168,14 +189,27 @@ impl ZeroCadApp {
                     },
                 )
             }
+            CombineMode::Intersect => {
+                let target = op.bodies[op.target_index].clone();
+                let tool = op.bodies[1 - op.target_index].clone();
+                (
+                    format!("intersect_bodies_{n}"),
+                    self.next_body_intersect_name(),
+                    FeatureType::BodyIntersect {
+                        target,
+                        tool,
+                        keep_tool: op.keep_tool,
+                    },
+                )
+            }
         };
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name,
             feature,
         });
         for source in &op.bodies {
-            self.graph.add_dependency(source, &id);
+            self.document.add_dependency(source, &id);
         }
         self.combine_op = None;
         self.selected_body.clear();
@@ -185,6 +219,7 @@ impl ZeroCadApp {
         self.status_msg = match op.mode {
             CombineMode::Join => "Join created. Bodies must touch or overlap.",
             CombineMode::Cut => "Cut created. Bodies must overlap.",
+            CombineMode::Intersect => "Intersect created. Only shared volume is kept.",
         }
         .to_string();
     }
@@ -216,7 +251,7 @@ mod tests {
     fn cut_commit_preserves_target_tool_order_and_keep_option() {
         let mut app = ZeroCadApp::new();
         for (id, name) in [("body_a", "A"), ("body_b", "B")] {
-            app.graph.add_feature(FeatureNode {
+            app.document.add_feature(FeatureNode {
                 id: id.to_string(),
                 name: name.to_string(),
                 feature: FeatureType::Box {
@@ -234,10 +269,10 @@ mod tests {
         });
 
         let feature = app
-            .graph
+            .document
             .graph
             .node_indices()
-            .find_map(|index| match &app.graph.graph[index].feature {
+            .find_map(|index| match &app.document.graph[index].feature {
                 FeatureType::BodyCut {
                     target,
                     tool,
@@ -249,5 +284,56 @@ mod tests {
         assert_eq!(feature.0, "body_b");
         assert_eq!(feature.1, "body_a");
         assert!(*feature.2);
+    }
+
+    #[test]
+    fn intersect_commit_preserves_target_tool_order_and_keep_option() {
+        let mut app = ZeroCadApp::new();
+        for (id, name) in [("body_a", "A"), ("body_b", "B")] {
+            app.document.add_feature(FeatureNode {
+                id: id.to_string(),
+                name: name.to_string(),
+                feature: FeatureType::Box {
+                    w: 10.0,
+                    h: 10.0,
+                    d: 10.0,
+                },
+            });
+        }
+        app.commit_combine(CombineOp {
+            bodies: ["body_a".to_string(), "body_b".to_string()],
+            mode: CombineMode::Intersect,
+            target_index: 1,
+            keep_tool: true,
+        });
+        let feature = app
+            .document
+            .graph
+            .node_indices()
+            .find_map(|index| match &app.document.graph[index].feature {
+                FeatureType::BodyIntersect {
+                    target,
+                    tool,
+                    keep_tool,
+                } => Some((target, tool, keep_tool)),
+                _ => None,
+            })
+            .expect("BodyIntersect feature");
+        assert_eq!(feature.0, "body_b");
+        assert_eq!(feature.1, "body_a");
+        assert!(*feature.2);
+
+        app.undo();
+        assert!(!app
+            .document
+            .graph
+            .node_weights()
+            .any(|node| matches!(node.feature, FeatureType::BodyIntersect { .. })));
+        app.redo();
+        assert!(app
+            .document
+            .graph
+            .node_weights()
+            .any(|node| matches!(node.feature, FeatureType::BodyIntersect { .. })));
     }
 }

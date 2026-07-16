@@ -54,44 +54,186 @@ impl ParametricGraph {
 
     /// Add base coordinate system planes
     fn bootstrap_origin(&mut self) {
-        let origin = FeatureNode {
-            id: "origin".to_string(),
-            name: "Base Origin".to_string(),
-            feature: FeatureType::Origin,
-        };
-        let idx = self.graph.add_node(origin);
-        self.node_map.insert("origin".to_string(), idx);
-        self.semantics.register(
-            "origin",
-            "Base Origin",
-            &FeatureType::Origin,
+        let origin = FeatureRecord::from_node(
+            FeatureNode {
+                id: "origin".to_string(),
+                name: "Base Origin".to_string(),
+                feature: FeatureType::Origin,
+            },
             crate::document::SequenceKey(0),
         );
+        let idx = self.graph.add_node(origin);
+        self.node_map.insert("origin".to_string(), idx);
+    }
+
+    fn next_sequence(&self) -> crate::document::SequenceKey {
+        crate::document::SequenceKey(
+            self.graph
+                .node_weights()
+                .map(|feature| feature.sequence.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        )
     }
 
     /// Add a feature node to the tree
     pub fn add_feature(&mut self, node: FeatureNode) -> NodeIndex {
         let id = node.id.clone();
-        let sequence = self.semantics.next_sequence();
-        self.semantics
-            .register(&node.id, &node.name, &node.feature, sequence);
-        let idx = self.graph.add_node(node);
+        for input in crate::document::FeatureRegistry::dependencies(&node.feature) {
+            if let crate::document::FeatureInputTarget::Selection(selector) = input.target {
+                if let Some(body) = selector.topology.body {
+                    self.ensure_body_output_reference(body.as_str());
+                }
+            }
+        }
+        let record = FeatureRecord::from_node(node, self.next_sequence());
+        let body = record.body.clone();
+        let feature_id = crate::document::FeatureId::from(id.as_str());
+        let name = record.name.clone();
+        let idx = self.graph.add_node(record);
         self.node_map.insert(id, idx);
+        if let Some(body_id) = body {
+            self.semantics
+                .body_outputs
+                .insert(body_id.to_string(), feature_id.clone());
+            self.semantics
+                .bodies
+                .entry(body_id.clone())
+                .or_insert_with(|| crate::document::BodyRecord {
+                    id: body_id.clone(),
+                    name,
+                    timeline: Vec::new(),
+                })
+                .timeline
+                .push(feature_id);
+        }
+        // Split has two stable runtime body outputs. Register the second one
+        // when the feature enters the document so provenance and UI grouping
+        // never depend on parsing the `::body:2` spelling.
+        if matches!(self.graph[idx].feature, FeatureType::BodySplit { .. }) {
+            self.semantics.body_outputs.insert(
+                body_output_id(&self.graph[idx].id, 1),
+                crate::document::FeatureId::from(self.graph[idx].id.as_str()),
+            );
+        }
         idx
     }
 
     /// Establish a directional dependency (e.g. Extrude depends on Sketch)
     pub fn add_dependency(&mut self, parent_id: &str, child_id: &str) {
-        // A single New Body feature may emit several independently selectable
-        // runtime bodies. Downstream features target the exact output id, but
-        // the dependency graph still points to the one feature that owns it.
-        let parent_feature_id = body_output_owner_id(parent_id);
+        self.ensure_body_output_reference(parent_id);
+        let parent_feature_id = self.dependency_parent_feature_id(parent_id, child_id);
         if let (Some(parent_idx), Some(child_idx)) = (
-            self.resolve_node(parent_feature_id),
+            self.resolve_node(&parent_feature_id),
             self.resolve_node(child_id),
         ) {
-            self.graph.add_edge(parent_idx, child_idx, ());
-            self.semantics.add_dependency(parent_feature_id, child_id);
+            if self.graph.find_edge(parent_idx, child_idx).is_none() {
+                self.graph.add_edge(parent_idx, child_idx, ());
+            }
+            self.refresh_feature_contract(child_id)
+                .expect("new dependency must preserve the feature contract");
+        }
+    }
+
+    /// Decoder-only dependency insertion. Canonical documents already carry
+    /// their semantic inputs, so loading must build the runtime DAG without
+    /// silently repairing a mismatched semantic record before strict
+    /// validation gets a chance to reject it.
+    pub(crate) fn add_dependency_for_load(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<(), String> {
+        self.ensure_body_output_reference(parent_id);
+        let parent_feature_id = self.dependency_parent_feature_id(parent_id, child_id);
+        let parent_idx = self
+            .resolve_node(&parent_feature_id)
+            .ok_or_else(|| format!("dependency parent '{parent_feature_id}' does not exist"))?;
+        let child_idx = self
+            .resolve_node(child_id)
+            .ok_or_else(|| format!("dependency child '{child_id}' does not exist"))?;
+        if self.graph.find_edge(parent_idx, child_idx).is_some() {
+            return Err(format!(
+                "duplicate dependency '{parent_feature_id}' -> '{child_id}'"
+            ));
+        }
+        self.graph.add_edge(parent_idx, child_idx, ());
+        Ok(())
+    }
+
+    fn dependency_parent_feature_id(&self, parent_id: &str, child_id: &str) -> String {
+        let mapped = self
+            .body_producer_feature_id(parent_id)
+            .unwrap_or(parent_id);
+        if mapped != child_id {
+            return mapped.to_string();
+        }
+        self.semantics
+            .bodies
+            .get(&crate::document::BodyId::from(parent_id))
+            .and_then(|body| {
+                body.timeline
+                    .iter()
+                    .rev()
+                    .find(|feature| feature.as_str() != child_id)
+            })
+            .map(ToString::to_string)
+            .unwrap_or_else(|| parent_id.to_string())
+    }
+
+    /// Resolve a displayed/runtime body id through the semantic output table.
+    /// Callers use this for provenance, UI grouping, and dependency scheduling;
+    /// no production decision depends on the spelling of the id.
+    pub fn body_producer_feature_id(&self, body_id: &str) -> Option<&str> {
+        self.semantics
+            .body_outputs
+            .get(body_id)
+            .map(crate::document::FeatureId::as_str)
+            .or_else(|| {
+                self.graph
+                    .node_weights()
+                    .find(|feature| feature.id == body_id)
+                    .map(|feature| feature.id.as_str())
+            })
+    }
+
+    pub fn semantic_body_id_for_runtime_body(
+        &self,
+        body_id: &str,
+    ) -> Option<crate::document::BodyId> {
+        if let Some((id, _)) = self
+            .semantics
+            .bodies
+            .get_key_value(&crate::document::BodyId::from(body_id))
+        {
+            return Some(id.clone());
+        }
+        let producer = self.body_producer_feature_id(body_id)?;
+        self.graph
+            .node_weights()
+            .find(|feature| feature.id == producer)
+            .and_then(|feature| feature.body.clone())
+    }
+
+    /// Compatibility migration for pre-Phase-3 documents whose extra body
+    /// outputs existed only as `feature::body:N` strings. The relationship is
+    /// parsed once at the edit/load boundary and immediately recorded; all
+    /// subsequent production paths consume `body_outputs`.
+    fn ensure_body_output_reference(&mut self, body_id: &str) {
+        if self.semantics.body_outputs.contains_key(body_id) {
+            return;
+        }
+        let legacy_owner = body_output_owner_id(body_id);
+        if self
+            .graph
+            .node_weights()
+            .any(|feature| feature.id == legacy_owner)
+        {
+            self.semantics.body_outputs.insert(
+                body_id.to_string(),
+                crate::document::FeatureId::from(legacy_owner),
+            );
         }
     }
 
@@ -103,16 +245,14 @@ impl ParametricGraph {
     /// sketch builds no body).
     pub fn rebuild_node_map(&mut self) {
         self.node_map.clear();
-        let records: Vec<(String, String, FeatureType)> = self
+        let live_ids: std::collections::HashSet<String> = self
             .graph
             .node_weights()
-            .map(|node| (node.id.clone(), node.name.clone(), node.feature.clone()))
+            .map(|node| node.id.clone())
             .collect();
-        let live_ids: std::collections::HashSet<&str> =
-            records.iter().map(|(id, _, _)| id.as_str()).collect();
         self.semantics
-            .features
-            .retain(|id, _| live_ids.contains(id.as_str()));
+            .body_outputs
+            .retain(|_, producer| live_ids.contains(producer.as_str()));
         self.semantics.bodies.retain(|_, body| {
             body.timeline
                 .retain(|member| live_ids.contains(member.as_str()));
@@ -120,19 +260,56 @@ impl ParametricGraph {
         });
         for idx in self.graph.node_indices() {
             self.node_map.insert(self.graph[idx].id.clone(), idx);
+            if let Some(body) = &self.graph[idx].body {
+                self.semantics
+                    .body_outputs
+                    .entry(body.to_string())
+                    .or_insert_with(|| {
+                        crate::document::FeatureId::from(self.graph[idx].id.as_str())
+                    });
+            }
         }
-        for (id, name, feature) in records {
-            if !self
-                .semantics
-                .features
-                .contains_key(&crate::document::FeatureId::from(id.as_str()))
-            {
-                let sequence = if id == "origin" {
-                    crate::document::SequenceKey(0)
-                } else {
-                    self.semantics.next_sequence()
+        // Legacy/raw graph snapshots can omit the derived body index entirely.
+        // Rebuild it only when wholly absent; a partial timeline remains an
+        // integrity error instead of being silently normalized.
+        if self.semantics.bodies.is_empty() {
+            let mut records = std::collections::BTreeMap::new();
+            for feature in self.graph.node_weights() {
+                let Some(body_id) = feature.body.clone() else {
+                    continue;
                 };
-                self.semantics.register(&id, &name, &feature, sequence);
+                records
+                    .entry(body_id.clone())
+                    .or_insert_with(|| crate::document::BodyRecord {
+                        id: body_id,
+                        name: feature.name.clone(),
+                        timeline: Vec::new(),
+                    })
+                    .timeline
+                    .push(crate::document::FeatureId::from(feature.id.as_str()));
+            }
+            let sequences: std::collections::HashMap<_, _> = self
+                .graph
+                .node_weights()
+                .map(|feature| {
+                    (
+                        crate::document::FeatureId::from(feature.id.as_str()),
+                        feature.sequence,
+                    )
+                })
+                .collect();
+            for body in records.values_mut() {
+                body.timeline
+                    .sort_by_key(|member| sequences.get(member).copied().unwrap_or_default());
+            }
+            self.semantics.bodies = records;
+        }
+        for body in self.semantics.bodies.values() {
+            if let Some(producer) = body.timeline.last() {
+                self.semantics
+                    .body_outputs
+                    .entry(body.id.to_string())
+                    .or_insert_with(|| producer.clone());
             }
         }
     }
@@ -142,24 +319,65 @@ impl ParametricGraph {
     pub fn validate_semantic_contracts(&self) -> Result<(), String> {
         let mut node_ids = std::collections::HashSet::new();
         for node in self.graph.node_weights() {
-            if !node_ids.insert(node.id.as_str()) {
+            if !node_ids.insert(node.id.clone()) {
                 return Err(format!("duplicate feature id '{}'", node.id));
             }
-            let semantic = self
-                .semantics
-                .features
-                .get(&crate::document::FeatureId::from(node.id.as_str()))
-                .ok_or_else(|| format!("feature '{}' has no semantic contract", node.id))?;
+        }
+        let mut sequences = std::collections::BTreeMap::new();
+        for feature in self.graph.node_weights() {
+            if let Some(previous) = sequences.insert(feature.sequence.0, feature.id.as_str()) {
+                return Err(format!(
+                    "features '{previous}' and '{}' share sequence key {}",
+                    feature.id, feature.sequence.0
+                ));
+            }
+        }
+
+        for idx in self.graph.node_indices() {
+            let node = &self.graph[idx];
             let registration = crate::document::FeatureRegistry::for_feature(&node.feature);
-            if semantic.kind_id.as_str() != registration.kind_id
-                || semantic.payload_version != registration.payload_version
+            if node.kind_id.as_str() != registration.kind_id
+                || node.payload_version != registration.payload_version
             {
                 return Err(format!(
                     "feature '{}' runtime kind/version disagrees with its semantic contract",
                     node.id
                 ));
             }
-            for input in &semantic.inputs {
+
+            let incoming: Vec<String> = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .map(|parent| self.graph[parent].id.clone())
+                .collect();
+            let mut dependency_ids = incoming.clone();
+            dependency_ids.sort();
+            dependency_ids.dedup();
+            if dependency_ids.len() != incoming.len() {
+                return Err(format!(
+                    "feature '{}' has duplicate runtime dependency edges",
+                    node.id
+                ));
+            }
+
+            for (input_index, input) in node.inputs.iter().enumerate() {
+                if node.inputs[input_index + 1..].contains(input) {
+                    return Err(format!(
+                        "feature '{}' repeats semantic input '{}'",
+                        node.id, input.role
+                    ));
+                }
+            }
+            let expected_inputs =
+                crate::document::feature_inputs_for_runtime(&node.feature, &dependency_ids);
+            if node.inputs != expected_inputs {
+                return Err(format!(
+                    "feature '{}' semantic inputs disagree with its payload or dependency DAG",
+                    node.id
+                ));
+            }
+
+            for input in &node.inputs {
                 use crate::document::FeatureInputTarget;
                 let target_id = match &input.target {
                     FeatureInputTarget::Feature(id) => Some(id.as_str()),
@@ -176,11 +394,30 @@ impl ParametricGraph {
                     ));
                 }
             }
+
+            let expected_body = crate::document::body_for_feature(&node.id, &node.feature);
+            if node.body != expected_body {
+                return Err(format!(
+                    "feature '{}' runtime body ownership disagrees with its semantic contract",
+                    node.id
+                ));
+            }
         }
-        if self.semantics.features.len() != node_ids.len() {
-            return Err("semantic document contains feature records with no runtime node".into());
-        }
-        for body in self.semantics.bodies.values() {
+
+        let mut memberships: std::collections::BTreeMap<
+            crate::document::FeatureId,
+            Vec<crate::document::BodyId>,
+        > = std::collections::BTreeMap::new();
+        for (body_id, body) in &self.semantics.bodies {
+            if body_id != &body.id {
+                return Err(format!(
+                    "semantic body map key '{body_id}' disagrees with record id '{}'",
+                    body.id
+                ));
+            }
+            if body.timeline.is_empty() {
+                return Err(format!("body '{}' has an empty timeline", body.id));
+            }
             let mut previous = None;
             let mut members = std::collections::HashSet::new();
             for member in &body.timeline {
@@ -190,9 +427,13 @@ impl ParametricGraph {
                         body.id
                     ));
                 }
-                let feature = self.semantics.features.get(member).ok_or_else(|| {
-                    format!("body '{}' references missing feature '{member}'", body.id)
-                })?;
+                let feature = self
+                    .graph
+                    .node_weights()
+                    .find(|feature| feature.id == member.as_str())
+                    .ok_or_else(|| {
+                        format!("body '{}' references missing feature '{member}'", body.id)
+                    })?;
                 if feature.body.as_ref() != Some(&body.id) {
                     return Err(format!(
                         "feature '{member}' is filed under the wrong body timeline"
@@ -205,6 +446,58 @@ impl ParametricGraph {
                     ));
                 }
                 previous = Some(feature.sequence);
+                memberships
+                    .entry(member.clone())
+                    .or_default()
+                    .push(body.id.clone());
+            }
+        }
+
+        for semantic in self.graph.node_weights() {
+            let feature_id = crate::document::FeatureId::from(semantic.id.as_str());
+            let bodies = memberships
+                .get(&feature_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            match &semantic.body {
+                Some(expected) if bodies.len() == 1 && &bodies[0] == expected => {}
+                Some(expected) => {
+                    return Err(format!(
+                        "feature '{}' must appear exactly once in body '{expected}' timeline",
+                        semantic.id
+                    ));
+                }
+                None if bodies.is_empty() => {}
+                None => {
+                    return Err(format!(
+                        "non-body feature '{}' appears in a body timeline",
+                        semantic.id
+                    ));
+                }
+            }
+        }
+        for (output_id, producer) in &self.semantics.body_outputs {
+            if output_id.is_empty() {
+                return Err("semantic body output has an empty id".to_string());
+            }
+            if !node_ids.contains(producer.as_str()) {
+                return Err(format!(
+                    "body output '{output_id}' references missing producer '{producer}'"
+                ));
+            }
+        }
+        for body in self.semantics.bodies.values() {
+            let Some(actual) = self.semantics.body_outputs.get(body.id.as_str()) else {
+                return Err(format!(
+                    "body '{}' has no recorded output producer",
+                    body.id
+                ));
+            };
+            if !body.timeline.contains(actual) {
+                return Err(format!(
+                    "body '{}' output producer is not a member of its timeline",
+                    body.id
+                ));
             }
         }
         Ok(())
@@ -236,7 +529,14 @@ impl ParametricGraph {
         self.sketch_face_refs.remove(id);
         self.sketch_datum_refs.remove(id);
         self.sketch_face_boundaries.remove(id);
-        self.semantics.remove(id);
+        let feature_id = crate::document::FeatureId::from(id);
+        self.semantics.bodies.retain(|_, body| {
+            body.timeline.retain(|member| member != &feature_id);
+            !body.timeline.is_empty()
+        });
+        self.semantics
+            .body_outputs
+            .retain(|_, producer| producer.as_str() != id);
         self.rebuild_node_map();
         true
     }
@@ -312,9 +612,9 @@ impl ParametricGraph {
     /// Explicit sequence key for one feature. Runtime nodes created before the
     /// semantic contract was introduced are lazily assigned during rebuild.
     pub fn feature_sequence(&self, id: &str) -> Option<crate::document::SequenceKey> {
-        self.semantics
-            .features
-            .get(&crate::document::FeatureId::from(id))
+        self.graph
+            .node_weights()
+            .find(|feature| feature.id == id)
             .map(|feature| feature.sequence)
     }
 
@@ -325,22 +625,27 @@ impl ParametricGraph {
         id: &str,
         sequence: crate::document::SequenceKey,
     ) -> bool {
-        let Some(feature) = self
-            .semantics
-            .features
-            .get_mut(&crate::document::FeatureId::from(id))
+        let Some(idx) = self
+            .graph
+            .node_indices()
+            .find(|&idx| self.graph[idx].id == id)
         else {
             return false;
         };
-        feature.sequence = sequence;
+        self.graph[idx].sequence = sequence;
+        let sequences: std::collections::HashMap<_, _> = self
+            .graph
+            .node_weights()
+            .map(|feature| {
+                (
+                    crate::document::FeatureId::from(feature.id.as_str()),
+                    feature.sequence,
+                )
+            })
+            .collect();
         for body in self.semantics.bodies.values_mut() {
-            body.timeline.sort_by_key(|member| {
-                self.semantics
-                    .features
-                    .get(member)
-                    .map(|feature| feature.sequence)
-                    .unwrap_or_default()
-            });
+            body.timeline
+                .sort_by_key(|member| sequences.get(member).copied().unwrap_or_default());
         }
         self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
         true
@@ -373,32 +678,24 @@ impl ParametricGraph {
             return false;
         };
         let other_id = body.timeline[other_position].clone();
-        let Some(sequence) = self
-            .semantics
-            .features
-            .get(&feature_id)
-            .map(|feature| feature.sequence)
+        let Some(feature_idx) = self
+            .graph
+            .node_indices()
+            .find(|&idx| self.graph[idx].id == feature_id.as_str())
         else {
             return false;
         };
-        let Some(other_sequence) = self
-            .semantics
-            .features
-            .get(&other_id)
-            .map(|feature| feature.sequence)
+        let Some(other_idx) = self
+            .graph
+            .node_indices()
+            .find(|&idx| self.graph[idx].id == other_id.as_str())
         else {
             return false;
         };
-        self.semantics
-            .features
-            .get_mut(&feature_id)
-            .expect("timeline feature vanished")
-            .sequence = other_sequence;
-        self.semantics
-            .features
-            .get_mut(&other_id)
-            .expect("timeline feature vanished")
-            .sequence = sequence;
+        let sequence = self.graph[feature_idx].sequence;
+        let other_sequence = self.graph[other_idx].sequence;
+        self.graph[feature_idx].sequence = other_sequence;
+        self.graph[other_idx].sequence = sequence;
         self.semantics
             .bodies
             .get_mut(&body_id)
@@ -409,19 +706,105 @@ impl ParametricGraph {
         true
     }
 
+    /// Commit an edit to an authoritative feature record. Relationship inputs,
+    /// body ownership, and registry metadata are regenerated on that same
+    /// record; there is no parallel semantic sidecar to synchronize.
+    pub fn commit_feature_edit(&mut self, id: &str) -> Result<(), String> {
+        self.refresh_feature_contract(id)?;
+        self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
+        self.validate_semantic_contracts()
+    }
+
+    fn refresh_feature_contract(&mut self, id: &str) -> Result<(), String> {
+        let idx = self
+            .resolve_node(id)
+            .ok_or_else(|| format!("feature '{id}' does not exist"))?;
+        let feature_id = crate::document::FeatureId::from(id);
+
+        let mut dependency_ids: Vec<String> = self
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .map(|parent| self.graph[parent].id.clone())
+            .collect();
+        dependency_ids.sort();
+        let edge_count = dependency_ids.len();
+        dependency_ids.dedup();
+        if dependency_ids.len() != edge_count {
+            return Err(format!("feature '{id}' has duplicate dependency edges"));
+        }
+
+        let body = crate::document::body_for_feature(id, &self.graph[idx].feature);
+        let inputs =
+            crate::document::feature_inputs_for_runtime(&self.graph[idx].feature, &dependency_ids);
+        let registration = crate::document::FeatureRegistry::for_feature(&self.graph[idx].feature);
+        let name = self.graph[idx].name.clone();
+        self.semantics.bodies.retain(|_, record| {
+            record.timeline.retain(|member| member != &feature_id);
+            !record.timeline.is_empty()
+        });
+        self.graph[idx].kind_id = crate::document::FeatureKindId::from(registration.kind_id);
+        self.graph[idx].payload_version = registration.payload_version;
+        self.graph[idx].inputs = inputs;
+        self.graph[idx].body = body.clone();
+        if let Some(body_id) = body {
+            let record = self
+                .semantics
+                .bodies
+                .entry(body_id.clone())
+                .or_insert_with(|| crate::document::BodyRecord {
+                    id: body_id.clone(),
+                    name,
+                    timeline: Vec::new(),
+                });
+            record.timeline.push(feature_id.clone());
+            let sequences: std::collections::HashMap<_, _> = self
+                .graph
+                .node_weights()
+                .map(|feature| {
+                    (
+                        crate::document::FeatureId::from(feature.id.as_str()),
+                        feature.sequence,
+                    )
+                })
+                .collect();
+            record
+                .timeline
+                .sort_by_key(|member| sequences.get(member).copied().unwrap_or_default());
+            self.semantics
+                .body_outputs
+                .insert(body_id.to_string(), feature_id);
+        }
+        for record in self.semantics.bodies.values() {
+            let output_id = record.id.to_string();
+            let stale = self
+                .semantics
+                .body_outputs
+                .get(&output_id)
+                .is_some_and(|producer| !record.timeline.contains(producer));
+            if stale {
+                if let Some(producer) = record.timeline.last() {
+                    self.semantics
+                        .body_outputs
+                        .insert(output_id, producer.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn feature_state(&self, id: &str) -> Option<crate::document::FeatureState> {
-        self.semantics
-            .features
-            .get(&crate::document::FeatureId::from(id))
+        self.graph
+            .node_weights()
+            .find(|feature| feature.id == id)
             .map(|feature| feature.state)
     }
 
     /// Suppress or resume one feature. This changes evaluation; hiding does not.
     pub fn set_feature_suppressed(&mut self, id: &str, suppressed: bool) -> bool {
-        let Some(feature) = self
-            .semantics
-            .features
-            .get_mut(&crate::document::FeatureId::from(id))
+        let Some(idx) = self
+            .graph
+            .node_indices()
+            .find(|&idx| self.graph[idx].id == id)
         else {
             return false;
         };
@@ -430,10 +813,10 @@ impl ParametricGraph {
         } else {
             crate::document::FeatureState::Active
         };
-        if feature.state == state {
+        if self.graph[idx].state == state {
             return false;
         }
-        feature.state = state;
+        self.graph[idx].state = state;
         self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
         true
     }
@@ -544,7 +927,7 @@ impl ParametricGraph {
             .next()
             .map(|cp| cp.statuses.clone())
             .unwrap_or_default();
-        let bodies = try_tessellate_bodies(visible_live_bodies(live, hidden))?;
+        let bodies = try_tessellate_bodies(self.visible_live_bodies(live, hidden))?;
         Ok((bodies, warnings, statuses))
     }
 
@@ -614,7 +997,7 @@ impl ParametricGraph {
                 .collect();
             let tess_started = std::time::Instant::now();
             let bodies = tessellate_bodies_with_cancel(
-                visible_live_bodies(live, hidden),
+                self.visible_live_bodies(live, hidden),
                 Some(cancellation),
             )?;
             let tessellation = tess_started.elapsed();
@@ -684,7 +1067,7 @@ impl ParametricGraph {
         let run = || -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
             let (live, warnings) = self.build_live(hidden, draft)?;
             Ok((
-                try_tessellate_bodies(visible_live_bodies(live, hidden))?,
+                try_tessellate_bodies(self.visible_live_bodies(live, hidden))?,
                 warnings,
             ))
         };
@@ -918,17 +1301,12 @@ impl ParametricGraph {
     /// outer pipeline; feature-specific code is isolated here.
     fn resolve_feature_evaluator(
         &self,
-        node: &FeatureNode,
+        node: &FeatureRecord,
     ) -> Result<crate::document::FeatureEvaluatorKind, String> {
-        let semantic = self
-            .semantics
-            .features
-            .get(&crate::document::FeatureId::from(node.id.as_str()))
-            .ok_or_else(|| "missing semantic feature contract".to_string())?;
-        let registration = crate::document::FeatureRegistry::get(semantic.kind_id.as_str())
-            .ok_or_else(|| format!("unregistered feature kind '{}'", semantic.kind_id))?;
+        let registration = crate::document::FeatureRegistry::get(node.kind_id.as_str())
+            .ok_or_else(|| format!("unregistered feature kind '{}'", node.kind_id))?;
         if registration.kind_id != node.feature.kind_id()
-            || registration.payload_version != semantic.payload_version
+            || registration.payload_version != node.payload_version
         {
             return Err("runtime feature disagrees with its registered semantic contract".into());
         }
@@ -948,45 +1326,18 @@ impl ParametricGraph {
         warnings: &mut Vec<String>,
     ) -> Result<(), String> {
         let node = &self.graph[idx];
-        let supported = match evaluator {
-            crate::document::FeatureEvaluatorKind::Primitive => {
-                matches!(
-                    node.feature,
-                    FeatureType::Box { .. } | FeatureType::Cylinder { .. }
-                )
-            }
-            crate::document::FeatureEvaluatorKind::Exchange => {
-                matches!(node.feature, FeatureType::Import { .. })
-            }
-            crate::document::FeatureEvaluatorKind::BodyOperation => matches!(
-                node.feature,
-                FeatureType::Extrude { .. }
-                    | FeatureType::Revolve { .. }
-                    | FeatureType::Pattern { .. }
-                    | FeatureType::BodyTransform { .. }
-                    | FeatureType::BodyJoin { .. }
-                    | FeatureType::BodyCut { .. }
-                    | FeatureType::Thread { .. }
-                    | FeatureType::Loft { .. }
-                    | FeatureType::Sweep { .. }
-                    | FeatureType::Shell { .. }
-                    | FeatureType::Hole { .. }
-                    | FeatureType::EdgeMod { .. }
-            ),
-            crate::document::FeatureEvaluatorKind::Infrastructure
-            | crate::document::FeatureEvaluatorKind::Sketch
-            | crate::document::FeatureEvaluatorKind::Datum => false,
-        };
-        if !supported {
-            return Err(format!(
-                "registry evaluator {:?} cannot invoke feature kind '{}'",
-                evaluator,
+        let payload_mismatch = || {
+            format!(
+                "registry evaluator {evaluator:?} cannot invoke feature kind '{}'",
                 node.feature.kind_id()
-            ));
-        }
+            )
+        };
 
-        match &node.feature {
-            FeatureType::Box { w, h, d } => {
+        match evaluator {
+            crate::document::FeatureEvaluatorKind::Box => {
+                let FeatureType::Box { w, h, d } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
                 let source = SketchExtrudeSource {
                     regions: vec![SketchExtrudeRegionSource {
                         boundary: vec![(0.0, 0.0), (*w, 0.0), (*w, *h), (0.0, *h)],
@@ -1010,18 +1361,20 @@ impl ParametricGraph {
                     .unwrap_or_else(|| MockMesh::make_box(*w, *h, *d));
                 stamp_box_face_refs(&mut pristine, &node.id);
                 crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
-                live.push(LiveBody {
-                    id: node.id.clone(),
-                    parts: vec![solid],
-                    pristine: Some(pristine.into()),
-                    sketch_source: Some(source),
-                    cut_tools: Vec::new(),
-                    cut_replay: None,
-                    edge_mod_cut_history_path_used: false,
-                    thread_replay: None,
-                });
+                apply_new(
+                    live,
+                    LiveBody {
+                        id: node.id.clone(),
+                        parts: vec![solid],
+                        pristine: Some(pristine.into()),
+                        sketch_source: Some(source),
+                    },
+                );
             }
-            FeatureType::Cylinder { r, h } => {
+            crate::document::FeatureEvaluatorKind::Cylinder => {
+                let FeatureType::Cylinder { r, h } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
                 if let Some(solid) = crate::mock_kernel::cylinder_solid(*r, *h) {
                     // Display derives from the part (single source of truth); the
                     // analytic make_cylinder mesh is the cracked-mesh fallback.
@@ -1029,22 +1382,28 @@ impl ParametricGraph {
                         .unwrap_or_else(|| MockMesh::make_cylinder(*r, *h, 32));
                     stamp_cylinder_face_refs(&mut pristine, &node.id);
                     crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
-                    live.push(LiveBody {
-                        id: node.id.clone(),
-                        parts: vec![solid],
-                        pristine: Some(pristine.into()),
-                        sketch_source: None,
-                        cut_tools: Vec::new(),
-                        cut_replay: None,
-                        edge_mod_cut_history_path_used: false,
-                        thread_replay: None,
-                    });
+                    apply_new(
+                        live,
+                        LiveBody {
+                            id: node.id.clone(),
+                            parts: vec![solid],
+                            pristine: Some(pristine.into()),
+                            sketch_source: None,
+                        },
+                    );
                 }
             }
-            FeatureType::Import { step_data, label } => {
+            crate::document::FeatureEvaluatorKind::Import => {
+                let FeatureType::Import { step_data, label } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
                 match crate::mock_kernel::consume_operation(
                     "STEP import",
-                    openrcad::exchange::read_step_str_operation(step_data),
+                    openrcad::exchange::read_step_str_operation_with_policy_and_options(
+                        step_data,
+                        &openrcad::foundation::TolerancePolicy::STANDARD,
+                        openrcad::exchange::StepImportOptions::LEGACY_PCURVE_RECONSTRUCTION,
+                    ),
                 ) {
                     Ok(outcome) => {
                         let solid = outcome.solid;
@@ -1057,16 +1416,15 @@ impl ParametricGraph {
                         }
                         stamp_import_face_refs(&mut pristine, &node.id);
                         crate::mock_kernel::populate_edge_adjacent_face_names(&mut pristine);
-                        live.push(LiveBody {
-                            id: node.id.clone(),
-                            parts: vec![solid],
-                            pristine: Some(pristine.into()),
-                            sketch_source: None,
-                            cut_tools: Vec::new(),
-                            cut_replay: None,
-                            edge_mod_cut_history_path_used: false,
-                            thread_replay: None,
-                        });
+                        apply_new(
+                            live,
+                            LiveBody {
+                                id: node.id.clone(),
+                                parts: vec![solid],
+                                pristine: Some(pristine.into()),
+                                sketch_source: None,
+                            },
+                        );
                     }
                     Err(e) => warnings.push(format!(
                         "Import '{}' ({}): failed to parse STEP data: {}.",
@@ -1074,13 +1432,17 @@ impl ParametricGraph {
                     )),
                 }
             }
-            FeatureType::Extrude {
-                depth,
-                region_indices,
-                mode,
-                depth_expr,
-                target,
-            } => {
+            crate::document::FeatureEvaluatorKind::Extrude => {
+                let FeatureType::Extrude {
+                    depth,
+                    region_indices,
+                    mode,
+                    depth_expr,
+                    target,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 // An expression that still resolves drives the depth; a
                 // missing/broken variable falls back to the stored value and
                 // surfaces a warning (otherwise the model silently builds
@@ -1114,14 +1476,18 @@ impl ParametricGraph {
                     warnings,
                 );
             }
-            FeatureType::Revolve {
-                axis,
-                angle_deg,
-                angle_expr,
-                region_indices,
-                mode,
-                target,
-            } => {
+            crate::document::FeatureEvaluatorKind::Revolve => {
+                let FeatureType::Revolve {
+                    axis,
+                    angle_deg,
+                    angle_expr,
+                    region_indices,
+                    mode,
+                    target,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 let eff_angle = match angle_expr.as_ref() {
                     Some(e) => match crate::expr::eval(e, vars) {
                         Ok(v) => v as f32,
@@ -1150,39 +1516,113 @@ impl ParametricGraph {
                     warnings,
                 );
             }
-            FeatureType::Pattern { source, kind } => {
+            crate::document::FeatureEvaluatorKind::Pattern => {
+                let FeatureType::Pattern { source, kind } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
                 apply_pattern(&node.id, source, kind, vars, datums, live, warnings);
             }
-            FeatureType::BodyTransform {
-                source,
-                translation,
-                copy,
-            } => {
+            crate::document::FeatureEvaluatorKind::BodyTransform => {
+                let FeatureType::BodyTransform {
+                    source,
+                    translation,
+                    copy,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 apply_body_transform(&node.id, source, *translation, *copy, live, warnings);
             }
-            FeatureType::BodyJoin { sources } => {
+            crate::document::FeatureEvaluatorKind::BodyJoin => {
+                let FeatureType::BodyJoin { sources } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
                 apply_body_join(&node.id, sources, live, warnings);
             }
-            FeatureType::BodyCut {
-                target,
-                tool,
-                keep_tool,
-            } => {
+            crate::document::FeatureEvaluatorKind::BodyCut => {
+                let FeatureType::BodyCut {
+                    target,
+                    tool,
+                    keep_tool,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 apply_body_cut(&node.id, target, tool, *keep_tool, live, warnings);
             }
-            FeatureType::Thread {
-                target,
-                face,
-                internal,
-                pitch,
-                depth,
-                angle_deg,
-                right_handed,
-                starts,
-                length,
-                flip,
-                ..
-            } => {
+            crate::document::FeatureEvaluatorKind::BodyIntersect => {
+                let FeatureType::BodyIntersect {
+                    target,
+                    tool,
+                    keep_tool,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                apply_body_intersect(&node.id, target, tool, *keep_tool, live, warnings);
+            }
+            crate::document::FeatureEvaluatorKind::BodySplit => {
+                let FeatureType::BodySplit {
+                    target,
+                    plane,
+                    face,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                apply_body_split(
+                    &node.id,
+                    target,
+                    plane,
+                    face.as_ref(),
+                    datums,
+                    live,
+                    warnings,
+                );
+            }
+            crate::document::FeatureEvaluatorKind::BodyScale => {
+                let FeatureType::BodyScale {
+                    source,
+                    factor,
+                    factor_expr,
+                    center,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                let effective_factor = match factor_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, vars) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Scale body '{}': factor expression \"{}\" no longer \
+                                 evaluates; using last value {:.6}.",
+                                node.id, expression, factor
+                            ));
+                            *factor
+                        }
+                    },
+                    None => *factor,
+                };
+                apply_body_scale(&node.id, source, effective_factor, *center, live, warnings);
+            }
+            crate::document::FeatureEvaluatorKind::Thread => {
+                let FeatureType::Thread {
+                    target,
+                    face,
+                    internal,
+                    pitch,
+                    depth,
+                    angle_deg,
+                    right_handed,
+                    starts,
+                    length,
+                    flip,
+                    ..
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 apply_thread(
                     &node.id,
                     target,
@@ -1199,11 +1639,15 @@ impl ParametricGraph {
                     warnings,
                 );
             }
-            FeatureType::Loft {
-                sections,
-                mode,
-                target,
-            } => {
+            crate::document::FeatureEvaluatorKind::Loft => {
+                let FeatureType::Loft {
+                    sections,
+                    mode,
+                    target,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 self.apply_loft(
                     &node.id,
                     sections,
@@ -1215,13 +1659,17 @@ impl ParametricGraph {
                     warnings,
                 );
             }
-            FeatureType::Sweep {
-                profile_sketch,
-                profile_region,
-                path_sketch,
-                mode,
-                target,
-            } => {
+            crate::document::FeatureEvaluatorKind::Sweep => {
+                let FeatureType::Sweep {
+                    profile_sketch,
+                    profile_region,
+                    path_sketch,
+                    mode,
+                    target,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 self.apply_sweep(
                     &node.id,
                     profile_sketch,
@@ -1235,12 +1683,16 @@ impl ParametricGraph {
                     warnings,
                 );
             }
-            FeatureType::Shell {
-                target,
-                thickness,
-                thickness_expr,
-                open_faces,
-            } => {
+            crate::document::FeatureEvaluatorKind::Shell => {
+                let FeatureType::Shell {
+                    target,
+                    thickness,
+                    thickness_expr,
+                    open_faces,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 let eff_thickness = match thickness_expr.as_ref() {
                     Some(e) => match crate::expr::eval(e, vars) {
                         Ok(v) => v as f32,
@@ -1257,15 +1709,19 @@ impl ParametricGraph {
                 };
                 apply_shell(&node.id, target, eff_thickness, open_faces, live, warnings);
             }
-            FeatureType::Hole {
-                target,
-                position,
-                direction,
-                diameter,
-                diameter_expr,
-                depth,
-                kind,
-            } => {
+            crate::document::FeatureEvaluatorKind::Hole => {
+                let FeatureType::Hole {
+                    target,
+                    position,
+                    direction,
+                    diameter,
+                    diameter_expr,
+                    depth,
+                    kind,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 let eff_diameter = match diameter_expr.as_ref() {
                     Some(e) => match crate::expr::eval(e, vars) {
                         Ok(v) => v as f32,
@@ -1292,14 +1748,17 @@ impl ParametricGraph {
                     warnings,
                 );
             }
-            FeatureType::EdgeMod {
-                target,
-                edge,
-                dist,
-                dist_expr,
-                replay,
-                kind,
-            } => {
+            crate::document::FeatureEvaluatorKind::EdgeMod => {
+                let FeatureType::EdgeMod {
+                    target,
+                    edge,
+                    dist,
+                    dist_expr,
+                    kind,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
                 let eff_dist = match dist_expr.as_ref() {
                     Some(e) => match crate::expr::eval(e, vars) {
                         Ok(v) => v as f32,
@@ -1314,38 +1773,16 @@ impl ParametricGraph {
                     },
                     None => *dist,
                 };
-                apply_edge_mod(
-                    &node.id, target, edge, replay, eff_dist, *kind, live, warnings,
-                );
+                apply_edge_mod(&node.id, target, edge, eff_dist, *kind, live, warnings);
             }
-            _ => {}
+            crate::document::FeatureEvaluatorKind::Infrastructure
+            | crate::document::FeatureEvaluatorKind::Sketch
+            | crate::document::FeatureEvaluatorKind::Datum => {
+                return Err(payload_mismatch());
+            }
         }
 
         Ok(())
-    }
-
-    pub fn edge_mod_replay_intent_for_edge(
-        &self,
-        target: &str,
-        edge: &EdgeRef,
-        hidden: &std::collections::HashSet<String>,
-    ) -> EdgeModReplayIntent {
-        let mut intent = EdgeModReplayIntent::auto_for(target.to_string(), edge.clone());
-        if let Ok((live, _)) = self.build_live(hidden, false) {
-            if let Some(history) = live
-                .iter()
-                .find(|body| body.id == target)
-                .and_then(|body| body.cut_replay.as_ref())
-            {
-                intent.pre_cut_target = Some(history.base_body_id.clone());
-                intent.replay_cut_nodes = history
-                    .steps
-                    .iter()
-                    .map(|step| step.node_id.clone())
-                    .collect();
-            }
-        }
-        intent
     }
 
     /// Cumulative content hash of the geometry inputs for each node in `nodes`,
@@ -1358,11 +1795,9 @@ impl ParametricGraph {
     /// Hashing only — no geometry is built here.
     ///
     /// NOTE: evaluation quality is deliberately not folded into these graph-input
-    /// keys. Edge modifiers use the same geometry in both qualities. Cut and Join
-    /// do use `draft` to defer expensive thread replay, but interactive evaluation
-    /// runs on a throwaway graph clone, so those draft checkpoints never populate
-    /// the authoritative graph's cache. If previews ever share their checkpoint
-    /// cache with committed evaluation, quality must be folded into the seed.
+    /// keys because every feature produces the same committed geometry in both
+    /// qualities. If preview-only geometry is introduced, quality must be folded
+    /// into the seed before previews can share authoritative checkpoints.
     pub(crate) fn eval_prefix_keys(
         &self,
         nodes: &[NodeIndex],
@@ -1588,6 +2023,9 @@ impl ParametricGraph {
                         | FeatureType::BodyTransform { .. }
                         | FeatureType::BodyJoin { .. }
                         | FeatureType::BodyCut { .. }
+                        | FeatureType::BodyIntersect { .. }
+                        | FeatureType::BodySplit { .. }
+                        | FeatureType::BodyScale { .. }
                         | FeatureType::Hole { .. }
                         | FeatureType::Shell { .. }
                         | FeatureType::Loft { .. }
@@ -1837,7 +2275,6 @@ impl ParametricGraph {
         };
 
         let mut newbody_tools: Vec<KernelSolid> = Vec::new();
-        let mut newbody_cut_tools: Vec<CutTool> = Vec::new();
         let mut cut_tools: Vec<CutTool> = Vec::new();
         let mut join_tools: Vec<JoinTool> = Vec::new();
         let mut sketch_source = SketchExtrudeSource {
@@ -1845,8 +2282,6 @@ impl ParametricGraph {
         };
         let mut newbody_mesh = MockMesh::empty();
         let mut newbody_part_meshes: Vec<([i64; 6], MockMesh)> = Vec::new();
-        let mut newbody_body_count = 0usize;
-        let mut newbody_cut_replay: Option<CutReplayHistory> = None;
 
         // An open construction/projected line can partition a drawn circle into
         // two or more selected regions. Extruding those pieces independently
@@ -1880,7 +2315,6 @@ impl ParametricGraph {
                     match mode {
                         ExtrudeMode::NewBody => {
                             newbody_tools.push(solid);
-                            newbody_body_count += 1;
                         }
                         ExtrudeMode::Join => {
                             let dipped = crate::mock_kernel::circular_cylinder_tool(
@@ -2023,40 +2457,7 @@ impl ParametricGraph {
                     let region_part = body_tool.clone();
                     if let Some(s) = body_tool {
                         newbody_tools.push(s);
-                        newbody_body_count += 1;
                     }
-                    let grown_replay_cutter = provenance
-                        .and_then(|provenance| {
-                            rect_circle_region_base_and_cutter_from_provenance(
-                                provenance,
-                                region,
-                                depth,
-                                cs,
-                                CUT_WALL_GROW,
-                            )
-                        })
-                        .or_else(|| {
-                            rect_circle_region_base_and_cutter_from_sketch(
-                                &sketch.curves,
-                                region,
-                                depth,
-                                cs,
-                                CUT_WALL_GROW,
-                            )
-                        });
-                    let expanded_replay_cutter = grown_replay_cutter
-                        .clone()
-                        .map(|(_, cutter)| cutter)
-                        .or_else(|| {
-                            crate::mock_kernel::rect_minus_circle_region_base_and_grown_cutter(
-                                &region.boundary,
-                                &region.holes,
-                                depth,
-                                cs,
-                                CUT_WALL_GROW,
-                            )
-                            .map(|(_, cutter)| cutter)
-                        });
                     let region_source = SketchExtrudeRegionSource {
                         boundary: region.boundary.clone(),
                         holes: region.holes.clone(),
@@ -2064,27 +2465,6 @@ impl ParametricGraph {
                         cs: *cs,
                         rect_circle: canonical_rect_circle,
                     };
-                    if let Some(canonical) = region_source.rect_circle.as_ref() {
-                        let replay_tool = CutTool::single_direction(
-                            Some(canonical.cutter.clone()),
-                            None,
-                            expanded_replay_cutter.clone(),
-                            None,
-                        );
-                        newbody_cut_tools.extend(cut_tool_recutter_tools(&replay_tool));
-                        newbody_cut_replay = Some(CutReplayHistory {
-                            base_body_id: node_id.to_string(),
-                            base_parts: vec![canonical.base.clone()],
-                            base_pristine: None,
-                            base_sketch_source: Some(SketchExtrudeSource {
-                                regions: vec![region_source.clone()],
-                            }),
-                            steps: vec![CutReplayStep {
-                                node_id: node_id.to_string(),
-                                tool: replay_tool,
-                            }],
-                        });
-                    }
                     sketch_source.regions.push(region_source);
                     let mut region_mesh = match region_part.as_ref() {
                         Some(part) => crate::mock_kernel::display_mesh_from_part(
@@ -2240,22 +2620,20 @@ impl ParametricGraph {
                     if parts.len() > 1 {
                         newbody_mesh.suppress_duplicate_edge_groups();
                     }
-                    live.push(LiveBody {
-                        id: node_id.to_string(),
-                        parts,
-                        // Per-region meshes retain the shared sketch boundary.
-                        // Tessellate the fused B-Rep after a successful union so
-                        // a continuous coplanar face has no internal display edge.
-                        pristine: (!fused_brep && !newbody_mesh.indices.is_empty())
-                            .then(|| std::sync::Arc::new(newbody_mesh)),
-                        sketch_source: (!sketch_source.regions.is_empty()).then_some(sketch_source),
-                        cut_tools: newbody_cut_tools,
-                        cut_replay: (newbody_body_count == 1)
-                            .then_some(())
-                            .and(newbody_cut_replay),
-                        edge_mod_cut_history_path_used: false,
-                        thread_replay: None,
-                    });
+                    apply_new(
+                        live,
+                        LiveBody {
+                            id: node_id.to_string(),
+                            parts,
+                            // Per-region meshes retain the shared sketch boundary.
+                            // Tessellate the fused B-Rep after a successful union so
+                            // a continuous coplanar face has no internal display edge.
+                            pristine: (!fused_brep && !newbody_mesh.indices.is_empty())
+                                .then(|| std::sync::Arc::new(newbody_mesh)),
+                            sketch_source: (!sketch_source.regions.is_empty())
+                                .then_some(sketch_source),
+                        },
+                    );
                 } else {
                     // The feature owns several bodies. Keep the first output id
                     // backward-compatible (`extrude_N`) and suffix later bodies.
@@ -2332,24 +2710,20 @@ impl ParametricGraph {
                             &mut mesh, &output_id, &parts,
                         );
 
-                        live.push(LiveBody {
-                            id: output_id,
-                            parts,
-                            pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
-                            sketch_source: (!part_source_regions.is_empty()).then_some(
-                                SketchExtrudeSource {
-                                    regions: part_source_regions,
-                                },
-                            ),
-                            // Canonical circular-bite replay metadata is assembled
-                            // feature-wide above. It cannot safely be shared across
-                            // independently targeted bodies; native body operations
-                            // remain available and clear/rebuild this state normally.
-                            cut_tools: Vec::new(),
-                            cut_replay: None,
-                            edge_mod_cut_history_path_used: false,
-                            thread_replay: None,
-                        });
+                        apply_new(
+                            live,
+                            LiveBody {
+                                id: output_id,
+                                parts,
+                                pristine: (!mesh.indices.is_empty())
+                                    .then(|| std::sync::Arc::new(mesh)),
+                                sketch_source: (!part_source_regions.is_empty()).then_some(
+                                    SketchExtrudeSource {
+                                        regions: part_source_regions,
+                                    },
+                                ),
+                            },
+                        );
                     }
                 }
             }
@@ -2447,24 +2821,22 @@ fn apply_body_transform(
     if !copy {
         live.remove(source_index);
     }
-    live.push(LiveBody {
-        id: node_id.to_string(),
-        parts,
-        pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
-        sketch_source: None,
-        cut_tools: Vec::new(),
-        cut_replay: None,
-        edge_mod_cut_history_path_used: false,
-        thread_replay: None,
-    });
+    apply_new(
+        live,
+        LiveBody {
+            id: node_id.to_string(),
+            parts,
+            pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
+            sketch_source: None,
+        },
+    );
 }
 
 impl ParametricGraph {
     /// Evaluate one Revolve node: resolve the parent sketch and the axis, build
     /// a solid of revolution per selected region, then assemble by mode. The
-    /// revolve analogue of [`apply_extrude`], deliberately leaner — no
-    /// rect-circle canonical forms or cut-replay history (those are extrude
-    /// tricks for prismatic pockets); the kernel solid IS the analytic result.
+    /// revolve analogue of [`apply_extrude`], deliberately leaner because the
+    /// kernel solid is already the analytic result.
     #[allow(clippy::too_many_arguments)]
     fn apply_revolve(
         &self,
@@ -2603,17 +2975,16 @@ impl ParametricGraph {
         match mode {
             ExtrudeMode::NewBody => {
                 if !newbody_parts.is_empty() {
-                    live.push(LiveBody {
-                        id: node_id.to_string(),
-                        parts: newbody_parts,
-                        pristine: (!newbody_mesh.indices.is_empty())
-                            .then(|| std::sync::Arc::new(newbody_mesh)),
-                        sketch_source: None,
-                        cut_tools: Vec::new(),
-                        cut_replay: None,
-                        edge_mod_cut_history_path_used: false,
-                        thread_replay: None,
-                    });
+                    apply_new(
+                        live,
+                        LiveBody {
+                            id: node_id.to_string(),
+                            parts: newbody_parts,
+                            pristine: (!newbody_mesh.indices.is_empty())
+                                .then(|| std::sync::Arc::new(newbody_mesh)),
+                            sketch_source: None,
+                        },
+                    );
                 }
             }
             ExtrudeMode::Join | ExtrudeMode::Cut => {
@@ -2809,16 +3180,15 @@ impl ParametricGraph {
                 }
                 stamp(&mut mesh);
                 crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
-                live.push(LiveBody {
-                    id: node_id.to_string(),
-                    parts: vec![solid],
-                    pristine: Some(mesh.into()),
-                    sketch_source: None,
-                    cut_tools: Vec::new(),
-                    cut_replay: None,
-                    edge_mod_cut_history_path_used: false,
-                    thread_replay: None,
-                });
+                apply_new(
+                    live,
+                    LiveBody {
+                        id: node_id.to_string(),
+                        parts: vec![solid],
+                        pristine: Some(mesh.into()),
+                        sketch_source: None,
+                    },
+                );
             }
             ExtrudeMode::Join | ExtrudeMode::Cut => {
                 if let Some(target_id) = boolean_target {
@@ -2927,8 +3297,16 @@ fn apply_shell(
             new_parts.push(part.clone());
             continue;
         }
-        match openrcad::algo::shell_solid(part, thickness as f64, &kernel_open) {
-            Ok(shelled) => new_parts.push(shelled),
+        match crate::mock_kernel::consume_operation(
+            "shell",
+            openrcad::algo::shell_solid_operation_with_policy(
+                part,
+                thickness as f64,
+                &kernel_open,
+                &openrcad::foundation::TolerancePolicy::STANDARD,
+            ),
+        ) {
+            Ok(outcome) => new_parts.push(outcome.solid),
             Err(e) => {
                 warnings.push(format!(
                     "Shell '{node_id}': the kernel couldn't hollow this body ({e:?}). \
@@ -2942,7 +3320,6 @@ fn apply_shell(
     body.parts = new_parts;
     // The analytic mesh no longer matches; re-derive display from the parts.
     body.pristine = None;
-    body.cut_replay = None;
 }
 
 /// Evaluate one Hole node: compose the drill from analytic cylinder/cone
@@ -3107,7 +3484,7 @@ fn apply_thread(
         return;
     };
 
-    let step = ThreadReplayStep {
+    let parameters = ThreadParameters {
         face: face.clone(),
         internal,
         pitch,
@@ -3119,22 +3496,8 @@ fn apply_thread(
         flip,
     };
 
-    // Snapshot the smooth pre-thread solids the FIRST time this body is threaded,
-    // *before* `thread_one` mutates `parts`. A later Join/Cut runs its boolean
-    // against these instead of the helical bands, then replays the thread steps.
-    let base_snapshot = live[bi]
-        .thread_replay
-        .is_none()
-        .then(|| live[bi].parts.clone());
-
-    match thread_one(&mut live[bi], &step) {
-        Ok(()) => {
-            let tr = live[bi].thread_replay.get_or_insert_with(|| ThreadReplay {
-                base_parts: base_snapshot.unwrap_or_default(),
-                steps: Vec::new(),
-            });
-            tr.steps.push(step);
-        }
+    match thread_one(&mut live[bi], &parameters) {
+        Ok(()) => {}
         Err(ThreadFailure::NoCylinderFace) => warnings.push(format!(
             "Thread '{node_id}': no cylindrical face found near the selection — thread left cosmetic."
         )),
@@ -3161,12 +3524,11 @@ pub(crate) enum ThreadFailure {
 /// analytic helix-railed faces, and refresh the body's pristine mesh. Only
 /// mutates `body` on success, so a failure leaves the input geometry intact.
 ///
-/// Shared by the graph-driven [`apply_thread`] and by the Join/Cut replay path,
-/// which re-runs each stored step against a freshly-booleaned smooth base so a
-/// threaded body can still absorb later booleans (see [`ThreadReplay`]).
+/// Shared by graph evaluation and focused operation tests. Later booleans act
+/// directly on this committed threaded B-Rep; no thread replay state exists.
 pub(crate) fn thread_one(
     body: &mut LiveBody,
-    step: &ThreadReplayStep,
+    step: &ThreadParameters,
 ) -> Result<(), ThreadFailure> {
     // Resolve the selected cylindrical face and which component it belongs to.
     // A LiveBody may intentionally contain several parts after a severing cut. Do
@@ -3239,16 +3601,25 @@ pub(crate) fn thread_one(
     // against anything else (a chamfer cone, fillet torus, or a partial-length
     // stop) fade out through a runout band into an untouched cylinder collar,
     // so rim blends survive.
-    let Some(threaded) = crate::mock_kernel::threaded_replace_cylinder_wall(
+    let original = body.parts[pi].clone();
+    let Some(threaded) = crate::mock_kernel::threaded_replace_cylinder_wall_with_policy(
         &body.parts[pi],
         &info,
         &spec,
         step.length.map(|l| l as f64),
         step.flip,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
     ) else {
         return Err(ThreadFailure::WallReplaceFailed);
     };
-    body.parts[pi] = threaded;
+    let threaded = crate::mock_kernel::consume_local_unary_operation(
+        "thread",
+        &original,
+        threaded,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+    )
+    .map_err(|_| ThreadFailure::WallReplaceFailed)?;
+    body.parts[pi] = threaded.solid;
 
     // Tessellating the dense helical bands is the expensive part of a thread
     // (hundreds of ms for a long/large one), so do it ONCE here and store it as
@@ -3467,18 +3838,17 @@ fn apply_pattern(
             if let Some(source_index) = live.iter().position(|body| body.id == source) {
                 live.remove(source_index);
             }
-            live.push(LiveBody {
-                // Mirror+Join modifies the selected source body; the Pattern node
-                // is an operation, not a second body identity.
-                id: source.to_string(),
-                parts: joined_parts,
-                pristine,
-                sketch_source: None,
-                cut_tools: Vec::new(),
-                cut_replay: None,
-                edge_mod_cut_history_path_used: false,
-                thread_replay: None,
-            });
+            apply_new(
+                live,
+                LiveBody {
+                    // Mirror+Join modifies the selected source body; the Pattern node
+                    // is an operation, not a second body identity.
+                    id: source.to_string(),
+                    parts: joined_parts,
+                    pristine,
+                    sketch_source: None,
+                },
+            );
             log::info!(
                 "[mirror_join:{node_id}] completed as body={source} kernel_parts={} display_cleanup={}",
                 live.last().map_or(0, |body| body.parts.len()),
@@ -3494,16 +3864,15 @@ fn apply_pattern(
         ));
     }
     if !new_parts.is_empty() {
-        live.push(LiveBody {
-            id: node_id.to_string(),
-            parts: new_parts,
-            pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
-            sketch_source: None,
-            cut_tools: Vec::new(),
-            cut_replay: None,
-            edge_mod_cut_history_path_used: false,
-            thread_replay: None,
-        });
+        apply_new(
+            live,
+            LiveBody {
+                id: node_id.to_string(),
+                parts: new_parts,
+                pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
+                sketch_source: None,
+            },
+        );
     }
 }
 
@@ -4344,18 +4713,23 @@ fn try_tessellate_bodies(live: Vec<LiveBody>) -> Result<Vec<(String, MockMesh)>,
 
 /// Visibility is presentation-only. The complete B-Rep history is built and
 /// cached first; only final display bodies are removed here.
-fn visible_live_bodies(
-    live: Vec<LiveBody>,
-    hidden: &std::collections::HashSet<String>,
-) -> Vec<LiveBody> {
-    if hidden.is_empty() {
-        return live;
+impl ParametricGraph {
+    fn visible_live_bodies(
+        &self,
+        live: Vec<LiveBody>,
+        hidden: &std::collections::HashSet<String>,
+    ) -> Vec<LiveBody> {
+        if hidden.is_empty() {
+            return live;
+        }
+        live.into_iter()
+            .filter(|body| {
+                let producer = self.body_producer_feature_id(&body.id);
+                !hidden.contains(&body.id)
+                    && producer.is_none_or(|producer| !hidden.contains(producer))
+            })
+            .collect()
     }
-    live.into_iter()
-        .filter(|body| {
-            !hidden.contains(&body.id) && !hidden.contains(body_output_owner_id(&body.id))
-        })
-        .collect()
 }
 
 /// Global evaluator invariant: every runtime part is exactly one connected,
@@ -4385,18 +4759,6 @@ fn validate_live_body_state(live: &[LiveBody]) -> Result<(), String> {
 
     for body in live {
         validate_parts(&format!("body '{}'", body.id), &body.parts)?;
-        if let Some(replay) = &body.thread_replay {
-            validate_parts(
-                &format!("body '{}' thread replay", body.id),
-                &replay.base_parts,
-            )?;
-        }
-        if let Some(replay) = &body.cut_replay {
-            validate_parts(
-                &format!("body '{}' cut replay", body.id),
-                &replay.base_parts,
-            )?;
-        }
     }
     Ok(())
 }

@@ -16,20 +16,7 @@ const LEGACY_MARKERS: &[&str] = &[
     "openrcad::mesh::tessellate_compatibility",
 ];
 
-const PHASE3_ALLOWLIST: &[(&str, &str)] = &[
-    (
-        "mock_kernel/boolean.rs",
-        "openrcad::algo::boolean_checked_with_history",
-    ),
-    (
-        "mock_kernel/tessellation.rs",
-        "openrcad::mesh::tessellate_compatibility_for_display_with_policy_and_cancel",
-    ),
-    (
-        "parametric/edge_mod.rs",
-        "openrcad::mesh::tessellate_compatibility_for_display_with_policy_and_cancel",
-    ),
-];
+const PHASE3_ALLOWLIST: &[(&str, &str)] = &[];
 
 #[test]
 fn phase1_production_code_does_not_add_legacy_kernel_calls() {

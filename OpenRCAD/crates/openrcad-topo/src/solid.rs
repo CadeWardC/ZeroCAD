@@ -7,6 +7,7 @@
 //! 8 distinct vertices and 12 distinct edges rather than 48.
 
 use openrcad_foundation::{BndBox, Trsf};
+use openrcad_geom::{Curve, GeomCurve};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -46,16 +47,34 @@ impl Solid {
     /// A solid bounded by `outer_shell`.
     #[inline]
     pub fn new(outer_shell: Shell) -> Self {
+        Self::from_shells([outer_shell]).expect("a one-shell solid is non-empty")
+    }
+
+    /// Build one material region from an outer boundary shell and any enclosed
+    /// void shells. Shell order is significant: the first shell is the outer
+    /// boundary and subsequent shells bound voids.
+    ///
+    /// Returns `None` for an empty iterator because a solid without a boundary
+    /// is not a representable volume.
+    pub fn from_shells<I: IntoIterator<Item = Shell>>(shells: I) -> Option<Self> {
         let mut brep = BRep::new();
-        let map = brep.merge(&outer_shell.brep);
-        let new_shell = map.shells[&outer_shell.id];
-        let id = brep.solids.insert(SolidData {
-            shells: vec![new_shell],
-        });
-        Self {
+        let mut merged = HashMap::<usize, (Arc<BRep>, crate::arena::MergeMap)>::new();
+        let mut new_shells = Vec::new();
+        for shell in shells {
+            let ptr = Arc::as_ptr(&shell.brep) as usize;
+            let (_, map) = merged
+                .entry(ptr)
+                .or_insert_with(|| (shell.brep.clone(), brep.merge(&shell.brep)));
+            new_shells.push(map.shells[&shell.id]);
+        }
+        if new_shells.is_empty() {
+            return None;
+        }
+        let id = brep.solids.insert(SolidData { shells: new_shells });
+        Some(Self {
             brep: Arc::new(brep),
             id,
-        }
+        })
     }
 
     /// The outer boundary shell.
@@ -69,11 +88,31 @@ impl Solid {
         }
     }
 
+    /// All boundary shells, with the outer shell first followed by void shells.
+    pub fn shells(&self) -> Vec<Shell> {
+        self.brep.solids[self.id]
+            .shells
+            .iter()
+            .map(|&id| Shell {
+                brep: self.brep.clone(),
+                id,
+            })
+            .collect()
+    }
+
+    /// All boundary faces across the outer and void shells.
+    pub fn faces(&self) -> Vec<Face> {
+        self.shells()
+            .into_iter()
+            .flat_map(|shell| shell.faces())
+            .collect()
+    }
+
     /// All distinct [`Vertex`] locations (coincident endpoints merged).
     pub fn vertices(&self) -> Vec<Vertex> {
         let mut out: Vec<Vertex> = Vec::new();
         let mut seen = HashSet::new();
-        for face in self.shell().faces() {
+        for face in self.faces() {
             for wire in face.wires() {
                 for edge in wire.edges() {
                     for v in [edge.start(), edge.end()] {
@@ -98,7 +137,7 @@ impl Solid {
     pub fn edges(&self) -> Vec<Edge> {
         let mut out: Vec<Edge> = Vec::new();
         let mut seen = HashSet::new();
-        for face in self.shell().faces() {
+        for face in self.faces() {
             for wire in face.wires() {
                 for edge in wire.edges() {
                     if seen.insert(edge_key(&edge)) {
@@ -119,7 +158,7 @@ impl Solid {
     /// Number of faces.
     #[inline]
     pub fn face_count(&self) -> usize {
-        self.shell().len()
+        self.shells().iter().map(Shell::len).sum()
     }
 
     /// The axis-aligned bounding box of all vertices.
@@ -138,14 +177,21 @@ impl Solid {
     /// single shell holding two disjoint, individually-watertight boxes — a
     /// valid B-Rep, but really two bodies. This groups faces into connected
     /// components (two faces are connected when they share a boundary edge,
-    /// matched by quantized endpoint position like [`edges`](Solid::edges) and
+    /// matched by quantized endpoints plus a curve midpoint like
+    /// [`edges`](Solid::edges) and
     /// [`manifold_report`](Solid::manifold_report)) and rebuilds one solid per
     /// component.
     ///
     /// Returns a single-element vector (a clone of `self`) when the boundary is
     /// already one connected piece — so callers can treat the result uniformly.
     pub fn split_disconnected(&self) -> Vec<Solid> {
-        let faces = self.shell().faces();
+        // Multiple shells intentionally represent one material region with
+        // enclosed voids. They must not be split into separate bodies merely
+        // because their boundary graphs are disconnected.
+        if self.shells().len() > 1 {
+            return vec![self.clone()];
+        }
+        let faces = self.faces();
         let n = faces.len();
         if n <= 1 {
             return vec![self.clone()];
@@ -161,7 +207,7 @@ impl Solid {
         }
 
         let mut parent: Vec<usize> = (0..n).collect();
-        let mut edge_owner: HashMap<[(i64, i64, i64); 2], usize> = HashMap::new();
+        let mut edge_owner: HashMap<_, usize> = HashMap::new();
         for (fi, face) in faces.iter().enumerate() {
             for wire in face.wires() {
                 for edge in wire.edges() {
@@ -217,10 +263,20 @@ fn vertex_key(v: &Vertex) -> (i64, i64, i64) {
     point_key(&v.point())
 }
 
-fn edge_key(edge: &Edge) -> [(i64, i64, i64); 2] {
+fn edge_key(edge: &Edge) -> [(i64, i64, i64); 3] {
     let mut endpoints = [vertex_key(&edge.start()), vertex_key(&edge.end())];
     endpoints.sort_unstable();
-    endpoints
+    let start = edge.start().point();
+    let end = edge.end().point();
+    let midpoint = match edge.curve() {
+        // Sewing may merge a line's endpoints while retaining a slightly
+        // offset source line. Topological identity follows the merged vertices
+        // there. Curved edges need an interior sample to distinguish two arcs
+        // that legitimately share the same endpoints.
+        None | Some(GeomCurve::Line(_)) => start + (end - start) * 0.5,
+        Some(curve) => curve.point(0.5 * (edge.first() + edge.last())),
+    };
+    [endpoints[0], endpoints[1], point_key(&midpoint)]
 }
 
 fn point_key(p: &openrcad_foundation::Pnt) -> (i64, i64, i64) {
@@ -234,7 +290,7 @@ fn point_key(p: &openrcad_foundation::Pnt) -> (i64, i64, i64) {
 
 impl PartialEq for Solid {
     fn eq(&self, other: &Self) -> bool {
-        self.shell() == other.shell()
+        self.shells() == other.shells()
     }
 }
 

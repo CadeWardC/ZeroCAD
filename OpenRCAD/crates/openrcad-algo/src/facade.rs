@@ -86,10 +86,19 @@ impl SolidExt for Solid {
         )
     }
     fn chamfer(&self, distance: f64) -> Result<Solid, BlendError> {
-        crate::chamfer(self, distance)
+        crate::chamfer_with_policy(
+            self,
+            distance,
+            &openrcad_foundation::TolerancePolicy::STANDARD,
+        )
     }
     fn hollow(&self, thickness: f64, open_faces: &[Face]) -> Result<Solid, BlendError> {
-        crate::shell_solid(self, thickness, open_faces)
+        crate::shell_solid_with_policy(
+            self,
+            thickness,
+            open_faces,
+            &openrcad_foundation::TolerancePolicy::STANDARD,
+        )
     }
     fn planar_faces(&self) -> Vec<Face> {
         self.shell()

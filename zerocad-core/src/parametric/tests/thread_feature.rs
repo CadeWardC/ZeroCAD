@@ -129,12 +129,8 @@ fn thread_targets_clicked_cylinder_across_multipart_body() {
         parts: vec![flange, shaft],
         pristine: None,
         sketch_source: None,
-        cut_tools: Vec::new(),
-        cut_replay: None,
-        edge_mod_cut_history_path_used: false,
-        thread_replay: None,
     };
-    let step = ThreadReplayStep {
+    let step = ThreadParameters {
         face: FaceRef {
             centroid: [38.0, 7.0, 0.0],
             normal: [1.0, 0.0, 0.0],

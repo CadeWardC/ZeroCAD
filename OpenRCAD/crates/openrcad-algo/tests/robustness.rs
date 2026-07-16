@@ -6,10 +6,8 @@
 //! configurations, so a regression that re-introduces a gap or sliver fails
 //! loudly instead of silently shipping a leaky shell.
 //!
-//! A second, `#[ignore]`d group documents the current failure frontier — the
-//! "partial imprint" cases where an intersection only partly crosses a face.
-//! They are runnable with `cargo test --ignored` and encode the watertight goal
-//! the boolean engine does not yet meet, so progress (or regress) is measurable.
+//! Former partial-imprint frontier cases run in the ordinary suite. Phase 3 does
+//! not hide boolean or blend regressions behind ignored tests.
 
 use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
 use openrcad_foundation::{Ax1, Ax2, Dir, Pnt, Trsf};
@@ -95,7 +93,6 @@ fn corner_overlap_intersection_is_watertight() {
 }
 
 #[test]
-#[ignore = "Phase 3: enclosed voids require outer/inner multi-shell solid representation"]
 fn enclosed_void_cut_is_closed() {
     // A box with a fully interior cubic void: two nested closed shells, so it is
     // watertight and two-manifold (Euler 4 = two genus-0 shells).
@@ -110,6 +107,7 @@ fn enclosed_void_cut_is_closed() {
         4,
         "outer shell + inner void shell"
     );
+    assert_eq!(r.shells().len(), 2, "void must be a second boundary shell");
 }
 
 #[test]

@@ -12,12 +12,12 @@
 
 use core::fmt;
 
-use openrcad_foundation::{tolerance, Dir, Pnt, Vec as GeomVec};
+use openrcad_foundation::{tolerance, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{GeomCurve, GeomSurface, Line, Plane, RuledSurface};
 use openrcad_topo::{Edge, Face, Solid, Wire};
 
 use crate::revolve::{loop_agrees_with_surface, reversed_wire};
-use crate::sew::{compatibility_policy, sew_with_policy};
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Errors reported by [`skin_polygon_rings`].
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +30,8 @@ pub enum SkinError {
     DegenerateRing,
     /// The skinned shell did not close watertight.
     NotWatertight,
+    /// The supplied document tolerance policy is internally inconsistent.
+    InvalidTolerancePolicy(String),
 }
 
 impl fmt::Display for SkinError {
@@ -39,6 +41,9 @@ impl fmt::Display for SkinError {
             Self::RingMismatch => f.write_str("skin: all rings must have the same point count"),
             Self::DegenerateRing => f.write_str("skin: a ring is degenerate"),
             Self::NotWatertight => f.write_str("skin: result did not close watertight"),
+            Self::InvalidTolerancePolicy(reason) => {
+                write!(f, "skin: invalid tolerance policy: {reason}")
+            }
         }
     }
 }
@@ -62,7 +67,18 @@ fn ring_normal(ring: &[Pnt]) -> Option<Dir> {
 
 /// Build a solid through `rings` (ordered ring points; each ring closed
 /// implicitly, first point NOT repeated at the end).
+#[deprecated(note = "use skin_polygon_rings_with_policy")]
 pub fn skin_polygon_rings(rings: &[Vec<Pnt>]) -> Result<Solid, SkinError> {
+    skin_polygon_rings_with_policy(rings, &TolerancePolicy::STANDARD)
+}
+
+pub fn skin_polygon_rings_with_policy(
+    rings: &[Vec<Pnt>],
+    policy: &TolerancePolicy,
+) -> Result<Solid, SkinError> {
+    policy
+        .validate()
+        .map_err(|error| SkinError::InvalidTolerancePolicy(error.to_string()))?;
     if rings.len() < 2 || rings.iter().any(|r| r.len() < 3) {
         return Err(SkinError::TooFewRings);
     }
@@ -170,10 +186,11 @@ pub fn skin_polygon_rings(rings: &[Vec<Pnt>]) -> Result<Solid, SkinError> {
         ));
     }
 
-    let policy = compatibility_policy(tolerance::CONFUSION * 10.0);
-    let solid =
-        Solid::new(sew_with_policy(&faces, &policy).expect("compatibility policy is valid"));
-    if !solid.is_watertight() {
+    let solid = Solid::new(
+        sew_with_policy(&faces, policy)
+            .map_err(|error| SkinError::InvalidTolerancePolicy(error.to_string()))?,
+    );
+    if !solid.is_watertight_with_policy(policy) {
         return Err(SkinError::NotWatertight);
     }
     Ok(solid)

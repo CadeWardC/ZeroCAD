@@ -39,25 +39,13 @@ impl CutTool {
             circle,
         }
     }
-
-    pub(crate) fn has_any_solid(&self) -> bool {
-        [
-            self.smooth.as_ref(),
-            self.exact.as_ref(),
-            self.expanded.as_ref(),
-            self.smooth_rev.as_ref(),
-            self.exact_rev.as_ref(),
-            self.expanded_rev.as_ref(),
-        ]
-        .into_iter()
-        .any(|solid| solid.is_some())
-    }
 }
 
 /// Combine-style body cut: subtract the complete `tool` body from `target`.
 /// The operation is atomic and requires a positive-volume overlap. A miss or
-/// unchanged/failed boolean leaves both inputs untouched. On success the target
-/// is consumed into `node_id`; the tool is consumed unless `keep_tool` is true.
+/// unchanged/failed boolean leaves both inputs untouched. On success the result
+/// is the body produced by `node_id`; the tool is consumed unless `keep_tool` is
+/// true. Face provenance still records which target/tool topology contributed.
 pub(crate) fn apply_body_cut(
     node_id: &str,
     target: &str,
@@ -122,7 +110,7 @@ pub(crate) fn apply_body_cut(
         .map(|names| crate::mock_kernel::owner_classes_from_names(names));
     let exact_history_eligible = target_body.parts.len() == 1 && tool_body.parts.len() == 1;
     let mut result_parts = target_body.parts.clone();
-    let mut cut_trace: Option<(KernelSolid, crate::mock_kernel::BooleanFaceHistory)> = None;
+    let mut cut_trace: Option<Vec<crate::mock_kernel::BooleanFaceHistory>> = None;
     let mut changed = false;
     for tool_part in &tool_body.parts {
         let mut next = Vec::new();
@@ -138,12 +126,12 @@ pub(crate) fn apply_body_cut(
                     .then_some(owner_classes.as_deref())
                     .flatten(),
             ) {
-                Some((parts, combined, history)) if cut_parts_changed(&target_part, &parts) => {
+                Some(outcome) if cut_parts_changed(&target_part, &outcome.bodies) => {
                     changed = true;
                     if exact_history_eligible {
-                        cut_trace = Some((combined, history));
+                        cut_trace = Some(outcome.face_history.clone());
                     }
-                    next.extend(parts);
+                    next.extend(outcome.bodies);
                 }
                 _ => next.push(target_part),
             }
@@ -159,16 +147,17 @@ pub(crate) fn apply_body_cut(
     }
 
     let pristine = match (&cut_trace, &input_names, target_body.pristine.as_deref()) {
-        (Some((combined, history)), Some(names), Some(input_mesh)) => Some(std::sync::Arc::new(
-            crate::mock_kernel::propagate_face_names_via_history(
+        (Some(histories), Some(names), Some(input_mesh)) => {
+            crate::mock_kernel::propagate_face_names_via_body_histories(
                 input_mesh,
                 names,
-                combined,
-                history,
+                &result_parts,
+                histories,
                 node_id,
                 &format!("cut:{node_id}"),
-            ),
-        )),
+            )
+            .map(std::sync::Arc::new)
+        }
         _ => propagate_cut_face_names(
             &target_body.parts,
             target_body.pristine.as_deref(),
@@ -188,16 +177,15 @@ pub(crate) fn apply_body_cut(
         live.remove(index);
     }
     if !result_parts.is_empty() {
-        live.push(LiveBody {
-            id: node_id.to_string(),
-            parts: result_parts,
-            pristine,
-            sketch_source: None,
-            cut_tools: Vec::new(),
-            cut_replay: None,
-            edge_mod_cut_history_path_used: false,
-            thread_replay: None,
-        });
+        apply_new(
+            live,
+            LiveBody {
+                id: node_id.to_string(),
+                parts: result_parts,
+                pristine,
+                sketch_source: None,
+            },
+        );
     }
 }
 
@@ -247,7 +235,7 @@ pub(crate) fn directional_cut(cs: &CoordinateSystem, depth: f32) -> (CoordinateS
 /// rebuild geometry without a boolean, so they carry no trace.
 pub(crate) struct CutOutcome {
     pub(crate) parts: Vec<KernelSolid>,
-    pub(crate) trace: Option<(KernelSolid, crate::mock_kernel::BooleanFaceHistory)>,
+    pub(crate) trace: Option<Vec<crate::mock_kernel::BooleanFaceHistory>>,
 }
 
 pub(crate) fn cut_part_one_dir(
@@ -265,13 +253,12 @@ pub(crate) fn cut_part_one_dir(
         return None;
     }
     let changed_difference = |label: &str, tool: &KernelSolid| {
-        let (parts, combined, history) =
-            crate::mock_kernel::difference_bodies_with_history(part, tool, obj_classes)?;
-        if cut_parts_changed(part, &parts) {
+        let outcome = crate::mock_kernel::difference_bodies_with_history(part, tool, obj_classes)?;
+        if cut_parts_changed(part, &outcome.bodies) {
             recut_debug(format!("cut variant '{label}' changed part"));
             Some(CutOutcome {
-                parts,
-                trace: Some((combined, history)),
+                parts: outcome.bodies,
+                trace: Some(outcome.face_history),
             })
         } else {
             recut_debug(format!("cut variant '{label}' made no geometry change"));
@@ -295,40 +282,6 @@ pub(crate) fn cut_part_one_dir(
         .and_then(|tool| changed_difference("expanded", tool))
     {
         return Some(outcome);
-    }
-    if let Some(part) = exact
-        .as_ref()
-        .and_then(|tool| crate::mock_kernel::axis_aligned_through_cut(part, tool))
-    {
-        recut_debug("cut variant 'exact axis-aligned through' changed part");
-        return Some(CutOutcome {
-            parts: vec![part],
-            trace: None,
-        });
-    }
-    if let Some(part) = expanded
-        .as_ref()
-        .and_then(|tool| crate::mock_kernel::axis_aligned_through_cut(part, tool))
-    {
-        recut_debug("cut variant 'expanded axis-aligned through' changed part");
-        return Some(CutOutcome {
-            parts: vec![part],
-            trace: None,
-        });
-    }
-    if let Some(parts) = exact
-        .as_ref()
-        .and_then(|tool| crate::mock_kernel::axis_aligned_cut_parts(part, tool))
-    {
-        recut_debug("cut variant 'exact axis-aligned parts' changed part");
-        return Some(CutOutcome { parts, trace: None });
-    }
-    if let Some(parts) = expanded
-        .as_ref()
-        .and_then(|tool| crate::mock_kernel::axis_aligned_cut_parts(part, tool))
-    {
-        recut_debug("cut variant 'expanded axis-aligned parts' changed part");
-        return Some(CutOutcome { parts, trace: None });
     }
     recut_debug("all cut variants failed or missed");
     None
@@ -391,47 +344,6 @@ pub(crate) fn cut_tool_bboxes(
     (fwd_bb, rev_bb)
 }
 
-pub(crate) fn cut_part_with_tool(part: &KernelSolid, tool: &CutTool) -> Option<Vec<KernelSolid>> {
-    let (fwd_bb, rev_bb) = cut_tool_bboxes(tool);
-    if fwd_bb.is_none() && rev_bb.is_none() {
-        return None;
-    }
-    let pbb = crate::mock_kernel::solid_aabb(part);
-    let overlap_vol = |tbb: Option<&([f32; 3], [f32; 3])>| -> f32 {
-        match (pbb.as_ref(), tbb) {
-            (Some(p), Some(t)) => (0..3)
-                .map(|i| (p.1[i].min(t.1[i]) - p.0[i].max(t.0[i])).max(0.0))
-                .product(),
-            _ => 0.0,
-        }
-    };
-    let fwd = (&tool.smooth, &tool.exact, &tool.expanded, fwd_bb.as_ref());
-    let rev = (
-        &tool.smooth_rev,
-        &tool.exact_rev,
-        &tool.expanded_rev,
-        rev_bb.as_ref(),
-    );
-    let (first, second) = if overlap_vol(rev_bb.as_ref()) > overlap_vol(fwd_bb.as_ref()) {
-        (rev, fwd)
-    } else {
-        (fwd, rev)
-    };
-    cut_part_one_dir(part, pbb.as_ref(), first.0, first.1, first.2, first.3, None)
-        .or_else(|| {
-            cut_part_one_dir(
-                part,
-                pbb.as_ref(),
-                second.0,
-                second.1,
-                second.2,
-                second.3,
-                None,
-            )
-        })
-        .map(|outcome| outcome.parts)
-}
-
 /// Apply a Cut extrude: subtract each tool from every body part whose AABB it
 /// overlaps. For each part it tries the **drawn** direction first (smooth → exact
 /// → expanded), then falls back to the **opposite** sweep when the drawn one
@@ -439,16 +351,14 @@ pub(crate) fn cut_part_with_tool(part: &KernelSolid, tool: &CutTool) -> Option<V
 /// on a top face) still bites instead of silently doing nothing. A solver failure
 /// on a body the tool genuinely overlaps leaves the part intact (safer than
 /// dropping a valid body) and warns; a part fully consumed by the cut is removed.
-/// `draft` is set for live drag previews: cutting into a threaded body then
-/// skips replaying the (expensive) helical thread so the preview stays fast —
-/// the shaft reads smooth mid-drag and the threads return on the committed
-/// (non-draft) rebuild.
+/// `draft` is reserved for preview-quality kernel settings; it never changes
+/// construction history or invokes a feature-specific replay path.
 pub(crate) fn apply_cut(
     live: &mut [LiveBody],
     extrude_id: &str,
     tools: Vec<CutTool>,
     boolean_target: Option<&str>,
-    draft: bool,
+    _draft: bool,
     warnings: &mut Vec<String>,
 ) {
     for tool in &tools {
@@ -467,19 +377,8 @@ pub(crate) fn apply_cut(
             if boolean_target.is_some_and(|t| t != body.id) {
                 continue;
             }
-            // Threaded body: subtracting from the helical bands is not viable.
-            // Cut the smooth pre-thread base instead, then replay the thread
-            // steps so the shaft stays threaded and the pocket stays smooth.
-            if body.thread_replay.is_some() {
-                if let CutBaseOutcome::FailedOnOverlap = cut_into_threaded_base(body, tool, !draft)
-                {
-                    failed_on_overlap = true;
-                }
-                continue;
-            }
             let before_parts = body.parts.clone();
             let before_pristine = body.pristine.clone();
-            let before_sketch_source = body.sketch_source.clone();
             // Exact-history plumbing for the single-part common case: the input
             // body's face names per shell-face position, and the derived owner
             // classes the kernel's owner-aware merge respects.
@@ -493,7 +392,7 @@ pub(crate) fn apply_cut(
             let owner_classes: Option<Vec<Option<u64>>> = input_names
                 .as_ref()
                 .map(|names| crate::mock_kernel::owner_classes_from_names(names));
-            let mut cut_trace: Option<(KernelSolid, crate::mock_kernel::BooleanFaceHistory)> = None;
+            let mut cut_trace: Option<Vec<crate::mock_kernel::BooleanFaceHistory>> = None;
             let mut changed = false;
             let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
             for part in body.parts.drain(..) {
@@ -574,10 +473,6 @@ pub(crate) fn apply_cut(
                     tool.circle
                         .and_then(|circle| sketch_source_after_circle_cut(source, circle))
                 });
-                let replay_tool = next_source
-                    .as_ref()
-                    .and_then(cut_replay_tool_from_source)
-                    .unwrap_or_else(|| tool.clone());
                 // Propagate the input body's face names through the cut so a captured
                 // face survives the boolean (Phase 3). When the kernel emitted an
                 // exact history (general-boolean path, single named input part),
@@ -586,19 +481,18 @@ pub(crate) fn apply_cut(
                 // names. Otherwise the geometric matcher covers it; any mismatch
                 // falls back to `None` (re-tessellation), never a wrong name.
                 body.pristine = match (&cut_trace, &input_names) {
-                    (Some((combined, history)), Some(names))
+                    (Some(histories), Some(names))
                         if before_parts.len() == 1 && before_pristine.is_some() =>
                     {
-                        Some(std::sync::Arc::new(
-                            crate::mock_kernel::propagate_face_names_via_history(
-                                before_pristine.as_ref().unwrap(),
-                                names,
-                                combined,
-                                history,
-                                &body.id,
-                                &format!("cut:{extrude_id}"),
-                            ),
-                        ))
+                        crate::mock_kernel::propagate_face_names_via_body_histories(
+                            before_pristine.as_ref().unwrap(),
+                            names,
+                            &body.parts,
+                            histories,
+                            &body.id,
+                            &format!("cut:{extrude_id}"),
+                        )
+                        .map(std::sync::Arc::new)
                     }
                     _ => propagate_cut_face_names(
                         &before_parts,
@@ -609,20 +503,6 @@ pub(crate) fn apply_cut(
                     .map(std::sync::Arc::new),
                 };
                 body.sketch_source = next_source;
-                body.cut_tools.extend(cut_tool_recutter_tools(&replay_tool));
-                body.edge_mod_cut_history_path_used = false;
-                let mut replay = body.cut_replay.clone().unwrap_or_else(|| CutReplayHistory {
-                    base_body_id: body.id.clone(),
-                    base_parts: before_parts,
-                    base_pristine: before_pristine,
-                    base_sketch_source: before_sketch_source,
-                    steps: Vec::new(),
-                });
-                replay.steps.push(CutReplayStep {
-                    node_id: extrude_id.to_string(),
-                    tool: replay_tool,
-                });
-                body.cut_replay = Some(replay);
             }
         }
         if failed_on_overlap {
@@ -633,79 +513,6 @@ pub(crate) fn apply_cut(
             ));
         }
     }
-}
-
-/// Outcome of cutting a threaded body's smooth base (see
-/// [`cut_into_threaded_base`]).
-enum CutBaseOutcome {
-    /// The cut subtracted material; the shaft was re-threaded on top.
-    Changed,
-    /// The tool missed the base entirely (normal — no warning).
-    Missed,
-    /// The tool overlapped the base but the solver couldn't subtract it (the
-    /// user's material was left intact, so warn).
-    FailedOnOverlap,
-}
-
-/// Subtract `tool` from a threaded body via its smooth pre-thread base
-/// (`body.thread_replay`), then replay the thread steps. Keeps the smooth base
-/// intact for still-later booleans; the displayed geometry becomes the pocketed
-/// base with the shaft re-threaded. A thread step that can no longer re-cut
-/// leaves that region smooth rather than dropping the body.
-fn cut_into_threaded_base(body: &mut LiveBody, tool: &CutTool, rethread: bool) -> CutBaseOutcome {
-    let Some(replay) = body.thread_replay.as_mut() else {
-        return CutBaseOutcome::Missed;
-    };
-    let (fwd_bb, rev_bb) = cut_tool_bboxes(tool);
-
-    let mut changed = false;
-    let mut overlapped = false;
-    let mut new_base: Vec<KernelSolid> = Vec::with_capacity(replay.base_parts.len());
-    for part in replay.base_parts.drain(..) {
-        let pbb = crate::mock_kernel::solid_aabb(&part);
-        let overlaps_dir = |tbb: &Option<([f32; 3], [f32; 3])>| {
-            tbb.as_ref().is_some_and(|t| {
-                pbb.as_ref()
-                    .is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, t, 0.05))
-            })
-        };
-        if overlaps_dir(&fwd_bb) || overlaps_dir(&rev_bb) {
-            overlapped = true;
-        }
-        match cut_part_with_tool(&part, tool) {
-            Some(parts) => {
-                changed = true;
-                new_base.extend(parts);
-            }
-            None => new_base.push(part),
-        }
-    }
-    replay.base_parts = new_base;
-
-    if !changed {
-        return if overlapped {
-            CutBaseOutcome::FailedOnOverlap
-        } else {
-            CutBaseOutcome::Missed
-        };
-    }
-
-    // Rebuild the displayed geometry from the pocketed smooth base and replay
-    // the threads. `body.parts` gets its own copy so the base stays smooth for
-    // future booleans.
-    let base = replay.base_parts.clone();
-    let steps = replay.steps.clone();
-    body.parts = base;
-    body.sketch_source = None;
-    body.cut_replay = None;
-    body.edge_mod_cut_history_path_used = false;
-    if rethread {
-        for step in &steps {
-            let _ = thread_one(body, step);
-        }
-    }
-    refresh_thread_pristine(body);
-    CutBaseOutcome::Changed
 }
 
 /// Build a name-propagated pristine mesh for a cut result, or `None` to fall back
@@ -732,261 +539,4 @@ fn propagate_cut_face_names(
         ));
     }
     Some(mesh)
-}
-
-pub(crate) fn cut_tool_recutter_tools(tool: &CutTool) -> Vec<CutTool> {
-    tool.has_any_solid()
-        .then_some(tool.clone())
-        .into_iter()
-        .collect()
-}
-
-fn cut_replay_tool_from_source(source: &SketchExtrudeSource) -> Option<CutTool> {
-    source.regions.iter().find_map(|region| {
-        let canonical = region.rect_circle.as_ref()?;
-        let expanded = crate::mock_kernel::rect_minus_circle_region_base_and_grown_cutter(
-            &region.boundary,
-            &region.holes,
-            region.depth,
-            &region.cs,
-            CUT_WALL_GROW,
-        )
-        .map(|(_, cutter)| cutter);
-        Some(CutTool::single_direction(
-            Some(canonical.cutter.clone()),
-            None,
-            expanded,
-            None,
-        ))
-    })
-}
-
-pub(crate) fn replay_nodes_are_ordered_subset(
-    steps: &[CutReplayStep],
-    requested: &[String],
-) -> bool {
-    let mut cursor = 0usize;
-    for wanted in requested {
-        let Some(offset) = steps[cursor..]
-            .iter()
-            .position(|step| step.node_id == *wanted)
-        else {
-            return false;
-        };
-        cursor += offset + 1;
-    }
-    true
-}
-
-pub(crate) fn replay_cut_history(
-    mut parts: Vec<KernelSolid>,
-    steps: &[CutReplayStep],
-) -> Result<Vec<KernelSolid>, String> {
-    for (step_index, step) in steps.iter().enumerate() {
-        recut_debug(format!(
-            "replay step {step_index} '{}' across {} part(s)",
-            step.node_id,
-            parts.len()
-        ));
-        let (fwd_bb, rev_bb) = cut_tool_bboxes(&step.tool);
-        let mut next = Vec::with_capacity(parts.len());
-        for (part_index, part) in parts.into_iter().enumerate() {
-            let pbb = crate::mock_kernel::solid_aabb(&part);
-            let overlaps = |tbb: Option<&([f32; 3], [f32; 3])>| {
-                tbb.is_some_and(|t| {
-                    pbb.as_ref()
-                        .is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, t, 0.05))
-                })
-            };
-            match cut_part_with_tool(&part, &step.tool) {
-                Some(cut_parts) => {
-                    recut_debug(format!(
-                        "replay step '{}' cut part {part_index} into {} part(s)",
-                        step.node_id,
-                        cut_parts.len()
-                    ));
-                    next.extend(cut_parts);
-                }
-                None if overlaps(fwd_bb.as_ref()) || overlaps(rev_bb.as_ref()) => {
-                    let reason = format!("cut '{}' could not be replayed", step.node_id);
-                    recut_debug(&reason);
-                    return Err(reason);
-                }
-                None => {
-                    recut_debug(format!(
-                        "replay step '{}' missed part {part_index}",
-                        step.node_id
-                    ));
-                    next.push(part);
-                }
-            }
-        }
-        parts = next;
-    }
-    if parts.is_empty() {
-        recut_debug("replayed cuts consumed the entire body");
-        Err("replayed cuts consumed the entire body".to_string())
-    } else {
-        Ok(parts)
-    }
-}
-
-pub(crate) fn recut_replayed_parts_with_tools(
-    mut parts: Vec<KernelSolid>,
-    tools: &[CutTool],
-) -> Result<Vec<KernelSolid>, String> {
-    for (tool_index, tool) in tools.iter().enumerate() {
-        recut_debug(format!(
-            "recut cached tool {tool_index} across {} part(s)",
-            parts.len()
-        ));
-        let (fwd_bb, rev_bb) = cut_tool_bboxes(tool);
-        let mut next = Vec::with_capacity(parts.len());
-        for (part_index, part) in parts.into_iter().enumerate() {
-            let pbb = crate::mock_kernel::solid_aabb(&part);
-            let overlaps = |tbb: Option<&([f32; 3], [f32; 3])>| {
-                tbb.is_some_and(|t| {
-                    pbb.as_ref()
-                        .is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, t, 0.05))
-                })
-            };
-            if !overlaps(fwd_bb.as_ref()) && !overlaps(rev_bb.as_ref()) {
-                recut_debug(format!(
-                    "recut cached tool {tool_index} missed part {part_index}"
-                ));
-                next.push(part);
-                continue;
-            }
-            match cut_part_with_tool(&part, tool) {
-                Some(cut_parts) => {
-                    recut_debug(format!(
-                        "recut cached tool {tool_index} cut part {part_index} into {} part(s)",
-                        cut_parts.len()
-                    ));
-                    next.extend(cut_parts);
-                }
-                None => {
-                    recut_debug(format!(
-                        "recut cached tool {tool_index} overlapped part {part_index} but failed"
-                    ));
-                    next.push(part);
-                }
-            }
-        }
-        parts = next;
-    }
-    if parts.is_empty() {
-        recut_debug("grown recut consumed the entire replayed body");
-        Err("grown recut consumed the entire replayed body".to_string())
-    } else {
-        Ok(parts)
-    }
-}
-
-pub(crate) fn recut_candidate_with_tools(
-    candidate: KernelSolid,
-    tools: &[CutTool],
-) -> Result<Option<KernelSolid>, String> {
-    if tools.is_empty() {
-        return Ok(None);
-    }
-    let mut recut = recut_replayed_parts_with_tools(vec![candidate], tools)?;
-    if recut.len() == 1 {
-        Ok(recut.pop())
-    } else {
-        Err(format!(
-            "recut produced {} separate parts where one part was expected",
-            recut.len()
-        ))
-    }
-}
-
-pub(crate) fn replay_cut_void_ghost_sample_count(
-    history: &CutReplayHistory,
-    candidate_mesh: &MockMesh,
-) -> usize {
-    let voids: Vec<ReplayCutVoid> = history
-        .steps
-        .iter()
-        .flat_map(|step| replay_cut_void_solids(&step.tool))
-        .map(|solid| {
-            let mesh = MockMesh::from_solid(solid);
-            let aabb = mesh_position_aabb(&mesh);
-            ReplayCutVoid { mesh, aabb }
-        })
-        .filter(|void| !void.mesh.indices.is_empty())
-        .collect();
-    if voids.is_empty() {
-        return 0;
-    }
-
-    let vertex6 = |vi: u32| {
-        let b = vi as usize * 6;
-        [
-            candidate_mesh.vertices[b],
-            candidate_mesh.vertices[b + 1],
-            candidate_mesh.vertices[b + 2],
-        ]
-    };
-    let mut count = 0usize;
-    for v in candidate_mesh.vertices.chunks_exact(6) {
-        let p = [v[0], v[1], v[2]];
-        if replay_cut_void_contains_non_wall_sample(&voids, p) {
-            count += 1;
-        }
-    }
-    for tri in candidate_mesh.indices.chunks_exact(3) {
-        let a = vertex6(tri[0]);
-        let b = vertex6(tri[1]);
-        let c = vertex6(tri[2]);
-        let p = [
-            (a[0] + b[0] + c[0]) / 3.0,
-            (a[1] + b[1] + c[1]) / 3.0,
-            (a[2] + b[2] + c[2]) / 3.0,
-        ];
-        if replay_cut_void_contains_non_wall_sample(&voids, p) {
-            count += 1;
-        }
-    }
-    count
-}
-
-pub(crate) fn replay_cut_void_solids(tool: &CutTool) -> impl Iterator<Item = &KernelSolid> {
-    [
-        tool.smooth.as_ref().or(tool.exact.as_ref()),
-        tool.smooth_rev.as_ref().or(tool.exact_rev.as_ref()),
-    ]
-    .into_iter()
-    .flatten()
-}
-
-struct ReplayCutVoid {
-    mesh: MockMesh,
-    aabb: Option<([f32; 3], [f32; 3])>,
-}
-
-fn replay_cut_void_contains_non_wall_sample(voids: &[ReplayCutVoid], p: [f32; 3]) -> bool {
-    const WALL_TOL: f32 = 0.18;
-    voids.iter().any(|void| {
-        if let Some((lo, hi)) = void.aabb {
-            if !point_in_aabb(p, lo, hi, WALL_TOL) {
-                return false;
-            }
-        }
-        if mesh_surface_distance_sq(&void.mesh, p) <= WALL_TOL * WALL_TOL {
-            return false;
-        }
-        point_inside_triangle_mesh(&void.mesh, p, 0.02)
-    })
-}
-
-fn mesh_surface_distance_sq(mesh: &MockMesh, p: [f32; 3]) -> f32 {
-    let mut best = f32::INFINITY;
-    for tri in mesh.indices.chunks_exact(3) {
-        let a = mesh_vertex_pos6(mesh, tri[0]);
-        let b = mesh_vertex_pos6(mesh, tri[1]);
-        let c = mesh_vertex_pos6(mesh, tri[2]);
-        best = best.min(point_triangle_distance_sq(p, a, b, c));
-    }
-    best
 }

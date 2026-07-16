@@ -421,21 +421,117 @@ impl BRep {
     /// Returns a transformed copy of this B-Rep, transforming all vertices, curves, and surfaces.
     pub fn transformed(&self, t: &openrcad_foundation::Trsf) -> Self {
         let mut cloned = self.clone();
+        // Local uncertainty is expressed in model units. Rigid transforms keep
+        // it unchanged, while a uniform scale must carry it into the scaled
+        // coordinate system just like every other length-valued quantity.
+        let tolerance_scale = t.scale_factor().abs();
+        let pcurve_scales = exact_pcurve_coordinate_scales(self, t);
         for (_, v_data) in &mut cloned.vertices {
             v_data.point = t.transform_point(&v_data.point);
+            v_data.tolerance *= tolerance_scale;
         }
         for (_, e_data) in &mut cloned.edges {
             if let Some(ref mut c) = e_data.curve {
+                // Lines and parabolas use distance-valued parameters. Their
+                // supporting geometry is scaled below, so their trimmed range
+                // must be scaled as well to keep both vertices on the curve.
+                if matches!(
+                    c,
+                    openrcad_geom::GeomCurve::Line(_) | openrcad_geom::GeomCurve::Parabola(_)
+                ) {
+                    e_data.first *= tolerance_scale;
+                    e_data.last *= tolerance_scale;
+                }
                 *c = c.transformed(t);
             }
+            e_data.tolerance *= tolerance_scale;
         }
         for (_, f_data) in &mut cloned.faces {
             if let Some(ref mut s) = f_data.surface {
                 *s = s.transformed(t);
             }
         }
+        for (pcurve_id, (u_scale, v_scale)) in pcurve_scales {
+            let Some(mapped) = self.pcurves[pcurve_id].scaled_surface_coordinates(u_scale, v_scale)
+            else {
+                continue;
+            };
+            cloned.pcurves[pcurve_id] = mapped;
+        }
         cloned
     }
+}
+
+/// Exact UV coordinate scaling induced by a positive uniform 3D scale.
+fn surface_coordinate_scale(surface: &GeomSurface, scale: f64) -> Option<(f64, f64)> {
+    if scale == 1.0 {
+        return Some((1.0, 1.0));
+    }
+    match surface {
+        GeomSurface::Plane(_) => Some((scale, scale)),
+        GeomSurface::Cylinder(_) | GeomSurface::Cone(_) => Some((1.0, scale)),
+        GeomSurface::Sphere(_)
+        | GeomSurface::Torus(_)
+        | GeomSurface::BSpline(_)
+        | GeomSurface::Gregory(_) => Some((1.0, 1.0)),
+        GeomSurface::Offset(offset) => surface_coordinate_scale(&offset.base, scale),
+        GeomSurface::Ruled(ruled) => {
+            let first = curve_parameter_scale(&ruled.curve1, scale);
+            let second = curve_parameter_scale(&ruled.curve2, scale);
+            (first == second).then_some((first, 1.0))
+        }
+    }
+}
+
+fn curve_parameter_scale(curve: &GeomCurve, scale: f64) -> f64 {
+    match curve {
+        // These parameters are distances in model units.
+        GeomCurve::Line(_) | GeomCurve::Parabola(_) => scale,
+        // The remaining curve parameters are angular, dimensionless, or the
+        // unchanged knot coordinate of transformed control points.
+        GeomCurve::Circle(_)
+        | GeomCurve::Ellipse(_)
+        | GeomCurve::Hyperbola(_)
+        | GeomCurve::BSpline(_)
+        | GeomCurve::Helix(_) => 1.0,
+    }
+}
+
+fn exact_pcurve_coordinate_scales(
+    brep: &BRep,
+    transform: &openrcad_foundation::Trsf,
+) -> std::collections::HashMap<PcurveId, (f64, f64)> {
+    let scale = transform.scale_factor();
+    if !scale.is_finite() || scale <= 0.0 || transform.reverses_orientation() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut mappings = std::collections::HashMap::new();
+    for face in brep.faces.values() {
+        let Some(surface) = face.surface.as_ref() else {
+            continue;
+        };
+        let Some(coordinate_scale) = surface_coordinate_scale(surface, scale) else {
+            continue;
+        };
+        for loop_id in face.outer_wire.iter().chain(&face.inner_wires) {
+            for coedge in &brep.loops[*loop_id].edges {
+                let Some(pcurve_id) = coedge.pcurve else {
+                    continue;
+                };
+                mappings
+                    .entry(pcurve_id)
+                    .and_modify(|existing| {
+                        if *existing != coordinate_scale {
+                            *existing = (f64::NAN, f64::NAN);
+                        }
+                    })
+                    .or_insert(coordinate_scale);
+            }
+        }
+    }
+    mappings.retain(|_, (u_scale, v_scale)| u_scale.is_finite() && v_scale.is_finite());
+    mappings
 }
 
 /// Helper mapping old keys to new keys after merging BReps.

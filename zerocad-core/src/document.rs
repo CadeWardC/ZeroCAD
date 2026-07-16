@@ -4,7 +4,7 @@
 //! petgraph-backed evaluator input.  This module owns the durable meaning that
 //! must not depend on petgraph arena order or Rust enum discriminants.
 
-use crate::parametric::{body_output_owner_id, ExtrudeMode, FeatureType};
+use crate::parametric::{ExtrudeMode, FeatureType};
 use crate::{ParametricGraph, Unit};
 use std::collections::BTreeMap;
 
@@ -105,6 +105,13 @@ pub struct FeatureInput {
 }
 
 impl FeatureInput {
+    pub fn selection(role: impl Into<String>, selector: SemanticSelector) -> Self {
+        Self {
+            role: role.into(),
+            target: FeatureInputTarget::Selection(Box::new(selector)),
+        }
+    }
+
     pub fn feature(role: impl Into<String>, id: impl Into<FeatureId>) -> Self {
         Self {
             role: role.into(),
@@ -134,17 +141,6 @@ impl FeatureInput {
     }
 }
 
-/// Durable semantic metadata for one runtime feature node.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FeatureSemantics {
-    pub kind_id: FeatureKindId,
-    pub payload_version: u16,
-    pub sequence: SequenceKey,
-    pub inputs: Vec<FeatureInput>,
-    pub state: FeatureState,
-    pub body: Option<BodyId>,
-}
-
 /// A stable body and its explicit ordered feature timeline.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BodyRecord {
@@ -153,12 +149,15 @@ pub struct BodyRecord {
     pub timeline: Vec<FeatureId>,
 }
 
-/// Semantic sidecar for the runtime evaluator graph. BTree maps keep iteration
-/// deterministic for hashing and persistence.
+/// Cross-feature semantic document data. Feature contracts live directly on
+/// the authoritative runtime records; only body timelines need a shared map.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DocumentSemantics {
-    pub features: BTreeMap<FeatureId, FeatureSemantics>,
     pub bodies: BTreeMap<BodyId, BodyRecord>,
+    /// Runtime body output id -> the feature that produced it. This replaces
+    /// ownership guesses based on parsing display ids.
+    #[serde(default)]
+    pub body_outputs: BTreeMap<String, FeatureId>,
 }
 
 /// The durable entity classes accepted by the shared selector contract.
@@ -430,7 +429,7 @@ impl Default for DocumentState {
 /// not members of this type.
 #[derive(Debug, Clone)]
 pub struct Document {
-    pub graph: ParametricGraph,
+    runtime: ParametricGraph,
     pub state: DocumentState,
 }
 
@@ -443,14 +442,14 @@ impl Default for Document {
 impl Document {
     pub fn new() -> Self {
         Self {
-            graph: ParametricGraph::new(),
+            runtime: ParametricGraph::new(),
             state: DocumentState::default(),
         }
     }
 
     pub fn from_graph(graph: ParametricGraph, units: Unit) -> Self {
         Self {
-            graph,
+            runtime: graph,
             state: DocumentState {
                 units,
                 created_unix: None,
@@ -479,89 +478,38 @@ impl Document {
             .filter_map(|(id, visible)| (!*visible).then_some(id.clone()))
             .collect()
     }
+
+    /// Borrow the evaluator projection owned by this document.
+    ///
+    /// Phase 3 makes `Document` the application/edit-session root while keeping
+    /// `ParametricGraph` as the optimized runtime representation.  These
+    /// accessors make that ownership boundary explicit for workers and
+    /// persistence code without forcing UI code to know how the projection is
+    /// stored.
+    pub fn evaluator_graph(&self) -> &ParametricGraph {
+        &self.runtime
+    }
+
+    pub fn evaluator_graph_mut(&mut self) -> &mut ParametricGraph {
+        &mut self.runtime
+    }
+
+    pub fn into_evaluator_graph(self) -> ParametricGraph {
+        self.runtime
+    }
 }
 
-impl DocumentSemantics {
-    pub fn next_sequence(&self) -> SequenceKey {
-        SequenceKey(
-            self.features
-                .values()
-                .map(|feature| feature.sequence.0)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1),
-        )
+impl std::ops::Deref for Document {
+    type Target = ParametricGraph;
+
+    fn deref(&self) -> &Self::Target {
+        self.evaluator_graph()
     }
+}
 
-    pub(crate) fn register(
-        &mut self,
-        id: &str,
-        name: &str,
-        feature: &FeatureType,
-        sequence: SequenceKey,
-    ) {
-        let feature_id = FeatureId::from(id);
-        let body = body_for_feature(id, feature);
-        let semantics = FeatureSemantics {
-            kind_id: FeatureKindId::from(feature.kind_id()),
-            payload_version: feature.payload_version(),
-            sequence,
-            inputs: FeatureRegistry::dependencies(feature),
-            state: FeatureState::Active,
-            body: body.clone(),
-        };
-        self.features.insert(feature_id.clone(), semantics);
-
-        if let Some(body_id) = body {
-            let record = self
-                .bodies
-                .entry(body_id.clone())
-                .or_insert_with(|| BodyRecord {
-                    id: body_id,
-                    name: name.to_owned(),
-                    timeline: Vec::new(),
-                });
-            if !record.timeline.contains(&feature_id) {
-                record.timeline.push(feature_id);
-            }
-            record.timeline.sort_by_key(|member| {
-                self.features
-                    .get(member)
-                    .map(|feature| feature.sequence)
-                    .unwrap_or_default()
-            });
-        }
-    }
-
-    pub(crate) fn add_dependency(&mut self, parent: &str, child: &str) {
-        let Some(feature) = self.features.get_mut(&FeatureId::from(child)) else {
-            return;
-        };
-        let input = FeatureInput::feature("dependency", FeatureId::from(parent));
-        if !feature.inputs.contains(&input) {
-            feature.inputs.push(input);
-            feature.inputs.sort_by(|a, b| {
-                (a.role.as_str(), input_target_key(&a.target))
-                    .cmp(&(b.role.as_str(), input_target_key(&b.target)))
-            });
-        }
-    }
-
-    pub(crate) fn remove(&mut self, id: &str) {
-        let feature_id = FeatureId::from(id);
-        self.features.remove(&feature_id);
-        self.bodies.retain(|_, body| {
-            body.timeline.retain(|member| member != &feature_id);
-            !body.timeline.is_empty()
-        });
-        for feature in self.features.values_mut() {
-            feature.inputs.retain(|input| match &input.target {
-                FeatureInputTarget::Feature(target) => target != &feature_id,
-                FeatureInputTarget::Selection(selector) => {
-                    selector.provenance.feature.as_ref() != Some(&feature_id)
-                }
-            });
-        }
+impl std::ops::DerefMut for Document {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.evaluator_graph_mut()
     }
 }
 
@@ -586,7 +534,7 @@ fn input_target_key(target: &FeatureInputTarget) -> (&'static str, String) {
     }
 }
 
-fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId> {
+pub(crate) fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId> {
     let own_body = || Some(BodyId::from(id));
     match feature {
         FeatureType::Box { .. }
@@ -594,22 +542,22 @@ fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId> {
         | FeatureType::Import { .. }
         | FeatureType::Pattern { .. }
         | FeatureType::BodyTransform { .. }
-        | FeatureType::BodyJoin { .. } => own_body(),
+        | FeatureType::BodyJoin { .. }
+        | FeatureType::BodyCut { .. }
+        | FeatureType::BodyIntersect { .. }
+        | FeatureType::BodySplit { .. }
+        | FeatureType::BodyScale { .. } => own_body(),
         FeatureType::Extrude { mode, target, .. }
         | FeatureType::Revolve { mode, target, .. }
         | FeatureType::Loft { mode, target, .. }
         | FeatureType::Sweep { mode, target, .. } => match mode {
             ExtrudeMode::NewBody => own_body(),
-            ExtrudeMode::Join | ExtrudeMode::Cut => target
-                .as_deref()
-                .map(body_output_owner_id)
-                .map(BodyId::from),
+            ExtrudeMode::Join | ExtrudeMode::Cut => target.as_deref().map(BodyId::from),
         },
         FeatureType::EdgeMod { target, .. }
         | FeatureType::Shell { target, .. }
         | FeatureType::Hole { target, .. }
-        | FeatureType::Thread { target, .. }
-        | FeatureType::BodyCut { target, .. } => Some(BodyId::from(body_output_owner_id(target))),
+        | FeatureType::Thread { target, .. } => Some(BodyId::from(target.as_str())),
         FeatureType::Origin
         | FeatureType::Sketch { .. }
         | FeatureType::VariableSet { .. }
@@ -619,29 +567,60 @@ fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId> {
     }
 }
 
+/// Reconstruct the complete semantic input contract from the runtime payload
+/// and the dependency DAG. Keeping this in the semantic module gives
+/// registration, strict validation, and explicit edit synchronization one
+/// canonical comparison target while the Phase 2 sidecar remains in place.
+pub(crate) fn feature_inputs_for_runtime(
+    feature: &FeatureType,
+    dependency_ids: &[String],
+) -> Vec<FeatureInput> {
+    let mut inputs = intrinsic_inputs(feature);
+    inputs.extend(
+        dependency_ids
+            .iter()
+            .map(|id| FeatureInput::feature("dependency", FeatureId::from(id.as_str()))),
+    );
+    inputs.sort_by(|a, b| {
+        (a.role.as_str(), input_target_key(&a.target))
+            .cmp(&(b.role.as_str(), input_target_key(&b.target)))
+    });
+    inputs.dedup();
+    inputs
+}
+
 fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
     let mut inputs = match feature {
         FeatureType::EdgeMod { target, .. }
         | FeatureType::Shell { target, .. }
         | FeatureType::Hole { target, .. }
-        | FeatureType::Thread { target, .. } => vec![FeatureInput::body(
-            "target",
-            BodyId::from(body_output_owner_id(target)),
-        )],
-        FeatureType::Pattern { source, .. } | FeatureType::BodyTransform { source, .. } => {
-            vec![FeatureInput::body(
-                "source",
-                BodyId::from(body_output_owner_id(source)),
-            )]
+        | FeatureType::Thread { target, .. } => {
+            vec![FeatureInput::body("target", BodyId::from(target.as_str()))]
+        }
+        FeatureType::Pattern { source, .. }
+        | FeatureType::BodyTransform { source, .. }
+        | FeatureType::BodyScale { source, .. } => {
+            vec![FeatureInput::body("source", BodyId::from(source.as_str()))]
         }
         FeatureType::BodyJoin { sources } => sources
             .iter()
-            .map(|source| FeatureInput::body("source", BodyId::from(body_output_owner_id(source))))
+            .map(|source| FeatureInput::body("source", BodyId::from(source.as_str())))
             .collect(),
-        FeatureType::BodyCut { target, tool, .. } => vec![
-            FeatureInput::body("target", BodyId::from(body_output_owner_id(target))),
-            FeatureInput::body("tool", BodyId::from(body_output_owner_id(tool))),
+        FeatureType::BodyCut { target, tool, .. }
+        | FeatureType::BodyIntersect { target, tool, .. } => vec![
+            FeatureInput::body("target", BodyId::from(target.as_str())),
+            FeatureInput::body("tool", BodyId::from(tool.as_str())),
         ],
+        FeatureType::BodySplit { target, face, .. } => {
+            let mut inputs = vec![FeatureInput::body("target", BodyId::from(target.as_str()))];
+            if let Some(face) = face {
+                inputs.push(FeatureInput::selection(
+                    "plane_face",
+                    SemanticSelector::from_face(face),
+                ));
+            }
+            inputs
+        }
         FeatureType::Loft { sections, .. } => sections
             .iter()
             .map(|(sketch, _)| FeatureInput::sketch("section", FeatureId::from(sketch.as_str())))
@@ -680,9 +659,24 @@ pub enum FeatureEvaluatorKind {
     Infrastructure,
     Sketch,
     Datum,
-    Primitive,
-    BodyOperation,
-    Exchange,
+    Box,
+    Cylinder,
+    Extrude,
+    EdgeMod,
+    Import,
+    Revolve,
+    Loft,
+    Sweep,
+    Shell,
+    Hole,
+    Pattern,
+    BodyTransform,
+    Thread,
+    BodyJoin,
+    BodyCut,
+    BodyIntersect,
+    BodySplit,
+    BodyScale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -708,13 +702,13 @@ impl FeatureRegistry {
         registration(
             "part.box",
             "Box",
-            FeatureEvaluatorKind::Primitive,
+            FeatureEvaluatorKind::Box,
             FeatureEditorGroup::Solid,
         ),
         registration(
             "part.cylinder",
             "Cylinder",
-            FeatureEvaluatorKind::Primitive,
+            FeatureEvaluatorKind::Cylinder,
             FeatureEditorGroup::Solid,
         ),
         registration(
@@ -726,13 +720,13 @@ impl FeatureRegistry {
         registration(
             "part.extrude",
             "Extrude",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Extrude,
             FeatureEditorGroup::Solid,
         ),
         registration(
             "part.edge_mod",
             "Fillet / Chamfer",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::EdgeMod,
             FeatureEditorGroup::Modify,
         ),
         registration(
@@ -744,55 +738,55 @@ impl FeatureRegistry {
         registration(
             "exchange.step_import",
             "STEP Import",
-            FeatureEvaluatorKind::Exchange,
+            FeatureEvaluatorKind::Import,
             FeatureEditorGroup::Exchange,
         ),
         registration(
             "part.revolve",
             "Revolve",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Revolve,
             FeatureEditorGroup::Solid,
         ),
         registration(
             "part.loft",
             "Loft",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Loft,
             FeatureEditorGroup::Solid,
         ),
         registration(
             "part.sweep",
             "Sweep",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Sweep,
             FeatureEditorGroup::Solid,
         ),
         registration(
             "part.shell",
             "Shell",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Shell,
             FeatureEditorGroup::Modify,
         ),
         registration(
             "part.hole",
             "Hole",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Hole,
             FeatureEditorGroup::Modify,
         ),
         registration(
             "part.pattern",
             "Pattern",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Pattern,
             FeatureEditorGroup::Modify,
         ),
         registration(
             "part.transform",
             "Move / Copy",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::BodyTransform,
             FeatureEditorGroup::Modify,
         ),
         registration(
             "part.thread",
             "Thread",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::Thread,
             FeatureEditorGroup::Modify,
         ),
         registration(
@@ -816,13 +810,31 @@ impl FeatureRegistry {
         registration(
             "part.join",
             "Join",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::BodyJoin,
             FeatureEditorGroup::Modify,
         ),
         registration(
             "part.cut",
             "Cut",
-            FeatureEvaluatorKind::BodyOperation,
+            FeatureEvaluatorKind::BodyCut,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "part.intersect",
+            "Intersect",
+            FeatureEvaluatorKind::BodyIntersect,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "part.split",
+            "Split Body",
+            FeatureEvaluatorKind::BodySplit,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "part.scale",
+            "Scale Body",
+            FeatureEvaluatorKind::BodyScale,
             FeatureEditorGroup::Modify,
         ),
     ];
@@ -884,6 +896,9 @@ impl FeatureType {
             FeatureType::DatumPoint { .. } => "datum.point",
             FeatureType::BodyJoin { .. } => "part.join",
             FeatureType::BodyCut { .. } => "part.cut",
+            FeatureType::BodyIntersect { .. } => "part.intersect",
+            FeatureType::BodySplit { .. } => "part.split",
+            FeatureType::BodyScale { .. } => "part.scale",
         }
     }
 

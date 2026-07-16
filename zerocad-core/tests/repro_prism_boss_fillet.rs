@@ -234,7 +234,6 @@ fn oversized_boss_plane_seam_fillet_fails_safely() {
             // must be rejected before the Phase 3 replay path.
             dist: 30.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });
@@ -353,7 +352,6 @@ fn fillet_really_sharp_prism_corner_edge_gui_path() {
             },
             dist: 3.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });
@@ -387,7 +385,6 @@ fn fillet_acute_prism_corner_edge_gui_path() {
             },
             dist: 3.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });
@@ -421,7 +418,6 @@ fn fillet_prism_top_edge_with_boss_bite() {
             },
             dist: 3.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });

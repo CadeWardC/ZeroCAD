@@ -22,6 +22,7 @@ mod import;
 mod loft_sweep;
 mod node_map_resync;
 mod pattern_feature;
+mod phase35;
 mod reattachment_matrix;
 mod revolve_feature;
 mod semantic_document;

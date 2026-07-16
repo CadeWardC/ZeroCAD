@@ -7,14 +7,14 @@ use openrcad_geom::{CylindricalSurface, GeomCurve, GeomSurface, Plane, RuledSurf
 use openrcad_topo::{Edge, Face, FaceId, Solid, Vertex, Wire};
 use std::collections::{HashMap, HashSet};
 
-use crate::blend::{chamfer_cylinder, detect_cylinder, BlendError};
+use crate::blend::{chamfer_cylinder_with_policy, detect_cylinder, BlendError};
 use crate::rolling_ball::{
     adjacent_faces, endpoint_cap_faces, farthest_endpoint, is_concave_cut_cylinder,
     line_meets_cylinder, nearest_endpoint, orient_edge_between,
     planar_edge_material_wedge_is_concave, planar_outward_normal_checked, polyline_edge,
     relocate_edge, same_face, trim_face_along_spine, trim_face_at_corner, RollingBallError,
 };
-use crate::sew::{compatibility_policy, sew_with_policy};
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Errors reported by selected-edge chamfer construction.
 #[derive(Clone, Debug, PartialEq)]
@@ -116,8 +116,20 @@ impl From<RollingBallError> for ChamferError {
 }
 
 /// Chamfer every edge of `solid` by `distance`.
+#[deprecated(note = "use chamfer_with_policy")]
 pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
-    if distance <= tolerance::CONFUSION {
+    chamfer_with_policy(solid, distance, &TolerancePolicy::STANDARD)
+}
+
+pub fn chamfer_with_policy(
+    solid: &Solid,
+    distance: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    policy
+        .validate()
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    if distance <= policy.linear {
         return Ok(solid.clone());
     }
     if let Some((p0, ex, ey, ez, dx, dy, dz)) = detect_box(solid) {
@@ -128,10 +140,10 @@ pub fn chamfer(solid: &Solid, distance: f64) -> Result<Solid, BlendError> {
                 max,
             });
         }
-        return Ok(chamfer_box(p0, ex, ey, ez, dx, dy, dz, distance));
+        return Ok(chamfer_box(p0, ex, ey, ez, dx, dy, dz, distance, policy));
     }
     if let Some(cyl) = detect_cylinder(solid) {
-        return chamfer_cylinder(&cyl, distance);
+        return chamfer_cylinder_with_policy(&cyl, distance, policy);
     }
     Err(BlendError::UnsupportedShape)
 }
@@ -766,6 +778,7 @@ fn chamfer_box(
     dy: f64,
     dz: f64,
     distance: f64,
+    policy: &TolerancePolicy,
 ) -> Solid {
     let frame = LocalFrame { p0, ex, ey, ez };
 
@@ -1023,8 +1036,8 @@ fn chamfer_box(
     }
 
     // Sew the 26 faces into a single watertight Shell
-    let policy = compatibility_policy(distance * 0.1);
-    let shell = sew_with_policy(&faces, &policy).expect("compatibility policy is valid");
+    let shell =
+        sew_with_policy(&faces, policy).expect("policy was validated by chamfer_with_policy");
     Solid::new(shell)
 }
 

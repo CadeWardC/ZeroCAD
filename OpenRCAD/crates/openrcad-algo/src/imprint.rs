@@ -58,6 +58,39 @@ pub(crate) fn imprint_curve_on_face(
         face_edges.extend(builder.brep().loops[inner_id].edges.iter().copied());
     }
 
+    // A re-cut can rediscover an intersection that is already an approximate
+    // degree-one B-spline boundary of the candidate (notably a blend meeting a
+    // cylindrical cavity). Treat that span as existing topology instead of
+    // intersecting every pole against every pole and inserting duplicate seams.
+    if let GeomCurve::BSpline(candidate) = curve {
+        if candidate.degree() == 1 {
+            let boundary_tol = imprint_tolerance(tol) * 10.0;
+            let already_on_boundary = face_edges.iter().any(|oriented| {
+                let Some(edge) = builder.brep().edges.get(oriented.id) else {
+                    return false;
+                };
+                let Some(boundary_curve @ GeomCurve::BSpline(boundary)) = edge.curve.as_ref()
+                else {
+                    return false;
+                };
+                if boundary.degree() != 1 {
+                    return false;
+                }
+                (0..=4).all(|index| {
+                    let fraction = index as f64 / 4.0;
+                    let parameter = first + (last - first) * fraction;
+                    let point = curve.point(parameter);
+                    let edge_parameter =
+                        project_point_on_curve(&point, boundary_curve, edge.first, edge.last);
+                    boundary_curve.point(edge_parameter).distance(&point) <= boundary_tol
+                })
+            });
+            if already_on_boundary {
+                return (vec![face_id], Vec::new());
+            }
+        }
+    }
+
     // 2. Find all intersections of `curve` within `[first, last]` with the face edges
     let mut intersections = Vec::new();
     for oe in &face_edges {

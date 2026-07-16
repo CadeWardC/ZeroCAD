@@ -9,7 +9,10 @@ use openrcad_foundation::{Ax2, Ax22d, Ax3, Dir, Dir2d, Pnt, Pnt2d};
 use openrcad_geom::{BSplineCurve, BSplineSurface, Curve, GeomCurve, GeomSurface, Surface};
 use openrcad_geom2d::{BSplineCurve2d, Circle2d, Curve2d, Ellipse2d, GeomCurve2d, Line2d};
 use openrcad_topo::{
-    arena::{BRep, EdgeData, FaceData, LoopData, OrientedEdge, ShellData, SolidData, VertexData},
+    arena::{
+        BRep, EdgeData, EdgeId, FaceData, FaceId, LoopData, OrientedEdge, ShellData, SolidData,
+        VertexData,
+    },
     orientation::Orientation,
     PcurveData, Solid, SurfacePeriodicity,
 };
@@ -853,12 +856,16 @@ fn parse_curve2d_representation(
 
 fn surface_curve_arguments(entity: &StepEntity) -> Option<&[StepValue]> {
     match entity {
-        StepEntity::Simple { name, args } if name == "SURFACE_CURVE" || name == "SEAM_CURVE" => {
+        StepEntity::Simple { name, args }
+            if name == "SURFACE_CURVE" || name == "SEAM_CURVE" || name == "INTERSECTION_CURVE" =>
+        {
             Some(args)
         }
         StepEntity::Complex(parts) => parts
             .iter()
-            .find(|(name, _)| name == "SURFACE_CURVE" || name == "SEAM_CURVE")
+            .find(|(name, _)| {
+                name == "SURFACE_CURVE" || name == "SEAM_CURVE" || name == "INTERSECTION_CURVE"
+            })
             .map(|(_, args)| args.as_slice()),
         _ => None,
     }
@@ -1734,7 +1741,6 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
 
     let mut vertex_map = HashMap::new();
     let mut edge_map = HashMap::new();
-    let mut loop_map = HashMap::new();
     let mut face_map = HashMap::new();
     let mut pcurve_occurrences = HashMap::<(u32, u32), usize>::new();
 
@@ -1816,11 +1822,17 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
         let mut outer_wire = None;
         let mut inner_wires = Vec::new();
 
-        for &bound_ref in &bounds_list {
+        let has_explicit_outer = bounds_list.iter().any(|bound_ref| {
+            matches!(
+                entities.get(bound_ref),
+                Some(StepEntity::Simple { name, .. }) if name == "FACE_OUTER_BOUND"
+            )
+        });
+        for (bound_index, &bound_ref) in bounds_list.iter().enumerate() {
             let bound_ent = entities
                 .get(&bound_ref)
                 .ok_or_else(|| format!("Bound #{} not found", bound_ref))?;
-            let (loop_ref, is_outer) = match bound_ent {
+            let (loop_ref, is_outer, bound_forward) = match bound_ent {
                 StepEntity::Simple { name, args }
                     if name == "FACE_OUTER_BOUND" || name == "FACE_BOUND" =>
                 {
@@ -1829,7 +1841,16 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                             StepValue::Ref(r) => r,
                             _ => return Err("Invalid bound loop reference".to_string()),
                         };
-                        (l_ref, name == "FACE_OUTER_BOUND")
+                        let orientation = match &args[2] {
+                            StepValue::Enum(value) => value == "T",
+                            _ => true,
+                        };
+                        // AP203-era exporters commonly encode every boundary as
+                        // FACE_BOUND. In that representation the first bound is
+                        // the face exterior and subsequent bounds are holes.
+                        let is_outer =
+                            name == "FACE_OUTER_BOUND" || (!has_explicit_outer && bound_index == 0);
+                        (l_ref, is_outer, orientation)
                     } else {
                         return Err("Invalid bound arguments".to_string());
                     }
@@ -1842,9 +1863,11 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                 }
             };
 
-            let l_id = if let Some(&l_id) = loop_map.get(&loop_ref) {
-                l_id
-            } else {
+            // Coedges and their pcurves are face-local. Rebuild every bound
+            // occurrence even when a STEP EDGE_LOOP entity is referenced more
+            // than once; sharing the first occurrence would incorrectly share
+            // its surface-specific pcurves and orientation.
+            let l_id = {
                 let loop_ent = entities
                     .get(&loop_ref)
                     .ok_or_else(|| format!("Loop #{} not found", loop_ref))?;
@@ -1874,7 +1897,12 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                 };
 
                 let mut oriented_edges = Vec::new();
-                for &oe_ref in &oe_refs {
+                let oriented_edge_refs: Vec<_> = if bound_forward {
+                    oe_refs.iter().copied().collect()
+                } else {
+                    oe_refs.iter().rev().copied().collect()
+                };
+                for oe_ref in oriented_edge_refs {
                     let oe_ent = entities
                         .get(&oe_ref)
                         .ok_or_else(|| format!("Oriented edge #{} not found", oe_ref))?;
@@ -1893,7 +1921,14 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                                     StepValue::Enum(s) => s == "T",
                                     _ => true,
                                 };
-                                (e_ref, same_sense)
+                                (
+                                    e_ref,
+                                    if bound_forward {
+                                        same_sense
+                                    } else {
+                                        !same_sense
+                                    },
+                                )
                             } else {
                                 return Err("Invalid ORIENTED_EDGE arguments".to_string());
                             }
@@ -2017,7 +2052,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                         };
 
                         let curve = parse_curve(curve_ref, &entities)?;
-                        let first = project_on_curve(&curve, brep.vertices[start_v_id].point);
+                        let mut first = project_on_curve(&curve, brep.vertices[start_v_id].point);
                         let mut last = project_on_curve(&curve, brep.vertices[end_v_id].point);
                         if curve.is_periodic() {
                             let period = curve.period();
@@ -2030,6 +2065,24 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                                     last -= period;
                                 }
                             }
+                        }
+                        if curve.is_closed()
+                            && (last - first).abs() <= openrcad_foundation::tolerance::CONFUSION
+                            && brep.vertices[start_v_id]
+                                .point
+                                .distance(&brep.vertices[end_v_id].point)
+                                <= openrcad_foundation::tolerance::CONFUSION
+                        {
+                            // A closed, non-periodic B-spline projects its shared
+                            // endpoint to both ends of the domain. Preserve the
+                            // full EDGE_CURVE instead of collapsing it at the
+                            // first projection minimum.
+                            let (bound_first, bound_last) = curve.bounds();
+                            (first, last) = if curve_same_sense {
+                                (bound_first, bound_last)
+                            } else {
+                                (bound_last, bound_first)
+                            };
                         }
 
                         // The edge is stored in its natural sense (start -> end with the
@@ -2088,7 +2141,6 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                 let l_id = brep.loops.insert(LoopData {
                     edges: oriented_edges,
                 });
-                loop_map.insert(loop_ref, l_id);
                 l_id
             };
 
@@ -2113,6 +2165,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
         shell_faces.push(f_id);
     }
 
+    orient_imported_shell(&mut brep, &shell_faces)?;
     let shell_id_new = brep.shells.insert(ShellData { faces: shell_faces });
 
     let solid_id_new = brep.solids.insert(SolidData {
@@ -2120,6 +2173,75 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
     });
 
     Ok(Solid::from_id(std::sync::Arc::new(brep), solid_id_new))
+}
+
+/// Reconcile STEP face senses into one consistently oriented shell. STEP keeps
+/// surface sense, face-bound sense, and oriented-edge sense in separate
+/// entities; this final graph pass composes them and flips only faces whose
+/// shared-edge traversal would otherwise agree with their neighbour.
+fn orient_imported_shell(brep: &mut BRep, faces: &[FaceId]) -> Result<(), String> {
+    let mut uses = HashMap::<EdgeId, Vec<(usize, bool)>>::new();
+    for (face_index, &face_id) in faces.iter().enumerate() {
+        let face = &brep.faces[face_id];
+        let face_reversed = face.orientation == Orientation::Reversed;
+        for loop_id in face
+            .outer_wire
+            .into_iter()
+            .chain(face.inner_wires.iter().copied())
+        {
+            for coedge in &brep.loops[loop_id].edges {
+                let effective_forward =
+                    (coedge.orientation == Orientation::Forward) ^ face_reversed;
+                uses.entry(coedge.id)
+                    .or_default()
+                    .push((face_index, effective_forward));
+            }
+        }
+    }
+
+    let mut adjacency = vec![Vec::<(usize, bool)>::new(); faces.len()];
+    for edge_uses in uses.values() {
+        if let [(left, left_forward), (right, right_forward)] = edge_uses.as_slice() {
+            // flip[right] = flip[left] XOR relation.
+            let relation = *left_forward ^ *right_forward ^ true;
+            adjacency[*left].push((*right, relation));
+            adjacency[*right].push((*left, relation));
+        }
+    }
+
+    let mut flips = vec![None; faces.len()];
+    for root in 0..faces.len() {
+        if flips[root].is_some() {
+            continue;
+        }
+        flips[root] = Some(false);
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(face) = queue.pop_front() {
+            let current = flips[face].expect("queued face has an orientation");
+            for &(neighbour, relation) in &adjacency[face] {
+                let required = current ^ relation;
+                match flips[neighbour] {
+                    Some(existing) if existing != required => {
+                        return Err(
+                            "STEP shell has inconsistent face orientation constraints".into()
+                        )
+                    }
+                    Some(_) => {}
+                    None => {
+                        flips[neighbour] = Some(required);
+                        queue.push_back(neighbour);
+                    }
+                }
+            }
+        }
+    }
+
+    for (&face_id, flip) in faces.iter().zip(flips) {
+        if flip == Some(true) {
+            brep.faces[face_id].orientation = brep.faces[face_id].orientation.reversed();
+        }
+    }
+    Ok(())
 }
 
 /// Read a STEP file at `path` into a [`Solid`] (AP242 B-Rep).

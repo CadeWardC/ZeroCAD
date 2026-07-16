@@ -94,10 +94,11 @@ impl Surface for ToroidalSurface {
     }
 
     fn transformed(&self, t: &Trsf) -> Self {
+        let scale = t.scale_factor().abs();
         Self::new(
             self.pos.transformed(t),
-            self.major_radius,
-            self.minor_radius,
+            self.major_radius * scale,
+            self.minor_radius * scale,
         )
     }
 }

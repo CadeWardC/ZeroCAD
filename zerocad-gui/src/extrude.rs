@@ -297,7 +297,7 @@ impl ZeroCadApp {
         for id in hidden {
             id.hash(&mut h);
         }
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         let mut var_keys: Vec<&String> = vars.keys().collect();
         var_keys.sort();
         for key in var_keys {
@@ -325,13 +325,13 @@ impl ZeroCadApp {
         self.extrude_preview_settle = None;
     }
 
-    fn build_preview_extrude_graph(&self) -> Option<zerocad_core::ParametricGraph> {
+    fn build_preview_extrude_document(&self) -> Option<zerocad_core::Document> {
         let op = self.extrude_op.as_ref()?;
         if op.depth.abs() < 0.01 {
             return None;
         }
 
-        let mut graph = self.graph.clone();
+        let mut graph = self.document.clone();
         // Direct face push/pull: the helper sketch only exists in this preview
         // clone (and later at commit) — never in the working graph.
         if let Some(p) = &op.pending_face_sketch {
@@ -427,10 +427,10 @@ impl ZeroCadApp {
         // The persistent evaluator owns the single worker and applies latest-wins
         // cancellation, so no per-preview thread or result channel is needed.
         if self.extrude_preview_inflight.is_none() {
-            if let Some(graph) = self.build_preview_extrude_graph() {
+            if let Some(document) = self.build_preview_extrude_document() {
                 self.evaluator.submit(
                     crate::evaluation_worker::EvaluationPurpose::ExtrudePreview(key),
-                    graph,
+                    document,
                     self.hidden_nodes.clone(),
                     zerocad_core::EvaluationQuality::Interactive,
                     self.egui_ctx.clone(),
@@ -722,7 +722,7 @@ impl ZeroCadApp {
         // bystander body that later drifts into the tool's path, and a deleted
         // target fails loud instead of cutting something else.
         let target = if matches!(mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
-            self.graph
+            self.document
                 .sketch_face_refs
                 .get(sketch_id)
                 .and_then(|fref| fref.topology.as_ref())
@@ -742,8 +742,8 @@ impl ZeroCadApp {
                 depth_expr,
             },
         };
-        self.graph.add_feature(extrude_node);
-        self.graph.add_dependency(sketch_id, &extrude_id);
+        self.document.add_feature(extrude_node);
+        self.document.add_dependency(sketch_id, &extrude_id);
         Some(extrude_id)
     }
 
@@ -759,9 +759,9 @@ impl ZeroCadApp {
         Vec<zerocad_core::ShapeLoop>,
         Vec<zerocad_core::Circle>,
     )> {
-        let var_map = self.graph.variable_map();
-        self.graph.graph.node_indices().find_map(|idx| {
-            let node = &self.graph.graph[idx];
+        let var_map = self.document.variable_map();
+        self.document.graph.node_indices().find_map(|idx| {
+            let node = &self.document.graph[idx];
             if node.id == sketch_id {
                 if let FeatureType::Sketch {
                     cs,
@@ -786,7 +786,7 @@ impl ZeroCadApp {
                     // Same merge order as the evaluator: drawn curves first,
                     // then the projected face boundary (sketch-on-face), so
                     // the region indices agree with what eval will build.
-                    if let Some(b) = self.graph.sketch_face_boundaries.get(sketch_id) {
+                    if let Some(b) = self.document.sketch_face_boundaries.get(sketch_id) {
                         eff.extend_curves(b);
                     }
                     // Shape outlines (skipped when the sketch uses corner-mods,
@@ -816,10 +816,10 @@ impl ZeroCadApp {
         let Some(op) = self.extrude_op.as_ref() else {
             return false;
         };
-        let var_map = self.graph.variable_map();
+        let var_map = self.document.variable_map();
         op.targets.iter().any(|t| {
-            self.graph.graph.node_indices().any(|idx| {
-                let node = &self.graph.graph[idx];
+            self.document.graph.node_indices().any(|idx| {
+                let node = &self.document.graph[idx];
                 if node.id != t.sketch_id {
                     return false;
                 }
@@ -1086,7 +1086,7 @@ impl ZeroCadApp {
         // Direct face push/pull: materialize the helper on-face sketch now
         // (inside this undo unit), so the extrude below has a real parent.
         if let Some(p) = &op.pending_face_sketch {
-            insert_pending_face_sketch(&mut self.graph, p);
+            insert_pending_face_sketch(&mut self.document, p);
         }
 
         let mut last_id = None;

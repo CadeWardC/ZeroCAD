@@ -11,9 +11,7 @@ use zerocad_core::mock_kernel::{
     EdgeCurveHint, KernelSolid, MockMesh, ThreadSpec,
 };
 use zerocad_core::parametric::FaceRef;
-use zerocad_core::{
-    CornerKind, EdgeModReplayIntent, EdgeRef, FeatureNode, FeatureType, ParametricGraph,
-};
+use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, ParametricGraph};
 
 /// Cylinder primitive: +Y axis, base at origin.
 fn add_cylinder(g: &mut ParametricGraph, id: &str, r: f32, h: f32) {
@@ -57,7 +55,6 @@ fn add_rim_blend(
             edge: rim,
             dist: 1.0,
             dist_expr: None,
-            replay: EdgeModReplayIntent::default(),
             kind,
         },
     });
@@ -464,7 +461,6 @@ fn internal_thread_keeps_the_countersink() {
                 edge: rim,
                 dist: 1.0,
                 dist_expr: None,
-                replay: EdgeModReplayIntent::default(),
                 kind: CornerKind::Chamfer,
             },
         });

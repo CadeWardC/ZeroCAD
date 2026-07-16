@@ -47,12 +47,14 @@ impl Shell {
     /// Build from anything iterable of faces.
     pub fn from_faces<I: IntoIterator<Item = Face>>(faces: I) -> Self {
         let mut brep = BRep::new();
-        let mut merged: std::collections::HashMap<usize, crate::arena::MergeMap> =
+        let mut merged: std::collections::HashMap<usize, (Arc<BRep>, crate::arena::MergeMap)> =
             std::collections::HashMap::new();
         let mut new_faces = Vec::new();
         for face in faces {
             let ptr = Arc::as_ptr(&face.brep) as usize;
-            let map = merged.entry(ptr).or_insert_with(|| brep.merge(&face.brep));
+            let (_, map) = merged
+                .entry(ptr)
+                .or_insert_with(|| (face.brep.clone(), brep.merge(&face.brep)));
             let new_face_id = map.faces[&face.id];
 
             // Sync face's orientation in BRep data to match handle

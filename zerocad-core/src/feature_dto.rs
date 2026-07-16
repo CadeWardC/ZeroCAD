@@ -5,8 +5,8 @@
 //! feature kind's payload version and adds an explicit decoder.
 
 use crate::parametric::{
-    AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeModReplayIntent, EdgeRef,
-    ExtrudeMode, FaceRef, FeatureType, HoleKind, PatternKind, Variable,
+    AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeRef, ExtrudeMode, FaceRef,
+    FeatureType, HoleKind, PatternKind, PlaneBase, Variable,
 };
 use crate::sketch::{
     CornerKind, CornerMod, EntityId, SketchMirror, SketchShape, SketchSolverModel,
@@ -105,14 +105,15 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             edge,
             dist,
             dist_expr,
-            replay,
             kind,
         } => {
             put(&mut fields, 0, target);
             put(&mut fields, 1, edge);
             put(&mut fields, 2, dist);
             put(&mut fields, 3, dist_expr);
-            put(&mut fields, 4, replay);
+            // Field 4 was the pre-Phase-3 construction-replay hint. Keep its
+            // numeric slot reserved so v5 payload numbering remains stable.
+            put(&mut fields, 4, &());
             put(&mut fields, 5, kind);
         }
         FeatureType::VariableSet { variables } => put(&mut fields, 0, variables),
@@ -233,6 +234,35 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             put(&mut fields, 1, tool);
             put(&mut fields, 2, keep_tool);
         }
+        FeatureType::BodyIntersect {
+            target,
+            tool,
+            keep_tool,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, tool);
+            put(&mut fields, 2, keep_tool);
+        }
+        FeatureType::BodySplit {
+            target,
+            plane,
+            face,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, plane);
+            put(&mut fields, 2, face);
+        }
+        FeatureType::BodyScale {
+            source,
+            factor,
+            factor_expr,
+            center,
+        } => {
+            put(&mut fields, 0, source);
+            put(&mut fields, 1, factor);
+            put(&mut fields, 2, factor_expr);
+            put(&mut fields, 3, center);
+        }
     }
     fields
 }
@@ -272,8 +302,14 @@ pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<Fea
             edge: take::<EdgeRef>(&mut fields, 1, "edge")?,
             dist: take(&mut fields, 2, "distance")?,
             dist_expr: take(&mut fields, 3, "distance expression")?,
-            replay: take::<EdgeModReplayIntent>(&mut fields, 4, "replay")?,
-            kind: take::<CornerKind>(&mut fields, 5, "kind")?,
+            kind: {
+                // Replay hints are intentionally discarded: Phase 3 evaluates
+                // the current body through the native operation pipeline.
+                fields.remove(&4).ok_or_else(|| {
+                    "feature payload is missing field 4 (reserved replay slot)".to_string()
+                })?;
+                take::<CornerKind>(&mut fields, 5, "kind")?
+            },
         },
         "document.variables" => FeatureType::VariableSet {
             variables: take::<Vec<Variable>>(&mut fields, 0, "variables")?,
@@ -352,6 +388,22 @@ pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<Fea
             tool: take(&mut fields, 1, "tool")?,
             keep_tool: take(&mut fields, 2, "keep tool")?,
         },
+        "part.intersect" => FeatureType::BodyIntersect {
+            target: take(&mut fields, 0, "target")?,
+            tool: take(&mut fields, 1, "tool")?,
+            keep_tool: take(&mut fields, 2, "keep tool")?,
+        },
+        "part.split" => FeatureType::BodySplit {
+            target: take(&mut fields, 0, "target")?,
+            plane: take::<PlaneBase>(&mut fields, 1, "plane")?,
+            face: take::<Option<FaceRef>>(&mut fields, 2, "face")?,
+        },
+        "part.scale" => FeatureType::BodyScale {
+            source: take(&mut fields, 0, "source")?,
+            factor: take(&mut fields, 1, "factor")?,
+            factor_expr: take(&mut fields, 2, "factor expression")?,
+            center: take(&mut fields, 3, "center")?,
+        },
         "exchange.step_import" => {
             return Err("STEP imports must use a content-addressed asset payload".into())
         }
@@ -359,4 +411,59 @@ pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<Fea
     };
     finish(kind, fields)?;
     Ok(feature)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase35_payloads_have_stable_v1_round_trips() {
+        let intersect = FeatureType::BodyIntersect {
+            target: "target".into(),
+            tool: "tool".into(),
+            keep_tool: true,
+        };
+        let decoded = decode("part.intersect", encode(&intersect)).unwrap();
+        assert!(matches!(
+            decoded,
+            FeatureType::BodyIntersect { target, tool, keep_tool }
+                if target == "target" && tool == "tool" && keep_tool
+        ));
+
+        let split = FeatureType::BodySplit {
+            target: "target".into(),
+            plane: PlaneBase::Datum("datum".into()),
+            face: None,
+        };
+        let decoded = decode("part.split", encode(&split)).unwrap();
+        assert!(matches!(
+            decoded,
+            FeatureType::BodySplit {
+                target,
+                plane: PlaneBase::Datum(datum),
+                face: None,
+            } if target == "target" && datum == "datum"
+        ));
+
+        let scale = FeatureType::BodyScale {
+            source: "source".into(),
+            factor: 2.5,
+            factor_expr: Some("scale_factor".into()),
+            center: [1.0, 2.0, 3.0],
+        };
+        let decoded = decode("part.scale", encode(&scale)).unwrap();
+        assert!(matches!(
+            decoded,
+            FeatureType::BodyScale {
+                source,
+                factor,
+                factor_expr: Some(expression),
+                center,
+            } if source == "source"
+                && factor == 2.5
+                && expression == "scale_factor"
+                && center == [1.0, 2.0, 3.0]
+        ));
+    }
 }

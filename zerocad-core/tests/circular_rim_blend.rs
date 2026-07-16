@@ -8,8 +8,8 @@ use zerocad_core::mock_kernel::{
     chamfer_edge_with_hint, cylinder_solid, fillet_edge_with_hint, EdgeCurveHint, KernelSolid,
 };
 use zerocad_core::{
-    detect_regions, CoordinateSystem, EdgeModReplayIntent, EdgeRef, ExtrudeMode, FeatureNode,
-    FeatureType, ParametricGraph, SketchCurves, Vec3,
+    detect_regions, CoordinateSystem, EdgeRef, ExtrudeMode, FeatureNode, FeatureType,
+    ParametricGraph, SketchCurves, Vec3,
 };
 
 /// The cylinder primitive is built about the +Y axis, so its top rim sits at
@@ -131,7 +131,6 @@ fn rim_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
             edge: rim,
             dist: 1.0,
             dist_expr: None,
-            replay: EdgeModReplayIntent::default(),
             kind,
         },
     });
@@ -198,7 +197,6 @@ fn rim_edge_mod_reaches_native_solver_and_degrades_safely() {
             edge: rim,
             dist: 1.0,
             dist_expr: None,
-            replay: EdgeModReplayIntent::default(),
             kind: zerocad_core::CornerKind::Fillet,
         },
     });
@@ -567,7 +565,6 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
             edge: arc,
             dist: 1.5,
             dist_expr: None,
-            replay: EdgeModReplayIntent::default(),
             kind,
         },
     });
@@ -665,7 +662,6 @@ fn sketch_extrude_edge_mod(
             edge,
             dist,
             dist_expr: None,
-            replay: EdgeModReplayIntent::default(),
             kind,
         },
     });
@@ -909,7 +905,6 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
                     edge,
                     dist: distance,
                     dist_expr: None,
-                    replay: EdgeModReplayIntent::default(),
                     kind: zerocad_core::CornerKind::Fillet,
                 },
             });
@@ -918,10 +913,12 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
     let first_dist = if arc_first { dist } else { 30.0 };
     edge_mod(&mut g, "em1", "e", first, first_dist);
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
-    if warnings
-        .iter()
-        .any(|warning| warning.contains("couldn't be"))
-    {
+    let blend_declined = |warnings: &[String]| {
+        warnings.iter().any(|warning| {
+            warning.contains("couldn't be") || warning.contains("native operation failed")
+        })
+    };
+    if blend_declined(&warnings) {
         assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
         if !arc_first {
             let solids = g.debug_kernel_solids(&HashSet::new()).unwrap();
@@ -947,10 +944,8 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
     if !arc_first {
         assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("couldn't be")),
-            "{label}: oversized second fillet must be diagnosed"
+            blend_declined(&warnings),
+            "{label}: oversized second fillet must be diagnosed, got {warnings:?}"
         );
         assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
         assert_eq!(
@@ -964,10 +959,7 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
         }));
         return;
     }
-    if warnings
-        .iter()
-        .any(|warning| warning.contains("couldn't be"))
-    {
+    if blend_declined(&warnings) {
         assert_eq!(bodies.len(), 1, "{label}: safe fallback keeps one body");
         assert_eq!(
             bodies[0].1.indices.len(),

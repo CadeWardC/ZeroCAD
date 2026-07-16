@@ -13,7 +13,7 @@ use crate::merge::{
     consolidate_collinear_edges_with_policy, heal_tjunctions_with_policy,
     merge_cocylindrical_faces_classed_with_policy, merge_coplanar_faces_classed_with_policy,
 };
-use crate::sew::sew_with_policy;
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Failure of the shared Phase 1 healing pipeline.
 #[derive(Clone, Debug, PartialEq)]

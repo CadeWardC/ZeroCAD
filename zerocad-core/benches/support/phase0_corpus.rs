@@ -116,8 +116,14 @@ pub fn five_hundred_feature_history() -> ParametricGraph {
 }
 
 fn box_step_data() -> String {
-    let solid =
-        openrcad::primitives::make_box(&openrcad::foundation::Pnt::origin(), 20.0, 12.0, 8.0);
+    let solid = openrcad::primitives::make_box_operation(
+        &openrcad::foundation::Pnt::origin(),
+        20.0,
+        12.0,
+        8.0,
+    )
+    .expect("build imported STEP corpus")
+    .value;
     let sequence = STEP_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "zerocad_phase0_import_{}_{sequence}.step",

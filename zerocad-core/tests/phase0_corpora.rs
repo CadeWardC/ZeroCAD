@@ -109,24 +109,6 @@ fn fresh_phase0_evaluations_have_deterministic_body_and_triangle_counts() {
 }
 
 #[test]
-fn external_step_fixture_has_a_stable_explicit_unsupported_curve_diagnostic() {
-    let hidden = HashSet::new();
-    let evaluate = || {
-        corpus::external_step_history()
-            .evaluate_bodies_with_warnings(&hidden)
-            .expect("unsupported external STEP entities must not crash evaluation")
-    };
-
-    let (first_bodies, first_warnings) = evaluate();
-    let (second_bodies, second_warnings) = evaluate();
-    assert!(first_bodies.is_empty());
-    assert!(second_bodies.is_empty());
-    assert_eq!(first_warnings, second_warnings);
-    assert_eq!(first_warnings.len(), 1);
-    assert!(first_warnings[0].contains("Unsupported curve type: INTERSECTION_CURVE"));
-}
-
-#[test]
 fn external_step_fixture_retains_its_non_openrcad_provenance() {
     let fixture = include_str!("fixtures/step/nist-bracket1-part.stp");
     assert!(fixture.contains("'ST-ACIS'"));

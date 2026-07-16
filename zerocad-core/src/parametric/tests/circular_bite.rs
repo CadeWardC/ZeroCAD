@@ -261,10 +261,6 @@ fn assert_circular_bite_fillet_3mm_committed(
     );
     assert_eq!(live.len(), 1, "{label}: {kind:?} keeps one live body");
     assert!(
-        live[0].edge_mod_cut_history_path_used,
-        "{label}: {kind:?} must use the guarded cut-history path for the circular-bite sketch case"
-    );
-    assert!(
         live[0].pristine.is_none(),
         "{label}: {kind:?} must clear pristine after modifying the B-Rep"
     );
@@ -385,10 +381,6 @@ fn assert_replay_fillet_preserves_explicit_cylinder_cut_bite(depth: f32, label: 
         base_warnings.is_empty(),
         "{label}: explicit cylinder-cut setup should be clean, got {base_warnings:?}"
     );
-    assert!(
-        base_live[0].cut_replay.is_some(),
-        "{label}: cut body should carry replayable construction history"
-    );
     let base_mesh = tessellate_bodies(base_live)[0].1.clone();
     assert!(
         mesh_has_wire_edge_between(&base_mesh, edge.p0, edge.p1, 0.08),
@@ -404,10 +396,6 @@ fn assert_replay_fillet_preserves_explicit_cylinder_cut_bite(depth: f32, label: 
         "{label}: replay fillet on explicit cylinder cut should not warn, got {warnings:?}"
     );
     assert_eq!(live.len(), 1, "{label}: replay fillet keeps one body");
-    assert!(
-        live[0].edge_mod_cut_history_path_used,
-        "{label}: explicit cylinder-cut fillet must use the guarded cut-history path"
-    );
     assert!(
         live_has_cylinder_radius(&live, 14.0),
         "{label}: replayed cut should keep the radius-14 analytic cylinder"
@@ -463,10 +451,6 @@ fn assert_replay_fillet_preserves_rectangular_pocket_cut(depth: f32, label: &str
         warnings.is_empty(),
         "{label}: replay fillet on rectangular pocket should not warn, got {warnings:?}"
     );
-    assert!(
-        live[0].edge_mod_cut_history_path_used,
-        "{label}: rectangular pocket fillet must use the guarded cut-history path"
-    );
     let mesh = &tessellate_bodies(live)[0].1;
     assert_eq!(
         mesh_sample_count_in_box(mesh, [14.0, 2.0, 1.0], [26.0, 10.0, 9.0]),
@@ -492,19 +476,12 @@ fn assert_replay_fillet_preserves_rectangular_pocket_cut(depth: f32, label: &str
 }
 
 #[test]
-fn invalid_replay_fillet_preserves_later_cuts_and_diagnoses() {
+fn invalid_native_fillet_preserves_later_cuts_and_diagnoses() {
     let edge = explicit_cylinder_cutoff_edge();
     let mut g = box_with_explicit_cylinder_cut();
     add_later_rectangular_pocket_cut(&mut g, "sketch_4", "cut_5");
 
-    let replay =
-        g.edge_mod_replay_intent_for_edge("box_1", &edge, &std::collections::HashSet::new());
-    assert_eq!(
-        replay.replay_cut_nodes,
-        vec!["cut_3".to_string(), "cut_5".to_string()],
-        "replay intent should capture the full ordered cut chain"
-    );
-    add_replay_fillet_with_intent(&mut g, "cut_5", "fillet_6", edge.clone(), -1.0, replay);
+    add_replay_fillet(&mut g, "cut_5", "fillet_6", edge.clone(), -1.0);
 
     let (live, warnings) = g
         .build_live(&std::collections::HashSet::new(), false)
@@ -626,19 +603,6 @@ fn add_replay_fillet(
     edge: EdgeRef,
     radius: f32,
 ) {
-    let replay =
-        g.edge_mod_replay_intent_for_edge("box_1", &edge, &std::collections::HashSet::new());
-    add_replay_fillet_with_intent(g, dependency, id, edge, radius, replay);
-}
-
-fn add_replay_fillet_with_intent(
-    g: &mut ParametricGraph,
-    dependency: &str,
-    id: &str,
-    edge: EdgeRef,
-    radius: f32,
-    replay: EdgeModReplayIntent,
-) {
     g.add_feature(FeatureNode {
         id: id.to_string(),
         name: "Replay Fillet".to_string(),
@@ -647,7 +611,6 @@ fn add_replay_fillet_with_intent(
             edge,
             dist: radius,
             dist_expr: None,
-            replay,
             kind: crate::sketch::CornerKind::Fillet,
         },
     });

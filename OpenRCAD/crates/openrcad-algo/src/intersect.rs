@@ -3,8 +3,8 @@
 
 use openrcad_foundation::{Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
-    BSplineCurve, Circle, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, Plane,
-    Surface,
+    BSplineCurve, Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve,
+    GeomSurface, Plane, Surface,
 };
 use openrcad_topo::{containment::point_in_polygon_2d, Face, Orientation};
 
@@ -423,8 +423,117 @@ fn analytic_curve_curve(c1: &GeomCurve, c2: &GeomCurve, tol: f64) -> Option<Vec<
         (GeomCurve::Line(l), GeomCurve::Circle(ci))
         | (GeomCurve::Circle(ci), GeomCurve::Line(l)) => Some(line_circle(l, ci, tol)),
         (GeomCurve::Circle(a), GeomCurve::Circle(b)) => Some(circle_circle(a, b, tol)),
+        (GeomCurve::BSpline(a), GeomCurve::BSpline(b)) if a.degree() == 1 && b.degree() == 1 => {
+            Some(polyline_polyline_intersections(a.poles(), b.poles(), tol))
+        }
+        (GeomCurve::BSpline(polyline), other) if polyline.degree() == 1 => {
+            polyline_analytic_intersections(polyline.poles(), other, tol)
+        }
+        (other, GeomCurve::BSpline(polyline)) if polyline.degree() == 1 => {
+            polyline_analytic_intersections(polyline.poles(), other, tol)
+        }
         _ => None,
     }
+}
+
+/// Intersect a degree-one B-spline with an analytic boundary curve segment by
+/// segment. Surface/surface intersection polylines can contain hundreds of
+/// poles; sending each line/circle boundary through the generic recursive
+/// solver makes trimming needlessly quadratic in subdivision depth.
+fn polyline_analytic_intersections(poles: &[Pnt], other: &GeomCurve, tol: f64) -> Option<Vec<Pnt>> {
+    if !matches!(other, GeomCurve::Line(_) | GeomCurve::Circle(_)) {
+        return None;
+    }
+
+    let mut intersections = Vec::new();
+    for segment in poles.windows(2) {
+        let [start, end] = segment else {
+            continue;
+        };
+        let delta = *end - *start;
+        let Some(direction) = delta.normalized() else {
+            continue;
+        };
+        let segment_line = openrcad_geom::Line::from_point_dir(*start, direction);
+        let candidates = match other {
+            GeomCurve::Line(line) => line_line(&segment_line, line, tol),
+            GeomCurve::Circle(circle) => line_circle(&segment_line, circle, tol),
+            _ => unreachable!("analytic boundary curve checked above"),
+        };
+
+        let length = delta.magnitude();
+        for point in candidates {
+            let along = (point - *start).dot(&GeomVec::from_dir(direction));
+            if along >= -tol
+                && along <= length + tol
+                && !intersections
+                    .iter()
+                    .any(|existing: &Pnt| existing.distance(&point) <= tol)
+            {
+                intersections.push(point);
+            }
+        }
+    }
+    Some(intersections)
+}
+
+/// Direct intersection for two degree-one B-splines. This is the common case
+/// when a sampled surface/surface intersection meets an already fitted trim
+/// boundary. Recursive spline subdivision scales poorly with hundreds of poles,
+/// while the curves are exactly polylines and can be tested segment by segment.
+fn polyline_polyline_intersections(a: &[Pnt], b: &[Pnt], tol: f64) -> Vec<Pnt> {
+    let mut intersections = Vec::new();
+    for first in a.windows(2) {
+        let [a0, a1] = first else {
+            continue;
+        };
+        let a_delta = *a1 - *a0;
+        let Some(a_direction) = a_delta.normalized() else {
+            continue;
+        };
+        let a_length = a_delta.magnitude();
+        let a_line = openrcad_geom::Line::from_point_dir(*a0, a_direction);
+
+        for second in b.windows(2) {
+            let [b0, b1] = second else {
+                continue;
+            };
+            if !segments_bbox_overlap(a0, a1, b0, b1, tol) {
+                continue;
+            }
+            let b_delta = *b1 - *b0;
+            let Some(b_direction) = b_delta.normalized() else {
+                continue;
+            };
+            let b_length = b_delta.magnitude();
+            let b_line = openrcad_geom::Line::from_point_dir(*b0, b_direction);
+
+            for point in line_line(&a_line, &b_line, tol) {
+                let a_along = (point - *a0).dot(&GeomVec::from_dir(a_direction));
+                let b_along = (point - *b0).dot(&GeomVec::from_dir(b_direction));
+                if a_along >= -tol
+                    && a_along <= a_length + tol
+                    && b_along >= -tol
+                    && b_along <= b_length + tol
+                    && !intersections
+                        .iter()
+                        .any(|existing: &Pnt| existing.distance(&point) <= tol)
+                {
+                    intersections.push(point);
+                }
+            }
+        }
+    }
+    intersections
+}
+
+fn segments_bbox_overlap(a0: &Pnt, a1: &Pnt, b0: &Pnt, b1: &Pnt, tol: f64) -> bool {
+    let overlaps = |x0: f64, x1: f64, y0: f64, y1: f64| {
+        x0.min(x1) <= y0.max(y1) + tol && y0.min(y1) <= x0.max(x1) + tol
+    };
+    overlaps(a0.x(), a1.x(), b0.x(), b1.x())
+        && overlaps(a0.y(), a1.y(), b0.y(), b1.y())
+        && overlaps(a0.z(), a1.z(), b0.z(), b1.z())
 }
 
 /// Find intersection points between two 3D curves.
@@ -881,12 +990,81 @@ fn analytic_surface_surface(s1: &GeomSurface, s2: &GeomSurface) -> Option<Vec<Ge
         return Some(cylinder_cylinder_curves(c1, c2));
     }
 
-    let (plane, cyl) = match (s1, s2) {
-        (GeomSurface::Plane(p), GeomSurface::Cylinder(c)) => (p, c),
-        (GeomSurface::Cylinder(c), GeomSurface::Plane(p)) => (p, c),
-        _ => return None,
-    };
-    Some(plane_cylinder_curves(plane, cyl))
+    if let (GeomSurface::Cone(cone), GeomSurface::Cylinder(cylinder))
+    | (GeomSurface::Cylinder(cylinder), GeomSurface::Cone(cone)) = (s1, s2)
+    {
+        if let Some(curves) = coaxial_cone_cylinder_curves(cone, cylinder) {
+            return Some(curves);
+        }
+    }
+
+    match (s1, s2) {
+        (GeomSurface::Plane(plane), GeomSurface::Cylinder(cylinder))
+        | (GeomSurface::Cylinder(cylinder), GeomSurface::Plane(plane)) => {
+            Some(plane_cylinder_curves(plane, cylinder))
+        }
+        (GeomSurface::Plane(plane), GeomSurface::Cone(cone))
+        | (GeomSurface::Cone(cone), GeomSurface::Plane(plane)) => plane_cone_curves(plane, cone),
+        _ => None,
+    }
+}
+
+/// Exact circles where a cone meets a coaxial cylinder. Countersinks rely on
+/// this at the bore transition; the generic surface solver otherwise emits
+/// fragmented spans around the periodic seam and cannot close the cut wall.
+fn coaxial_cone_cylinder_curves(
+    cone: &ConicalSurface,
+    cylinder: &CylindricalSurface,
+) -> Option<Vec<GeomCurve>> {
+    let cone_axis = cone.position();
+    let cylinder_axis = cylinder.position();
+    let cone_direction = GeomVec::from_dir(cone_axis.direction());
+    let cylinder_direction = GeomVec::from_dir(cylinder_axis.direction());
+    if cone_direction.cross(&cylinder_direction).magnitude() > 1.0e-8 {
+        return None;
+    }
+    let offset = cylinder_axis.location() - cone_axis.location();
+    if (offset - cone_direction * offset.dot(&cone_direction)).magnitude() > 1.0e-8 {
+        return None;
+    }
+
+    let slope = cone.semi_angle().tan();
+    if slope.abs() <= 1.0e-12 {
+        return Some(Vec::new());
+    }
+    let heights = [
+        (cylinder.radius() - cone.ref_radius()) / slope,
+        (-cylinder.radius() - cone.ref_radius()) / slope,
+    ];
+    let mut curves = Vec::new();
+    for height in heights {
+        let center = cone_axis.location() + cone_direction * height;
+        let frame = Ax3::new_axes(center, cone_axis.direction(), cone_axis.x_direction());
+        curves.push(GeomCurve::Circle(Circle::new(frame, cylinder.radius())));
+    }
+    Some(curves)
+}
+
+/// Exact perpendicular plane/cone section. This is the dominant countersink
+/// case; returning one analytic circle avoids the fragmented sampled B-spline
+/// spans that cannot form a connected partition across the cone wall.
+fn plane_cone_curves(plane: &Plane, cone: &ConicalSurface) -> Option<Vec<GeomCurve>> {
+    let axis = cone.position();
+    let w = GeomVec::from_dir(axis.direction());
+    let n = GeomVec::from_dir(plane.normal());
+    let denom = w.dot(&n);
+    if (denom.abs() - 1.0).abs() > 1.0e-7 {
+        return None;
+    }
+
+    let height = (plane.location() - axis.location()).dot(&n) / denom;
+    let radius = cone.ref_radius() + height * cone.semi_angle().tan();
+    if radius.abs() <= 1.0e-12 {
+        return Some(Vec::new());
+    }
+    let center = axis.location() + w * height;
+    let frame = Ax3::new_axes(center, axis.direction(), axis.x_direction());
+    Some(vec![GeomCurve::Circle(Circle::new(frame, radius.abs()))])
 }
 
 fn plane_cylinder_curves(plane: &Plane, cyl: &CylindricalSurface) -> Vec<GeomCurve> {
@@ -940,7 +1118,7 @@ fn plane_cylinder_curves(plane: &Plane, cyl: &CylindricalSurface) -> Vec<GeomCur
     // Oblique plane ∩ cylinder = an exact ellipse. Emitting the analytic curve
     // (instead of a 160-point sampled B-spline) keeps the imprinted seam exactly
     // on both surfaces, so the cut trims watertight instead of leaving the tiny
-    // sampling error that broke the result topology (`SuspiciousEulerCharacteristic`).
+    // sampling error that broke the result topology (`InvalidEulerCharacteristic`).
     //
     //   center      = where the axis pierces the plane
     //   major dir   = the axis projected into the plane (steepest tilt), |a| = r/|cosθ|
@@ -1688,6 +1866,20 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
             for wire in face.wires() {
                 for edge in wire.edges() {
                     if let Some(edge_curve) = edge.curve() {
+                        if curves_overlap(edge_curve, &curve, tol) {
+                            for point in [
+                                edge_curve.point(edge.first()),
+                                edge_curve.point(edge.last()),
+                            ] {
+                                let t = crate::boolean::project_point_on_curve(
+                                    &point, &curve, c_min, c_max,
+                                );
+                                if t > c_min + tol && t < c_max - tol {
+                                    out.push(t);
+                                }
+                            }
+                            continue;
+                        }
                         let pts = curve_curve(edge_curve, &curve, tol);
                         for pt in pts {
                             let t =
@@ -1748,7 +1940,11 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
             );
         }
 
-        // For each segment, check if its midpoint lies inside both faces
+        // For each segment, check if its midpoint lies inside both faces. Merge
+        // adjacent accepted spans before returning them: periodic face tests can
+        // contribute redundant transition parameters at a seam, but those must
+        // not turn one continuous intersection into hundreds of split edges.
+        let mut accepted_span: Option<(f64, f64)> = None;
         for i in 0..unique_params.len() - 1 {
             let t1 = unique_params[i];
             let t2 = unique_params[i + 1];
@@ -1760,7 +1956,11 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
             let (u1, v1) = uv_of(s1, &p_mid);
             let (u2, v2) = uv_of(s2, &p_mid);
 
-            if is_inside_trimming_loops(u1, v1, face1) && is_inside_trimming_loops(u2, v2, face2) {
+            let in_face1 = is_inside_trimming_loops(u1, v1, face1)
+                || point_on_face_boundary(&p_mid, face1, tol);
+            let in_face2 = is_inside_trimming_loops(u2, v2, face2)
+                || point_on_face_boundary(&p_mid, face2, tol);
+            if in_face1 && in_face2 {
                 if debug {
                     let a = curve.point(t1);
                     let b = curve.point(t2);
@@ -1774,12 +1974,41 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
                         b.z()
                     );
                 }
-                trimmed_curves.push((curve.clone(), t1, t2));
+                match accepted_span.as_mut() {
+                    Some((_, end)) if (t1 - *end).abs() <= tol.max(1.0e-8) => *end = t2,
+                    Some(_) => {
+                        let (first, last) = accepted_span.replace((t1, t2)).unwrap();
+                        trimmed_curves.push((curve.clone(), first, last));
+                    }
+                    None => accepted_span = Some((t1, t2)),
+                }
+            } else if let Some((first, last)) = accepted_span.take() {
+                trimmed_curves.push((curve.clone(), first, last));
             }
+        }
+        if let Some((first, last)) = accepted_span {
+            trimmed_curves.push((curve, first, last));
         }
     }
 
     trimmed_curves
+}
+
+/// Inclusive boundary membership used while trimming intersection curves.
+/// Point-in-polygon is deliberately strict, but an intersection that coincides
+/// with one face's rim still has to be imprinted on the opposite face (the
+/// cone-to-bore transition in a countersink is the canonical example).
+fn point_on_face_boundary(point: &Pnt, face: &Face, tolerance: f64) -> bool {
+    face.wires().iter().any(|wire| {
+        wire.edges().iter().any(|edge| {
+            let Some(curve) = edge.curve() else {
+                return point.distance(&edge.start().point()) <= tolerance;
+            };
+            let parameter =
+                crate::boolean::project_point_on_curve(point, curve, edge.first(), edge.last());
+            curve.point(parameter).distance(point) <= tolerance.max(edge.tolerance())
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2075,6 +2304,51 @@ mod tests {
         let pt = curves[0].point(0.0);
         assert!(pt.y().abs() < 1e-2);
         assert!(pt.z().abs() < 1e-2);
+    }
+
+    #[test]
+    fn perpendicular_plane_cone_is_exact_circle() {
+        use openrcad_foundation::Ax3;
+
+        let cone = GeomSurface::Cone(ConicalSurface::new(
+            Ax3::new(Pnt::origin(), Dir::dz()),
+            4.0,
+            (-1.0_f64).atan(),
+        ));
+        let plane =
+            GeomSurface::Plane(Plane::from_point_normal(Pnt::new(0.0, 0.0, 2.0), Dir::dz()));
+        let curves = surface_surface(&plane, &cone, 1.0e-7);
+        assert_eq!(curves.len(), 1);
+        let GeomCurve::Circle(circle) = &curves[0] else {
+            panic!("perpendicular plane/cone section must stay analytic");
+        };
+        assert!(circle.center().distance(&Pnt::new(0.0, 0.0, 2.0)) <= 1.0e-12);
+        assert!((circle.radius() - 2.0).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn coaxial_cone_cylinder_intersections_are_exact_circles() {
+        use openrcad_foundation::Ax3;
+
+        let frame = Ax3::new(Pnt::origin(), Dir::dz());
+        let cone = GeomSurface::Cone(ConicalSurface::new(frame, 4.0, (-1.0_f64).atan()));
+        let cylinder = GeomSurface::Cylinder(CylindricalSurface::new(frame, 2.0));
+        let curves = surface_surface(&cone, &cylinder, 1.0e-7);
+        assert_eq!(
+            curves.len(),
+            2,
+            "both sheets of the untrimmed cone intersect"
+        );
+        let mut heights = curves
+            .iter()
+            .map(|curve| match curve {
+                GeomCurve::Circle(circle) => circle.center().z(),
+                _ => panic!("coaxial cone/cylinder intersections must stay analytic"),
+            })
+            .collect::<Vec<_>>();
+        heights.sort_by(f64::total_cmp);
+        assert!((heights[0] - 2.0).abs() <= 1.0e-12);
+        assert!((heights[1] - 6.0).abs() <= 1.0e-12);
     }
 
     #[test]

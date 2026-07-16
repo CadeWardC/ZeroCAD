@@ -167,7 +167,7 @@ impl ZeroCadApp {
     /// user commits. Called after any change to the shape list, the pending set,
     /// or the radius text.
     pub(crate) fn rebuild_active_sketch_curves(&mut self) {
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         let mut mods = self.sketch_corner_mods.clone();
         mods.extend(self.pending_corner_mods());
         // A solver model (Edit Sketch session) is the source of truth for the
@@ -189,7 +189,7 @@ impl ZeroCadApp {
     /// sketch moves minimally. On a failed solve the model keeps its current
     /// (last-valid) positions — the geometry degrades, never blanks.
     pub(crate) fn solve_live_sketch(&mut self) {
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         if let Some(model) = &mut self.sketch_solver_model {
             let report = zerocad_core::sketch::solve_model(model, &vars);
             if report.outcome == zerocad_core::sketch::SolveOutcome::Converged {
@@ -293,7 +293,7 @@ impl ZeroCadApp {
     /// sketch coords), computed from the un-rounded geometry. Used to place and
     /// orient the 2D radius drag handle. `None` for a straight/degenerate corner.
     pub(crate) fn corner_bisector(&self, at: (f32, f32)) -> Option<((f32, f32), (f32, f32))> {
-        let vars = self.graph.variable_map();
+        let vars = self.document.variable_map();
         // Geometry without ANY corner mods, so the pending corner is still sharp.
         let sharp =
             zerocad_core::effective_curves(&SketchCurves::new(), &self.sketch_shapes, &[], &vars);

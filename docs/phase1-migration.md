@@ -1,48 +1,43 @@
 # Phase 1 representation migration ledger
 
-This ledger is the mechanical boundary between the strict Phase 1 production
-path and operations intentionally deferred to Phase 3. The integration test in
-`zerocad-core/tests/phase1_api_boundaries.rs` rejects new legacy OpenRCAD calls
-unless both the file and API are listed below.
+Phase 3 closes the representation debt recorded here. The architecture test in
+`zerocad-core/tests/phase1_api_boundaries.rs` keeps the production allowlist
+empty and rejects any return to metadata-discarding kernel calls.
 
-## Migrated production paths
+## Closed production boundary
 
-- Box, cylinder, cone, prism/extrusion, and revolve construction consume
-  `OperationResult<Solid>` through `mock_kernel::outcome::consume_operation`.
-- STEP feature import uses the strict `read_step_str_operation` entry point.
-- Single-body fuse, cut, and common operations use policy-aware canonical
-  boolean operations, including cancellation and owner-aware face history.
-- Kernel diagnostics and recovery actions are converted into evaluator
-  diagnostics by the outcome adapter. Shared topology history is mapped into
-  ZeroCAD's current face-naming representation at that same boundary.
-- Display tessellation crosses one explicitly named compatibility adapter. It
-  is a no-op for Phase 1 solids with complete pcurves, and attaches and validates
-  pcurves only for allowlisted Phase 3 results before strict tessellation.
+- Every ZeroCAD primitive, import, boolean, blend, shell, sweep/loft, pattern,
+  mirror, thread, and transform path enters through a policy-aware structured
+  operation or the single outcome adapter.
+- Production display and candidate validation use strict stored-pcurve
+  tessellation. Projection-based compatibility tessellation is not called by
+  ZeroCAD production code.
+- Prism/extrusion and full/partial revolve build native pcurves. Unary operations
+  repair and validate pcurves before commit, then normalize safe coplanar and
+  cocylindrical same-domain faces.
+- Booleans use face arrangements, split inherited pcurves, fit and validate
+  intersection boundaries, return per-body history, and fail atomically when
+  strict output cannot be produced. No application-level axis-aligned cut
+  approximation remains.
+- Enclosed cuts are represented by an outer shell plus independently oriented
+  void shells. Severing cuts return structured bodies with per-body face
+  history rather than a disconnected shell.
+- Fillet, chamfer, shell, prism, revolve, skin/loft, transform, native
+  primitives, STEP imports, and booleans all pass the cross-cutting Phase 3
+  operation gate: health, watertightness, pcurve consistency, history coverage,
+  and strict tessellation.
+- Legacy STEP reconstruction is explicit. It reports every rebuilt pcurve and
+  any policy-capped imported-edge tolerance promotion; strict import never
+  performs that recovery implicitly.
 
-## Phase 3 compatibility allowlist
+## Compatibility status
 
-| Production file | Temporary API | Reason and removal gate |
-| --- | --- | --- |
-| `zerocad-core/src/mock_kernel/boolean.rs` | `boolean_checked_with_history[_cancel]` | A severing cut returns multiple connected solids while preserving the combined pre-split face-index map. Replace with a structured multi-body operation result and tests for per-body history coverage. |
-| `zerocad-core/src/mock_kernel/tessellation.rs` | `tessellate_compatibility_for_display_with_policy_and_cancel` | Fillet, chamfer, shell/offset, generalized sweep/loft/skin, pattern, and mirror results are Phase 3. Remove after each producer stores valid pcurves and its replacement tests pass. |
-| `zerocad-core/src/parametric/edge_mod.rs` | `tessellate_compatibility_for_display_with_policy_and_cancel` | Phase 3 edge-mod candidate volume scoring uses the explicit, fallible compatibility adapter. Reconstruction failure rejects the candidate with a user-visible diagnostic; it never silently drops a fillet or panics. Remove after native fillet/chamfer trim builders store pcurves. |
+The Phase 3 production compatibility allowlist is empty. Deprecated OpenRCAD
+source-compatibility entry points remain callable for downstream consumers, but
+they are not used by ZeroCAD production and are not an alternate geometry
+engine. Each delegates to the canonical operation and documents the metadata or
+strictness it discards.
 
-No fillet, chamfer, or sequential-blend regression is ignored. Phase 3 frontier
-cases run on every test pass with a Phase 1 safety contract: either the operation
-returns a healthy, watertight result that passes standard validation, or it
-returns a concrete diagnostic while leaving the healthy source body unchanged.
-The valid native-kernel cases retain geometry assertions; expensive app-level
-duplicates use bounded oversized-radius rejection cases so the gate cannot hang.
-
-The removal gate remains a native fillet/chamfer trim builder that stores valid
-pcurves at construction time. Relaxing strict validation or restoring implicit
-projection inside strict tessellation is not an acceptable workaround.
-
-The enclosed-void boolean probe is also deferred: its legacy result packs outer
-and cavity faces into one disconnected shell. Its removal gate is representing
-the cavity as a separately oriented inner shell of one solid; shell-connectivity
-validation must remain strict.
-
-The compatibility wrappers remain deprecated. Delete them in Phase 3 only
-after the corresponding producer is migrated, strict representation tests pass,
-and this allowlist entry can be removed.
+No fillet, chamfer, pocket, thread, sequential-blend, enclosed-void, or boolean
+regression is ignored for Phase 3. The only remaining ignored topology
+reattachment case is the explicitly Phase 4 half-space discriminator.

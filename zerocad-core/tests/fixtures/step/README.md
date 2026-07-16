@@ -13,12 +13,12 @@ https://www.nist.gov/ctl/smart-connected-systems-division/smart-connected-manufa
 
 The fixture is committed byte-for-byte and must not be regenerated through
 OpenRCAD. It exists to exercise an externally authored exchange file rather
-than a round trip through ZeroCAD's own STEP writer. The Phase 0 importer does
-not yet implement its `INTERSECTION_CURVE` geometry, so the regression test
-currently locks in a clear, deterministic unsupported-entity diagnostic. When
-that curve support lands, replace the diagnostic assertion with health,
-watertightness, bounds, and repeatability assertions without replacing the
-fixture.
+than a round trip through ZeroCAD's own STEP writer. Phase 3 added its
+`INTERSECTION_CURVE` geometry and explicit, reported legacy-pcurve recovery.
+The Phase 3 operation gate now locks in a healthy, watertight import, complete
+pcurves and topology history, and strict tessellation without replacing the
+fixture. The Phase 0 corpus test continues to lock its provenance and the
+committed baseline continues to lock the original corpus manifest.
 
 Frozen SHA-256:
 `E17A7657B0F251E93713A201BD3DC393A9F905AE477E43952BD9170D17F1A7FF`

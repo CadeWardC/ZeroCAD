@@ -130,9 +130,9 @@ impl ZeroCadApp {
         // future picks agree with what was just built. Self-healing
         // normalization, not a user edit — no undo step. If the user is
         // mid-edit on such a sketch, refresh its live reference outline too.
-        if self.graph.apply_face_reattach() {
+        if self.document.apply_face_reattach() {
             if let Some(editing_id) = self.editing_sketch_id.clone() {
-                if let Some(b) = self.graph.sketch_face_boundaries.get(&editing_id) {
+                if let Some(b) = self.document.sketch_face_boundaries.get(&editing_id) {
                     self.active_face_boundary = b.clone();
                     self.recompute_sketch_regions();
                 }
@@ -157,7 +157,7 @@ impl ZeroCadApp {
     pub(crate) fn spawn_refine_eval(&mut self) {
         self.eval_generation = self.evaluator.submit(
             evaluation_worker::EvaluationPurpose::CommittedModel,
-            self.graph.clone(),
+            self.document.clone(),
             self.hidden_nodes.clone(),
             zerocad_core::EvaluationQuality::Final,
             self.egui_ctx.clone(),
@@ -246,8 +246,10 @@ impl ZeroCadApp {
                         .iter()
                         .filter_map(|s| s.reason().map(|r| (s.feature_id.clone(), r.to_string())))
                         .collect();
-                    self.graph.install_evaluation_cache(output.cache_snapshot);
-                    self.graph.apply_face_reattach_updates(output.face_reattach);
+                    self.document
+                        .install_evaluation_cache(output.cache_snapshot);
+                    self.document
+                        .apply_face_reattach_updates(output.face_reattach);
                     self.apply_eval_result(output.bodies, output.warnings);
                 }
                 Err(err) => {

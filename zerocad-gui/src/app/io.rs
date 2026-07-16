@@ -5,10 +5,14 @@ use crate::*;
 /// sketch, so undoing the extrude must also reveal the sketch again.
 impl ZeroCadApp {
     fn snapshot(&self) -> UndoSnapshot {
-        UndoSnapshot {
-            graph: self.graph.clone_document(),
-            hidden_nodes: self.hidden_nodes.clone(),
+        let mut document = self.document.clone();
+        document.state.units = self.current_unit;
+        document.state.created_unix = self.doc_created_unix;
+        document.state.visibility.clear();
+        for hidden in &self.hidden_nodes {
+            document.set_visible(hidden.clone(), false);
         }
+        UndoSnapshot { document }
     }
 
     /// Restore a snapshot: swap in the graph (rebuilding its skipped id→index
@@ -16,9 +20,11 @@ impl ZeroCadApp {
     /// visibility set, then clear all selection/op state that may reference
     /// nodes that no longer exist.
     fn restore_snapshot(&mut self, snap: UndoSnapshot) {
-        self.graph = snap.graph;
-        self.graph.rebuild_node_map();
-        self.hidden_nodes = snap.hidden_nodes;
+        self.current_unit = snap.document.state.units;
+        self.doc_created_unix = snap.document.state.created_unix;
+        self.hidden_nodes = snap.document.hidden_entities();
+        self.document = snap.document;
+        self.document.rebuild_node_map();
         self.selected_node_id = None;
         self.selected_faces.clear();
         self.selected_body.clear();
@@ -26,6 +32,8 @@ impl ZeroCadApp {
         self.edge_mod_op = None;
         self.move_op = None;
         self.combine_op = None;
+        self.split_body_op = None;
+        self.scale_body_op = None;
         self.move_preview_bodies = None;
         self.pending_visual = None;
         self.reevaluate_geometry();
@@ -73,7 +81,7 @@ impl ZeroCadApp {
     pub(crate) fn new_design(&mut self) {
         log::info!("Creating new empty model.");
         self.push_undo();
-        self.graph = ParametricGraph::new();
+        self.document = Document::new();
         self.doc_created_unix = None;
         self.set_body_meshes(Vec::new());
         self.selected_node_id = None;
@@ -159,15 +167,19 @@ impl ZeroCadApp {
                     .as_secs()
             });
             let save = self.pending_save.as_mut().expect("pending save vanished");
+            let mut document = self.document.clone();
+            document.state.units = self.current_unit;
+            document.state.created_unix = Some(created_unix);
+            document.state.visibility.clear();
+            for hidden in &self.hidden_nodes {
+                document.set_visible(hidden.clone(), false);
+            }
             self.document_worker.submit(document_worker::SaveRequest {
                 path: save.path.clone(),
-                graph: self.graph.clone_document(),
+                document,
                 bodies: self.body_meshes.clone(),
                 profile: save.profile,
-                units: self.current_unit,
-                hidden_nodes: self.hidden_nodes.clone(),
-                created_unix: Some(created_unix),
-                cache: self.graph.evaluation_cache_snapshot(),
+                cache: self.document.evaluation_cache_snapshot(),
             });
             save.dispatched = true;
             self.status_msg = "Saving design…".to_string();
@@ -684,7 +696,7 @@ impl ZeroCadApp {
         self.hidden_nodes = loaded.document.hidden_entities();
         self.current_unit = loaded.document.state.units;
         self.doc_created_unix = loaded.document.state.created_unix;
-        self.graph = loaded.document.graph;
+        self.document = loaded.document;
         // Continue the user-facing feature id sequence after the largest loaded
         // suffix. Dependencies and semantic timelines determine evaluation.
         self.reseed_id_counter_from_graph();
@@ -708,7 +720,7 @@ impl ZeroCadApp {
         }
         let had_evaluation_cache = loaded.accelerators.evaluation_cache.is_some();
         if let Some(cache) = loaded.accelerators.evaluation_cache {
-            self.graph.install_evaluation_cache(cache);
+            self.document.install_evaluation_cache(cache);
         }
         // Seed the onboarding thumbnail cache from the file's embedded preview so
         // a `.zcad` from another machine shows its real thumbnail even if it has
@@ -809,11 +821,11 @@ impl ZeroCadApp {
             .enumerate()
             .map(|(i, (id, _))| {
                 let name = self
-                    .graph
+                    .document
                     .graph
                     .node_indices()
-                    .find(|&n| self.graph.graph[n].id == *id)
-                    .map(|n| self.graph.graph[n].name.clone())
+                    .find(|&n| self.document.graph[n].id == *id)
+                    .map(|n| self.document.graph[n].name.clone())
                     .unwrap_or_else(|| id.clone());
                 (name, i)
             })
@@ -870,7 +882,7 @@ impl ZeroCadApp {
             .to_string();
         self.push_undo();
         let id = format!("import_{}", self.next_id());
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: label.clone(),
             feature: FeatureType::Import { step_data, label },
@@ -899,16 +911,16 @@ impl ZeroCadApp {
     /// should hand the user back its source sketch.
     pub(crate) fn delete_node_by_id(&mut self, del_id: &str) -> bool {
         let exists = self
-            .graph
+            .document
             .graph
             .node_indices()
-            .any(|idx| self.graph.graph[idx].id == del_id);
+            .any(|idx| self.document.graph[idx].id == del_id);
         if !exists {
             return false;
         }
         self.push_undo();
-        let reveal = self.graph.sole_sketch_parents(del_id);
-        self.graph.remove_feature(del_id);
+        let reveal = self.document.sole_sketch_parents(del_id);
+        self.document.remove_feature(del_id);
         for sketch_id in reveal {
             self.hidden_nodes.remove(&sketch_id);
         }

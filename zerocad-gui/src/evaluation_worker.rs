@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use zerocad_core::{
-    EvaluationCancellation, EvaluationError, EvaluationOutput, EvaluationQuality, ParametricGraph,
+    Document, EvaluationCancellation, EvaluationError, EvaluationOutput, EvaluationQuality,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub(crate) enum EvaluationPurpose {
 struct EvaluationRequest {
     generation: u64,
     purpose: EvaluationPurpose,
-    graph: ParametricGraph,
+    document: Document,
     hidden: HashSet<String>,
     quality: EvaluationQuality,
     repaint: Option<egui::Context>,
@@ -72,7 +72,7 @@ impl ModelEvaluator {
                     }
                     let cancellation =
                         EvaluationCancellation::new(request.generation, worker_generation.clone());
-                    let result = request.graph.evaluate_request(
+                    let result = request.document.evaluate_request(
                         &request.hidden,
                         request.quality,
                         &cancellation,
@@ -117,7 +117,7 @@ impl ModelEvaluator {
     pub(crate) fn submit(
         &self,
         purpose: EvaluationPurpose,
-        graph: ParametricGraph,
+        document: Document,
         hidden: HashSet<String>,
         quality: EvaluationQuality,
         repaint: Option<egui::Context>,
@@ -132,7 +132,7 @@ impl ModelEvaluator {
         let _ = self.request_tx.send(EvaluationRequest {
             generation,
             purpose,
-            graph,
+            document,
             hidden,
             quality,
             repaint,

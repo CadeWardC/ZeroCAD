@@ -114,6 +114,22 @@ impl Trsf {
         self.loc
     }
 
+    /// Determinant of the complete linear map `scale * matrix`.
+    ///
+    /// A negative value means the transform reverses handedness. Computing
+    /// this from the actual map keeps topology orientation decisions independent
+    /// of a caller-supplied transform-form hint.
+    #[inline]
+    pub fn linear_determinant(&self) -> f64 {
+        self.scale.powi(3) * self.matrix.determinant()
+    }
+
+    /// True when the complete linear map reverses orientation.
+    #[inline]
+    pub fn reverses_orientation(&self) -> bool {
+        self.linear_determinant().is_sign_negative()
+    }
+
     // --- elementary setters ------------------------------------------------
 
     /// Pure translation by `v`.
@@ -461,5 +477,20 @@ mod tests {
         assert!(approx(rt.x(), p.x()));
         assert!(approx(rt.y(), p.y()));
         assert!(approx(rt.z(), p.z()));
+    }
+
+    #[test]
+    fn orientation_is_derived_from_the_complete_linear_map() {
+        let plane_mirror = Trsf::mirror_plane(&Ax2::new(Pnt::origin(), Dir::dz()));
+        assert!(plane_mirror.reverses_orientation());
+        assert!(plane_mirror.linear_determinant() < 0.0);
+
+        let half_turn = Trsf::mirror_axis(&Ax1::new(Pnt::origin(), Dir::dz()));
+        assert!(!half_turn.reverses_orientation());
+        assert!(half_turn.linear_determinant() > 0.0);
+
+        let negative_scale = Trsf::scale(&Pnt::origin(), -2.0);
+        assert!(negative_scale.reverses_orientation());
+        assert!((negative_scale.linear_determinant() + 8.0).abs() < 1e-12);
     }
 }

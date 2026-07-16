@@ -471,6 +471,37 @@ pub fn propagate_face_names_via_history(
     mesh
 }
 
+/// Apply histories whose face indices are local to independently validated
+/// connected solids, then combine their display meshes.
+pub fn propagate_face_names_via_body_histories(
+    input_mesh: &MockMesh,
+    input_names: &[Option<String>],
+    result_bodies: &[KernelSolid],
+    histories: &[openrcad::algo::BooleanFaceHistory],
+    body_id: &str,
+    generated_prefix: &str,
+) -> Option<MockMesh> {
+    if result_bodies.len() != histories.len() {
+        return None;
+    }
+    let mut mesh = MockMesh::empty();
+    for (body, history) in result_bodies.iter().zip(histories) {
+        if history.face_source.len() != body.face_count() {
+            return None;
+        }
+        mesh.append(propagate_face_names_via_history(
+            input_mesh,
+            input_names,
+            body,
+            history,
+            body_id,
+            generated_prefix,
+        ));
+    }
+    populate_edge_adjacent_face_names(&mut mesh);
+    Some(mesh)
+}
+
 /// A canonical, position-based identity for a body **part** (one connected lump):
 /// its quantized axis-aligned bounding box (min corner then max corner). Lumps in
 /// different places get distinct keys, and the key is stable across rebuilds, so a

@@ -57,7 +57,6 @@ fn curved_circular_rim_selection_reaches_native_solver_and_fails_safely() {
             },
             dist: 3.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: crate::sketch::CornerKind::Fillet,
         },
     });
@@ -72,7 +71,8 @@ fn curved_circular_rim_selection_reaches_native_solver_and_fails_safely() {
             .iter()
             .any(|w| w.contains("cut trim requires a cylindrical blend")
                 || w.contains("not watertight and healthy")
-                || w.contains("non-manifold edges")),
+                || w.contains("non-manifold edges")
+                || w.contains("candidate validation failed")),
         "curved rim fillet should reach the native solver and fail safely, got {warnings:?}"
     );
     assert!(

@@ -45,8 +45,8 @@ pub use builder::{BRepBuilder, PcurveAttachmentError};
 pub use edge::Edge;
 pub use face::{Face, FaceBuildError};
 pub use history::{
-    HistoryCoverage, HistoryStage, InputTopologyRef, TopologyChange, TopologyHistory,
-    TopologyHistoryChain, TopologyHistoryError, TopologyKind, TopologyRef,
+    HistoryCoverage, InputTopologyRef, TopologyChange, TopologyHistory, TopologyHistoryError,
+    TopologyKind, TopologyRef,
 };
 pub use operation::{
     Diagnostic, DiagnosticSeverity, OperationResult, RecoveryAction, RecoveryReport,

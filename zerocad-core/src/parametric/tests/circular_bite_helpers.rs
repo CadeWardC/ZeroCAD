@@ -44,8 +44,6 @@ pub(super) fn circular_bite_graph_with_depth(
             curve: None,
             topology: None,
         };
-        let replay =
-            g.edge_mod_replay_intent_for_edge("e", &edge, &std::collections::HashSet::new());
         g.add_feature(FeatureNode {
             id: "em".to_string(),
             name: "Edge Mod".to_string(),
@@ -54,7 +52,6 @@ pub(super) fn circular_bite_graph_with_depth(
                 edge,
                 dist: 1.5,
                 dist_expr: None,
-                replay,
                 kind,
             },
         });
@@ -162,7 +159,6 @@ pub(super) fn circular_bite_cutoff_edge_graph_at_depth_with_edge(
     edge: EdgeRef,
 ) -> ParametricGraph {
     let mut g = circular_bite_graph_with_depth(None, depth);
-    let replay = g.edge_mod_replay_intent_for_edge("e", &edge, &std::collections::HashSet::new());
     g.add_feature(FeatureNode {
         id: "em".to_string(),
         name: "Edge Mod".to_string(),
@@ -171,7 +167,6 @@ pub(super) fn circular_bite_cutoff_edge_graph_at_depth_with_edge(
             edge,
             dist,
             dist_expr: None,
-            replay,
             kind,
         },
     });

@@ -145,6 +145,94 @@ impl PcurveData {
         reversed
     }
 
+    /// Map this pcurve through an exact diagonal change of surface coordinates.
+    ///
+    /// Uniform 3D scaling changes analytic surface parameters differently: a
+    /// plane scales both `(u, v)`, while cylinders and cones keep angular `u`
+    /// and scale distance-valued `v`. Lines and B-splines are closed under this
+    /// mapping, so their stored pcurves can be preserved exactly. Other conics
+    /// return `None` for anisotropic UV changes and are handled by the validated
+    /// pcurve reconstruction fallback.
+    pub(crate) fn scaled_surface_coordinates(&self, u_scale: f64, v_scale: f64) -> Option<Self> {
+        if !u_scale.is_finite() || !v_scale.is_finite() || u_scale <= 0.0 || v_scale <= 0.0 {
+            return None;
+        }
+        if u_scale == 1.0 && v_scale == 1.0 {
+            return Some(self.clone());
+        }
+
+        let map_point = |point: Pnt2d| Pnt2d::new(point.x() * u_scale, point.y() * v_scale);
+        let (curve, parameter_scale) = match &self.curve {
+            GeomCurve2d::Line(line) => {
+                let direction = line.direction();
+                let dx = direction.x() * u_scale;
+                let dy = direction.y() * v_scale;
+                let parameter_scale = dx.hypot(dy);
+                if !parameter_scale.is_finite() || parameter_scale <= f64::EPSILON {
+                    return None;
+                }
+                (
+                    GeomCurve2d::line(openrcad_geom2d::Line2d::from_point_dir(
+                        map_point(line.location()),
+                        openrcad_foundation::Dir2d::new(dx, dy),
+                    )),
+                    parameter_scale,
+                )
+            }
+            GeomCurve2d::BSpline(curve) => (
+                GeomCurve2d::bspline(openrcad_geom2d::BSplineCurve2d::new(
+                    curve.degree(),
+                    curve.poles().iter().copied().map(map_point).collect(),
+                    curve.weights().map(<[f64]>::to_vec),
+                    curve.knots().to_vec(),
+                    curve.multiplicities().to_vec(),
+                )),
+                1.0,
+            ),
+            GeomCurve2d::Circle(curve) if u_scale == v_scale => (
+                GeomCurve2d::circle(openrcad_geom2d::Circle2d::new(
+                    scaled_frame(curve.position(), map_point),
+                    curve.radius() * u_scale,
+                )),
+                1.0,
+            ),
+            GeomCurve2d::Ellipse(curve) if u_scale == v_scale => (
+                GeomCurve2d::ellipse(openrcad_geom2d::Ellipse2d::new(
+                    scaled_frame(curve.position(), map_point),
+                    curve.major_radius() * u_scale,
+                    curve.minor_radius() * u_scale,
+                )),
+                1.0,
+            ),
+            GeomCurve2d::Parabola(curve) if u_scale == v_scale => (
+                GeomCurve2d::parabola(openrcad_geom2d::Parabola2d::new(
+                    scaled_frame(curve.position(), map_point),
+                    curve.focal() * u_scale,
+                )),
+                u_scale,
+            ),
+            GeomCurve2d::Hyperbola(curve) if u_scale == v_scale => (
+                GeomCurve2d::hyperbola(openrcad_geom2d::Hyperbola2d::new(
+                    scaled_frame(curve.position(), map_point),
+                    curve.major_radius() * u_scale,
+                    curve.minor_radius() * u_scale,
+                )),
+                1.0,
+            ),
+            _ => return None,
+        };
+
+        Some(Self {
+            curve,
+            first: self.first * parameter_scale,
+            last: self.last * parameter_scale,
+            periodicity: SurfacePeriodicity {
+                u_period: self.periodicity.u_period.map(|period| period * u_scale),
+                v_period: self.periodicity.v_period.map(|period| period * v_scale),
+            },
+        })
+    }
+
     /// True when the unwrapped pcurve crosses a U seam.
     pub fn crosses_u_seam(&self) -> bool {
         crosses_periodic_seam(
@@ -162,6 +250,17 @@ impl PcurveData {
             self.periodicity.v_period,
         )
     }
+}
+
+fn scaled_frame(
+    frame: openrcad_foundation::Ax22d,
+    map_point: impl FnOnce(Pnt2d) -> Pnt2d,
+) -> openrcad_foundation::Ax22d {
+    openrcad_foundation::Ax22d::new_axes(
+        map_point(frame.location()),
+        frame.x_direction(),
+        frame.y_direction(),
+    )
 }
 
 fn wrap_if_periodic(value: f64, period: Option<f64>) -> f64 {
@@ -209,5 +308,26 @@ mod tests {
         assert_eq!((second.first, second.last), (0.25, 1.0));
         assert_eq!(first.periodicity, pcurve.periodicity);
         assert_eq!(second.periodicity, pcurve.periodicity);
+    }
+
+    #[test]
+    fn diagonal_surface_scale_maps_line_pcurves_exactly() {
+        let source = PcurveData::new(
+            GeomCurve2d::line(Line2d::from_point_dir(
+                Pnt2d::new(2.0, 3.0),
+                Dir2d::new(1.0, 1.0),
+            )),
+            -1.0,
+            2.0,
+        );
+        let scaled = source
+            .scaled_surface_coordinates(4.0, 2.0)
+            .expect("line mapping is exact");
+        for fraction in [0.0, 0.25, 0.5, 1.0] {
+            let before = source.point_at_fraction(fraction);
+            let after = scaled.point_at_fraction(fraction);
+            assert!((after.x() - before.x() * 4.0).abs() < 1e-12);
+            assert!((after.y() - before.y() * 2.0).abs() < 1e-12);
+        }
     }
 }

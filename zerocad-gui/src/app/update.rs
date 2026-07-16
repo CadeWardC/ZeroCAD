@@ -40,6 +40,8 @@ impl eframe::App for ZeroCadApp {
 
         self.show_move_dialog(ctx);
         self.show_combine_dialog(ctx);
+        self.show_split_body_dialog(ctx);
+        self.show_scale_body_dialog(ctx);
 
         self.draw_feature_tree(ctx);
 

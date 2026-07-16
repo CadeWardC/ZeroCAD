@@ -598,11 +598,20 @@ impl BRepBuilder {
             .expect("partition_face: face has no surface");
         if debug {
             eprintln!(
-                "partition start face={face_id:?} surface={} outer_edges={} split_edges={}",
+                "partition start face={face_id:?} surface={} outer_edges={} inner_wires={} split_edges={}",
                 surface_debug_name(surface),
                 outer_loop.edges.len(),
+                face_data.inner_wires.len(),
                 splitting_edges.len()
             );
+            for &loop_id in &face_data.inner_wires {
+                if let Some(inner) = self.brep.loops.get(loop_id) {
+                    eprintln!("  existing inner {loop_id:?} edges={}", inner.edges.len());
+                    for &edge in &inner.edges {
+                        eprintln!("    {}", edge_debug_line(&self.brep, edge));
+                    }
+                }
+            }
             for &e_id in splitting_edges {
                 eprintln!(
                     "  split {}",
@@ -622,8 +631,23 @@ impl BRepBuilder {
         // 1. Gather all edges (outer boundary + splitting edges) and build both Forward and Reversed half-edges
         // so that the graph is symmetric and every edge is traversed in both directions (avoiding dead ends / bijections breaking).
         let mut edges_pool = Vec::new();
-        edges_pool.extend(outer_loop.edges.iter().map(|oe| oe.id));
-        edges_pool.extend(splitting_edges.iter().copied());
+        edges_pool.extend(
+            outer_loop
+                .edges
+                .iter()
+                .map(|oe| oe.id)
+                .filter(|edge| self.brep.edges.contains_key(*edge)),
+        );
+        // A later imprint can split and replace an earlier queued crosscut.
+        // SlotMap correctly invalidates the old id; ignore that superseded
+        // segment here because its replacement is already present in the face
+        // graph. Partitioning must never index a stale arena key.
+        edges_pool.extend(
+            splitting_edges
+                .iter()
+                .copied()
+                .filter(|edge| self.brep.edges.contains_key(*edge)),
+        );
 
         let mut half_edges = Vec::new();
         for e_id in edges_pool {
@@ -639,7 +663,13 @@ impl BRepBuilder {
             adjacency.entry(start).or_default().push(oe);
         }
 
-        let periodic = matches!(surface, openrcad_geom::GeomSurface::Cylinder(_));
+        let periodic = matches!(
+            surface,
+            openrcad_geom::GeomSurface::Cylinder(_)
+                | openrcad_geom::GeomSurface::Cone(_)
+                | openrcad_geom::GeomSurface::Sphere(_)
+                | openrcad_geom::GeomSurface::Torus(_)
+        );
         let u_anchor = outer_loop
             .edges
             .first()
@@ -672,6 +702,41 @@ impl BRepBuilder {
                 }
                 (u, v)
             };
+
+        // Polygon tests in the partition graph must follow the actual trimming
+        // curves, not just their end vertices. A full circular wire is commonly
+        // stored as three arcs; treating those three vertices as a triangle can
+        // put a concentric splitting circle "outside" its containing cap. That
+        // misclassifies the reverse traversal as a second face instead of the
+        // annulus hole and leaves a free edge after sewing. A small deterministic
+        // sampling budget is sufficient for containment/area classification and
+        // applies equally to analytic and fitted boundaries.
+        let sample_loop_uv = |edges: &[OrientedEdge]| -> Vec<(f64, f64)> {
+            const SAMPLES_PER_EDGE: usize = 8;
+            let mut polygon = Vec::with_capacity(edges.len() * SAMPLES_PER_EDGE);
+            for &oriented in edges {
+                let edge = &self.brep.edges[oriented.id];
+                if let Some(curve) = &edge.curve {
+                    for sample in 0..SAMPLES_PER_EDGE {
+                        let fraction = sample as f64 / SAMPLES_PER_EDGE as f64;
+                        let parameter = match oriented.orientation {
+                            Orientation::Reversed => {
+                                edge.last + (edge.first - edge.last) * fraction
+                            }
+                            _ => edge.first + (edge.last - edge.first) * fraction,
+                        };
+                        polygon.push(project_point_on_surface(curve.point(parameter), surface));
+                    }
+                } else {
+                    let (start, _) = get_edge_endpoints(&self.brep, oriented);
+                    polygon.push(project_point_on_surface(
+                        self.brep.vertices[start].point,
+                        surface,
+                    ));
+                }
+            }
+            polygon
+        };
 
         // Helper to get polar angle of outgoing tangent direction of oriented edge at its start vertex
         let get_tangent_angle =
@@ -789,12 +854,7 @@ impl BRepBuilder {
             }
         }
 
-        let mut orig_poly = Vec::new();
-        for &oe in &outer_loop.edges {
-            let (v_start, _) = get_edge_endpoints(&self.brep, oe);
-            let p = self.brep.vertices[v_start].point;
-            orig_poly.push(project_point_on_surface(p, surface));
-        }
+        let orig_poly = sample_loop_uv(&outer_loop.edges);
         let mut orig_area = 0.0;
         if orig_poly.len() >= 3 {
             for i in 0..orig_poly.len() {
@@ -825,12 +885,7 @@ impl BRepBuilder {
             };
             if !is_exterior {
                 // Calculate area to check for degeneracy
-                let mut poly = Vec::new();
-                for &oe in &loop_edges {
-                    let (v_start, _) = get_edge_endpoints(&self.brep, oe);
-                    let p = self.brep.vertices[v_start].point;
-                    poly.push(project_point_on_surface(p, surface));
-                }
+                let poly = sample_loop_uv(&loop_edges);
                 let mut area = 0.0;
                 if poly.len() >= 3 {
                     for i in 0..poly.len() {
@@ -854,23 +909,16 @@ impl BRepBuilder {
             }
         }
 
-        let mut loop_polys = Vec::new();
+        let loop_polys: Vec<Vec<(f64, f64)>> = inner_loop_edges_list
+            .iter()
+            .map(|edges| sample_loop_uv(edges))
+            .collect();
         let mut new_loop_ids = Vec::new();
-
         for new_edges in &inner_loop_edges_list {
             let l_id = self.brep.loops.insert(LoopData {
                 edges: new_edges.clone(),
             });
             new_loop_ids.push(l_id);
-
-            // Reconstruct outer boundary polygon in UV space
-            let mut poly = Vec::new();
-            for &oe in new_edges {
-                let (v_start, _) = get_edge_endpoints(&self.brep, oe);
-                let p = self.brep.vertices[v_start].point;
-                poly.push(project_point_on_surface(p, surface));
-            }
-            loop_polys.push(poly);
         }
 
         // Initialize classification arrays
@@ -912,24 +960,12 @@ impl BRepBuilder {
                         tangent
                     };
 
-                    let normal = match surface {
-                        openrcad_geom::GeomSurface::Plane(plane) => plane.normal(),
-                        _ => {
-                            if let openrcad_geom::GeomSurface::Cylinder(cyl) = surface {
-                                let axis_pt = cyl.position().axis().location();
-                                let axis_dir = openrcad_foundation::Vec::from_dir(
-                                    cyl.position().axis().direction(),
-                                );
-                                let diff = mid_p - axis_pt;
-                                let proj = axis_pt + axis_dir * diff.dot(&axis_dir);
-                                (mid_p - proj)
-                                    .normalized()
-                                    .unwrap_or(openrcad_foundation::Dir::dz())
-                            } else {
-                                openrcad_foundation::Dir::dz()
-                            }
-                        }
-                    };
+                    let (u, v) = project_point_on_surface(mid_p, surface);
+                    let (_, du, dv) = surface.d1(u, v);
+                    let normal = du
+                        .cross(&dv)
+                        .normalized()
+                        .unwrap_or(openrcad_foundation::Dir::dz());
                     let left_dir = tangent
                         .cross(&openrcad_foundation::Vec::from_dir(normal))
                         .normalized()

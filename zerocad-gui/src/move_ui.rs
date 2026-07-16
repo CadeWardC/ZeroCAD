@@ -125,7 +125,7 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("copy_{n}");
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Body Copy {n}"),
             feature: FeatureType::BodyTransform {
@@ -134,7 +134,7 @@ impl ZeroCadApp {
                 copy: true,
             },
         });
-        self.graph.add_dependency(&clipboard.source, &id);
+        self.document.add_dependency(&clipboard.source, &id);
         self.body_clipboard = Some(clipboard);
         self.selected_body.clear();
         self.selected_body.insert((id.clone(), BodyPick::Whole));
@@ -186,7 +186,7 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("move_{n}");
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Move Body {n}"),
             feature: FeatureType::BodyTransform {
@@ -195,7 +195,7 @@ impl ZeroCadApp {
                 copy: false,
             },
         });
-        self.graph.add_dependency(&op.source, &id);
+        self.document.add_dependency(&op.source, &id);
         self.selected_body.clear();
         self.selected_body.insert((id.clone(), BodyPick::Whole));
         self.selected_node_id = Some(id);

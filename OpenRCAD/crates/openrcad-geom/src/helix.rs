@@ -120,7 +120,13 @@ impl Curve for Helix {
     }
 
     fn transformed(&self, t: &Trsf) -> Self {
-        Self::new(self.pos.transformed(t), self.radius, self.taper, self.lead)
+        let scale = t.scale_factor().abs();
+        Self::new(
+            self.pos.transformed(t),
+            self.radius * scale,
+            self.taper * scale,
+            self.lead * scale,
+        )
     }
 }
 

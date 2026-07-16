@@ -464,32 +464,14 @@ pub(crate) struct LiveBody {
     pub(crate) parts: Vec<KernelSolid>,
     pub(crate) pristine: Option<std::sync::Arc<MockMesh>>,
     pub(crate) sketch_source: Option<SketchExtrudeSource>,
-    pub(crate) cut_tools: Vec<CutTool>,
-    pub(crate) cut_replay: Option<CutReplayHistory>,
-    pub(crate) edge_mod_cut_history_path_used: bool,
-    /// Set once a Thread feature has replaced this body's cylindrical wall with
-    /// analytic helical bands. A boolean against those bands is neither robust
-    /// nor fast, so a later Join/Cut instead runs against the smooth pre-thread
-    /// solid held here, then replays the thread steps — the shaft stays
-    /// threaded, the added/removed volume stays smooth. See [`ThreadReplay`].
-    pub(crate) thread_replay: Option<ThreadReplay>,
 }
 
-/// Lets a threaded body absorb later Join/Cut booleans robustly. `base_parts`
-/// is the smooth solid *before* any thread wall replacement (with the chamfer /
-/// fillet rims kept); it is the surface booleans run against. `steps` are the
-/// thread applications, replayed in order after each boolean to rebuild the
-/// displayed threaded geometry from the updated smooth base.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ThreadReplay {
-    pub(crate) base_parts: Vec<KernelSolid>,
-    pub(crate) steps: Vec<ThreadReplayStep>,
-}
+// Phase 3 evaluates booleans against the current body; no feature replay state
+// is stored on a live body.
 
-/// One thread application, holding everything [`super::eval`]'s thread core
-/// needs to re-run against a freshly-booleaned smooth base.
+/// Fully resolved inputs for one native thread operation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ThreadReplayStep {
+pub(crate) struct ThreadParameters {
     pub(crate) face: FaceRef,
     pub(crate) internal: bool,
     pub(crate) pitch: f32,
@@ -499,21 +481,6 @@ pub(crate) struct ThreadReplayStep {
     pub(crate) starts: u32,
     pub(crate) length: Option<f32>,
     pub(crate) flip: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CutReplayHistory {
-    pub(crate) base_body_id: String,
-    pub(crate) base_parts: Vec<KernelSolid>,
-    pub(crate) base_pristine: Option<std::sync::Arc<MockMesh>>,
-    pub(crate) base_sketch_source: Option<SketchExtrudeSource>,
-    pub(crate) steps: Vec<CutReplayStep>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CutReplayStep {
-    pub(crate) node_id: String,
-    pub(crate) tool: CutTool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

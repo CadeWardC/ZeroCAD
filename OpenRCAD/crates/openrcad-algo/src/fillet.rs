@@ -1,10 +1,22 @@
 use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{Circle, CylindricalSurface, GeomCurve, GeomSurface, Plane, SphericalSurface};
-use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
+use openrcad_topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 use std::collections::HashMap;
 
 use crate::blend::{detect_cylinder, fillet_cylinder_with_policy, BlendError};
-use crate::sew::sew_with_policy;
+use crate::native_pcurve::{analytic_face_with_pcurves, planar_face_with_pcurves};
+use crate::sew::sew_shell_with_policy as sew_with_policy;
+
+fn face_with_native_pcurves(surface: GeomSurface, wire: Wire) -> Face {
+    match surface {
+        GeomSurface::Plane(plane) => {
+            planar_face_with_pcurves(plane, Some(wire), Vec::new(), Orientation::Forward)
+                .expect("fillet plane boundaries have exact pcurves")
+        }
+        surface => analytic_face_with_pcurves(surface, wire, Orientation::Forward)
+            .expect("fillet analytic boundaries are coordinate curves"),
+    }
+}
 
 /// Roll a constant-`radius` fillet along every edge of `solid`.
 #[deprecated(note = "use fillet_with_policy")]
@@ -200,7 +212,7 @@ fn make_cylindrical_face(
 
     let w = Wire::from_edges([e1, e2, e3, e4]);
     let surf = GeomSurface::cylinder(CylindricalSurface::new(pos, radius));
-    Face::new(Some(surf), w)
+    face_with_native_pcurves(surf, w)
 }
 
 fn make_spherical_face(v1: &Vertex, v2: &Vertex, v3: &Vertex, c: Pnt, radius: f64) -> Face {
@@ -223,7 +235,7 @@ fn make_spherical_face(v1: &Vertex, v2: &Vertex, v3: &Vertex, c: Pnt, radius: f6
     let w = Wire::from_edges([arc1, arc2, arc3]);
     let pos = Ax3::new(c, Dir::dz());
     let surf = GeomSurface::sphere(SphericalSurface::new(pos, radius));
-    Face::new(Some(surf), w)
+    face_with_native_pcurves(surf, w)
 }
 
 #[allow(clippy::too_many_arguments)] // the box frame is naturally seven scalars/vectors
@@ -295,7 +307,7 @@ fn fillet_box(
             frame.to_world(0.0, 0.0, 0.0),
             frame.to_world_dir(0.0, 0.0, -1.0),
         ));
-        Face::new(Some(surf), w)
+        face_with_native_pcurves(surf, w)
     };
     faces.push(f_bottom);
 
@@ -315,7 +327,7 @@ fn fillet_box(
             frame.to_world(0.0, 0.0, dz),
             frame.to_world_dir(0.0, 0.0, 1.0),
         ));
-        Face::new(Some(surf), w)
+        face_with_native_pcurves(surf, w)
     };
     faces.push(f_top);
 
@@ -335,7 +347,7 @@ fn fillet_box(
             frame.to_world(0.0, 0.0, 0.0),
             frame.to_world_dir(0.0, -1.0, 0.0),
         ));
-        Face::new(Some(surf), w)
+        face_with_native_pcurves(surf, w)
     };
     faces.push(f_front);
 
@@ -355,7 +367,7 @@ fn fillet_box(
             frame.to_world(0.0, dy, 0.0),
             frame.to_world_dir(0.0, 1.0, 0.0),
         ));
-        Face::new(Some(surf), w)
+        face_with_native_pcurves(surf, w)
     };
     faces.push(f_back);
 
@@ -375,7 +387,7 @@ fn fillet_box(
             frame.to_world(0.0, 0.0, 0.0),
             frame.to_world_dir(-1.0, 0.0, 0.0),
         ));
-        Face::new(Some(surf), w)
+        face_with_native_pcurves(surf, w)
     };
     faces.push(f_left);
 
@@ -395,7 +407,7 @@ fn fillet_box(
             frame.to_world(dx, 0.0, 0.0),
             frame.to_world_dir(1.0, 0.0, 0.0),
         ));
-        Face::new(Some(surf), w)
+        face_with_native_pcurves(surf, w)
     };
     faces.push(f_right);
 

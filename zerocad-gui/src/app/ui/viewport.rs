@@ -659,6 +659,35 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Planar-face picks requested by Split Body use the
+                        // same exact body-face picker but do not disturb normal
+                        // viewport selection.
+                        if response.clicked()
+                            && self
+                                .split_body_op
+                                .as_ref()
+                                .is_some_and(|op| op.picking_face)
+                        {
+                            if let Some(click_pos) = response.interact_pointer_pos() {
+                                let gpu_face = self.gpu_pick_face(
+                                    click_pos,
+                                    rect,
+                                    ctx.pixels_per_point(),
+                                );
+                                if let Some((node, BodyPick::Face(face))) = self.pick_body_element(
+                                    click_pos,
+                                    &project_3d,
+                                    sin_p,
+                                    cos_p,
+                                    sin_y,
+                                    cos_y,
+                                    gpu_face,
+                                ) {
+                                    self.pick_split_face(node, face);
+                                }
+                            }
+                        }
+
                         // 3D selection: click picks a body face/edge/vertex (or a finished
                         // sketch's face/edge); double-click selects the whole body/sketch.
                         // Works in normal 3D view, and while sketching when no drawing
@@ -671,6 +700,8 @@ impl ZeroCadApp {
                             && self.edge_mod_op.is_none()
                             && self.move_op.is_none()
                             && self.combine_op.is_none()
+                            && self.split_body_op.is_none()
+                            && self.scale_body_op.is_none()
                             && !self.camera_anim_active
                         {
                             let is_double = response.double_clicked();
@@ -707,9 +738,9 @@ impl ZeroCadApp {
                                 let mut best: Option<(String, usize, f32)> = None; // (sketch, region, depth)
                                 let mut best_edge: Option<(String, usize, f32)> = None; // (sketch, edge, px dist)
                                 const EDGE_TOL_PX: f32 = 6.0;
-                                let var_map = self.graph.variable_map();
-                                for idx in self.graph.graph.node_indices() {
-                                    let node = &self.graph.graph[idx];
+                                let var_map = self.document.variable_map();
+                                for idx in self.document.graph.node_indices() {
+                                    let node = &self.document.graph[idx];
                                     if self.hidden_nodes.contains(&node.id) {
                                         continue; // can't pick a hidden sketch
                                     }
@@ -776,7 +807,7 @@ impl ZeroCadApp {
                                         // above stays on the drawn curves only.
                                         let mut region_curves = curves.clone();
                                         if let Some(b) =
-                                            self.graph.sketch_face_boundaries.get(&node.id)
+                                            self.document.sketch_face_boundaries.get(&node.id)
                                         {
                                             region_curves.extend_curves(b);
                                         }
@@ -1005,7 +1036,7 @@ impl ZeroCadApp {
                                     let drag = (dx * dx + dy * dy).sqrt();
                                     let diameter = self
                                         .dim_param(0, 2.0 * drag)
-                                        .resolve(&self.graph.variable_map());
+                                        .resolve(&self.document.variable_map());
                                     let (ux, uy) = if drag > 1.0e-4 {
                                         (dx / drag, dy / drag)
                                     } else {

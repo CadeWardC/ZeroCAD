@@ -42,7 +42,7 @@ impl Surface for OffsetSurface {
     fn transformed(&self, t: &Trsf) -> Self {
         Self {
             base: Box::new(self.base.transformed(t)),
-            distance: self.distance,
+            distance: self.distance * t.scale_factor().abs(),
         }
     }
 }

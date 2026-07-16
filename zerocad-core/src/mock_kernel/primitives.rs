@@ -206,19 +206,27 @@ pub fn cone_tool_at(
 /// re-sewn: `sew`'s winding-consistency BFS plus its global signed-volume
 /// outward pass restores a well-oriented shell.
 pub fn transformed_solid(solid: &KernelSolid, t: &Trsf, is_reflection: bool) -> KernelSolid {
-    if !is_reflection {
-        return solid.transformed(t);
-    }
-    let faces: Vec<Face> = solid
-        .shell()
-        .faces()
-        .iter()
-        .map(|f| f.transformed(t))
-        .collect();
-    Solid::new(
-        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
-            .expect("standard tolerance policy is valid"),
+    transformed_solid_diagnostic(solid, t, is_reflection)
+        .expect("a rigid transform of a valid solid must remain valid")
+}
+
+/// Policy-validated transform for feature evaluators that must report failure
+/// without partially committing a body.
+pub(crate) fn transformed_solid_diagnostic(
+    solid: &KernelSolid,
+    t: &Trsf,
+    is_reflection: bool,
+) -> Result<KernelSolid, String> {
+    consume_operation(
+        "body transform",
+        openrcad::algo::transform_operation_with_policy(
+            solid,
+            t,
+            is_reflection,
+            &TolerancePolicy::STANDARD,
+        ),
     )
+    .map(|outcome| outcome.solid)
 }
 
 /// Resample a closed 2D polygon to exactly `n` points equally spaced by arc
@@ -295,8 +303,14 @@ pub fn lofted_solid(
             .collect();
         rings.push(ring);
     }
-    match skin_polygon_rings(&rings) {
-        Ok(solid) => Some(solid),
+    match consume_operation(
+        "loft skin",
+        openrcad::algo::skin_polygon_rings_operation_with_policy(
+            &rings,
+            &TolerancePolicy::STANDARD,
+        ),
+    ) {
+        Ok(outcome) => Some(outcome.solid),
         Err(e) => {
             log::warn!("loft failed: {e}");
             None
@@ -397,8 +411,14 @@ pub fn swept_solid(
         );
     }
 
-    match skin_polygon_rings(&rings) {
-        Ok(solid) => Some(solid),
+    match consume_operation(
+        "sweep skin",
+        openrcad::algo::skin_polygon_rings_operation_with_policy(
+            &rings,
+            &TolerancePolicy::STANDARD,
+        ),
+    ) {
+        Ok(outcome) => Some(outcome.solid),
         Err(e) => {
             log::warn!("sweep failed: {e}");
             None
@@ -2130,9 +2150,8 @@ fn cone_cut_assembly(
     z_max: f64,
     z_eps: f64,
     r_eps: f64,
+    policy: &TolerancePolicy,
 ) -> Option<KernelSolid> {
-    use openrcad::foundation::tolerance;
-
     let external = !spec.internal;
     let lead = spec.pitch as f64;
     let span = z_max - z_min;
@@ -2364,14 +2383,11 @@ fn cone_cut_assembly(
 
     faces.extend(bands.faces);
 
-    let mut solid = Solid::new(
-        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
-            .expect("standard tolerance policy is valid"),
-    );
-    if !solid.is_watertight() {
-        solid = openrcad::algo::merge::heal_tjunctions(&solid, tolerance::CONFUSION * 100.0);
+    let mut solid = Solid::new(openrcad::algo::sew_with_policy(&faces, policy).ok()?.value);
+    if !solid.is_watertight_with_policy(policy) {
+        solid = openrcad::algo::merge::heal_tjunctions_with_policy(&solid, policy);
     }
-    if !solid.is_watertight() {
+    if !solid.is_watertight_with_policy(policy) {
         log::warn!("thread cone cut-through did not close watertight");
         return None;
     }
@@ -2392,6 +2408,7 @@ fn cone_cut_assembly(
 /// Returns `None` (leaving the body untouched) when no matching cylindrical
 /// faces exist, the wall shape can't be classified, the thread window is
 /// shorter than a full turn, or the resewn solid does not close watertight.
+#[deprecated(note = "use threaded_replace_cylinder_wall_with_policy")]
 pub fn threaded_replace_cylinder_wall(
     part: &KernelSolid,
     info: &CylinderFaceInfo,
@@ -2399,8 +2416,25 @@ pub fn threaded_replace_cylinder_wall(
     length: Option<f64>,
     flip: bool,
 ) -> Option<KernelSolid> {
-    use openrcad::foundation::tolerance;
+    threaded_replace_cylinder_wall_with_policy(
+        part,
+        info,
+        spec,
+        length,
+        flip,
+        &TolerancePolicy::STANDARD,
+    )
+}
 
+pub fn threaded_replace_cylinder_wall_with_policy(
+    part: &KernelSolid,
+    info: &CylinderFaceInfo,
+    spec: &ThreadSpec,
+    length: Option<f64>,
+    flip: bool,
+    policy: &TolerancePolicy,
+) -> Option<KernelSolid> {
+    policy.validate().ok()?;
     let want_dir = GeomVec::new(info.dir[0] as f64, info.dir[1] as f64, info.dir[2] as f64);
     let want_r = info.radius as f64;
     let want_origin = Pnt::new(
@@ -2493,21 +2527,6 @@ pub fn threaded_replace_cylinder_wall(
         }
     };
 
-    // Which wall ends abut a flat cap rim (a kept wire riding the rim circle)?
-    // Only those ends may cut the thread straight through the profile; any
-    // other end fades out through a runout band + collar.
-    let mut flat_bottom_rim = false;
-    let mut flat_top_rim = false;
-    for face in &keep {
-        for wire in &face.wires() {
-            match rim_of(wire) {
-                Some(true) => flat_bottom_rim = true,
-                Some(false) => flat_top_rim = true,
-                None => {}
-            }
-        }
-    }
-
     // The thread window along the wall: full span, or a partial length
     // anchored at the z_max end (`flip` anchors at z_min instead).
     let full = length.is_none_or(|l| l <= 0.0 || l >= span - z_eps);
@@ -2518,8 +2537,16 @@ pub fn threaded_replace_cylinder_wall(
     } else {
         ((z_max - length.unwrap_or(span)).max(z_min), z_max)
     };
-    let flat_bottom = flat_bottom_rim && win_lo <= z_min + z_eps;
-    let flat_top = flat_top_rim && win_hi >= z_max - z_eps;
+    // A modeled thread must leave an ordinary analytic boundary for whatever
+    // feature follows it in the body timeline. Cutting the helical profile
+    // straight through a planar end cap made a later Join/Cut intersect a
+    // high-degree thread outline at the cap and was both scale-fragile and
+    // construction-order dependent. Terminate at every end through the same
+    // deterministic runout + cylindrical collar used for partial threads.
+    // The original cap wire is then preserved verbatim and subsequent body
+    // operations meet a cylinder/plane pair instead of a helical seam.
+    let flat_bottom = false;
+    let flat_top = false;
 
     // Fusion-style cut-through: when a chamfer cone (or countersink) rides a
     // non-flat end of the window, extend the thread THROUGH it and carve the
@@ -2561,6 +2588,7 @@ pub fn threaded_replace_cylinder_wall(
             z_max,
             z_eps,
             r_eps,
+            policy,
         ) {
             return Some(solid);
         }
@@ -2572,7 +2600,10 @@ pub fn threaded_replace_cylinder_wall(
     // window end (inset by a hair-thin collar when the window touches an
     // extremity whose neighbor isn't a flat cap, e.g. a chamfered rim).
     let lead = spec.pitch as f64;
-    let eps_collar = (0.05 * lead).min(0.01 * span);
+    // Keep the collar wider than the feature-operation coplanarity nudge used
+    // by ZeroCAD (0.1 model unit at standard scale). This is expressed through
+    // thread/part scale rather than a hard-coded global tolerance.
+    let eps_collar = (0.25 * lead).min(0.05 * span);
     let runout_len = (0.5 * lead).min(0.25 * (win_hi - win_lo));
     let (z_band_hi, z_circle_top) = if flat_top {
         (win_hi, None)
@@ -2699,15 +2730,15 @@ pub fn threaded_replace_cylinder_wall(
     faces.extend(wall.faces);
     faces.extend(extra_faces);
 
-    let mut solid = Solid::new(
-        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
-            .expect("standard tolerance policy is valid"),
-    );
-    if !solid.is_watertight() {
+    let mut solid = Solid::new(openrcad::algo::sew_with_policy(&faces, policy).ok()?.value);
+    if !solid.is_watertight_with_policy(policy) {
         // Safety net for hosts whose rim vertices don't line up exactly.
-        solid = openrcad::algo::merge::heal_tjunctions(&solid, tolerance::CONFUSION * 100.0);
+        solid = openrcad::algo::merge::heal_tjunctions_with_policy(&solid, policy);
     }
-    if !solid.is_watertight() {
+    let (solid, _) = solid.repair_pcurves(policy).ok()?;
+    if !solid.is_watertight_with_policy(policy)
+        || solid.validate_strict_with_policy(policy).is_err()
+    {
         log::warn!("thread wall replacement did not close watertight");
         return None;
     }
@@ -2721,6 +2752,7 @@ pub fn threaded_replace_cylinder_wall(
 /// each crest/flank/root band spans the full thread length — and NO boolean:
 /// fast and robust where a helical-tool difference against a smooth cylinder
 /// is neither.
+#[deprecated(note = "use threaded_cylinder_solid_with_policy")]
 pub fn threaded_cylinder_solid(
     axis_origin: crate::geometry::Vec3,
     axis_dir: crate::geometry::Vec3,
@@ -2729,6 +2761,27 @@ pub fn threaded_cylinder_solid(
     axial_max: f32,
     spec: &ThreadSpec,
 ) -> Option<KernelSolid> {
+    threaded_cylinder_solid_with_policy(
+        axis_origin,
+        axis_dir,
+        radius,
+        axial_min,
+        axial_max,
+        spec,
+        &TolerancePolicy::STANDARD,
+    )
+}
+
+pub fn threaded_cylinder_solid_with_policy(
+    axis_origin: crate::geometry::Vec3,
+    axis_dir: crate::geometry::Vec3,
+    radius: f32,
+    axial_min: f32,
+    axial_max: f32,
+    spec: &ThreadSpec,
+    policy: &TolerancePolicy,
+) -> Option<KernelSolid> {
+    policy.validate().ok()?;
     let origin = Pnt::new(
         axis_origin.x as f64,
         axis_origin.y as f64,
@@ -2761,11 +2814,11 @@ pub fn threaded_cylinder_solid(
         wire_ccw_on(top_wire, &top_plane, (0.0, 0.0)),
     ));
 
-    let solid = Solid::new(
-        openrcad::algo::sew_with_policy(&faces, &TolerancePolicy::STANDARD)
-            .expect("standard tolerance policy is valid"),
-    );
-    if !solid.is_watertight() {
+    let solid = Solid::new(openrcad::algo::sew_with_policy(&faces, policy).ok()?.value);
+    let (solid, _) = solid.repair_pcurves(policy).ok()?;
+    if !solid.is_watertight_with_policy(policy)
+        || solid.validate_strict_with_policy(policy).is_err()
+    {
         log::warn!("threaded cylinder wall did not close watertight");
         return None;
     }

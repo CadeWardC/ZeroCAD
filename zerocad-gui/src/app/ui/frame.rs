@@ -90,6 +90,17 @@ impl ZeroCadApp {
             self.cancel_move_body();
             return;
         }
+        if self.split_body_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.split_body_op = None;
+            self.status_msg = "Split Body cancelled.".to_string();
+            return;
+        }
+        if self.scale_body_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.scale_body_op = None;
+            self.move_preview_bodies = None;
+            self.status_msg = "Scale Body cancelled.".to_string();
+            return;
+        }
         // In the plain 3D view (no sketch, no live op or dialog), Escape returns to
         // the neutral Select state by clearing the current selection.
         if !self.is_sketch_mode
@@ -97,6 +108,8 @@ impl ZeroCadApp {
             && self.edge_mod_op.is_none()
             && self.move_op.is_none()
             && self.combine_op.is_none()
+            && self.split_body_op.is_none()
+            && self.scale_body_op.is_none()
             && self.dim_input.is_none()
             && !self.is_plane_selection_mode
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))

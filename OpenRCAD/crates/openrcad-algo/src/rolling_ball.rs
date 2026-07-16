@@ -14,10 +14,16 @@ use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface,
     GregorySurface, Plane, RuledSurface, SphericalSurface, Surface, ToroidalSurface,
 };
-use openrcad_mesh::tessellate_compatibility_with_policy_and_cancel;
+use openrcad_mesh::tessellate_checked_with_policy_and_cancel;
 use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
 
-use crate::sew::sew_with_policy;
+use crate::native_pcurve::analytic_face_with_pcurves;
+use crate::sew::sew_shell_with_policy as sew_with_policy;
+
+fn native_blend_face(surface: GeomSurface, wire: Wire) -> Result<Face, RollingBallError> {
+    analytic_face_with_pcurves(surface, wire, Orientation::Forward)
+        .map_err(|_| RollingBallError::BlendSurfaceBuild("invalid native blend pcurve"))
+}
 
 /// Reasons the rolling-ball solver could not resolve a face adjacency.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,7 +66,7 @@ pub enum RollingBallError {
     BlendSurfaceBuild(&'static str),
     /// The local edit built faces, but the sewn shell was not watertight/healthy.
     InvalidTopology,
-    /// A compatibility-only validation stage could not inspect the candidate.
+    /// A strict validation stage could not inspect the candidate.
     CandidateValidation { stage: &'static str, reason: String },
 }
 
@@ -356,34 +362,6 @@ fn fillet_planar_edge_inner(
 
     let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
     let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
-    if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-        let kind = |f: &Face| match f.surface() {
-            Some(GeomSurface::Plane(p)) => {
-                let n = p.normal();
-                let l = p.position().location();
-                format!(
-                    "Plane(n=({:.2},{:.2},{:.2}) p=({:.1},{:.1},{:.1}))",
-                    n.x(),
-                    n.y(),
-                    n.z(),
-                    l.x(),
-                    l.y(),
-                    l.z()
-                )
-            }
-            Some(GeomSurface::Cylinder(_)) => "Cyl".to_string(),
-            Some(GeomSurface::Torus(_)) => "Torus".to_string(),
-            _ => "Other".to_string(),
-        };
-        eprintln!(
-            "fillet dbg: concave={} start={:?} end={:?} start_caps={:?} end_caps={:?} use_sphere={use_sphere}",
-            blend.concave,
-            (start.x(), start.y(), start.z()),
-            (end.x(), end.y(), end.z()),
-            start_caps.iter().map(kind).collect::<Vec<_>>(),
-            end_caps.iter().map(kind).collect::<Vec<_>>()
-        );
-    }
     let cut_guards = cut_cylinder_guards(solid, &blend, start, &start_caps, end, &end_caps);
 
     let mut faces = Vec::new();
@@ -600,30 +578,6 @@ fn fillet_planar_edge_inner(
 
     let trimmed_a = trim_face_along_spine(&blend.face_a, &blend.spine, &blend.contact_a)?;
     let trimmed_b = trim_face_along_spine(&blend.face_b, &blend.spine, &blend.contact_b)?;
-    if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-        for (name, f) in [("trimmed_a", &trimmed_a), ("trimmed_b", &trimmed_b)] {
-            let pts: Vec<String> = f
-                .outer_wire()
-                .map(|w| w.edges())
-                .unwrap_or_default()
-                .iter()
-                .map(|e| {
-                    let a = e.source().point();
-                    let b = e.target().point();
-                    format!(
-                        "[{:.2},{:.2},{:.2}]->[{:.2},{:.2},{:.2}]",
-                        a.x(),
-                        a.y(),
-                        a.z(),
-                        b.x(),
-                        b.y(),
-                        b.z()
-                    )
-                })
-                .collect();
-            eprintln!("trim dbg {name}: {}", pts.join(" "));
-        }
-    }
 
     for face in solid.shell().faces() {
         if same_face(&face, &blend.face_a)
@@ -646,31 +600,7 @@ fn fillet_planar_edge_inner(
     let result = Solid::new(
         sew_with_policy(&faces, policy).map_err(RollingBallError::InvalidTolerancePolicy)?,
     );
-    if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-        eprintln!(
-            "fillet dbg: result watertight={} healthy={} errors={:?}",
-            result.is_watertight(),
-            result.health_report().is_healthy(),
-            result.health_report().errors
-        );
-        for (fi, face) in result.shell().faces().iter().enumerate() {
-            for wire in face.wires() {
-                let edges = wire.edges();
-                let n = edges.len();
-                for i in 0..n {
-                    let t = edges[i].target().point();
-                    let s = edges[(i + 1) % n].source().point();
-                    if t.distance(&s) > 1.0e-4 {
-                        eprintln!(
-                            "  gap dbg: face {fi} edge {i}->{}: [{:.3},{:.3},{:.3}] != [{:.3},{:.3},{:.3}]",
-                            (i + 1) % n,
-                            t.x(), t.y(), t.z(), s.x(), s.y(), s.z()
-                        );
-                    }
-                }
-            }
-        }
-    }
+    let result = complete_blend_candidate_pcurves(&result, policy)?;
     let merged =
         crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if cut_guards.is_empty() {
@@ -763,16 +693,13 @@ fn accept_subtractive_blend_result(
     if cut_guards.is_empty() {
         return Ok(Some(candidate.clone()));
     }
-    let intrudes = solid_surface_intrudes_into_cut(candidate, cut_guards, policy)?;
-    if !intrudes {
-        return Ok(Some(candidate.clone()));
-    }
-
     let mut clipped = candidate.clone();
+    let mut repaired = false;
     for guard in cut_guards {
         if !solid_surface_intrudes_into_cut(&clipped, std::slice::from_ref(guard), policy)? {
             continue;
         }
+        repaired = true;
         let axis = guard.cyl.position();
         let dir = axis.direction();
         let base = axis.location() + GeomVec::from_dir(dir) * (guard.v_min - 0.25);
@@ -803,10 +730,26 @@ fn accept_subtractive_blend_result(
         clipped =
             crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&clipped));
     }
+    if !repaired {
+        return Ok(Some(candidate.clone()));
+    }
     Ok((clipped.is_watertight()
         && clipped.health_report().is_healthy()
         && !solid_surface_intrudes_into_cut(&clipped, cut_guards, policy)?)
     .then_some(clipped))
+}
+
+fn complete_blend_candidate_pcurves(
+    candidate: &Solid,
+    policy: &TolerancePolicy,
+) -> Result<Solid, RollingBallError> {
+    candidate
+        .complete_missing_pcurves(policy)
+        .map(|(solid, _)| solid)
+        .map_err(|error| RollingBallError::CandidateValidation {
+            stage: "blend candidate pcurve construction",
+            reason: error.to_string(),
+        })
 }
 
 fn solid_surface_intrudes_into_cut(
@@ -822,22 +765,22 @@ fn solid_surface_intrudes_into_cut_once(
     cut_guards: &[CutCylinderGuard],
     policy: &TolerancePolicy,
 ) -> Result<bool, RollingBallError> {
-    // This Phase 3 blend candidate may not yet store pcurves. The explicit
-    // compatibility adapter must attach and validate them before strict
-    // tessellation. If that cannot be done, conservatively reject the candidate
-    // instead of panicking or inspecting a projection-derived mesh.
-    let mesh = tessellate_compatibility_with_policy_and_cancel(
-        candidate,
-        0.05,
-        0.5,
-        policy,
-        &NeverCancelled,
-    )
-    .map_err(|error| RollingBallError::CandidateValidation {
-        stage: "cut-intrusion tessellation",
-        reason: error.to_string(),
+    // Attach and validate operation-created candidate pcurves before entering
+    // the strict tessellator. Failure is surfaced to the evaluator instead of
+    // silently dropping the blend candidate.
+    let (candidate, _) = candidate.repair_pcurves(policy).map_err(|error| {
+        RollingBallError::CandidateValidation {
+            stage: "cut-intrusion pcurve repair",
+            reason: error.to_string(),
+        }
     })?;
-    let faces = candidate.shell().faces();
+    let mesh =
+        tessellate_checked_with_policy_and_cancel(&candidate, 0.05, 0.5, policy, &NeverCancelled)
+            .map_err(|error| RollingBallError::CandidateValidation {
+            stage: "cut-intrusion tessellation",
+            reason: error.to_string(),
+        })?;
+    let faces = candidate.faces();
     for (i, tri) in mesh.triangles.iter().enumerate() {
         let a = mesh.vertices[tri[0] as usize];
         let b = mesh.vertices[tri[1] as usize];
@@ -967,14 +910,7 @@ fn handle_corner_endpoint(
         // the ordinary flat trim on the union — the corner vertex then owns both
         // of its loop edges in a single wire. The Gregory patch below is for
         // genuinely distinct cap planes at an n-valent vertex.
-        let dbg = std::env::var("ORC_DEBUG_FILLET").is_ok();
         if let Some(merged) = merged_coplanar_cap(caps) {
-            if dbg {
-                eprintln!(
-                    "corner dbg: merged cap with {} outer edges",
-                    merged.outer_wire().map_or(0, |w| w.edges().len())
-                );
-            }
             let in_plane = match merged.surface() {
                 Some(GeomSurface::Plane(pl)) => {
                     let n = GeomVec::from_dir(pl.normal());
@@ -992,23 +928,12 @@ fn handle_corner_endpoint(
                 _ => false,
             };
             if in_plane {
-                match trim_face_at_corner(&merged, corner, ca, cb, arc) {
-                    Ok(trimmed) => {
-                        faces.push(trimmed);
-                        skipped.extend(caps.iter().map(|cap| cap.id()));
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if dbg {
-                            eprintln!("corner dbg: merged-cap trim failed: {e}");
-                        }
-                    }
+                if let Ok(trimmed) = trim_face_at_corner(&merged, corner, ca, cb, arc) {
+                    faces.push(trimmed);
+                    skipped.extend(caps.iter().map(|cap| cap.id()));
+                    return Ok(());
                 }
-            } else if dbg {
-                eprintln!("corner dbg: merged cap rejected — arc not in cap plane");
             }
-        } else if dbg {
-            eprintln!("corner dbg: caps did not merge (n={})", caps.len());
         }
         let patch = make_gregory_corner_patch(corner, ca, cb, radius);
         faces.push(patch);
@@ -1595,6 +1520,18 @@ fn polyline_edge_with_tolerance(points: &[Pnt], edge_tolerance: f64) -> Edge {
     )
 }
 
+/// Build a chorded intersection edge and record a conservative bound for the
+/// distance between each chord and the curved surfaces it approximates.
+fn polyline_edge_with_curvature_tolerance(points: &[Pnt], min_radius: f64) -> Edge {
+    let max_segment = points
+        .windows(2)
+        .map(|pair| pair[0].distance(&pair[1]))
+        .fold(0.0_f64, f64::max);
+    let radius = min_radius.max(tolerance::CONFUSION);
+    let chord_sag = max_segment * max_segment / (8.0 * radius);
+    polyline_edge_with_tolerance(points, chord_sag * 1.25 + tolerance::CONFUSION)
+}
+
 /// Sample the intersection of the `blend` cylinder with the `cut` cylinder
 /// between contact points `p_a` (on the blend's A-side contact) and `p_b` (B-side),
 /// returning a chorded B-spline edge that lies on *both* surfaces.
@@ -1676,15 +1613,9 @@ fn cyl_cyl_trim_edge(
         pts.push(p);
     }
     pts.push(p_b);
-    let max_segment = pts
-        .windows(2)
-        .map(|pair| pair[0].distance(&pair[1]))
-        .fold(0.0_f64, f64::max);
-    let radius = r_b.min(cut.radius()).max(tolerance::CONFUSION);
-    let chord_sag = max_segment * max_segment / (8.0 * radius);
-    Some(polyline_edge_with_tolerance(
+    Some(polyline_edge_with_curvature_tolerance(
         &pts,
-        chord_sag * 1.25 + tolerance::CONFUSION,
+        r_b.min(cut.radius()),
     ))
 }
 
@@ -4590,9 +4521,9 @@ pub fn fillet_circular_edge_chain_with_policy(
     // Open chain (the "bite arc"): prefer the analytic torus band with flush
     // end trims; fall back to the legacy rolling-ball open path for whatever
     // configuration it declines.
-    if let Ok(result) = blend_open_circular_chain(solid, chain_edges, spine, radius, false, policy)
-    {
-        return Ok(result);
+    match blend_open_circular_chain(solid, chain_edges, spine, radius, false, policy) {
+        Ok(result) => return Ok(result),
+        Err(_) => {}
     }
 
     let (plane_face, cyl_faces) = circular_chain_support_faces(solid, chain_edges)?;
@@ -4690,6 +4621,7 @@ pub fn fillet_circular_edge_chain_with_policy(
     let result = Solid::new(
         sew_with_policy(&faces, policy).map_err(RollingBallError::InvalidTolerancePolicy)?,
     );
+    let result = complete_blend_candidate_pcurves(&result, policy)?;
     let merged =
         crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if cut_guards.is_empty() {
@@ -4874,6 +4806,7 @@ fn assemble_closed_rim(
     let result = Solid::new(
         sew_with_policy(&band_faces, policy).map_err(RollingBallError::InvalidTolerancePolicy)?,
     );
+    let result = complete_blend_candidate_pcurves(&result, policy)?;
     let merged =
         crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if let Some(accepted) = accept_subtractive_blend_result(&merged, &[], policy)? {
@@ -4943,12 +4876,7 @@ fn chamfer_closed_circular_rim(
     if chain_edges.len() < 2 {
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
-    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist).map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed at rim recovery: {error:?}");
-        }
-        error
-    })?;
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist)?;
 
     // The cone passes through both contact rings: reference radius `spine_r` at the
     // wall contact, growing/shrinking to `major_radius` at the cap over axial
@@ -5242,12 +5170,7 @@ fn blend_open_circular_chain(
     if chain_edges.is_empty() {
         return Err(RollingBallError::SpineNotOnFace);
     }
-    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist).map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed at rim recovery: {error:?}");
-        }
-        error
-    })?;
+    let geom = recover_closed_rim_geom(solid, chain_edges, spine, dist)?;
 
     let (t_lo, t_hi) = (
         spine.first().min(spine.last()),
@@ -5305,18 +5228,8 @@ fn blend_open_circular_chain(
             _ => Err(RollingBallError::UnsupportedTrimTopology),
         }
     };
-    let (cap_lo, miter_lo) = cap_at(corner_lo).map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed at low cap lookup: {error:?}");
-        }
-        error
-    })?;
-    let (cap_hi, miter_hi) = cap_at(corner_hi).map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed at high cap lookup: {error:?}");
-        }
-        error
-    })?;
+    let (cap_lo, miter_lo) = cap_at(corner_lo)?;
+    let (cap_hi, miter_hi) = cap_at(corner_hi)?;
 
     // Ring frame (shared by both contact rings) and the cap-ring axial offset.
     let xv = GeomVec::from_dir(geom.c_plane.position().x_direction());
@@ -5359,11 +5272,6 @@ fn blend_open_circular_chain(
             let c = (geom.contact_center + caxv * h - p0).dot(&n);
             let hyp = a.hypot(b);
             if hyp <= tolerance::CONFUSION || (c / hyp).abs() > 1.0 + 1.0e-9 {
-                if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-                    eprintln!(
-                        "open circular solve_u rejected rho={rho:.6} h={h:.6} near={seed:.6} a={a:.6} b={b:.6} c={c:.6} hyp={hyp:.6}"
-                    );
-                }
                 return None;
             }
             let phi = b.atan2(a);
@@ -5385,12 +5293,6 @@ fn blend_open_circular_chain(
             .ok_or(RollingBallError::UnsupportedTrimTopology)?;
         let ub =
             solve_u(geom.spine_r, 0.0, near).ok_or(RollingBallError::UnsupportedTrimTopology)?;
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!(
-                "open circular end params near={near:.6} ua={ua:.6} ub={ub:.6} span=[{t_lo:.6},{t_hi:.6}] concave={}",
-                geom.concave
-            );
-        }
         // A convex outer rim retracts both contacts into the selected span. A
         // concave pocket rim is the opposite: its plane-contact radius grows,
         // so that contact must extend a short way PAST the original arc endpoint
@@ -5436,7 +5338,7 @@ fn blend_open_circular_chain(
             corner,
             ua,
             ub,
-            trim: polyline_edge(&pts),
+            trim: polyline_edge_with_curvature_tolerance(&pts, dist),
             miter: false,
         })
     };
@@ -5501,7 +5403,7 @@ fn blend_open_circular_chain(
             corner,
             ua,
             ub,
-            trim: polyline_edge(&pts),
+            trim: polyline_edge_with_curvature_tolerance(&pts, dist.min(r)),
             miter: true,
         })
     };
@@ -5509,23 +5411,11 @@ fn blend_open_circular_chain(
     let end_lo = match &miter_lo {
         Some(cyl) => resolve_end_miter(&cap_lo, cyl, corner_lo, t_lo, -1.0),
         None => resolve_end(&cap_lo, corner_lo, t_lo),
-    }
-    .map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed resolving low end: {error:?}");
-        }
-        error
-    })?;
+    }?;
     let end_hi = match &miter_hi {
         Some(cyl) => resolve_end_miter(&cap_hi, cyl, corner_hi, t_hi, 1.0),
         None => resolve_end(&cap_hi, corner_hi, t_hi),
-    }
-    .map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed resolving high end: {error:?}");
-        }
-        error
-    })?;
+    }?;
     if end_lo.ua >= end_hi.ua - 1.0e-6 || end_lo.ub >= end_hi.ub - 1.0e-6 {
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
@@ -5638,30 +5528,16 @@ fn blend_open_circular_chain(
         spine,
         &c_plane_edge,
         (end_lo.ua, end_hi.ua),
-    )
-    .map_err(|error| {
-        if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-            eprintln!("open circular blend failed trimming cap support: {error:?}");
-        }
-        error
-    })?;
+    )?;
     let mut trimmed_walls = Vec::new();
     for cyl in &geom.cyl_faces {
-        trimmed_walls.push(
-            trim_face_along_spine_segments_clamped(
-                cyl,
-                chain_edges,
-                spine,
-                &c_cyl_edge,
-                (end_lo.ub, end_hi.ub),
-            )
-            .map_err(|error| {
-                if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-                    eprintln!("open circular blend failed trimming wall support: {error:?}");
-                }
-                error
-            })?,
-        );
+        trimmed_walls.push(trim_face_along_spine_segments_clamped(
+            cyl,
+            chain_edges,
+            spine,
+            &c_cyl_edge,
+            (end_lo.ub, end_hi.ub),
+        )?);
     }
 
     // End caps re-trimmed to the flush sections (both ends can land on the
@@ -5688,18 +5564,8 @@ fn blend_open_circular_chain(
     };
     let mut trimmed_caps: Vec<Face> = Vec::new();
     if same_face(&end_lo.cap, &end_hi.cap) {
-        let once = trim_cap(&end_lo.cap, &end_lo).map_err(|error| {
-            if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-                eprintln!("open circular low cap trim failed: {error:?}");
-            }
-            error
-        })?;
-        trimmed_caps.push(trim_cap(&once, &end_hi).map_err(|error| {
-            if std::env::var("ORC_DEBUG_FILLET").is_ok() {
-                eprintln!("open circular high cap trim failed: {error:?}");
-            }
-            error
-        })?);
+        let once = trim_cap(&end_lo.cap, &end_lo)?;
+        trimmed_caps.push(trim_cap(&once, &end_hi)?);
     } else {
         trimmed_caps.push(trim_cap(&end_lo.cap, &end_lo)?);
         trimmed_caps.push(trim_cap(&end_hi.cap, &end_hi)?);
@@ -5747,6 +5613,7 @@ fn blend_open_circular_chain(
     let result = Solid::new(
         sew_with_policy(&faces, policy).map_err(RollingBallError::InvalidTolerancePolicy)?,
     );
+    let result = complete_blend_candidate_pcurves(&result, policy)?;
     let merged =
         crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
     if let Some(accepted) = accept_subtractive_blend_result(&merged, &[], policy)? {
@@ -6155,7 +6022,7 @@ pub fn rolling_ball_between_curved_faces_with_policy(
                 contact_b.clone().reversed(),
                 arc_start.clone(),
             ]);
-            let blend_face = Face::new(Some(torus_surf), wire);
+            let blend_face = native_blend_face(torus_surf, wire)?;
 
             return Ok(RollingBallBlend {
                 spine: edge.clone(),
@@ -6327,7 +6194,7 @@ fn rolling_ball_plane_perp_cylinder(
         contact_b.clone().reversed(),
         arc_start.clone(),
     ]);
-    let blend_face = Face::new(Some(blend_surf), wire);
+    let blend_face = native_blend_face(blend_surf, wire)?;
 
     // Reconstruct the original (face_a, face_b) ordering from the plane/cylinder
     // pair and the `is_a_plane` flag.
@@ -6454,7 +6321,7 @@ fn planar_blend(
         Ax3::new_axes(c0, spine_dir, n_a),
         radius,
     ));
-    let blend_face = Face::new(Some(surface), wire);
+    let blend_face = native_blend_face(surface, wire)?;
 
     Ok(RollingBallBlend {
         spine: edge.clone(),
@@ -6544,7 +6411,7 @@ fn planar_blend_concave(
         Ax3::new_axes(c0, spine_dir, n_a.reversed()),
         radius,
     ));
-    let blend_face = Face::new(Some(surface), wire);
+    let blend_face = native_blend_face(surface, wire)?;
 
     Ok(RollingBallBlend {
         spine: edge.clone(),

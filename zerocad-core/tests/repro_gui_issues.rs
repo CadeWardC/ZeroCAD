@@ -212,7 +212,6 @@ fn extruded_box_fillet_succeeds_and_is_fast() {
             edge,
             dist: 4.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });
@@ -464,7 +463,6 @@ fn fillet_preview_drag_is_responsive() {
                 edge: edge.clone(),
                 dist: r,
                 dist_expr: None,
-                replay: Default::default(),
                 kind: CornerKind::Fillet,
             },
         });

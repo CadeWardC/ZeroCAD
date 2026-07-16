@@ -8,7 +8,7 @@ use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Surface};
 use openrcad_topo::arena::EdgeId;
 use openrcad_topo::{
     BRepBuilder, Face, FaceId, HealthReport, InputTopologyRef, PcurveBuildError, Solid,
-    TopologyHistory, TopologyRef, Wire,
+    TopologyHistory, TopologyHistoryError, TopologyRef, Wire,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -42,9 +42,18 @@ pub enum BooleanFaceSource {
 /// from the split bookkeeping the boolean already performs internally
 /// (`obj_sub`/`tool_sub` parent→child maps), so two same-plane faces with
 /// different owners resolve by their true imprint boundaries.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BooleanFaceHistory {
     pub face_source: Vec<Option<BooleanFaceSource>>,
+}
+
+/// Structured value returned by a boolean that may create several connected
+/// solids.  Face history is indexed per returned body, so applications never
+/// need to keep an invalid disconnected shell merely to interpret lineage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanBodies {
+    pub bodies: Vec<Solid>,
+    pub face_history: Vec<BooleanFaceHistory>,
 }
 
 impl BooleanFaceHistory {
@@ -147,6 +156,12 @@ pub enum BooleanError {
     },
     /// The boolean implementation panicked before it could produce a result.
     Panicked,
+    /// A successful geometry candidate carried malformed topology lineage.
+    InvalidHistory(TopologyHistoryError),
+    /// Result topology exists but the history omitted one or more entities.
+    IncompleteHistory { missing: Vec<TopologyRef> },
+    /// The operation produced no connected solid result.
+    EmptyOutput,
     /// The resulting solid failed structural health checks.
     InvalidOutput {
         /// Topology health diagnostics for the output.
@@ -181,6 +196,14 @@ impl core::fmt::Display for BooleanError {
                 write!(f, "invalid boolean {input:?} input: {report:?}")
             }
             Self::Panicked => write!(f, "boolean operation panicked"),
+            Self::InvalidHistory(error) => write!(f, "invalid boolean topology history: {error}"),
+            Self::IncompleteHistory { missing } => {
+                write!(
+                    f,
+                    "boolean topology history omitted result entities: {missing:?}"
+                )
+            }
+            Self::EmptyOutput => write!(f, "boolean produced no connected solid result"),
             Self::InvalidOutput { report } => {
                 write!(f, "boolean produced invalid topology: {report:?}")
             }
@@ -300,7 +323,13 @@ pub fn boolean_operation_with_classes_policy_and_cancel(
     let face_history = face_history.unwrap_or_default();
     let mut history = face_history.topology_history(op, object.face_count(), tool.face_count());
     let unattributed = history.complete_unattributed_results(&value);
-    debug_assert!(history.validate().is_ok());
+    history.validate().map_err(BooleanError::InvalidHistory)?;
+    let coverage = history.coverage_for_solid(&value);
+    if !coverage.is_complete() {
+        return Err(BooleanError::IncompleteHistory {
+            missing: coverage.missing_results,
+        });
+    }
     let mut diagnostics: Vec<_> = face_history
         .face_source
         .iter()
@@ -322,12 +351,185 @@ pub fn boolean_operation_with_classes_policy_and_cancel(
         )
     }));
     let validation = ValidationReport::for_solid(&value, policy);
-    debug_assert!(validation.is_valid());
+    if !validation.is_valid() {
+        return Err(BooleanError::InvalidOutput {
+            report: validation.health,
+        });
+    }
 
     Ok(OperationResult {
         value,
         history,
         diagnostics,
+        recovery,
+        validation,
+    })
+}
+
+/// Canonical multi-body boolean operation under an explicit policy.
+///
+/// Each connected result is strictly validated and receives its own face-index
+/// history. The shared operation history uses a flattened result-face index and
+/// explicitly covers every lower-level result entity conservatively.
+pub fn boolean_bodies_operation_with_classes_policy_and_cancel(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+) -> Result<OperationResult<BooleanBodies>, BooleanError> {
+    policy
+        .validate()
+        .map_err(BooleanError::InvalidTolerancePolicy)?;
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
+    validate_operand(BooleanInput::Object, object, policy)?;
+    validate_operand(BooleanInput::Tool, tool, policy)?;
+
+    let (combined, packed_history, mut recovery) = catch_unwind(AssertUnwindSafe(|| {
+        boolean_impl(
+            object,
+            tool,
+            op,
+            BooleanOptions {
+                obj_classes,
+                tool_classes,
+                want_history: true,
+                policy,
+                cancel,
+            },
+        )
+    }))
+    .map_err(|_| BooleanError::Panicked)?
+    .map_err(|_| BooleanError::Cancelled)?;
+    cancel
+        .check_cancelled()
+        .map_err(|_| BooleanError::Cancelled)?;
+    let (combined, reconstructed) = repair_multi_body_boolean_output(combined, policy)?;
+    if reconstructed > 0 {
+        recovery.actions.push(RecoveryAction::ReconstructPcurves {
+            count: reconstructed,
+        });
+    }
+
+    let packed_history = packed_history.unwrap_or_default();
+    let bodies = combined.split_disconnected();
+    if bodies.is_empty() {
+        return Err(BooleanError::EmptyOutput);
+    }
+    let combined_faces = combined.faces();
+    let mut face_history = Vec::with_capacity(bodies.len());
+    for body in &bodies {
+        let mut sources = Vec::with_capacity(body.face_count());
+        for face in body.faces() {
+            let packed_index = combined_faces
+                .iter()
+                .position(|candidate| candidate == &face)
+                .ok_or(BooleanError::InvalidOutput {
+                    report: body.health_report_with_policy(policy),
+                })?;
+            sources.push(packed_history.source_of(packed_index));
+        }
+        face_history.push(BooleanFaceHistory {
+            face_source: sources,
+        });
+    }
+
+    let mut history = TopologyHistory::default();
+    let mut flat_face_index = 0usize;
+    for per_body in &face_history {
+        for source in &per_body.face_source {
+            let result = TopologyRef::face(flat_face_index);
+            match source {
+                Some(BooleanFaceSource::Object(index)) => {
+                    history.modified(InputTopologyRef::face(0, *index), result)
+                }
+                Some(BooleanFaceSource::Tool(index)) if op == BooleanOp::Cut => {
+                    history.generated([InputTopologyRef::face(1, *index)], result)
+                }
+                Some(BooleanFaceSource::Tool(index)) => {
+                    history.modified(InputTopologyRef::face(1, *index), result)
+                }
+                None => history.generated([], result),
+            }
+            flat_face_index += 1;
+        }
+    }
+    // Multi-body topology has no single local arena for edge/vertex positions.
+    // Account for those entities in deterministic body-major order, and record
+    // every returned shell/solid explicitly.
+    for kind in [
+        openrcad_topo::TopologyKind::Vertex,
+        openrcad_topo::TopologyKind::Edge,
+        openrcad_topo::TopologyKind::Wire,
+    ] {
+        let mut index = 0usize;
+        for body in &bodies {
+            let count = match kind {
+                openrcad_topo::TopologyKind::Vertex => body.vertex_count(),
+                openrcad_topo::TopologyKind::Edge => body.edge_count(),
+                openrcad_topo::TopologyKind::Wire => body
+                    .shell()
+                    .faces()
+                    .iter()
+                    .map(|face| face.wires().len())
+                    .sum(),
+                _ => unreachable!(),
+            };
+            for _ in 0..count {
+                history.generated([], TopologyRef::new(kind, index));
+                index += 1;
+            }
+        }
+    }
+    for index in 0..bodies.len() {
+        history.generated(
+            [InputTopologyRef::new(
+                0,
+                TopologyRef::new(openrcad_topo::TopologyKind::Shell, 0),
+            )],
+            TopologyRef::new(openrcad_topo::TopologyKind::Shell, index),
+        );
+        history.generated(
+            [InputTopologyRef::new(
+                0,
+                TopologyRef::new(openrcad_topo::TopologyKind::Solid, 0),
+            )],
+            TopologyRef::new(openrcad_topo::TopologyKind::Solid, index),
+        );
+    }
+
+    history.validate().map_err(BooleanError::InvalidHistory)?;
+    let coverage = history.coverage_for_solids(&bodies);
+    if !coverage.is_complete() {
+        return Err(BooleanError::IncompleteHistory {
+            missing: coverage.missing_results,
+        });
+    }
+
+    let mut validation = ValidationReport::for_solid(&bodies[0], policy);
+    for body in bodies.iter().skip(1) {
+        let report = ValidationReport::for_solid(body, policy);
+        validation.health.errors.extend(report.health.errors);
+        validation.health.warnings.extend(report.health.warnings);
+        validation.watertight &= report.watertight;
+        validation.pcurves_complete &= report.pcurves_complete;
+    }
+    if !validation.is_valid() {
+        return Err(BooleanError::InvalidOutput {
+            report: validation.health,
+        });
+    }
+    Ok(OperationResult {
+        value: BooleanBodies {
+            bodies,
+            face_history,
+        },
+        history,
+        diagnostics: Vec::new(),
         recovery,
         validation,
     })
@@ -477,167 +679,6 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
         .value
 }
 
-/// [`boolean`] plus the exact face correspondence ([`BooleanFaceHistory`]).
-///
-/// `obj_classes` / `tool_classes` optionally give each input face (by shell
-/// position) an **owner class**: the coplanar/cocylindrical merge passes then
-/// refuse to combine result faces descending from different classes, so a
-/// caller's face identities survive the merge (the Bidarra owner-aware-merge
-/// rule). `None` classes ⇒ merges behave exactly as [`boolean`].
-#[deprecated(
-    note = "use boolean_operation_with_classes_policy_and_cancel; this wrapper returns only legacy face history and discards validation, diagnostics, and recovery"
-)]
-#[allow(deprecated)]
-pub fn boolean_with_history(
-    object: &Solid,
-    tool: &Solid,
-    op: BooleanOp,
-    obj_classes: Option<&[Option<u64>]>,
-    tool_classes: Option<&[Option<u64>]>,
-) -> (Solid, BooleanFaceHistory) {
-    let (solid, history, _) = boolean_impl(
-        object,
-        tool,
-        op,
-        BooleanOptions {
-            obj_classes,
-            tool_classes,
-            want_history: true,
-            policy: &TolerancePolicy::STANDARD,
-            cancel: &NeverCancelled,
-        },
-    )
-    .expect("NeverCancelled cannot cancel");
-    let (solid, _) = repair_boolean_output(solid, &TolerancePolicy::STANDARD)
-        .unwrap_or_else(|error| panic!("boolean_with_history: {error}"));
-    (solid, history.unwrap_or_default())
-}
-
-/// Checked variant of [`boolean_with_history`] — same validation as
-/// [`boolean_checked`].
-#[deprecated(
-    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
-)]
-#[allow(deprecated)]
-pub fn boolean_checked_with_history(
-    object: &Solid,
-    tool: &Solid,
-    op: BooleanOp,
-    obj_classes: Option<&[Option<u64>]>,
-    tool_classes: Option<&[Option<u64>]>,
-) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
-    boolean_checked_with_history_and_policy(
-        object,
-        tool,
-        op,
-        obj_classes,
-        tool_classes,
-        &TolerancePolicy::STANDARD,
-    )
-}
-
-/// Checked history-producing boolean under an explicit tolerance policy.
-#[deprecated(
-    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
-)]
-pub fn boolean_checked_with_history_and_policy(
-    object: &Solid,
-    tool: &Solid,
-    op: BooleanOp,
-    obj_classes: Option<&[Option<u64>]>,
-    tool_classes: Option<&[Option<u64>]>,
-    policy: &TolerancePolicy,
-) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
-    policy
-        .validate()
-        .map_err(BooleanError::InvalidTolerancePolicy)?;
-    validate_operand(BooleanInput::Object, object, policy)?;
-    validate_operand(BooleanInput::Tool, tool, policy)?;
-
-    let (result, history, _) = catch_unwind(AssertUnwindSafe(|| {
-        boolean_impl(
-            object,
-            tool,
-            op,
-            BooleanOptions {
-                obj_classes,
-                tool_classes,
-                want_history: true,
-                policy,
-                cancel: &NeverCancelled,
-            },
-        )
-    }))
-    .map_err(|_| BooleanError::Panicked)?
-    .expect("NeverCancelled cannot cancel");
-    let (result, _) = repair_multi_body_boolean_output(result, policy)?;
-    Ok((result, history.unwrap_or_default()))
-}
-
-#[deprecated(
-    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
-)]
-#[allow(deprecated)]
-pub fn boolean_checked_with_history_cancel(
-    object: &Solid,
-    tool: &Solid,
-    op: BooleanOp,
-    obj_classes: Option<&[Option<u64>]>,
-    tool_classes: Option<&[Option<u64>]>,
-    cancel: &dyn CancellationProbe,
-) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
-    boolean_checked_with_history_policy_and_cancel(
-        object,
-        tool,
-        op,
-        obj_classes,
-        tool_classes,
-        &TolerancePolicy::STANDARD,
-        cancel,
-    )
-}
-
-/// Cancellable history-producing boolean under an explicit tolerance policy.
-#[deprecated(
-    note = "use boolean_operation_with_classes_policy_and_cancel; this Phase 3 compatibility wrapper returns only legacy face history"
-)]
-pub fn boolean_checked_with_history_policy_and_cancel(
-    object: &Solid,
-    tool: &Solid,
-    op: BooleanOp,
-    obj_classes: Option<&[Option<u64>]>,
-    tool_classes: Option<&[Option<u64>]>,
-    policy: &TolerancePolicy,
-    cancel: &dyn CancellationProbe,
-) -> Result<(Solid, BooleanFaceHistory), BooleanError> {
-    policy
-        .validate()
-        .map_err(BooleanError::InvalidTolerancePolicy)?;
-    cancel
-        .check_cancelled()
-        .map_err(|_| BooleanError::Cancelled)?;
-    validate_operand(BooleanInput::Object, object, policy)?;
-    validate_operand(BooleanInput::Tool, tool, policy)?;
-    let (result, history, _) = catch_unwind(AssertUnwindSafe(|| {
-        boolean_impl(
-            object,
-            tool,
-            op,
-            BooleanOptions {
-                obj_classes,
-                tool_classes,
-                want_history: true,
-                policy,
-                cancel,
-            },
-        )
-    }))
-    .map_err(|_| BooleanError::Panicked)?
-    .map_err(|_| BooleanError::Cancelled)?;
-    let (result, _) = repair_multi_body_boolean_output(result, policy)?;
-    Ok((result, history.unwrap_or_default()))
-}
-
 struct BooleanOptions<'a> {
     obj_classes: Option<&'a [Option<u64>]>,
     tool_classes: Option<&'a [Option<u64>]>,
@@ -682,8 +723,8 @@ fn boolean_impl(
     let mut builder_tool = BRepBuilder::from_brep((**tool.brep()).clone());
 
     // 2. Perform intersection and splitting
-    let faces_obj = object.shell().faces();
-    let faces_tool = tool.shell().faces();
+    let faces_obj = object.faces();
+    let faces_tool = tool.faces();
     let bvh_obj = Bvh::build(&faces_obj);
     let bvh_tool = Bvh::build(&faces_tool);
     let pairs = Bvh::overlapping_pairs(&bvh_obj, &bvh_tool);
@@ -770,9 +811,19 @@ fn boolean_impl(
 
         let s_obj = f_obj.surface().unwrap();
         let s_tool = f_tool.surface().unwrap();
+        if surfaces_are_same_domain(s_obj, s_tool, tol) {
+            // Re-cutting a curved cavity presents the cavity wall and cutter
+            // wall on the same infinite support. Their mutual boundaries do
+            // not remove material; intersecting cap/blend faces provide every
+            // real axial or angular split. Imprinting curved same-domain faces
+            // against one another merely duplicates periodic seams.
+            let recut_curved_domain = op == BooleanOp::Cut
+                && !matches!(s_obj, GeomSurface::Plane(_) | GeomSurface::BSpline(_));
+            if recut_curved_domain {
+                continue;
+            }
 
-        if surfaces_are_coplanar(s_obj, s_tool, tol) {
-            // Coplanar faces: split f_obj along f_tool's boundary edges, and
+            // Same-domain faces: split f_obj along f_tool's boundary edges, and
             // vice versa — restricted to each face's own descendants.
             for w_tool in f_tool.wires() {
                 // A coplanar circular cap (cylinder rim) sitting fully inside
@@ -897,10 +948,16 @@ fn boolean_impl(
     >| {
         let mut new_sub = Vec::new();
         for &fid in sub.iter() {
-            if let Some(edges) = split_map.remove(&fid) {
+            if let Some(mut edges) = split_map.remove(&fid) {
                 if builder.brep().faces.contains_key(fid) {
-                    let partitioned = builder.partition_face(fid, &edges);
-                    new_sub.extend(partitioned);
+                    deduplicate_splitting_edges(builder, &mut edges, policy.intersection);
+                    discard_existing_boundary_splits(builder, fid, &mut edges, policy.intersection);
+                    if edges.is_empty() {
+                        new_sub.push(fid);
+                    } else {
+                        let partitioned = builder.partition_face(fid, &edges);
+                        new_sub.extend(partitioned);
+                    }
                 } else {
                     new_sub.push(fid);
                 }
@@ -965,6 +1022,10 @@ fn boolean_impl(
 
     let brep_obj = builder_obj.build(); // seals into Arc<BRep>
     let brep_tool = builder_tool.build();
+    let active_obj: std::collections::HashSet<FaceId> =
+        obj_sub.values().flatten().copied().collect();
+    let active_tool: std::collections::HashSet<FaceId> =
+        tool_sub.values().flatten().copied().collect();
 
     // BVHs over the *split* faces so the coplanar pre-check tests only the
     // handful of opposite-side faces a given face actually overlaps, instead of
@@ -972,17 +1033,22 @@ fn boolean_impl(
     let split_faces_obj: Vec<Face> = brep_obj
         .faces
         .iter()
+        .filter(|(id, _)| active_obj.contains(id))
         .map(|(id, d)| Face::from_id(brep_obj.clone(), id, d.orientation))
         .collect();
     let split_faces_tool: Vec<Face> = brep_tool
         .faces
         .iter()
+        .filter(|(id, _)| active_tool.contains(id))
         .map(|(id, d)| Face::from_id(brep_tool.clone(), id, d.orientation))
         .collect();
     let bvh_split_obj = Bvh::build(&split_faces_obj);
     let bvh_split_tool = Bvh::build(&split_faces_tool);
 
     for (f_id, f_data) in &brep_obj.faces {
+        if !active_obj.contains(&f_id) {
+            continue;
+        }
         cancel.check_cancelled()?;
         let face = Face::from_id(brep_obj.clone(), f_id, f_data.orientation);
         let pos = point_on_face(&face);
@@ -994,29 +1060,16 @@ fn boolean_impl(
             let ft_data = &brep_tool.faces[ft_id];
             let face_t = Face::from_id(brep_tool.clone(), ft_id, ft_data.orientation);
             if let (Some(s_obj), Some(s_tool)) = (face.surface(), face_t.surface()) {
-                if surfaces_are_coplanar(s_obj, s_tool, class_tol) {
+                if surfaces_are_same_domain(s_obj, s_tool, class_tol) {
                     let (u, v) =
                         crate::intersect::search_nearest_parameter(s_tool, &pos, (0.0, 0.0));
                     if crate::intersect::is_inside_trimming_loops(u, v, &face_t) {
-                        let n_obj = match s_obj {
-                            GeomSurface::Plane(p)
-                                if f_data.orientation == openrcad_topo::Orientation::Reversed =>
-                            {
-                                p.normal().reversed()
-                            }
-                            GeomSurface::Plane(p) => p.normal(),
-                            _ => openrcad_foundation::Dir::dz(),
-                        };
-                        let n_tool = match s_tool {
-                            GeomSurface::Plane(p)
-                                if ft_data.orientation == openrcad_topo::Orientation::Reversed =>
-                            {
-                                p.normal().reversed()
-                            }
-                            GeomSurface::Plane(p) => p.normal(),
-                            _ => openrcad_foundation::Dir::dz(),
-                        };
-                        if n_obj.dot(&n_tool) > 0.0 {
+                        let aligned = effective_normal_at(&face, &pos)
+                            .zip(effective_normal_at(&face_t, &pos))
+                            .is_some_and(|(object_normal, tool_normal)| {
+                                object_normal.dot(&tool_normal) > 0.0
+                            });
+                        if aligned {
                             coplanar_same = true;
                         } else {
                             coplanar_opposite = true;
@@ -1041,9 +1094,26 @@ fn boolean_impl(
                 BooleanOp::Cut => {}
             }
         } else if coplanar_opposite {
-            // Discard both
+            // For a cut, an oppositely-oriented coincident object face is
+            // already the correctly oriented boundary of an existing cavity.
+            // Re-cutting with the same tool surface keeps that face. Fuse and
+            // Common discard the zero-thickness shared boundary.
+            if op == BooleanOp::Cut {
+                kept_sources.push(
+                    origin_obj
+                        .get(&f_id)
+                        .copied()
+                        .map(BooleanFaceSource::Object),
+                );
+                kept_faces.push(face);
+            }
         } else {
-            let inside = is_point_inside_solid(&pos, tool, &bvh_tool);
+            // Classification is a correctness boundary, including for planar
+            // regions cut out by a periodic tool. A single parity ray can graze
+            // one cylinder seam at ordinary part scale and keep the cap disk,
+            // giving its rim three coedge uses. Use the same multi-direction
+            // vote as the tool-side classification.
+            let inside = is_point_inside_solid_robust(&pos, tool, &bvh_tool);
             let keep = match op {
                 BooleanOp::Fuse => !inside,
                 BooleanOp::Cut => !inside,
@@ -1062,6 +1132,9 @@ fn boolean_impl(
     }
 
     for (f_id, f_data) in &brep_tool.faces {
+        if !active_tool.contains(&f_id) {
+            continue;
+        }
         cancel.check_cancelled()?;
         let face = Face::from_id(brep_tool.clone(), f_id, f_data.orientation);
         let pos = point_on_face(&face);
@@ -1071,7 +1144,7 @@ fn boolean_impl(
             let fo_data = &brep_obj.faces[fo_id];
             let face_o = Face::from_id(brep_obj.clone(), fo_id, fo_data.orientation);
             if let (Some(s_obj), Some(s_tool)) = (face_o.surface(), face.surface()) {
-                if surfaces_are_coplanar(s_obj, s_tool, class_tol) {
+                if surfaces_are_same_domain(s_obj, s_tool, class_tol) {
                     let (u, v) =
                         crate::intersect::search_nearest_parameter(s_obj, &pos, (0.0, 0.0));
                     if crate::intersect::is_inside_trimming_loops(u, v, &face_o) {
@@ -1085,7 +1158,7 @@ fn boolean_impl(
         if coplanar {
             // Discard tool's coincident face (already handled by object's side)
         } else {
-            let inside = is_point_inside_solid(&pos, object, &bvh_obj);
+            let inside = is_point_inside_solid_robust(&pos, object, &bvh_obj);
             let keep = match op {
                 BooleanOp::Fuse => !inside,
                 BooleanOp::Cut => inside,
@@ -1106,7 +1179,7 @@ fn boolean_impl(
 
     // 4. Sew kept faces together
     cancel.check_cancelled()?;
-    let shell = crate::sew::sew_with_policy(&kept_faces, policy)
+    let shell = crate::sew::sew_shell_with_policy(&kept_faces, policy)
         .expect("boolean policy was validated before assembly");
     let solid = Solid::new(shell);
 
@@ -1131,7 +1204,7 @@ fn boolean_impl(
     let class_map = if has_classes {
         let origins = resolve_face_origins(&solid, &kept_faces, &kept_sources, policy);
         let mut map: std::collections::HashMap<FaceId, u64> = std::collections::HashMap::new();
-        for (face, origin) in solid.shell().faces().iter().zip(&origins) {
+        for (face, origin) in solid.faces().iter().zip(&origins) {
             // Tag the side into the class key so an object class value can
             // never collide with an equal tool class value.
             let class = match origin {
@@ -1185,12 +1258,71 @@ fn boolean_impl(
                 removed_faces: before_count.saturating_sub(solid.face_count()),
             });
     }
-
+    let solid = package_nested_cut_shells(solid, op, policy);
     let history = want_history
         .then(|| resolve_face_origins(&solid, &kept_faces, &kept_sources, policy))
         .map(|face_source| BooleanFaceHistory { face_source });
     cancel.check_cancelled()?;
     Ok((solid, history, recovery))
+}
+
+/// Convert a cut whose kept boundary has one enclosing component plus one or
+/// more fully enclosed components into a single multi-shell solid. A severing
+/// cut remains a packed disconnected shell so the public multi-body adapter can
+/// split it into independent bodies.
+fn package_nested_cut_shells(solid: Solid, op: BooleanOp, policy: &TolerancePolicy) -> Solid {
+    if op != BooleanOp::Cut {
+        return solid;
+    }
+    let mut components = solid.split_disconnected();
+    if components.len() <= 1 {
+        return solid;
+    }
+
+    let extent_volume = |component: &Solid| {
+        component
+            .bounding_box()
+            .corners()
+            .map(|(lo, hi)| {
+                (hi.x() - lo.x()).abs() * (hi.y() - lo.y()).abs() * (hi.z() - lo.z()).abs()
+            })
+            .unwrap_or(0.0)
+    };
+    let outer_index = components
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| extent_volume(left).total_cmp(&extent_volume(right)))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    components.swap(0, outer_index);
+
+    let outer = &components[0];
+    let tolerance = policy.classification.max(policy.linear);
+    let Some((outer_lo, outer_hi)) = outer.bounding_box().corners() else {
+        return solid;
+    };
+    let all_enclosed = components[1..].iter().all(|component| {
+        let Some((lo, hi)) = component.bounding_box().corners() else {
+            return false;
+        };
+        let bbox_enclosed = lo.x() > outer_lo.x() + tolerance
+            && lo.y() > outer_lo.y() + tolerance
+            && lo.z() > outer_lo.z() + tolerance
+            && hi.x() < outer_hi.x() - tolerance
+            && hi.y() < outer_hi.y() - tolerance
+            && hi.z() < outer_hi.z() - tolerance;
+        bbox_enclosed
+            && component
+                .faces()
+                .first()
+                .is_some_and(|face| point_in_solid(&point_on_face(face), outer))
+    });
+    if !all_enclosed {
+        return solid;
+    }
+
+    Solid::from_shells(components.into_iter().map(|component| component.shell()))
+        .expect("nested cut has at least an outer shell")
 }
 
 /// For each face of `solid` (in shell order), the kept split face it descends
@@ -1206,7 +1338,6 @@ fn resolve_face_origins(
 ) -> Vec<Option<BooleanFaceSource>> {
     let surf_tol = (policy.classification * 10.0).max(policy.pcurve_consistency);
     solid
-        .shell()
         .faces()
         .iter()
         .map(|face| {
@@ -1350,7 +1481,7 @@ struct PlanarFaceInfo {
 
 fn planar_faces(solid: &Solid) -> Vec<PlanarFaceInfo> {
     let mut out = Vec::new();
-    for f in solid.shell().faces() {
+    for f in solid.faces() {
         if let Some(GeomSurface::Plane(p)) = f.surface() {
             let pos = p.position();
             let n = pos.direction();
@@ -1378,7 +1509,7 @@ fn planar_faces(solid: &Solid) -> Vec<PlanarFaceInfo> {
 fn bbox_diag(solid: &Solid) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
-    for f in solid.shell().faces() {
+    for f in solid.faces() {
         if let Some(w) = f.outer_wire() {
             for e in w.edges() {
                 let p = e.start().point();
@@ -1596,8 +1727,137 @@ fn split_tracked(
     *subfaces = result;
 }
 
+/// Remove repeated geometric split spans contributed by adjacent face pairs.
+/// A periodic tool face can overlap both sides of an operand seam, causing the
+/// same circle arc to be enqueued under two arena IDs. Feeding both copies to
+/// the half-edge partition graph creates a zero-width two-edge region instead
+/// of the intended crosscut.
+fn deduplicate_splitting_edges(builder: &BRepBuilder, edges: &mut Vec<EdgeId>, tolerance: f64) {
+    let mut unique = Vec::with_capacity(edges.len());
+    for edge in edges.iter().copied() {
+        if builder.brep().edges.contains_key(edge)
+            && !unique
+                .iter()
+                .copied()
+                .any(|other| edge_spans_match(builder, edge, other, tolerance))
+        {
+            unique.push(edge);
+        }
+    }
+    *edges = unique;
+}
+
+/// A closed imprint can become an inner boundary before a second face pair
+/// queues the same geometric spans for the later partition pass. Partitioning
+/// along both copies gives the boundary three coedge uses. Drop queued spans
+/// that the face already owns as outer or inner topology.
+fn discard_existing_boundary_splits(
+    builder: &BRepBuilder,
+    face_id: FaceId,
+    edges: &mut Vec<EdgeId>,
+    tolerance: f64,
+) {
+    let Some(face) = builder.brep().faces.get(face_id) else {
+        return;
+    };
+    let mut boundary_edges = Vec::new();
+    for loop_id in face
+        .outer_wire
+        .into_iter()
+        .chain(face.inner_wires.iter().copied())
+    {
+        if let Some(wire) = builder.brep().loops.get(loop_id) {
+            boundary_edges.extend(wire.edges.iter().map(|edge| edge.id));
+        }
+    }
+    edges.retain(|edge| {
+        !boundary_edges
+            .iter()
+            .copied()
+            .any(|boundary| edge_spans_match(builder, *edge, boundary, tolerance))
+    });
+}
+
+fn edge_spans_match(builder: &BRepBuilder, left: EdgeId, right: EdgeId, tolerance: f64) -> bool {
+    let Some(left) = builder.brep().edges.get(left) else {
+        return false;
+    };
+    let Some(right) = builder.brep().edges.get(right) else {
+        return false;
+    };
+    let tolerance = tolerance.max(1.0e-8) * 10.0;
+    let sample = |edge: &openrcad_topo::arena::EdgeData, fraction: f64| {
+        if let Some(curve) = &edge.curve {
+            curve.point(edge.first + (edge.last - edge.first) * fraction)
+        } else {
+            let start = builder.brep().vertices[edge.start].point;
+            let end = builder.brep().vertices[edge.end].point;
+            start + (end - start) * fraction
+        }
+    };
+    let same_direction = sample(left, 0.0).distance(&sample(right, 0.0)) <= tolerance
+        && sample(left, 1.0).distance(&sample(right, 1.0)) <= tolerance;
+    let opposite_direction = sample(left, 0.0).distance(&sample(right, 1.0)) <= tolerance
+        && sample(left, 1.0).distance(&sample(right, 0.0)) <= tolerance;
+    (same_direction || opposite_direction)
+        && [0.25, 0.5, 0.75].into_iter().all(|fraction| {
+            let right_fraction = if same_direction {
+                fraction
+            } else {
+                1.0 - fraction
+            };
+            sample(left, fraction).distance(&sample(right, right_fraction)) <= tolerance
+        })
+}
+
 pub(crate) fn project_point_on_curve(p: &Pnt, curve: &GeomCurve, t_min: f64, t_max: f64) -> f64 {
     let (t_min, t_max) = ordered_curve_bounds(t_min, t_max);
+    if let GeomCurve::BSpline(spline) = curve {
+        if spline.degree() == 1
+            && spline.weights().is_none()
+            && spline.knots().len() == spline.poles().len()
+        {
+            let mut best = (t_min, f64::INFINITY);
+            for (index, segment) in spline.poles().windows(2).enumerate() {
+                let [start, end] = segment else {
+                    continue;
+                };
+                let delta = *end - *start;
+                let length_squared = delta.dot(&delta);
+                if length_squared <= 1.0e-24 {
+                    continue;
+                }
+                let knots = spline.knots();
+                let knot_start = knots[index];
+                let knot_end = knots[index + 1];
+                let knot_span = knot_end - knot_start;
+                if knot_span.abs() <= 1.0e-24 {
+                    continue;
+                }
+                let allowed_start = t_min.max(knot_start.min(knot_end));
+                let allowed_end = t_max.min(knot_start.max(knot_end));
+                if allowed_start > allowed_end {
+                    continue;
+                }
+                let fraction_start = ((allowed_start - knot_start) / knot_span).clamp(0.0, 1.0);
+                let fraction_end = ((allowed_end - knot_start) / knot_span).clamp(0.0, 1.0);
+                let fraction = ((*p - *start).dot(&delta) / length_squared).clamp(
+                    fraction_start.min(fraction_end),
+                    fraction_start.max(fraction_end),
+                );
+                let candidate = *start + delta * fraction;
+                let distance = candidate.distance(p);
+                if distance < best.1 {
+                    let parameter = knot_start + knot_span * fraction;
+                    best = (parameter, distance);
+                }
+            }
+            if best.1.is_finite() {
+                return best.0;
+            }
+        }
+    }
+
     let mut best_t = t_min;
     let mut min_dist = p.distance(&curve.point(t_min));
     let steps = 10;
@@ -1640,6 +1900,39 @@ fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
 }
 
 fn point_on_face(face: &Face) -> Pnt {
+    // Surface-backed faces already carry authoritative, unwrapped pcurves.
+    // Averaging boundary samples in UV gives a true interior point for periodic
+    // bands (notably a cylinder split by a full-circle counterbore). A 3D chord
+    // centroid falls inside the cylinder and the edge-offset fallback can land
+    // on the split rim, which misclassifies the engulfed band.
+    if let (Some(outer), Some(surface)) = (face.outer_wire(), face.surface()) {
+        let samples: Vec<_> = (0..outer.len())
+            .filter_map(|index| {
+                outer
+                    .pcurve(index)
+                    .map(|curve| curve.point_at_fraction(0.5))
+            })
+            .collect();
+        if samples.len() == outer.len() && !samples.is_empty() {
+            let (u_sum, v_sum) = samples
+                .iter()
+                .fold((0.0, 0.0), |(u, v), point| (u + point.x(), v + point.y()));
+            let u = u_sum / samples.len() as f64;
+            let v = v_sum / samples.len() as f64;
+            if crate::intersect::is_inside_trimming_loops(u, v, face) {
+                let point = surface.point(u, v);
+                let on_boundary = face.wires().iter().any(|wire| {
+                    wire.edges()
+                        .iter()
+                        .any(|edge| distance_point_to_edge(&point, edge) < 1e-4)
+                });
+                if !on_boundary {
+                    return point;
+                }
+            }
+        }
+    }
+
     // Preferred: the centroid of the outer loop's vertices, projected onto the
     // surface. For a convex face this is a robustly *interior* point, which the
     // ray-parity classifier needs — a near-boundary sample produces ambiguous
@@ -1817,18 +2110,6 @@ fn unchecked_ray_parity(p: &Pnt, solid: &Solid, bvh: &Bvh, ray_dir: GeomVec) -> 
     (count % 2) == 1
 }
 
-/// Fast classifier used for the many split-face decisions inside a boolean.
-/// The curve-aware bounds rejection handles exterior points before the bounded,
-/// boundary-aware parity cast.
-fn is_point_inside_solid(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
-    if point_outside_solid_bounds(p, bvh) {
-        return false;
-    }
-    let ray_dir = Dir::new(0.182_321, 0.523_157, 0.832_511);
-    cast_ray_parity(p, solid, bvh, ray_dir, 42, 32)
-        .unwrap_or_else(|| unchecked_ray_parity(p, solid, bvh, GeomVec::from_dir(ray_dir)))
-}
-
 fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
     if point_outside_solid_bounds(p, bvh) {
         return false;
@@ -1885,7 +2166,7 @@ fn is_point_inside_solid_robust(p: &Pnt, solid: &Solid, bvh: &Bvh) -> bool {
 /// the rolling-ball fillet distinguishing a concave cut wall (material outside
 /// the cylinder) from a convex prior-blend cylinder (inside).
 pub fn point_in_solid(p: &Pnt, solid: &Solid) -> bool {
-    let bvh = Bvh::build(&solid.shell().faces());
+    let bvh = Bvh::build(&solid.faces());
     is_point_inside_solid_robust(p, solid, &bvh)
 }
 
@@ -1975,6 +2256,59 @@ fn surfaces_are_coplanar(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> bool {
             }
             let dist = GeomVec::from_dir(p1.normal()).dot(&(p2.location() - p1.location()));
             dist.abs() <= tol
+        }
+        _ => false,
+    }
+}
+
+/// Whether two analytic parameterizations describe the same infinite support
+/// surface. Parameter origins and seam directions may differ; boolean trimming
+/// cares about the geometric domain, not those coordinates.
+fn surfaces_are_same_domain(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> bool {
+    if surfaces_are_coplanar(s1, s2, tol) {
+        return true;
+    }
+    let axes_same_line = |a: openrcad_foundation::Ax3, b: openrcad_foundation::Ax3| {
+        let da = a.direction();
+        let db = b.direction();
+        da.dot(&db).abs() >= 1.0 - 1.0e-6
+            && (b.location() - a.location())
+                .cross(&GeomVec::from_dir(da))
+                .magnitude()
+                <= tol
+    };
+    match (s1, s2) {
+        (GeomSurface::Cylinder(a), GeomSurface::Cylinder(b)) => {
+            (a.radius() - b.radius()).abs() <= tol && axes_same_line(a.position(), b.position())
+        }
+        (GeomSurface::Cone(a), GeomSurface::Cone(b)) => {
+            if (a.semi_angle() - b.semi_angle()).abs() > 1.0e-6
+                || !axes_same_line(a.position(), b.position())
+            {
+                return false;
+            }
+            let slope = a.semi_angle().tan();
+            if slope.abs() <= 1.0e-12 {
+                return false;
+            }
+            let apex_a = a.position().location()
+                - GeomVec::from_dir(a.position().direction()) * (a.ref_radius() / slope);
+            let apex_b = b.position().location()
+                - GeomVec::from_dir(b.position().direction()) * (b.ref_radius() / slope);
+            apex_a.distance(&apex_b) <= tol
+        }
+        (GeomSurface::Sphere(a), GeomSurface::Sphere(b)) => {
+            (a.radius() - b.radius()).abs() <= tol && a.center().distance(&b.center()) <= tol
+        }
+        (GeomSurface::Torus(a), GeomSurface::Torus(b)) => {
+            (a.major_radius() - b.major_radius()).abs() <= tol
+                && (a.minor_radius() - b.minor_radius()).abs() <= tol
+                && a.position().location().distance(&b.position().location()) <= tol
+                && a.position()
+                    .direction()
+                    .dot(&b.position().direction())
+                    .abs()
+                    >= 1.0 - 1.0e-6
         }
         _ => false,
     }
@@ -2090,12 +2424,36 @@ mod tests {
         })
     }
 
+    fn face_history_from_operation(result: &OperationResult<Solid>) -> BooleanFaceHistory {
+        BooleanFaceHistory {
+            face_source: (0..result.value.face_count())
+                .map(|index| {
+                    result
+                        .history
+                        .sources_of(TopologyRef::face(index))
+                        .into_iter()
+                        .find_map(|source| match (source.operand, source.entity.kind) {
+                            (0, openrcad_topo::TopologyKind::Face) => {
+                                Some(BooleanFaceSource::Object(source.entity.index))
+                            }
+                            (1, openrcad_topo::TopologyKind::Face) => {
+                                Some(BooleanFaceSource::Tool(source.entity.index))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn history_traces_union_faces_to_their_operands() {
         // obj [0,10]^3 ∪ tool [5,15]x[0,10]x[0,10] → one [0,15] box.
         let obj = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
         let tool = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
-        let (result, hist) = boolean_with_history(&obj, &tool, BooleanOp::Fuse, None, None);
+        let outcome = boolean_operation(&obj, &tool, BooleanOp::Fuse).expect("fuse");
+        let hist = face_history_from_operation(&outcome);
+        let result = outcome.value;
 
         assert_eq!(
             hist.face_source.len(),
@@ -2128,7 +2486,9 @@ mod tests {
         // Square pillar punched through the box in Z: 4 generated hole walls.
         let obj = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
         let tool = make_box(&Pnt::new(3.0, 3.0, -1.0), 4.0, 4.0, 12.0);
-        let (result, hist) = boolean_with_history(&obj, &tool, BooleanOp::Cut, None, None);
+        let outcome = boolean_operation(&obj, &tool, BooleanOp::Cut).expect("cut");
+        let hist = face_history_from_operation(&outcome);
+        let result = outcome.value;
 
         let tool_walls = hist
             .face_source
@@ -2149,7 +2509,8 @@ mod tests {
             "the holed top face is a MODIFIED image of the object's top"
         );
         // Determinism: the correspondence is identical across rebuilds.
-        let (_, hist2) = boolean_with_history(&obj, &tool, BooleanOp::Cut, None, None);
+        let outcome2 = boolean_operation(&obj, &tool, BooleanOp::Cut).expect("repeat cut");
+        let hist2 = face_history_from_operation(&outcome2);
         assert_eq!(hist.face_source, hist2.face_source);
     }
 
@@ -2180,13 +2541,18 @@ mod tests {
             (0..obj.shell().faces().len() as u64).map(Some).collect();
         let tool_classes: Vec<Option<u64>> =
             (0..tool.shell().faces().len() as u64).map(Some).collect();
-        let (classed, hist) = boolean_with_history(
+        let outcome = boolean_operation_with_classes_policy_and_cancel(
             &obj,
             &tool,
             BooleanOp::Fuse,
             Some(&obj_classes),
             Some(&tool_classes),
-        );
+            &TolerancePolicy::STANDARD,
+            &NeverCancelled,
+        )
+        .expect("classed fuse");
+        let hist = face_history_from_operation(&outcome);
+        let classed = outcome.value;
         let classed_tops: Vec<usize> = classed
             .shell()
             .faces()
@@ -2578,6 +2944,39 @@ mod tests {
             "far piece at x≈20, got {}",
             x_los[1]
         );
+    }
+
+    #[test]
+    fn structured_severing_cut_has_local_complete_history() {
+        let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);
+        let knife = make_box(&Pnt::new(10.0, -1.0, -1.0), 10.0, 12.0, 12.0);
+        let outcome = boolean_bodies_operation_with_classes_policy_and_cancel(
+            &bar,
+            &knife,
+            BooleanOp::Cut,
+            None,
+            None,
+            &TolerancePolicy::STANDARD,
+            &NeverCancelled,
+        )
+        .expect("structured severing cut");
+
+        assert_eq!(outcome.value.bodies.len(), 2);
+        assert_eq!(outcome.value.face_history.len(), 2);
+        assert!(outcome.validation.is_valid());
+        assert!(outcome.history.validate().is_ok());
+        assert!(outcome
+            .history
+            .coverage_for_solids(&outcome.value.bodies)
+            .is_complete());
+        for (body, history) in outcome.value.bodies.iter().zip(&outcome.value.face_history) {
+            assert!(body.is_watertight_with_policy(&TolerancePolicy::STANDARD));
+            assert!(body
+                .health_report_with_policy(&TolerancePolicy::STANDARD)
+                .is_healthy());
+            assert_eq!(history.face_source.len(), body.face_count());
+            assert!(history.face_source.iter().all(Option::is_some));
+        }
     }
 
     #[test]

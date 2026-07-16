@@ -25,7 +25,7 @@ impl ZeroCadApp {
                 let mut datums = Vec::new();
                 let mut variable_sets = Vec::new();
                 let mut names = std::collections::BTreeMap::new();
-                for node in self.graph.graph.node_weights() {
+                for node in self.document.graph.node_weights() {
                     names.insert(node.id.clone(), node.name.clone());
                     let entry = (node.id.clone(), node.name.clone());
                     match node.feature {
@@ -43,7 +43,7 @@ impl ZeroCadApp {
                 // one ordered feature timeline; runtime split outputs are merely
                 // display children and never reconstruct ownership from id text.
                 let body_groups: Vec<BodyBrowserGroup> = self
-                    .graph
+                    .document
                     .semantics
                     .bodies
                     .values()
@@ -62,7 +62,8 @@ impl ZeroCadApp {
                             .iter()
                             .filter(|(id, _)| {
                                 id != body.id.as_str()
-                                    && zerocad_core::body_output_owner_id(id) == body.id.as_str()
+                                    && self.document.semantic_body_id_for_runtime_body(id).as_ref()
+                                        == Some(&body.id)
                             })
                             .map(|(id, _)| (id.clone(), body_output_label(&body.name, id)))
                             .collect();
@@ -228,9 +229,12 @@ impl ZeroCadApp {
                     self.reevaluate_geometry();
                 }
                 if let Some(feature_id) = id_to_suppress {
-                    let suppressed = self.graph.is_feature_suppressed(&feature_id);
+                    let suppressed = self.document.is_feature_suppressed(&feature_id);
                     self.push_undo();
-                    if self.graph.set_feature_suppressed(&feature_id, !suppressed) {
+                    if self
+                        .document
+                        .set_feature_suppressed(&feature_id, !suppressed)
+                    {
                         self.status_msg = if suppressed {
                             format!("Resumed feature '{feature_id}'.")
                         } else {
@@ -241,7 +245,7 @@ impl ZeroCadApp {
                 }
                 if let Some((feature_id, offset)) = id_to_move {
                     self.push_undo();
-                    if self.graph.move_feature_in_timeline(&feature_id, offset) {
+                    if self.document.move_feature_in_timeline(&feature_id, offset) {
                         self.selected_node_id = Some(feature_id.clone());
                         self.status_msg =
                             format!("Moved feature '{feature_id}' in its body timeline.");
@@ -257,9 +261,10 @@ impl ZeroCadApp {
                 if create_var_set {
                     self.push_undo();
                     let id = format!("varset_{}", self.next_id());
-                    self.graph.add_feature(FeatureNode {
+                    let name = self.next_variable_set_name();
+                    self.document.add_feature(FeatureNode {
                         id: id.clone(),
-                        name: self.next_variable_set_name(),
+                        name,
                         feature: FeatureType::VariableSet {
                             variables: Vec::new(),
                         },
@@ -269,10 +274,10 @@ impl ZeroCadApp {
                 if let Some(set_id) = id_to_add_var {
                     self.push_undo();
                     let unit = self.current_unit;
-                    for idx in self.graph.graph.node_indices() {
-                        if self.graph.graph[idx].id == set_id {
+                    for idx in self.document.graph.node_indices() {
+                        if self.document.graph[idx].id == set_id {
                             if let FeatureType::VariableSet { variables } =
-                                &mut self.graph.graph[idx].feature
+                                &mut self.document.graph[idx].feature
                             {
                                 variables.push(Variable::new(
                                     format!("var{}", variables.len() + 1),
@@ -301,8 +306,12 @@ impl ZeroCadApp {
         allow_reorder: bool,
     ) -> RowAction {
         let mut action = RowAction::None;
-        let owner_id = zerocad_core::body_output_owner_id(id).to_string();
-        let suppressed = self.graph.is_feature_suppressed(&owner_id);
+        let owner_id = self
+            .document
+            .body_producer_feature_id(id)
+            .unwrap_or(id)
+            .to_string();
+        let suppressed = self.document.is_feature_suppressed(&owner_id);
         let is_live_body = self.body_meshes.iter().any(|(body_id, _)| body_id == id);
         let unresolved = self.unresolved_features.get(&owner_id).cloned();
 
@@ -367,7 +376,7 @@ impl ZeroCadApp {
                     let new_name = self.rename_buffer.trim();
                     if !new_name.is_empty() {
                         if let Some(node) = self
-                            .graph
+                            .document
                             .graph
                             .node_weights_mut()
                             .find(|node| node.id == owner_id)
@@ -375,7 +384,7 @@ impl ZeroCadApp {
                             node.name = new_name.to_owned();
                         }
                         if let Some(body) = self
-                            .graph
+                            .document
                             .semantics
                             .bodies
                             .get_mut(&zerocad_core::BodyId::from(owner_id.as_str()))
@@ -427,7 +436,7 @@ impl ZeroCadApp {
                 if allow_reorder {
                     let feature_id = zerocad_core::FeatureId::from(owner_id.as_str());
                     if let Some(body) = self
-                        .graph
+                        .document
                         .semantics
                         .bodies
                         .values()

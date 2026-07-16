@@ -2,10 +2,7 @@
 //! round-trip the Save/Load path uses, and a corrupt document fails gracefully
 //! (an `Err`, never a panic) so the GUI can surface it.
 
-use zerocad_core::{
-    CornerKind, EdgeModReplayIntent, EdgeModReplayMode, EdgeRef, FeatureNode, FeatureType,
-    ParametricGraph,
-};
+use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, ParametricGraph};
 
 fn box_graph() -> ParametricGraph {
     let mut pg = ParametricGraph::new();
@@ -56,7 +53,7 @@ fn malformed_document_is_an_error_not_a_panic() {
 }
 
 #[test]
-fn edge_mod_replay_metadata_survives_json_round_trip() {
+fn edge_mod_selection_survives_json_round_trip() {
     let edge = EdgeRef {
         p0: [0.0, 0.0, 10.0],
         p1: [8.5, 0.0, 10.0],
@@ -65,12 +62,7 @@ fn edge_mod_replay_metadata_survives_json_round_trip() {
         curve: None,
         topology: None,
     };
-    let replay = EdgeModReplayIntent {
-        mode: EdgeModReplayMode::Auto,
-        pre_cut_target: Some("box1".to_string()),
-        replay_cut_nodes: vec!["cut1".to_string(), "cut2".to_string()],
-        selected_span: Some(edge.clone()),
-    };
+    let expected_edge = edge.clone();
     let mut pg = box_graph();
     pg.add_feature(FeatureNode {
         id: "fillet1".to_string(),
@@ -80,7 +72,6 @@ fn edge_mod_replay_metadata_survives_json_round_trip() {
             edge,
             dist: 3.0,
             dist_expr: None,
-            replay: replay.clone(),
             kind: CornerKind::Fillet,
         },
     });
@@ -94,9 +85,10 @@ fn edge_mod_replay_metadata_survives_json_round_trip() {
         .find(|&idx| restored.graph[idx].id == "fillet1")
         .expect("restored replay fillet node");
     match &restored.graph[idx].feature {
-        FeatureType::EdgeMod {
-            replay: restored, ..
-        } => assert_eq!(restored, &replay),
+        FeatureType::EdgeMod { edge, kind, .. } => {
+            assert_eq!(edge, &expected_edge);
+            assert_eq!(*kind, CornerKind::Fillet);
+        }
         other => panic!("expected restored EdgeMod, got {other:?}"),
     }
 }

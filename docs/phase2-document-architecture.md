@@ -16,17 +16,19 @@ evaluation contract for contributors.
   role. Geometric fallback is allowed only for unnamed legacy selections. A
   missing named selection fails instead of silently retargeting.
 
-`ParametricGraph` remains the efficient runtime dependency graph. Its semantic
-sidecar is authoritative for ordering, suppression, body membership, and feature
-inputs. Rebuilding the node map removes stale semantic membership and backfills
-records for legacy in-memory graphs.
+`Document` is the editable application root and privately owns
+`ParametricGraph` as its efficient runtime projection. Each authoritative
+`FeatureRecord` owns payload, inputs, ordering, suppression, and body membership;
+`DocumentSemantics` owns only cross-feature body timelines and recorded output
+provenance. Rebuilding the node map reconstructs derived scheduling state and
+performs narrowly isolated legacy migration.
 
 The feature registry is exhaustive. Adding a `FeatureType` requires a stable
 kind id, payload version, evaluator kind, editor group, intrinsic dependency
 mapping, and persistence DTO coverage.
 
-Body evaluation uses one registry-driven contract: resolve the registered
-evaluator family, invoke into a candidate body state, validate that candidate,
+Body evaluation uses one registry-driven contract: resolve the exact registered
+evaluator, invoke into a candidate body state, validate that candidate,
 record feature diagnostics/status, commit only healthy topology, then cache the
 validated checkpoint. Feature-specific match arms are isolated behind that
 boundary. Graph dependencies always precede consumers; `SequenceKey` orders
@@ -82,6 +84,36 @@ OpenRCAD/tolerance ABI, content hash, topology health, and watertightness.
 Creation time is assigned once by the application, stored in document state,
 and preserved by canonical load/save. Loads prune visibility entries whose
 feature no longer exists and report each recovery as a diagnostic.
+
+## Phase 3 closure of the Phase 2 deviation ledger
+
+- **P2-D1 — Application container closed.** `Document` is now the application,
+  undo, preview, persistence, document-worker, and evaluation-worker root. It
+  privately owns `ParametricGraph` as its derived evaluator projection; explicit
+  accessors define that boundary and existing UI field access is an ergonomic
+  dereference, not competing ownership. **Phase 3 closure:** complete.
+- **P2-D2 — Authoritative feature record closed.** `FeatureRecord` owns the
+  payload, stable kind, payload version, selector inputs, sequence, state, and
+  body membership together. `FeatureNode` is only an insertion command and no
+  production edit path synchronizes a semantic sidecar. **Phase 3 closure:**
+  complete.
+- **P2-D3 — Relationship and body membership closed.** Semantic selectors and
+  body timelines are the persisted relationship model; petgraph edges are
+  derived scheduling data. `DocumentSemantics::body_outputs` records producer
+  provenance directly. Parsing the historical `feature::body:N` convention is
+  isolated to legacy edit/load migration and immediately materializes the
+  provenance record; production ownership queries never infer a feature kind
+  from an entity-id prefix. **Phase 3 closure:** complete.
+- **P2-D4 — Evaluator dispatch closed.** The registry maps every stable feature
+  kind to one exact evaluator kind. The shared outer transaction performs
+  resolve, invoke, validate, diagnostic/status recording, commit, and checkpoint
+  caching. Feature payload destructuring occurs only after exact registry
+  dispatch; there is no central `FeatureType` family match and every body
+  mutation reaches the common New/Join/Cut operation services. There is no
+  user-facing Intersect feature yet; the kernel Common service is already the
+  shared intersection operation when one is introduced. **Phase 3 closure:**
+  complete.
+
 
 ## Migration rules
 

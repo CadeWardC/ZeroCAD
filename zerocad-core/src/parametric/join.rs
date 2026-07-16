@@ -93,16 +93,15 @@ pub(crate) fn apply_body_join(
     for index in source_indices.into_iter().rev() {
         live.remove(index);
     }
-    live.push(LiveBody {
-        id: node_id.to_string(),
-        parts,
-        pristine: None,
-        sketch_source: None,
-        cut_tools: Vec::new(),
-        cut_replay: None,
-        edge_mod_cut_history_path_used: false,
-        thread_replay: None,
-    });
+    apply_new(
+        live,
+        LiveBody {
+            id: node_id.to_string(),
+            parts,
+            pristine: None,
+            sketch_source: None,
+        },
+    );
 }
 
 /// Attempt a material-preserving union. The AABB gate avoids asking the kernel
@@ -211,16 +210,14 @@ pub(crate) fn overshoot_depth(depth: f32, ends: f32) -> f32 {
 /// produce a connected, valid union. A failed Join never degrades into a
 /// separate body or an unfused component hidden inside the target body.
 ///
-/// `draft` is set for live drag previews: joining onto a threaded body then
-/// skips replaying the (expensive) helical thread so the preview stays fast —
-/// the shaft reads smooth mid-drag and the threads return on the committed
-/// (non-draft) rebuild.
+/// `draft` is reserved for preview-quality kernel settings; it never changes
+/// construction history or invokes a feature-specific replay path.
 pub(crate) fn apply_join(
     live: &mut Vec<LiveBody>,
     extrude_id: &str,
     tools: Vec<JoinTool>,
     boolean_target: Option<&str>,
-    draft: bool,
+    _draft: bool,
     warnings: &mut Vec<String>,
 ) {
     // Join is a feature-level transaction. Every region must fuse successfully;
@@ -235,11 +232,7 @@ pub(crate) fn apply_join(
             }
 
             let mut candidate = body.clone();
-            let success = if candidate.thread_replay.is_some() {
-                join_into_threaded_base(&mut candidate, tool, !draft)
-            } else {
-                join_tool_into_body(&mut candidate, tool, extrude_id)
-            };
+            let success = join_tool_into_body(&mut candidate, tool, extrude_id);
             if success {
                 *body = candidate;
                 merged = true;
@@ -305,8 +298,6 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
         body.parts = parts;
         body.pristine = named.map(std::sync::Arc::new);
         body.sketch_source = None;
-        body.cut_replay = None;
-        body.edge_mod_cut_history_path_used = false;
         return true;
     }
     false
@@ -330,8 +321,20 @@ fn union_variant_into_parts(
         }
 
         let (mut merged, history) = if capture_history && source_parts.len() == 1 {
-            let (unioned, history) =
-                crate::mock_kernel::union_with_history(&source_parts[start], tool, None)?;
+            let (unioned, history) = match crate::mock_kernel::union_with_history_diagnostic(
+                &source_parts[start],
+                tool,
+                None,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    log::debug!("join boolean candidate rejected: {error}");
+                    if std::env::var_os("OPENRCAD_BOOLEAN_DEBUG").is_some() {
+                        eprintln!("join boolean candidate rejected: {error}");
+                    }
+                    continue;
+                }
+            };
             if !valid_union_result(&source_parts[start], tool, &unioned) {
                 continue;
             }
@@ -379,52 +382,4 @@ fn valid_union_result(a: &KernelSolid, b: &KernelSolid, result: &KernelSolid) ->
         && result.is_watertight()
         && result.health_report().is_healthy()
         && result.split_disconnected().len() <= 1
-}
-
-/// Union `tool` into a threaded body via its smooth pre-thread base
-/// (`body.thread_replay`), then replay the thread steps. Keeps the smooth base
-/// intact (so still-later booleans keep working) while the displayed geometry
-/// is base + boss with the shaft re-threaded. Returns `true` if the boolean
-/// merged the boss; `false` if it didn't overlap the base or the union failed,
-/// so the caller can treat the boss as a separate body rather than losing it.
-///
-/// `rethread` re-applies the helical thread steps after the union. It is `false`
-/// for draft previews, where the shaft is left smooth for speed (the threads
-/// come back on the committed rebuild).
-fn join_into_threaded_base(body: &mut LiveBody, tool: &JoinTool, rethread: bool) -> bool {
-    let Some(replay) = body.thread_replay.as_mut() else {
-        return false;
-    };
-    let joined = [
-        tool.smooth.as_ref(),
-        tool.exact.as_ref(),
-        tool.dipped.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|variant| union_variant_into_parts(&replay.base_parts, variant, false))
-    .map(|(parts, _)| parts);
-    let Some(joined) = joined else {
-        return false;
-    };
-    replay.base_parts = joined;
-
-    // Rebuild the displayed geometry from the (now boss-joined) smooth base and
-    // replay every thread step on top. `body.parts` gets its own copy so the
-    // base held in `thread_replay` stays smooth for future booleans. A step
-    // that can no longer re-cut leaves that region smooth — still better than
-    // dropping the joined volume.
-    let new_base = replay.base_parts.clone();
-    let steps = replay.steps.clone();
-    body.parts = new_base;
-    body.sketch_source = None;
-    body.cut_replay = None;
-    body.edge_mod_cut_history_path_used = false;
-    if rethread {
-        for step in &steps {
-            let _ = thread_one(body, step);
-        }
-    }
-    refresh_thread_pristine(body);
-    true
 }

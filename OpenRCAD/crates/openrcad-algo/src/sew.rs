@@ -1,10 +1,37 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 
 use openrcad_foundation::{tolerance, Pnt, TolerancePolicy, TolerancePolicyError, Vec as FVec};
 use openrcad_geom::{Curve, GeomSurface, Plane};
 use openrcad_topo::arena::{LoopId, OrientedEdge, ShellData};
-use openrcad_topo::{BRep, EdgeId, Face, FaceId, Orientation, Shell, Solid, VertexId};
+use openrcad_topo::{
+    BRep, Diagnostic, EdgeId, Face, FaceId, OperationResult, Orientation, RecoveryAction,
+    RecoveryReport, Shell, Solid, TopologyHistory, ValidationReport, VertexId,
+};
+
+/// Failure to produce a strict, closed shell through the public sewing
+/// operation. Open-shell assembly remains an internal modeling primitive.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SewError {
+    InvalidTolerancePolicy(TolerancePolicyError),
+    InvalidOutput(ValidationReport),
+}
+
+impl fmt::Display for SewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTolerancePolicy(error) => write!(f, "sewing: invalid policy: {error}"),
+            Self::InvalidOutput(report) => write!(
+                f,
+                "sewing: invalid output (watertight={}, pcurves_complete={}): {:?}",
+                report.watertight, report.pcurves_complete, report.health
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SewError {}
 
 /// A point quantized to a fine integer grid (see [`quantize`]).
 type QPoint = (i64, i64, i64);
@@ -308,6 +335,40 @@ fn canonicalize_shell_orientation(brep: &mut BRep, face_ids: &[FaceId]) {
 pub fn sew_with_policy(
     faces: &[Face],
     policy: &TolerancePolicy,
+) -> Result<OperationResult<Shell>, SewError> {
+    policy
+        .validate()
+        .map_err(SewError::InvalidTolerancePolicy)?;
+    let value = sew_impl(faces, policy);
+    let validation = ValidationReport::for_solid(&Solid::new(value.clone()), policy);
+    if !validation.is_valid() {
+        return Err(SewError::InvalidOutput(validation));
+    }
+    let history = TopologyHistory::generated_shell(&value);
+    debug_assert!(history.coverage_for_shell(&value).is_complete());
+    let recovery = if faces.len() > 1 {
+        RecoveryReport {
+            actions: vec![RecoveryAction::SewFaces {
+                face_count: faces.len(),
+            }],
+        }
+    } else {
+        RecoveryReport::default()
+    };
+    Ok(OperationResult {
+        value,
+        history,
+        diagnostics: Vec::<Diagnostic>::new(),
+        recovery,
+        validation,
+    })
+}
+
+/// Internal shell assembly for modeling stages that intentionally create an
+/// open intermediate. The stage that closes the body owns strict validation.
+pub(crate) fn sew_shell_with_policy(
+    faces: &[Face],
+    policy: &TolerancePolicy,
 ) -> Result<Shell, TolerancePolicyError> {
     policy.validate()?;
     Ok(sew_impl(faces, policy))
@@ -323,7 +384,7 @@ pub fn sew_with_policy(
 )]
 pub fn sew(faces: &[Face], tol: f64) -> Shell {
     let policy = compatibility_policy(tol);
-    sew_with_policy(faces, &policy).unwrap_or_else(|_| Shell::default())
+    sew_shell_with_policy(faces, &policy).unwrap_or_else(|_| Shell::default())
 }
 
 /// Preserve a legacy builder's explicit sewing tolerance while making its use
@@ -978,6 +1039,28 @@ mod tests {
     use openrcad_foundation::Pnt;
     use openrcad_geom::{GeomCurve, Line};
     use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
+
+    #[test]
+    fn canonical_sew_returns_complete_validated_metadata() {
+        let source = openrcad_primitives::make_box_operation(&Pnt::origin(), 3.0, 4.0, 5.0)
+            .expect("box")
+            .value;
+        let outcome = sew_with_policy(&source.faces(), &TolerancePolicy::STANDARD)
+            .expect("closed face set must sew");
+
+        assert!(outcome.validation.is_valid());
+        assert!(outcome.history.validate().is_ok());
+        assert!(outcome
+            .history
+            .coverage_for_shell(&outcome.value)
+            .is_complete());
+        assert_eq!(
+            outcome.recovery.actions,
+            vec![RecoveryAction::SewFaces {
+                face_count: source.face_count(),
+            }]
+        );
+    }
 
     /// A unit square in the Z=0 plane at `offset_x`, every boundary vertex built
     /// with the given per-entity `vtol`.

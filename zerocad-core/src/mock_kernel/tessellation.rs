@@ -628,11 +628,7 @@ pub(crate) fn solid_to_flat_mesh_with_cancel(
     // vertex copy belongs to a single triangle, so the per-vertex→face mapping
     // `smooth_vertex_normals` relies on holds.
     let (chord, angle) = active_tess_budget();
-    // Phase 3 features can still hand display code a solid built before the
-    // pcurve contract. Keep that migration boundary explicit: the adapter
-    // repairs and validates first, then invokes the strict tessellator. For a
-    // Phase 1 outcome the repair is a no-op.
-    let mesh = match openrcad::mesh::tessellate_compatibility_for_display_with_policy_and_cancel(
+    let mesh = match openrcad::mesh::tessellate_checked_for_display_with_policy_and_cancel(
         solid,
         chord,
         angle,

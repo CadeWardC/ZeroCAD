@@ -8,7 +8,7 @@
 
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
-use zerocad_core::{CornerKind, EdgeModReplayIntent, EdgeRef, FeatureNode, FeatureType, MockMesh};
+use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, MockMesh};
 
 use crate::{PendingCommitVisual, PendingVisualMode, SharedBodyMeshes, ZeroCadApp};
 
@@ -375,8 +375,6 @@ pub(crate) struct EdgeModOp {
     /// edge, captured at selection time from the body mesh. Drives the preview
     /// ribbon to the correct (outward) side; convex edges stay `false`.
     pub(crate) concave: Vec<bool>,
-    /// Replay intent captured at selection time, one entry per edge.
-    pub(crate) replay: Vec<EdgeModReplayIntent>,
     /// Fillet (round) or Chamfer (bevel).
     pub(crate) kind: CornerKind,
     /// Resolved size in base units (mm), kept in sync with `dist_text`.
@@ -575,7 +573,6 @@ mod tests {
             .expect("rim edge resolves");
         for kind in [CornerKind::Fillet, CornerKind::Chamfer] {
             let mut g = extruded_cylinder_graph(r, h);
-            let replay = g.edge_mod_replay_intent_for_edge("extrude_2", &edge, &hidden);
             // Body nodes evaluate in creation order = numeric id suffix; the
             // GUI names spec nodes past `id_counter`, so use a trailing suffix.
             g.add_feature(FeatureNode {
@@ -586,7 +583,6 @@ mod tests {
                     edge: edge.clone(),
                     dist,
                     dist_expr: None,
-                    replay,
                     kind,
                 },
             });
@@ -636,7 +632,6 @@ mod tests {
             edges: vec![edge.clone()],
             display_edges: vec![edge],
             concave: vec![false],
-            replay: vec![EdgeModReplayIntent::default()],
             kind,
             dist,
             dist_text: format!("{dist:.2}"),
@@ -991,13 +986,6 @@ impl ZeroCadApp {
             self.status_msg = "Those edges have no usable geometry to fillet/chamfer.".to_string();
             return;
         }
-        let replay = edges
-            .iter()
-            .map(|edge| {
-                self.graph
-                    .edge_mod_replay_intent_for_edge(&node_id, edge, &self.hidden_nodes)
-            })
-            .collect();
         // Classify each edge's wedge from the body's display mesh so the preview
         // ribbon draws on the correct side (concave edges add material outward).
         let body_mesh = self
@@ -1024,7 +1012,6 @@ impl ZeroCadApp {
             edges,
             display_edges,
             concave,
-            replay,
             kind,
             dist,
             dist_text: text,
@@ -1127,19 +1114,6 @@ impl ZeroCadApp {
         }
     }
 
-    fn hash_replay_intent(h: &mut impl std::hash::Hasher, replay: &EdgeModReplayIntent) {
-        use std::hash::Hash;
-        (replay.mode as u8).hash(h);
-        replay.pre_cut_target.hash(h);
-        replay.replay_cut_nodes.hash(h);
-        if let Some(edge) = replay.selected_span.as_ref() {
-            1u8.hash(h);
-            Self::hash_edge_ref(h, edge);
-        } else {
-            0u8.hash(h);
-        }
-    }
-
     /// Hash of everything that determines an edge-mod's committed geometry — the
     /// exact size, kind, target body, selected edge identity, and hidden nodes.
     /// The preview worker result is only reusable when this full identity matches.
@@ -1151,9 +1125,6 @@ impl ZeroCadApp {
         op.target.hash(&mut h);
         for edge in &op.display_edges {
             Self::hash_edge_ref(&mut h, edge);
-        }
-        for replay in &op.replay {
-            Self::hash_replay_intent(&mut h, replay);
         }
         let mut hidden: Vec<&String> = hidden_nodes.iter().collect();
         hidden.sort();
@@ -1179,9 +1150,6 @@ impl ZeroCadApp {
         let mut prev = op.target.clone();
         for (i, edge) in op.edges.iter().enumerate() {
             let id = format!("edgemod_{tag}_{}", self.id_counter + i);
-            let replay = op.replay.get(i).cloned().unwrap_or_else(|| {
-                graph.edge_mod_replay_intent_for_edge(&op.target, edge, &self.hidden_nodes)
-            });
             graph.add_feature(FeatureNode {
                 id: id.clone(),
                 name: format!("{tag} edge mod {i}"),
@@ -1190,7 +1158,6 @@ impl ZeroCadApp {
                     edge: edge.clone(),
                     dist,
                     dist_expr: None,
-                    replay,
                     kind: op.kind,
                 },
             });
@@ -1204,20 +1171,20 @@ impl ZeroCadApp {
     /// the commit will. Evaluated on a worker thread, it yields exactly the bodies
     /// a commit at this size would. Bodies key by `target`, not the node id, so
     /// this matches the committed result despite the throwaway node name.
-    fn build_edge_mod_arc_graph(&self) -> Option<zerocad_core::ParametricGraph> {
+    fn build_edge_mod_arc_document(&self) -> Option<zerocad_core::Document> {
         let op = self.edge_mod_op.as_ref()?;
-        let mut graph = self.graph.clone();
+        let mut graph = self.document.clone();
         self.append_edge_mod_chain(&mut graph, op, op.dist.max(0.2), "spec");
         Some(graph)
     }
 
     fn spawn_edge_mod_arc_eval(&mut self, ctx: &egui::Context, key: u64) {
-        let Some(graph) = self.build_edge_mod_arc_graph() else {
+        let Some(document) = self.build_edge_mod_arc_document() else {
             return;
         };
         self.evaluator.submit(
             crate::evaluation_worker::EvaluationPurpose::EdgeModPreview(key),
-            graph,
+            document,
             self.hidden_nodes.clone(),
             zerocad_core::EvaluationQuality::Interactive,
             Some(ctx.clone()),
@@ -1320,9 +1287,6 @@ impl ZeroCadApp {
             for edge in &op.display_edges {
                 Self::hash_edge_ref(&mut h, edge);
             }
-            for replay in &op.replay {
-                Self::hash_replay_intent(&mut h, replay);
-            }
             self.id_counter.hash(&mut h);
             let mut hidden: Vec<&String> = self.hidden_nodes.iter().collect();
             hidden.sort();
@@ -1419,15 +1383,10 @@ impl ZeroCadApp {
         let dist = op.dist.max(0.2);
         let edge_count = op.display_edges.len();
         let mut prev = op.target.clone();
-        let replays = op.replay;
-        for (i, edge) in op.edges.into_iter().enumerate() {
+        for edge in op.edges {
             let id = format!("edgemod_{}", self.next_id());
             let name = self.next_edge_mod_name(op.kind);
-            let replay = replays.get(i).cloned().unwrap_or_else(|| {
-                self.graph
-                    .edge_mod_replay_intent_for_edge(&op.target, &edge, &self.hidden_nodes)
-            });
-            self.graph.add_feature(FeatureNode {
+            self.document.add_feature(FeatureNode {
                 id: id.clone(),
                 name,
                 feature: FeatureType::EdgeMod {
@@ -1435,11 +1394,10 @@ impl ZeroCadApp {
                     edge,
                     dist,
                     dist_expr: dist_expr.clone(),
-                    replay,
                     kind: op.kind,
                 },
             });
-            self.graph.add_dependency(&prev, &id);
+            self.document.add_dependency(&prev, &id);
             prev = id;
         }
         // Remember the size for the next edge.

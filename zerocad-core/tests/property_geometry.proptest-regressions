@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 5c06459af969fae900b99ebc29cbee132b04084ca5f596de467b33adda5433cd # shrinks to width = 50.45370471572464, depth = 58.85151465245165, height = 28.052053118610065, radius_ratio = 0.2549353255475629
+cc 8069e5bc54fb3fce2a98839e8095fa15322417f0c7344168e36d764eeecf04fc # shrinks to width = 63.78010569502545, depth = 66.26064321593478, height = 23.465789933943718, radius_ratio = 0.2584652305402042

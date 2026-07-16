@@ -1,20 +1,13 @@
 use crate::SharedBodyMeshes;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use zerocad_core::{
-    Document, EvaluationCacheSnapshot, HydrationBundle, ParametricGraph, SaveOptions, SaveProfile,
-    Unit,
-};
+use zerocad_core::{Document, EvaluationCacheSnapshot, HydrationBundle, SaveOptions, SaveProfile};
 
 pub(crate) struct SaveRequest {
     pub path: PathBuf,
-    pub graph: ParametricGraph,
+    pub document: Document,
     pub bodies: SharedBodyMeshes,
     pub profile: SaveProfile,
-    pub units: Unit,
-    pub hidden_nodes: HashSet<String>,
-    pub created_unix: Option<u64>,
     pub cache: EvaluationCacheSnapshot,
 }
 
@@ -63,12 +56,6 @@ impl DocumentWorker {
 }
 
 fn save(request: SaveRequest) -> Result<(), zerocad_core::ZcadError> {
-    let mut document = Document::from_graph(request.graph, request.units);
-    document.state.created_unix = request.created_unix;
-    for hidden in request.hidden_nodes {
-        document.set_visible(hidden, false);
-    }
-
     let small_preview_png = preview_with_cap(&request.bodies, 128, 96, 32 * 1024);
     if let Some((w, h, rgba)) = (!request.bodies.is_empty())
         .then(|| crate::thumbnail::render_thumbnail(&request.bodies, 128))
@@ -86,7 +73,7 @@ fn save(request: SaveRequest) -> Result<(), zerocad_core::ZcadError> {
     };
     zerocad_core::write_document_file(
         &request.path,
-        &document,
+        &request.document,
         &SaveOptions {
             profile: request.profile,
         },

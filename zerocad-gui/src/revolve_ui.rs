@@ -192,7 +192,7 @@ impl ZeroCadApp {
         let name = format!("Revolve {n}");
         // Cut/Join from a face-attached sketch targets that body, like extrude.
         let target = if matches!(op.mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
-            self.graph
+            self.document
                 .sketch_face_refs
                 .get(&op.sketch_id)
                 .and_then(|fref| fref.topology.as_ref())
@@ -200,7 +200,7 @@ impl ZeroCadApp {
         } else {
             None
         };
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name,
             feature: FeatureType::Revolve {
@@ -213,9 +213,9 @@ impl ZeroCadApp {
                 target,
             },
         });
-        self.graph.add_dependency(&op.sketch_id, &id);
+        self.document.add_dependency(&op.sketch_id, &id);
         if let RevolveAxisChoice::Datum(datum_id, _) = &op.axis {
-            self.graph.add_dependency(datum_id, &id);
+            self.document.add_dependency(datum_id, &id);
         }
         // The revolve consumes its sketch, like an extrude commit.
         self.hidden_nodes.insert(op.sketch_id.clone());

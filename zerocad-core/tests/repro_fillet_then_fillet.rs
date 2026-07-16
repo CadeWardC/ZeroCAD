@@ -174,7 +174,6 @@ fn fillet_then_larger_fillet_perpendicular_edge() {
             },
             dist: 4.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });
@@ -203,7 +202,6 @@ fn fillet_then_larger_fillet_perpendicular_edge() {
             edge: edge2,
             dist: 6.0,
             dist_expr: None,
-            replay: Default::default(),
             kind: CornerKind::Fillet,
         },
     });

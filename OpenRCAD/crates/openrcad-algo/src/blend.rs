@@ -16,9 +16,10 @@ use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, GeomCurve, GeomSurface, OffsetSurface,
     Plane, ToroidalSurface,
 };
-use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
+use openrcad_topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
-use crate::sew::{compatibility_policy, sew_with_policy};
+use crate::native_pcurve::{analytic_face_with_pcurves, planar_face_with_pcurves};
+use crate::sew::sew_shell_with_policy as sew_with_policy;
 
 /// Why a blend builder could not run.
 #[derive(Clone, Debug, PartialEq)]
@@ -167,12 +168,13 @@ fn arc_edges(circle: Circle) -> Vec<Edge> {
 /// with the given `normal`.
 fn cap_face(circle: Circle, plane_pt: Pnt, normal: Dir) -> Face {
     let wire = Wire::from_edges(arc_edges(circle));
-    Face::new(
-        Some(GeomSurface::plane(Plane::from_point_normal(
-            plane_pt, normal,
-        ))),
-        wire,
+    planar_face_with_pcurves(
+        Plane::from_point_normal(plane_pt, normal),
+        Some(wire),
+        Vec::new(),
+        Orientation::Forward,
     )
+    .expect("circular cap has an exact planar pcurve")
 }
 
 /// A quarter-circle arc of radius `r` about `centre`, from `p1` to `p2`.
@@ -219,7 +221,8 @@ fn band_faces(
             hi_arcs[i].clone().reversed(),
             seams[i].clone().reversed(),
         ]);
-        let face = Face::new(Some(surface.clone()), wire);
+        let face = analytic_face_with_pcurves(surface.clone(), wire, Orientation::Forward)
+            .expect("analytic band boundaries are exact coordinate curves");
         faces.push(if reversed { face.reversed() } else { face });
     }
     faces
@@ -309,7 +312,19 @@ pub fn fillet_cylinder_with_policy(
 }
 
 /// Bevel both circular rims of a cylinder by `distance` (a 45° frustum chamfer).
+#[deprecated(note = "use chamfer_cylinder_with_policy")]
 pub fn chamfer_cylinder(info: &CylinderInfo, distance: f64) -> Result<Solid, BlendError> {
+    chamfer_cylinder_with_policy(info, distance, &TolerancePolicy::STANDARD)
+}
+
+pub fn chamfer_cylinder_with_policy(
+    info: &CylinderInfo,
+    distance: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    policy
+        .validate()
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
     let CylinderInfo {
         base,
         axis,
@@ -361,18 +376,30 @@ pub fn chamfer_cylinder(info: &CylinderInfo, distance: f64) -> Result<Solid, Ble
         Edge::between_points(lo, hi)
     }));
 
-    let policy = compatibility_policy(distance * 0.1);
-    Ok(Solid::new(
-        sew_with_policy(&faces, &policy).expect("compatibility policy is valid"),
-    ))
+    let shell = sew_with_policy(&faces, policy)
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    Ok(Solid::new(shell))
 }
 
 /// Hollow a cylinder to wall `thickness`, leaving any cap in `open_faces` open.
+#[deprecated(note = "use shell_cylinder_with_policy")]
 pub fn shell_cylinder(
     info: &CylinderInfo,
     thickness: f64,
     open_faces: &[Face],
 ) -> Result<Solid, BlendError> {
+    shell_cylinder_with_policy(info, thickness, open_faces, &TolerancePolicy::STANDARD)
+}
+
+pub fn shell_cylinder_with_policy(
+    info: &CylinderInfo,
+    thickness: f64,
+    open_faces: &[Face],
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendError> {
+    policy
+        .validate()
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
     let CylinderInfo {
         base,
         axis,
@@ -462,10 +489,9 @@ pub fn shell_cylinder(
         faces.push(cap_face(ring(ceil, axis, xref, inner_r), ceil, axis.reversed()).reversed());
     }
 
-    let policy = compatibility_policy(thickness * 0.1);
-    Ok(Solid::new(
-        sew_with_policy(&faces, &policy).expect("compatibility policy is valid"),
-    ))
+    let shell = sew_with_policy(&faces, policy)
+        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    Ok(Solid::new(shell))
 }
 
 #[cfg(test)]

@@ -62,14 +62,15 @@ pub enum HealthError {
     NonFiniteVertex(VertexId),
     /// An edge's chord length is at or below tolerance.
     DegenerateEdge { edge: EdgeId, length: f64 },
+    /// A closed orientable shell must have an even Euler characteristic no
+    /// larger than two (summed across shells for a multi-shell solid).
+    InvalidEulerCharacteristic { value: i64 },
 }
 
 /// A softer health warning. These are useful for import diagnostics and test
 /// triage, but do not necessarily mean the B-Rep is structurally broken.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HealthWarning {
-    /// A closed genus-0 solid normally has Euler characteristic 2.
-    SuspiciousEulerCharacteristic { value: i64 },
     /// One or more boundary edges are shared by three or more faces.
     NonManifoldEdges { count: usize },
 }
@@ -749,7 +750,7 @@ impl Solid {
     /// This is intentionally cheap and conservative: it checks reference/loop
     /// validity via [`validate`](Solid::validate), then scans the reached B-Rep
     /// for non-finite coordinates, degenerate edges, faces without boundaries,
-    /// and suspicious Euler characteristic. It does not claim full CAD-kernel
+    /// and an impossible Euler characteristic. It does not claim full CAD-kernel
     /// validity (self-intersection and exact watertightness still need deeper
     /// algorithmic checks), but it gives booleans, importers, and renderers a
     /// shared diagnostic hook.
@@ -774,21 +775,33 @@ impl Solid {
             report.errors.push(HealthError::EmptySolid);
         }
 
-        for (vertex_id, vertex) in &brep.vertices {
-            let p = vertex.point;
+        for vertex in self.vertices() {
+            let vertex_id = vertex.id();
+            let p = vertex.point();
             if !p.x().is_finite() || !p.y().is_finite() || !p.z().is_finite() {
                 report.errors.push(HealthError::NonFiniteVertex(vertex_id));
             }
         }
 
-        for (edge_id, edge) in &brep.edges {
+        for reached_edge in self.edges() {
+            let edge_id = reached_edge.id();
+            let edge = &brep.edges[edge_id];
             let Some(start) = brep.vertices.get(edge.start) else {
                 continue;
             };
             let Some(end) = brep.vertices.get(edge.end) else {
                 continue;
             };
-            let length = start.point.distance(&end.point);
+            let chord = start.point.distance(&end.point);
+            // A closed analytic edge (most often a periodic seam or a full
+            // circle) legitimately has coincident vertices. Its interior must
+            // still span space; chord length alone would reject it as collapsed.
+            let length = edge.curve.as_ref().map_or(chord, |curve| {
+                let mid = curve.point(0.5 * (edge.first + edge.last));
+                chord
+                    .max(start.point.distance(&mid))
+                    .max(end.point.distance(&mid))
+            });
             let tol = edge.tolerance.max(policy.linear);
             if length <= tol {
                 report.errors.push(HealthError::DegenerateEdge {
@@ -818,10 +831,11 @@ impl Solid {
         }
 
         let euler = self.euler_characteristic();
-        if self.face_count() > 1 && euler != 2 {
+        let maximum_euler = 2 * solid_data.shells.len() as i64;
+        if self.face_count() > 1 && (euler.rem_euclid(2) != 0 || euler > maximum_euler) {
             report
-                .warnings
-                .push(HealthWarning::SuspiciousEulerCharacteristic { value: euler });
+                .errors
+                .push(HealthError::InvalidEulerCharacteristic { value: euler });
         }
 
         let manifold = self.manifold_report_with_policy(policy);
@@ -834,11 +848,17 @@ impl Solid {
         report
     }
 
-    /// The Euler characteristic `V − E + F` over the solid's deduplicated
-    /// boundary entities. For a closed, genus-0 solid this is `2`
-    /// (Euler–Poincaré); each handle through a hole subtracts `2`.
+    /// The Euler characteristic over the solid's deduplicated boundary cell
+    /// complex. A face with `n` inner wires contributes `1 − n`, rather than
+    /// being incorrectly counted as a disk. For a closed genus-0 solid the
+    /// result is `2`; each handle through a hole subtracts `2`.
     pub fn euler_characteristic(&self) -> i64 {
-        self.vertex_count() as i64 - self.edge_count() as i64 + self.face_count() as i64
+        let face_cells = self
+            .faces()
+            .into_iter()
+            .map(|face| 1_i64 - face.inner_wires().len() as i64)
+            .sum::<i64>();
+        self.vertex_count() as i64 - self.edge_count() as i64 + face_cells
     }
 
     /// Tally how the solid's boundary edges are shared between faces.
@@ -866,7 +886,7 @@ impl Solid {
             )
         };
         let mut counts: std::collections::HashMap<EdgeKey, u32> = std::collections::HashMap::new();
-        for face in self.shell().faces() {
+        for face in self.faces() {
             for wire in face.wires() {
                 for edge in wire.edges() {
                     let start = edge.start().point();

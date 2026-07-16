@@ -87,7 +87,7 @@ mod viewer_app {
     ///
     /// Blocks the calling thread until the window is closed.
     pub fn run_solid(solid: &openrcad_topo::Solid, chord_err: f64) {
-        let mesh = openrcad_mesh::tessellate_compatibility_with_policy_and_cancel(
+        let mesh = openrcad_mesh::tessellate_checked_with_policy_and_cancel(
             solid,
             chord_err,
             0.5,

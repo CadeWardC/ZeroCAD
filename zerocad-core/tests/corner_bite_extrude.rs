@@ -176,7 +176,6 @@ fn oversized_fillet_into_corner_bite_fails_safely() {
         curve: None,
         topology: None,
     };
-    let replay = g.edge_mod_replay_intent_for_edge("extrude_2", &edge, &HashSet::new());
     g.add_feature(FeatureNode {
         id: "em_3".into(),
         name: "Fillet".into(),
@@ -185,7 +184,6 @@ fn oversized_fillet_into_corner_bite_fails_safely() {
             edge,
             dist: 50.0,
             dist_expr: None,
-            replay,
             kind: zerocad_core::CornerKind::Fillet,
         },
     });

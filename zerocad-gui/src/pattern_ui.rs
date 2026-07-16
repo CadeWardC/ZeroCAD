@@ -179,8 +179,8 @@ impl ZeroCadApp {
 
     /// True when `id` names a node that produces a body (a valid pattern source).
     fn node_is_body(&self, id: &str) -> bool {
-        self.graph.graph.node_indices().any(|i| {
-            let n = &self.graph.graph[i];
+        self.document.graph.node_indices().any(|i| {
+            let n = &self.document.graph[i];
             n.id == id
                 && matches!(
                     n.feature,
@@ -190,6 +190,9 @@ impl ZeroCadApp {
                         | FeatureType::Pattern { .. }
                         | FeatureType::BodyJoin { .. }
                         | FeatureType::BodyCut { .. }
+                        | FeatureType::BodyIntersect { .. }
+                        | FeatureType::BodySplit { .. }
+                        | FeatureType::BodyScale { .. }
                         | FeatureType::Extrude {
                             mode: ExtrudeMode::NewBody,
                             ..
@@ -515,7 +518,7 @@ impl ZeroCadApp {
             PatternKindChoice::Mirror => self.next_body_name(),
             _ => format!("Pattern {n}"),
         };
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name,
             feature: FeatureType::Pattern {
@@ -523,12 +526,12 @@ impl ZeroCadApp {
                 kind,
             },
         });
-        self.graph.add_dependency(&op.source, &id);
+        self.document.add_dependency(&op.source, &id);
         if let RevolveAxisChoice::Datum(datum_id, _) = &op.axis {
-            self.graph.add_dependency(datum_id, &id);
+            self.document.add_dependency(datum_id, &id);
         }
         if let Some(MirrorPlaneChoice::Datum(datum_id, _)) = &op.plane {
-            self.graph.add_dependency(datum_id, &id);
+            self.document.add_dependency(datum_id, &id);
         }
         if let Some(MirrorPlaneChoice::Face(face, _)) = &op.plane {
             if let Some(body_id) = face
@@ -536,7 +539,7 @@ impl ZeroCadApp {
                 .as_ref()
                 .and_then(|topology| topology.body_id.as_deref())
             {
-                self.graph.add_dependency(body_id, &id);
+                self.document.add_dependency(body_id, &id);
             }
         }
         self.selected_node_id = Some(id);

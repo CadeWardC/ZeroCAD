@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Solid;
+use crate::{Shell, Solid};
 
 /// Kind of topological entity participating in operation history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -107,6 +107,21 @@ pub struct TopologyHistory {
 }
 
 impl TopologyHistory {
+    /// History for a newly assembled shell. Every entity owned by the shell is
+    /// explicit; unlike [`Self::generated_solid`], no synthetic solid result is
+    /// included because the operation value is the shell itself.
+    pub fn generated_shell(shell: &Shell) -> Self {
+        let solid = Solid::new(shell.clone());
+        let mut history = Self::default();
+        for result in result_inventory(&solid)
+            .into_iter()
+            .filter(|result| result.kind != TopologyKind::Solid)
+        {
+            history.generated([], result);
+        }
+        history
+    }
+
     /// History for a newly-created solid. Every result entity is explicitly
     /// recorded as generated rather than being implied by an empty history.
     pub fn generated_solid(solid: &Solid) -> Self {
@@ -117,8 +132,92 @@ impl TopologyHistory {
         history
     }
 
+    /// Complete conservative lineage for a unary operation when the builder
+    /// cannot yet distinguish exact lower-level descendants. Every result is
+    /// explicitly sourced from all input entities of the same kind, and input
+    /// kinds with no result are explicitly deleted. This preserves coverage
+    /// and provenance without inventing a one-to-one identity.
+    pub fn conservative_unary(source: &Solid, result: &Solid) -> Self {
+        let source_entities = result_inventory(source);
+        let result_entities = result_inventory(result);
+        let mut history = Self::default();
+        for result_entity in result_entities {
+            let sources: Vec<_> = source_entities
+                .iter()
+                .filter(|source_entity| source_entity.kind == result_entity.kind)
+                .copied()
+                .map(|entity| InputTopologyRef::new(0, entity))
+                .collect();
+            history.generated(sources, result_entity);
+        }
+        for source_entity in source_entities {
+            if !history.changes.iter().any(|change| match change {
+                TopologyChange::Generated { sources, .. }
+                | TopologyChange::Merged { sources, .. } => {
+                    sources.contains(&InputTopologyRef::new(0, source_entity))
+                }
+                TopologyChange::Modified { source, .. } | TopologyChange::Split { source, .. } => {
+                    *source == InputTopologyRef::new(0, source_entity)
+                }
+                TopologyChange::Deleted { source } => {
+                    *source == InputTopologyRef::new(0, source_entity)
+                }
+            }) {
+                history.deleted(InputTopologyRef::new(0, source_entity));
+            }
+        }
+        history
+    }
+
     /// Report result entities absent from this history.
     pub fn coverage_for_solid(&self, solid: &Solid) -> HistoryCoverage {
+        self.coverage_for_inventory(result_inventory(solid))
+    }
+
+    /// Report entities absent from a shell-valued operation history.
+    pub fn coverage_for_shell(&self, shell: &Shell) -> HistoryCoverage {
+        let solid = Solid::new(shell.clone());
+        self.coverage_for_inventory(
+            result_inventory(&solid)
+                .into_iter()
+                .filter(|result| result.kind != TopologyKind::Solid),
+        )
+    }
+
+    /// Report entities absent from a body-major, kind-local multi-solid result.
+    ///
+    /// Multi-body operation histories number each topology kind consecutively
+    /// across returned bodies. This is the corresponding release-mode coverage
+    /// check; it prevents a structured operation from relying on a debug-only
+    /// assertion when one connected result was omitted from history.
+    pub fn coverage_for_solids(&self, solids: &[Solid]) -> HistoryCoverage {
+        let kinds = [
+            TopologyKind::Vertex,
+            TopologyKind::Edge,
+            TopologyKind::Wire,
+            TopologyKind::Face,
+            TopologyKind::Shell,
+            TopologyKind::Solid,
+        ];
+        let inventory = kinds.into_iter().flat_map(|kind| {
+            let count = solids
+                .iter()
+                .map(|solid| {
+                    result_inventory(solid)
+                        .into_iter()
+                        .filter(|entity| entity.kind == kind)
+                        .count()
+                })
+                .sum::<usize>();
+            (0..count).map(move |index| TopologyRef::new(kind, index))
+        });
+        self.coverage_for_inventory(inventory)
+    }
+
+    fn coverage_for_inventory(
+        &self,
+        inventory: impl IntoIterator<Item = TopologyRef>,
+    ) -> HistoryCoverage {
         let mut represented = std::collections::HashSet::new();
         for change in &self.changes {
             match change {
@@ -134,7 +233,7 @@ impl TopologyHistory {
             }
         }
         HistoryCoverage {
-            missing_results: result_inventory(solid)
+            missing_results: inventory
                 .into_iter()
                 .filter(|result| !represented.contains(result))
                 .collect(),
@@ -297,23 +396,10 @@ impl TopologyHistory {
         }
         Ok(())
     }
-
-    /// Start a composable history chain with `next`. `carried_operand` names the
-    /// operand of `next` that consumes this operation's result.
-    pub fn compose(self, next: Self, carried_operand: usize) -> TopologyHistoryChain {
-        TopologyHistoryChain {
-            first: self,
-            following: vec![HistoryStage {
-                history: next,
-                carried_operand,
-            }],
-        }
-    }
 }
 
 fn result_inventory(solid: &Solid) -> Vec<TopologyRef> {
     let wire_count = solid
-        .shell()
         .faces()
         .iter()
         .map(|face| face.wires().len())
@@ -335,51 +421,6 @@ fn result_inventory(solid: &Solid) -> Vec<TopologyRef> {
         .into_iter()
         .flat_map(|(kind, count)| (0..count).map(move |index| TopologyRef::new(kind, index)))
         .collect()
-}
-
-/// A later operation and the operand through which prior result topology flows.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryStage {
-    pub history: TopologyHistory,
-    pub carried_operand: usize,
-}
-
-/// Lossless composition of operation histories.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopologyHistoryChain {
-    pub first: TopologyHistory,
-    pub following: Vec<HistoryStage>,
-}
-
-impl TopologyHistoryChain {
-    /// Append another operation that consumes the current result through
-    /// `carried_operand`.
-    pub fn then(mut self, history: TopologyHistory, carried_operand: usize) -> Self {
-        self.following.push(HistoryStage {
-            history,
-            carried_operand,
-        });
-        self
-    }
-
-    /// Trace one entity from the first operation's input to all descendants at
-    /// the end of the chain.
-    pub fn descendants(&self, source: InputTopologyRef) -> Vec<TopologyRef> {
-        let mut current = self.first.descendants(source);
-        for stage in &self.following {
-            current = current
-                .into_iter()
-                .flat_map(|entity| {
-                    stage
-                        .history
-                        .descendants(InputTopologyRef::new(stage.carried_operand, entity))
-                })
-                .collect();
-            current.sort_unstable_by_key(|entity| (kind_order(entity.kind), entity.index));
-            current.dedup();
-        }
-        current
-    }
 }
 
 /// A malformed history event.
@@ -437,24 +478,5 @@ mod tests {
         );
         assert_eq!(history.sources_of(TopologyRef::face(3)), vec![source]);
         assert!(history.descendants(InputTopologyRef::face(1, 0)).is_empty());
-    }
-
-    #[test]
-    fn history_chain_traces_the_carried_operand() {
-        let original = InputTopologyRef::face(0, 4);
-        let mut first = TopologyHistory::default();
-        first.modified(original, TopologyRef::face(2));
-
-        let mut second = TopologyHistory::default();
-        second.split(
-            InputTopologyRef::face(1, 2),
-            [TopologyRef::face(7), TopologyRef::face(8)],
-        );
-
-        let chain = first.compose(second, 1);
-        assert_eq!(
-            chain.descendants(original),
-            vec![TopologyRef::face(7), TopologyRef::face(8)]
-        );
     }
 }

@@ -53,8 +53,8 @@ impl ZeroCadApp {
         // Render dynamic sliders based on selected node's feature type
         if let Some(ref selected_id) = self.selected_node_id {
             let mut node_idx = None;
-            for idx in self.graph.graph.node_indices() {
-                if self.graph.graph[idx].id == *selected_id {
+            for idx in self.document.graph.node_indices() {
+                if self.document.graph[idx].id == *selected_id {
                     node_idx = Some(idx);
                     break;
                 }
@@ -65,8 +65,8 @@ impl ZeroCadApp {
                 // `node` holds a mutable borrow of the graph below.
                 let mut extrude_request: Option<String> = None;
                 let mut edit_sketch_request: Option<String> = None;
-                let selected_feature_id = self.graph.graph[idx].id.clone();
-                let feature_suppressed = self.graph.is_feature_suppressed(&selected_feature_id);
+                let selected_feature_id = self.document.graph[idx].id.clone();
+                let feature_suppressed = self.document.is_feature_suppressed(&selected_feature_id);
                 let mut suppression_request: Option<bool> = None;
                 let mut modified = false;
 
@@ -75,15 +75,20 @@ impl ZeroCadApp {
                 // show what an expression-driven depth resolves to).
                 let pal = self.pal();
                 let current_unit = self.current_unit;
-                let var_map = self.graph.variable_map();
+                let var_map = self.document.variable_map();
+                let current_body_center = self
+                    .body_meshes
+                    .iter()
+                    .find(|(body_id, _)| body_id == &selected_feature_id)
+                    .and_then(|(_, mesh)| zerocad_core::parametric::body_bounds_center(mesh));
                 // Sketch-on-face reference outline, captured before the
                 // mutable node borrow below (used by the Sketch panel).
                 let face_boundary = self
-                    .graph
+                    .document
                     .sketch_face_boundaries
-                    .get(&self.graph.graph[idx].id)
+                    .get(&self.document.graph[idx].id)
                     .cloned();
-                let node = &mut self.graph.graph[idx];
+                let node = &mut self.document.graph[idx];
 
                 // Render inside a highly visual white inspector card
                 egui::Frame::none()
@@ -978,6 +983,95 @@ impl ZeroCadApp {
                                         modified = true;
                                     }
                                 }
+                                FeatureType::BodyIntersect {
+                                    target,
+                                    tool,
+                                    keep_tool,
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Target: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("Intersecting body: {tool}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    if ui.checkbox(keep_tool, "Keep tool body").changed() {
+                                        modified = true;
+                                    }
+                                }
+                                FeatureType::BodySplit {
+                                    target, plane, face, ..
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Body: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(if face.is_some() {
+                                            "Reference: planar body face".to_string()
+                                        } else {
+                                            format!("Reference: {plane:?}")
+                                        })
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Outputs: negative and positive side")
+                                            .size(10.5)
+                                            .color(pal.text_faint),
+                                    );
+                                }
+                                FeatureType::BodyScale {
+                                    source,
+                                    factor,
+                                    factor_expr,
+                                    center,
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Source: {source}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Factor");
+                                        if let Some(expression) = factor_expr {
+                                            if ui.text_edit_singleline(expression).changed() {
+                                                modified = true;
+                                            }
+                                        } else if ui
+                                            .add(egui::DragValue::new(factor).speed(0.05))
+                                            .changed()
+                                        {
+                                            modified = true;
+                                        }
+                                    });
+                                    ui.label("Pivot");
+                                    for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(label);
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut center[axis])
+                                                        .speed(0.25)
+                                                        .suffix(current_unit.suffix()),
+                                                )
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
+                                    if let Some(body_center) = current_body_center {
+                                        if ui.button("Reset pivot to current center").clicked() {
+                                            *center = body_center;
+                                            modified = true;
+                                        }
+                                    }
+                                }
                                 FeatureType::Thread {
                                     internal,
                                     pitch,
@@ -1191,7 +1285,7 @@ impl ZeroCadApp {
                 if let Some(suppressed) = suppression_request {
                     self.push_undo();
                     if self
-                        .graph
+                        .document
                         .set_feature_suppressed(&selected_feature_id, suppressed)
                     {
                         self.status_msg = if suppressed {
@@ -1204,7 +1298,19 @@ impl ZeroCadApp {
                 }
 
                 if modified {
-                    self.reevaluate_geometry();
+                    match self.document.commit_feature_edit(&selected_feature_id) {
+                        Ok(()) => self.reevaluate_geometry(),
+                        Err(error) => {
+                            log::error!(
+                                "Failed to synchronize feature '{}': {error}",
+                                selected_feature_id
+                            );
+                            self.status_msg = format!(
+                                "Feature '{}' has inconsistent document relationships: {error}",
+                                selected_feature_id
+                            );
+                        }
+                    }
                 }
 
                 if let Some(sketch_id) = extrude_request {

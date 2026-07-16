@@ -42,13 +42,21 @@ impl Wire {
     /// Build from anything iterable of edges.
     pub fn from_edges<I: IntoIterator<Item = Edge>>(edges: I) -> Self {
         let mut brep = BRep::new();
-        let mut merged: std::collections::HashMap<usize, crate::arena::MergeMap> =
-            std::collections::HashMap::new();
+        // Retain each source arena alongside its merge map. Keying only by its
+        // allocation address is not sufficient: an edge's last Arc can drop at
+        // the end of an iteration and the allocator may reuse that address for
+        // the next, unrelated edge arena.
+        let mut merged: std::collections::HashMap<
+            usize,
+            (std::sync::Arc<BRep>, crate::arena::MergeMap),
+        > = std::collections::HashMap::new();
         let mut new_edges = Vec::new();
         for edge in edges {
             let ptr = Arc::as_ptr(&edge.brep) as usize;
             // Since HashMap insertion returns a borrow, we avoid multiple mutable/immutable borrows.
-            let map = merged.entry(ptr).or_insert_with(|| brep.merge(&edge.brep));
+            let (_, map) = merged
+                .entry(ptr)
+                .or_insert_with(|| (edge.brep.clone(), brep.merge(&edge.brep)));
             let new_edge_id = map.edges[&edge.id];
 
             // The edge is stored once in its natural sense; this *use* of it in the

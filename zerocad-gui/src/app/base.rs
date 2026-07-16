@@ -2,12 +2,12 @@ use crate::*;
 
 impl ZeroCadApp {
     pub(crate) fn new() -> Self {
-        let graph = ParametricGraph::new();
+        let document = Document::new();
         let prefs = settings::AppSettings::load();
 
         Self {
             pending_visual: None,
-            graph,
+            document,
             selected_node_id: None,
             body_meshes: std::sync::Arc::new(Vec::new()),
             mesh_stats: (0, 0),
@@ -92,6 +92,8 @@ impl ZeroCadApp {
             body_clipboard: None,
             move_op: None,
             combine_op: None,
+            split_body_op: None,
+            scale_body_op: None,
             move_preview_bodies: None,
             extrude_depth: 25.0,
             extrude_mode: ExtrudeMode::NewBody,
@@ -162,8 +164,8 @@ impl ZeroCadApp {
     /// lives in one place and each consumer builds exactly the collection it
     /// needs (no intermediate `Vec` just to `collect` it into something else).
     pub(crate) fn for_each_visible_variable(&self, mut f: impl FnMut(&str, f64)) {
-        for idx in self.graph.graph.node_indices() {
-            let node = &self.graph.graph[idx];
+        for idx in self.document.graph.node_indices() {
+            let node = &self.document.graph[idx];
             if self.hidden_nodes.contains(&node.id) {
                 continue;
             }

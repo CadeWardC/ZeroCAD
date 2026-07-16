@@ -11,7 +11,7 @@ pub mod zcad_format;
 use core::fmt;
 
 use openrcad_algo::{
-    boolean_operation, chamfer, fillet_with_policy, BlendError, BooleanError, BooleanOp,
+    boolean_operation, chamfer_with_policy, fillet_with_policy, BlendError, BooleanError, BooleanOp,
 };
 use openrcad_foundation::{Ax2, Dir, Pnt};
 use openrcad_primitives::{make_box_operation, make_cylinder_operation};
@@ -389,7 +389,11 @@ impl Document {
                 radius,
                 &openrcad_foundation::TolerancePolicy::STANDARD,
             )?),
-            FeatureKind::Chamfer { input, distance } => Ok(chamfer(self.solid(input)?, distance)?),
+            FeatureKind::Chamfer { input, distance } => Ok(chamfer_with_policy(
+                self.solid(input)?,
+                distance,
+                &openrcad_foundation::TolerancePolicy::STANDARD,
+            )?),
         }
     }
 }

@@ -12,10 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use openrcad::algo::{
-    apply_blend_contour_with_policy, skin_polygon_rings, BlendContour, BlendCurveHint, BlendKind,
-    BooleanOp,
-};
+use openrcad::algo::{BlendContour, BlendCurveHint, BlendKind, BooleanOp};
 pub use openrcad::algo::{BooleanFaceHistory, BooleanFaceSource};
 use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, TolerancePolicy, Trsf, Vec as GeomVec};
 use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};

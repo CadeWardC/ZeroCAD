@@ -571,15 +571,7 @@ impl DocumentRecipeV3 {
             .node_indices()
             .map(|idx| {
                 let node = &graph.graph[idx];
-                let semantics = graph
-                    .semantics
-                    .features
-                    .get(&crate::document::FeatureId::from(node.id.as_str()));
-                let sequence = semantics
-                    .map(|feature| feature.sequence)
-                    .unwrap_or_else(|| {
-                        crate::document::SequenceKey(crate::parametric::creation_key(&node.id))
-                    });
+                let sequence = node.sequence;
                 let payload = match &node.feature {
                     crate::parametric::FeatureType::Import { step_data, label } => {
                         let bytes = step_data.as_bytes().to_vec();
@@ -593,21 +585,13 @@ impl DocumentRecipeV3 {
                     id: node.id.clone(),
                     name: node.name.clone(),
                     creation_order: sequence.0,
-                    payload_schema: semantics
-                        .map(|feature| feature.payload_version)
-                        .unwrap_or_else(|| node.feature.payload_version()),
+                    payload_schema: node.payload_version,
                     payload,
-                    kind_id: semantics
-                        .map(|feature| feature.kind_id.clone())
-                        .unwrap_or_else(|| {
-                            crate::document::FeatureKindId::from(node.feature.kind_id())
-                        }),
+                    kind_id: node.kind_id.clone(),
                     sequence,
-                    inputs: semantics
-                        .map(|feature| feature.inputs.clone())
-                        .unwrap_or_default(),
-                    state: semantics.map(|feature| feature.state).unwrap_or_default(),
-                    body: semantics.and_then(|feature| feature.body.clone()),
+                    inputs: node.inputs.clone(),
+                    state: node.state,
+                    body: node.body.clone(),
                 }
             })
             .collect();
@@ -769,34 +753,38 @@ impl DocumentRecipeV3 {
                     record.payload_schema, record.kind_id
                 )));
             }
-            let semantics = crate::document::FeatureSemantics {
-                kind_id: record.kind_id.clone(),
-                payload_version: record.payload_schema,
-                sequence: record.sequence,
-                inputs: record.inputs.clone(),
-                state: record.state,
-                body: record.body.clone(),
-            };
             if record.id == "origin" {
-                graph
-                    .semantics
-                    .features
-                    .insert(crate::document::FeatureId::from("origin"), semantics);
+                let origin = graph
+                    .graph
+                    .node_weights_mut()
+                    .find(|feature| feature.id == "origin")
+                    .expect("new graph must contain origin");
+                origin.name = record.name;
+                origin.kind_id = record.kind_id;
+                origin.payload_version = record.payload_schema;
+                origin.sequence = record.sequence;
+                origin.inputs = record.inputs;
+                origin.state = record.state;
+                origin.body = record.body;
                 continue;
             }
-            let id = record.id.clone();
-            graph.add_feature(FeatureNode {
+            let idx = graph.add_feature(FeatureNode {
                 id: record.id,
                 name: record.name,
                 feature,
             });
-            graph
-                .semantics
-                .features
-                .insert(crate::document::FeatureId::from(id), semantics);
+            let stored = &mut graph.graph[idx];
+            stored.kind_id = record.kind_id;
+            stored.payload_version = record.payload_schema;
+            stored.sequence = record.sequence;
+            stored.inputs = record.inputs;
+            stored.state = record.state;
+            stored.body = record.body;
         }
         for dependency in dependencies {
-            graph.add_dependency(&dependency.parent, &dependency.child);
+            graph
+                .add_dependency_for_load(&dependency.parent, &dependency.child)
+                .map_err(ZcadError::Decode)?;
         }
         graph.sketch_face_refs = sketch_face_refs.into_iter().collect();
         graph.sketch_datum_refs = sketch_datum_refs.into_iter().collect();
@@ -808,10 +796,10 @@ impl DocumentRecipeV3 {
             }
         }
         graph.semantics.bodies = body_records;
-        graph.rebuild_node_map();
         graph
             .validate_semantic_contracts()
             .map_err(ZcadError::Decode)?;
+        graph.rebuild_node_map();
         Ok(graph)
     }
 }
@@ -1080,16 +1068,11 @@ fn mesh_cache_fresh(stored_hash: [u8; 32], recipe_cbor: &[u8]) -> bool {
 
 fn mesh_cache_valid(bodies: &[(String, MockMesh)], graph: &ParametricGraph) -> Result<(), String> {
     let mut body_ids = HashSet::with_capacity(bodies.len());
-    let feature_ids: HashSet<&str> = graph
-        .graph
-        .node_weights()
-        .map(|node| node.id.as_str())
-        .collect();
     for (body_id, mesh) in bodies {
         if body_id.is_empty() || !body_ids.insert(body_id.as_str()) {
             return Err(format!("invalid or duplicate display body id '{body_id}'"));
         }
-        if !feature_ids.contains(crate::parametric::body_output_owner_id(body_id)) {
+        if graph.body_producer_feature_id(body_id).is_none() {
             return Err(format!("display body '{body_id}' has no owning feature"));
         }
         if mesh.vertices.len() % 6 != 0
@@ -1233,6 +1216,9 @@ pub fn write_document<W: Write + Seek>(
     options: &SaveOptions,
     accelerators: &HydrationBundle,
 ) -> Result<(), ZcadError> {
+    document
+        .validate_semantic_contracts()
+        .map_err(|error| ZcadError::Decode(format!("invalid semantic document: {error}")))?;
     let budget = match options.profile {
         SaveProfile::Compact => None,
         SaveProfile::Hydrated {
@@ -1247,7 +1233,7 @@ pub fn write_document<W: Write + Seek>(
     };
     let hidden_nodes = document.hidden_entities();
     let legacy = ZcadDocument {
-        graph: &document.graph,
+        graph: document.evaluator_graph(),
         thumbnail_png: accelerators.small_preview_png.clone(),
         mesh_cache: budget.and(accelerators.display_meshes.as_deref()),
         units: document.state.units,
@@ -1301,14 +1287,8 @@ fn loaded_zcad_to_document(loaded: LoadedZcad) -> Result<LoadedDocument, ZcadErr
     let mut hidden_nodes: Vec<_> = loaded.hidden_nodes.into_iter().collect();
     hidden_nodes.sort_unstable();
     for hidden in hidden_nodes {
-        let owner = crate::parametric::body_output_owner_id(&hidden);
-        let valid = document
-            .graph
-            .graph
-            .node_weights()
-            .any(|node| node.id == owner)
+        let valid = document.body_producer_feature_id(&hidden).is_some()
             || document
-                .graph
                 .semantics
                 .bodies
                 .contains_key(&crate::document::BodyId::from(hidden.as_str()));

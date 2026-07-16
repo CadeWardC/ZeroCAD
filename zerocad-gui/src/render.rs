@@ -1783,9 +1783,9 @@ impl ZeroCadApp {
             .as_ref()
             .map(|op| op.targets.iter().map(|t| t.sketch_id.clone()).collect())
             .unwrap_or_default();
-        let var_map = self.graph.variable_map();
-        for idx in self.graph.graph.node_indices() {
-            let node = &self.graph.graph[idx];
+        let var_map = self.document.variable_map();
+        for idx in self.document.graph.node_indices() {
+            let node = &self.document.graph[idx];
             if self.hidden_nodes.contains(&node.id) {
                 continue; // hidden sketch — don't draw
             }
@@ -1820,7 +1820,7 @@ impl ZeroCadApp {
                     solver.as_ref(),
                     &var_map,
                 );
-                if let Some(b) = self.graph.sketch_face_boundaries.get(&node.id) {
+                if let Some(b) = self.document.sketch_face_boundaries.get(&node.id) {
                     eff.extend_curves(b);
                 }
                 let curves = &eff;

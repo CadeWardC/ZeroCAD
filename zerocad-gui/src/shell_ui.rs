@@ -122,7 +122,7 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("shell_{n}");
-        self.graph.add_feature(FeatureNode {
+        self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Shell {n}"),
             feature: FeatureType::Shell {
@@ -133,7 +133,7 @@ impl ZeroCadApp {
                 open_faces: op.open_faces.clone(),
             },
         });
-        self.graph.add_dependency(&op.target, &id);
+        self.document.add_dependency(&op.target, &id);
         self.selected_body.clear();
         self.selected_node_id = Some(id);
         self.shell_op = None;

@@ -86,6 +86,13 @@ pub enum RecoveryAction {
     ReconstructPcurves {
         count: usize,
     },
+    /// Promoted imported edge tolerances only within the policy's explicit
+    /// compatibility-recovery cap so approximate legacy intersection curves
+    /// remain consistent with their supporting surfaces.
+    PromoteImportedTolerance {
+        edge_count: usize,
+        maximum: f64,
+    },
     MergeCoplanarFaces {
         removed_faces: usize,
     },

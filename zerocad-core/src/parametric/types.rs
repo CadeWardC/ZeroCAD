@@ -174,53 +174,6 @@ pub struct FaceRef {
     pub topology: Option<TopologyFaceRef>,
 }
 
-/// How an edge modifier should use saved construction history.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum EdgeModReplayMode {
-    /// Prefer construction replay when the target body carries replayable cut
-    /// history; fall back to native edge modification for unsupported selections.
-    #[default]
-    Auto,
-    /// Bypass construction replay. Used for native-only topology such as circular
-    /// rim edges or when a future UI exposes an explicit escape hatch.
-    NativeOnly,
-}
-
-/// Saved intent for reconstructing a fillet through earlier cuts.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct EdgeModReplayIntent {
-    #[serde(default)]
-    pub mode: EdgeModReplayMode,
-    #[serde(default)]
-    pub pre_cut_target: Option<String>,
-    #[serde(default)]
-    pub replay_cut_nodes: Vec<String>,
-    #[serde(default)]
-    pub selected_span: Option<EdgeRef>,
-}
-
-impl Default for EdgeModReplayIntent {
-    fn default() -> Self {
-        Self {
-            mode: EdgeModReplayMode::Auto,
-            pre_cut_target: None,
-            replay_cut_nodes: Vec::new(),
-            selected_span: None,
-        }
-    }
-}
-
-impl EdgeModReplayIntent {
-    pub fn auto_for(target: impl Into<String>, edge: EdgeRef) -> Self {
-        Self {
-            mode: EdgeModReplayMode::Auto,
-            pre_cut_target: Some(target.into()),
-            replay_cut_nodes: Vec::new(),
-            selected_span: Some(edge),
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum FeatureType {
     Origin,
@@ -326,9 +279,6 @@ pub enum FeatureType {
         /// re-evaluated every build. `dist` holds the last resolved value.
         #[serde(default)]
         dist_expr: Option<String>,
-        /// Construction-replay intent for fillets through earlier cuts.
-        #[serde(default)]
-        replay: EdgeModReplayIntent,
         /// Whether to round (Fillet) or bevel (Chamfer) the edge.
         kind: crate::sketch::CornerKind,
     },
@@ -516,6 +466,32 @@ pub enum FeatureType {
         #[serde(default)]
         keep_tool: bool,
     },
+    /// Keep only the common positive volume of two finished bodies. The tool
+    /// is consumed unless `keep_tool` is enabled.
+    BodyIntersect {
+        target: String,
+        tool: String,
+        #[serde(default)]
+        keep_tool: bool,
+    },
+    /// Divide one body with an origin/datum plane or an associatively captured
+    /// planar face. The evaluator emits two explicitly registered body outputs.
+    BodySplit {
+        target: String,
+        plane: PlaneBase,
+        #[serde(default)]
+        face: Option<FaceRef>,
+    },
+    /// Positive uniform scale of a finished body about a persisted world-space
+    /// pivot. `factor_expr` is authoritative when it resolves successfully;
+    /// `factor` is the last known numeric fallback.
+    BodyScale {
+        source: String,
+        factor: f32,
+        #[serde(default)]
+        factor_expr: Option<String>,
+        center: [f32; 3],
+    },
 }
 
 /// A plane input to a datum definition: one of the three base planes or a
@@ -667,11 +643,50 @@ pub struct FeatureNode {
     pub feature: FeatureType,
 }
 
+/// Authoritative feature record stored by a document.
+///
+/// `FeatureNode` remains the lightweight creation command used by callers, but
+/// once inserted the payload and all stable semantic fields live together in
+/// this one record.  The evaluator graph is derived scheduling structure; it no
+/// longer needs a parallel feature sidecar that can drift from the payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FeatureRecord {
+    pub id: String,
+    pub name: String,
+    pub feature: FeatureType,
+    pub kind_id: crate::document::FeatureKindId,
+    pub payload_version: u16,
+    pub sequence: crate::document::SequenceKey,
+    pub inputs: Vec<crate::document::FeatureInput>,
+    pub state: crate::document::FeatureState,
+    pub body: Option<crate::document::BodyId>,
+}
+
+impl FeatureRecord {
+    pub(crate) fn from_node(node: FeatureNode, sequence: crate::document::SequenceKey) -> Self {
+        let kind_id = crate::document::FeatureKindId::from(node.feature.kind_id());
+        let payload_version = node.feature.payload_version();
+        let inputs = crate::document::FeatureRegistry::dependencies(&node.feature);
+        let body = crate::document::body_for_feature(&node.id, &node.feature);
+        Self {
+            id: node.id,
+            name: node.name,
+            feature: node.feature,
+            kind_id,
+            payload_version,
+            sequence,
+            inputs,
+            state: crate::document::FeatureState::Active,
+            body,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParametricGraph {
-    pub graph: DiGraph<FeatureNode, ()>,
-    /// Stable document meaning for runtime nodes: explicit sequence, inputs,
-    /// suppression, kind IDs, body identity, and body timelines.
+    pub graph: DiGraph<FeatureRecord, ()>,
+    /// Stable body identities and ordered timelines. Feature semantics live on
+    /// each [`FeatureRecord`]; this collection owns only cross-feature bodies.
     #[serde(default)]
     pub semantics: crate::document::DocumentSemantics,
     /// For a sketch placed on a body face: the durable [`FaceRef`] to that face,

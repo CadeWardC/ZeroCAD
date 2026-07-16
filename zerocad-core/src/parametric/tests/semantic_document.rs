@@ -17,6 +17,23 @@ fn add_box(graph: &mut ParametricGraph, id: &str) {
     });
 }
 
+fn add_hole(graph: &mut ParametricGraph, id: &str, target: &str) {
+    graph.add_feature(FeatureNode {
+        id: id.to_owned(),
+        name: "Hole".to_owned(),
+        feature: FeatureType::Hole {
+            target: target.to_owned(),
+            position: [5.0, 4.0, 6.0],
+            direction: [0.0, 0.0, -1.0],
+            diameter: 2.0,
+            diameter_expr: None,
+            depth: None,
+            kind: HoleKind::Simple,
+        },
+    });
+    graph.add_dependency(target, id);
+}
+
 #[test]
 fn stable_kind_registry_covers_every_builtin_without_duplicate_ids() {
     let mut ids: Vec<_> = FeatureRegistry::BUILTINS
@@ -30,7 +47,7 @@ fn stable_kind_registry_covers_every_builtin_without_duplicate_ids() {
     assert!(FeatureRegistry::get("part.extrude").is_some());
     assert!(FeatureRegistry::get("not.a.feature").is_none());
     let extrude = FeatureRegistry::get("part.extrude").unwrap();
-    assert_eq!(extrude.evaluator, FeatureEvaluatorKind::BodyOperation);
+    assert_eq!(extrude.evaluator, FeatureEvaluatorKind::Extrude);
     assert_eq!(extrude.editor_group, FeatureEditorGroup::Solid);
 }
 
@@ -154,11 +171,7 @@ fn body_timeline_and_input_roles_are_explicit() {
         body.timeline,
         [FeatureId::from("box_1"), FeatureId::from("hole_2")]
     );
-    let hole = graph
-        .semantics
-        .features
-        .get(&FeatureId::from("hole_2"))
-        .unwrap();
+    let hole = &graph.graph[graph.node_map["hole_2"]];
     assert!(hole.inputs.iter().any(|input| {
         input.role == "target"
             && matches!(
@@ -206,4 +219,83 @@ fn timeline_reorder_is_independent_but_never_precedes_a_dependency() {
         .collect();
     assert_eq!(evaluation_ids, ["box_1", "hole_2"]);
     graph.evaluate_bodies(&HashSet::new()).unwrap();
+}
+
+#[test]
+fn semantic_validation_rejects_dependency_input_drift() {
+    let mut graph = ParametricGraph::new();
+    add_box(&mut graph, "box_1");
+    add_hole(&mut graph, "hole_2", "box_1");
+
+    let hole = graph.node_map["hole_2"];
+    graph.graph[hole]
+        .inputs
+        .retain(|input| input.role != "dependency");
+
+    let error = graph.validate_semantic_contracts().unwrap_err();
+    assert!(error.contains("semantic inputs disagree"), "{error}");
+    let evaluation_error = graph.evaluate_bodies(&HashSet::new()).unwrap_err();
+    assert!(evaluation_error.contains("Invalid semantic document"));
+}
+
+#[test]
+fn semantic_validation_rejects_missing_body_timeline_membership() {
+    let mut graph = ParametricGraph::new();
+    add_box(&mut graph, "box_1");
+    add_hole(&mut graph, "hole_2", "box_1");
+
+    graph
+        .semantics
+        .bodies
+        .get_mut(&crate::document::BodyId::from("box_1"))
+        .unwrap()
+        .timeline
+        .retain(|member| member.as_str() != "hole_2");
+
+    let error = graph.validate_semantic_contracts().unwrap_err();
+    assert!(error.contains("must appear exactly once"), "{error}");
+}
+
+#[test]
+fn explicit_refresh_repairs_a_relationship_bearing_payload_edit() {
+    let mut graph = ParametricGraph::new();
+    add_box(&mut graph, "box_1");
+    add_box(&mut graph, "box_2");
+    add_hole(&mut graph, "hole_3", "box_1");
+
+    let box_1 = graph.node_map["box_1"];
+    let hole = graph.node_map["hole_3"];
+    let old_edge = graph.graph.find_edge(box_1, hole).unwrap();
+    graph.graph.remove_edge(old_edge);
+    if let FeatureType::Hole { target, .. } = &mut graph.graph[hole].feature {
+        *target = "box_2".to_owned();
+    }
+    let box_2 = graph.node_map["box_2"];
+    graph.graph.add_edge(box_2, hole, ());
+
+    assert!(graph.validate_semantic_contracts().is_err());
+    graph.commit_feature_edit("hole_3").unwrap();
+    graph.validate_semantic_contracts().unwrap();
+    let body = &graph.semantics.bodies[&crate::document::BodyId::from("box_2")];
+    assert!(body
+        .timeline
+        .iter()
+        .any(|member| member.as_str() == "hole_3"));
+}
+
+#[test]
+fn legacy_body_index_backfill_preserves_authoritative_inputs() {
+    let mut graph = ParametricGraph::new();
+    add_box(&mut graph, "box_1");
+    add_hole(&mut graph, "hole_2", "box_1");
+
+    graph.semantics = crate::document::DocumentSemantics::default();
+    graph.rebuild_node_map();
+    graph.validate_semantic_contracts().unwrap();
+
+    let hole = &graph.graph[graph.node_map["hole_2"]];
+    assert!(hole.inputs.iter().any(|input| {
+        input.role == "dependency"
+            && input.target == FeatureInputTarget::Feature(FeatureId::from("box_1"))
+    }));
 }

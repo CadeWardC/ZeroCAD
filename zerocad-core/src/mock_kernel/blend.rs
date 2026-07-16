@@ -76,8 +76,7 @@ pub fn fillet_edge_with_hint(
                 radius as f64,
                 Some(BlendCurveHint::Circle),
             );
-            return apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
-                .map_err(|err| err.to_string());
+            return consume_blend_contour(solid, &contour);
         }
         let contour = BlendContour::constant(
             chain,
@@ -85,8 +84,7 @@ pub fn fillet_edge_with_hint(
             radius as f64,
             Some(BlendCurveHint::Circle),
         );
-        return apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
-            .map_err(|err| err.to_string());
+        return consume_blend_contour(solid, &contour);
     }
 
     let e = Edge::between_points(
@@ -94,8 +92,22 @@ pub fn fillet_edge_with_hint(
         snap_point_to_topology(solid, p1),
     );
     let contour = BlendContour::constant(vec![e], BlendKind::Fillet, radius as f64, None);
-    apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
-        .map_err(|err| err.to_string())
+    consume_blend_contour(solid, &contour)
+}
+
+fn consume_blend_contour(
+    solid: &KernelSolid,
+    contour: &BlendContour,
+) -> Result<KernelSolid, String> {
+    consume_operation(
+        "edge blend",
+        openrcad::algo::blend_contour_operation_with_policy(
+            solid,
+            contour,
+            &TolerancePolicy::STANDARD,
+        ),
+    )
+    .map(|outcome| outcome.solid)
 }
 
 fn append_tangent_line_edges(solid: &KernelSolid, chain: &mut Vec<Edge>) {
@@ -297,8 +309,7 @@ pub fn chamfer_edge_with_hint(
             distance as f64,
             Some(BlendCurveHint::Circle),
         );
-        return apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
-            .map_err(|err| err.to_string());
+        return consume_blend_contour(solid, &contour);
     }
 
     let e = Edge::between_points(
@@ -306,6 +317,5 @@ pub fn chamfer_edge_with_hint(
         snap_point_to_topology(solid, p1),
     );
     let contour = BlendContour::constant(vec![e], BlendKind::Chamfer, distance as f64, None);
-    apply_blend_contour_with_policy(solid, &contour, &TolerancePolicy::STANDARD)
-        .map_err(|err| err.to_string())
+    consume_blend_contour(solid, &contour)
 }

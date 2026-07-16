@@ -78,6 +78,28 @@ pub(crate) fn planar_face_with_pcurves(
     Face::with_wires_and_pcurves(Some(GeomSurface::plane(plane)), outer, inners, orientation)
 }
 
+/// Build a face on an analytic surface whose constructor guarantees that each
+/// boundary edge follows a surface coordinate line. Pcurves are bound in the
+/// same transaction as the face, so the face never exists in a surface-backed
+/// state with missing coedge data.
+pub(crate) fn analytic_face_with_pcurves(
+    surface: GeomSurface,
+    outer: Wire,
+    orientation: Orientation,
+) -> Result<Face, FaceBuildError> {
+    let pcurves = outer
+        .edges()
+        .iter()
+        .map(|edge| analytic_line_pcurve(&surface, edge))
+        .collect();
+    Face::with_wires_and_pcurves(
+        Some(surface),
+        Some((outer, pcurves)),
+        Vec::new(),
+        orientation,
+    )
+}
+
 /// Exact image of a planar 3D edge in the plane's Cartesian UV frame.
 fn planar_edge_pcurve(plane: &Plane, edge: &Edge) -> PcurveData {
     let project_point = |point: Pnt| {
