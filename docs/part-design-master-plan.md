@@ -93,10 +93,12 @@ reorder, suppression, and undo/redo behavior.
 
 Phase 3 routed body-producing Part Design features through shared New, Join,
 Cut, and operation-outcome services, hardened boolean and blend behavior,
-completed native blend pcurves, removed obsolete compatibility paths, and made
-topology history composition real in downstream naming. It also added the
-operation and equivalence matrices required to keep feature ordering and
-serialization behavior stable.
+completed native blend pcurves, removed obsolete compatibility paths, and
+integrated per-operation topology history directly into downstream face naming.
+The unused generic history composition/chain API was deleted rather than
+retained as a fictional abstraction. Phase 3 also added the operation and
+equivalence matrices required to keep feature ordering and serialization
+behavior stable.
 
 The official boolean strategy and its arrangement-engine trigger are documented
 in [`phase3-boolean-strategy.md`](phase3-boolean-strategy.md).
@@ -149,8 +151,10 @@ professional Part Design UI is built on top of them.
   operation. The scale preview is not described as a worker-generated B-Rep.
 - Transform all source parts transactionally and consume the source only after
   complete validation.
-- Scale local topology tolerances by the absolute factor, repair invalidated
-  pcurves with recorded recovery, and strictly validate before commit.
+- Scale local topology tolerances by the absolute factor and map stored pcurves
+  directly when the carrying surface has an exact UV transform. Unsupported
+  parameterizations use the explicit, validated reconstruction fallback with
+  recorded recovery. Strict validation remains mandatory before commit.
 
 ### Phase 3.5 gate
 
@@ -243,6 +247,12 @@ Direct STEP editing and useful STL intake are Part Design 1.0 requirements.
 General surface-recognizing mesh-to-BRep conversion is explicitly deferred until
 after 1.0.
 
+Gate: a curated matrix of independently authored STEP parts survives every
+supported direct-edit feature, strict validation, deterministic save/load, and
+subsequent Part Design operations. Imported STL bodies pass manifold and winding
+diagnostics plus display, selection, transform, measurement, section, and export
+tests without being treated as B-Reps.
+
 ## Phase 6 — Exchange, performance, and architecture cleanup
 
 - Broaden STEP interoperability and round-trip fixtures without weakening the
@@ -256,6 +266,13 @@ after 1.0.
 - Maintain the Phase 0 performance comparison and investigate every material
   regression rather than refreshing the baseline to hide it.
 
+Gate: every scheduled migration ledger, compatibility allowlist, obsolete
+wrapper, and dual ownership/container convention is empty. STEP round-trip and
+cross-version fixtures pass, the frozen correctness corpus is unchanged, the
+relative performance harness is green, and the remaining distance to the Phase
+7 absolute budgets is measured. Any unavoidable release exception moves to
+Phase 7 with an owner, reason, user impact, and removal trigger.
+
 ## Phase 7 — Stabilization and Part Design 1.0
 
 - Run long-form randomized, scale, imported-part, save/load, undo/redo, and
@@ -266,6 +283,37 @@ after 1.0.
   exception needs an owner, reason, and removal trigger.
 - Ship only when both workspaces are warning-reviewed, all gates are green, and
   the frozen corpus and performance harness pass unchanged.
+
+### Absolute performance and footprint release invariants
+
+The relative Phase 0 comparison prevents sudden regressions; these absolute
+limits prevent several individually acceptable changes from accumulating into a
+slow release. Measurements use the Phase 0 reference machine and procedure, or
+a formally documented replacement with both old and new results captured for
+normalization.
+
+- Stripped release executable remains under 30 MiB.
+- Compressed distribution targets 20–25 MiB; installed footprint remains under
+  50 MiB.
+- Cold start remains under 1 second and warm start under 500 ms.
+- Idle working set targets 120–150 MiB and must not exceed 150 MiB without an
+  approved, measured justification.
+- A typical trailing feature edit completes in under 50 ms; a representative
+  full rebuild completes in under 250 ms.
+- The viewport sustains 60 FPS around one million displayed triangles on the
+  reference scene and hardware.
+- Compact recipe save and open each remain under 100 ms for 100 features and
+  under 250 ms for 500 features, excluding geometry rebuild.
+- A hydrated `.zcadh` document displays its validated mesh within 250 ms and its
+  first edit takes no more than twice the equivalent already-warm edit.
+- Streaming `.zcadh` save/open never retains the complete file plus every
+  uncompressed section simultaneously.
+- No time, footprint, or file-size regression above 10% is accepted without a
+  documented correctness justification, even when the absolute ceiling still
+  passes.
+
+Gate: all absolute limits above, the relative 10% comparison, long-form stress
+suites, compatibility checks, and both workspace gates pass on a release build.
 
 ## Required handoff gates
 
