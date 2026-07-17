@@ -139,15 +139,26 @@ impl ZeroCadApp {
                     egui::CollapsingHeader::new(&body.body_id)
                         .default_open(true)
                         .show(ui, |ui| {
-                            ui.monospace(format!("Volume: {:.6} mm³", body.volume_mm3));
+                            if let Some(volume) = body.volume_mm3 {
+                                ui.monospace(format!("Volume: {volume:.6} mm³"));
+                            } else {
+                                ui.monospace("Volume: unavailable (open mesh)");
+                            }
                             ui.monospace(format!(
                                 "Surface area: {:.6} mm²",
                                 body.surface_area_mm2
                             ));
-                            ui.monospace(format!(
-                                "Mass: {:.6} g at {:.6} g/cm³",
-                                body.mass_g, body.density_g_cm3
-                            ));
+                            if let Some(mass) = body.mass_g {
+                                ui.monospace(format!(
+                                    "Mass: {mass:.6} g at {:.6} g/cm³",
+                                    body.density_g_cm3
+                                ));
+                            } else {
+                                ui.monospace(format!(
+                                    "Mass: unavailable at {:.6} g/cm³ (open mesh)",
+                                    body.density_g_cm3
+                                ));
+                            }
                             ui.monospace(format!(
                                 "Centroid: ({:.6}, {:.6}, {:.6}) mm",
                                 body.centroid[0], body.centroid[1], body.centroid[2]

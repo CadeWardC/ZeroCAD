@@ -7,15 +7,19 @@ use crate::mock_kernel::{common_bodies_with_history, CommonBodiesError};
 pub struct BodyInspection {
     pub body_id: String,
     pub part_count: usize,
-    pub volume_mm3: f64,
+    /// Enclosed volume. Open mesh bodies have no well-defined enclosed volume
+    /// and report `None` rather than a misleading numeric zero.
+    pub volume_mm3: Option<f64>,
     pub surface_area_mm2: f64,
     pub centroid: [f64; 3],
     pub bounds_min: [f64; 3],
     pub bounds_max: [f64; 3],
     /// Display/material density selected by the caller. Geometry remains in
-    /// millimetres, so `mass_g = volume_mm3 / 1000 * density_g_cm3`.
+    /// millimetres, so `mass_g = volume_mm3 / 1000 * density_g_cm3` when the
+    /// body has a defined enclosed volume.
     pub density_g_cm3: f64,
-    pub mass_g: f64,
+    /// Density-derived mass. This is unavailable for open mesh bodies.
+    pub mass_g: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,13 +250,13 @@ fn inspect_live_body(body: &LiveBody, density_g_cm3: f64) -> Result<BodyInspecti
     Ok(BodyInspection {
         body_id: body.id.clone(),
         part_count: body.parts.len(),
-        volume_mm3: volume,
+        volume_mm3: Some(volume),
         surface_area_mm2: surface_area,
         centroid: centroid_sum.map(|component| component / volume),
         bounds_min,
         bounds_max,
         density_g_cm3,
-        mass_g: volume / 1_000.0 * density_g_cm3,
+        mass_g: Some(volume / 1_000.0 * density_g_cm3),
     })
 }
 
@@ -285,11 +289,13 @@ fn inspect_mesh_body(
     if surface_area <= 0.0 || !bounds_min[0].is_finite() {
         return Err(format!("mesh body '{body_id}' has no measurable triangles"));
     }
-    let mass = mesh.mass_properties();
-    let (volume, centroid) = mass.map_or_else(
-        || (0.0, area_centroid.map(|component| component / surface_area)),
-        |properties| (properties.volume, properties.centroid),
-    );
+    let (volume, centroid) = match mesh.mass_properties() {
+        Some(properties) => (Some(properties.volume), properties.centroid),
+        None => (
+            None,
+            area_centroid.map(|component| component / surface_area),
+        ),
+    };
     Ok(BodyInspection {
         body_id: body_id.to_string(),
         part_count: 1,
@@ -299,7 +305,7 @@ fn inspect_mesh_body(
         bounds_min,
         bounds_max,
         density_g_cm3,
-        mass_g: volume / 1_000.0 * density_g_cm3,
+        mass_g: volume.map(|volume| volume / 1_000.0 * density_g_cm3),
     })
 }
 
@@ -354,11 +360,11 @@ mod tests {
             },
         });
         let measured = graph.inspect_body("box_1").unwrap();
-        assert!((measured.volume_mm3 - 6_000.0).abs() < 1.0e-6);
+        assert!((measured.volume_mm3.expect("closed volume") - 6_000.0).abs() < 1.0e-6);
         assert!((measured.surface_area_mm2 - 2_200.0).abs() < 1.0e-6);
         assert_eq!(measured.centroid, [5.0, 10.0, 15.0]);
         let steel = graph.inspect_body_with_density("box_1", 7.85).unwrap();
-        assert!((steel.mass_g - 47.1).abs() < 1.0e-9);
+        assert!((steel.mass_g.expect("closed mass") - 47.1).abs() < 1.0e-9);
     }
 
     #[test]

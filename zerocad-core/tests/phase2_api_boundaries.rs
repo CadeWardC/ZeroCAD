@@ -148,13 +148,19 @@ fn phase3_closes_the_document_deviation_ledger_and_keeps_guards() {
         "runtime body ownership disagrees",
         "must appear exactly once in body",
         "semantics.body_outputs",
-        "ensure_body_output_reference",
+        "semantics.body_outputs",
     ] {
         assert!(
             eval.contains(guard),
             "semantic integrity guard missing: {guard}"
         );
     }
+    assert!(
+        !eval.contains("body_output_owner_id")
+            && !eval.contains("ensure_body_output_reference")
+            && !eval.contains("split(\"::body:\")"),
+        "Phase 6 forbids inferring body ownership from identifier spelling"
+    );
 
     let format =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/zcad_format.rs"))

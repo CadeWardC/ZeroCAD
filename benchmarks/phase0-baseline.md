@@ -24,6 +24,12 @@ hard-coded test thresholds.
 The cold-window result is 22.4 ms above the eventual sub-one-second target. It
 is retained as-is so later work is compared against the real starting point.
 
+For active startup work, run `benchmarks/profile-startup.ps1`. Unlike the frozen
+single-sample Phase 0 record, it captures seven fresh-process samples, median,
+and p95 in `target/startup-profile.json` and fails while either is at or above
+the one-second release invariant. This profiling gate does not rewrite or
+replace the committed Phase 0 baseline.
+
 ## Kernel and document workloads
 
 The frozen machine-readable values are committed in

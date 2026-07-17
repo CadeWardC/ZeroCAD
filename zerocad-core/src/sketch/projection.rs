@@ -1,9 +1,8 @@
 //! Associative body-edge projection into sketch construction geometry.
 //!
 //! Lines and circular edges parallel to the sketch plane stay analytic. A
-//! circle viewed obliquely becomes an ellipse; until sketches own an analytic
-//! ellipse entity, that case is represented by a deterministic polyline whose
-//! vertices are exact orthogonal projections of the source curve.
+//! circle viewed obliquely becomes one associative analytic ellipse entity;
+//! faceting happens only at the final `SketchCurves` compatibility boundary.
 
 use super::{EntityId, ProjectedEdgeReference, SketchEntity, SketchPoint, SketchSolverModel};
 use crate::geometry::{CoordinateSystem, Vec3};
@@ -19,6 +18,14 @@ enum Primitive {
         start: (f32, f32),
         end: (f32, f32),
         radius: f32,
+    },
+    Ellipse {
+        center: (f32, f32),
+        major_axis: [f32; 2],
+        minor_axis: [f32; 2],
+        start: f32,
+        end: f32,
+        closed: bool,
     },
 }
 
@@ -82,26 +89,22 @@ fn projected_primitives(source: &EdgeRef, cs: CoordinateSystem) -> Result<Vec<Pr
                 }]);
             }
 
-            // Orthogonal projection of an oblique circle is an ellipse. Keep
-            // every sample on the exact projected conic and use a fixed budget
-            // so save/load and upstream rebuilds remain deterministic.
-            let segments = if *closed { 64 } else { 32 };
-            let mut points = Vec::with_capacity(segments + 1);
-            for index in 0..=segments {
-                let t = *start + sweep * index as f32 / segments as f32;
-                points.push(cs.project(circle_point(center, x_dir, y_dir, *radius, t)));
+            let x = cs.project(center.add(x_dir.mul(*radius)));
+            let y = cs.project(center.add(y_dir.mul(*radius)));
+            let major_axis = [x.0 - center_2d.0, x.1 - center_2d.1];
+            let minor_axis = [y.0 - center_2d.0, y.1 - center_2d.1];
+            let determinant = major_axis[0] * minor_axis[1] - major_axis[1] * minor_axis[0];
+            if determinant.abs() <= 1.0e-7 {
+                return Err("selected circle collapses to a line in the sketch plane".to_string());
             }
-            let mut primitives = Vec::with_capacity(segments);
-            for pair in points.windows(2) {
-                if (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1) > 1.0e-6 {
-                    primitives.push(Primitive::Line(pair[0], pair[1]));
-                }
-            }
-            if primitives.is_empty() {
-                Err("selected circle collapses in the sketch plane".to_string())
-            } else {
-                Ok(primitives)
-            }
+            Ok(vec![Primitive::Ellipse {
+                center: center_2d,
+                major_axis,
+                minor_axis,
+                start: *start,
+                end: *end,
+                closed: *closed,
+            }])
         }
         _ => {
             let first = cs.project(world_point(source.p0));
@@ -201,6 +204,33 @@ fn build_projection(
                 point_ids.extend([center_id, start_id, end_id]);
                 entity_ids.push(id);
             }
+            Primitive::Ellipse {
+                center,
+                major_axis,
+                minor_axis,
+                start,
+                end,
+                closed,
+            } => {
+                let center_id = alloc(next);
+                let id = alloc(next);
+                model.points.push(SketchPoint {
+                    id: center_id,
+                    pos: (f64::from(center.0), f64::from(center.1)),
+                });
+                model.entities.push(SketchEntity::Ellipse {
+                    id,
+                    center: center_id,
+                    major_axis: major_axis.map(f64::from),
+                    minor_axis: minor_axis.map(f64::from),
+                    start_parameter: f64::from(start),
+                    end_parameter: f64::from(end),
+                    closed,
+                    derived_from: None,
+                });
+                point_ids.push(center_id);
+                entity_ids.push(id);
+            }
         }
     }
     model.construction.extend(entity_ids.iter().copied());
@@ -257,6 +287,7 @@ pub fn rebuild_projected_edge(
                             (Primitive::Line(..), SketchEntity::Line { .. })
                                 | (Primitive::Circle(..), SketchEntity::Circle { .. })
                                 | (Primitive::Arc { .. }, SketchEntity::Arc { .. })
+                                | (Primitive::Ellipse { .. }, SketchEntity::Ellipse { .. })
                         )
                     })
             });
@@ -307,6 +338,36 @@ pub fn rebuild_projected_edge(
                         model.entities.iter_mut().find(|entity| entity.id() == *id)
                     {
                         *stored = f64::from(radius);
+                    }
+                }
+                (
+                    Primitive::Ellipse {
+                        center,
+                        major_axis,
+                        minor_axis,
+                        start,
+                        end,
+                        closed,
+                    },
+                    SketchEntity::Ellipse {
+                        center: center_id, ..
+                    },
+                ) => {
+                    update_point(model, center_id, center);
+                    if let Some(SketchEntity::Ellipse {
+                        major_axis: stored_major,
+                        minor_axis: stored_minor,
+                        start_parameter,
+                        end_parameter,
+                        closed: stored_closed,
+                        ..
+                    }) = model.entities.iter_mut().find(|entity| entity.id() == *id)
+                    {
+                        *stored_major = major_axis.map(f64::from);
+                        *stored_minor = minor_axis.map(f64::from);
+                        *start_parameter = f64::from(start);
+                        *end_parameter = f64::from(end);
+                        *stored_closed = closed;
                     }
                 }
                 _ => unreachable!("projection compatibility was checked above"),

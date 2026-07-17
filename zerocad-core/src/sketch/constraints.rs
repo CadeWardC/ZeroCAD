@@ -107,6 +107,22 @@ pub enum SketchEntity {
         #[serde(default)]
         derived_from: Option<EntityId>,
     },
+    /// An analytic ellipse or elliptical arc. `major_axis` and `minor_axis`
+    /// are the two world-in-sketch-plane vectors of the conic; the parameter
+    /// interval evaluates `center + major*cos(t) + minor*sin(t)`. Keeping the
+    /// vectors instead of a faceted outline makes projected circular edges
+    /// associative and exact even when viewed obliquely.
+    Ellipse {
+        id: EntityId,
+        center: EntityId,
+        major_axis: [f64; 2],
+        minor_axis: [f64; 2],
+        start_parameter: f64,
+        end_parameter: f64,
+        closed: bool,
+        #[serde(default)]
+        derived_from: Option<EntityId>,
+    },
     Spline {
         id: EntityId,
         points: Vec<EntityId>,
@@ -129,6 +145,7 @@ impl SketchEntity {
             SketchEntity::Line { id, .. }
             | SketchEntity::Circle { id, .. }
             | SketchEntity::Arc { id, .. }
+            | SketchEntity::Ellipse { id, .. }
             | SketchEntity::Spline { id, .. } => *id,
         }
     }
@@ -138,6 +155,7 @@ impl SketchEntity {
             SketchEntity::Line { derived_from, .. }
             | SketchEntity::Circle { derived_from, .. }
             | SketchEntity::Arc { derived_from, .. }
+            | SketchEntity::Ellipse { derived_from, .. }
             | SketchEntity::Spline { derived_from, .. } => *derived_from,
         }
     }
@@ -406,6 +424,38 @@ pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::Sket
                         start: s,
                         end: e,
                     });
+                }
+            }
+            SketchEntity::Ellipse {
+                center,
+                major_axis,
+                minor_axis,
+                start_parameter,
+                end_parameter,
+                closed,
+                ..
+            } => {
+                if let Some(center) = pos(*center) {
+                    let segments = if *closed { 64 } else { 32 };
+                    let sweep = if *closed {
+                        std::f64::consts::TAU
+                    } else {
+                        end_parameter - start_parameter
+                    };
+                    let point = |parameter: f64| {
+                        let (sin, cos) = parameter.sin_cos();
+                        (
+                            center.0
+                                + (major_axis[0] * cos + minor_axis[0] * sin) as f32,
+                            center.1
+                                + (major_axis[1] * cos + minor_axis[1] * sin) as f32,
+                        )
+                    };
+                    for index in 0..segments {
+                        let a = *start_parameter + sweep * index as f64 / segments as f64;
+                        let b = *start_parameter + sweep * (index + 1) as f64 / segments as f64;
+                        curves.add_line(point(a), point(b));
+                    }
                 }
             }
             SketchEntity::Spline {

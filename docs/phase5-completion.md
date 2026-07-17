@@ -48,6 +48,20 @@ not mistaken for missing validation or an unsafe approximation.
 - A mesh body cannot enter a B-Rep boolean or face edit. Rejection is explicit
   and atomic; Phase 5 never silently promotes triangle soup into a kernel solid.
 
+## Post-completion hardening
+
+- A working imported STEP plus direct-edit graph now passes deterministic binary
+  `.zcad` save, load, semantic validation, exact mesh comparison, and strict
+  kernel reconstruction. The payload-only corpus remains as a separate ABI gate.
+- Reorder, suppression, restoration, provenance, and strict-output checks cover
+  Face Offset, Move Face, Delete Face, and Thicken independently.
+- Open meshes report enclosed volume and density-derived mass as unavailable;
+  the inspection UI no longer displays a misleading numeric zero.
+- Direct-edit boolean tools overshoot selected faces using model bounds and the
+  kernel tolerance policy instead of an absolute millimetre constant.
+- Dedicated STL fixtures assert both non-manifold-edge and disconnected-component
+  counts and their user-facing diagnostics.
+
 ## Deliberate exact-set limits and removal phase
 
 - General tangential Move Face needs neighborhood surgery rather than a face
@@ -70,7 +84,7 @@ not mistaken for missing validation or an unsafe approximation.
 ## Verification record
 
 On 2026-07-17, formatting, check, complete tests, and all-target clippy exited
-zero in both the ZeroCAD and OpenRCAD workspaces. ZeroCAD's run included 287
+zero in both the ZeroCAD and OpenRCAD workspaces. ZeroCAD's run included 292
 passing core unit tests, every integration suite, 35 document-container tests,
 and 65 GUI tests; the one pre-existing half-space naming test remains explicitly
 ignored under its named N4 trigger.
@@ -89,3 +103,11 @@ short serialization rows, confirming that the one-shot timing comparison is not
 settled. Cold startup measured 1.747 seconds and remains above the Phase 7
 sub-one-second invariant. These are release blockers; the committed baseline was
 not refreshed or relaxed.
+
+The startup blocker is now executable work rather than a passive note:
+`benchmarks/profile-startup.ps1` builds once, launches seven fresh GUI processes,
+records every sample plus median and p95, and exits nonzero while either is at
+or above one second. The first seven-sample run measured a 61 ms median but a
+1.245-second p95, so the blocker remains open rather than being hidden by warm
+launches. Phase 6 owns profiling initialization until both gates are green; it
+does not permit refreshing the frozen Phase 0 baseline.

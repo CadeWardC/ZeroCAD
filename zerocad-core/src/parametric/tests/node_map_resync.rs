@@ -110,6 +110,5 @@ fn generated_body_output_dependency_resolves_to_owning_feature() {
     let owner = g.node_map["extrude_2"];
     let child = g.node_map["move_3"];
     assert!(g.graph.find_edge(owner, child).is_some());
-    assert_eq!(body_output_owner_id("extrude_2::body:2"), "extrude_2");
     assert_eq!(body_output_index("extrude_2::body:2"), 1);
 }

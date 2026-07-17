@@ -100,10 +100,9 @@ feature no longer exists and report each recovery as a diagnostic.
 - **P2-D3 — Relationship and body membership closed.** Semantic selectors and
   body timelines are the persisted relationship model; petgraph edges are
   derived scheduling data. `DocumentSemantics::body_outputs` records producer
-  provenance directly. Parsing the historical `feature::body:N` convention is
-  isolated to legacy edit/load migration and immediately materializes the
-  provenance record; production ownership queries never infer a feature kind
-  from an entity-id prefix. **Phase 3 closure:** complete.
+  provenance directly. Phase 6 removed the last edit/load parser for the
+  historical `feature::body:N` spelling; ownership now always comes from the
+  persisted provenance record. **Phase 3 closure:** complete.
 - **P2-D4 — Evaluator dispatch closed.** The registry maps every stable feature
   kind to one exact evaluator kind. The shared outer transaction performs
   resolve, invoke, validate, diagnostic/status recording, commit, and checkpoint

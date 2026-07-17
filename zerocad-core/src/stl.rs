@@ -570,4 +570,29 @@ mod tests {
         assert_eq!(report.inconsistent_winding_edges, 1);
         assert!(!report.is_closed_manifold());
     }
+
+    #[test]
+    fn three_facets_sharing_one_edge_report_non_manifold_topology() {
+        let ascii = b"solid nonmanifold\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nfacet normal 0 0 -1\nouter loop\nvertex 1 0 0\nvertex 0 0 0\nvertex 0 -1 0\nendloop\nendfacet\nfacet normal 0 -1 0\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 0 1\nendloop\nendfacet\nendsolid nonmanifold\n";
+        let report = read_stl_mesh(ascii).unwrap().validation;
+
+        assert_eq!(report.non_manifold_edges, 1);
+        assert!(!report.is_closed_manifold());
+        assert!(report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("non-manifold")));
+    }
+
+    #[test]
+    fn separated_triangle_islands_report_disconnected_components() {
+        let ascii = b"solid disconnected\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nfacet normal 0 0 1\nouter loop\nvertex 10 0 0\nvertex 11 0 0\nvertex 10 1 0\nendloop\nendfacet\nendsolid disconnected\n";
+        let report = read_stl_mesh(ascii).unwrap().validation;
+
+        assert_eq!(report.connected_components, 2);
+        assert!(report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("2 disconnected components")));
+    }
 }

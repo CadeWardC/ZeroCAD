@@ -80,13 +80,6 @@ impl ParametricGraph {
     /// Add a feature node to the tree
     pub fn add_feature(&mut self, node: FeatureNode) -> NodeIndex {
         let id = node.id.clone();
-        for input in crate::document::FeatureRegistry::dependencies(&node.feature) {
-            if let crate::document::FeatureInputTarget::Selection(selector) = input.target {
-                if let Some(body) = selector.topology.body {
-                    self.ensure_body_output_reference(body.as_str());
-                }
-            }
-        }
         let record = FeatureRecord::from_node(node, self.next_sequence());
         let body = record.body.clone();
         let feature_id = crate::document::FeatureId::from(id.as_str());
@@ -122,7 +115,6 @@ impl ParametricGraph {
 
     /// Establish a directional dependency (e.g. Extrude depends on Sketch)
     pub fn add_dependency(&mut self, parent_id: &str, child_id: &str) {
-        self.ensure_body_output_reference(parent_id);
         let parent_feature_id = self.dependency_parent_feature_id(parent_id, child_id);
         if let (Some(parent_idx), Some(child_idx)) = (
             self.resolve_node(&parent_feature_id),
@@ -145,7 +137,6 @@ impl ParametricGraph {
         parent_id: &str,
         child_id: &str,
     ) -> Result<(), String> {
-        self.ensure_body_output_reference(parent_id);
         let parent_feature_id = self.dependency_parent_feature_id(parent_id, child_id);
         let parent_idx = self
             .resolve_node(&parent_feature_id)
@@ -214,27 +205,6 @@ impl ParametricGraph {
             .node_weights()
             .find(|feature| feature.id == producer)
             .and_then(|feature| feature.body.clone())
-    }
-
-    /// Compatibility migration for pre-Phase-3 documents whose extra body
-    /// outputs existed only as `feature::body:N` strings. The relationship is
-    /// parsed once at the edit/load boundary and immediately recorded; all
-    /// subsequent production paths consume `body_outputs`.
-    fn ensure_body_output_reference(&mut self, body_id: &str) {
-        if self.semantics.body_outputs.contains_key(body_id) {
-            return;
-        }
-        let legacy_owner = body_output_owner_id(body_id);
-        if self
-            .graph
-            .node_weights()
-            .any(|feature| feature.id == legacy_owner)
-        {
-            self.semantics.body_outputs.insert(
-                body_id.to_string(),
-                crate::document::FeatureId::from(legacy_owner),
-            );
-        }
     }
 
     /// Rebuild the id → `NodeIndex` lookup from the live graph. The map is

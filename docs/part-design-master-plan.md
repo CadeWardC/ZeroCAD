@@ -309,6 +309,11 @@ tests without being treated as B-Reps.
   their named replacement gates pass.
 - Profile rebuild, boolean, tessellation, rendering, and large-document paths;
   use deterministic caches and cancellation without changing results.
+- Treat startup as an active Phase 6 blocker: run
+  `benchmarks/profile-startup.ps1` over seven fresh release-process launches,
+  retain the sample report, and profile initialization until both median and
+  p95 are below the one-second release invariant. Requiring both prevents warm
+  launches from hiding an unstable cold launch.
 - Close every item in the Phase 4 completion ledger: expand versioned standards
   packs, add analytic projected ellipse/conic geometry, route general edge
   inspection through exact kernel curves, and add spline-native constraints.
@@ -324,7 +329,8 @@ Gate: every scheduled migration ledger, compatibility allowlist, obsolete
 wrapper, and dual ownership/container convention is empty. STEP round-trip and
 cross-version fixtures pass, the frozen correctness corpus is unchanged, the
 relative performance harness is green, and the remaining distance to the Phase
-7 absolute budgets is measured. Any unavoidable release exception moves to
+7 absolute budgets is measured. The dedicated seven-sample startup profile must
+also pass its sub-one-second median and p95 gates. Any unavoidable release exception moves to
 Phase 7 with an owner, reason, user impact, and removal trigger.
 
 ## Phase 7 — Stabilization and Part Design 1.0

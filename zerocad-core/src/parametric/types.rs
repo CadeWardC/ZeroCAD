@@ -35,18 +35,6 @@ pub fn body_output_id(feature_id: &str, output_index: usize) -> String {
     }
 }
 
-/// Owning feature id for a runtime body id created by [`body_output_id`].
-pub fn body_output_owner_id(body_id: &str) -> &str {
-    let Some((owner, suffix)) = body_id.rsplit_once(BODY_OUTPUT_SEPARATOR) else {
-        return body_id;
-    };
-    if suffix.parse::<usize>().is_ok_and(|number| number >= 2) {
-        owner
-    } else {
-        body_id
-    }
-}
-
 /// Zero-based output index encoded in a runtime body id.
 pub fn body_output_index(body_id: &str) -> usize {
     let Some((_, suffix)) = body_id.rsplit_once(BODY_OUTPUT_SEPARATOR) else {

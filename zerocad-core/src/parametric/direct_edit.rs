@@ -9,7 +9,30 @@
 
 use super::*;
 
-const DIRECT_EDIT_OVERSHOOT: f32 = 0.1;
+const DIRECT_EDIT_OVERSHOOT_RELATIVE: f64 = 0.05;
+const DIRECT_EDIT_TOLERANCE_MULTIPLIER: f64 = 8.0;
+
+/// Extend boolean tools beyond the selected face by a model-sized margin.
+/// The policy term keeps very small models numerically separated while the
+/// relative term prevents large models from depending on a millimetre literal.
+fn direct_edit_overshoot(
+    solid: &KernelSolid,
+    policy: &openrcad::foundation::TolerancePolicy,
+) -> f32 {
+    let model_scale = crate::mock_kernel::solid_aabb(solid)
+        .map(|(min, max)| {
+            (0..3)
+                .map(|axis| f64::from(max[axis] - min[axis]).abs())
+                .fold(0.0_f64, f64::max)
+        })
+        .unwrap_or(0.0);
+    let policy_margin = policy
+        .classification
+        .max(policy.intersection)
+        .max(policy.sewing)
+        * DIRECT_EDIT_TOLERANCE_MULTIPLIER;
+    (model_scale * DIRECT_EDIT_OVERSHOOT_RELATIVE + policy_margin) as f32
+}
 
 pub(crate) fn apply_face_offset(
     node_id: &str,
@@ -46,13 +69,12 @@ pub(crate) fn apply_face_offset(
     };
     let source = live[body_index].clone();
     let component = &source.parts[component_index];
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+    let overshoot = direct_edit_overshoot(component, &policy);
     let (start_offset, sweep) = if distance > 0.0 {
-        (-DIRECT_EDIT_OVERSHOOT, distance + DIRECT_EDIT_OVERSHOOT)
+        (-overshoot, distance + overshoot)
     } else {
-        (
-            DIRECT_EDIT_OVERSHOOT,
-            distance - 2.0 * DIRECT_EDIT_OVERSHOOT,
-        )
+        (overshoot, distance - 2.0 * overshoot)
     };
     let start = face.transformed(&openrcad::foundation::Trsf::translation(
         openrcad::foundation::Vec::new(
@@ -68,11 +90,7 @@ pub(crate) fn apply_face_offset(
     );
     let tool = match crate::mock_kernel::consume_operation(
         "direct-edit face prism",
-        openrcad::algo::prism_operation_with_policy(
-            &start,
-            vector,
-            &openrcad::foundation::TolerancePolicy::STANDARD,
-        ),
+        openrcad::algo::prism_operation_with_policy(&start, vector, &policy),
     ) {
         Ok(outcome) => outcome.solid,
         Err(reason) => {
@@ -318,10 +336,11 @@ fn apply_cylindrical_face_offset(
     } else {
         new_radius > cylinder.radius
     };
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
     let overshoot = if adds_material {
         0.0
     } else {
-        DIRECT_EDIT_OVERSHOOT
+        direct_edit_overshoot(component, &policy)
     };
     let inner = new_radius.min(cylinder.radius);
     let outer = new_radius.max(cylinder.radius);
@@ -645,4 +664,36 @@ fn commit_component_replacement(
             sketch_source: None,
         },
     );
+}
+
+#[cfg(test)]
+mod overshoot_tests {
+    use super::*;
+
+    #[test]
+    fn boolean_tool_overshoot_tracks_model_scale_and_policy() {
+        let small = openrcad::primitives::make_box_operation(
+            &openrcad::foundation::Pnt::origin(),
+            0.01,
+            0.01,
+            0.01,
+        )
+        .expect("small box")
+        .value;
+        let large = openrcad::primitives::make_box_operation(
+            &openrcad::foundation::Pnt::origin(),
+            1_000.0,
+            1_000.0,
+            1_000.0,
+        )
+        .expect("large box")
+        .value;
+        let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+        let small_margin = direct_edit_overshoot(&small, &policy);
+        let large_margin = direct_edit_overshoot(&large, &policy);
+
+        assert!(small_margin > policy.classification as f32);
+        assert!(large_margin > small_margin * 1_000.0);
+        assert!((large_margin - 50.00008).abs() < 1.0e-3);
+    }
 }

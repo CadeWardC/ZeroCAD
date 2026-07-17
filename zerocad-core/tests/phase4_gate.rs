@@ -203,7 +203,8 @@ fn phase4_features_survive_rename_save_load_and_rebuild() {
 
     let measured = loaded.inspect_body("box").expect("strict body inspection");
     assert_eq!(measured, measured_before_save);
-    assert!((measured.volume_mm3 - after_load.volume).abs() / measured.volume_mm3 < 0.005);
+    let measured_volume = measured.volume_mm3.expect("closed volume after load");
+    assert!((measured_volume - after_load.volume).abs() / measured_volume < 0.005);
     assert!(
         (measured.surface_area_mm2 - after_load.surface_area).abs() / measured.surface_area_mm2
             < 0.005

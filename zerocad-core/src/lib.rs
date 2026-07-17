@@ -30,7 +30,7 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    body_output_id, body_output_index, body_output_owner_id, boolean_region_plan,
+    body_output_id, body_output_index, boolean_region_plan,
     complete_selected_circles, edge_wedge_is_concave_mesh, AxisBase, BodyInspection,
     BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticSeverity,
     EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic,

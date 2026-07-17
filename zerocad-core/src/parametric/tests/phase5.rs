@@ -128,7 +128,7 @@ fn imported_planar_face_press_pull_is_strict_and_downstream_ready() {
     let downstream = graph
         .inspect_body("downstream_scale")
         .expect("downstream Part Design operation");
-    assert!((downstream.volume_mm3 - 187.5).abs() < 1.0);
+    assert!((downstream.volume_mm3.expect("closed volume") - 187.5).abs() < 1.0);
     assert_strict_output(&graph, "downstream_scale");
 }
 
@@ -192,7 +192,7 @@ fn imported_planar_face_move_and_thicken_use_exact_prisms() {
     });
     moved.add_dependency("foreign_box", "move_face");
     let inspection = moved.inspect_body("move_face").expect("moved face body");
-    assert!((inspection.volume_mm3 - 1_200.0).abs() < 1.0);
+    assert!((inspection.volume_mm3.expect("closed volume") - 1_200.0).abs() < 1.0);
     assert_strict_output(&moved, "move_face");
 
     let mut thickened = imported_box_graph();
@@ -212,7 +212,7 @@ fn imported_planar_face_move_and_thicken_use_exact_prisms() {
     let inspection = thickened
         .inspect_body("thicken_face")
         .expect("thickened face body");
-    assert!((inspection.volume_mm3 - 200.0).abs() < 1.0);
+    assert!((inspection.volume_mm3.expect("closed volume") - 200.0).abs() < 1.0);
     assert_strict_output(&thickened, "thicken_face");
 }
 
@@ -240,8 +240,7 @@ fn tangential_move_fails_atomically_with_a_diagnostic() {
         .any(|warning| warning.contains("tangential")));
 }
 
-#[test]
-fn delete_internal_cylindrical_face_heals_an_imported_hole() {
+fn imported_bored_box_graph() -> ParametricGraph {
     use openrcad::foundation::{Ax2, Dir, Pnt};
     let box_solid = openrcad::primitives::make_box_operation(&Pnt::origin(), 10.0, 10.0, 10.0)
         .expect("box")
@@ -266,6 +265,10 @@ fn delete_internal_cylindrical_face_heals_an_imported_hole() {
             label: "foreign-bored.step".into(),
         },
     });
+    graph
+}
+
+fn internal_hole_wall(graph: &ParametricGraph) -> FaceRef {
     let (bodies, warnings) = graph
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .expect("import bored part");
@@ -284,7 +287,13 @@ fn delete_internal_cylindrical_face_heals_an_imported_hole() {
             distance(a).total_cmp(&distance(b))
         })
         .expect("cylindrical hole wall");
-    let face = captured_face(wall);
+    captured_face(wall)
+}
+
+#[test]
+fn delete_internal_cylindrical_face_heals_an_imported_hole() {
+    let mut graph = imported_bored_box_graph();
+    let face = internal_hole_wall(&graph);
     graph.add_feature(FeatureNode {
         id: "delete_hole".into(),
         name: "Delete Hole Face".into(),
@@ -372,7 +381,9 @@ fn analytic_cylinder_offset_and_thicken_preserve_strict_geometry() {
     let measured = offset
         .inspect_body("offset_cylinder")
         .expect("offset cylinder");
-    assert!((measured.volume_mm3 - std::f64::consts::PI * 160.0).abs() < 1.0);
+    assert!(
+        (measured.volume_mm3.expect("closed volume") - std::f64::consts::PI * 160.0).abs() < 1.0
+    );
     assert_strict_output(&offset, "offset_cylinder");
 
     let mut thickened = imported_cylinder_graph();
@@ -392,7 +403,9 @@ fn analytic_cylinder_offset_and_thicken_preserve_strict_geometry() {
     let measured = thickened
         .inspect_body("thicken_cylinder")
         .expect("thickened cylinder");
-    assert!((measured.volume_mm3 - std::f64::consts::PI * 70.0).abs() < 1.0);
+    assert!(
+        (measured.volume_mm3.expect("closed volume") - std::f64::consts::PI * 70.0).abs() < 1.0
+    );
     assert_strict_output(&thickened, "thicken_cylinder");
 }
 
@@ -570,13 +583,33 @@ fn stl_mesh_body_supports_transform_scale_measure_and_export() {
         .1;
     assert!(!mesh.indices.is_empty());
     let inspection = graph.inspect_body("mesh_scale").expect("mesh measurement");
-    assert!((inspection.volume_mm3 - 8.0 / 6.0).abs() < 1.0e-4);
+    assert!((inspection.volume_mm3.expect("closed volume") - 8.0 / 6.0).abs() < 1.0e-4);
     let section =
         crate::mock_kernel::clip_mesh_by_plane(mesh, [2.5, 3.5, 4.5], [1.0, 1.0, 1.0], true)
             .expect("mesh section");
     assert!(!section.mesh.indices.is_empty());
     assert!(!section.contours.is_empty());
     assert!(!crate::meshes_to_binary_stl(std::iter::once(mesh)).is_empty());
+}
+
+#[test]
+fn open_stl_mesh_reports_volume_and_mass_as_unavailable() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "open_mesh".into(),
+        name: "Open mesh".into(),
+        feature: FeatureType::ImportStl {
+            stl_data: b"solid open\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid open\n".to_vec(),
+            label: "open.stl".into(),
+        },
+    });
+
+    let inspection = graph
+        .inspect_body("open_mesh")
+        .expect("open mesh inspection");
+    assert_eq!(inspection.volume_mm3, None);
+    assert_eq!(inspection.mass_g, None);
+    assert!(inspection.surface_area_mm2 > 0.0);
 }
 
 #[test]
@@ -614,50 +647,160 @@ fn mesh_body_is_rejected_by_brep_boolean_without_consuming_inputs() {
 }
 
 #[test]
-fn direct_edit_semantics_support_reorder_suppression_and_explicit_provenance() {
-    let mut graph = imported_box_graph();
-    let face = top_face(&graph);
-    graph.add_feature(FeatureNode {
+fn every_direct_edit_supports_reorder_suppression_and_explicit_provenance() {
+    let mut offset = imported_box_graph();
+    let offset_face = top_face(&offset);
+    offset.add_feature(FeatureNode {
         id: "semantic_offset".into(),
         name: "Semantic offset".into(),
         feature: FeatureType::FaceOffset {
             target: "foreign_box".into(),
-            face,
+            face: offset_face,
             distance: 1.0,
             distance_expr: None,
         },
     });
-    graph.add_dependency("foreign_box", "semantic_offset");
+    offset.add_dependency("foreign_box", "semantic_offset");
 
+    let mut moved = imported_box_graph();
+    let moved_face = top_face(&moved);
+    moved.add_feature(FeatureNode {
+        id: "semantic_move".into(),
+        name: "Semantic move".into(),
+        feature: FeatureType::FaceMove {
+            target: "foreign_box".into(),
+            face: moved_face,
+            translation: [0.0, 0.0, 1.0],
+        },
+    });
+    moved.add_dependency("foreign_box", "semantic_move");
+
+    let mut thickened = imported_box_graph();
+    let thickened_face = top_face(&thickened);
+    thickened.add_feature(FeatureNode {
+        id: "semantic_thicken".into(),
+        name: "Semantic thicken".into(),
+        feature: FeatureType::FaceThicken {
+            target: "foreign_box".into(),
+            face: thickened_face,
+            thickness: 1.0,
+            thickness_expr: None,
+            reverse: false,
+        },
+    });
+    thickened.add_dependency("foreign_box", "semantic_thicken");
+
+    let mut deleted = imported_bored_box_graph();
+    let deleted_face = internal_hole_wall(&deleted);
+    deleted.add_feature(FeatureNode {
+        id: "semantic_delete".into(),
+        name: "Semantic delete".into(),
+        feature: FeatureType::FaceDelete {
+            target: "foreign_bored".into(),
+            face: deleted_face,
+        },
+    });
+    deleted.add_dependency("foreign_bored", "semantic_delete");
+
+    for (mut graph, source_id, edit_id) in [
+        (offset, "foreign_box", "semantic_offset"),
+        (moved, "foreign_box", "semantic_move"),
+        (thickened, "foreign_box", "semantic_thicken"),
+        (deleted, "foreign_bored", "semantic_delete"),
+    ] {
+        graph
+            .validate_semantic_contracts()
+            .unwrap_or_else(|error| panic!("{edit_id}: invalid semantic contract: {error}"));
+        assert_eq!(graph.body_producer_feature_id(edit_id), Some(edit_id));
+        assert!(graph.set_feature_sequence(edit_id, crate::document::SequenceKey(1)));
+        assert!(graph.set_feature_sequence(source_id, crate::document::SequenceKey(2)));
+        assert_eq!(
+            graph.feature_sequence(edit_id),
+            Some(crate::document::SequenceKey(1))
+        );
+        assert!(graph
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap_or_else(|error| panic!("{edit_id}: dependency-ordered evaluation: {error}"))
+            .iter()
+            .any(|(id, _)| id == edit_id));
+
+        assert!(graph.set_feature_suppressed(edit_id, true));
+        let suppressed = graph
+            .evaluate_bodies(&std::collections::HashSet::new())
+            .unwrap_or_else(|error| panic!("{edit_id}: suppressed evaluation: {error}"));
+        assert!(suppressed.iter().any(|(id, _)| id == source_id));
+        assert!(!suppressed.iter().any(|(id, _)| id == edit_id));
+
+        assert!(graph.set_feature_suppressed(edit_id, false));
+        graph
+            .validate_semantic_contracts()
+            .unwrap_or_else(|error| panic!("{edit_id}: restored semantic contract: {error}"));
+        assert_strict_output(&graph, edit_id);
+    }
+}
+
+#[test]
+fn working_direct_edit_graph_round_trips_through_zcad_with_identical_geometry() {
+    let mut graph = imported_box_graph();
+    let face = top_face(&graph);
+    graph.add_feature(FeatureNode {
+        id: "persisted_offset".into(),
+        name: "Persisted offset".into(),
+        feature: FeatureType::FaceOffset {
+            target: "foreign_box".into(),
+            face,
+            distance: 2.0,
+            distance_expr: None,
+        },
+    });
+    graph.add_dependency("foreign_box", "persisted_offset");
     graph
         .validate_semantic_contracts()
-        .expect("direct-edit semantic contract");
-    assert_eq!(
-        graph.body_producer_feature_id("semantic_offset"),
-        Some("semantic_offset")
-    );
-    assert!(graph.set_feature_sequence("semantic_offset", crate::document::SequenceKey(1)));
-    assert!(graph.set_feature_sequence("foreign_box", crate::document::SequenceKey(2)));
-    assert_eq!(
-        graph.feature_sequence("semantic_offset"),
-        Some(crate::document::SequenceKey(1))
-    );
-    assert!(graph
-        .evaluate_bodies(&std::collections::HashSet::new())
-        .expect("dependency-ordered evaluation")
+        .expect("source direct-edit contract");
+    let (before_bodies, before_warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("source direct-edit evaluation");
+    assert!(before_warnings.is_empty(), "warnings={before_warnings:?}");
+    let before = before_bodies
         .iter()
-        .any(|(id, _)| id == "semantic_offset"));
+        .find(|(id, _)| id == "persisted_offset")
+        .expect("source direct-edit body")
+        .1
+        .clone();
 
-    assert!(graph.set_feature_suppressed("semantic_offset", true));
-    let suppressed = graph
-        .evaluate_bodies(&std::collections::HashSet::new())
-        .expect("suppressed direct edit");
-    assert!(suppressed.iter().any(|(id, _)| id == "foreign_box"));
-    assert!(!suppressed.iter().any(|(id, _)| id == "semantic_offset"));
+    let document = crate::document::Document::from_graph(graph, crate::units::Unit::Millimeter);
+    let options = crate::zcad_format::SaveOptions::default();
+    let hydration = crate::zcad_format::HydrationBundle::default();
+    let first = crate::zcad_format::write_document_to_vec(&document, &options, &hydration)
+        .expect("save direct-edit document");
+    let second = crate::zcad_format::write_document_to_vec(&document, &options, &hydration)
+        .expect("repeat direct-edit save");
+    assert_eq!(
+        first, second,
+        "direct-edit compact save is not deterministic"
+    );
 
-    assert!(graph.set_feature_suppressed("semantic_offset", false));
-    graph
+    let loaded = crate::zcad_format::read_document_from_slice(
+        &first,
+        &crate::zcad_format::LoadOptions::default(),
+    )
+    .expect("load direct-edit document");
+    loaded
+        .document
         .validate_semantic_contracts()
-        .expect("restored direct-edit semantic contract");
-    assert_strict_output(&graph, "semantic_offset");
+        .expect("loaded direct-edit contract");
+    let (after_bodies, after_warnings) = loaded
+        .document
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("loaded direct-edit evaluation");
+    assert_eq!(before_warnings, after_warnings);
+    let after = &after_bodies
+        .iter()
+        .find(|(id, _)| id == "persisted_offset")
+        .expect("loaded direct-edit body")
+        .1;
+    assert_eq!(before.vertices, after.vertices);
+    assert_eq!(before.indices, after.indices);
+    assert_eq!(before.face_ids, after.face_ids);
+    assert_strict_output(loaded.document.evaluator_graph(), "persisted_offset");
 }
