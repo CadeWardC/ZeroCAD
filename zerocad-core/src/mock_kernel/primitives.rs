@@ -172,6 +172,51 @@ pub fn cylinder_tool_at(
     .map(|outcome| outcome.solid)
 }
 
+/// A blind-hole cutter with one continuous analytic cylindrical wall and drill
+/// point. Building it as a single revolved profile avoids an internal
+/// cylinder/cone boolean seam and gives the final cut one watertight tool.
+pub fn drill_point_tool_at(
+    origin: crate::geometry::Vec3,
+    dir: crate::geometry::Vec3,
+    radius: f64,
+    cylinder_length: f64,
+    included_angle_deg: f64,
+) -> Option<KernelSolid> {
+    if radius <= 0.0
+        || cylinder_length <= 0.0
+        || !(included_angle_deg > 0.0 && included_angle_deg < 180.0)
+    {
+        return None;
+    }
+    let axis = dir.normalize();
+    if axis == crate::geometry::Vec3::ZERO {
+        return None;
+    }
+    let seed = if axis.x.abs() < 0.9 {
+        crate::geometry::Vec3::X
+    } else {
+        crate::geometry::Vec3::Y
+    };
+    let radial = axis.cross(seed).normalize();
+    let frame = crate::geometry::CoordinateSystem::new(origin, radial, axis);
+    let tip_height = radius / (included_angle_deg * 0.5).to_radians().tan();
+    let profile = [
+        (0.0, 0.0),
+        (radius as f32, 0.0),
+        (radius as f32, cylinder_length as f32),
+        (0.0, (cylinder_length + tip_height) as f32),
+    ];
+    revolved_region_solid(
+        &profile,
+        &[],
+        &frame,
+        origin,
+        axis,
+        std::f64::consts::TAU,
+        &[],
+    )
+}
+
 /// An analytic cone-frustum solid (base radius `r1` at `origin`, `r2` after
 /// `length` along `dir`) — the countersink cutter. `None` on degenerate inputs.
 pub fn cone_tool_at(

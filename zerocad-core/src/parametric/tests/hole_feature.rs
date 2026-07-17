@@ -37,6 +37,8 @@ fn add_hole(
             diameter_expr: None,
             depth,
             kind,
+            standard: None,
+            manufacturing: None,
         },
     });
     g.add_dependency(target, id);
@@ -103,6 +105,49 @@ fn blind_hole_stops_at_depth() {
     assert!(
         v <= nominal + 1.0 && v >= with_overshoot - 1.0,
         "blind-hole volume {v}, expected in [{with_overshoot}, {nominal}]"
+    );
+}
+
+#[test]
+fn blind_hole_models_the_persisted_drill_point() {
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_1", 20.0, 20.0, 10.0);
+    add_hole(
+        &mut g,
+        "hole_2",
+        "box_1",
+        [10.0, 10.0, 10.0],
+        [0.0, 0.0, -1.0],
+        6.0,
+        Some(4.0),
+        HoleKind::Simple,
+    );
+    let hole = g.node_map["hole_2"];
+    let FeatureType::Hole { manufacturing, .. } = &mut g.graph[hole].feature else {
+        unreachable!()
+    };
+    *manufacturing = Some(crate::parametric::HoleManufacturingMetadata {
+        application: crate::parametric::HoleApplication::Clearance,
+        drill_point_angle_deg: Some(118.0),
+        cosmetic_thread: false,
+        thread_designation: None,
+        thread_class: None,
+        tap_pitch_mm: None,
+    });
+
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    let volume = body_volume(&bodies, "box_1");
+    let radius = 3.0_f64;
+    let point_height = radius / 59_f64.to_radians().tan();
+    let removed = std::f64::consts::PI * radius * radius * 4.0
+        + std::f64::consts::PI * radius * radius * point_height / 3.0;
+    let expected = 4_000.0 - removed;
+    assert!(
+        (volume - expected).abs() / expected < 0.01,
+        "drill-point volume {volume} vs {expected}"
     );
 }
 

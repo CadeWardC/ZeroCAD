@@ -202,6 +202,50 @@ pub fn references_variable(input: &str) -> bool {
     }
 }
 
+/// Identifier references in first-appearance order, deduplicated. This is used
+/// by the parameters table to show dependencies and detect cycles before a
+/// model rebuild.
+pub fn identifiers(input: &str) -> Result<Vec<String>, String> {
+    let tokens = tokenize(input)?;
+    let mut names = Vec::new();
+    for token in tokens {
+        if let Token::Ident(name) = token {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+pub fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(is_ident_start) && chars.all(is_ident_char)
+}
+
+/// Rename an identifier without touching substrings, numbers, whitespace, or
+/// operators. The original expression formatting is preserved.
+pub fn rename_identifier(input: &str, old: &str, new: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut output = String::with_capacity(input.len() + new.len().saturating_sub(old.len()));
+    let mut index = 0;
+    while index < chars.len() {
+        if is_ident_start(chars[index]) {
+            let start = index;
+            index += 1;
+            while index < chars.len() && is_ident_char(chars[index]) {
+                index += 1;
+            }
+            let identifier: String = chars[start..index].iter().collect();
+            output.push_str(if identifier == old { new } else { &identifier });
+        } else {
+            output.push(chars[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
 /// True when `input` should be kept as editable source text instead of being
 /// collapsed to its evaluated numeric value. Plain numeric literals do not
 /// need a separate source representation; arithmetic and variable expressions
@@ -272,6 +316,20 @@ mod tests {
         assert!(references_variable("width / 2 + 3"));
         assert!(!references_variable("42"));
         assert!(!references_variable("3.5 * 2"));
+    }
+
+    #[test]
+    fn identifier_helpers_preserve_expression_text_and_boundaries() {
+        assert_eq!(
+            identifiers("width + height / width").unwrap(),
+            ["width", "height"]
+        );
+        assert!(is_valid_identifier("wall_2"));
+        assert!(!is_valid_identifier("2wall"));
+        assert_eq!(
+            rename_identifier("width + width_extra / 2", "width", "span"),
+            "span + width_extra / 2"
+        );
     }
 
     #[test]

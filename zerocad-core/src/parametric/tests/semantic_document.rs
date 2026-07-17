@@ -29,6 +29,8 @@ fn add_hole(graph: &mut ParametricGraph, id: &str, target: &str) {
             diameter_expr: None,
             depth: None,
             kind: HoleKind::Simple,
+            standard: None,
+            manufacturing: None,
         },
     });
     graph.add_dependency(target, id);
@@ -158,6 +160,8 @@ fn body_timeline_and_input_roles_are_explicit() {
             diameter_expr: None,
             depth: None,
             kind: HoleKind::Simple,
+            standard: None,
+            manufacturing: None,
         },
     });
     graph.add_dependency("box_1", "hole_2");
@@ -201,6 +205,8 @@ fn timeline_reorder_is_independent_but_never_precedes_a_dependency() {
             diameter_expr: None,
             depth: None,
             kind: HoleKind::Simple,
+            standard: None,
+            manufacturing: None,
         },
     });
     graph.add_dependency("box_1", "hole_2");

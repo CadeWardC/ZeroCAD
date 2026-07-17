@@ -546,7 +546,12 @@ pub(crate) fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId
         | FeatureType::BodyCut { .. }
         | FeatureType::BodyIntersect { .. }
         | FeatureType::BodySplit { .. }
-        | FeatureType::BodyScale { .. } => own_body(),
+        | FeatureType::BodyScale { .. }
+        | FeatureType::FaceOffset { .. }
+        | FeatureType::FaceMove { .. }
+        | FeatureType::FaceDelete { .. }
+        | FeatureType::FaceThicken { .. }
+        | FeatureType::ImportStl { .. } => own_body(),
         FeatureType::Extrude { mode, target, .. }
         | FeatureType::Revolve { mode, target, .. }
         | FeatureType::Loft { mode, target, .. }
@@ -621,6 +626,13 @@ fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
             }
             inputs
         }
+        FeatureType::FaceOffset { target, face, .. }
+        | FeatureType::FaceMove { target, face, .. }
+        | FeatureType::FaceDelete { target, face }
+        | FeatureType::FaceThicken { target, face, .. } => vec![
+            FeatureInput::body("target", BodyId::from(target.as_str())),
+            FeatureInput::selection("face", SemanticSelector::from_face(face)),
+        ],
         FeatureType::Loft { sections, .. } => sections
             .iter()
             .map(|(sketch, _)| FeatureInput::sketch("section", FeatureId::from(sketch.as_str())))
@@ -677,6 +689,11 @@ pub enum FeatureEvaluatorKind {
     BodyIntersect,
     BodySplit,
     BodyScale,
+    FaceOffset,
+    FaceMove,
+    FaceDelete,
+    FaceThicken,
+    ImportStl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,6 +854,36 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::BodyScale,
             FeatureEditorGroup::Modify,
         ),
+        registration(
+            "direct.face_offset",
+            "Press / Pull Face",
+            FeatureEvaluatorKind::FaceOffset,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "direct.face_move",
+            "Move Face",
+            FeatureEvaluatorKind::FaceMove,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "direct.face_delete",
+            "Delete Face",
+            FeatureEvaluatorKind::FaceDelete,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "direct.face_thicken",
+            "Thicken Face",
+            FeatureEvaluatorKind::FaceThicken,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "exchange.stl_import",
+            "STL Import",
+            FeatureEvaluatorKind::ImportStl,
+            FeatureEditorGroup::Exchange,
+        ),
     ];
 
     pub fn get(kind_id: &str) -> Option<&'static FeatureRegistration> {
@@ -899,6 +946,11 @@ impl FeatureType {
             FeatureType::BodyIntersect { .. } => "part.intersect",
             FeatureType::BodySplit { .. } => "part.split",
             FeatureType::BodyScale { .. } => "part.scale",
+            FeatureType::FaceOffset { .. } => "direct.face_offset",
+            FeatureType::FaceMove { .. } => "direct.face_move",
+            FeatureType::FaceDelete { .. } => "direct.face_delete",
+            FeatureType::FaceThicken { .. } => "direct.face_thicken",
+            FeatureType::ImportStl { .. } => "exchange.stl_import",
         }
     }
 

@@ -17,6 +17,7 @@ pub(crate) struct ThreadOp {
     pub(crate) surface: ThreadSurfaceFrame,
     pub(crate) standard: ThreadStandard,
     pub(crate) preset_idx: usize,
+    pub(crate) class: String,
     pub(crate) internal: bool,
     pub(crate) right_handed: bool,
     pub(crate) full_length: bool,
@@ -108,6 +109,7 @@ impl ZeroCadApp {
         // off the mesh), else M6.
         let dia = Some(surface.radius * 2.0);
         let standard = ThreadStandard::MetricCoarse;
+        let internal = surface.empty_side < 0.0;
         let preset_idx = dia
             .and_then(|d| {
                 closest_preset(standard, d).and_then(|p| {
@@ -129,10 +131,15 @@ impl ZeroCadApp {
         self.thread_op = Some(ThreadOp {
             target: node,
             face,
-            internal: surface.empty_side < 0.0,
+            internal,
             surface,
             standard,
             preset_idx,
+            class: zerocad_core::parametric::thread_classes(standard, internal)
+                .get(1)
+                .copied()
+                .unwrap_or("6H")
+                .to_string(),
             right_handed: true,
             full_length: true,
             flip: false,
@@ -217,6 +224,12 @@ impl ZeroCadApp {
                             {
                                 op_new.standard = std;
                                 op_new.preset_idx = 0;
+                                op_new.class =
+                                    zerocad_core::parametric::thread_classes(std, op_new.internal)
+                                        .get(1)
+                                        .copied()
+                                        .unwrap_or("")
+                                        .to_string();
                                 // Seed the custom fields from the new selection.
                                 if let Some(p) = std.presets().first() {
                                     op_new.pitch_text = format!("{:.3}", p.pitch_mm);
@@ -227,6 +240,17 @@ impl ZeroCadApp {
                             }
                         }
                     });
+                    if op_new.standard != ThreadStandard::Custom {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} v{}",
+                                zerocad_core::parametric::STANDARDS_LIBRARY_ID,
+                                zerocad_core::parametric::STANDARDS_LIBRARY_VERSION
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
                     ui.add_space(4.0);
 
                     // Size (preset) or custom numeric fields.
@@ -269,6 +293,24 @@ impl ZeroCadApp {
                                     }
                                 });
                         });
+                        let classes = zerocad_core::parametric::thread_classes(
+                            op_new.standard,
+                            op_new.internal,
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Class");
+                            egui::ComboBox::from_id_salt("thread_class")
+                                .selected_text(&op_new.class)
+                                .show_ui(ui, |ui| {
+                                    for class in classes {
+                                        ui.selectable_value(
+                                            &mut op_new.class,
+                                            (*class).to_string(),
+                                            *class,
+                                        );
+                                    }
+                                });
+                        });
                     }
                     ui.add_space(4.0);
 
@@ -276,9 +318,21 @@ impl ZeroCadApp {
                     ui.horizontal(|ui| {
                         if ui.selectable_label(!op_new.internal, "External").clicked() {
                             op_new.internal = false;
+                            op_new.class =
+                                zerocad_core::parametric::thread_classes(op_new.standard, false)
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or("")
+                                    .to_string();
                         }
                         if ui.selectable_label(op_new.internal, "Internal").clicked() {
                             op_new.internal = true;
+                            op_new.class =
+                                zerocad_core::parametric::thread_classes(op_new.standard, true)
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or("")
+                                    .to_string();
                         }
                         ui.separator();
                         if ui.selectable_label(op_new.right_handed, "RH").clicked() {
@@ -350,6 +404,17 @@ impl ZeroCadApp {
         self.push_undo();
         let n = self.next_id();
         let id = format!("thread_{n}");
+        let standard = (op.standard != ThreadStandard::Custom)
+            .then(|| op.standard.presets().get(op.preset_idx))
+            .flatten()
+            .and_then(|preset| {
+                zerocad_core::parametric::thread_reference_with_class(
+                    op.standard,
+                    preset,
+                    op.internal,
+                    &op.class,
+                )
+            });
         self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: format!("Thread {n} ({designation})"),
@@ -365,6 +430,7 @@ impl ZeroCadApp {
                 length,
                 flip: op.flip,
                 designation,
+                standard,
             },
         });
         self.document.add_dependency(&op.target, &id);

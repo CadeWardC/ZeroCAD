@@ -237,6 +237,11 @@ impl ZeroCadApp {
         let tol = 9.0 / scale.max(1e-4); // ~9 px in world units
         let tol2 = tol * tol;
         let dist2 = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2);
+        let construction = self
+            .sketch_solver_model
+            .as_ref()
+            .map(zerocad_core::sketch::bake_construction_curves)
+            .unwrap_or_default();
         // Straight segments that participate in snapping: drawn curves plus the
         // projected face boundary (sketch-on-face). Snapping onto the body's
         // edges/corners is what lets a drawn profile land on the face outline.
@@ -245,6 +250,7 @@ impl ZeroCadApp {
                 .segments
                 .iter()
                 .chain(self.active_face_boundary.segments.iter())
+                .chain(construction.segments.iter())
         };
         // Perpendicular (midline) unit direction of a segment, if non-degenerate.
         let seg_perp = |s: &LineSegment| {
@@ -277,12 +283,30 @@ impl ZeroCadApp {
         for c in &self.sketch_curves.circles {
             consider(c.center, SnapKind::Center, None);
         }
+        for c in &construction.circles {
+            consider(c.center, SnapKind::Center, None);
+        }
         // Fillet arcs: their endpoints act as the new corners where the arc meets
         // the straight edges, and their centre is a genuine centre to snap onto.
         for a in &self.sketch_curves.arcs {
             consider(a.start, SnapKind::Endpoint, None);
             consider(a.end, SnapKind::Endpoint, None);
             consider(a.center, SnapKind::Center, None);
+        }
+        for a in &construction.arcs {
+            consider(a.start, SnapKind::Endpoint, None);
+            consider(a.end, SnapKind::Endpoint, None);
+            consider(a.center, SnapKind::Center, None);
+        }
+        for spline in self
+            .sketch_curves
+            .splines
+            .iter()
+            .chain(construction.splines.iter())
+        {
+            for point in &spline.points {
+                consider(*point, SnapKind::Endpoint, None);
+            }
         }
         // Midline intersections (e.g. a rectangle centre): each woken guide
         // crossed with every OTHER segment's midline, plus the other guide.
@@ -550,6 +574,31 @@ impl ZeroCadApp {
         let dx = last.0 - p0.0;
         let dy = last.1 - p0.1;
         let shape = match tool {
+            SketchTool::ControlPointSpline | SketchTool::FitPointSpline => {
+                let mut points = self.sketch_points.clone();
+                if points.last().map_or(true, |point| {
+                    (point.0 - last.0).hypot(point.1 - last.1) > 1.0e-5
+                }) {
+                    points.push(last);
+                }
+                if points.len() < 2 {
+                    return None;
+                }
+                let spline = if tool == SketchTool::ControlPointSpline {
+                    zerocad_core::Spline::control_points(
+                        points.clone(),
+                        (points.len() - 1).min(3) as u8,
+                        false,
+                    )
+                } else {
+                    zerocad_core::Spline::fit_points(
+                        points,
+                        false,
+                        zerocad_core::SplineContinuity::Curvature,
+                    )
+                };
+                SketchShape::Spline { spline }
+            }
             SketchTool::Line => SketchShape::Line {
                 start: p0,
                 length: self.dim_param(0, (dx * dx + dy * dy).sqrt()),
@@ -596,6 +645,24 @@ impl ZeroCadApp {
             SketchTool::Mirror | SketchTool::Fillet | SketchTool::Chamfer => return None,
         };
         Some(shape)
+    }
+
+    /// Finish the current variable-point spline through the same shape commit
+    /// path as every other sketch primitive. The last stored click is popped
+    /// and passed as `last` because `shape_record_from_points` treats that value
+    /// as the live/final point for both preview and commit.
+    pub(crate) fn finish_in_progress_spline(&mut self) {
+        if !self.active_tool.is_some_and(SketchTool::is_spline) {
+            return;
+        }
+        if self.sketch_points.len() < 2 {
+            self.status_msg = "A spline needs at least two distinct points.".to_string();
+            return;
+        }
+        if let Some(last) = self.sketch_points.pop() {
+            self.finalize_shape(last);
+            self.status_msg = "Spline created. Click to start another spline.".to_string();
+        }
     }
 
     /// The in-progress shape resolved to [`SketchCurves`] — the parametric record
@@ -799,6 +866,8 @@ impl ZeroCadApp {
                 f,
                 FeatureType::Box { .. }
                     | FeatureType::Cylinder { .. }
+                    | FeatureType::Import { .. }
+                    | FeatureType::ImportStl { .. }
                     | FeatureType::Extrude {
                         mode: ExtrudeMode::NewBody,
                         ..
@@ -814,6 +883,10 @@ impl ZeroCadApp {
                     | FeatureType::BodyIntersect { .. }
                     | FeatureType::BodySplit { .. }
                     | FeatureType::BodyScale { .. }
+                    | FeatureType::FaceOffset { .. }
+                    | FeatureType::FaceMove { .. }
+                    | FeatureType::FaceDelete { .. }
+                    | FeatureType::FaceThicken { .. }
             )
         }) + self
             .body_meshes

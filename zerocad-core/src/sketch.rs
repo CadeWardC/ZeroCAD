@@ -33,10 +33,13 @@ use std::collections::HashMap;
 /// keep one `crate::sketch::` namespace.
 pub mod constraints;
 pub mod linalg;
+pub mod projection;
 pub mod solve;
 pub use constraints::{
-    effective_shape_ids, Constraint, EntityId, SketchEntity, SketchPoint, SketchSolverModel,
+    bake_construction_curves, effective_shape_ids, Constraint, EntityId, ProjectedEdgeReference,
+    SketchEntity, SketchPoint, SketchSolverModel,
 };
+pub use projection::{append_projected_edge, rebuild_projected_edge};
 pub use solve::{solve_model, SolveOutcome, SolveReport};
 
 /// Vertex coordinate snap tolerance (in sketch plane units / mm).
@@ -79,6 +82,364 @@ pub struct Arc {
     pub end: (f32, f32),
 }
 
+/// How a spline's stored points define the curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SplineKind {
+    /// The stored points are B-spline/NURBS control points. The curve generally
+    /// does not pass through interior points.
+    ControlPoint,
+    /// The stored points are interpolation points through which the curve must
+    /// pass.
+    FitPoint,
+}
+
+/// Continuity requested between fit-point spline spans. Control-point splines
+/// derive their continuity from degree and knot multiplicity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SplineContinuity {
+    /// Connected spans only (C0).
+    Position,
+    /// Shared tangent direction (C1).
+    Tangent,
+    /// Shared first and second derivatives (C2).
+    #[default]
+    Curvature,
+}
+
+/// A durable editable sketch spline.
+///
+/// DXF NURBS data can be stored without throwing away degree, knots, or
+/// weights. Native fit-point curves use `points` as interpolation handles and
+/// the selected [`SplineContinuity`]. `trim` is a normalized inclusive
+/// parameter interval; untrimmed splines use the full `[0, 1]` domain.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Spline {
+    pub kind: SplineKind,
+    pub points: Vec<(f32, f32)>,
+    #[serde(default = "default_spline_degree")]
+    pub degree: u8,
+    #[serde(default)]
+    pub knots: Vec<f32>,
+    #[serde(default)]
+    pub weights: Vec<f32>,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default)]
+    pub periodic: bool,
+    #[serde(default)]
+    pub continuity: SplineContinuity,
+    #[serde(default)]
+    pub trim: Option<(f32, f32)>,
+}
+
+const fn default_spline_degree() -> u8 {
+    3
+}
+
+impl Spline {
+    pub fn control_points(points: Vec<(f32, f32)>, degree: u8, closed: bool) -> Self {
+        Self {
+            kind: SplineKind::ControlPoint,
+            points,
+            degree,
+            knots: Vec::new(),
+            weights: Vec::new(),
+            closed,
+            periodic: false,
+            continuity: SplineContinuity::Curvature,
+            trim: None,
+        }
+    }
+
+    pub fn fit_points(points: Vec<(f32, f32)>, closed: bool, continuity: SplineContinuity) -> Self {
+        Self {
+            kind: SplineKind::FitPoint,
+            points,
+            degree: 3,
+            knots: Vec::new(),
+            weights: Vec::new(),
+            closed,
+            periodic: closed,
+            continuity,
+            trim: None,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let min_points = match self.kind {
+            SplineKind::ControlPoint => self.degree.max(1) as usize + 1,
+            SplineKind::FitPoint => 2,
+        };
+        self.points.len() >= min_points
+            && self
+                .points
+                .iter()
+                .all(|(x, y)| x.is_finite() && y.is_finite())
+            && self.weights.iter().all(|w| w.is_finite() && *w > 0.0)
+            && self.knots.iter().all(|k| k.is_finite())
+            && self.knots.windows(2).all(|window| window[0] <= window[1])
+            && self.trim.is_none_or(|(a, b)| {
+                a.is_finite() && b.is_finite() && a >= 0.0 && b <= 1.0 && b > a
+            })
+    }
+
+    /// Deterministically sample this spline for sketch display, planar-region
+    /// construction, and legacy polyline consumers. The budget scales with
+    /// control-polygon length and is bounded so malformed imports cannot cause
+    /// unbounded work.
+    pub fn sampled_points(&self, tolerance: f32) -> Vec<(f32, f32)> {
+        if !self.is_valid() {
+            return Vec::new();
+        }
+        let polygon_length: f32 = self
+            .points
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+            .sum();
+        let tolerance = tolerance.max(1.0e-4);
+        let spans = ((polygon_length / tolerance).sqrt().ceil() as usize)
+            .max(self.points.len().saturating_mul(8))
+            .clamp(16, 512);
+        let (start, end) = self.trim.unwrap_or((0.0, 1.0));
+        let mut sampled = Vec::with_capacity(spans + 1);
+        for index in 0..=spans {
+            let fraction = index as f32 / spans as f32;
+            let t = start + (end - start) * fraction;
+            if let Some(point) = self.evaluate(t) {
+                if sampled.last().is_none_or(|previous: &(f32, f32)| {
+                    (previous.0 - point.0).hypot(previous.1 - point.1) > 1.0e-6
+                }) {
+                    sampled.push(point);
+                }
+            }
+        }
+        if self.closed && self.trim.is_none() && sampled.len() > 2 {
+            let first = sampled[0];
+            if sampled
+                .last()
+                .is_some_and(|last| (last.0 - first.0).hypot(last.1 - first.1) > 1.0e-5)
+            {
+                sampled.push(first);
+            }
+        }
+        sampled
+    }
+
+    fn evaluate(&self, t: f32) -> Option<(f32, f32)> {
+        match self.kind {
+            SplineKind::ControlPoint => self.evaluate_control_point(t),
+            SplineKind::FitPoint => self.evaluate_fit_point(t),
+        }
+    }
+
+    fn evaluate_control_point(&self, t: f32) -> Option<(f32, f32)> {
+        if t <= 0.0 {
+            return self.points.first().copied();
+        }
+        if t >= 1.0 {
+            return if self.closed {
+                self.points.first().copied()
+            } else {
+                self.points.last().copied()
+            };
+        }
+        let mut points = self.points.clone();
+        let degree = usize::from(self.degree.max(1));
+        if self.closed && self.knots.is_empty() {
+            for point in self.points.iter().take(degree) {
+                points.push(*point);
+            }
+        }
+        if points.len() <= degree {
+            return None;
+        }
+        let expected_knots = points.len() + degree + 1;
+        let knots = if self.knots.len() == expected_knots {
+            self.knots.clone()
+        } else {
+            clamped_uniform_knots(points.len(), degree)
+        };
+        let weights = if self.weights.len() == self.points.len() {
+            let mut weights = self.weights.clone();
+            if points.len() > weights.len() {
+                weights.extend(self.weights.iter().copied().take(degree));
+            }
+            weights
+        } else {
+            vec![1.0; points.len()]
+        };
+        let domain_start = knots[degree];
+        let domain_end = knots[points.len()];
+        if domain_end <= domain_start {
+            return None;
+        }
+        let u = domain_start + t.clamp(0.0, 1.0) * (domain_end - domain_start);
+        let mut basis = vec![0.0_f32; points.len()];
+        for index in 0..points.len() {
+            let at_end = t >= 1.0 && index + 1 == points.len();
+            if (knots[index] <= u && u < knots[index + 1]) || at_end {
+                basis[index] = 1.0;
+            }
+        }
+        for order in 1..=degree {
+            let previous = basis.clone();
+            for index in 0..points.len() {
+                let left_denominator = knots[index + order] - knots[index];
+                let left = if left_denominator.abs() > f32::EPSILON {
+                    (u - knots[index]) / left_denominator * previous[index]
+                } else {
+                    0.0
+                };
+                let right = if index + 1 < points.len() {
+                    let right_denominator = knots[index + order + 1] - knots[index + 1];
+                    if right_denominator.abs() > f32::EPSILON {
+                        (knots[index + order + 1] - u) / right_denominator * previous[index + 1]
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                basis[index] = left + right;
+            }
+        }
+        let mut numerator = (0.0_f32, 0.0_f32);
+        let mut denominator = 0.0_f32;
+        for ((point, weight), basis) in points.iter().zip(weights).zip(basis) {
+            let factor = weight * basis;
+            numerator.0 += point.0 * factor;
+            numerator.1 += point.1 * factor;
+            denominator += factor;
+        }
+        (denominator.abs() > f32::EPSILON)
+            .then_some((numerator.0 / denominator, numerator.1 / denominator))
+    }
+
+    fn evaluate_fit_point(&self, t: f32) -> Option<(f32, f32)> {
+        match self.continuity {
+            SplineContinuity::Position => evaluate_linear(&self.points, t, self.closed),
+            SplineContinuity::Tangent => evaluate_catmull_rom(&self.points, t, self.closed),
+            SplineContinuity::Curvature if !self.closed => evaluate_natural_cubic(&self.points, t),
+            SplineContinuity::Curvature => evaluate_catmull_rom(&self.points, t, true),
+        }
+    }
+}
+
+fn clamped_uniform_knots(point_count: usize, degree: usize) -> Vec<f32> {
+    let knot_count = point_count + degree + 1;
+    let interior_count = point_count.saturating_sub(degree + 1);
+    let mut knots = Vec::with_capacity(knot_count);
+    knots.extend(std::iter::repeat_n(0.0, degree + 1));
+    for index in 1..=interior_count {
+        knots.push(index as f32 / (interior_count + 1) as f32);
+    }
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    knots
+}
+
+fn evaluate_linear(points: &[(f32, f32)], t: f32, closed: bool) -> Option<(f32, f32)> {
+    let span_count = if closed {
+        points.len()
+    } else {
+        points.len().saturating_sub(1)
+    };
+    if span_count == 0 {
+        return None;
+    }
+    let scaled = t.clamp(0.0, 1.0) * span_count as f32;
+    let span = (scaled.floor() as usize).min(span_count - 1);
+    let local = if t >= 1.0 { 1.0 } else { scaled.fract() };
+    let a = points[span];
+    let b = points[(span + 1) % points.len()];
+    Some((a.0 + (b.0 - a.0) * local, a.1 + (b.1 - a.1) * local))
+}
+
+fn evaluate_catmull_rom(points: &[(f32, f32)], t: f32, closed: bool) -> Option<(f32, f32)> {
+    if points.len() < 2 {
+        return None;
+    }
+    let span_count = if closed {
+        points.len()
+    } else {
+        points.len() - 1
+    };
+    let scaled = t.clamp(0.0, 1.0) * span_count as f32;
+    let span = (scaled.floor() as usize).min(span_count - 1);
+    let u = if t >= 1.0 { 1.0 } else { scaled.fract() };
+    let at = |index: isize| -> (f32, f32) {
+        if closed {
+            points[index.rem_euclid(points.len() as isize) as usize]
+        } else {
+            points[index.clamp(0, points.len() as isize - 1) as usize]
+        }
+    };
+    let p0 = at(span as isize - 1);
+    let p1 = at(span as isize);
+    let p2 = at(span as isize + 1);
+    let p3 = at(span as isize + 2);
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let component = |a: f32, b: f32, c: f32, d: f32| {
+        0.5 * ((2.0 * b)
+            + (-a + c) * u
+            + (2.0 * a - 5.0 * b + 4.0 * c - d) * u2
+            + (-a + 3.0 * b - 3.0 * c + d) * u3)
+    };
+    Some((
+        component(p0.0, p1.0, p2.0, p3.0),
+        component(p0.1, p1.1, p2.1, p3.1),
+    ))
+}
+
+fn evaluate_natural_cubic(points: &[(f32, f32)], t: f32) -> Option<(f32, f32)> {
+    if points.len() < 3 {
+        return evaluate_linear(points, t, false);
+    }
+    let second_derivatives = |coordinate: fn(&(f32, f32)) -> f32| {
+        let count = points.len();
+        let mut lower = vec![0.0_f32; count];
+        let mut diagonal = vec![1.0_f32; count];
+        let mut upper = vec![0.0_f32; count];
+        let mut rhs = vec![0.0_f32; count];
+        for index in 1..count - 1 {
+            lower[index] = 1.0;
+            diagonal[index] = 4.0;
+            upper[index] = 1.0;
+            rhs[index] = 6.0
+                * (coordinate(&points[index + 1]) - 2.0 * coordinate(&points[index])
+                    + coordinate(&points[index - 1]));
+        }
+        for index in 1..count {
+            let factor = lower[index] / diagonal[index - 1];
+            diagonal[index] -= factor * upper[index - 1];
+            rhs[index] -= factor * rhs[index - 1];
+        }
+        let mut solved = vec![0.0_f32; count];
+        solved[count - 1] = rhs[count - 1] / diagonal[count - 1];
+        for index in (0..count - 1).rev() {
+            solved[index] = (rhs[index] - upper[index] * solved[index + 1]) / diagonal[index];
+        }
+        solved
+    };
+    let mx = second_derivatives(|point| point.0);
+    let my = second_derivatives(|point| point.1);
+    let span_count = points.len() - 1;
+    let scaled = t.clamp(0.0, 1.0) * span_count as f32;
+    let span = (scaled.floor() as usize).min(span_count - 1);
+    let u = if t >= 1.0 { 1.0 } else { scaled.fract() };
+    let a = 1.0 - u;
+    let b = u;
+    let component = |index: usize, second: &[f32], coordinate: fn(&(f32, f32)) -> f32| {
+        a * coordinate(&points[index])
+            + b * coordinate(&points[index + 1])
+            + ((a * a * a - a) * second[index] + (b * b * b - b) * second[index + 1]) / 6.0
+    };
+    Some((
+        component(span, &mx, |point| point.0),
+        component(span, &my, |point| point.1),
+    ))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SketchCurves {
     pub segments: Vec<LineSegment>,
@@ -87,6 +448,10 @@ pub struct SketchCurves {
     /// files written before arcs existed still deserialize.
     #[serde(default)]
     pub arcs: Vec<Arc>,
+    /// Analytic editable spline records. Every existing consumer either reads
+    /// these directly or uses the deterministic sampling path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splines: Vec<Spline>,
 }
 
 impl SketchCurves {
@@ -95,7 +460,10 @@ impl SketchCurves {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.segments.is_empty() && self.circles.is_empty() && self.arcs.is_empty()
+        self.segments.is_empty()
+            && self.circles.is_empty()
+            && self.arcs.is_empty()
+            && self.splines.is_empty()
     }
 
     /// Append every curve of `other` after this set's own curves. Used to fold
@@ -108,6 +476,7 @@ impl SketchCurves {
         self.segments.extend(other.segments.iter().copied());
         self.circles.extend(other.circles.iter().copied());
         self.arcs.extend(other.arcs.iter().copied());
+        self.splines.extend(other.splines.iter().cloned());
     }
 
     /// Append a rectangle as four segments around the two opposite corners.
@@ -143,6 +512,11 @@ impl SketchCurves {
         }
         for a in &self.arcs {
             segs.push(Seg::Arc(*a));
+        }
+        for spline in &self.splines {
+            for pair in spline.sampled_points(0.01).windows(2) {
+                segs.push(Seg::Line(pair[0], pair[1]));
+            }
         }
         if segs.is_empty() {
             return None;
@@ -228,6 +602,12 @@ impl SketchCurves {
         }
     }
 
+    pub fn add_spline(&mut self, spline: Spline) {
+        if spline.is_valid() {
+            self.splines.push(spline);
+        }
+    }
+
     /// Append an ellipse as a faceted closed polyline (the same polygon-
     /// approximation strategy circles/cylinders already use for the boolean
     /// kernel — there is no analytic ellipse primitive). `major` is the
@@ -265,15 +645,10 @@ impl SketchCurves {
     /// Remove the most recently added primitive (LIFO across circles, arcs, then
     /// segments). Rectangles count as 4 segments — call 4× to undo one.
     pub fn pop_last(&mut self) -> bool {
-        if self.circles.pop().is_some() {
-            true
-        } else if self.arcs.pop().is_some() {
-            true
-        } else if self.segments.pop().is_some() {
-            true
-        } else {
-            false
-        }
+        self.splines.pop().is_some()
+            || self.circles.pop().is_some()
+            || self.arcs.pop().is_some()
+            || self.segments.pop().is_some()
     }
 }
 
@@ -313,6 +688,24 @@ impl Dimension {
 /// dimensions) rather than baked coordinates, so it can be rebuilt against the
 /// current variables. Tools without dimension fields (3-point shapes, ellipses)
 /// are stored pre-built as [`SketchShape::Raw`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SketchImportFormat {
+    Dxf,
+}
+
+/// Source identity retained with imported sketch geometry. Geometry is stored
+/// in ZeroCAD's millimetre base unit, while these fields preserve the source
+/// layer and unit declaration for inspection and deterministic re-export.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImportedSketchMetadata {
+    pub format: SketchImportFormat,
+    pub source_name: String,
+    pub layer: String,
+    pub source_unit_code: u16,
+    pub source_unit_name: String,
+    pub source_scale_to_mm: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SketchShape {
     /// Axis-aligned rectangle. When `from_center`, `origin` is the center and
@@ -345,6 +738,16 @@ pub enum SketchShape {
         diameter: Dimension,
         rotation_deg: f32,
         circumscribed: bool,
+    },
+    /// An editable native spline. Its defining points remain available after
+    /// save/load instead of being reduced to an anonymous polyline.
+    Spline { spline: Spline },
+    /// One source layer from an imported sketch file. Keeping layers as
+    /// separate shape records makes layer identity stable and inspectable while
+    /// still feeding the normal sketch-region pipeline.
+    Imported {
+        curves: SketchCurves,
+        metadata: ImportedSketchMetadata,
     },
     /// Pre-built geometry with no variable bindings (3-point rect/circle,
     /// ellipses). Stored as-is and emitted verbatim.
@@ -422,6 +825,8 @@ impl SketchShape {
                     }
                 }
             }
+            SketchShape::Spline { spline } => c.add_spline(spline.clone()),
+            SketchShape::Imported { curves, .. } => c = curves.clone(),
             SketchShape::Raw { curves } => c = curves.clone(),
         }
         c
@@ -439,6 +844,7 @@ pub fn build_sketch_curves(shapes: &[SketchShape], vars: &HashMap<String, f64>) 
         out.segments.extend(c.segments);
         out.circles.extend(c.circles);
         out.arcs.extend(c.arcs);
+        out.splines.extend(c.splines);
     }
     out
 }
@@ -509,6 +915,15 @@ pub fn reflect_curves_across(curves: &SketchCurves, a: (f32, f32), b: (f32, f32)
             start: reflect_pt(arc.start, a, d),
             end: reflect_pt(arc.end, a, d),
         });
+    }
+    for spline in &curves.splines {
+        let mut reflected = spline.clone();
+        reflected.points = spline
+            .points
+            .iter()
+            .map(|point| reflect_pt(*point, a, d))
+            .collect();
+        out.splines.push(reflected);
     }
     out
 }
@@ -893,14 +1308,19 @@ fn sketch_provenance_fragments(
             radius: circle.radius,
         });
     }
-    if fragments.is_empty() && !curves.segments.is_empty() {
+    if fragments.is_empty()
+        && (!curves.segments.is_empty() || !curves.arcs.is_empty() || !curves.splines.is_empty())
+    {
         fragments.push(RegionProvenanceFragment::RawPolyline {
             shape_id: shapes
                 .iter()
                 .position(|shape| {
                     matches!(
                         shape,
-                        SketchShape::RegularPolygon { .. } | SketchShape::Raw { .. }
+                        SketchShape::RegularPolygon { .. }
+                            | SketchShape::Spline { .. }
+                            | SketchShape::Imported { .. }
+                            | SketchShape::Raw { .. }
                     )
                 })
                 .and_then(id_at),
@@ -1107,6 +1527,15 @@ fn flatten_curves(curves: &SketchCurves) -> Vec<(P, P)> {
             };
             out.push((prev, cur));
             prev = cur;
+        }
+    }
+    for spline in &curves.splines {
+        for pair in spline.sampled_points(0.01).windows(2) {
+            let a = P::from(pair[0]);
+            let b = P::from(pair[1]);
+            if (a.x - b.x).abs() > VERTEX_TOL || (a.y - b.y).abs() > VERTEX_TOL {
+                out.push((a, b));
+            }
         }
     }
     out
@@ -2205,5 +2634,34 @@ mod tests {
             &vars,
         );
         assert_eq!(overlap_clusters(&loops), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn control_point_spline_preserves_endpoints_and_trim() {
+        let mut spline = Spline::control_points(
+            vec![(0.0, 0.0), (3.0, 5.0), (7.0, -2.0), (10.0, 0.0)],
+            3,
+            false,
+        );
+        let full = spline.sampled_points(0.01);
+        assert_eq!(full.first().copied(), Some((0.0, 0.0)));
+        assert_eq!(full.last().copied(), Some((10.0, 0.0)));
+        spline.trim = Some((0.25, 0.75));
+        let trimmed = spline.sampled_points(0.01);
+        assert_ne!(trimmed.first(), full.first());
+        assert_ne!(trimmed.last(), full.last());
+    }
+
+    #[test]
+    fn closed_fit_spline_participates_in_region_detection() {
+        let mut curves = SketchCurves::new();
+        curves.add_spline(Spline::fit_points(
+            vec![(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)],
+            true,
+            SplineContinuity::Tangent,
+        ));
+        let regions = detect_regions(&curves);
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].area > 90.0);
     }
 }

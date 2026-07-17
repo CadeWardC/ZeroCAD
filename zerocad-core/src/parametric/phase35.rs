@@ -146,8 +146,19 @@ pub(crate) fn apply_body_split(
         return;
     }
     let split_plane = match face {
-        Some(reference) => match resolved_planar_face(live, reference) {
-            Ok(plane) => plane,
+        Some(reference) => match resolved_split_face(live, reference) {
+            Ok(SplitFaceSurface::Plane(plane)) => plane,
+            Ok(SplitFaceSurface::Cylinder(cylinder)) => {
+                apply_body_split_by_cylinder(
+                    node_id,
+                    target_index,
+                    target_body,
+                    cylinder,
+                    live,
+                    warnings,
+                );
+                return;
+            }
             Err(reason) => {
                 warnings.push(format!("Split body '{node_id}': {reason}."));
                 return;
@@ -298,9 +309,9 @@ pub(crate) fn apply_body_scale(
         return;
     };
     let source_body = live[source_index].clone();
-    if source_body.parts.is_empty() {
+    if source_body.parts.is_empty() && source_body.pristine.is_none() {
         warnings.push(format!(
-            "Scale body '{node_id}': source body '{source}' has no solid geometry."
+            "Scale body '{node_id}': source body '{source}' has no geometry."
         ));
         return;
     }
@@ -319,15 +330,24 @@ pub(crate) fn apply_body_scale(
             }
         }
     }
-    let pristine = source_body.pristine.as_deref().and_then(|input_mesh| {
-        let mut mesh = MockMesh::empty();
-        for part in &parts {
-            mesh.append(crate::mock_kernel::propagate_face_names(
-                input_mesh, part, node_id,
-            ));
-        }
-        (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh))
-    });
+    let pristine = if source_body.parts.is_empty() {
+        source_body.pristine.as_deref().map(|input_mesh| {
+            let mut mesh = input_mesh.clone();
+            mesh.scale_uniform(factor, center);
+            restamp_mesh_body(&mut mesh, node_id, node_id);
+            std::sync::Arc::new(mesh)
+        })
+    } else {
+        source_body.pristine.as_deref().and_then(|input_mesh| {
+            let mut mesh = MockMesh::empty();
+            for part in &parts {
+                mesh.append(crate::mock_kernel::propagate_face_names(
+                    input_mesh, part, node_id,
+                ));
+            }
+            (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh))
+        })
+    };
     live.remove(source_index);
     apply_new(
         live,
@@ -359,10 +379,12 @@ fn plane_from_coordinate_system(cs: CoordinateSystem) -> openrcad::geom::Plane {
     ))
 }
 
-fn resolved_planar_face(
-    live: &[LiveBody],
-    reference: &FaceRef,
-) -> Result<openrcad::geom::Plane, String> {
+enum SplitFaceSurface {
+    Plane(openrcad::geom::Plane),
+    Cylinder(crate::mock_kernel::CylinderFaceInfo),
+}
+
+fn resolved_split_face(live: &[LiveBody], reference: &FaceRef) -> Result<SplitFaceSurface, String> {
     let body = if let Some(body_id) = reference
         .topology
         .as_ref()
@@ -393,7 +415,8 @@ fn resolved_planar_face(
         resolved.face.normal[2],
     )
     .normalize();
-    part.faces()
+    let plane = part
+        .faces()
         .into_iter()
         .filter_map(|face| match face.surface() {
             Some(openrcad::geom::GeomSurface::Plane(plane)) => {
@@ -414,8 +437,169 @@ fn resolved_planar_face(
         })
         .min_by(|(left, _), (right, _)| left.total_cmp(right))
         .filter(|(distance, _)| *distance <= 1.0e-3)
-        .map(|(_, plane)| plane)
-        .ok_or_else(|| "the selected face is not planar".to_string())
+        .map(|(_, plane)| plane);
+    if let Some(plane) = plane {
+        return Ok(SplitFaceSurface::Plane(plane));
+    }
+    crate::mock_kernel::cylinder_face_near(part, resolved.face.centroid)
+        .map(SplitFaceSurface::Cylinder)
+        .ok_or_else(|| {
+            "the selected face is neither planar nor a supported analytic cylinder".to_string()
+        })
+}
+
+fn apply_body_split_by_cylinder(
+    node_id: &str,
+    target_index: usize,
+    target_body: LiveBody,
+    cylinder: crate::mock_kernel::CylinderFaceInfo,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let axis = Vec3::new(cylinder.dir[0], cylinder.dir[1], cylinder.dir[2]).normalize();
+    let axis_origin = Vec3::new(cylinder.origin[0], cylinder.origin[1], cylinder.origin[2]);
+    let mut axial_min = f32::INFINITY;
+    let mut axial_max = f32::NEG_INFINITY;
+    for part in &target_body.parts {
+        for vertex in part.vertices() {
+            let point = vertex.point();
+            let relative = Vec3::new(
+                point.x() as f32 - axis_origin.x,
+                point.y() as f32 - axis_origin.y,
+                point.z() as f32 - axis_origin.z,
+            );
+            let axial = relative.dot(axis);
+            axial_min = axial_min.min(axial);
+            axial_max = axial_max.max(axial);
+        }
+    }
+    if !axial_min.is_finite() || axial_max - axial_min <= 1.0e-5 {
+        warnings.push(format!(
+            "Split body '{node_id}': target bounds are invalid for a cylindrical split."
+        ));
+        return;
+    }
+    let overshoot = (axial_max - axial_min).max(1.0) * 0.05 + 0.25;
+    let start = axis_origin.add(axis.mul(axial_min - overshoot));
+    let Some(tool) = crate::mock_kernel::cylinder_tool_at(
+        start,
+        axis,
+        cylinder.radius as f64,
+        (axial_max - axial_min + 2.0 * overshoot) as f64,
+    ) else {
+        warnings.push(format!(
+            "Split body '{node_id}': could not construct the analytic cylindrical splitter."
+        ));
+        return;
+    };
+
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    let mut inside_histories = Vec::new();
+    let mut outside_histories = Vec::new();
+    let mut exact_history = target_body.parts.len() == 1;
+    for part in &target_body.parts {
+        let common = match crate::mock_kernel::common_bodies_with_history(part, &tool, None) {
+            Ok(outcome) => outcome,
+            Err(crate::mock_kernel::CommonBodiesError::Empty) => {
+                outside.push(part.clone());
+                exact_history = false;
+                continue;
+            }
+            Err(crate::mock_kernel::CommonBodiesError::Failed(reason)) => {
+                warnings.push(format!(
+                    "Split body '{node_id}': cylindrical inside classification failed ({reason}); the source was left unchanged."
+                ));
+                return;
+            }
+        };
+        let common_volume: f64 = common.bodies.iter().filter_map(solid_volume).sum();
+        let part_volume = solid_volume(part).unwrap_or(0.0);
+        inside.extend(common.bodies);
+        inside_histories.extend(common.face_history);
+        match crate::mock_kernel::difference_bodies_with_history(part, &tool, None) {
+            Some(outcome) if !outcome.bodies.is_empty() => {
+                outside.extend(outcome.bodies);
+                outside_histories.extend(outcome.face_history);
+            }
+            _ if part_volume > 0.0
+                && (part_volume - common_volume).abs() <= part_volume * 1.0e-5 + 1.0e-6 => {}
+            _ => {
+                warnings.push(format!(
+                    "Split body '{node_id}': cylindrical outside classification failed; the source was left unchanged."
+                ));
+                return;
+            }
+        }
+    }
+    if inside.is_empty() || outside.is_empty() {
+        warnings.push(format!(
+            "Split body '{node_id}': the cylindrical face does not divide the target into two positive volumes."
+        ));
+        return;
+    }
+    inside.sort_by_key(crate::mock_kernel::part_key);
+    outside.sort_by_key(crate::mock_kernel::part_key);
+    let source_volume: f64 = target_body.parts.iter().filter_map(solid_volume).sum();
+    let result_volume: f64 = inside.iter().chain(&outside).filter_map(solid_volume).sum();
+    if source_volume <= 0.0
+        || (result_volume - source_volume).abs() > source_volume * 2.0e-3 + 1.0e-5
+    {
+        warnings.push(format!(
+            "Split body '{node_id}': cylindrical split failed volume conservation; the source was left unchanged."
+        ));
+        return;
+    }
+
+    let input_names = match (&target_body.pristine, &target_body.parts[..]) {
+        (Some(mesh), [part]) => Some(crate::mock_kernel::input_shell_face_names(mesh, part)),
+        _ => None,
+    };
+    let named = |parts: &[KernelSolid],
+                 histories: &[crate::mock_kernel::BooleanFaceHistory],
+                 side: &str| {
+        exact_history.then(|| {
+            crate::mock_kernel::propagate_face_names_via_body_histories(
+                target_body.pristine.as_deref()?,
+                input_names.as_deref()?,
+                parts,
+                histories,
+                node_id,
+                &format!("split:{node_id}:{side}"),
+            )
+            .map(std::sync::Arc::new)
+        })?
+    };
+    let inside_mesh = named(&inside, &inside_histories, "cylinder-inside");
+    let positive_id = body_output_id(node_id, 1);
+    let mut outside_mesh = named(&outside, &outside_histories, "cylinder-outside");
+    if let Some(mesh) = outside_mesh.as_mut() {
+        restamp_mesh_body(std::sync::Arc::make_mut(mesh), &positive_id, node_id);
+    }
+    live.remove(target_index);
+    apply_new(
+        live,
+        LiveBody {
+            id: node_id.to_string(),
+            parts: inside,
+            pristine: inside_mesh,
+            sketch_source: None,
+        },
+    );
+    apply_new(
+        live,
+        LiveBody {
+            id: positive_id,
+            parts: outside,
+            pristine: outside_mesh,
+            sketch_source: None,
+        },
+    );
+}
+
+fn solid_volume(solid: &KernelSolid) -> Option<f64> {
+    let mesh = openrcad::mesh::tessellate_checked(solid, 0.05, 0.25).ok()?;
+    openrcad::mesh::mass_properties(&mesh).map(|properties| properties.volume)
 }
 
 fn restamp_mesh_body(mesh: &mut MockMesh, body_id: &str, producer: &str) {

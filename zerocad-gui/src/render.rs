@@ -9,8 +9,8 @@ use zerocad_core::{
     detect_regions, CoordinateSystem, ExtrudeMode, FeatureType, MockMesh, SketchPlane,
 };
 
-use crate::geom2d::draw_sketch_geometry;
-use crate::{BodyPick, PendingVisualMode, SharedBodyMeshes, SnapKind, ZeroCadApp};
+use crate::geom2d::{draw_sketch_geometry, fill_nested_loops};
+use crate::{BodyPick, PendingVisualMode, SectionView, SharedBodyMeshes, SnapKind, ZeroCadApp};
 
 const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
 // Match the GPU renderer's warm selected-face tint: yellow body fill with the
@@ -27,6 +27,69 @@ pub(crate) const PERSP_DIST: f32 = 1200.0;
 struct RenderItem {
     depth: f32,
     content: RenderItemContent,
+}
+
+fn section_mesh(mesh: &MockMesh, section: &SectionView) -> (MockMesh, Vec<Vec<[f32; 3]>>) {
+    let (origin, normal) = section.plane();
+    match zerocad_core::mock_kernel::clip_mesh_by_plane(mesh, origin, normal, section.keep_positive)
+    {
+        Ok(section) => (section.mesh, section.contours),
+        Err(_) => (mesh.clone(), Vec::new()),
+    }
+}
+
+fn draw_construction_curves(
+    painter: &egui::Painter,
+    curves: &zerocad_core::SketchCurves,
+    to_screen: &dyn Fn((f32, f32)) -> egui::Pos2,
+) {
+    let stroke = egui::Stroke::new(1.2, egui::Color32::from_rgb(55, 125, 205));
+    let draw_polyline = |points: Vec<(f32, f32)>| {
+        if points.len() >= 2 {
+            let screen: Vec<egui::Pos2> = points.into_iter().map(to_screen).collect();
+            painter.add(egui::Shape::dashed_line(&screen, stroke, 5.0, 3.0));
+        }
+    };
+    for segment in &curves.segments {
+        draw_polyline(vec![segment.a, segment.b]);
+    }
+    for circle in &curves.circles {
+        draw_polyline(
+            (0..=48)
+                .map(|index| {
+                    let angle = index as f32 / 48.0 * std::f32::consts::TAU;
+                    (
+                        circle.center.0 + circle.radius * angle.cos(),
+                        circle.center.1 + circle.radius * angle.sin(),
+                    )
+                })
+                .collect(),
+        );
+    }
+    for arc in &curves.arcs {
+        let start = (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
+        let mut end = (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
+        while end - start > std::f32::consts::PI {
+            end -= std::f32::consts::TAU;
+        }
+        while end - start < -std::f32::consts::PI {
+            end += std::f32::consts::TAU;
+        }
+        draw_polyline(
+            (0..=32)
+                .map(|index| {
+                    let angle = start + (end - start) * index as f32 / 32.0;
+                    (
+                        arc.center.0 + arc.radius * angle.cos(),
+                        arc.center.1 + arc.radius * angle.sin(),
+                    )
+                })
+                .collect(),
+        );
+    }
+    for spline in &curves.splines {
+        draw_polyline(spline.sampled_points(0.01));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +281,39 @@ mod selected_material_tests {
         assert!(needs_cpu_occlusion(true, false, false, true, false));
         assert!(needs_cpu_occlusion(true, false, false, false, true));
         assert!(needs_cpu_occlusion(false, true, false, false, false));
+    }
+
+    #[test]
+    fn section_plane_clips_a_body_and_returns_a_closed_cut_contour() {
+        let mut graph = zerocad_core::ParametricGraph::new();
+        graph.add_feature(zerocad_core::FeatureNode {
+            id: "box".to_string(),
+            name: "Box".to_string(),
+            feature: zerocad_core::FeatureType::Box {
+                w: 10.0,
+                h: 8.0,
+                d: 6.0,
+            },
+        });
+        let mesh = graph.evaluate().expect("box mesh");
+        let section = SectionView {
+            origin: [0.0; 3],
+            normal: [1.0, 0.0, 0.0],
+            offset: 5.0,
+            keep_positive: true,
+            capped: true,
+        };
+        let (clipped, contours) = section_mesh(&mesh, &section);
+
+        assert!(!clipped.indices.is_empty());
+        assert_eq!(contours.len(), 1, "a box section has one closed contour");
+        assert!(contours[0].len() >= 4);
+        for vertex in clipped.vertices.chunks_exact(6) {
+            assert!(vertex[0] >= 5.0 - 1.0e-5, "clipped x={}", vertex[0]);
+        }
+        for point in &contours[0] {
+            assert!((point[0] - 5.0).abs() < 1.0e-5);
+        }
     }
 }
 
@@ -920,10 +1016,44 @@ impl ZeroCadApp {
             /// depth sort would otherwise bury behind the walls around them.
             on_top: bool,
         }
+        let (sectioned_bodies, section_contours): (
+            Option<Vec<(String, MockMesh)>>,
+            Vec<Vec<[f32; 3]>>,
+        ) = if let Some(section) = &self.section_view {
+            let source = preview_bodies.as_ref().unwrap_or(&self.body_meshes);
+            let mut bodies = Vec::with_capacity(source.len());
+            let mut contours = Vec::new();
+            for (id, mesh) in source.iter() {
+                let (clipped, mut loops) = section_mesh(mesh, section);
+                bodies.push((id.clone(), clipped));
+                contours.append(&mut loops);
+            }
+            (Some(bodies), contours)
+        } else {
+            (None, Vec::new())
+        };
         let mut meshes: Vec<Drawable> = if gpu_active {
             // The GPU composited this frame's full scene — committed bodies AND
             // live preview layers — so the CPU paints no solids at all.
             Vec::new()
+        } else if let Some(bodies) = sectioned_bodies.as_ref() {
+            let alpha = if preview_bodies.is_some() {
+                body_alpha
+            } else {
+                255
+            };
+            bodies
+                .iter()
+                .map(|(id, m)| Drawable {
+                    node_id: Some(id.as_str()),
+                    mesh: m,
+                    base: NORMAL_BODY_BASE,
+                    alpha,
+                    cull_back: alpha == 255,
+                    draw_edges: true,
+                    on_top: false,
+                })
+                .collect()
         } else if let Some(bodies) = preview_bodies.as_ref() {
             bodies
                 .iter()
@@ -1574,6 +1704,40 @@ impl ZeroCadApp {
         // Flush any remaining triangles.
         flush_batch(&mut batched_mesh, &painter);
 
+        if !section_contours.is_empty() {
+            let projected: Vec<Vec<egui::Pos2>> = section_contours
+                .iter()
+                .map(|loop_| {
+                    loop_
+                        .iter()
+                        .map(|point| {
+                            let projected = project_3d(point[0], point[1], point[2]);
+                            egui::pos2(projected.0, projected.1)
+                        })
+                        .collect()
+                })
+                .collect();
+            if self
+                .section_view
+                .as_ref()
+                .is_some_and(|section| section.capped)
+            {
+                fill_nested_loops(
+                    &painter,
+                    &projected,
+                    egui::Color32::from_rgba_unmultiplied(245, 120, 70, 210),
+                );
+            }
+            for loop_ in &projected {
+                for index in 0..loop_.len() {
+                    painter.line_segment(
+                        [loop_[index], loop_[(index + 1) % loop_.len()]],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(190, 65, 25)),
+                    );
+                }
+            }
+        }
+
         // F. Wireframe edges, drawn ON TOP of the solids with depth-buffer
         // hidden-line removal. Each edge is walked in screen space and only the
         // spans that aren't behind a nearer solid face (per the occlusion buffer
@@ -1833,6 +1997,10 @@ impl ZeroCadApp {
                 draw_sketch_geometry(
                     &painter, curves, &regions, &selected, &sel_edges, &to_screen, false,
                 );
+                if let Some(solver) = solver.as_ref() {
+                    let construction = zerocad_core::sketch::bake_construction_curves(solver);
+                    draw_construction_curves(&painter, &construction, &to_screen);
+                }
             }
         }
 
@@ -1857,6 +2025,10 @@ impl ZeroCadApp {
                 &to_screen,
                 true,
             );
+            if let Some(solver) = self.sketch_solver_model.as_ref() {
+                let construction = zerocad_core::sketch::bake_construction_curves(solver);
+                draw_construction_curves(&painter, &construction, &to_screen);
+            }
             if !self.active_face_boundary.is_empty() {
                 let stroke = egui::Stroke::new(1.6, egui::Color32::from_rgb(150, 80, 200));
                 for s in &self.active_face_boundary.segments {

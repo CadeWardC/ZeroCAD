@@ -6,7 +6,8 @@
 
 use crate::parametric::{
     AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeRef, ExtrudeMode, FaceRef,
-    FeatureType, HoleKind, PatternKind, PlaneBase, Variable,
+    FeatureType, HoleKind, HoleManufacturingMetadata, PatternKind, PlaneBase, StandardReference,
+    Variable,
 };
 use crate::sketch::{
     CornerKind, CornerMod, EntityId, SketchMirror, SketchShape, SketchSolverModel,
@@ -40,6 +41,18 @@ fn take<T: DeserializeOwned>(
     ciborium::into_writer(&value, &mut bytes).map_err(|error| error.to_string())?;
     ciborium::from_reader(bytes.as_slice())
         .map_err(|error| format!("invalid feature field {key} ({name}): {error}"))
+}
+
+fn take_if_present<T: DeserializeOwned>(
+    fields: &mut NumericFeatureFields,
+    key: u16,
+    name: &str,
+) -> Result<Option<T>, String> {
+    if fields.contains_key(&key) {
+        take(fields, key, name).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn finish(kind: &str, fields: NumericFeatureFields) -> Result<(), String> {
@@ -174,6 +187,8 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             diameter_expr,
             depth,
             kind,
+            standard,
+            manufacturing,
         } => {
             put(&mut fields, 0, target);
             put(&mut fields, 1, position);
@@ -182,6 +197,10 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             put(&mut fields, 4, diameter_expr);
             put(&mut fields, 5, depth);
             put(&mut fields, 6, kind);
+            put(&mut fields, 7, standard);
+            if manufacturing.is_some() {
+                put(&mut fields, 8, manufacturing);
+            }
         }
         FeatureType::Pattern { source, kind } => {
             put(&mut fields, 0, source);
@@ -208,6 +227,7 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             length,
             flip,
             designation,
+            standard,
         } => {
             put(&mut fields, 0, target);
             put(&mut fields, 1, face);
@@ -220,6 +240,7 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             put(&mut fields, 8, length);
             put(&mut fields, 9, flip);
             put(&mut fields, 10, designation);
+            put(&mut fields, 11, standard);
         }
         FeatureType::DatumPlane { def } => put(&mut fields, 0, def),
         FeatureType::DatumAxis { def } => put(&mut fields, 0, def),
@@ -263,6 +284,44 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             put(&mut fields, 2, factor_expr);
             put(&mut fields, 3, center);
         }
+        FeatureType::FaceOffset {
+            target,
+            face,
+            distance,
+            distance_expr,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, face);
+            put(&mut fields, 2, distance);
+            put(&mut fields, 3, distance_expr);
+        }
+        FeatureType::FaceMove {
+            target,
+            face,
+            translation,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, face);
+            put(&mut fields, 2, translation);
+        }
+        FeatureType::FaceDelete { target, face } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, face);
+        }
+        FeatureType::FaceThicken {
+            target,
+            face,
+            thickness,
+            thickness_expr,
+            reverse,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, face);
+            put(&mut fields, 2, thickness);
+            put(&mut fields, 3, thickness_expr);
+            put(&mut fields, 4, reverse);
+        }
+        FeatureType::ImportStl { .. } => {}
     }
     fields
 }
@@ -348,6 +407,18 @@ pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<Fea
             diameter_expr: take(&mut fields, 4, "diameter expression")?,
             depth: take(&mut fields, 5, "depth")?,
             kind: take::<HoleKind>(&mut fields, 6, "kind")?,
+            standard: take_if_present::<Option<StandardReference>>(
+                &mut fields,
+                7,
+                "standard reference",
+            )?
+            .flatten(),
+            manufacturing: take_if_present::<Option<HoleManufacturingMetadata>>(
+                &mut fields,
+                8,
+                "manufacturing metadata",
+            )?
+            .flatten(),
         },
         "part.pattern" => FeatureType::Pattern {
             source: take(&mut fields, 0, "source")?,
@@ -370,6 +441,12 @@ pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<Fea
             length: take(&mut fields, 8, "length")?,
             flip: take(&mut fields, 9, "flip")?,
             designation: take(&mut fields, 10, "designation")?,
+            standard: take_if_present::<Option<StandardReference>>(
+                &mut fields,
+                11,
+                "standard reference",
+            )?
+            .flatten(),
         },
         "datum.plane" => FeatureType::DatumPlane {
             def: take::<DatumPlaneDef>(&mut fields, 0, "definition")?,
@@ -404,8 +481,33 @@ pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<Fea
             factor_expr: take(&mut fields, 2, "factor expression")?,
             center: take(&mut fields, 3, "center")?,
         },
+        "direct.face_offset" => FeatureType::FaceOffset {
+            target: take(&mut fields, 0, "target")?,
+            face: take::<FaceRef>(&mut fields, 1, "face")?,
+            distance: take(&mut fields, 2, "distance")?,
+            distance_expr: take(&mut fields, 3, "distance expression")?,
+        },
+        "direct.face_move" => FeatureType::FaceMove {
+            target: take(&mut fields, 0, "target")?,
+            face: take::<FaceRef>(&mut fields, 1, "face")?,
+            translation: take(&mut fields, 2, "translation")?,
+        },
+        "direct.face_delete" => FeatureType::FaceDelete {
+            target: take(&mut fields, 0, "target")?,
+            face: take::<FaceRef>(&mut fields, 1, "face")?,
+        },
+        "direct.face_thicken" => FeatureType::FaceThicken {
+            target: take(&mut fields, 0, "target")?,
+            face: take::<FaceRef>(&mut fields, 1, "face")?,
+            thickness: take(&mut fields, 2, "thickness")?,
+            thickness_expr: take(&mut fields, 3, "thickness expression")?,
+            reverse: take(&mut fields, 4, "reverse")?,
+        },
         "exchange.step_import" => {
             return Err("STEP imports must use a content-addressed asset payload".into())
+        }
+        "exchange.stl_import" => {
+            return Err("STL imports must use a content-addressed asset payload".into())
         }
         _ => return Err(format!("unknown feature kind '{kind}'")),
     };
@@ -464,6 +566,63 @@ mod tests {
                 && factor == 2.5
                 && expression == "scale_factor"
                 && center == [1.0, 2.0, 3.0]
+        ));
+    }
+
+    #[test]
+    fn phase5_direct_edit_payloads_have_stable_v1_round_trips() {
+        let face = FaceRef {
+            centroid: [1.0, 2.0, 3.0],
+            normal: [0.0, 0.0, 1.0],
+            topology: None,
+        };
+        let offset = FeatureType::FaceOffset {
+            target: "imported".into(),
+            face: face.clone(),
+            distance: -2.5,
+            distance_expr: Some("-wall".into()),
+        };
+        assert!(matches!(
+            decode("direct.face_offset", encode(&offset)).unwrap(),
+            FeatureType::FaceOffset {
+                target,
+                distance,
+                distance_expr: Some(expression),
+                ..
+            } if target == "imported" && distance == -2.5 && expression == "-wall"
+        ));
+        let moved = FeatureType::FaceMove {
+            target: "imported".into(),
+            face: face.clone(),
+            translation: [0.0, 0.0, 4.0],
+        };
+        assert!(matches!(
+            decode("direct.face_move", encode(&moved)).unwrap(),
+            FeatureType::FaceMove { translation, .. } if translation == [0.0, 0.0, 4.0]
+        ));
+        let deleted = FeatureType::FaceDelete {
+            target: "imported".into(),
+            face: face.clone(),
+        };
+        assert!(matches!(
+            decode("direct.face_delete", encode(&deleted)).unwrap(),
+            FeatureType::FaceDelete { target, .. } if target == "imported"
+        ));
+        let thickened = FeatureType::FaceThicken {
+            target: "imported".into(),
+            face,
+            thickness: 1.25,
+            thickness_expr: Some("sheet".into()),
+            reverse: true,
+        };
+        assert!(matches!(
+            decode("direct.face_thicken", encode(&thickened)).unwrap(),
+            FeatureType::FaceThicken {
+                thickness,
+                thickness_expr: Some(expression),
+                reverse: true,
+                ..
+            } if thickness == 1.25 && expression == "sheet"
         ));
     }
 }

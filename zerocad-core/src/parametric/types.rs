@@ -67,6 +67,10 @@ pub struct Variable {
     pub name: String,
     pub value: f64,
     pub unit: Unit,
+    /// Optional expression evaluated in base units. `value` remains the
+    /// last-valid/fallback display value in `unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
 }
 
 impl Variable {
@@ -76,6 +80,7 @@ impl Variable {
             name: name.into(),
             value: 0.0,
             unit,
+            expression: None,
         }
     }
 
@@ -83,6 +88,19 @@ impl Variable {
     pub fn value_in_base(&self) -> f64 {
         self.unit.to_base(self.value)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableDiagnostic {
+    pub name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VariableResolution {
+    pub values: std::collections::HashMap<String, f64>,
+    pub dependencies: std::collections::BTreeMap<String, Vec<String>>,
+    pub diagnostics: Vec<VariableDiagnostic>,
 }
 
 /// Optional stable topology identity for a selected edge.
@@ -377,6 +395,14 @@ pub enum FeatureType {
         depth: Option<f32>,
         #[serde(default)]
         kind: HoleKind,
+        /// Optional standards-library identity plus the resolved values used to
+        /// create this hole. Evaluation always uses the numeric fields above.
+        #[serde(default)]
+        standard: Option<super::standards::StandardReference>,
+        /// Persisted machining intent. A blind-hole drill point changes exact
+        /// geometry; tap/thread fields describe cosmetic manufacturing intent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manufacturing: Option<super::standards::HoleManufacturingMetadata>,
     },
     /// Replicate an existing BODY node's solids: linear/circular arrays and
     /// mirrors. v1 patterns whole bodies (the instances land as one new body);
@@ -434,6 +460,10 @@ pub enum FeatureType {
         /// Human designation for display (e.g. "M6×1", "¼-20 UNC", "Custom").
         #[serde(default)]
         designation: String,
+        /// Optional standards-library identity plus the resolved values used to
+        /// create this thread. Evaluation never re-queries the live table.
+        #[serde(default)]
+        standard: Option<super::standards::StandardReference>,
     },
     /// A reference plane (datum). Carries no geometry of its own — it resolves
     /// to a [`crate::geometry::CoordinateSystem`] during evaluation and exists
@@ -491,6 +521,50 @@ pub enum FeatureType {
         #[serde(default)]
         factor_expr: Option<String>,
         center: [f32; 3],
+    },
+    /// Move a reattached planar face along its outward normal. Positive values
+    /// add material (Press/Pull outward); negative values remove material.
+    /// The source body is consumed only after the rebuilt solid passes strict
+    /// validation.
+    FaceOffset {
+        target: String,
+        face: FaceRef,
+        distance: f32,
+        #[serde(default)]
+        distance_expr: Option<String>,
+    },
+    /// Translate a reattached planar face. Phase 5 accepts the exact direct-
+    /// modeling case where the vector is parallel to the face normal; a
+    /// tangential component is rejected instead of approximated.
+    FaceMove {
+        target: String,
+        face: FaceRef,
+        translation: [f32; 3],
+    },
+    /// Remove one face and heal the surrounding solid. Phase 5 supports
+    /// internal cylindrical faces (hole deletion); other topology changes fail
+    /// explicitly and leave the input untouched.
+    FaceDelete {
+        target: String,
+        face: FaceRef,
+    },
+    /// Create a new solid by thickening one planar face. The source remains in
+    /// the document and the new feature owns the thickened result.
+    FaceThicken {
+        target: String,
+        face: FaceRef,
+        thickness: f32,
+        #[serde(default)]
+        thickness_expr: Option<String>,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// A validated triangle-mesh body imported from ASCII or binary STL. The
+    /// bytes are stored as a content-addressed required asset in `.zcad` files.
+    /// Mesh bodies remain distinct from B-Reps and cannot enter solid booleans.
+    ImportStl {
+        stl_data: Vec<u8>,
+        label: String,
     },
 }
 

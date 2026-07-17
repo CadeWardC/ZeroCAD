@@ -830,20 +830,181 @@ impl ParametricGraph {
     /// variable sets contribute (visibility is a rendering concern, not a
     /// definition one); a duplicate name keeps the last one seen.
     pub fn variable_map(&self) -> HashMap<String, f64> {
-        let mut map = HashMap::new();
+        self.resolve_variables().values
+    }
+
+    /// Resolve literal and expression-backed parameters, including forward
+    /// references, while reporting duplicate names, invalid identifiers,
+    /// unknown dependencies, malformed expressions, and cycles. Failed rows
+    /// retain their stored fallback value so geometry remains available.
+    pub fn resolve_variables(&self) -> VariableResolution {
+        let mut definitions: HashMap<String, Variable> = HashMap::new();
+        let mut diagnostics = Vec::new();
         for idx in self.graph.node_indices() {
             if self.is_feature_suppressed(&self.graph[idx].id) {
                 continue;
             }
             if let FeatureType::VariableSet { variables } = &self.graph[idx].feature {
                 for v in variables {
-                    if !v.name.trim().is_empty() {
-                        map.insert(v.name.clone(), v.value_in_base());
+                    let name = v.name.trim();
+                    if !crate::expr::is_valid_identifier(name) {
+                        diagnostics.push(VariableDiagnostic {
+                            name: v.name.clone(),
+                            message: "name must start with a letter or '_' and contain only letters, digits, or '_'"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    if definitions.insert(name.to_string(), v.clone()).is_some() {
+                        diagnostics.push(VariableDiagnostic {
+                            name: name.to_string(),
+                            message: "duplicate parameter name; the last definition is active"
+                                .to_string(),
+                        });
                     }
                 }
             }
         }
-        map
+
+        fn resolve_one(
+            name: &str,
+            definitions: &HashMap<String, Variable>,
+            states: &mut HashMap<String, u8>,
+            values: &mut HashMap<String, f64>,
+            dependencies: &mut std::collections::BTreeMap<String, Vec<String>>,
+        ) -> Result<f64, String> {
+            match states.get(name).copied().unwrap_or(0) {
+                1 => return Err(format!("cyclic dependency involving '{name}'")),
+                2 => {
+                    return values
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| format!("parameter '{name}' did not resolve"))
+                }
+                _ => {}
+            }
+            let variable = definitions
+                .get(name)
+                .ok_or_else(|| format!("unknown parameter '{name}'"))?;
+            states.insert(name.to_string(), 1);
+            let result = if let Some(expression) = variable
+                .expression
+                .as_deref()
+                .filter(|expression| !expression.trim().is_empty())
+            {
+                let refs = crate::expr::identifiers(expression)?;
+                dependencies.insert(name.to_string(), refs.clone());
+                let mut scope = HashMap::new();
+                for dependency in refs {
+                    if !definitions.contains_key(&dependency) {
+                        states.insert(name.to_string(), 0);
+                        return Err(format!("unknown parameter '{dependency}'"));
+                    }
+                    let value =
+                        match resolve_one(&dependency, definitions, states, values, dependencies) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                states.insert(name.to_string(), 0);
+                                return Err(error);
+                            }
+                        };
+                    scope.insert(dependency, value);
+                }
+                crate::expr::eval(expression, &scope)
+            } else {
+                dependencies.insert(name.to_string(), Vec::new());
+                Ok(variable.value_in_base())
+            };
+            match result {
+                Ok(value) => {
+                    states.insert(name.to_string(), 2);
+                    values.insert(name.to_string(), value);
+                    Ok(value)
+                }
+                Err(error) => {
+                    states.insert(name.to_string(), 0);
+                    Err(error)
+                }
+            }
+        }
+
+        let mut values = HashMap::new();
+        let mut states = HashMap::new();
+        let mut dependencies = std::collections::BTreeMap::new();
+        let mut names: Vec<String> = definitions.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            if let Err(message) = resolve_one(
+                &name,
+                &definitions,
+                &mut states,
+                &mut values,
+                &mut dependencies,
+            ) {
+                diagnostics.push(VariableDiagnostic {
+                    name: name.clone(),
+                    message,
+                });
+                if let Some(variable) = definitions.get(&name) {
+                    values.insert(name, variable.value_in_base());
+                }
+            }
+        }
+        diagnostics.sort_by(|a, b| a.name.cmp(&b.name).then(a.message.cmp(&b.message)));
+        diagnostics.dedup();
+        VariableResolution {
+            values,
+            dependencies,
+            diagnostics,
+        }
+    }
+
+    /// Rename one document parameter and rewrite every expression reference at
+    /// identifier boundaries. Ambiguous or colliding names are rejected before
+    /// any mutation, making the operation atomic.
+    pub fn rename_variable(&mut self, old: &str, new: &str) -> Result<(), String> {
+        let old = old.trim();
+        let new = new.trim();
+        if !crate::expr::is_valid_identifier(old) {
+            return Err(format!("'{old}' is not a valid existing parameter name"));
+        }
+        if !crate::expr::is_valid_identifier(new) {
+            return Err(format!("'{new}' is not a valid parameter name"));
+        }
+        if old == new {
+            return Ok(());
+        }
+        let mut old_count = 0;
+        let mut new_count = 0;
+        for node in self.graph.node_weights() {
+            if let FeatureType::VariableSet { variables } = &node.feature {
+                old_count += variables
+                    .iter()
+                    .filter(|variable| variable.name == old)
+                    .count();
+                new_count += variables
+                    .iter()
+                    .filter(|variable| variable.name == new)
+                    .count();
+            }
+        }
+        if old_count != 1 {
+            return Err(format!(
+                "parameter '{old}' must have exactly one definition (found {old_count})"
+            ));
+        }
+        if new_count != 0 {
+            return Err(format!("parameter '{new}' already exists"));
+        }
+        for node in self.graph.node_weights_mut() {
+            rename_feature_expressions(&mut node.feature, old, new);
+            if let FeatureType::VariableSet { variables } = &mut node.feature {
+                if let Some(variable) = variables.iter_mut().find(|variable| variable.name == old) {
+                    variable.name = new.to_string();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Perform a topological sort of the history graph and evaluate the 3D model.
@@ -1432,6 +1593,42 @@ impl ParametricGraph {
                     )),
                 }
             }
+            crate::document::FeatureEvaluatorKind::ImportStl => {
+                let FeatureType::ImportStl { stl_data, label } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
+                match crate::stl::read_stl_mesh(stl_data) {
+                    Ok(imported) => {
+                        let mut mesh = imported.mesh;
+                        let report = imported.validation;
+                        stamp_generated_face_refs(&mut mesh, &node.id, "stl");
+                        for face in &mut mesh.face_refs {
+                            if let Some(topology) = face.topology.as_mut() {
+                                topology.surface_kind = Some("mesh_triangle".to_string());
+                            }
+                        }
+                        crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+                        for diagnostic in report.diagnostics() {
+                            warnings.push(format!(
+                                "STL import '{}' ({}): {diagnostic}.",
+                                node.id, label
+                            ));
+                        }
+                        apply_new(
+                            live,
+                            LiveBody {
+                                id: node.id.clone(),
+                                parts: Vec::new(),
+                                pristine: Some(mesh.into()),
+                                sketch_source: None,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        warnings.push(format!("STL import '{}' ({}): {error}.", node.id, label))
+                    }
+                }
+            }
             crate::document::FeatureEvaluatorKind::Extrude => {
                 let FeatureType::Extrude {
                     depth,
@@ -1606,6 +1803,82 @@ impl ParametricGraph {
                 };
                 apply_body_scale(&node.id, source, effective_factor, *center, live, warnings);
             }
+            crate::document::FeatureEvaluatorKind::FaceOffset => {
+                let FeatureType::FaceOffset {
+                    target,
+                    face,
+                    distance,
+                    distance_expr,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                let effective_distance = match distance_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, vars) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Press/Pull '{}': distance expression \"{}\" no longer evaluates; using last value {:.6}.",
+                                node.id, expression, distance
+                            ));
+                            *distance
+                        }
+                    },
+                    None => *distance,
+                };
+                apply_face_offset(&node.id, target, face, effective_distance, live, warnings);
+            }
+            crate::document::FeatureEvaluatorKind::FaceMove => {
+                let FeatureType::FaceMove {
+                    target,
+                    face,
+                    translation,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                apply_face_move(&node.id, target, face, *translation, live, warnings);
+            }
+            crate::document::FeatureEvaluatorKind::FaceDelete => {
+                let FeatureType::FaceDelete { target, face } = &node.feature else {
+                    return Err(payload_mismatch());
+                };
+                apply_face_delete(&node.id, target, face, live, warnings);
+            }
+            crate::document::FeatureEvaluatorKind::FaceThicken => {
+                let FeatureType::FaceThicken {
+                    target,
+                    face,
+                    thickness,
+                    thickness_expr,
+                    reverse,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                let effective_thickness = match thickness_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, vars) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Thicken face '{}': thickness expression \"{}\" no longer evaluates; using last value {:.6}.",
+                                node.id, expression, thickness
+                            ));
+                            *thickness
+                        }
+                    },
+                    None => *thickness,
+                };
+                apply_face_thicken(
+                    &node.id,
+                    target,
+                    face,
+                    effective_thickness,
+                    *reverse,
+                    live,
+                    warnings,
+                );
+            }
             crate::document::FeatureEvaluatorKind::Thread => {
                 let FeatureType::Thread {
                     target,
@@ -1718,6 +1991,8 @@ impl ParametricGraph {
                     diameter_expr,
                     depth,
                     kind,
+                    manufacturing,
+                    ..
                 } = &node.feature
                 else {
                     return Err(payload_mismatch());
@@ -1744,6 +2019,9 @@ impl ParametricGraph {
                     eff_diameter,
                     *depth,
                     kind,
+                    manufacturing
+                        .as_ref()
+                        .and_then(|metadata| metadata.drill_point_angle_deg),
                     live,
                     warnings,
                 );
@@ -2018,6 +2296,7 @@ impl ParametricGraph {
                         | FeatureType::Extrude { .. }
                         | FeatureType::EdgeMod { .. }
                         | FeatureType::Import { .. }
+                        | FeatureType::ImportStl { .. }
                         | FeatureType::Revolve { .. }
                         | FeatureType::Pattern { .. }
                         | FeatureType::BodyTransform { .. }
@@ -2026,6 +2305,10 @@ impl ParametricGraph {
                         | FeatureType::BodyIntersect { .. }
                         | FeatureType::BodySplit { .. }
                         | FeatureType::BodyScale { .. }
+                        | FeatureType::FaceOffset { .. }
+                        | FeatureType::FaceMove { .. }
+                        | FeatureType::FaceDelete { .. }
+                        | FeatureType::FaceThicken { .. }
                         | FeatureType::Hole { .. }
                         | FeatureType::Shell { .. }
                         | FeatureType::Loft { .. }
@@ -2755,6 +3038,117 @@ impl ParametricGraph {
     }
 }
 
+fn rename_expression(expression: &mut Option<String>, old: &str, new: &str) {
+    if let Some(expression) = expression {
+        *expression = crate::expr::rename_identifier(expression, old, new);
+    }
+}
+
+fn rename_dimension_expression(dimension: &mut crate::sketch::Dimension, old: &str, new: &str) {
+    rename_expression(&mut dimension.expr, old, new);
+}
+
+fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
+    match feature {
+        FeatureType::Sketch {
+            shapes,
+            corner_mods,
+            solver,
+            ..
+        } => {
+            for shape in shapes {
+                match shape {
+                    crate::sketch::SketchShape::Rectangle { w, h, .. } => {
+                        rename_dimension_expression(w, old, new);
+                        rename_dimension_expression(h, old, new);
+                    }
+                    crate::sketch::SketchShape::Circle { diameter, .. }
+                    | crate::sketch::SketchShape::RegularPolygon { diameter, .. } => {
+                        rename_dimension_expression(diameter, old, new);
+                    }
+                    crate::sketch::SketchShape::Line {
+                        length, angle_deg, ..
+                    } => {
+                        rename_dimension_expression(length, old, new);
+                        rename_dimension_expression(angle_deg, old, new);
+                    }
+                    crate::sketch::SketchShape::Spline { .. }
+                    | crate::sketch::SketchShape::Imported { .. }
+                    | crate::sketch::SketchShape::Raw { .. } => {}
+                }
+            }
+            for corner in corner_mods {
+                rename_dimension_expression(&mut corner.radius, old, new);
+            }
+            if let Some(solver) = solver {
+                for constraint in &mut solver.constraints {
+                    match constraint {
+                        crate::sketch::Constraint::Distance { d, .. } => {
+                            rename_dimension_expression(d, old, new)
+                        }
+                        crate::sketch::Constraint::Radius { r, .. } => {
+                            rename_dimension_expression(r, old, new)
+                        }
+                        crate::sketch::Constraint::DistanceX { d, .. }
+                        | crate::sketch::Constraint::DistanceY { d, .. }
+                        | crate::sketch::Constraint::Diameter { d, .. } => {
+                            rename_dimension_expression(d, old, new)
+                        }
+                        crate::sketch::Constraint::Angle { angle_deg, .. } => {
+                            rename_dimension_expression(angle_deg, old, new)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        FeatureType::Extrude { depth_expr, .. } => rename_expression(depth_expr, old, new),
+        FeatureType::EdgeMod { dist_expr, .. } => rename_expression(dist_expr, old, new),
+        FeatureType::VariableSet { variables } => {
+            for variable in variables {
+                rename_expression(&mut variable.expression, old, new);
+            }
+        }
+        FeatureType::Revolve { angle_expr, .. } => rename_expression(angle_expr, old, new),
+        FeatureType::Shell { thickness_expr, .. } => rename_expression(thickness_expr, old, new),
+        FeatureType::Hole { diameter_expr, .. } => rename_expression(diameter_expr, old, new),
+        FeatureType::Pattern { kind, .. } => match kind {
+            PatternKind::Linear { spacing_expr, .. } => rename_expression(spacing_expr, old, new),
+            PatternKind::Mirror { offset_expr, .. } => rename_expression(offset_expr, old, new),
+            PatternKind::Circular { .. } => {}
+        },
+        FeatureType::DatumPlane { def } => match def {
+            DatumPlaneDef::Offset { distance_expr, .. } => {
+                rename_expression(distance_expr, old, new)
+            }
+            DatumPlaneDef::Angle { angle_expr, .. } => rename_expression(angle_expr, old, new),
+            DatumPlaneDef::ThreePoints { .. } | DatumPlaneDef::MidPlane { .. } => {}
+        },
+        FeatureType::BodyScale { factor_expr, .. } => rename_expression(factor_expr, old, new),
+        FeatureType::FaceOffset { distance_expr, .. } => rename_expression(distance_expr, old, new),
+        FeatureType::FaceThicken { thickness_expr, .. } => {
+            rename_expression(thickness_expr, old, new)
+        }
+        FeatureType::Origin
+        | FeatureType::Box { .. }
+        | FeatureType::Cylinder { .. }
+        | FeatureType::Import { .. }
+        | FeatureType::ImportStl { .. }
+        | FeatureType::Loft { .. }
+        | FeatureType::Sweep { .. }
+        | FeatureType::BodyTransform { .. }
+        | FeatureType::Thread { .. }
+        | FeatureType::DatumAxis { .. }
+        | FeatureType::DatumPoint { .. }
+        | FeatureType::BodyJoin { .. }
+        | FeatureType::BodyCut { .. }
+        | FeatureType::BodyIntersect { .. }
+        | FeatureType::BodySplit { .. }
+        | FeatureType::FaceMove { .. }
+        | FeatureType::FaceDelete { .. } => {}
+    }
+}
+
 /// Apply a persistent rigid translation to a live body. A copy leaves the
 /// source untouched; a move consumes it and gives the transform node the new
 /// body identity so subsequent features can target the moved result.
@@ -2773,9 +3167,9 @@ fn apply_body_transform(
         return;
     };
     let source_body = live[source_index].clone();
-    if source_body.parts.is_empty() {
+    if source_body.parts.is_empty() && source_body.pristine.is_none() {
         warnings.push(format!(
-            "Body transform '{node_id}': source body '{source}' has no solid geometry."
+            "Body transform '{node_id}': source body '{source}' has no geometry."
         ));
         return;
     }
@@ -3229,7 +3623,7 @@ impl ParametricGraph {
 
 /// Stamp a generated body's faces `{kind}:{node}:face:{k}` in quantized-
 /// centroid order (stable across runs).
-fn stamp_generated_face_refs(mesh: &mut MockMesh, body_id: &str, kind: &str) {
+pub(crate) fn stamp_generated_face_refs(mesh: &mut MockMesh, body_id: &str, kind: &str) {
     let quant = |v: f32| (v as f64 * 1.0e3).round() as i64;
     let mut order: Vec<usize> = (0..mesh.face_refs.len())
         .filter(|&i| mesh.face_refs[i].topology.is_none())
@@ -3336,6 +3730,7 @@ fn apply_hole(
     diameter: f32,
     depth: Option<f32>,
     kind: &HoleKind,
+    drill_point_angle_deg: Option<f32>,
     live: &mut Vec<LiveBody>,
     warnings: &mut Vec<String>,
 ) {
@@ -3368,6 +3763,7 @@ fn apply_hole(
     let overshoot = CUT_OVERSHOOT;
     let start = pos.sub(dir.mul(overshoot));
     let bore_len = match depth {
+        Some(d) if d > 0.0 && drill_point_angle_deg.is_some() => d + overshoot,
         Some(d) if d > 0.0 => d + 2.0 * overshoot,
         Some(_) => {
             warnings.push(format!("Hole '{node_id}': depth must be positive."));
@@ -3386,6 +3782,12 @@ fn apply_hole(
     // Head-before-bore is also the natural machining order, so this is a
     // correct model, not merely a dodge.
     let mut cut_tools: Vec<CutTool> = Vec::new();
+    if drill_point_angle_deg.is_some_and(|angle| !(angle > 0.0 && angle < 180.0)) {
+        warnings.push(format!(
+            "Hole '{node_id}': drill-point angle must be in (0, 180)."
+        ));
+        return;
+    }
     match kind {
         HoleKind::Simple => {}
         HoleKind::Counterbore {
@@ -3433,8 +3835,18 @@ fn apply_hole(
             }
         }
     }
-    let bore =
-        crate::mock_kernel::cylinder_tool_at(start, dir, diameter as f64 / 2.0, bore_len as f64);
+    let bore = match drill_point_angle_deg.filter(|_| depth.is_some()) {
+        Some(angle) => crate::mock_kernel::drill_point_tool_at(
+            start,
+            dir,
+            diameter as f64 / 2.0,
+            bore_len as f64,
+            angle as f64,
+        ),
+        None => {
+            crate::mock_kernel::cylinder_tool_at(start, dir, diameter as f64 / 2.0, bore_len as f64)
+        }
+    };
     match bore {
         Some(tool) => cut_tools.push(CutTool::single_direction(Some(tool), None, None, None)),
         None => {
@@ -4851,6 +5263,12 @@ pub(crate) fn hash_curves(c: &SketchCurves) -> u64 {
         ] {
             h.write_u32(v.to_bits());
         }
+    }
+    h.write_usize(c.splines.len());
+    for spline in &c.splines {
+        let encoded = serde_json::to_vec(spline).expect("sketch spline must serialize");
+        h.write_usize(encoded.len());
+        h.write(&encoded);
     }
     h.finish()
 }

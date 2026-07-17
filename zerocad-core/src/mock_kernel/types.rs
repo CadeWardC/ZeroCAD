@@ -187,6 +187,34 @@ impl MockMesh {
         }
     }
 
+    /// Apply a positive uniform scale about `center` to display geometry and
+    /// picking metadata. Positive uniform scaling leaves unit normals and
+    /// winding unchanged.
+    pub(crate) fn scale_uniform(&mut self, factor: f32, center: [f32; 3]) {
+        let scale_point = |point: &mut [f32]| {
+            for axis in 0..3 {
+                point[axis] = center[axis] + (point[axis] - center[axis]) * factor;
+            }
+        };
+        for vertex in self.vertices.chunks_exact_mut(6) {
+            scale_point(vertex);
+        }
+        for vertex in self.edge_vertices.chunks_exact_mut(3) {
+            scale_point(vertex);
+        }
+        for edge in &mut self.edge_refs {
+            for axis in 0..3 {
+                edge.p0[axis] = center[axis] + (edge.p0[axis] - center[axis]) * factor;
+                edge.p1[axis] = center[axis] + (edge.p1[axis] - center[axis]) * factor;
+            }
+        }
+        for face in &mut self.face_refs {
+            for axis in 0..3 {
+                face.centroid[axis] = center[axis] + (face.centroid[axis] - center[axis]) * factor;
+            }
+        }
+    }
+
     /// Largest face id currently in this mesh, or `None` when there are no faces.
     fn max_face_id(&self) -> Option<u32> {
         self.face_ids.iter().copied().max()

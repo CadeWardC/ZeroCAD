@@ -15,7 +15,9 @@ use zerocad_core::{
 };
 
 mod combine_ui;
+mod direct_edit_ui;
 mod document_worker;
+mod dxf_ui;
 mod edgemod;
 mod evaluation_worker;
 mod expr;
@@ -24,8 +26,10 @@ mod geom2d;
 mod gpu_viewport;
 mod hole_ui;
 mod icons;
+mod inspection_ui;
 mod loft_sweep_ui;
 mod move_ui;
+mod parameters_ui;
 mod pattern_ui;
 mod phase35_ui;
 mod render;
@@ -38,13 +42,16 @@ mod theme;
 mod thread_ui;
 mod thumbnail;
 use combine_ui::CombineOp;
+use direct_edit_ui::DirectFaceCommand;
 use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
 use geom2d::{circumcircle, dist_point_to_segment, is_point_in_quad, project_point_on_segment};
 use hole_ui::HoleOp;
+use inspection_ui::{InspectionDialog, SectionView};
 use loft_sweep_ui::SweepOp;
 use move_ui::{BodyClipboard, MoveOp};
+use parameters_ui::ParametersDialog;
 use pattern_ui::PatternOp;
 use phase35_ui::{ScaleBodyOp, SplitBodyOp};
 use revolve_ui::RevolveOp;
@@ -53,6 +60,7 @@ use shortcuts::{Keymap, ShortcutAction};
 use sketch_ui::{dim_fields_for, DimInput};
 use theme::{apply_premium_dark_theme, apply_premium_light_theme, Palette};
 use thread_ui::ThreadOp;
+use zerocad_core::parametric::FaceRef;
 
 fn main() -> eframe::Result<()> {
     let mut builder = env_logger::Builder::from_default_env();
@@ -118,6 +126,12 @@ fn main() -> eframe::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SketchTool {
     Line,
+    /// Cubic B-spline defined by editable control points. Double-click or press
+    /// Enter to finish the current curve.
+    ControlPointSpline,
+    /// Interpolating spline through editable fit points. Double-click or press
+    /// Enter to finish the current curve.
+    FitPointSpline,
     /// Corner-to-corner rectangle (the Rectangle button's default).
     Rectangle,
     /// Rectangle from its center to a corner.
@@ -189,6 +203,7 @@ pub(crate) struct MidlineGuide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFamily {
     Line,
+    Spline,
     Rectangle,
     Circle,
     /// The regular-polygon button, holding the inscribed and circumscribed modes.
@@ -205,6 +220,7 @@ impl SketchTool {
     pub fn family(self) -> ToolFamily {
         match self {
             SketchTool::Line => ToolFamily::Line,
+            SketchTool::ControlPointSpline | SketchTool::FitPointSpline => ToolFamily::Spline,
             SketchTool::Rectangle
             | SketchTool::RectangleCenter
             | SketchTool::RectangleThreePoint => ToolFamily::Rectangle,
@@ -224,6 +240,8 @@ impl SketchTool {
     pub fn point_count(self) -> usize {
         match self {
             SketchTool::Line
+            | SketchTool::ControlPointSpline
+            | SketchTool::FitPointSpline
             | SketchTool::Rectangle
             | SketchTool::RectangleCenter
             | SketchTool::Circle
@@ -252,6 +270,13 @@ impl SketchTool {
         )
     }
 
+    pub fn is_spline(self) -> bool {
+        matches!(
+            self,
+            SketchTool::ControlPointSpline | SketchTool::FitPointSpline
+        )
+    }
+
     /// The corner-modifier kind for the Fillet/Chamfer tools, else `None`.
     pub fn corner_kind(self) -> Option<CornerKind> {
         match self {
@@ -265,6 +290,7 @@ impl SketchTool {
     pub(crate) fn icon(self) -> icons::Icon {
         match self {
             SketchTool::Line => icons::Icon::Line,
+            SketchTool::ControlPointSpline | SketchTool::FitPointSpline => icons::Icon::Line,
             SketchTool::Rectangle => icons::Icon::Rectangle,
             SketchTool::RectangleCenter => icons::Icon::RectangleFromCenter,
             SketchTool::RectangleThreePoint => icons::Icon::RectangleThreePoints,
@@ -283,6 +309,8 @@ impl SketchTool {
     pub fn label(self) -> &'static str {
         match self {
             SketchTool::Line => "Line",
+            SketchTool::ControlPointSpline => "Control Point Spline",
+            SketchTool::FitPointSpline => "Fit Point Spline",
             SketchTool::Rectangle => "Rectangle",
             SketchTool::RectangleCenter => "Center Rectangle",
             SketchTool::RectangleThreePoint => "3-Point Rectangle",
@@ -304,6 +332,7 @@ impl ToolFamily {
     pub fn default_mode(self) -> SketchTool {
         match self {
             ToolFamily::Line => SketchTool::Line,
+            ToolFamily::Spline => SketchTool::ControlPointSpline,
             ToolFamily::Rectangle => SketchTool::Rectangle,
             ToolFamily::Circle => SketchTool::Circle,
             ToolFamily::Polygon => SketchTool::PolygonInscribed,
@@ -316,6 +345,7 @@ impl ToolFamily {
     pub fn modes(self) -> &'static [SketchTool] {
         match self {
             ToolFamily::Line => &[SketchTool::Line],
+            ToolFamily::Spline => &[SketchTool::ControlPointSpline, SketchTool::FitPointSpline],
             ToolFamily::Rectangle => &[
                 SketchTool::Rectangle,
                 SketchTool::RectangleCenter,
@@ -349,7 +379,9 @@ fn sketch_variable_dims(shapes: &[SketchShape]) -> Vec<String> {
                 length, angle_deg, ..
             } => vec![length, angle_deg],
             SketchShape::RegularPolygon { diameter, .. } => vec![diameter],
-            SketchShape::Raw { .. } => vec![],
+            SketchShape::Spline { .. } | SketchShape::Imported { .. } | SketchShape::Raw { .. } => {
+                vec![]
+            }
         };
         for d in dims {
             if let Some(e) = &d.expr {
@@ -723,6 +755,10 @@ struct ZeroCadApp {
     /// Material density (g/cm³) for the Measure panel's mass line. A display
     /// preference, not part of the document.
     measure_density: f32,
+    /// Read-only measure/section/interference workspace.
+    inspection_dialog: Option<InspectionDialog>,
+    /// Active visual section plane; presentation-only and never serialized.
+    section_view: Option<SectionView>,
     /// In plane-selection mode, the planar body face `(node_id, face_id)` under
     /// the cursor. A hovered face takes priority over the origin plane quads and,
     /// when clicked, starts a sketch on that face (the same path as pre-selecting
@@ -887,6 +923,8 @@ struct ZeroCadApp {
 
     /// Whether the Settings window is open.
     show_preferences: bool,
+    /// Centralized parameter table, staged until Apply for atomic validation.
+    parameters_dialog: Option<ParametersDialog>,
     /// Which tab is selected in the Settings window.
     settings_tab: SettingsTab,
     /// User-configurable keyboard shortcuts (loaded from disk on startup).

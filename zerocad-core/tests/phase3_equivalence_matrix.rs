@@ -76,6 +76,8 @@ fn add_hole(graph: &mut ParametricGraph, id: &str) {
             diameter_expr: None,
             depth: None,
             kind: HoleKind::Simple,
+            standard: None,
+            manufacturing: None,
         },
     });
     graph.add_dependency("box_1", id);

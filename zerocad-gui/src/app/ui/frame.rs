@@ -44,6 +44,14 @@ impl ZeroCadApp {
     }
 
     pub(crate) fn handle_sketch_keys(&mut self, ctx: &egui::Context) {
+        if self.is_sketch_mode
+            && self.dim_input.is_none()
+            && self.active_tool.is_some_and(SketchTool::is_spline)
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        {
+            self.finish_in_progress_spline();
+        }
+
         // Enter commits the staged Fillet/Chamfer corners (the dimension dialog,
         // when open, owns Enter for its own fields — so only act when it's not).
         if self.is_sketch_mode

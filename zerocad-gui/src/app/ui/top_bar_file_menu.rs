@@ -67,6 +67,22 @@ impl ZeroCadApp {
                 }
 
                 if icons::Icon::Download
+                    .menu_button(ui, "Import STL")
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.import_stl();
+                }
+
+                if icons::Icon::Download
+                    .menu_button(ui, "Import DXF to Sketch")
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.import_dxf();
+                }
+
+                if icons::Icon::Download
                     .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
                     .clicked()
                 {
@@ -83,6 +99,19 @@ impl ZeroCadApp {
                 }
 
                 ui.separator();
+
+                if icons::Icon::Settings
+                    .menu_button(ui, "Parameters")
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.open_parameters_dialog();
+                }
+
+                if icons::Icon::EyeOpen.menu_button(ui, "Inspect").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.open_inspection_dialog();
+                }
 
                 if icons::Icon::Settings
                     .menu_button_hint(ui, "Settings", &hint(self, ShortcutAction::OpenSettings))

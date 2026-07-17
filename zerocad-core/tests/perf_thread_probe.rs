@@ -34,6 +34,7 @@ fn threaded_rod(r: f32, h: f32, pitch: f32, depth: f32) -> ParametricGraph {
             length: None,
             flip: false,
             designation: "probe".into(),
+            standard: None,
         },
     });
     g.add_dependency("cyl_1", "thread_2");

@@ -1,4 +1,5 @@
 pub mod document;
+pub mod dxf;
 pub mod expr;
 mod feature_dto;
 pub mod geometry;
@@ -22,26 +23,36 @@ pub use document::{
     FeatureRegistration, FeatureRegistry, FeatureState, GeometricIntent, SelectionProvenance,
     SelectionTopology, SelectorResolutionTier, SemanticEntityKind, SemanticSelector, SequenceKey,
 };
+pub use dxf::{
+    read_dxf_file, read_dxf_str, DxfDiagnostic, DxfDiagnosticSeverity, DxfError, DxfImport, DxfUnit,
+};
 pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
     body_output_id, body_output_index, body_output_owner_id, boolean_region_plan,
-    complete_selected_circles, edge_wedge_is_concave_mesh, AxisBase, BooleanRegionPlan,
-    DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticSeverity, EdgeRef,
-    EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic, EvaluationError,
-    EvaluationOutput, EvaluationQuality, EvaluationTimings, ExtrudeMode, FeatureNode,
-    FeatureTiming, FeatureType, HoleKind, ParametricGraph, PatternKind, PlaneBase, TopologyEdgeRef,
-    Variable,
+    complete_selected_circles, edge_wedge_is_concave_mesh, AxisBase, BodyInspection,
+    BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticSeverity,
+    EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic,
+    EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings, ExtrudeMode,
+    FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
+    HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, ParametricGraph, PatternKind,
+    PlaneBase, ResolvedStandardGeometry, StandardReference, StandardsFamily, TopologyEdgeRef,
+    Variable, VariableDiagnostic, VariableResolution, HOLE_STANDARD_PRESETS, STANDARDS_LIBRARY_ID,
+    STANDARDS_LIBRARY_VERSION,
 };
 pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,
     effective_curves_solved, overlap_clusters, reflect_curves_across, shape_loops, shapes_cross,
-    shapes_overlap, Circle, CornerKind, CornerMod, Dimension, LineSegment, Region,
-    RegionProvenance, RegionProvenanceFragment, RegionWithProvenance, ShapeLoop, SketchCurves,
-    SketchMirror, SketchShape,
+    shapes_overlap, Circle, CornerKind, CornerMod, Dimension, ImportedSketchMetadata, LineSegment,
+    Region, RegionProvenance, RegionProvenanceFragment, RegionWithProvenance, ShapeLoop,
+    SketchCurves, SketchImportFormat, SketchMirror, SketchShape, Spline, SplineContinuity,
+    SplineKind,
 };
-pub use stl::{meshes_to_3mf, meshes_to_binary_stl, write_binary_stl};
+pub use stl::{
+    meshes_to_3mf, meshes_to_binary_stl, read_stl_mesh, write_binary_stl, StlImportError,
+    StlValidationReport, ValidatedMeshBody,
+};
 pub use units::{Parameter, Unit};
 #[allow(deprecated)]
 pub use zcad_format::{

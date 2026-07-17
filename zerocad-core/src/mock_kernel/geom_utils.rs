@@ -113,6 +113,9 @@ pub struct CylinderFaceInfo {
     pub radius: f32,
     pub axial_min: f32,
     pub axial_max: f32,
+    /// True when the face orientation reverses the cylinder's intrinsic radial
+    /// normal, as on the wall of a drilled hole.
+    pub internal: bool,
 }
 
 /// Find the cylindrical face of `solid` whose wall passes closest to `centroid`
@@ -134,7 +137,7 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
         )
     };
 
-    let mut best: Option<(f32, [f32; 3], [f32; 3], f32)> = None;
+    let mut best: Option<(f32, [f32; 3], [f32; 3], f32, bool)> = None;
     for face in solid.shell().faces() {
         let Some(GeomSurface::Cylinder(cyl)) = face.surface() else {
             continue;
@@ -156,10 +159,16 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
         let (radial, _) = radial_dist(centroid, origin, dir);
         let err = (radial - r).abs();
         if best.as_ref().map_or(true, |b| err < b.0) {
-            best = Some((err, origin, dir, r));
+            best = Some((
+                err,
+                origin,
+                dir,
+                r,
+                face.orientation() == Orientation::Reversed,
+            ));
         }
     }
-    let (_, origin, dir, radius) = best?;
+    let (_, origin, dir, radius, internal) = best?;
 
     // Axial extent from the tessellated vertices that lie on this cylinder.
     let mesh = try_display_mesh_from_part(solid)?;
@@ -182,6 +191,7 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
         radius,
         axial_min: amin,
         axial_max: amax,
+        internal,
     })
 }
 

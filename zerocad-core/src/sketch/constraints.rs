@@ -64,6 +64,20 @@ pub struct SketchPoint {
     pub pos: (f64, f64),
 }
 
+/// Associative source record for construction geometry projected from a body
+/// edge. `entity_ids` and `point_ids` identify the generated sketch elements;
+/// they are locked by the solver and can be rebuilt in place when the named
+/// source edge changes upstream.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectedEdgeReference {
+    pub source_body: String,
+    pub source: crate::parametric::EdgeRef,
+    #[serde(default)]
+    pub entity_ids: Vec<EntityId>,
+    #[serde(default)]
+    pub point_ids: Vec<EntityId>,
+}
+
 /// One solver entity. `derived_from` records the legacy shape (its
 /// [`EntityId`]) this entity was promoted from, so region provenance keeps
 /// emitting the pre-promotion fragment ids and references captured before the
@@ -93,6 +107,20 @@ pub enum SketchEntity {
         #[serde(default)]
         derived_from: Option<EntityId>,
     },
+    Spline {
+        id: EntityId,
+        points: Vec<EntityId>,
+        kind: crate::sketch::SplineKind,
+        degree: u8,
+        knots: Vec<f32>,
+        weights: Vec<f32>,
+        closed: bool,
+        periodic: bool,
+        continuity: crate::sketch::SplineContinuity,
+        trim: Option<(f32, f32)>,
+        #[serde(default)]
+        derived_from: Option<EntityId>,
+    },
 }
 
 impl SketchEntity {
@@ -100,7 +128,8 @@ impl SketchEntity {
         match self {
             SketchEntity::Line { id, .. }
             | SketchEntity::Circle { id, .. }
-            | SketchEntity::Arc { id, .. } => *id,
+            | SketchEntity::Arc { id, .. }
+            | SketchEntity::Spline { id, .. } => *id,
         }
     }
 
@@ -108,7 +137,8 @@ impl SketchEntity {
         match self {
             SketchEntity::Line { derived_from, .. }
             | SketchEntity::Circle { derived_from, .. }
-            | SketchEntity::Arc { derived_from, .. } => *derived_from,
+            | SketchEntity::Arc { derived_from, .. }
+            | SketchEntity::Spline { derived_from, .. } => *derived_from,
         }
     }
 }
@@ -171,6 +201,64 @@ pub enum Constraint {
     },
     /// A point anchored at its current position (kills rigid-body freedom).
     Fixed { id: EntityId, p: EntityId },
+    /// Signed horizontal separation between two points.
+    DistanceX {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+        d: crate::sketch::Dimension,
+    },
+    /// Signed vertical separation between two points.
+    DistanceY {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+        d: crate::sketch::Dimension,
+    },
+    /// Included angle between two lines in degrees.
+    Angle {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+        angle_deg: crate::sketch::Dimension,
+    },
+    /// Two circles/arcs share a center.
+    Concentric {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+    },
+    /// A point lies at a line's midpoint.
+    Midpoint {
+        id: EntityId,
+        point: EntityId,
+        line: EntityId,
+    },
+    /// A point lies on a line or circle/arc.
+    PointOnObject {
+        id: EntityId,
+        point: EntityId,
+        object: EntityId,
+    },
+    /// Two lines lie on the same infinite line.
+    Collinear {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+    },
+    /// Two points are mirror-symmetric about a line.
+    Symmetric {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+        axis: EntityId,
+    },
+    /// Driving circle/arc diameter.
+    Diameter {
+        id: EntityId,
+        circle: EntityId,
+        d: crate::sketch::Dimension,
+    },
 }
 
 impl Constraint {
@@ -185,7 +273,16 @@ impl Constraint {
             | Constraint::Perpendicular { id, .. }
             | Constraint::Tangent { id, .. }
             | Constraint::Equal { id, .. }
-            | Constraint::Fixed { id, .. } => *id,
+            | Constraint::Fixed { id, .. }
+            | Constraint::DistanceX { id, .. }
+            | Constraint::DistanceY { id, .. }
+            | Constraint::Angle { id, .. }
+            | Constraint::Concentric { id, .. }
+            | Constraint::Midpoint { id, .. }
+            | Constraint::PointOnObject { id, .. }
+            | Constraint::Collinear { id, .. }
+            | Constraint::Symmetric { id, .. }
+            | Constraint::Diameter { id, .. } => *id,
         }
     }
 }
@@ -204,6 +301,21 @@ pub struct SketchSolverModel {
     pub entities: Vec<SketchEntity>,
     #[serde(default)]
     pub constraints: Vec<Constraint>,
+    /// Entity ids used as reference/construction geometry. They remain in the
+    /// solver and render in the sketch, but do not participate in region
+    /// detection or Part Design profiles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub construction: Vec<EntityId>,
+    /// Dimensional constraints that report the live geometric value without
+    /// contributing a solver equation. The durable constraint id survives a
+    /// driving/reference toggle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driven_dimensions: Vec<EntityId>,
+    /// Body-edge projections are construction geometry, but unlike ordinary
+    /// construction entities they retain a stable source and refresh after an
+    /// upstream rebuild.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_edges: Vec<ProjectedEdgeReference>,
 }
 
 impl SketchSolverModel {
@@ -213,6 +325,22 @@ impl SketchSolverModel {
 
     pub fn point(&self, id: EntityId) -> Option<&SketchPoint> {
         self.points.iter().find(|p| p.id == id)
+    }
+
+    pub fn is_driven_dimension(&self, id: EntityId) -> bool {
+        self.driven_dimensions.contains(&id)
+    }
+
+    pub fn is_projected_point(&self, id: EntityId) -> bool {
+        self.projected_edges
+            .iter()
+            .any(|projection| projection.point_ids.contains(&id))
+    }
+
+    pub fn is_projected_entity(&self, id: EntityId) -> bool {
+        self.projected_edges
+            .iter()
+            .any(|projection| projection.entity_ids.contains(&id))
     }
 }
 
@@ -250,6 +378,9 @@ pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::Sket
         model.point(id).map(|p| (p.pos.0 as f32, p.pos.1 as f32))
     };
     for entity in &model.entities {
+        if model.construction.contains(&entity.id()) {
+            continue;
+        }
         match entity {
             SketchEntity::Line { p0, p1, .. } => {
                 if let (Some(a), Some(b)) = (pos(*p0), pos(*p1)) {
@@ -277,9 +408,46 @@ pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::Sket
                     });
                 }
             }
+            SketchEntity::Spline {
+                points,
+                kind,
+                degree,
+                knots,
+                weights,
+                closed,
+                periodic,
+                continuity,
+                trim,
+                ..
+            } => {
+                let positions: Option<Vec<(f32, f32)>> = points.iter().map(|id| pos(*id)).collect();
+                if let Some(points) = positions {
+                    curves.add_spline(crate::sketch::Spline {
+                        kind: *kind,
+                        points,
+                        degree: *degree,
+                        knots: knots.clone(),
+                        weights: weights.clone(),
+                        closed: *closed,
+                        periodic: *periodic,
+                        continuity: *continuity,
+                        trim: *trim,
+                    });
+                }
+            }
         }
     }
     curves
+}
+
+/// Bake only reference/construction entities for dedicated sketch rendering.
+pub fn bake_construction_curves(model: &SketchSolverModel) -> crate::sketch::SketchCurves {
+    let mut construction = model.clone();
+    construction
+        .entities
+        .retain(|entity| model.construction.contains(&entity.id()));
+    construction.construction.clear();
+    bake_entities_to_curves(&construction)
 }
 
 /// Promote a legacy `shapes` sketch into the solver's entity model — the
@@ -446,9 +614,10 @@ pub fn promote_shapes_to_entities(
                     d: length.clone(),
                 });
             }
-            SketchShape::RegularPolygon { .. } | SketchShape::Raw { .. } => {
-                promote_raw(&built, owner, &mut ids, &mut model)
-            }
+            SketchShape::RegularPolygon { .. }
+            | SketchShape::Spline { .. }
+            | SketchShape::Imported { .. }
+            | SketchShape::Raw { .. } => promote_raw(&built, owner, &mut ids, &mut model),
         }
     }
     let next = ids.next_value();
@@ -509,6 +678,27 @@ fn promote_raw(
             start,
             end,
             radius: arc.radius as f64,
+            derived_from: Some(owner),
+        });
+    }
+    for spline in &built.splines {
+        let points = spline
+            .points
+            .iter()
+            .map(|point| point_at(ids, model, *point))
+            .collect();
+        let id = ids.alloc();
+        model.entities.push(SketchEntity::Spline {
+            id,
+            points,
+            kind: spline.kind,
+            degree: spline.degree,
+            knots: spline.knots.clone(),
+            weights: spline.weights.clone(),
+            closed: spline.closed,
+            periodic: spline.periodic,
+            continuity: spline.continuity,
+            trim: spline.trim,
             derived_from: Some(owner),
         });
     }
@@ -578,6 +768,19 @@ mod tests {
                     radius: 4.0,
                     derived_from: None,
                 },
+                SketchEntity::Spline {
+                    id: EntityId(15),
+                    points: vec![EntityId(0), EntityId(1)],
+                    kind: crate::sketch::SplineKind::ControlPoint,
+                    degree: 1,
+                    knots: vec![0.0, 0.0, 1.0, 1.0],
+                    weights: vec![1.0, 1.0],
+                    closed: false,
+                    periodic: false,
+                    continuity: crate::sketch::SplineContinuity::Tangent,
+                    trim: Some((0.1, 0.9)),
+                    derived_from: None,
+                },
             ],
             constraints: vec![
                 Constraint::Coincident {
@@ -631,7 +834,71 @@ mod tests {
                     id: EntityId(14),
                     p: EntityId(0),
                 },
+                Constraint::DistanceX {
+                    id: EntityId(16),
+                    a: EntityId(0),
+                    b: EntityId(1),
+                    d: Dimension::literal(10.0),
+                },
+                Constraint::DistanceY {
+                    id: EntityId(17),
+                    a: EntityId(0),
+                    b: EntityId(1),
+                    d: Dimension::literal(0.25),
+                },
+                Constraint::Angle {
+                    id: EntityId(18),
+                    a: EntityId(2),
+                    b: EntityId(2),
+                    angle_deg: Dimension::literal(0.0),
+                },
+                Constraint::Concentric {
+                    id: EntityId(19),
+                    a: EntityId(3),
+                    b: EntityId(4),
+                },
+                Constraint::Midpoint {
+                    id: EntityId(20),
+                    point: EntityId(0),
+                    line: EntityId(2),
+                },
+                Constraint::PointOnObject {
+                    id: EntityId(21),
+                    point: EntityId(1),
+                    object: EntityId(2),
+                },
+                Constraint::Collinear {
+                    id: EntityId(22),
+                    a: EntityId(2),
+                    b: EntityId(2),
+                },
+                Constraint::Symmetric {
+                    id: EntityId(23),
+                    a: EntityId(0),
+                    b: EntityId(1),
+                    axis: EntityId(2),
+                },
+                Constraint::Diameter {
+                    id: EntityId(24),
+                    circle: EntityId(3),
+                    d: Dimension::literal(8.0),
+                },
             ],
+            construction: vec![EntityId(2)],
+            driven_dimensions: vec![EntityId(24)],
+            projected_edges: vec![ProjectedEdgeReference {
+                source_body: "box_1".to_string(),
+                source: crate::parametric::EdgeRef {
+                    p0: [0.0, 0.0, 0.0],
+                    p1: [10.0, 0.0, 0.0],
+                    n1: [0.0, 1.0, 0.0],
+                    n2: [0.0, 0.0, 1.0],
+                    curve: Some(crate::mock_kernel::EdgeCurveHint::Line),
+                    topology: None,
+                },
+                entity_ids: vec![EntityId(2)],
+                point_ids: vec![EntityId(0), EntityId(1)],
+            }],
         };
         let json = serde_json::to_string(&model).expect("serialize");
         let back: SketchSolverModel = serde_json::from_str(&json).expect("deserialize");
@@ -725,5 +992,37 @@ mod tests {
         assert!(probe.solver.is_none());
         assert!(probe.entity_ids.is_empty());
         assert_eq!(probe.next_entity_id, 0);
+    }
+
+    #[test]
+    fn construction_entities_are_editable_but_do_not_form_profiles() {
+        let mut model = SketchSolverModel::default();
+        model.points.extend([
+            SketchPoint {
+                id: EntityId(0),
+                pos: (0.0, 0.0),
+            },
+            SketchPoint {
+                id: EntityId(1),
+                pos: (10.0, 0.0),
+            },
+        ]);
+        model.entities.push(SketchEntity::Line {
+            id: EntityId(2),
+            p0: EntityId(0),
+            p1: EntityId(1),
+            derived_from: None,
+        });
+        model.construction.push(EntityId(2));
+        model.constraints.push(Constraint::Horizontal {
+            id: EntityId(3),
+            line: EntityId(2),
+        });
+
+        assert!(bake_entities_to_curves(&model).is_empty());
+        let reference = bake_construction_curves(&model);
+        assert_eq!(reference.segments.len(), 1);
+        assert_eq!(reference.segments[0].a, (0.0, 0.0));
+        assert_eq!(reference.segments[0].b, (10.0, 0.0));
     }
 }

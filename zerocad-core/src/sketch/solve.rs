@@ -120,8 +120,39 @@ struct System {
 }
 
 /// One residual row: closed-form value + sparse analytic gradient.
+type ResidualFunction = dyn Fn(&System) -> (f64, Vec<(usize, f64)>);
+
 struct ResidualRow {
-    value_and_grad: Box<dyn Fn(&System) -> (f64, Vec<(usize, f64)>)>,
+    value_and_grad: Box<ResidualFunction>,
+}
+
+fn point_on_line_row(
+    px: usize,
+    py: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> ResidualRow {
+    ResidualRow {
+        value_and_grad: Box::new(move |system| {
+            let ux = system.x[x1] - system.x[x0];
+            let uy = system.x[y1] - system.x[y0];
+            let wx = system.x[px] - system.x[x0];
+            let wy = system.x[py] - system.x[y0];
+            (
+                ux * wy - uy * wx,
+                vec![
+                    (x0, uy - wy),
+                    (y0, wx - ux),
+                    (x1, wy),
+                    (y1, -wx),
+                    (px, -uy),
+                    (py, ux),
+                ],
+            )
+        }),
+    }
 }
 
 impl System {
@@ -204,6 +235,9 @@ impl System {
         // Constraints assemble in stored order; unresolvable references (a
         // deleted entity) contribute no row — degraded, never wrong.
         for constraint in &model.constraints {
+            if model.is_driven_dimension(constraint.id()) {
+                continue;
+            }
             match constraint {
                 Constraint::Coincident { a, b, .. } => {
                     if let (Some(ax), Some(ay), Some(bx), Some(by)) =
@@ -360,6 +394,254 @@ impl System {
                             value_and_grad: Box::new(move |s| (s.x[yi] - y0, vec![(yi, 1.0)])),
                         });
                     }
+                }
+                Constraint::DistanceX { a, b, d, .. } | Constraint::DistanceY { a, b, d, .. } => {
+                    let horizontal = matches!(constraint, Constraint::DistanceX { .. });
+                    let (first, second) = if horizontal {
+                        (self.px(*a), self.px(*b))
+                    } else {
+                        (self.py(*a), self.py(*b))
+                    };
+                    if let (Some(first), Some(second)) = (first, second) {
+                        let target = d.resolve(vars) as f64;
+                        self.rows.push(ResidualRow {
+                            value_and_grad: Box::new(move |system| {
+                                (
+                                    system.x[second] - system.x[first] - target,
+                                    vec![(first, -1.0), (second, 1.0)],
+                                )
+                            }),
+                        });
+                    }
+                }
+                Constraint::Angle {
+                    a, b, angle_deg, ..
+                } => {
+                    if let (Some(pa), Some(pb)) =
+                        (self.line_params(model, *a), self.line_params(model, *b))
+                    {
+                        let target_cos = (angle_deg.resolve(vars) as f64).to_radians().cos();
+                        let (ax0, ay0, ax1, ay1) = pa;
+                        let (bx0, by0, bx1, by1) = pb;
+                        self.rows.push(ResidualRow {
+                            value_and_grad: Box::new(move |system| {
+                                let ua =
+                                    [system.x[ax1] - system.x[ax0], system.x[ay1] - system.x[ay0]];
+                                let ub =
+                                    [system.x[bx1] - system.x[bx0], system.x[by1] - system.x[by0]];
+                                let a2 = ua[0] * ua[0] + ua[1] * ua[1];
+                                let b2 = ub[0] * ub[0] + ub[1] * ub[1];
+                                let root = (a2 * b2).sqrt().max(1.0e-12);
+                                let dot = ua[0] * ub[0] + ua[1] * ub[1];
+                                let grad_a = [
+                                    ub[0] - target_cos * b2 * ua[0] / root,
+                                    ub[1] - target_cos * b2 * ua[1] / root,
+                                ];
+                                let grad_b = [
+                                    ua[0] - target_cos * a2 * ub[0] / root,
+                                    ua[1] - target_cos * a2 * ub[1] / root,
+                                ];
+                                (
+                                    dot - target_cos * root,
+                                    vec![
+                                        (ax0, -grad_a[0]),
+                                        (ay0, -grad_a[1]),
+                                        (ax1, grad_a[0]),
+                                        (ay1, grad_a[1]),
+                                        (bx0, -grad_b[0]),
+                                        (by0, -grad_b[1]),
+                                        (bx1, grad_b[0]),
+                                        (by1, grad_b[1]),
+                                    ],
+                                )
+                            }),
+                        });
+                    }
+                }
+                Constraint::Concentric { a, b, .. } => {
+                    let center = |entity_id: EntityId| {
+                        model.entities.iter().find_map(|entity| match entity {
+                            SketchEntity::Circle { id, center, .. }
+                            | SketchEntity::Arc { id, center, .. }
+                                if *id == entity_id =>
+                            {
+                                Some(*center)
+                            }
+                            _ => None,
+                        })
+                    };
+                    if let (Some(a), Some(b)) = (center(*a), center(*b)) {
+                        if let (Some(ax), Some(ay), Some(bx), Some(by)) =
+                            (self.px(a), self.py(a), self.px(b), self.py(b))
+                        {
+                            self.push_diff(ax, bx);
+                            self.push_diff(ay, by);
+                        }
+                    }
+                }
+                Constraint::Midpoint { point, line, .. } => {
+                    if let (Some(px), Some(py), Some((x0, y0, x1, y1))) = (
+                        self.px(*point),
+                        self.py(*point),
+                        self.line_params(model, *line),
+                    ) {
+                        for (point, first, second) in [(px, x0, x1), (py, y0, y1)] {
+                            self.rows.push(ResidualRow {
+                                value_and_grad: Box::new(move |system| {
+                                    (
+                                        2.0 * system.x[point] - system.x[first] - system.x[second],
+                                        vec![(point, 2.0), (first, -1.0), (second, -1.0)],
+                                    )
+                                }),
+                            });
+                        }
+                    }
+                }
+                Constraint::PointOnObject { point, object, .. } => {
+                    if let (Some(px), Some(py), Some((x0, y0, x1, y1))) = (
+                        self.px(*point),
+                        self.py(*point),
+                        self.line_params(model, *object),
+                    ) {
+                        self.rows.push(point_on_line_row(px, py, x0, y0, x1, y1));
+                    } else {
+                        let center = model.entities.iter().find_map(|entity| match entity {
+                            SketchEntity::Circle { id, center, .. }
+                            | SketchEntity::Arc { id, center, .. }
+                                if id == object =>
+                            {
+                                Some(*center)
+                            }
+                            _ => None,
+                        });
+                        if let (Some(px), Some(py), Some(center), Some(radius)) =
+                            (self.px(*point), self.py(*point), center, self.pr(*object))
+                        {
+                            if let (Some(cx), Some(cy)) = (self.px(center), self.py(center)) {
+                                self.rows.push(ResidualRow {
+                                    value_and_grad: Box::new(move |system| {
+                                        let dx = system.x[px] - system.x[cx];
+                                        let dy = system.x[py] - system.x[cy];
+                                        let r = system.x[radius];
+                                        (
+                                            dx * dx + dy * dy - r * r,
+                                            vec![
+                                                (px, 2.0 * dx),
+                                                (py, 2.0 * dy),
+                                                (cx, -2.0 * dx),
+                                                (cy, -2.0 * dy),
+                                                (radius, -2.0 * r),
+                                            ],
+                                        )
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                }
+                Constraint::Collinear { a, b, .. } => {
+                    if let (Some(pa), Some(pb)) =
+                        (self.line_params(model, *a), self.line_params(model, *b))
+                    {
+                        self.push_cross_or_dot(pa, pb, true);
+                        let (x0, y0, x1, y1) = pa;
+                        let (px, py, _, _) = pb;
+                        self.rows.push(point_on_line_row(px, py, x0, y0, x1, y1));
+                    }
+                }
+                Constraint::Symmetric { a, b, axis, .. } => {
+                    if let (Some(ax), Some(ay), Some(bx), Some(by), Some((x0, y0, x1, y1))) = (
+                        self.px(*a),
+                        self.py(*a),
+                        self.px(*b),
+                        self.py(*b),
+                        self.line_params(model, *axis),
+                    ) {
+                        self.rows.push(ResidualRow {
+                            value_and_grad: Box::new(move |system| {
+                                let ux = system.x[x1] - system.x[x0];
+                                let uy = system.x[y1] - system.x[y0];
+                                let vx = system.x[bx] - system.x[ax];
+                                let vy = system.x[by] - system.x[ay];
+                                (
+                                    ux * vx + uy * vy,
+                                    vec![
+                                        (x0, -vx),
+                                        (y0, -vy),
+                                        (x1, vx),
+                                        (y1, vy),
+                                        (ax, -ux),
+                                        (ay, -uy),
+                                        (bx, ux),
+                                        (by, uy),
+                                    ],
+                                )
+                            }),
+                        });
+                        self.rows.push(ResidualRow {
+                            value_and_grad: Box::new(move |system| {
+                                let ux = system.x[x1] - system.x[x0];
+                                let uy = system.x[y1] - system.x[y0];
+                                let wx = system.x[ax] + system.x[bx] - 2.0 * system.x[x0];
+                                let wy = system.x[ay] + system.x[by] - 2.0 * system.x[y0];
+                                (
+                                    ux * wy - uy * wx,
+                                    vec![
+                                        (x0, -wy + 2.0 * uy),
+                                        (y0, wx - 2.0 * ux),
+                                        (x1, wy),
+                                        (y1, -wx),
+                                        (ax, -uy),
+                                        (ay, ux),
+                                        (bx, -uy),
+                                        (by, ux),
+                                    ],
+                                )
+                            }),
+                        });
+                    }
+                }
+                Constraint::Diameter { circle, d, .. } => {
+                    if let Some(radius) = self.pr(*circle) {
+                        let target = d.resolve(vars) as f64 * 0.5;
+                        self.rows.push(ResidualRow {
+                            value_and_grad: Box::new(move |system| {
+                                (system.x[radius] - target, vec![(radius, 1.0)])
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Projected references are immutable solver inputs. Other geometry may
+        // constrain itself to them, but the solver must never move the source
+        // edge's points or analytic radius to satisfy such a constraint.
+        for projection in &model.projected_edges {
+            for point in &projection.point_ids {
+                if let (Some(xi), Some(yi)) = (self.px(*point), self.py(*point)) {
+                    let x0 = self.x[xi];
+                    let y0 = self.x[yi];
+                    self.rows.push(ResidualRow {
+                        value_and_grad: Box::new(move |system| {
+                            (system.x[xi] - x0, vec![(xi, 1.0)])
+                        }),
+                    });
+                    self.rows.push(ResidualRow {
+                        value_and_grad: Box::new(move |system| {
+                            (system.x[yi] - y0, vec![(yi, 1.0)])
+                        }),
+                    });
+                }
+            }
+            for entity in &projection.entity_ids {
+                if let Some(radius) = self.pr(*entity) {
+                    let target = self.x[radius];
+                    self.rows.push(ResidualRow {
+                        value_and_grad: Box::new(move |system| {
+                            (system.x[radius] - target, vec![(radius, 1.0)])
+                        }),
+                    });
                 }
             }
         }
@@ -560,10 +842,17 @@ pub fn apply_solution(model: &mut SketchSolverModel, report: &SolveReport) {
 /// change with the document variables, so evaluation must re-solve instead of
 /// trusting the stored positions.
 pub fn has_variable_bound_constraint(model: &SketchSolverModel) -> bool {
-    model.constraints.iter().any(|c| match c {
-        Constraint::Distance { d, .. } => d.expr.is_some(),
-        Constraint::Radius { r, .. } => r.expr.is_some(),
-        _ => false,
+    model.constraints.iter().any(|c| {
+        !model.is_driven_dimension(c.id())
+            && match c {
+                Constraint::Distance { d, .. } => d.expr.is_some(),
+                Constraint::Radius { r, .. } => r.expr.is_some(),
+                Constraint::DistanceX { d, .. }
+                | Constraint::DistanceY { d, .. }
+                | Constraint::Diameter { d, .. } => d.expr.is_some(),
+                Constraint::Angle { angle_deg, .. } => angle_deg.expr.is_some(),
+                _ => false,
+            }
     })
 }
 
@@ -737,5 +1026,189 @@ mod tests {
         let (ux, uy) = (x1 - x0, y1 - y0);
         let dist = ((ux * (cy - y0) - uy * (cx - x0)) / (ux * ux + uy * uy).sqrt()).abs();
         assert!((dist - 5.0).abs() < 1e-6, "tangent distance {dist}");
+    }
+
+    #[test]
+    fn professional_dimension_and_location_constraints_solve() {
+        let mut model = SketchSolverModel::default();
+        for (id, pos) in [
+            (0, (0.0, 0.0)),
+            (1, (3.0, 4.0)),
+            (2, (-5.0, 0.0)),
+            (3, (5.0, 0.0)),
+            (4, (0.5, 2.0)),
+            (5, (2.0, 1.0)),
+        ] {
+            model.points.push(SketchPoint {
+                id: EntityId(id),
+                pos,
+            });
+        }
+        model.entities.push(SketchEntity::Line {
+            id: EntityId(6),
+            p0: EntityId(2),
+            p1: EntityId(3),
+            derived_from: None,
+        });
+        model.entities.push(SketchEntity::Circle {
+            id: EntityId(7),
+            center: EntityId(0),
+            radius: 2.0,
+            derived_from: None,
+        });
+        model.entities.push(SketchEntity::Circle {
+            id: EntityId(8),
+            center: EntityId(5),
+            radius: 1.0,
+            derived_from: None,
+        });
+        for (id, p) in [(9, 0), (10, 2), (11, 3)] {
+            model.constraints.push(Constraint::Fixed {
+                id: EntityId(id),
+                p: EntityId(p),
+            });
+        }
+        model.constraints.extend([
+            Constraint::DistanceX {
+                id: EntityId(12),
+                a: EntityId(0),
+                b: EntityId(1),
+                d: Dimension::literal(10.0),
+            },
+            Constraint::DistanceY {
+                id: EntityId(13),
+                a: EntityId(0),
+                b: EntityId(1),
+                d: Dimension::literal(2.0),
+            },
+            Constraint::Midpoint {
+                id: EntityId(14),
+                point: EntityId(4),
+                line: EntityId(6),
+            },
+            Constraint::Concentric {
+                id: EntityId(15),
+                a: EntityId(7),
+                b: EntityId(8),
+            },
+            Constraint::Diameter {
+                id: EntityId(16),
+                circle: EntityId(8),
+                d: Dimension::literal(8.0),
+            },
+        ]);
+
+        let report = solve_model(&model, &HashMap::new());
+        assert_eq!(report.outcome, SolveOutcome::Converged, "{report:?}");
+        let points: HashMap<_, _> = report.positions.iter().copied().collect();
+        let p0 = points[&EntityId(0)];
+        let p1 = points[&EntityId(1)];
+        assert!((p1.0 - p0.0 - 10.0).abs() < 1.0e-6);
+        assert!((p1.1 - p0.1 - 2.0).abs() < 1.0e-6);
+        assert!(points[&EntityId(4)].0.abs() < 1.0e-6);
+        assert!(points[&EntityId(4)].1.abs() < 1.0e-6);
+        assert!((points[&EntityId(5)].0 - p0.0).abs() < 1.0e-6);
+        assert!((points[&EntityId(5)].1 - p0.1).abs() < 1.0e-6);
+        assert!(report
+            .radii
+            .iter()
+            .any(|(id, radius)| *id == EntityId(8) && (*radius - 4.0).abs() < 1.0e-6));
+    }
+
+    #[test]
+    fn driven_dimension_reports_without_constraining_geometry() {
+        let mut model = SketchSolverModel::default();
+        model.points.extend([
+            SketchPoint {
+                id: EntityId(1),
+                pos: (0.0, 0.0),
+            },
+            SketchPoint {
+                id: EntityId(2),
+                pos: (7.5, 0.0),
+            },
+        ]);
+        model.constraints.push(Constraint::Distance {
+            id: EntityId(3),
+            a: EntityId(1),
+            b: EntityId(2),
+            d: Dimension::literal(100.0),
+        });
+        model.driven_dimensions.push(EntityId(3));
+
+        let report = solve_model(&model, &HashMap::new());
+        assert_eq!(report.outcome, SolveOutcome::Converged);
+        assert_eq!(report.positions[0].1, (0.0, 0.0));
+        assert_eq!(report.positions[1].1, (7.5, 0.0));
+        assert_eq!(report.dof, 4, "a reference dimension removes no DOF");
+    }
+
+    #[test]
+    fn angle_and_point_on_object_constraints_solve() {
+        let mut model = SketchSolverModel::default();
+        for (id, pos) in [
+            (0, (0.0, 0.0)),
+            (1, (10.0, 0.0)),
+            (2, (0.0, 0.0)),
+            (3, (4.0, 3.0)),
+            (4, (2.0, 3.0)),
+        ] {
+            model.points.push(SketchPoint {
+                id: EntityId(id),
+                pos,
+            });
+        }
+        model.entities.extend([
+            SketchEntity::Line {
+                id: EntityId(5),
+                p0: EntityId(0),
+                p1: EntityId(1),
+                derived_from: None,
+            },
+            SketchEntity::Line {
+                id: EntityId(6),
+                p0: EntityId(2),
+                p1: EntityId(3),
+                derived_from: None,
+            },
+        ]);
+        for (id, p) in [(7, 0), (8, 1), (9, 2)] {
+            model.constraints.push(Constraint::Fixed {
+                id: EntityId(id),
+                p: EntityId(p),
+            });
+        }
+        model.constraints.extend([
+            Constraint::Angle {
+                id: EntityId(10),
+                a: EntityId(5),
+                b: EntityId(6),
+                angle_deg: Dimension::literal(90.0),
+            },
+            Constraint::Distance {
+                id: EntityId(11),
+                a: EntityId(2),
+                b: EntityId(3),
+                d: Dimension::literal(5.0),
+            },
+            Constraint::PointOnObject {
+                id: EntityId(12),
+                point: EntityId(4),
+                object: EntityId(5),
+            },
+        ]);
+
+        let report = solve_model(&model, &HashMap::new());
+        assert_eq!(report.outcome, SolveOutcome::Converged, "{report:?}");
+        let points: HashMap<_, _> = report.positions.iter().copied().collect();
+        let p2 = points[&EntityId(2)];
+        let p3 = points[&EntityId(3)];
+        let direction = (p3.0 - p2.0, p3.1 - p2.1);
+        assert!(
+            direction.0.abs() < 1.0e-6,
+            "line is vertical: {direction:?}"
+        );
+        assert!((direction.1.abs() - 5.0).abs() < 1.0e-6);
+        assert!(points[&EntityId(4)].1.abs() < 1.0e-6);
     }
 }

@@ -34,6 +34,7 @@ fn variable_rect_graph(w0: f32) -> ParametricGraph {
                 name: "w".to_string(),
                 value: w0 as f64,
                 unit: Unit::Millimeter,
+                expression: None,
             }],
         },
     });
@@ -781,6 +782,7 @@ fn solved_rect_graph(w0: f64) -> ParametricGraph {
                 name: "w".to_string(),
                 value: w0,
                 unit: Unit::Millimeter,
+                expression: None,
             }],
         },
     });

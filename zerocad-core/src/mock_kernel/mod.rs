@@ -29,6 +29,7 @@ mod history;
 mod mesh_topology;
 mod outcome;
 mod primitives;
+mod section;
 mod tessellation;
 mod types;
 mod wireframe;
@@ -46,6 +47,7 @@ pub use mesh_topology::mesh_face_boundary_2d;
 pub(crate) use mesh_topology::*;
 pub(crate) use outcome::*;
 pub use primitives::*;
+pub use section::*;
 #[allow(unused_imports)]
 pub(crate) use tessellation::*;
 pub use types::*;

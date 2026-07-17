@@ -65,6 +65,7 @@ fn add_external_thread(graph: &mut ParametricGraph, id: &str, target: &str) {
             length: None,
             flip: false,
             designation: "M16x2".to_string(),
+            standard: None,
         },
     });
     graph.add_dependency(target, id);

@@ -148,7 +148,7 @@ function Compare-Reports {
         ([double] $Baseline.tessellation_ms) ([double] $Current.tessellation_ms) `
         $AllowedPercent $TimingNoiseFloorMs
 
-    if ($null -ne $Current.application) {
+    if ($null -ne $Current.application -and $null -ne $Baseline.application) {
         foreach ($metric in @(
             "binary_bytes",
             "cold_start_ms",
@@ -160,8 +160,11 @@ function Compare-Reports {
                 ([double] $Current.application.$metric) $AllowedPercent
         }
     }
-    else {
+    elseif ($null -eq $Current.application) {
         Write-Warning "GUI measurements were skipped; application footprint budgets were not checked."
+    }
+    else {
+        Write-Warning "The comparison report has no GUI baseline; application footprint budgets were not checked."
     }
 
     $baselineCorpora = @{}

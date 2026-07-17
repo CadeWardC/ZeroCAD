@@ -24,6 +24,15 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
         normal: [0.0, 0.0, 1.0],
         topology: None,
     };
+    let direct_face = FaceRef {
+        topology: Some(TopologyFaceRef {
+            body_id: Some("missing_a".into()),
+            face_id: Some("foreign:face:1".into()),
+            producer_feature_id: Some("missing_a".into()),
+            ..TopologyFaceRef::default()
+        }),
+        ..face.clone()
+    };
     vec![
         FeatureType::Origin,
         FeatureType::Box {
@@ -108,6 +117,8 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
                 diameter: 4.0,
                 depth: 1.0,
             },
+            standard: None,
+            manufacturing: None,
         },
         FeatureType::Pattern {
             source: "missing_body".into(),
@@ -135,6 +146,7 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             length: Some(8.0),
             flip: true,
             designation: "M6x1".into(),
+            standard: None,
         },
         FeatureType::DatumPlane {
             def: DatumPlaneDef::Offset {
@@ -175,6 +187,32 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             factor: 2.0,
             factor_expr: Some("scale_factor".into()),
             center: [1.0, 2.0, 3.0],
+        },
+        FeatureType::FaceOffset {
+            target: "missing_a".into(),
+            face: direct_face.clone(),
+            distance: -2.0,
+            distance_expr: Some("-wall".into()),
+        },
+        FeatureType::FaceMove {
+            target: "missing_a".into(),
+            face: direct_face.clone(),
+            translation: [0.0, 0.0, 2.0],
+        },
+        FeatureType::FaceDelete {
+            target: "missing_a".into(),
+            face: direct_face.clone(),
+        },
+        FeatureType::FaceThicken {
+            target: "missing_a".into(),
+            face: direct_face,
+            thickness: 1.5,
+            thickness_expr: Some("sheet".into()),
+            reverse: true,
+        },
+        FeatureType::ImportStl {
+            stl_data: b"solid empty\nendsolid empty\n".to_vec(),
+            label: "empty.stl".into(),
         },
     ]
 }
@@ -395,6 +433,103 @@ fn every_feature_payload_round_trips_and_rebuilds_identically() {
             );
         }
     }
+}
+
+#[test]
+fn stl_asset_chain_round_trips_with_sequence_suppression_and_exact_bytes() {
+    let stl = br#"solid tetrahedron
+facet normal 0 0 -1
+ outer loop
+  vertex 0 0 0
+  vertex 0 1 0
+  vertex 1 0 0
+ endloop
+endfacet
+facet normal 0 -1 0
+ outer loop
+  vertex 0 0 0
+  vertex 1 0 0
+  vertex 0 0 1
+ endloop
+endfacet
+facet normal -1 0 0
+ outer loop
+  vertex 0 0 0
+  vertex 0 0 1
+  vertex 0 1 0
+ endloop
+endfacet
+facet normal 1 1 1
+ outer loop
+  vertex 1 0 0
+  vertex 0 1 0
+  vertex 0 0 1
+ endloop
+endfacet
+endsolid tetrahedron
+"#
+    .to_vec();
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "mesh".into(),
+        name: "Mesh".into(),
+        feature: FeatureType::ImportStl {
+            stl_data: stl.clone(),
+            label: "tetrahedron.stl".into(),
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "mesh_move".into(),
+        name: "Move mesh".into(),
+        feature: FeatureType::BodyTransform {
+            source: "mesh".into(),
+            translation: [2.0, 3.0, 4.0],
+            copy: false,
+        },
+    });
+    graph.add_dependency("mesh", "mesh_move");
+    assert!(graph.set_feature_sequence("mesh_move", zerocad_core::document::SequenceKey(1)));
+    assert!(graph.set_feature_sequence("mesh", zerocad_core::document::SequenceKey(2)));
+    assert!(graph.set_feature_suppressed("mesh_move", true));
+    graph
+        .validate_semantic_contracts()
+        .expect("mesh-chain semantic contract");
+
+    let bytes = write_zcad(&doc_for(&graph)).expect("write mesh document");
+    let mut loaded = read_zcad(&bytes).expect("read mesh document").graph;
+    assert_eq!(
+        loaded.feature_state("mesh_move"),
+        Some(FeatureState::Suppressed)
+    );
+    let mesh_node = loaded
+        .graph
+        .node_indices()
+        .find(|&index| loaded.graph[index].id == "mesh")
+        .expect("loaded mesh feature");
+    assert_eq!(
+        match &loaded.graph[mesh_node].feature {
+            FeatureType::ImportStl { stl_data, .. } => Some(stl_data.as_slice()),
+            _ => None,
+        },
+        Some(stl.as_slice())
+    );
+    assert_eq!(
+        loaded.feature_sequence("mesh_move"),
+        Some(zerocad_core::document::SequenceKey(1))
+    );
+    let suppressed = loaded
+        .evaluate_bodies(&HashSet::new())
+        .expect("suppressed loaded mesh chain");
+    assert_eq!(suppressed.len(), 1);
+    assert_eq!(suppressed[0].0, "mesh");
+
+    assert!(loaded.set_feature_suppressed("mesh_move", false));
+    let evaluated = loaded
+        .evaluate_bodies(&HashSet::new())
+        .expect("restored loaded mesh chain");
+    assert_eq!(evaluated.len(), 1);
+    assert_eq!(evaluated[0].0, "mesh_move");
+    assert!(loaded.inspect_body("mesh_move").is_ok());
 }
 
 #[test]

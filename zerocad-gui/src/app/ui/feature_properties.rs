@@ -394,8 +394,32 @@ impl ZeroCadApp {
                                     diameter,
                                     diameter_expr,
                                     depth,
+                                    kind,
+                                    standard,
+                                    manufacturing,
                                     ..
                                 } => {
+                                    if let Some(reference) = standard.as_ref() {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} {} · {} v{}",
+                                                reference.family.label(),
+                                                reference.designation,
+                                                reference.table,
+                                                reference.library_version
+                                            ))
+                                            .strong()
+                                            .size(11.5)
+                                            .color(pal.text_strong),
+                                        );
+                                        if let Some(class) = &reference.class {
+                                            ui.label(
+                                                egui::RichText::new(format!("Class {class}"))
+                                                    .small()
+                                                    .color(pal.text_muted),
+                                            );
+                                        }
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Diameter").size(12.0));
                                         if ui
@@ -435,6 +459,44 @@ impl ZeroCadApp {
                                             }
                                         });
                                     }
+                                    if let Some(metadata) = manufacturing.as_mut() {
+                                        if metadata.cosmetic_thread {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Tapped-hole metadata: {} · class {} · pitch {} mm (cosmetic)",
+                                                    metadata
+                                                        .thread_designation
+                                                        .as_deref()
+                                                        .unwrap_or("custom"),
+                                                    metadata.thread_class.as_deref().unwrap_or("—"),
+                                                    metadata
+                                                        .tap_pitch_mm
+                                                        .map_or_else(|| "—".to_string(), |pitch| pitch.to_string())
+                                                ))
+                                                .small()
+                                                .color(pal.text_muted),
+                                            );
+                                        }
+                                        if let Some(angle) = &mut metadata.drill_point_angle_deg {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Drill-point angle")
+                                                        .size(12.0),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(angle)
+                                                            .speed(0.5)
+                                                            .range(1.0..=179.0)
+                                                            .suffix("°"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Position").size(12.0));
                                         for coord in position.iter_mut() {
@@ -446,6 +508,34 @@ impl ZeroCadApp {
                                             }
                                         }
                                     });
+                                    if let Some(reference) = standard.as_mut() {
+                                        let (head_diameter, head_depth, head_angle) = match kind {
+                                            zerocad_core::HoleKind::Simple => (None, None, None),
+                                            zerocad_core::HoleKind::Counterbore {
+                                                diameter,
+                                                depth,
+                                            } => {
+                                                (Some(*diameter), Some(*depth), None)
+                                            }
+                                            zerocad_core::HoleKind::Countersink {
+                                                diameter,
+                                                angle_deg,
+                                            } => (Some(*diameter), None, Some(*angle_deg)),
+                                        };
+                                        if let zerocad_core::ResolvedStandardGeometry::Hole {
+                                            bore_diameter_mm,
+                                            head_diameter_mm,
+                                            head_depth_mm,
+                                            head_angle_deg,
+                                            ..
+                                        } = &mut reference.resolved
+                                        {
+                                            *bore_diameter_mm = *diameter;
+                                            *head_diameter_mm = head_diameter;
+                                            *head_depth_mm = head_depth;
+                                            *head_angle_deg = head_angle;
+                                        }
+                                    }
                                 }
                                 FeatureType::Pattern { source, kind } => {
                                     ui.label(
@@ -1072,14 +1162,182 @@ impl ZeroCadApp {
                                         }
                                     }
                                 }
+                                FeatureType::FaceOffset {
+                                    target,
+                                    distance,
+                                    distance_expr,
+                                    ..
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Body: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Signed distance");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(distance)
+                                                    .speed(0.25)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            *distance_expr = None;
+                                            modified = true;
+                                        }
+                                    });
+                                    expression_editor(
+                                        ui,
+                                        distance_expr,
+                                        &var_map,
+                                        "expression, e.g. wall+2",
+                                        current_unit.suffix(),
+                                        &mut modified,
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Positive adds material; negative removes it.",
+                                        )
+                                        .size(10.5)
+                                        .color(pal.text_faint),
+                                    );
+                                }
+                                FeatureType::FaceMove {
+                                    target,
+                                    translation,
+                                    ..
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Body: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.label("Normal translation");
+                                    for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(label);
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut translation[axis])
+                                                        .speed(0.25)
+                                                        .suffix(current_unit.suffix()),
+                                                )
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Tangential movement is rejected in Phase 5.",
+                                        )
+                                        .size(10.5)
+                                        .color(pal.text_faint),
+                                    );
+                                }
+                                FeatureType::FaceDelete { target, .. } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Body: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Heals an internal cylindrical face (hole removal).",
+                                        )
+                                        .size(10.5)
+                                        .color(pal.text_faint),
+                                    );
+                                }
+                                FeatureType::FaceThicken {
+                                    target,
+                                    thickness,
+                                    thickness_expr,
+                                    reverse,
+                                    ..
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Source body: {target}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Thickness");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(thickness)
+                                                    .speed(0.25)
+                                                    .range(0.001..=1.0e6)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            *thickness_expr = None;
+                                            modified = true;
+                                        }
+                                    });
+                                    expression_editor(
+                                        ui,
+                                        thickness_expr,
+                                        &var_map,
+                                        "expression, e.g. sheet_thickness",
+                                        current_unit.suffix(),
+                                        &mut modified,
+                                    );
+                                    if ui.checkbox(reverse, "Reverse direction").changed() {
+                                        modified = true;
+                                    }
+                                }
+                                FeatureType::ImportStl { stl_data, label } => {
+                                    ui.label(
+                                        egui::RichText::new("STL mesh body")
+                                            .strong()
+                                            .size(12.0)
+                                            .color(pal.text_strong),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {} bytes · mesh-only",
+                                            label,
+                                            stl_data.len()
+                                        ))
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Supports move, scale, measure, section, and mesh export; B-Rep booleans are disabled.",
+                                        )
+                                        .size(10.5)
+                                        .color(pal.text_faint),
+                                    );
+                                }
                                 FeatureType::Thread {
                                     internal,
                                     pitch,
                                     depth,
+                                    angle_deg,
                                     right_handed,
                                     designation,
+                                    standard,
                                     ..
                                 } => {
+                                    let original_internal = *internal;
+                                    if let Some(reference) = standard.as_ref() {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · {} v{} · class {}",
+                                                reference.table,
+                                                reference.library_id,
+                                                reference.library_version,
+                                                reference.class.as_deref().unwrap_or("—")
+                                            ))
+                                            .small()
+                                            .color(pal.text_muted),
+                                        );
+                                    }
                                     if !designation.is_empty() {
                                         ui.label(
                                             egui::RichText::new(designation.as_str())
@@ -1142,6 +1400,74 @@ impl ZeroCadApp {
                                         }
                                     });
                                     ui.add_space(4.0);
+                                    if let Some(reference) = standard.as_mut() {
+                                        let thread_standard = match reference.family {
+                                            zerocad_core::StandardsFamily::Iso => Some(
+                                                zerocad_core::parametric::ThreadStandard::MetricCoarse,
+                                            ),
+                                            zerocad_core::StandardsFamily::Ansi
+                                                if reference.table.contains("UNF") =>
+                                            {
+                                                Some(
+                                                    zerocad_core::parametric::ThreadStandard::UnifiedFine,
+                                                )
+                                            }
+                                            zerocad_core::StandardsFamily::Ansi => Some(
+                                                zerocad_core::parametric::ThreadStandard::UnifiedCoarse,
+                                            ),
+                                        };
+                                        if let Some(thread_standard) = thread_standard {
+                                            let classes = zerocad_core::parametric::thread_classes(
+                                                thread_standard,
+                                                *internal,
+                                            );
+                                            if original_internal != *internal
+                                                || reference.class.as_deref().is_none_or(|class| {
+                                                    !classes.contains(&class)
+                                                })
+                                            {
+                                                reference.class = classes
+                                                    .get(1)
+                                                    .copied()
+                                                    .map(str::to_string);
+                                            }
+                                            let mut selected =
+                                                reference.class.clone().unwrap_or_default();
+                                            ui.horizontal(|ui| {
+                                                ui.label("Class");
+                                                egui::ComboBox::from_id_salt(
+                                                    "thread_property_class",
+                                                )
+                                                .selected_text(&selected)
+                                                .show_ui(ui, |ui| {
+                                                    for class in classes {
+                                                        ui.selectable_value(
+                                                            &mut selected,
+                                                            (*class).to_string(),
+                                                            *class,
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                            if reference.class.as_deref()
+                                                != Some(selected.as_str())
+                                            {
+                                                reference.class = Some(selected);
+                                                modified = true;
+                                            }
+                                        }
+                                        if let zerocad_core::ResolvedStandardGeometry::Thread {
+                                            pitch_mm,
+                                            radial_depth_mm,
+                                            angle_deg: resolved_angle,
+                                            ..
+                                        } = &mut reference.resolved
+                                        {
+                                            *pitch_mm = *pitch;
+                                            *radial_depth_mm = *depth;
+                                            *resolved_angle = *angle_deg;
+                                        }
+                                    }
                                     ui.label(
                                         egui::RichText::new(
                                             "Cut into the selected cylindrical face. A failed \

@@ -93,6 +93,7 @@ fn add_thread(
             length,
             flip,
             designation: "test".to_string(),
+            standard: None,
         },
     });
     g.add_dependency(target, id);
@@ -433,6 +434,8 @@ fn internal_thread_keeps_the_countersink() {
                 diameter_expr: None,
                 depth: None,
                 kind: Default::default(),
+                standard: None,
+                manufacturing: None,
             },
         });
         g.add_dependency("box_1", "hole_2");

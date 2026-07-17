@@ -16,6 +16,7 @@ fn sketch_dimension_follows_a_variable() {
                 name: "w".to_string(),
                 value: 10.0,
                 unit: Unit::Millimeter,
+                expression: None,
             }],
         },
     });
@@ -97,6 +98,7 @@ fn topology_edge_ref_reattaches_after_sketch_dimension_edit() {
                 name: "w".to_string(),
                 value: 20.0,
                 unit: Unit::Millimeter,
+                expression: None,
             }],
         },
     });
@@ -212,6 +214,7 @@ fn extrude_depth_follows_a_variable() {
                 name: "h".to_string(),
                 value: 5.0,
                 unit: Unit::Millimeter,
+                expression: None,
             }],
         },
     });
@@ -256,4 +259,126 @@ fn extrude_depth_follows_a_variable() {
         (top_z(&g) - 20.0).abs() < 0.01,
         "changing the variable must change the extrude depth"
     );
+}
+
+#[test]
+fn parameter_expressions_resolve_forward_references_and_units() {
+    use crate::units::Unit;
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "vars_1".to_string(),
+        name: "Parameters".to_string(),
+        feature: FeatureType::VariableSet {
+            variables: vec![
+                Variable {
+                    name: "span".to_string(),
+                    value: 0.0,
+                    unit: Unit::Millimeter,
+                    expression: Some("base * 2".to_string()),
+                },
+                Variable {
+                    name: "base".to_string(),
+                    value: 1.0,
+                    unit: Unit::Inch,
+                    expression: None,
+                },
+            ],
+        },
+    });
+    let resolution = graph.resolve_variables();
+    assert!(resolution.diagnostics.is_empty(), "{resolution:?}");
+    assert!((resolution.values["base"] - 25.4).abs() < 1.0e-9);
+    assert!((resolution.values["span"] - 50.8).abs() < 1.0e-9);
+    assert_eq!(resolution.dependencies["span"], ["base"]);
+}
+
+#[test]
+fn parameter_cycles_report_and_keep_fallback_values() {
+    use crate::units::Unit;
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "vars_1".to_string(),
+        name: "Parameters".to_string(),
+        feature: FeatureType::VariableSet {
+            variables: vec![
+                Variable {
+                    name: "a".to_string(),
+                    value: 3.0,
+                    unit: Unit::Millimeter,
+                    expression: Some("b".to_string()),
+                },
+                Variable {
+                    name: "b".to_string(),
+                    value: 4.0,
+                    unit: Unit::Millimeter,
+                    expression: Some("a".to_string()),
+                },
+            ],
+        },
+    });
+    let resolution = graph.resolve_variables();
+    assert!(resolution
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("cyclic")));
+    assert_eq!(resolution.values["a"], 3.0);
+    assert_eq!(resolution.values["b"], 4.0);
+}
+
+#[test]
+fn rename_variable_rewrites_identifier_references_atomically() {
+    use crate::units::Unit;
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "vars_1".to_string(),
+        name: "Parameters".to_string(),
+        feature: FeatureType::VariableSet {
+            variables: vec![
+                Variable {
+                    name: "width".to_string(),
+                    value: 12.0,
+                    unit: Unit::Millimeter,
+                    expression: None,
+                },
+                Variable {
+                    name: "double_width".to_string(),
+                    value: 24.0,
+                    unit: Unit::Millimeter,
+                    expression: Some("width * 2".to_string()),
+                },
+            ],
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "extrude_2".to_string(),
+        name: "Extrude".to_string(),
+        feature: FeatureType::Extrude {
+            depth: 12.0,
+            region_indices: Vec::new(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            depth_expr: Some("width + width_extra".to_string()),
+        },
+    });
+    graph.rename_variable("width", "span").unwrap();
+    let variable_expression = graph
+        .graph
+        .node_weights()
+        .find_map(|node| match &node.feature {
+            FeatureType::VariableSet { variables } => variables[1].expression.clone(),
+            _ => None,
+        });
+    assert_eq!(variable_expression.as_deref(), Some("span * 2"));
+    let depth_expression = graph
+        .graph
+        .node_weights()
+        .find_map(|node| match &node.feature {
+            FeatureType::Extrude { depth_expr, .. } => depth_expr.clone(),
+            _ => None,
+        });
+    assert_eq!(depth_expression.as_deref(), Some("span + width_extra"));
+
+    let before = serde_json::to_vec(&graph).unwrap();
+    assert!(graph.rename_variable("span", "double_width").is_err());
+    assert_eq!(serde_json::to_vec(&graph).unwrap(), before);
 }

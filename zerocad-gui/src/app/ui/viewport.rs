@@ -464,7 +464,25 @@ impl ZeroCadApp {
                                     snapped
                                 };
 
-                                if let Some(kind) = tool.corner_kind() {
+                                if tool.is_spline() {
+                                    if response.clicked() {
+                                        let distinct = self.sketch_points.last().map_or(true, |last| {
+                                            (last.0 - pt.0).hypot(last.1 - pt.1) > 1.0e-5
+                                        });
+                                        if distinct {
+                                            self.sketch_points.push(pt);
+                                            self.sketch_temp_start = self.sketch_points.first().copied();
+                                        }
+                                        if response.double_clicked() && self.sketch_points.len() >= 2 {
+                                            self.finish_in_progress_spline();
+                                        } else {
+                                            self.status_msg = format!(
+                                                "Spline point {} set — keep clicking; double-click or press Enter to finish.",
+                                                self.sketch_points.len()
+                                            );
+                                        }
+                                    }
+                                } else if let Some(kind) = tool.corner_kind() {
                                     // Fillet/Chamfer: a click STAGES the nearest corner
                                     // (live preview); it isn't committed until Enter / OK.
                                     // The user can stack several corners and tune R first.
@@ -570,6 +588,9 @@ impl ZeroCadApp {
                                             model
                                                 .points
                                                 .iter()
+                                                .filter(|point| {
+                                                    !model.is_projected_point(point.id)
+                                                })
                                                 .map(|p| (p.id, to_screen(p.pos).distance(pos)))
                                                 .filter(|(_, d)| *d <= POINT_GRAB_PX)
                                                 .min_by(|a, b| {
@@ -765,7 +786,7 @@ impl ZeroCadApp {
                                                 .collect()
                                         };
 
-                                        // Edge candidates: drawn segments, then circles.
+                                        // Edge candidates: drawn segments, circles, then splines.
                                         let seg_count = curves.segments.len();
                                         for (i, s) in curves.segments.iter().enumerate() {
                                             let d = dist_point_to_segment(
@@ -797,6 +818,29 @@ impl ZeroCadApp {
                                                 && best_edge.as_ref().map_or(true, |b| mind < b.2)
                                             {
                                                 best_edge = Some((node.id.clone(), seg_count + j, mind));
+                                            }
+                                        }
+                                        let spline_offset = seg_count + curves.circles.len();
+                                        for (j, spline) in curves.splines.iter().enumerate() {
+                                            let mind = spline
+                                                .sampled_points(0.01)
+                                                .windows(2)
+                                                .map(|pair| {
+                                                    dist_point_to_segment(
+                                                        click_pos,
+                                                        to_scr(pair[0].0, pair[0].1),
+                                                        to_scr(pair[1].0, pair[1].1),
+                                                    )
+                                                })
+                                                .fold(f32::INFINITY, f32::min);
+                                            if mind < EDGE_TOL_PX
+                                                && best_edge.as_ref().map_or(true, |b| mind < b.2)
+                                            {
+                                                best_edge = Some((
+                                                    node.id.clone(),
+                                                    spline_offset + j,
+                                                    mind,
+                                                ));
                                             }
                                         }
 
@@ -1077,7 +1121,10 @@ impl ZeroCadApp {
                         // sets) to an offscreen texture, composited inside
                         // draw_viewport. Skipped only when GPU rendering is off
                         // or the wgpu backend is unavailable.
-                        if self.gpu_render && self.gpu.is_available() {
+                        if self.gpu_render
+                            && self.gpu.is_available()
+                            && self.section_view.is_none()
+                        {
                             self.render_gpu_scene(rect, ctx);
                         } else {
                             self.gpu_texture_id = None;
@@ -1182,6 +1229,44 @@ pub(crate) fn pick_solver_element(
                     // Screen-space radius from a second projected sample.
                     let rim = to_screen((c2.0 + *radius, c2.1));
                     (c.distance(pos) - c.distance(rim)).abs()
+                }
+                SketchEntity::Spline {
+                    points,
+                    kind,
+                    degree,
+                    knots,
+                    weights,
+                    closed,
+                    periodic,
+                    continuity,
+                    trim,
+                    ..
+                } => {
+                    let points: Option<Vec<(f32, f32)>> = points
+                        .iter()
+                        .map(|id| point_pos(*id).map(|point| (point.0 as f32, point.1 as f32)))
+                        .collect();
+                    let spline = zerocad_core::Spline {
+                        kind: *kind,
+                        points: points?,
+                        degree: *degree,
+                        knots: knots.clone(),
+                        weights: weights.clone(),
+                        closed: *closed,
+                        periodic: *periodic,
+                        continuity: *continuity,
+                        trim: *trim,
+                    };
+                    spline
+                        .sampled_points(0.01)
+                        .windows(2)
+                        .map(|pair| {
+                            seg_dist(
+                                to_screen((pair[0].0 as f64, pair[0].1 as f64)),
+                                to_screen((pair[1].0 as f64, pair[1].1 as f64)),
+                            )
+                        })
+                        .fold(f32::INFINITY, f32::min)
                 }
             };
             (d <= tol_px).then_some((e.id(), d))

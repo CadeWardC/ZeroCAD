@@ -108,6 +108,9 @@ fn eval_cache_key_changes_when_a_sketch_constraint_changes() {
                 id: EntityId(1),
                 p: EntityId(0),
             }],
+            construction: vec![],
+            driven_dimensions: vec![],
+            projected_edges: vec![],
         });
     } else {
         panic!("test fixture should contain a Sketch");

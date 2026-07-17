@@ -44,6 +44,7 @@ fn add_thread(
             length: None,
             flip: false,
             designation: "M-test".to_string(),
+            standard: None,
         },
     });
     g.add_dependency(target, id);
@@ -194,6 +195,8 @@ fn internal_thread_taps_a_drilled_hole() {
             diameter_expr: None,
             depth: None,
             kind: Default::default(),
+            standard: None,
+            manufacturing: None,
         },
     });
     g.add_dependency("box_1", "hole_2");

@@ -20,17 +20,21 @@ fn apply_new(live: &mut Vec<LiveBody>, body: LiveBody) {
 
 mod cut;
 mod datum;
+mod direct_edit;
 mod edge_mod;
 mod eval;
 mod extrude;
+mod inspection;
 mod join;
 mod phase35;
+pub mod standards;
 pub mod thread;
 pub mod topo_name;
 mod types;
 
 #[allow(unused_imports)]
 pub(crate) use cut::*;
+pub(crate) use direct_edit::*;
 pub use edge_mod::edge_wedge_is_concave_mesh;
 #[allow(unused_imports)]
 pub(crate) use edge_mod::*;
@@ -39,10 +43,17 @@ pub(crate) use eval::*;
 #[allow(unused_imports)]
 pub(crate) use extrude::*;
 pub use extrude::{boolean_region_plan, complete_selected_circles, BooleanRegionPlan};
+pub use inspection::{BodyInspection, FaceInspection, InterferencePair};
 #[allow(unused_imports)]
 pub(crate) use join::*;
 pub use phase35::body_bounds_center;
 pub(crate) use phase35::*;
+pub use standards::{
+    hole_presets, thread_classes, thread_reference, thread_reference_with_class, HoleApplication,
+    HoleFit, HoleManufacturingMetadata, HoleStandardPreset, ResolvedStandardGeometry,
+    StandardReference, StandardsFamily, HOLE_STANDARD_PRESETS, STANDARDS_LIBRARY_ID,
+    STANDARDS_LIBRARY_VERSION,
+};
 pub use thread::{
     closest_preset, default_depth_mm, ThreadPreset, ThreadStandard, METRIC_COARSE, UNIFIED_COARSE,
     UNIFIED_FINE,

@@ -397,6 +397,7 @@ fn uniform_scale_uses_persisted_pivot_and_expression() {
                 name: "s".to_string(),
                 value: 2.0,
                 unit: crate::Unit::Millimeter,
+                expression: None,
             }],
         },
     });

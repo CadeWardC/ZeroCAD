@@ -38,6 +38,7 @@ fn add_thread(g: &mut ParametricGraph, id: &str, target: &str, r: f32, h: f32) {
             length: None,
             flip: false,
             designation: "M-test".to_string(),
+            standard: None,
         },
     });
     g.add_dependency(target, id);

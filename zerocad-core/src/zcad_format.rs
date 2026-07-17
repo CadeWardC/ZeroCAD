@@ -320,6 +320,15 @@ impl RecipeFeaturePayload {
             Some(label),
         )
     }
+
+    fn stl_import(content_hash: [u8; 32], label: String) -> Self {
+        Self(
+            2,
+            crate::feature_dto::NumericFeatureFields::new(),
+            Some(content_hash),
+            Some(label),
+        )
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -579,6 +588,12 @@ impl DocumentRecipeV3 {
                         assets.entry(content_hash).or_insert(bytes);
                         RecipeFeaturePayload::step_import(content_hash, label.clone())
                     }
+                    crate::parametric::FeatureType::ImportStl { stl_data, label } => {
+                        let bytes = stl_data.clone();
+                        let content_hash = *blake3::hash(&bytes).as_bytes();
+                        assets.entry(content_hash).or_insert(bytes);
+                        RecipeFeaturePayload::stl_import(content_hash, label.clone())
+                    }
                     feature => RecipeFeaturePayload::inline(feature),
                 };
                 RecipeFeature {
@@ -728,6 +743,20 @@ impl DocumentRecipeV3 {
                         ))
                     })?;
                     crate::parametric::FeatureType::Import { step_data, label }
+                }
+                RecipeFeaturePayload(2, fields, Some(content_hash), Some(label))
+                    if fields.is_empty() =>
+                {
+                    let bytes = asset_map.get(&content_hash).ok_or_else(|| {
+                        ZcadError::Decode(format!(
+                            "STL import '{}' references missing required asset",
+                            record.id
+                        ))
+                    })?;
+                    crate::parametric::FeatureType::ImportStl {
+                        stl_data: bytes.to_vec(),
+                        label,
+                    }
                 }
                 RecipeFeaturePayload(tag, _, _, _) => {
                     return Err(ZcadError::Decode(format!(
@@ -2396,6 +2425,38 @@ mod tests {
                 "ISO-10303-21;END-ISO-10303-21;"
             ]
         );
+    }
+
+    #[test]
+    fn binary_stl_imports_round_trip_as_deduplicated_required_assets() {
+        let bytes = vec![0, 159, 146, 150, 255, 0, 42];
+        let mut graph = ParametricGraph::new();
+        for id in ["mesh_1", "mesh_2"] {
+            graph.add_feature(FeatureNode {
+                id: id.into(),
+                name: id.into(),
+                feature: FeatureType::ImportStl {
+                    stl_data: bytes.clone(),
+                    label: format!("{id}.stl"),
+                },
+            });
+        }
+        let (recipe, assets) = DocumentRecipeV3::from_graph_with_assets(&graph);
+        assert_eq!(
+            assets.blobs.len(),
+            1,
+            "identical mesh bytes are deduplicated"
+        );
+        let restored = recipe.into_graph_with_assets(&assets).unwrap();
+        let meshes: Vec<_> = restored
+            .graph
+            .node_weights()
+            .filter_map(|node| match &node.feature {
+                FeatureType::ImportStl { stl_data, .. } => Some(stl_data.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meshes, [bytes.as_slice(), bytes.as_slice()]);
     }
 
     #[test]

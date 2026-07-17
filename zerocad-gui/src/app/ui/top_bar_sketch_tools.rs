@@ -112,12 +112,33 @@ impl ZeroCadApp {
                             }
                         }
 
+                        let has_projectable_edge = self
+                            .selected_body
+                            .iter()
+                            .any(|(_, pick)| matches!(pick, BodyPick::Edge(_)));
+                        let project = ui
+                            .add_enabled(
+                                has_projectable_edge,
+                                egui::Button::new("Project Edge"),
+                            )
+                            .on_hover_text(
+                                "Project selected body edges into this sketch as construction geometry",
+                            );
+                        if project.clicked() {
+                            self.project_selected_edges_to_sketch();
+                        }
+
                         // Rectangle, Circle and the corner tool each expose a mode
                         // flyout: click the active button again (or right-click it)
                         // to choose corner/center/3-point, ellipse, or Fillet ↔
                         // Chamfer. The corner button is a single button (like the 3D
                         // edge fillet/chamfer) whose flyout switches the two kinds.
                         for (family, key, hover) in [
+                            (
+                                ToolFamily::Spline,
+                                "Spline",
+                                "Control-point / fit-point spline — click points, then double-click or press Enter to finish",
+                            ),
                             (
                                 ToolFamily::Rectangle,
                                 "Rectangle",
@@ -270,7 +291,10 @@ impl ZeroCadApp {
                     });
 
             // Curve statistics, Undo / Clear Sketch row
-            let curve_count = self.sketch_curves.segments.len() + self.sketch_curves.circles.len();
+            let curve_count = self.sketch_curves.segments.len()
+                + self.sketch_curves.circles.len()
+                + self.sketch_curves.arcs.len()
+                + self.sketch_curves.splines.len();
             if curve_count > 0 {
                 ui.separator();
                 ui.label(

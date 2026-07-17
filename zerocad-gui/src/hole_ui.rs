@@ -4,7 +4,7 @@
 //! the Properties panel afterwards.
 
 use crate::*;
-use zerocad_core::HoleKind;
+use zerocad_core::{HoleApplication, HoleFit, HoleKind, HoleStandardPreset, StandardsFamily};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum HoleKindChoice {
@@ -22,10 +22,170 @@ pub(crate) struct HoleOp {
     pub(crate) diameter_text: String,
     pub(crate) through: bool,
     pub(crate) depth_text: String,
+    pub(crate) use_drill_point: bool,
+    pub(crate) tip_angle_text: String,
     pub(crate) kind: HoleKindChoice,
     pub(crate) head_diameter_text: String,
     pub(crate) head_depth_text: String,
     pub(crate) head_angle_text: String,
+    pub(crate) use_standard: bool,
+    pub(crate) standard_family: StandardsFamily,
+    pub(crate) standard_application: HoleApplication,
+    pub(crate) standard_fit: HoleFit,
+    pub(crate) standard_preset_idx: usize,
+}
+
+impl HoleOp {
+    fn standard_presets(&self) -> Vec<&'static HoleStandardPreset> {
+        zerocad_core::parametric::hole_presets(
+            self.standard_family,
+            self.standard_application,
+            self.standard_fit,
+        )
+        .collect()
+    }
+
+    fn selected_standard(&self) -> Option<&'static HoleStandardPreset> {
+        self.standard_presets()
+            .get(self.standard_preset_idx)
+            .copied()
+    }
+
+    fn seed_from_standard(&mut self) {
+        let Some(preset) = self.selected_standard().copied() else {
+            return;
+        };
+        self.diameter_text = format_dimension(preset.bore_diameter_mm);
+        self.kind = match preset.application {
+            HoleApplication::Clearance | HoleApplication::Tapped => HoleKindChoice::Simple,
+            HoleApplication::Counterbore => HoleKindChoice::Counterbore,
+            HoleApplication::Countersink => HoleKindChoice::Countersink,
+        };
+        if let Some(value) = preset.head_diameter_mm {
+            self.head_diameter_text = format_dimension(value);
+        }
+        if let Some(value) = preset.head_depth_mm {
+            self.head_depth_text = format_dimension(value);
+        }
+        if let Some(value) = preset.head_angle_deg {
+            self.head_angle_text = format_dimension(value);
+        }
+    }
+}
+
+fn format_dimension(value: f32) -> String {
+    let text = format!("{value:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn draw_hole_standard_picker(ui: &mut egui::Ui, op: &mut HoleOp) {
+    ui.checkbox(&mut op.use_standard, "Use engineering standard");
+    if !op.use_standard {
+        return;
+    }
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Family");
+        for family in [StandardsFamily::Iso, StandardsFamily::Ansi] {
+            if ui
+                .selectable_label(op.standard_family == family, family.label())
+                .clicked()
+            {
+                op.standard_family = family;
+                op.standard_preset_idx = 0;
+                changed = true;
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Type");
+        for application in [
+            HoleApplication::Clearance,
+            HoleApplication::Tapped,
+            HoleApplication::Counterbore,
+            HoleApplication::Countersink,
+        ] {
+            if ui
+                .selectable_label(op.standard_application == application, application.label())
+                .clicked()
+            {
+                op.standard_application = application;
+                op.standard_fit = HoleFit::Normal;
+                op.standard_preset_idx = 0;
+                changed = true;
+            }
+        }
+    });
+    if op.standard_application == HoleApplication::Clearance {
+        ui.horizontal(|ui| {
+            ui.label("Fit");
+            for fit in [HoleFit::Close, HoleFit::Normal, HoleFit::Loose] {
+                let has_rows = zerocad_core::parametric::hole_presets(
+                    op.standard_family,
+                    op.standard_application,
+                    fit,
+                )
+                .next()
+                .is_some();
+                if ui
+                    .add_enabled(
+                        has_rows,
+                        egui::SelectableLabel::new(op.standard_fit == fit, fit.label()),
+                    )
+                    .clicked()
+                {
+                    op.standard_fit = fit;
+                    op.standard_preset_idx = 0;
+                    changed = true;
+                }
+            }
+        });
+    }
+    let presets = op.standard_presets();
+    let selected = presets
+        .get(op.standard_preset_idx)
+        .map_or("—", |preset| preset.designation);
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        egui::ComboBox::from_id_salt("hole_standard_size")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                for (index, preset) in presets.iter().enumerate() {
+                    if ui
+                        .selectable_value(&mut op.standard_preset_idx, index, preset.designation)
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+            });
+        if ui.small_button("Reset dimensions").clicked() {
+            changed = true;
+        }
+    });
+    if changed {
+        op.seed_from_standard();
+    }
+    if let Some(preset) = op.selected_standard() {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} v{} · {} · class {}",
+                zerocad_core::STANDARDS_LIBRARY_ID,
+                zerocad_core::STANDARDS_LIBRARY_VERSION,
+                preset.table,
+                preset.class.unwrap_or("—")
+            ))
+            .small()
+            .weak(),
+        );
+    }
+    ui.label(
+        egui::RichText::new(
+            "Resolved dimensions below are stored with the feature and may be overridden.",
+        )
+        .small()
+        .weak(),
+    );
 }
 
 impl ZeroCadApp {
@@ -55,13 +215,20 @@ impl ZeroCadApp {
             target: node,
             position: fref.centroid,
             direction: [-n[0], -n[1], -n[2]],
-            diameter_text: "6".to_string(),
+            diameter_text: "6.6".to_string(),
             through: true,
             depth_text: "10".to_string(),
+            use_drill_point: false,
+            tip_angle_text: "118".to_string(),
             kind: HoleKindChoice::Simple,
             head_diameter_text: "11".to_string(),
             head_depth_text: "3".to_string(),
             head_angle_text: "90".to_string(),
+            use_standard: true,
+            standard_family: StandardsFamily::Iso,
+            standard_application: HoleApplication::Clearance,
+            standard_fit: HoleFit::Normal,
+            standard_preset_idx: 3,
         });
         self.status_msg =
             "Hole: set the size and head style, then OK. Placed at the face centre (editable \
@@ -90,6 +257,8 @@ impl ZeroCadApp {
                             .color(self.pal().text_strong),
                     );
                     ui.add_space(6.0);
+                    draw_hole_standard_picker(ui, &mut op_new);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("Diameter");
                         ui.add(
@@ -111,18 +280,39 @@ impl ZeroCadApp {
                             crate::expr::evaluation_hint(ui, &op_new.depth_text, &var_map, "mm");
                         }
                     });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        for (k, label) in [
-                            (HoleKindChoice::Simple, "Simple"),
-                            (HoleKindChoice::Counterbore, "Counterbore"),
-                            (HoleKindChoice::Countersink, "Countersink"),
-                        ] {
-                            if ui.selectable_label(op_new.kind == k, label).clicked() {
-                                op_new.kind = k;
+                    ui.add_enabled_ui(!op_new.through, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut op_new.use_drill_point, "Modeled drill point");
+                            if op_new.use_drill_point {
+                                ui.label("Included angle");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut op_new.tip_angle_text)
+                                        .desired_width(42.0),
+                                );
+                                ui.label("Â°");
+                                crate::expr::evaluation_hint(
+                                    ui,
+                                    &op_new.tip_angle_text,
+                                    &var_map,
+                                    "Â°",
+                                );
                             }
-                        }
+                        });
                     });
+                    ui.add_space(4.0);
+                    if !op_new.use_standard {
+                        ui.horizontal(|ui| {
+                            for (k, label) in [
+                                (HoleKindChoice::Simple, "Simple"),
+                                (HoleKindChoice::Counterbore, "Counterbore"),
+                                (HoleKindChoice::Countersink, "Countersink"),
+                            ] {
+                                if ui.selectable_label(op_new.kind == k, label).clicked() {
+                                    op_new.kind = k;
+                                }
+                            }
+                        });
+                    }
                     match op_new.kind {
                         HoleKindChoice::Simple => {}
                         HoleKindChoice::Counterbore => {
@@ -252,6 +442,48 @@ impl ZeroCadApp {
                 }
             }
         };
+        let drill_point_angle_deg = if depth.is_some() && op.use_drill_point {
+            let angle = self.eval_dim(&op.tip_angle_text).unwrap_or(0.0);
+            if !(angle > 0.0 && angle < 180.0) {
+                self.status_msg = "Drill-point angle must be in (0, 180).".to_string();
+                return;
+            }
+            Some(angle)
+        } else {
+            None
+        };
+        let standard = if op.use_standard {
+            let Some(preset) = op.selected_standard().copied() else {
+                self.status_msg = "The selected standard has no available size.".to_string();
+                return;
+            };
+            let (head_diameter, head_depth, head_angle) = match &kind {
+                HoleKind::Simple => (None, None, None),
+                HoleKind::Counterbore { diameter, depth } => (Some(*diameter), Some(*depth), None),
+                HoleKind::Countersink {
+                    diameter,
+                    angle_deg,
+                } => (Some(*diameter), None, Some(*angle_deg)),
+            };
+            Some(preset.reference_with_resolved(diameter, head_diameter, head_depth, head_angle))
+        } else {
+            None
+        };
+        let manufacturing =
+            if let Some(preset) = op.selected_standard().copied().filter(|_| op.use_standard) {
+                Some(preset.manufacturing_metadata(drill_point_angle_deg))
+            } else if drill_point_angle_deg.is_some() {
+                Some(zerocad_core::HoleManufacturingMetadata {
+                    application: HoleApplication::Clearance,
+                    drill_point_angle_deg,
+                    cosmetic_thread: false,
+                    thread_designation: None,
+                    thread_class: None,
+                    tap_pitch_mm: None,
+                })
+            } else {
+                None
+            };
         self.push_undo();
         let n = self.next_id();
         let id = format!("hole_{n}");
@@ -267,6 +499,8 @@ impl ZeroCadApp {
                     .then(|| op.diameter_text.trim().to_string()),
                 depth,
                 kind,
+                standard,
+                manufacturing,
             },
         });
         self.document.add_dependency(&op.target, &id);

@@ -13,8 +13,8 @@ use zerocad_core::{Region, SketchCurves};
 /// `interactive` brightens the curves (used for the sketch being drawn). Faces
 /// in `selected` are highlighted blue and edges in `selected_edges` are
 /// highlighted orange; everything else stays faint so picking one element never
-/// recolors the whole sketch. Edge indices are `segment i` for i < segment
-/// count, else `circle (i - segment count)`.
+/// recolors the whole sketch. Edge indices are segments, then circles, then
+/// splines in their stored order.
 pub(crate) fn draw_sketch_geometry(
     painter: &egui::Painter,
     curves: &SketchCurves,
@@ -107,6 +107,49 @@ pub(crate) fn draw_sketch_geometry(
                 painter.line_segment([last, s], stroke);
             }
             prev = Some(s);
+        }
+    }
+
+    let spline_offset = seg_count + curves.circles.len();
+    for (index, spline) in curves.splines.iter().enumerate() {
+        let stroke = if selected_edges.contains(&(spline_offset + index)) {
+            sel_edge_stroke
+        } else {
+            seg_stroke
+        };
+        for pair in spline.sampled_points(0.01).windows(2) {
+            painter.line_segment([to_screen(pair[0]), to_screen(pair[1])], stroke);
+        }
+        if interactive {
+            if spline.kind == zerocad_core::SplineKind::ControlPoint {
+                for pair in spline.points.windows(2) {
+                    painter.line_segment(
+                        [to_screen(pair[0]), to_screen(pair[1])],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                    );
+                }
+            }
+            for point in &spline.points {
+                let center = to_screen(*point);
+                match spline.kind {
+                    zerocad_core::SplineKind::ControlPoint => {
+                        painter.rect_filled(
+                            egui::Rect::from_center_size(center, egui::vec2(7.0, 7.0)),
+                            1.0,
+                            egui::Color32::WHITE,
+                        );
+                        painter.rect_stroke(
+                            egui::Rect::from_center_size(center, egui::vec2(7.0, 7.0)),
+                            1.0,
+                            egui::Stroke::new(1.3, seg_color),
+                        );
+                    }
+                    zerocad_core::SplineKind::FitPoint => {
+                        painter.circle_filled(center, 3.5, egui::Color32::WHITE);
+                        painter.circle_stroke(center, 3.5, egui::Stroke::new(1.3, seg_color));
+                    }
+                }
+            }
         }
     }
 
@@ -450,6 +493,67 @@ fn fill_polygon_with_holes(
     }
     if !mesh.is_empty() {
         painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+/// Fill coplanar section loops while preserving nested holes. Loops may arrive
+/// in either winding and arbitrary order from triangle/plane intersection.
+pub(crate) fn fill_nested_loops(
+    painter: &egui::Painter,
+    loops: &[Vec<egui::Pos2>],
+    color: egui::Color32,
+) {
+    let loops: Vec<&Vec<egui::Pos2>> = loops.iter().filter(|loop_| loop_.len() >= 3).collect();
+    if loops.is_empty() {
+        return;
+    }
+    let contains = |polygon: &[egui::Pos2], point: egui::Pos2| {
+        let mut inside = false;
+        for index in 0..polygon.len() {
+            let a = polygon[index];
+            let b = polygon[(index + 1) % polygon.len()];
+            if (a.y > point.y) != (b.y > point.y)
+                && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+            {
+                inside = !inside;
+            }
+        }
+        inside
+    };
+    let areas: Vec<f32> = loops
+        .iter()
+        .map(|loop_| poly_signed_area(loop_).abs())
+        .collect();
+    let mut parents = vec![None; loops.len()];
+    for child in 0..loops.len() {
+        for candidate in 0..loops.len() {
+            if child == candidate || areas[candidate] <= areas[child] {
+                continue;
+            }
+            if contains(loops[candidate], loops[child][0])
+                && parents[child].is_none_or(|current| areas[candidate] < areas[current])
+            {
+                parents[child] = Some(candidate);
+            }
+        }
+    }
+    let depth = |mut index: usize| {
+        let mut depth = 0;
+        while let Some(parent) = parents[index] {
+            depth += 1;
+            index = parent;
+        }
+        depth
+    };
+    for outer in 0..loops.len() {
+        if depth(outer) % 2 != 0 {
+            continue;
+        }
+        let holes: Vec<Vec<egui::Pos2>> = (0..loops.len())
+            .filter(|index| parents[*index] == Some(outer))
+            .map(|index| loops[index].clone())
+            .collect();
+        fill_polygon_with_holes(painter, loops[outer], &holes, color);
     }
 }
 

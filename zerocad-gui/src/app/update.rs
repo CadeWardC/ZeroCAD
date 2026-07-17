@@ -36,6 +36,10 @@ impl eframe::App for ZeroCadApp {
 
         self.draw_settings_window(ctx);
 
+        self.show_parameters_dialog(ctx);
+
+        self.show_inspection_dialog(ctx);
+
         self.draw_top_bar(ctx);
 
         self.show_move_dialog(ctx);

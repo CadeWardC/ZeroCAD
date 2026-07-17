@@ -26,7 +26,7 @@ ZeroCAD/
 │   ├── sketch.rs        # 2D curves + detect_regions() (planar arrangement).
 │   ├── expr.rs          # Recursive-descent expression evaluator (shared with the UI).
 │   ├── units.rs         # mm / inch / meter conversions (base unit = mm).
-│   ├── stl.rs           # Binary STL export of tessellated meshes.
+│   ├── stl.rs           # Validated ASCII/binary STL mesh import and binary export.
 │   ├── document.rs      # Semantic bodies, timelines, inputs, selectors, feature registry.
 │   ├── feature_dto.rs   # Stable numeric-field persistence DTOs for every feature kind.
 │   ├── zcad_format.rs   # The binary `.zcad` document container (read/write).

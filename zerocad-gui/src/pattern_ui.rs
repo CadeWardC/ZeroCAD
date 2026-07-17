@@ -193,6 +193,10 @@ impl ZeroCadApp {
                         | FeatureType::BodyIntersect { .. }
                         | FeatureType::BodySplit { .. }
                         | FeatureType::BodyScale { .. }
+                        | FeatureType::FaceOffset { .. }
+                        | FeatureType::FaceMove { .. }
+                        | FeatureType::FaceDelete { .. }
+                        | FeatureType::FaceThicken { .. }
                         | FeatureType::Extrude {
                             mode: ExtrudeMode::NewBody,
                             ..

@@ -114,7 +114,7 @@ impl ZeroCadApp {
     pub(crate) fn apply_eval_result(
         &mut self,
         bodies: Vec<(String, MockMesh)>,
-        warnings: Vec<String>,
+        mut warnings: Vec<String>,
     ) {
         log::debug!(
             "[evaluation] applying committed result bodies={:?} warnings={:?}",
@@ -137,6 +137,16 @@ impl ZeroCadApp {
                     self.recompute_sketch_regions();
                 }
             }
+        }
+        match self.refresh_projected_sketch_edges() {
+            Ok(true) => {
+                self.spawn_refine_eval();
+                self.status_msg =
+                    "Updating sketches that reference changed body edges...".to_string();
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => warnings.push(error),
         }
         if warnings.is_empty() {
             self.error_msg = None;

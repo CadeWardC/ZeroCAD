@@ -892,6 +892,51 @@ impl ZeroCadApp {
         self.status_msg = format!("Imported {}", path.display());
     }
 
+    /// Import an ASCII or binary STL as an explicitly mesh-only history
+    /// feature. Validation diagnostics are produced by the evaluator and the
+    /// original bytes remain content-addressed inside the `.zcad` document.
+    pub(crate) fn import_stl(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import STL")
+            .add_filter("STL mesh", &["stl"])
+            .pick_file()
+        else {
+            return;
+        };
+        let stl_data = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status_msg = format!("STL import failed: {error}");
+                return;
+            }
+        };
+        let label = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("imported mesh")
+            .to_string();
+        if let Err(error) = self.commit_stl_import(stl_data, label) {
+            self.status_msg = format!("STL import failed: {error}");
+            return;
+        }
+        self.status_msg = format!("Imported mesh {}", path.display());
+    }
+
+    fn commit_stl_import(&mut self, stl_data: Vec<u8>, label: String) -> Result<String, String> {
+        let _validation =
+            zerocad_core::read_stl_mesh(&stl_data).map_err(|error| error.to_string())?;
+        self.push_undo();
+        let id = format!("stl_import_{}", self.next_id());
+        self.document.add_feature(FeatureNode {
+            id: id.clone(),
+            name: label.clone(),
+            feature: FeatureType::ImportStl { stl_data, label },
+        });
+        self.selected_node_id = Some(id.clone());
+        self.reevaluate_geometry();
+        Ok(id)
+    }
+
     /// Delete the currently selected browser node (sketch/body/variable set), if
     /// any (undoable). Mirrors the per-row delete button in the document browser.
     pub(crate) fn delete_selected_node(&mut self) {
@@ -933,5 +978,58 @@ impl ZeroCadApp {
         self.hidden_nodes.remove(del_id);
         self.reevaluate_geometry();
         true
+    }
+}
+
+#[cfg(test)]
+mod phase5_stl_tests {
+    use super::*;
+
+    const TRIANGLE: &[u8] = br#"solid triangle
+facet normal 0 0 1
+ outer loop
+  vertex 0 0 0
+  vertex 1 0 0
+  vertex 0 1 0
+ endloop
+endfacet
+endsolid triangle
+"#;
+
+    #[test]
+    fn validated_stl_import_is_undoable_and_redoable() {
+        let mut app = ZeroCadApp::new();
+        let id = app
+            .commit_stl_import(TRIANGLE.to_vec(), "triangle.stl".into())
+            .expect("GUI STL import");
+        assert_eq!(app.selected_node_id.as_deref(), Some(id.as_str()));
+        assert!(app.document.graph.node_weights().any(|node| {
+            matches!(
+                &node.feature,
+                FeatureType::ImportStl { stl_data, .. } if stl_data == TRIANGLE
+            )
+        }));
+        app.undo();
+        assert!(!app
+            .document
+            .graph
+            .node_weights()
+            .any(|node| matches!(node.feature, FeatureType::ImportStl { .. })));
+        app.redo();
+        assert!(app
+            .document
+            .graph
+            .node_weights()
+            .any(|node| matches!(node.feature, FeatureType::ImportStl { .. })));
+    }
+
+    #[test]
+    fn malformed_stl_does_not_mutate_the_document() {
+        let mut app = ZeroCadApp::new();
+        assert!(app
+            .commit_stl_import(b"not an STL".to_vec(), "bad.stl".into())
+            .is_err());
+        assert_eq!(app.document.graph.node_count(), 1, "origin only");
+        assert!(app.undo_stack.is_empty());
     }
 }

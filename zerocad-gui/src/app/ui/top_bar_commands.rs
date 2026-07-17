@@ -26,6 +26,20 @@ impl ZeroCadApp {
                 // the sketch never silently drops them.
                 self.commit_pending_corners();
                 self.recompute_sketch_regions();
+                let projection_sources: Vec<String> = self
+                    .sketch_solver_model
+                    .as_ref()
+                    .map(|model| {
+                        let mut sources: Vec<String> = model
+                            .projected_edges
+                            .iter()
+                            .map(|projection| projection.source_body.clone())
+                            .collect();
+                        sources.sort();
+                        sources.dedup();
+                        sources
+                    })
+                    .unwrap_or_default();
                 // Editing an existing sketch: update the node IN PLACE (same id
                 // → sketch_face_refs, dependency edges, and every downstream
                 // captured reference survive), then rebuild.
@@ -67,6 +81,9 @@ impl ZeroCadApp {
                             }
                             break;
                         }
+                        for source in &projection_sources {
+                            self.document.add_dependency(source, &editing_id);
+                        }
                         self.selected_node_id = Some(editing_id);
                         self.reset_sketch_state();
                         self.restore_camera(ctx);
@@ -91,7 +108,10 @@ impl ZeroCadApp {
                         "Saving sketch {} ({}) ({} curves, {} faces).",
                         sketch_id,
                         sketch_name,
-                        self.sketch_curves.segments.len() + self.sketch_curves.circles.len(),
+                        self.sketch_curves.segments.len()
+                            + self.sketch_curves.circles.len()
+                            + self.sketch_curves.arcs.len()
+                            + self.sketch_curves.splines.len(),
                         self.detected_regions.len(),
                     );
 
@@ -107,16 +127,24 @@ impl ZeroCadApp {
                             on_face: self.active_sketch_on_face,
                             // New sketches allocate real per-shape ids at commit;
                             // identity is the id, never the Vec position.
-                            entity_ids: zerocad_core::sketch::EntityId::sequence(
-                                self.sketch_shapes.len(),
-                            ),
-                            next_entity_id: self.sketch_shapes.len() as u32,
-                            solver: None,
+                            entity_ids: if self.sketch_entity_ids.len() == self.sketch_shapes.len()
+                            {
+                                self.sketch_entity_ids.clone()
+                            } else {
+                                zerocad_core::sketch::EntityId::sequence(self.sketch_shapes.len())
+                            },
+                            next_entity_id: self
+                                .sketch_next_entity_id
+                                .max(self.sketch_shapes.len() as u32),
+                            solver: self.sketch_solver_model.clone(),
                         },
                     };
 
                     self.push_undo();
                     self.document.add_feature(sketch_node);
+                    for source in &projection_sources {
+                        self.document.add_dependency(source, &sketch_id);
+                    }
                     // A sketch placed on a body face records that face + a dependency
                     // on the body, so on rebuild its plane is re-derived from where
                     // the face now is (the sketch follows the body).
@@ -506,6 +534,34 @@ impl ZeroCadApp {
                 {
                     self.begin_shell(target, fids);
                 }
+            }
+        }
+
+        // Imported-part direct modeling: one selected B-Rep face enables the
+        // exact Phase 5 operations. Numeric values are editable immediately in
+        // the feature Properties panel after creation.
+        if !active_sketching && self.selected_direct_face().is_some() {
+            let mut command = None;
+            ui.menu_button("Direct Edit", |ui| {
+                if ui.button("Press / Pull Face").clicked() {
+                    command = Some(DirectFaceCommand::PressPull);
+                    ui.close_menu();
+                }
+                if ui.button("Move Face").clicked() {
+                    command = Some(DirectFaceCommand::Move);
+                    ui.close_menu();
+                }
+                if ui.button("Delete Face").clicked() {
+                    command = Some(DirectFaceCommand::Delete);
+                    ui.close_menu();
+                }
+                if ui.button("Thicken Face").clicked() {
+                    command = Some(DirectFaceCommand::Thicken);
+                    ui.close_menu();
+                }
+            });
+            if let Some(command) = command {
+                self.commit_direct_face_command(command);
             }
         }
 

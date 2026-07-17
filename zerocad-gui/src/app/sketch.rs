@@ -1,6 +1,194 @@
 use crate::*;
 
 impl ZeroCadApp {
+    fn ensure_active_solver_model(&mut self) {
+        if self.sketch_solver_model.is_some() {
+            return;
+        }
+        let vars = self.document.variable_map();
+        let ids = if self.sketch_entity_ids.len() == self.sketch_shapes.len() {
+            self.sketch_entity_ids.clone()
+        } else {
+            zerocad_core::sketch::EntityId::sequence(self.sketch_shapes.len())
+        };
+        let next = self
+            .sketch_next_entity_id
+            .max(ids.iter().map(|id| id.0 + 1).max().unwrap_or(0));
+        let (model, next) = zerocad_core::sketch::constraints::promote_shapes_to_entities(
+            &self.sketch_shapes,
+            &ids,
+            &vars,
+            next,
+        );
+        self.sketch_entity_ids = ids;
+        self.sketch_next_entity_id = next;
+        self.sketch_solver_model = Some(model);
+    }
+
+    pub(crate) fn project_selected_edges_to_sketch(&mut self) {
+        let selected: Vec<(String, EdgeRef)> = self
+            .selected_body
+            .iter()
+            .filter_map(|(body, pick)| match pick {
+                BodyPick::Edge(group) => self
+                    .edge_ref_from(body, *group)
+                    .map(|edge| (body.clone(), edge)),
+                _ => None,
+            })
+            .collect();
+        if selected.is_empty() {
+            self.status_msg = "Select one or more body edges to project.".to_string();
+            return;
+        }
+        self.ensure_active_solver_model();
+        let mut added = 0usize;
+        let mut errors = Vec::new();
+        if let Some(model) = &mut self.sketch_solver_model {
+            for (body, edge) in selected {
+                match zerocad_core::sketch::append_projected_edge(
+                    model,
+                    body,
+                    edge,
+                    self.active_sketch_cs,
+                    &mut self.sketch_next_entity_id,
+                ) {
+                    Ok(()) => added += 1,
+                    Err(error) => errors.push(error),
+                }
+            }
+        }
+        if added == 0 {
+            self.status_msg = errors
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "The selected edges could not be projected.".to_string());
+            return;
+        }
+        self.selected_body.clear();
+        self.rebuild_active_sketch_curves();
+        self.status_msg = if errors.is_empty() {
+            format!("Projected {added} edge(s) as associative construction geometry.")
+        } else {
+            format!(
+                "Projected {added} edge(s); {} edge(s) could not be projected.",
+                errors.len()
+            )
+        };
+    }
+
+    fn resolve_projected_edge_source(
+        meshes: &[(String, MockMesh)],
+        projection: &zerocad_core::sketch::ProjectedEdgeReference,
+    ) -> Option<EdgeRef> {
+        let (_, mesh) = meshes
+            .iter()
+            .find(|(body, _)| body == &projection.source_body)?;
+        if let Some(edge_id) = projection
+            .source
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.edge_id.as_deref())
+        {
+            if let Some(group) = mesh.edge_refs.iter().find_map(|edge| {
+                (edge
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.edge_id.as_deref())
+                    == Some(edge_id))
+                .then_some(edge.group)
+            }) {
+                return Self::edge_ref_from_mesh(&projection.source_body, mesh, group);
+            }
+        }
+
+        let groups: std::collections::BTreeSet<u32> = mesh
+            .edge_refs
+            .iter()
+            .map(|edge| edge.group)
+            .chain(mesh.edge_groups.iter().copied())
+            .collect();
+        let distance = |a: [f32; 3], b: [f32; 3]| {
+            (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+        };
+        groups
+            .into_iter()
+            .filter_map(|group| {
+                let edge = Self::edge_ref_from_mesh(&projection.source_body, mesh, group)?;
+                let direct = distance(edge.p0, projection.source.p0)
+                    + distance(edge.p1, projection.source.p1);
+                let reverse = distance(edge.p0, projection.source.p1)
+                    + distance(edge.p1, projection.source.p0);
+                Some((direct.min(reverse), edge))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .and_then(|(distance, edge)| (distance <= 1.0).then_some(edge))
+    }
+
+    /// Refresh every persisted projection from the newly evaluated body
+    /// meshes. Returns true when a second evaluation is needed because a
+    /// projected reference moved and constrained sketch geometry may follow it.
+    pub(crate) fn refresh_projected_sketch_edges(&mut self) -> Result<bool, String> {
+        let meshes = self.body_meshes.clone();
+        let mut updates = Vec::new();
+        for node in self.document.graph.node_indices() {
+            let FeatureType::Sketch {
+                cs,
+                solver: Some(model),
+                ..
+            } = &self.document.graph[node].feature
+            else {
+                continue;
+            };
+            for (projection_index, projection) in model.projected_edges.iter().enumerate() {
+                let Some(edge) = Self::resolve_projected_edge_source(&meshes, projection) else {
+                    continue;
+                };
+                if edge != projection.source {
+                    updates.push((
+                        node,
+                        self.document.graph[node].id.clone(),
+                        projection_index,
+                        *cs,
+                        edge,
+                    ));
+                }
+            }
+        }
+        if updates.is_empty() {
+            return Ok(false);
+        }
+        let variables = self.document.variable_map();
+        let mut changed_nodes = Vec::new();
+        for (node, sketch_id, projection_index, cs, edge) in updates {
+            if let FeatureType::Sketch {
+                solver: Some(model),
+                ..
+            } = &mut self.document.graph[node].feature
+            {
+                zerocad_core::sketch::rebuild_projected_edge(model, projection_index, edge, cs)
+                    .map_err(|error| {
+                        format!("Sketch '{sketch_id}' projection {projection_index}: {error}.")
+                    })?;
+                changed_nodes.push(node);
+            }
+        }
+        changed_nodes.sort_by_key(|node| node.index());
+        changed_nodes.dedup();
+        for node in &changed_nodes {
+            if let FeatureType::Sketch {
+                solver: Some(model),
+                ..
+            } = &mut self.document.graph[*node].feature
+            {
+                let report = zerocad_core::sketch::solve_model(model, &variables);
+                if report.outcome == zerocad_core::sketch::SolveOutcome::Converged {
+                    zerocad_core::sketch::solve::apply_solution(model, &report);
+                }
+            }
+        }
+        Ok(!changed_nodes.is_empty())
+    }
+
     /// Undo the most recently committed action in the live sketch instead of
     /// stepping the document history. Sketch edits do not enter the document
     /// undo stack until Finish Sketch, so routing Ctrl/Cmd+Z to `undo()` while
@@ -49,28 +237,50 @@ impl ZeroCadApp {
                             point_ids.insert(*start);
                             point_ids.insert(*end);
                         }
+                        zerocad_core::sketch::SketchEntity::Spline { points, .. } => {
+                            point_ids.extend(points.iter().copied());
+                        }
                     }
                 }
                 model.points.retain(|point| point_ids.contains(&point.id));
                 model.constraints.retain(|constraint| {
                     use zerocad_core::sketch::Constraint;
                     match constraint {
-                        Constraint::Coincident { a, b, .. } | Constraint::Distance { a, b, .. } => {
+                        Constraint::Coincident { a, b, .. }
+                        | Constraint::Distance { a, b, .. }
+                        | Constraint::DistanceX { a, b, .. }
+                        | Constraint::DistanceY { a, b, .. } => {
                             point_ids.contains(a) && point_ids.contains(b)
                         }
                         Constraint::Horizontal { line, .. } | Constraint::Vertical { line, .. } => {
                             entity_ids.contains(line)
                         }
-                        Constraint::Radius { circle, .. } => entity_ids.contains(circle),
+                        Constraint::Radius { circle, .. } | Constraint::Diameter { circle, .. } => {
+                            entity_ids.contains(circle)
+                        }
                         Constraint::Parallel { a, b, .. }
                         | Constraint::Perpendicular { a, b, .. }
-                        | Constraint::Equal { a, b, .. } => {
+                        | Constraint::Equal { a, b, .. }
+                        | Constraint::Angle { a, b, .. }
+                        | Constraint::Concentric { a, b, .. }
+                        | Constraint::Collinear { a, b, .. } => {
                             entity_ids.contains(a) && entity_ids.contains(b)
                         }
                         Constraint::Tangent { line, circle, .. } => {
                             entity_ids.contains(line) && entity_ids.contains(circle)
                         }
                         Constraint::Fixed { p, .. } => point_ids.contains(p),
+                        Constraint::Midpoint { point, line, .. } => {
+                            point_ids.contains(point) && entity_ids.contains(line)
+                        }
+                        Constraint::PointOnObject { point, object, .. } => {
+                            point_ids.contains(point) && entity_ids.contains(object)
+                        }
+                        Constraint::Symmetric { a, b, axis, .. } => {
+                            point_ids.contains(a)
+                                && point_ids.contains(b)
+                                && entity_ids.contains(axis)
+                        }
                     }
                 });
             }
