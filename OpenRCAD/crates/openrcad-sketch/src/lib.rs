@@ -12,10 +12,14 @@ use openrcad_foundation::Pnt2d;
 use serde::{Deserialize, Serialize};
 
 pub mod arrangement;
+pub mod offset;
 
 pub use arrangement::{
     arrange_curve_spans, Arrangement, ArrangementError, ArrangementLoop, ArrangementOptions,
     ArrangementRegion,
+};
+pub use offset::{
+    offset_curve_chain, offset_material_region, OffsetChain, OffsetError, OffsetOptions,
 };
 
 /// Stable handle to a sketch entity.
