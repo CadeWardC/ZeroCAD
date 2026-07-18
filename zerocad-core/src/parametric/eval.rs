@@ -1381,6 +1381,7 @@ impl ParametricGraph {
             }
             let feature_started = std::time::Instant::now();
             let mut contract_feature_timing = None;
+            let mut contract_writebacks = FaceReattach::default();
             let node = &self.graph[idx];
             crate::mock_kernel::set_feature_context(Some(&node.id));
             let warn_before = warnings.len();
@@ -1396,16 +1397,15 @@ impl ParametricGraph {
                 let mut candidate_live = live.clone();
                 let mut feature_warnings = Vec::new();
                 let invocation = match self.resolve_feature_evaluator(node) {
-                    Ok(
-                        evaluator @ (crate::document::FeatureEvaluatorKind::Revolve
-                        | crate::document::FeatureEvaluatorKind::Loft
-                        | crate::document::FeatureEvaluatorKind::Sweep
-                        | crate::document::FeatureEvaluatorKind::Shell
-                        | crate::document::FeatureEvaluatorKind::Hole
-                        | crate::document::FeatureEvaluatorKind::Pattern
-                        | crate::document::FeatureEvaluatorKind::BodyTransform
-                        | crate::document::FeatureEvaluatorKind::Thread),
-                    ) => {
+                    Ok(evaluator)
+                        if !matches!(
+                            evaluator,
+                            crate::document::FeatureEvaluatorKind::EdgeMod
+                                | crate::document::FeatureEvaluatorKind::Infrastructure
+                                | crate::document::FeatureEvaluatorKind::Sketch
+                                | crate::document::FeatureEvaluatorKind::Datum
+                        ) =>
+                    {
                         let context = FeatureEvalContext {
                             feature: node,
                             feature_id: crate::document::FeatureId::from(node.id.as_str()),
@@ -1441,17 +1441,11 @@ impl ParametricGraph {
                             crate::document::FeatureEvaluatorKind::Thread => {
                                 self.evaluate_thread_candidate(context)
                             }
-                            _ => unreachable!(),
+                            _ => self.evaluate_direct_or_body_candidate(idx, evaluator, context),
                         };
                         result.and_then(|result| {
                             if result.writebacks.producing_revision != 0 {
                                 return Err("feature returned a stale writeback revision".into());
-                            }
-                            if !result.writebacks.face_reattach.boundaries.is_empty()
-                                || !result.writebacks.face_reattach.planes.is_empty()
-                                || !result.writebacks.face_reattach.region_indices.is_empty()
-                            {
-                                return Err("feature returned unsupported writebacks".into());
                             }
                             if result.validation_evidence.input_body_count != live.len()
                                 || result.validation_evidence.candidate_body_count
@@ -1464,6 +1458,7 @@ impl ParametricGraph {
                                 );
                             }
                             contract_feature_timing = Some(result.feature_timing);
+                            contract_writebacks = result.writebacks.face_reattach;
                             candidate_live = result.candidate_body_state;
                             feature_warnings.extend(
                                 result
@@ -1499,6 +1494,12 @@ impl ParametricGraph {
                             ));
                         } else {
                             live = candidate_live;
+                            let mut pending = self.pending_face_reattach.borrow_mut();
+                            pending.boundaries.extend(contract_writebacks.boundaries);
+                            pending.planes.extend(contract_writebacks.planes);
+                            pending
+                                .region_indices
+                                .extend(contract_writebacks.region_indices);
                         }
                     }
                 }
@@ -2038,6 +2039,65 @@ impl ParametricGraph {
             writebacks: RevisionBoundWritebacks {
                 producing_revision: context.document_revision,
                 face_reattach: FaceReattach::default(),
+            },
+        })
+    }
+
+    fn evaluate_direct_or_body_candidate(
+        &self,
+        idx: NodeIndex,
+        evaluator: crate::document::FeatureEvaluatorKind,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        let started = std::time::Instant::now();
+        if context
+            .cancellation
+            .is_some_and(EvaluationCancellation::is_cancelled)
+        {
+            return Err("model evaluation was superseded".into());
+        }
+        let mut candidate_body_state = context.live_bodies.to_vec();
+        let mut warnings = Vec::new();
+        let previous_writebacks = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
+        let invocation = self.invoke_registered_feature(
+            idx,
+            evaluator,
+            context.variables,
+            context.sketches,
+            context.datums,
+            context.quality == EvaluationQuality::Interactive,
+            &mut candidate_body_state,
+            &mut warnings,
+        );
+        let face_reattach = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
+        *self.pending_face_reattach.borrow_mut() = previous_writebacks;
+        invocation?;
+        let diagnostics = warnings
+            .into_iter()
+            .filter_map(|message| {
+                super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                    feature_id: context.feature_id.to_string(),
+                    feature_name: context.feature.name.clone(),
+                    state: ResolutionState::Unresolved(message),
+                })
+            })
+            .collect();
+        let topology_history = Vec::new();
+        let validation_evidence = FeatureValidationEvidence {
+            input_body_count: context.live_bodies.len(),
+            candidate_body_count: candidate_body_state.len(),
+            topology_history_entries: topology_history.len(),
+        };
+        let _tolerance = context.tolerance;
+        Ok(FeatureEvalResult {
+            candidate_body_state,
+            topology_history,
+            diagnostics,
+            validation_evidence,
+            feature_timing: started.elapsed(),
+            writebacks: RevisionBoundWritebacks {
+                producing_revision: context.document_revision,
+                face_reattach,
             },
         })
     }
