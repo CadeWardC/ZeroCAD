@@ -28,6 +28,7 @@ mod eval;
 mod extrude;
 mod inspection;
 mod join;
+mod mesh_support;
 pub mod standards;
 pub mod thread;
 pub mod topo_name;
