@@ -19,10 +19,11 @@ pub const CIRCLE_SEGS: usize = 48;
 
 // Re-export common structures for easy access
 pub use document::{
-    BodyId, BodyRecord, Document, DocumentSemantics, DocumentState, FeatureEditorGroup,
-    FeatureEvaluatorKind, FeatureId, FeatureInput, FeatureInputTarget, FeatureKindId,
-    FeatureRegistration, FeatureRegistry, FeatureState, GeometricIntent, SelectionProvenance,
-    SelectionTopology, SelectorResolutionTier, SemanticEntityKind, SemanticSelector, SequenceKey,
+    BodyId, BodyRecord, Document, DocumentRevision, DocumentSemantics, DocumentState,
+    FeatureEditorGroup, FeatureEvaluatorKind, FeatureId, FeatureInput, FeatureInputTarget,
+    FeatureKindId, FeatureRegistration, FeatureRegistry, FeatureState, GeometricIntent,
+    SelectionProvenance, SelectionTopology, SelectorResolutionTier, SemanticEntityKind,
+    SemanticSelector, SequenceKey,
 };
 pub use dxf::{
     read_dxf_file, read_dxf_str, DxfDiagnostic, DxfDiagnosticSeverity, DxfError, DxfImport, DxfUnit,
@@ -36,11 +37,12 @@ pub use parametric::{
     DatumValue, DiagnosticCode, DiagnosticParameterValue, DiagnosticSeverity, EdgeInspection,
     EdgePairInspection, EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation,
     EvaluationDiagnostic, EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings,
-    ExtrudeMode, FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit,
-    HoleKind, HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, ParametricGraph,
-    PatternKind, PlaneBase, ResolvedStandardGeometry, StandardReference, StandardsDataPack,
-    StandardsFamily, TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution,
-    HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
+    EvaluationTrace, ExtrudeMode, FaceInspection, FeatureNode, FeatureTiming, FeatureType,
+    HoleApplication, HoleFit, HoleKind, HoleManufacturingMetadata, HoleStandardPreset,
+    InterferencePair, ParametricGraph, PatternKind, PlaneBase, PristineMeshReuse,
+    ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily,
+    TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution, HOLE_STANDARD_PRESETS,
+    STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
 };
 pub use release::{
     validate_compatibility_exception_ledger, validate_phase7_exception_ledger,

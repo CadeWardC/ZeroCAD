@@ -834,8 +834,9 @@ impl<'de> serde::Deserialize<'de> for ParametricGraph {
 
 /// Refreshed sketch-on-face data queued during an evaluation — see
 /// [`ParametricGraph::pending_face_reattach`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FaceReattach {
+    producing_revision: crate::document::DocumentRevision,
     /// Sketch node id → the face outline re-projected from where the face is
     /// now (replaces the `sketch_face_boundaries` snapshot).
     pub boundaries: HashMap<crate::document::FeatureId, crate::sketch::SketchCurves>,
@@ -850,6 +851,34 @@ pub struct FaceReattach {
     pub region_indices: HashMap<crate::document::FeatureId, Vec<usize>>,
 }
 
+impl Default for FaceReattach {
+    fn default() -> Self {
+        Self::for_revision(crate::document::DocumentRevision::INITIAL)
+    }
+}
+
+impl FaceReattach {
+    pub(crate) fn for_revision(revision: crate::document::DocumentRevision) -> Self {
+        Self {
+            producing_revision: revision,
+            boundaries: HashMap::new(),
+            planes: HashMap::new(),
+            region_indices: HashMap::new(),
+        }
+    }
+
+    pub fn producing_revision(&self) -> crate::document::DocumentRevision {
+        self.producing_revision
+    }
+}
+
+/// Unpersisted dependency split for one evaluator checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DependencyManifest {
+    pub(crate) geometry_hash: u64,
+    pub(crate) diagnostic_hash: u64,
+}
+
 /// Checkpoints of [`evaluate_bodies_inner`], one per processed body node, in
 /// creation order. A pure accelerator — see [`ParametricGraph::eval_cache`].
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -862,6 +891,8 @@ pub(crate) struct EvalCache {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EvalCheckpoint {
     pub(crate) key: u64,
+    #[serde(skip)]
+    pub(crate) manifest: DependencyManifest,
     pub(crate) live: Vec<LiveBody>,
     pub(crate) warnings: Vec<String>,
     /// Per-feature resolution status accumulated up to and including this node,
@@ -982,6 +1013,24 @@ pub struct EvaluationTimings {
     pub tessellation: std::time::Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PristineMeshReuse {
+    pub body_id: crate::document::BodyId,
+    /// Stable only for the lifetime of the evaluation process. Tests compare
+    /// identity across warm evaluations; it is never persisted or displayed.
+    pub allocation_identity: usize,
+}
+
+/// Deterministic evaluator work classification. Normal tests assert this trace
+/// instead of machine-dependent wall-clock durations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvaluationTrace {
+    pub reused_checkpoints: Vec<crate::document::FeatureId>,
+    pub evaluated_features: Vec<crate::document::FeatureId>,
+    pub tessellated_bodies: Vec<crate::document::BodyId>,
+    pub pristine_mesh_reuse: Vec<PristineMeshReuse>,
+}
+
 #[derive(Debug)]
 pub struct EvaluationOutput {
     pub bodies: Vec<(String, MockMesh)>,
@@ -991,6 +1040,8 @@ pub struct EvaluationOutput {
     pub face_reattach: FaceReattach,
     pub timings: EvaluationTimings,
     pub feature_timings: Vec<FeatureTiming>,
+    pub trace: EvaluationTrace,
+    pub revision: crate::document::DocumentRevision,
     pub cache_snapshot: EvaluationCacheSnapshot,
 }
 

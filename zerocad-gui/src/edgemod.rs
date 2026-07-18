@@ -1419,7 +1419,7 @@ impl ZeroCadApp {
             // show them instantly (no faceted-draft flash, no wait), then refine
             // to full-quality tessellation in the background. `spawn_refine_eval`
             // bumps the generation, so any older in-flight refine is superseded.
-            self.apply_eval_result((*bodies).clone(), warnings);
+            self.apply_eval_result((*bodies).clone(), warnings, false);
             self.spawn_refine_eval();
             true
         } else {

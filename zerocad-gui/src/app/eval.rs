@@ -118,6 +118,7 @@ impl ZeroCadApp {
         &mut self,
         bodies: Vec<(String, MockMesh)>,
         mut warnings: Vec<String>,
+        face_reattached: bool,
     ) {
         log::debug!(
             "[evaluation] applying committed result bodies={:?} warnings={:?}",
@@ -133,7 +134,7 @@ impl ZeroCadApp {
         // future picks agree with what was just built. Self-healing
         // normalization, not a user edit — no undo step. If the user is
         // mid-edit on such a sketch, refresh its live reference outline too.
-        if self.document.apply_face_reattach() {
+        if face_reattached {
             if let Some(editing_id) = self.editing_sketch_id.clone() {
                 if let Some(b) = self
                     .document
@@ -274,9 +275,10 @@ impl ZeroCadApp {
                     let warnings = output.rendered_warnings();
                     self.document
                         .install_evaluation_cache(output.cache_snapshot);
-                    self.document
+                    let face_reattached = self
+                        .document
                         .apply_face_reattach_updates(output.face_reattach);
-                    self.apply_eval_result(output.bodies, warnings);
+                    self.apply_eval_result(output.bodies, warnings, face_reattached);
                 }
                 Err(err) => {
                     self.error_msg = Some(err.to_string());

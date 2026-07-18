@@ -125,6 +125,25 @@ macro_rules! string_id {
 
 string_id!(FeatureId);
 string_id!(BodyId);
+
+/// Monotonic identity of an authoritative in-memory document state.
+///
+/// Revisions are deliberately not serialized. They exist only to prevent
+/// background evaluation writebacks from crossing an intervening edit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocumentRevision(u64);
+
+impl DocumentRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    pub fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
 string_id!(FeatureKindId);
 
 /// Stable ordering key inside a body's intended history.
@@ -499,6 +518,7 @@ impl Default for DocumentState {
 pub struct Document {
     runtime: ParametricGraph,
     pub state: DocumentState,
+    revision: DocumentRevision,
 }
 
 impl Default for Document {
@@ -512,6 +532,7 @@ impl Document {
         Self {
             runtime: ParametricGraph::new(),
             state: DocumentState::default(),
+            revision: DocumentRevision::INITIAL,
         }
     }
 
@@ -523,6 +544,7 @@ impl Document {
                 created_unix: None,
                 visibility: BTreeMap::new(),
             },
+            revision: DocumentRevision::INITIAL,
         }
     }
 
@@ -532,10 +554,14 @@ impl Document {
 
     pub fn set_visible(&mut self, id: impl Into<String>, visible: bool) {
         let id = id.into();
+        let before = self.is_visible(&id);
         if visible {
             self.state.visibility.remove(&id);
         } else {
             self.state.visibility.insert(id, false);
+        }
+        if before != visible {
+            self.mark_edited();
         }
     }
 
@@ -559,11 +585,48 @@ impl Document {
     }
 
     pub fn evaluator_graph_mut(&mut self) -> &mut ParametricGraph {
+        self.mark_edited();
         &mut self.runtime
     }
 
     pub fn into_evaluator_graph(self) -> ParametricGraph {
         self.runtime
+    }
+
+    pub fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    pub fn mark_edited(&mut self) -> DocumentRevision {
+        self.revision = self.revision.next();
+        self.revision
+    }
+
+    pub fn evaluate_request(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        quality: crate::parametric::EvaluationQuality,
+        cancellation: &crate::parametric::EvaluationCancellation,
+    ) -> Result<crate::parametric::EvaluationOutput, crate::parametric::EvaluationError> {
+        self.runtime
+            .evaluate_request_at_revision(hidden, quality, cancellation, self.revision)
+    }
+
+    /// Commit evaluator writebacks only when they were produced from this exact
+    /// authoritative state. A successful writeback becomes a new revision.
+    pub fn apply_face_reattach_updates(
+        &mut self,
+        pending: crate::parametric::FaceReattach,
+    ) -> bool {
+        if pending.producing_revision() != self.revision {
+            return false;
+        }
+        if self.runtime.apply_face_reattach_updates(pending) {
+            self.mark_edited();
+            true
+        } else {
+            false
+        }
     }
 }
 

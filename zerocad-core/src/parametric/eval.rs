@@ -13,7 +13,7 @@ struct FeatureEvalContext<'a> {
     quality: EvaluationQuality,
     cancellation: Option<&'a EvaluationCancellation>,
     tolerance: &'a openrcad::foundation::TolerancePolicy,
-    document_revision: u64,
+    document_revision: crate::document::DocumentRevision,
     live_bodies: &'a [LiveBody],
 }
 
@@ -38,7 +38,7 @@ enum CandidateValidationFamily {
 
 #[derive(Debug)]
 struct RevisionBoundWritebacks {
-    producing_revision: u64,
+    producing_revision: crate::document::DocumentRevision,
     face_reattach: FaceReattach,
 }
 
@@ -1123,6 +1123,21 @@ impl ParametricGraph {
         quality: EvaluationQuality,
         cancellation: &EvaluationCancellation,
     ) -> Result<EvaluationOutput, EvaluationError> {
+        self.evaluate_request_at_revision(
+            hidden,
+            quality,
+            cancellation,
+            crate::document::DocumentRevision::INITIAL,
+        )
+    }
+
+    pub(crate) fn evaluate_request_at_revision(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        quality: EvaluationQuality,
+        cancellation: &EvaluationCancellation,
+        revision: crate::document::DocumentRevision,
+    ) -> Result<EvaluationOutput, EvaluationError> {
         let total_started = std::time::Instant::now();
         let draft = quality == EvaluationQuality::Interactive;
         let run_inner = || {
@@ -1131,8 +1146,8 @@ impl ParametricGraph {
                 return Err(EvaluationError::Cancelled);
             }
             let build_started = std::time::Instant::now();
-            let (live, warnings) = self
-                .build_live_with_cancel(hidden, draft, Some(cancellation))
+            let (live, warnings, mut trace) = self
+                .build_live_with_cancel_traced(hidden, draft, Some(cancellation), revision)
                 .map_err(|message| {
                     if cancellation.is_cancelled() {
                         EvaluationError::Cancelled
@@ -1178,6 +1193,7 @@ impl ParametricGraph {
             let bodies = tessellate_bodies_with_cancel(
                 self.visible_live_bodies(live, hidden),
                 Some(cancellation),
+                Some(&mut trace),
             )?;
             let tessellation = tess_started.elapsed();
             let face_reattach = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
@@ -1193,6 +1209,8 @@ impl ParametricGraph {
                     tessellation,
                 },
                 feature_timings,
+                trace,
+                revision,
                 cache_snapshot: self.evaluation_cache_snapshot(),
             })
         };
@@ -1291,6 +1309,24 @@ impl ParametricGraph {
         draft: bool,
         cancellation: Option<&EvaluationCancellation>,
     ) -> Result<(Vec<LiveBody>, Vec<String>), String> {
+        let (live, warnings, _) = self.build_live_with_cancel_traced(
+            hidden,
+            draft,
+            cancellation,
+            crate::document::DocumentRevision::INITIAL,
+        )?;
+        Ok((live, warnings))
+    }
+
+    fn build_live_with_cancel_traced(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+        draft: bool,
+        cancellation: Option<&EvaluationCancellation>,
+        document_revision: crate::document::DocumentRevision,
+    ) -> Result<(Vec<LiveBody>, Vec<String>, EvaluationTrace), String> {
+        let mut trace = EvaluationTrace::default();
+        *self.pending_face_reattach.borrow_mut() = FaceReattach::for_revision(document_revision);
         crate::mock_kernel::reset_diagnostics();
         if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
             return Err("model evaluation was superseded".to_string());
@@ -1322,7 +1358,11 @@ impl ParametricGraph {
         // identical, so the matching prefix (and its expensive booleans) is
         // restored from the previous evaluation instead of recomputed.
         let nodes: Vec<NodeIndex> = self.body_nodes_in_evaluation_order()?;
-        let keys = self.eval_prefix_keys(&nodes, hidden, &vars);
+        let manifests = self.eval_dependency_manifests(&nodes, hidden, &vars);
+        let keys: Vec<u64> = manifests
+            .iter()
+            .map(|manifest| manifest.geometry_hash)
+            .collect();
 
         // A complete checkpoint hit needs only the final assembled state. Keep
         // the immutable cache allocation in place instead of cloning every
@@ -1344,11 +1384,31 @@ impl ParametricGraph {
                 .flatten()
         };
         if let Some((live, mut warnings)) = fully_reused {
+            trace.reused_checkpoints.extend(
+                nodes
+                    .iter()
+                    .map(|idx| crate::document::FeatureId::from(self.graph[*idx].id.as_str())),
+            );
+            if self
+                .eval_cache
+                .borrow()
+                .checkpoints
+                .last()
+                .and_then(Option::as_ref)
+                .zip(manifests.last())
+                .is_some_and(|(checkpoint, manifest)| {
+                    checkpoint.manifest.diagnostic_hash != manifest.diagnostic_hash
+                })
+            {
+                let mut refreshed = self.eval_cache.borrow().as_ref().clone();
+                self.refresh_checkpoint_diagnostics(&mut refreshed.checkpoints, &manifests);
+                *self.eval_cache.borrow_mut() = std::sync::Arc::new(refreshed);
+            }
             if !datum_warnings.is_empty() {
                 datum_warnings.extend(warnings);
                 warnings = datum_warnings;
             }
-            return Ok((live, warnings));
+            return Ok((live, warnings, trace));
         }
 
         let (mut live, mut warnings, mut statuses, reuse, mut checkpoints) = {
@@ -1363,14 +1423,21 @@ impl ParametricGraph {
                 for i in 0..=last {
                     if let Some(old) = cps.get(i).and_then(Option::as_ref) {
                         if old.key == keys[i] {
-                            retained[i] = Some(old.clone());
+                            let mut retained_checkpoint = old.clone();
+                            retained_checkpoint.manifest = manifests[i];
+                            self.refresh_status_names(&mut retained_checkpoint.statuses);
+                            retained[i] = Some(retained_checkpoint);
                         }
                     }
                 }
                 (
                     cp.live.clone(),
                     cp.warnings.clone(),
-                    cp.statuses.clone(),
+                    {
+                        let mut statuses = cp.statuses.clone();
+                        self.refresh_status_names(&mut statuses);
+                        statuses
+                    },
                     last + 1,
                     retained,
                 )
@@ -1384,6 +1451,12 @@ impl ParametricGraph {
                 )
             }
         };
+        trace.reused_checkpoints.extend(
+            nodes
+                .iter()
+                .take(reuse)
+                .map(|idx| crate::document::FeatureId::from(self.graph[*idx].id.as_str())),
+        );
 
         for (i, &idx) in nodes.iter().enumerate() {
             if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
@@ -1398,6 +1471,9 @@ impl ParametricGraph {
             let mut contract_feature_timing = None;
             let mut contract_writebacks = FaceReattach::default();
             let node = &self.graph[idx];
+            trace
+                .evaluated_features
+                .push(crate::document::FeatureId::from(node.id.as_str()));
             crate::mock_kernel::set_feature_context(Some(&node.id));
             let warn_before = warnings.len();
             if self.is_feature_suppressed(&node.id) {
@@ -1433,7 +1509,7 @@ impl ParametricGraph {
                             },
                             cancellation,
                             tolerance: &openrcad::foundation::TolerancePolicy::STANDARD,
-                            document_revision: 0,
+                            document_revision,
                             live_bodies: &live,
                         };
                         let result = match evaluator {
@@ -1461,7 +1537,7 @@ impl ParametricGraph {
                             _ => self.evaluate_direct_or_body_candidate(idx, evaluator, context),
                         };
                         result.and_then(|result| {
-                            if result.writebacks.producing_revision != 0 {
+                            if result.writebacks.producing_revision != document_revision {
                                 return Err("feature returned a stale writeback revision".into());
                             }
                             if result.validation_evidence.input_body_count != live.len()
@@ -1560,6 +1636,7 @@ impl ParametricGraph {
             // that shares this prefix can resume from here.
             checkpoints[i] = Some(EvalCheckpoint {
                 key: keys[i],
+                manifest: manifests[i],
                 live: live.clone(),
                 warnings: warnings.clone(),
                 statuses: statuses.clone(),
@@ -1575,7 +1652,7 @@ impl ParametricGraph {
             datum_warnings.extend(warnings);
             warnings = datum_warnings;
         }
-        Ok((live, warnings))
+        Ok((live, warnings, trace))
     }
 
     /// Invoke one resolved feature through its registry-selected evaluator
@@ -2664,6 +2741,51 @@ impl ParametricGraph {
             keys.push(h.finish());
         }
         keys
+    }
+
+    fn eval_dependency_manifests(
+        &self,
+        nodes: &[NodeIndex],
+        hidden: &std::collections::HashSet<String>,
+        vars: &HashMap<String, f64>,
+    ) -> Vec<DependencyManifest> {
+        let geometry = self.eval_prefix_keys(nodes, hidden, vars);
+        let mut diagnostic_hasher = std::collections::hash_map::DefaultHasher::new();
+        nodes
+            .iter()
+            .zip(geometry)
+            .map(|(&idx, geometry_hash)| {
+                diagnostic_hasher.write_u64(geometry_hash);
+                diagnostic_hasher.write(self.graph[idx].id.as_bytes());
+                diagnostic_hasher.write_u8(0xfd);
+                diagnostic_hasher.write(self.graph[idx].name.as_bytes());
+                DependencyManifest {
+                    geometry_hash,
+                    diagnostic_hash: diagnostic_hasher.finish(),
+                }
+            })
+            .collect()
+    }
+
+    fn refresh_status_names(&self, statuses: &mut [FeatureStatus]) {
+        for status in statuses {
+            if let Some(index) = self.node_map.get(status.feature_id.as_str()).copied() {
+                status.feature_name.clone_from(&self.graph[index].name);
+            }
+        }
+    }
+
+    fn refresh_checkpoint_diagnostics(
+        &self,
+        checkpoints: &mut [Option<EvalCheckpoint>],
+        manifests: &[DependencyManifest],
+    ) {
+        for (checkpoint, manifest) in checkpoints.iter_mut().zip(manifests) {
+            if let Some(checkpoint) = checkpoint {
+                self.refresh_status_names(&mut checkpoint.statuses);
+                checkpoint.manifest = *manifest;
+            }
+        }
     }
 
     /// Detect (or fetch from the region cache) the planar regions of every
@@ -5092,7 +5214,7 @@ pub(crate) fn tessellate_bodies(live: Vec<LiveBody>) -> Vec<(String, MockMesh)> 
 }
 
 fn try_tessellate_bodies(live: Vec<LiveBody>) -> Result<Vec<(String, MockMesh)>, String> {
-    tessellate_bodies_with_cancel(live, None).map_err(|error| error.to_string())
+    tessellate_bodies_with_cancel(live, None, None).map_err(|error| error.to_string())
 }
 
 /// Visibility is presentation-only. The complete B-Rep history is built and
@@ -5150,6 +5272,7 @@ fn validate_live_body_state(live: &[LiveBody]) -> Result<(), String> {
 fn tessellate_bodies_with_cancel(
     live: Vec<LiveBody>,
     cancellation: Option<&EvaluationCancellation>,
+    mut trace: Option<&mut EvaluationTrace>,
 ) -> Result<Vec<(String, MockMesh)>, EvaluationError> {
     let mut bodies: Vec<(String, MockMesh)> = Vec::new();
     for body in live {
@@ -5158,11 +5281,20 @@ fn tessellate_bodies_with_cancel(
         }
         let mesh = match body.pristine {
             Some(m) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.pristine_mesh_reuse.push(PristineMeshReuse {
+                        body_id: body.id.clone(),
+                        allocation_identity: std::sync::Arc::as_ptr(&m) as usize,
+                    });
+                }
                 let mut mesh = (*m).clone();
                 crate::mock_kernel::stamp_body_face_components(&mut mesh, &body.id, &body.parts);
                 mesh
             }
             None => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.tessellated_bodies.push(body.id.clone());
+                }
                 let mut m = MockMesh::empty();
                 for part in &body.parts {
                     let mut part_mesh = match cancellation {

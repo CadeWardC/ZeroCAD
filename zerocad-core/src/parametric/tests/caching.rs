@@ -261,3 +261,91 @@ fn graph_clone_shares_warm_cache_until_worker_rebuilds_it() {
         &snapshot.cache
     ));
 }
+
+fn live_cancellation() -> EvaluationCancellation {
+    EvaluationCancellation::new(1, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)))
+}
+
+#[test]
+fn evaluation_trace_classifies_cold_and_warm_work_without_wall_clock_time() {
+    let mut graph = ParametricGraph::new();
+    for i in 1..=3 {
+        graph.add_feature(FeatureNode {
+            id: format!("box_{i}"),
+            name: format!("Box {i}"),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
+        });
+    }
+    let hidden = std::collections::HashSet::new();
+    let cold = graph
+        .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+        .unwrap();
+    assert_eq!(cold.trace.evaluated_features.len(), 3);
+    assert!(cold.trace.reused_checkpoints.is_empty());
+    assert_eq!(cold.trace.pristine_mesh_reuse.len(), 3);
+    assert!(cold.trace.tessellated_bodies.is_empty());
+
+    let warm = graph
+        .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+        .unwrap();
+    assert!(warm.trace.evaluated_features.is_empty());
+    assert_eq!(warm.trace.reused_checkpoints.len(), 3);
+    assert_eq!(warm.trace.pristine_mesh_reuse.len(), 3);
+    assert_eq!(
+        cold.trace.pristine_mesh_reuse, warm.trace.pristine_mesh_reuse,
+        "warm evaluation must reuse the exact pristine mesh allocations"
+    );
+}
+
+#[test]
+fn diagnostic_dependencies_refresh_names_without_rebuilding_geometry() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Original name".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let hidden = std::collections::HashSet::new();
+    graph
+        .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+        .unwrap();
+    graph.graph[graph.node_map["box_1"]].name = "Renamed box".into();
+
+    let warm = graph
+        .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+        .unwrap();
+    assert!(warm.trace.evaluated_features.is_empty());
+    assert_eq!(
+        warm.trace.reused_checkpoints,
+        [crate::document::FeatureId::from("box_1")]
+    );
+    assert_eq!(warm.statuses[0].feature_name, "Renamed box");
+}
+
+#[test]
+fn stale_revision_bound_writebacks_are_rejected() {
+    let mut document = crate::Document::new();
+    let producing_revision = document.revision();
+    let mut stale = FaceReattach::for_revision(producing_revision);
+    stale
+        .boundaries
+        .insert("sketch_1".into(), SketchCurves::default());
+    document.mark_edited();
+    assert!(!document.apply_face_reattach_updates(stale));
+    assert!(!document.sketch_face_boundaries.contains_key("sketch_1"));
+
+    let mut current = FaceReattach::for_revision(document.revision());
+    current
+        .boundaries
+        .insert("sketch_1".into(), SketchCurves::default());
+    assert!(document.apply_face_reattach_updates(current));
+    assert!(document.sketch_face_boundaries.contains_key("sketch_1"));
+}
