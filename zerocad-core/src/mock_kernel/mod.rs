@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 use openrcad::algo::{BlendContour, BlendCurveHint, BlendKind, BooleanOp};
 pub use openrcad::algo::{BooleanFaceHistory, BooleanFaceSource};
 use openrcad::foundation::{Ax2, Ax3, Dir, Pnt, TolerancePolicy, Trsf, Vec as GeomVec};
-use openrcad::geom::{Circle, Curve, CylindricalSurface, GeomCurve, GeomSurface, Plane};
+use openrcad::geom::{
+    BSplineCurve, Circle, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, Plane,
+};
 use openrcad::topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
 use crate::geometry::Vec3;
@@ -116,6 +118,50 @@ mod wireframe_tests {
             .collect();
         let (ev, ei, _) = build_extrusion_wireframe(&circle, &[], 8.0, &CoordinateSystem::XY);
         assert_eq!(count_struts(&ev, &ei, 8.0), 0);
+    }
+
+    #[test]
+    fn analytic_sketch_circle_reaches_brep_as_circle_edges() {
+        let mut curves = crate::sketch::SketchCurves::new();
+        curves.add_circle((3.0, -2.0), 5.0);
+        let region = crate::sketch::detect_regions_analytic(&curves)
+            .expect("circle arrangement")
+            .into_iter()
+            .next()
+            .expect("circle region");
+
+        let solid = extruded_sketch_region_solid(&region, 7.0, &CoordinateSystem::XY, &[])
+            .expect("analytic circle prism");
+
+        assert!(solid
+            .edges()
+            .iter()
+            .any(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_)))));
+    }
+
+    #[test]
+    fn analytic_nested_circles_build_inner_wire_prism() {
+        let mut curves = crate::sketch::SketchCurves::new();
+        curves.add_circle((0.0, 0.0), 8.0);
+        curves.add_circle((0.0, 0.0), 3.0);
+        let regions = crate::sketch::detect_regions_analytic(&curves).expect("nested circles");
+        let annulus = regions
+            .iter()
+            .find(|region| !region.holes.is_empty())
+            .expect("annular region");
+
+        let solid = extruded_sketch_region_solid(annulus, 4.0, &CoordinateSystem::XY, &[])
+            .expect("analytic annulus prism");
+
+        assert_eq!(solid.shells().len(), 1);
+        assert!(
+            solid
+                .edges()
+                .iter()
+                .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
+                .count()
+                >= 8
+        );
     }
 
     #[test]

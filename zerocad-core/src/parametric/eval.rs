@@ -3282,13 +3282,7 @@ impl ParametricGraph {
             .map(|a| (a.center, a.radius))
             .collect();
         let region_solid = |r: &Region, cs: &CoordinateSystem, d: f32| {
-            crate::mock_kernel::extruded_region_solid_with_arcs(
-                &r.boundary,
-                &r.holes,
-                d,
-                cs,
-                &arc_circles,
-            )
+            crate::mock_kernel::extruded_sketch_region_solid(r, d, cs, &arc_circles)
         };
         // The smooth native-cylinder tool for a circular, hole-free region (None
         // otherwise). Tried before the faceted prism so a round boss/pocket reads

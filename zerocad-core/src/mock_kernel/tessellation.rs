@@ -428,6 +428,146 @@ pub(crate) fn loop_to_polyline_wire(
     Some(Wire::from_edges(edges))
 }
 
+/// Lift one ordered analytic sketch loop into the sketch plane without
+/// replacing curves with display chords. The resulting topology retains exact
+/// line, circle/arc, ellipse, and B-Spline geometry through the prism sweep.
+pub(crate) fn analytic_loop_to_wire<P>(
+    sketch_loop: &openrcad::sketch::ArrangementLoop<P>,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<Wire> {
+    use openrcad::geom2d::{CurveSpan, GeomCurve2d};
+
+    fn point_on_plane(
+        point: openrcad::foundation::Pnt2d,
+        cs: &crate::geometry::CoordinateSystem,
+    ) -> Pnt {
+        let point = cs.unproject(point.x() as f32, point.y() as f32);
+        Pnt::new(point.x as f64, point.y as f64, point.z as f64)
+    }
+
+    fn direction_on_plane(
+        direction: openrcad::foundation::Dir2d,
+        cs: &crate::geometry::CoordinateSystem,
+    ) -> Option<Dir> {
+        GeomVec::new(
+            f64::from(cs.u.x) * direction.x() + f64::from(cs.v.x) * direction.y(),
+            f64::from(cs.u.y) * direction.x() + f64::from(cs.v.y) * direction.y(),
+            f64::from(cs.u.z) * direction.x() + f64::from(cs.v.z) * direction.y(),
+        )
+        .normalized()
+    }
+
+    fn conic_frame(
+        position: openrcad::foundation::Ax22d,
+        cs: &crate::geometry::CoordinateSystem,
+    ) -> Option<Ax3> {
+        let center = point_on_plane(position.location(), cs);
+        let x_direction = direction_on_plane(position.x_direction(), cs)?;
+        let y_direction = direction_on_plane(position.y_direction(), cs)?;
+        let normal = x_direction.try_cross(&y_direction)?;
+        Some(Ax3::new_full(center, normal, x_direction, y_direction))
+    }
+
+    fn lift_curve<P>(
+        span: &CurveSpan<P>,
+        cs: &crate::geometry::CoordinateSystem,
+    ) -> Option<GeomCurve> {
+        match &span.curve {
+            GeomCurve2d::Line(_) => None,
+            GeomCurve2d::Circle(circle) => Some(GeomCurve::circle(Circle::new(
+                conic_frame(circle.position(), cs)?,
+                circle.radius(),
+            ))),
+            GeomCurve2d::Ellipse(ellipse) => Some(GeomCurve::ellipse(Ellipse::new(
+                conic_frame(ellipse.position(), cs)?,
+                ellipse.major_radius(),
+                ellipse.minor_radius(),
+            ))),
+            GeomCurve2d::BSpline(spline) => {
+                let poles = spline
+                    .poles()
+                    .iter()
+                    .map(|point| point_on_plane(*point, cs))
+                    .collect();
+                Some(GeomCurve::bspline(BSplineCurve::new(
+                    spline.degree(),
+                    poles,
+                    spline.weights().map(<[f64]>::to_vec),
+                    spline.knots().to_vec(),
+                    spline.multiplicities().to_vec(),
+                )))
+            }
+            GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => return None,
+        }
+    }
+
+    let mut edges = Vec::with_capacity(sketch_loop.spans.len());
+    for span in &sketch_loop.spans {
+        let start = point_on_plane(span.start(), cs);
+        let end = point_on_plane(span.end(), cs);
+        let edge = if matches!(span.curve, GeomCurve2d::Line(_)) {
+            Edge::between_points(start, end)
+        } else {
+            Edge::new(
+                Some(lift_curve(span, cs)?),
+                span.first,
+                span.last,
+                Vertex::new(start),
+                Vertex::new(end),
+            )
+        };
+        edges.push(edge);
+    }
+    (edges.len() >= 2).then(|| Wire::from_edges(edges))
+}
+
+/// Sweep a provenance-bearing analytic region. This is deliberately separate
+/// from the sampled compatibility builder so display/picking polygons remain a
+/// downstream representation instead of silently becoming modeling geometry.
+pub(crate) fn build_analytic_extrusion_solid<P>(
+    region: &openrcad::sketch::ArrangementRegion<P>,
+    depth: f64,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<KernelSolid> {
+    if region.outer.spans.len() < 2 || depth.abs() < f64::EPSILON {
+        return None;
+    }
+    let outer = analytic_loop_to_wire(&region.outer, cs)?;
+    let inners: Vec<Wire> = region
+        .holes
+        .iter()
+        .map(|hole| analytic_loop_to_wire(hole, cs))
+        .collect::<Option<_>>()?;
+    let outer_points: Vec<Pnt> = region
+        .outer
+        .spans
+        .iter()
+        .map(|span| {
+            let point = span.start();
+            let point = cs.unproject(point.x() as f32, point.y() as f32);
+            Pnt::new(point.x as f64, point.y as f64, point.z as f64)
+        })
+        .collect();
+    let normal = newell_normal(&outer_points)?;
+    let plane = GeomSurface::plane(Plane::from_point_normal(outer_points[0], normal));
+    let face = if inners.is_empty() {
+        Face::new(Some(plane), outer)
+    } else {
+        Face::with_wires(Some(plane), Some(outer), inners, Orientation::Forward)
+    };
+    let sweep = GeomVec::new(
+        f64::from(cs.n.x) * depth,
+        f64::from(cs.n.y) * depth,
+        f64::from(cs.n.z) * depth,
+    );
+    consume_operation(
+        "analytic sketch prism extrusion",
+        openrcad::algo::prism::prism_operation(&face, sweep),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
+}
+
 pub(crate) fn build_extrusion_solid(
     points: &[(f32, f32)],
     holes: &[Vec<(f32, f32)>],

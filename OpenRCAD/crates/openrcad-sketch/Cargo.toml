@@ -13,4 +13,5 @@ keywords = ["cad", "sketch", "profile", "parametric"]
 
 [dependencies]
 openrcad-foundation.workspace = true
+openrcad-geom2d.workspace = true
 serde.workspace = true

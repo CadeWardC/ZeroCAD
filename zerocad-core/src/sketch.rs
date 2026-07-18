@@ -1181,6 +1181,10 @@ pub struct Region {
     pub holes: Vec<Vec<(f32, f32)>>,
     /// Net area: outer boundary area minus the area of the holes.
     pub area: f32,
+    /// Runtime analytic boundary used by B-Rep consumers. It is rebuilt from
+    /// persisted sketch intent and never changes `.zcad` payload bytes.
+    #[serde(skip)]
+    pub analytic: Option<AnalyticSketchRegion>,
 }
 
 impl Region {
@@ -1235,6 +1239,44 @@ pub enum RegionProvenanceFragment {
         shape_id: Option<usize>,
     },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SketchCurveFamily {
+    Line,
+    Circle,
+    Arc,
+    Spline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SketchCurveProvenance {
+    pub family: SketchCurveFamily,
+    pub index: usize,
+}
+
+pub type AnalyticSketchRegion = openrcad::sketch::ArrangementRegion<SketchCurveProvenance>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnalyticSketchError {
+    UnsupportedSpline { index: usize, kind: SplineKind },
+    Arrangement(openrcad::sketch::ArrangementError),
+}
+
+impl std::fmt::Display for AnalyticSketchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSpline { index, kind } => {
+                write!(
+                    formatter,
+                    "spline {index} ({kind:?}) is not supported analytically"
+                )
+            }
+            Self::Arrangement(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AnalyticSketchError {}
 
 pub fn detect_regions_with_provenance(
     curves: &SketchCurves,
@@ -1396,6 +1438,249 @@ impl P {
 }
 
 pub fn detect_regions(curves: &SketchCurves) -> Vec<Region> {
+    match detect_regions_analytic(curves) {
+        Ok(regions) => regions,
+        Err(_) => detect_regions_legacy(curves),
+    }
+}
+
+/// Build sketch faces from bounded analytic curves. Unsupported spline/NURBS
+/// pairs are returned as typed results; the compatibility [`detect_regions`]
+/// adapter may then use its historical sampled path without pretending the
+/// curve was handled analytically.
+pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, AnalyticSketchError> {
+    use openrcad::foundation::{Dir2d, Pnt2d};
+    use openrcad::geom2d::{BSplineCurve2d, Circle2d, Curve2d, CurveSpan, GeomCurve2d, Line2d};
+
+    let mut spans = Vec::new();
+    for (index, segment) in curves.segments.iter().enumerate() {
+        // Corner fillets retain their historical display/containment chords
+        // alongside one exact Arc record. The analytic arrangement consumes
+        // only that Arc; admitting its chords too would create a thin stack of
+        // duplicate faces between the curve and its approximation.
+        if curves
+            .arcs
+            .iter()
+            .any(|arc| segment_is_arc_display_chord(segment, arc))
+        {
+            continue;
+        }
+        let dx = f64::from(segment.b.0 - segment.a.0);
+        let dy = f64::from(segment.b.1 - segment.a.1);
+        let length = dx.hypot(dy);
+        if length <= VERTEX_TOL {
+            continue;
+        }
+        let direction = Dir2d::new(dx / length, dy / length);
+        spans.push(CurveSpan::new(
+            GeomCurve2d::line(Line2d::from_point_dir(
+                Pnt2d::new(f64::from(segment.a.0), f64::from(segment.a.1)),
+                direction,
+            )),
+            0.0,
+            length,
+            SketchCurveProvenance {
+                family: SketchCurveFamily::Line,
+                index,
+            },
+        ));
+    }
+    for (index, circle) in curves.circles.iter().enumerate() {
+        if circle.radius <= 0.0 {
+            continue;
+        }
+        spans.push(CurveSpan::new(
+            GeomCurve2d::circle(Circle2d::from_center(
+                Pnt2d::new(f64::from(circle.center.0), f64::from(circle.center.1)),
+                f64::from(circle.radius),
+            )),
+            0.0,
+            std::f64::consts::TAU,
+            SketchCurveProvenance {
+                family: SketchCurveFamily::Circle,
+                index,
+            },
+        ));
+    }
+    for (index, arc) in curves.arcs.iter().enumerate() {
+        if arc.radius <= 0.0 {
+            continue;
+        }
+        let angle = |point: (f32, f32)| {
+            f64::from(point.1 - arc.center.1).atan2(f64::from(point.0 - arc.center.0))
+        };
+        let first = angle(arc.start);
+        let mut last = angle(arc.end);
+        while last - first > std::f64::consts::PI {
+            last -= std::f64::consts::TAU;
+        }
+        while last - first < -std::f64::consts::PI {
+            last += std::f64::consts::TAU;
+        }
+        spans.push(CurveSpan::new(
+            GeomCurve2d::circle(Circle2d::from_center(
+                Pnt2d::new(f64::from(arc.center.0), f64::from(arc.center.1)),
+                f64::from(arc.radius),
+            )),
+            first,
+            last,
+            SketchCurveProvenance {
+                family: SketchCurveFamily::Arc,
+                index,
+            },
+        ));
+    }
+    for (index, spline) in curves.splines.iter().enumerate() {
+        if spline.kind != SplineKind::ControlPoint || spline.closed || spline.periodic {
+            return Err(AnalyticSketchError::UnsupportedSpline {
+                index,
+                kind: spline.kind,
+            });
+        }
+        let degree = usize::from(spline.degree.max(1));
+        let flat_knots: Vec<f64> = if spline.knots.len() == spline.points.len() + degree + 1 {
+            spline.knots.iter().map(|value| f64::from(*value)).collect()
+        } else {
+            clamped_uniform_knots(spline.points.len(), degree)
+                .into_iter()
+                .map(f64::from)
+                .collect()
+        };
+        let (knots, multiplicities) = distinct_knots(&flat_knots);
+        let poles = spline
+            .points
+            .iter()
+            .map(|point| Pnt2d::new(f64::from(point.0), f64::from(point.1)))
+            .collect();
+        let weights = (!spline.weights.is_empty()).then(|| {
+            spline
+                .weights
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect()
+        });
+        let curve = BSplineCurve2d::new(degree, poles, weights, knots, multiplicities);
+        let (first, last) = curve.bounds();
+        spans.push(CurveSpan::new(
+            GeomCurve2d::bspline(curve),
+            first,
+            last,
+            SketchCurveProvenance {
+                family: SketchCurveFamily::Spline,
+                index,
+            },
+        ));
+    }
+
+    if spans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrangement = openrcad::sketch::arrange_curve_spans(
+        &spans,
+        openrcad::sketch::ArrangementOptions {
+            // Persisted sketch coordinates are f32; leave enough room for an
+            // analytic arc reconstructed from those values to rejoin its
+            // trimmed line endpoint without treating a real modeling gap as
+            // closed.
+            tolerance: 1.0e-5,
+            root_subdivisions: 256,
+        },
+    )
+    .map_err(AnalyticSketchError::Arrangement)?;
+    Ok(arrangement
+        .regions
+        .into_iter()
+        .filter(|region| region.area > MIN_REGION_AREA)
+        .map(|analytic| Region {
+            boundary: sample_analytic_loop(&analytic.outer),
+            holes: analytic.holes.iter().map(sample_analytic_loop).collect(),
+            area: analytic.area as f32,
+            analytic: Some(analytic),
+        })
+        .collect())
+}
+
+fn segment_is_arc_display_chord(segment: &LineSegment, arc: &Arc) -> bool {
+    let radial_error =
+        |point: (f32, f32)| (point.0 - arc.center.0).hypot(point.1 - arc.center.1) - arc.radius;
+    if radial_error(segment.a).abs() > 1.0e-3 || radial_error(segment.b).abs() > 1.0e-3 {
+        return false;
+    }
+    let chord_length = (segment.b.0 - segment.a.0).hypot(segment.b.1 - segment.a.1);
+    let midpoint = (
+        (segment.a.0 + segment.b.0) * 0.5,
+        (segment.a.1 + segment.b.1) * 0.5,
+    );
+    // Fillet display chords are deliberately short. Requiring both a short
+    // chord and a near-circular midpoint prevents a genuine user line whose
+    // endpoints happen to lie on the same arc (for example a diameter) from
+    // being mistaken for the arc's sampled representation.
+    if chord_length > arc.radius * 0.35 || radial_error(midpoint).abs() > arc.radius * 0.02 {
+        return false;
+    }
+    let angle = |point: (f32, f32)| {
+        f64::from(point.1 - arc.center.1).atan2(f64::from(point.0 - arc.center.0))
+    };
+    let first = angle(arc.start);
+    let mut last = angle(arc.end);
+    while last - first > std::f64::consts::PI {
+        last -= std::f64::consts::TAU;
+    }
+    while last - first < -std::f64::consts::PI {
+        last += std::f64::consts::TAU;
+    }
+    let within = |point: (f32, f32)| {
+        let base = angle(point);
+        (-1..=1).any(|turn| {
+            let parameter = base + f64::from(turn) * std::f64::consts::TAU;
+            parameter >= first.min(last) - 1.0e-6 && parameter <= first.max(last) + 1.0e-6
+        })
+    };
+    within(segment.a) && within(segment.b)
+}
+
+fn distinct_knots(flat: &[f64]) -> (Vec<f64>, Vec<usize>) {
+    let mut knots = Vec::new();
+    let mut multiplicities = Vec::new();
+    for &value in flat {
+        if knots
+            .last()
+            .is_some_and(|last: &f64| (*last - value).abs() <= f64::EPSILON)
+        {
+            *multiplicities.last_mut().expect("knot multiplicity") += 1;
+        } else {
+            knots.push(value);
+            multiplicities.push(1);
+        }
+    }
+    (knots, multiplicities)
+}
+
+fn sample_analytic_loop(
+    loop_: &openrcad::sketch::ArrangementLoop<SketchCurveProvenance>,
+) -> Vec<(f32, f32)> {
+    use openrcad::geom2d::{Curve2d, CurveKind2d};
+    let mut points = Vec::new();
+    for span in &loop_.spans {
+        let steps = match span.kind() {
+            CurveKind2d::Line => 1,
+            CurveKind2d::Circle | CurveKind2d::Ellipse => {
+                ((span.parameter_length() / std::f64::consts::TAU * CIRCLE_SEGS as f64).ceil()
+                    as usize)
+                    .max(1)
+            }
+            _ => 24,
+        };
+        for step in 0..steps {
+            let parameter = span.first + (span.last - span.first) * step as f64 / steps as f64;
+            let point = span.curve.point(parameter);
+            points.push((point.x() as f32, point.y() as f32));
+        }
+    }
+    points
+}
+
+fn detect_regions_legacy(curves: &SketchCurves) -> Vec<Region> {
     let raw_segs = flatten_curves(curves);
     if raw_segs.is_empty() {
         return Vec::new();
@@ -1440,6 +1725,7 @@ pub fn detect_regions(curves: &SketchCurves) -> Vec<Region> {
                 boundary: pts,
                 holes: Vec::new(),
                 area: area as f32,
+                analytic: None,
             });
         }
     }

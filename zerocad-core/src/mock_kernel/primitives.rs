@@ -86,6 +86,24 @@ pub fn extruded_region_solid_with_arcs(
         .or_else(|| build_extrusion_solid_arcs(points, &[], depth as f64, cs, true, arc_circles))
 }
 
+/// Extrude a detected sketch region from its exact arrangement when available.
+/// Documents loaded from older payloads and unsupported analytic curve pairs
+/// continue through the established sampled/arc-refit compatibility path.
+pub fn extruded_sketch_region_solid(
+    region: &crate::sketch::Region,
+    depth: f32,
+    cs: &crate::geometry::CoordinateSystem,
+    arc_circles: &[((f32, f32), f32)],
+) -> Option<KernelSolid> {
+    region
+        .analytic
+        .as_ref()
+        .and_then(|analytic| build_analytic_extrusion_solid(analytic, f64::from(depth), cs))
+        .or_else(|| {
+            extruded_region_solid_with_arcs(&region.boundary, &region.holes, depth, cs, arc_circles)
+        })
+}
+
 /// Find the kernel faces of `solid` geometrically matching a captured face
 /// (world centroid + outward normal): plane contains the centroid, normal
 /// parallel, boundary near it. Used to resolve GUI face selections (which are

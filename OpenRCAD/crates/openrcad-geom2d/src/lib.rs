@@ -22,6 +22,7 @@ pub mod ellipse;
 pub mod hyperbola;
 pub mod line;
 pub mod parabola;
+pub mod span;
 
 pub use bspline::BSplineCurve2d;
 pub use circle::Circle2d;
@@ -30,6 +31,7 @@ pub use ellipse::Ellipse2d;
 pub use hyperbola::Hyperbola2d;
 pub use line::Line2d;
 pub use parabola::Parabola2d;
+pub use span::{CurveKind2d, CurveSpan};
 
 /// An owned 2D curve: one of the concrete [`Curve2d`]s, storable by value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

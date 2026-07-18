@@ -11,6 +11,13 @@ use core::fmt;
 use openrcad_foundation::Pnt2d;
 use serde::{Deserialize, Serialize};
 
+pub mod arrangement;
+
+pub use arrangement::{
+    arrange_curve_spans, Arrangement, ArrangementError, ArrangementLoop, ArrangementOptions,
+    ArrangementRegion,
+};
+
 /// Stable handle to a sketch entity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EntityId(pub usize);

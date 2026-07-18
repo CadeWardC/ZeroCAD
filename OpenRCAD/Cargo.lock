@@ -1348,6 +1348,7 @@ name = "openrcad-sketch"
 version = "0.1.0"
 dependencies = [
  "openrcad-foundation",
+ "openrcad-geom2d",
  "serde",
 ]
 
