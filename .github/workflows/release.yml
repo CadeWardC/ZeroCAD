@@ -1,0 +1,228 @@
+name: Release
+
+# Builds ZeroCAD release packages for Windows (.zip), Linux (.AppImage +
+# .tar.gz), and macOS (.dmg with a real .app bundle) whenever a version tag
+# (v0.1.0, v1.0.0-alpha.1, ...) is pushed, then publishes them as a draft
+# GitHub Release for review before going public.
+#
+# Code signing activates automatically when the corresponding repository
+# secrets exist; without them every step is skipped and the artifacts ship
+# unsigned. See docs/release-signing.md for how to obtain and store each secret.
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build (windows-x86_64)
+    runs-on: windows-latest
+    # Secrets are not readable inside `if:` expressions, so they are surfaced
+    # as env vars and the signing step gates on those being non-empty.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p zerocad-gui --locked
+
+      - name: Stage binary
+        shell: pwsh
+        run: |
+          $dir = "ZeroCAD-${{ github.ref_name }}-windows-x86_64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/zerocad-gui.exe "$dir/ZeroCAD.exe"
+          Copy-Item README.md, changelog.md, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES $dir
+
+      # Authenticode signing through Azure Trusted Signing. Runs only when the
+      # Azure secrets are configured; otherwise the exe ships unsigned.
+      - name: Sign ZeroCAD.exe (Azure Trusted Signing)
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files-folder: ZeroCAD-${{ github.ref_name }}-windows-x86_64
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $dir = "ZeroCAD-${{ github.ref_name }}-windows-x86_64"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ZeroCAD-${{ github.ref_name }}-windows-x86_64.zip
+          if-no-files-found: error
+
+  linux:
+    name: Build (linux-x86_64)
+    # ubuntu-22.04 keeps the glibc floor low so the binaries run on older
+    # distros than the runner they were built on.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # eframe/winit need X11/Wayland headers, rfd needs GTK3, and
+      # librsvg2-bin rasterizes packaging/icon.svg for the AppImage.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev librsvg2-bin
+
+      - name: Build release binary
+        run: cargo build --release -p zerocad-gui --locked
+
+      - name: Build AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp target/release/zerocad-gui AppDir/usr/bin/ZeroCAD
+          cp packaging/ZeroCAD.desktop AppDir/
+          rsvg-convert -w 256 -h 256 packaging/icon.svg -o AppDir/zerocad.png
+          cp AppDir/zerocad.png AppDir/.DirIcon
+          ln -s usr/bin/ZeroCAD AppDir/AppRun
+          wget -q -O appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
+            "ZeroCAD-${{ github.ref_name }}-linux-x86_64.AppImage"
+
+      - name: Package tar.gz
+        run: |
+          dir="ZeroCAD-${{ github.ref_name }}-linux-x86_64"
+          mkdir "$dir"
+          cp target/release/zerocad-gui "$dir/ZeroCAD"
+          cp README.md changelog.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES "$dir"
+          tar -czf "$dir.tar.gz" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            ZeroCAD-${{ github.ref_name }}-linux-x86_64.AppImage
+            ZeroCAD-${{ github.ref_name }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: Build (macos-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            os: macos-latest
+          - arch: x86_64
+            os: macos-13
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p zerocad-gui --locked
+
+      - name: Assemble ZeroCAD.app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP=ZeroCAD.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/zerocad-gui "$APP/Contents/MacOS/ZeroCAD"
+          sed "s/__VERSION__/$VERSION/g" packaging/Info.plist > "$APP/Contents/Info.plist"
+          # Rasterize the SVG icon into a proper .icns.
+          brew install --quiet librsvg
+          mkdir ZeroCAD.iconset
+          for s in 16 32 128 256 512; do
+            rsvg-convert -w "$s" -h "$s" packaging/icon.svg -o "ZeroCAD.iconset/icon_${s}x${s}.png"
+            rsvg-convert -w "$((s * 2))" -h "$((s * 2))" packaging/icon.svg -o "ZeroCAD.iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns ZeroCAD.iconset -o "$APP/Contents/Resources/ZeroCAD.icns"
+
+      # Developer ID signing with hardened runtime — required for notarization.
+      # Runs only when the certificate secrets are configured.
+      - name: Sign ZeroCAD.app
+        if: env.MACOS_CERT_P12 != ''
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PW" build.keychain
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" build.keychain
+          codesign --force --options runtime --timestamp \
+            --sign "Developer ID Application" ZeroCAD.app
+          codesign --verify --deep --strict ZeroCAD.app
+
+      - name: Create DMG
+        run: |
+          mkdir dmg-root
+          cp -R ZeroCAD.app dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname ZeroCAD -srcfolder dmg-root -ov -format UDZO \
+            "ZeroCAD-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
+
+      # Notarization removes the Gatekeeper "unidentified developer" block.
+      # Needs the app signed above plus an app-specific password for APPLE_ID.
+      - name: Notarize and staple DMG
+        if: env.MACOS_CERT_P12 != '' && env.APPLE_ID != ''
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          DMG="ZeroCAD-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
+          xcrun notarytool submit "$DMG" --wait \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+          xcrun stapler staple "$DMG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: ZeroCAD-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish draft release
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*

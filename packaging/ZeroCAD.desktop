@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ZeroCAD
+Comment=Parametric CAD application
+Exec=ZeroCAD
+Icon=zerocad
+Categories=Graphics;Engineering;
+Terminal=false

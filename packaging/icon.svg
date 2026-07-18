@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- App icon: dark rounded tile with a geometric Z. Rasterized in CI to
+       .icns (macOS) and .png (AppImage). Replace freely with real branding. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#252c3a"/>
+      <stop offset="1" stop-color="#151a24"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="180" fill="url(#bg)"/>
+  <!-- faint construction grid, a nod to CAD -->
+  <g stroke="#3a4557" stroke-width="6" opacity="0.55">
+    <line x1="200" y1="240" x2="824" y2="240"/>
+    <line x1="200" y1="784" x2="824" y2="784"/>
+    <line x1="240" y1="200" x2="240" y2="824"/>
+    <line x1="784" y1="200" x2="784" y2="824"/>
+  </g>
+  <path d="M 300 292 H 724 V 384 L 448 640 H 724 V 732 H 300 V 640 L 576 384 H 300 Z"
+        fill="#5ac8fa"/>
+  <circle cx="240" cy="240" r="22" fill="#e8edf5"/>
+  <circle cx="784" cy="784" r="22" fill="#e8edf5"/>
+</svg>
