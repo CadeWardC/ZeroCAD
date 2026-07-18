@@ -231,15 +231,62 @@ fn missing_target_warns() {
         None,
         HoleKind::Simple,
     );
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
-    assert_eq!(bodies.len(), 1);
+    assert_eq!(output.bodies.len(), 1);
     assert!(
-        warnings.iter().any(|w| w.contains("hole_2")),
-        "warnings: {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "hole_2"
+                && diagnostic.code.as_str() == DiagnosticCode::REFERENCE_MISSING
+        }),
+        "diagnostics: {:?}",
+        output.diagnostics
     );
     // The box is untouched.
-    let v = body_volume(&bodies, "box_1");
+    let v = body_volume(&output.bodies, "box_1");
     assert!((v - 1000.0).abs() < 1e-3);
+}
+
+#[test]
+fn hole_candidate_contract_cold_warm_cancel_and_restore() {
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_contract", 12.0, 12.0, 8.0);
+    add_hole(
+        &mut g,
+        "hole_contract",
+        "box_contract",
+        [6.0, 6.0, 8.0],
+        [0.0, 0.0, -1.0],
+        3.0,
+        None,
+        HoleKind::Simple,
+    );
+    let hidden = std::collections::HashSet::new();
+    let cold = g.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let warm = g.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert!(cold.1.is_empty() && warm.1.is_empty());
+    assert_eq!(cold.0[0].1.indices, warm.0[0].1.indices);
+    assert_eq!(cold.0[0].1.face_ids, warm.0[0].1.face_ids);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+    assert!(matches!(
+        g.evaluate_request(
+            &hidden,
+            EvaluationQuality::Interactive,
+            &EvaluationCancellation::new(1, cancelled),
+        ),
+        Err(EvaluationError::Cancelled)
+    ));
+    let restored: ParametricGraph =
+        serde_json::from_str(&serde_json::to_string(&g.clone_document()).unwrap()).unwrap();
+    assert!(restored
+        .evaluate_bodies_with_warnings(&hidden)
+        .unwrap()
+        .1
+        .is_empty());
 }

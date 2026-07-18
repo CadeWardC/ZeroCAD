@@ -1399,7 +1399,9 @@ impl ParametricGraph {
                     Ok(
                         evaluator @ (crate::document::FeatureEvaluatorKind::Revolve
                         | crate::document::FeatureEvaluatorKind::Loft
-                        | crate::document::FeatureEvaluatorKind::Sweep),
+                        | crate::document::FeatureEvaluatorKind::Sweep
+                        | crate::document::FeatureEvaluatorKind::Shell
+                        | crate::document::FeatureEvaluatorKind::Hole),
                     ) => {
                         let context = FeatureEvalContext {
                             feature: node,
@@ -1424,6 +1426,10 @@ impl ParametricGraph {
                             crate::document::FeatureEvaluatorKind::Loft
                             | crate::document::FeatureEvaluatorKind::Sweep => {
                                 self.evaluate_loft_or_sweep_candidate(evaluator, context)
+                            }
+                            crate::document::FeatureEvaluatorKind::Shell
+                            | crate::document::FeatureEvaluatorKind::Hole => {
+                                self.evaluate_shell_or_hole_candidate(evaluator, context)
                             }
                             _ => unreachable!(),
                         };
@@ -1701,6 +1707,135 @@ impl ParametricGraph {
                 );
             }
             _ => return Err("non-skinning family reached the Loft/Sweep contract".into()),
+        }
+        let diagnostics = warnings
+            .into_iter()
+            .filter_map(|message| {
+                super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                    feature_id: context.feature_id.to_string(),
+                    feature_name: context.feature.name.clone(),
+                    state: ResolutionState::Unresolved(message),
+                })
+            })
+            .collect();
+        let topology_history = Vec::new();
+        let validation_evidence = FeatureValidationEvidence {
+            input_body_count: context.live_bodies.len(),
+            candidate_body_count: candidate_body_state.len(),
+            topology_history_entries: topology_history.len(),
+        };
+        let _quality = context.quality;
+        let _tolerance = context.tolerance;
+        Ok(FeatureEvalResult {
+            candidate_body_state,
+            topology_history,
+            diagnostics,
+            validation_evidence,
+            feature_timing: started.elapsed(),
+            writebacks: RevisionBoundWritebacks {
+                producing_revision: context.document_revision,
+                face_reattach: FaceReattach::default(),
+            },
+        })
+    }
+
+    fn evaluate_shell_or_hole_candidate(
+        &self,
+        evaluator: crate::document::FeatureEvaluatorKind,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        let started = std::time::Instant::now();
+        if context
+            .cancellation
+            .is_some_and(EvaluationCancellation::is_cancelled)
+        {
+            return Err("model evaluation was superseded".into());
+        }
+        let mut candidate_body_state = context.live_bodies.to_vec();
+        let mut warnings = Vec::new();
+        match evaluator {
+            crate::document::FeatureEvaluatorKind::Shell => {
+                let FeatureType::Shell {
+                    target,
+                    thickness,
+                    thickness_expr,
+                    open_faces,
+                } = &context.feature.feature
+                else {
+                    return Err(format!(
+                        "registry evaluator Shell cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                let effective_thickness = match thickness_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, context.variables) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Shell '{}': thickness expression \"{}\" no longer evaluates; using last value {:.3}.",
+                                context.feature_id, expression, thickness
+                            ));
+                            *thickness
+                        }
+                    },
+                    None => *thickness,
+                };
+                apply_shell(
+                    context.feature_id.as_str(),
+                    target,
+                    effective_thickness,
+                    open_faces,
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            crate::document::FeatureEvaluatorKind::Hole => {
+                let FeatureType::Hole {
+                    target,
+                    position,
+                    direction,
+                    diameter,
+                    diameter_expr,
+                    depth,
+                    kind,
+                    manufacturing,
+                    ..
+                } = &context.feature.feature
+                else {
+                    return Err(format!(
+                        "registry evaluator Hole cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                let effective_diameter = match diameter_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, context.variables) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Hole '{}': diameter expression \"{}\" no longer evaluates; using last value {:.3}.",
+                                context.feature_id, expression, diameter
+                            ));
+                            *diameter
+                        }
+                    },
+                    None => *diameter,
+                };
+                apply_hole(
+                    context.feature_id.as_str(),
+                    target,
+                    *position,
+                    *direction,
+                    effective_diameter,
+                    *depth,
+                    kind,
+                    manufacturing
+                        .as_ref()
+                        .and_then(|metadata| metadata.drill_point_angle_deg),
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            _ => return Err("non Shell/Hole family reached the contract".into()),
         }
         let diagnostics = warnings
             .into_iter()
@@ -2141,74 +2276,10 @@ impl ParametricGraph {
                 return Err("Sweep must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Shell => {
-                let FeatureType::Shell {
-                    target,
-                    thickness,
-                    thickness_expr,
-                    open_faces,
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                let eff_thickness = match thickness_expr.as_ref() {
-                    Some(e) => match crate::expr::eval(e, vars) {
-                        Ok(v) => v as f32,
-                        Err(_) => {
-                            warnings.push(format!(
-                                "Shell '{}': thickness expression \"{}\" no longer \
-                                 evaluates; using last value {:.3}.",
-                                node.id, e, thickness
-                            ));
-                            *thickness
-                        }
-                    },
-                    None => *thickness,
-                };
-                apply_shell(&node.id, target, eff_thickness, open_faces, live, warnings);
+                return Err("Shell must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Hole => {
-                let FeatureType::Hole {
-                    target,
-                    position,
-                    direction,
-                    diameter,
-                    diameter_expr,
-                    depth,
-                    kind,
-                    manufacturing,
-                    ..
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                let eff_diameter = match diameter_expr.as_ref() {
-                    Some(e) => match crate::expr::eval(e, vars) {
-                        Ok(v) => v as f32,
-                        Err(_) => {
-                            warnings.push(format!(
-                                "Hole '{}': diameter expression \"{}\" no longer \
-                                 evaluates; using last value {:.3}.",
-                                node.id, e, diameter
-                            ));
-                            *diameter
-                        }
-                    },
-                    None => *diameter,
-                };
-                apply_hole(
-                    &node.id,
-                    target,
-                    *position,
-                    *direction,
-                    eff_diameter,
-                    *depth,
-                    kind,
-                    manufacturing
-                        .as_ref()
-                        .and_then(|metadata| metadata.drill_point_angle_deg),
-                    live,
-                    warnings,
-                );
+                return Err("Hole must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::EdgeMod => {
                 let FeatureType::EdgeMod {
