@@ -41,7 +41,7 @@ fn assert_strict_solids(label: &str, solids: &[Solid], history: &TopologyHistory
 }
 
 #[test]
-fn phase35_common_split_and_scale_share_the_strict_operation_gate() {
+fn common_split_and_scale_share_the_strict_operation_gate() {
     let policy = &TolerancePolicy::STANDARD;
     let source =
         make_box_operation_with_policy(&Pnt::origin(), 10.0, 8.0, 6.0, policy).expect("source box");

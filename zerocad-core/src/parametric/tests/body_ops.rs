@@ -456,7 +456,7 @@ fn invalid_scale_factor_leaves_source_body_visible() {
 }
 
 #[test]
-fn suppression_restores_inputs_for_every_phase35_feature() {
+fn suppression_restores_inputs_for_every_body_operation() {
     let hidden = std::collections::HashSet::new();
 
     let mut intersect = ParametricGraph::new();

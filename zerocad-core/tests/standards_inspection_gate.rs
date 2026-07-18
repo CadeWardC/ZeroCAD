@@ -31,7 +31,7 @@ fn evaluate_properties(graph: &ParametricGraph) -> openrcad::mesh::MassPropertie
 }
 
 #[test]
-fn phase4_features_survive_rename_save_load_and_rebuild() {
+fn standards_features_survive_rename_save_load_and_rebuild() {
     let imported = read_dxf_str("phase4-inch.dxf", DXF).expect("DXF import");
     assert_eq!(imported.unit.scale_to_mm, 25.4);
     assert_eq!(imported.shapes.len(), 2);
@@ -275,7 +275,7 @@ fn thread_standard_reference_round_trips_with_identity_and_class() {
 }
 
 #[test]
-fn section_and_interference_are_part_of_the_phase4_gate() {
+fn section_and_interference_are_part_of_the_inspection_gate() {
     let mesh = zerocad_core::mock_kernel::MockMesh::make_box(10.0, 10.0, 10.0);
     let section = zerocad_core::mock_kernel::clip_mesh_by_plane(
         &mesh,

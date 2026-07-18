@@ -19,7 +19,7 @@ const LEGACY_MARKERS: &[&str] = &[
 const PHASE3_ALLOWLIST: &[(&str, &str)] = &[];
 
 #[test]
-fn phase1_production_code_does_not_add_legacy_kernel_calls() {
+fn production_code_does_not_add_legacy_kernel_calls() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rust_files(&src, &mut files);

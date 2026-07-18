@@ -10,7 +10,7 @@ const LEGACY_DOCUMENT_MARKERS: &[&str] = &[
 ];
 
 #[test]
-fn phase2_production_code_uses_the_semantic_document_apis() {
+fn production_code_uses_the_semantic_document_apis() {
     let core_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let gui_src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -47,7 +47,7 @@ fn phase2_production_code_uses_the_semantic_document_apis() {
 }
 
 #[test]
-fn phase3_body_evaluation_has_one_exact_registry_transaction_boundary() {
+fn body_evaluation_has_one_exact_registry_transaction_boundary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let eval = fs::read_to_string(root.join("src/parametric/eval.rs"))
         .expect("evaluator source must be readable");

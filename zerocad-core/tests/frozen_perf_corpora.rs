@@ -1,7 +1,7 @@
 //! Frozen Phase 0 workloads. Keep their names, feature counts, and defining
 //! dimensions stable so later architectural phases compare like with like.
 
-#[path = "../benches/support/phase0_corpus.rs"]
+#[path = "../benches/support/benchmark_corpus.rs"]
 mod corpus;
 
 use std::collections::HashSet;
@@ -29,7 +29,7 @@ fn frozen_corpora() -> [(&'static str, CorpusBuilder); 5] {
 }
 
 #[test]
-fn phase0_corpus_manifest_is_stable() {
+fn baseline_corpus_manifest_is_stable() {
     assert_eq!(
         [
             corpus::SMALL_CORPUS,
@@ -85,7 +85,7 @@ fn geometry_corpora_evaluate_without_warnings() {
 }
 
 #[test]
-fn fresh_phase0_evaluations_have_deterministic_body_and_triangle_counts() {
+fn fresh_baseline_evaluations_have_deterministic_body_and_triangle_counts() {
     let hidden = HashSet::new();
     for (name, build) in frozen_corpora() {
         let evaluate = || {
@@ -117,7 +117,7 @@ fn external_step_fixture_retains_its_non_openrcad_provenance() {
 }
 
 #[test]
-fn committed_phase0_json_matches_the_frozen_corpus_manifest() {
+fn committed_baseline_json_matches_the_frozen_corpus_manifest() {
     let report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../benchmarks/phase0-baseline.json"

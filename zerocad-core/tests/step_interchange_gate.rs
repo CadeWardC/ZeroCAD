@@ -223,7 +223,7 @@ fn sketch_and_standards_extensions_survive_the_canonical_document() {
 }
 
 #[test]
-fn exact_inspection_and_strict_step_round_trip_cross_the_phase6_gate() {
+fn exact_inspection_and_strict_step_round_trip_cross_the_interchange_gate() {
     let mut graph = ParametricGraph::new();
     graph.add_feature(FeatureNode {
         id: "box".into(),

@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn phase35_payloads_have_stable_v1_round_trips() {
+    fn body_ops_payloads_have_stable_v1_round_trips() {
         let intersect = FeatureType::BodyIntersect {
             target: "target".into(),
             tool: "tool".into(),

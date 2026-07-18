@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn phase3_production_has_no_replay_or_geometry_approximation_escape_hatches() {
+fn production_has_no_replay_or_geometry_approximation_escape_hatches() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_root = root.join("src");
     let mut files = Vec::new();
@@ -37,7 +37,7 @@ fn phase3_production_has_no_replay_or_geometry_approximation_escape_hatches() {
 }
 
 #[test]
-fn phase3_geometry_safety_net_is_enabled() {
+fn geometry_safety_net_is_enabled() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("zerocad-core must be inside the workspace");
@@ -68,7 +68,7 @@ fn phase3_geometry_safety_net_is_enabled() {
 }
 
 #[test]
-fn phase3_cross_cutting_and_construction_equivalence_gates_exist() {
+fn cross_cutting_and_construction_equivalence_gates_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let gate = fs::read_to_string(root.join("tests/phase3_operation_gate.rs"))
         .expect("Phase 3 operation gate must exist");
@@ -108,7 +108,7 @@ fn phase3_cross_cutting_and_construction_equivalence_gates_exist() {
             .expect("construction-equivalence regression must exist");
     assert!(equivalence.contains("equivalent_flanged_shaft_histories_both_accept_the_same_thread"));
 
-    let matrix = fs::read_to_string(root.join("tests/phase3_equivalence_matrix.rs"))
+    let matrix = fs::read_to_string(root.join("tests/construction_equivalence_matrix.rs"))
         .expect("Phase 3 equivalence matrix must exist");
     for scenario in [
         "primitive_and_sketched_prism_are_equivalent",
@@ -140,7 +140,7 @@ fn phase3_cross_cutting_and_construction_equivalence_gates_exist() {
 }
 
 #[test]
-fn phase3_kernel_debt_apis_are_removed() {
+fn kernel_debt_apis_are_removed() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("zerocad-core must be inside the workspace");

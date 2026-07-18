@@ -1138,7 +1138,7 @@ fn round_trip_body_transform_keeps_copy_and_translation() {
 }
 
 #[test]
-fn phase35_features_save_load_with_equivalent_outputs_and_provenance() {
+fn body_ops_features_save_load_with_equivalent_outputs_and_provenance() {
     use zerocad_core::{DatumPlaneDef, PlaneBase};
 
     let mut graph = ParametricGraph::new();

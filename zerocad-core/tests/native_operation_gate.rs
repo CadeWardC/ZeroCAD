@@ -14,7 +14,7 @@ use openrcad::primitives::{
 };
 use openrcad::topo::{Edge, Face, OperationResult, Solid, Wire};
 
-fn assert_phase3_gate(label: &str, result: &OperationResult<Solid>) {
+fn assert_operation_gate(label: &str, result: &OperationResult<Solid>) {
     let policy = &TolerancePolicy::STANDARD;
     assert!(result.validation.is_valid(), "{label}: operation report");
     assert!(
@@ -69,7 +69,7 @@ fn rectangle_face(x0: f64, x1: f64, y0: f64, y1: f64) -> Face {
 }
 
 #[test]
-fn phase3_native_import_boolean_and_tessellation_gate() {
+fn native_import_boolean_and_tessellation_gate() {
     let policy = &TolerancePolicy::STANDARD;
     let box_result =
         make_box_operation_with_policy(&Pnt::origin(), 12.0, 10.0, 8.0, policy).expect("box");
@@ -93,7 +93,7 @@ fn phase3_native_import_boolean_and_tessellation_gate() {
         ("sphere", &sphere_result),
         ("wedge", &wedge_result),
     ] {
-        assert_phase3_gate(label, result);
+        assert_operation_gate(label, result);
     }
 
     for op in [BooleanOp::Fuse, BooleanOp::Cut, BooleanOp::Common] {
@@ -101,7 +101,7 @@ fn phase3_native_import_boolean_and_tessellation_gate() {
             .expect("boolean tool");
         let result = boolean_operation_with_policy(&box_result.value, &tool.value, op, policy)
             .unwrap_or_else(|error| panic!("{op:?}: {error}"));
-        assert_phase3_gate(&format!("boolean {op:?}"), &result);
+        assert_operation_gate(&format!("boolean {op:?}"), &result);
     }
 
     let imported = openrcad::exchange::read_step_str_operation_with_policy_and_options(
@@ -122,19 +122,19 @@ fn phase3_native_import_boolean_and_tessellation_gate() {
         imported.value.edge_count(),
         imported.value.face_count(),
     );
-    assert_phase3_gate("STEP import", &imported);
+    assert_operation_gate("STEP import", &imported);
 }
 
 #[test]
-fn phase3_general_operation_gate() {
+fn general_operation_gate() {
     let policy = &TolerancePolicy::STANDARD;
     let source =
         make_box_operation_with_policy(&Pnt::origin(), 10.0, 8.0, 6.0, policy).expect("source box");
 
     let fillet = fillet_operation_with_policy(&source.value, 0.75, policy).expect("fillet");
-    assert_phase3_gate("fillet", &fillet);
+    assert_operation_gate("fillet", &fillet);
     let chamfer = chamfer_operation_with_policy(&source.value, 0.75, policy).expect("chamfer");
-    assert_phase3_gate("chamfer", &chamfer);
+    assert_operation_gate("chamfer", &chamfer);
     let shell = shell_solid_operation_with_policy(
         &source.value,
         0.5,
@@ -142,12 +142,12 @@ fn phase3_general_operation_gate() {
         policy,
     )
     .expect("shell");
-    assert_phase3_gate("shell", &shell);
+    assert_operation_gate("shell", &shell);
 
     let profile = rectangle_face(2.0, 4.0, -2.0, 2.0);
     let prism =
         prism_operation_with_policy(&profile, GeomVec::new(0.0, 0.0, 5.0), policy).expect("prism");
-    assert_phase3_gate("prism", &prism);
+    assert_operation_gate("prism", &prism);
     let full_revolve = revolve_operation_with_policy(
         &profile,
         Pnt::origin(),
@@ -156,7 +156,7 @@ fn phase3_general_operation_gate() {
         policy,
     )
     .expect("full revolve");
-    assert_phase3_gate("full revolve", &full_revolve);
+    assert_operation_gate("full revolve", &full_revolve);
     let partial_revolve = revolve_operation_with_policy(
         &profile,
         Pnt::origin(),
@@ -165,7 +165,7 @@ fn phase3_general_operation_gate() {
         policy,
     )
     .expect("partial revolve");
-    assert_phase3_gate("partial revolve", &partial_revolve);
+    assert_operation_gate("partial revolve", &partial_revolve);
 
     let rings = vec![
         vec![
@@ -182,7 +182,7 @@ fn phase3_general_operation_gate() {
         ],
     ];
     let skin = skin_polygon_rings_operation_with_policy(&rings, policy).expect("skin/loft");
-    assert_phase3_gate("skin/loft", &skin);
+    assert_operation_gate("skin/loft", &skin);
 
     let transformed = transform_operation_with_policy(
         &source.value,
@@ -191,7 +191,7 @@ fn phase3_general_operation_gate() {
         policy,
     )
     .expect("transform");
-    assert_phase3_gate("transform", &transformed);
+    assert_operation_gate("transform", &transformed);
 
     let blend = blend_contour_operation_with_policy(
         &source.value,
@@ -204,6 +204,6 @@ fn phase3_general_operation_gate() {
         policy,
     );
     if let Ok(blend) = blend {
-        assert_phase3_gate("selected blend contour", &blend);
+        assert_operation_gate("selected blend contour", &blend);
     }
 }

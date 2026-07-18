@@ -26,7 +26,7 @@ mod eval;
 mod extrude;
 mod inspection;
 mod join;
-mod phase35;
+mod body_ops;
 pub mod standards;
 pub mod thread;
 pub mod topo_name;
@@ -48,8 +48,8 @@ pub use inspection::{
 };
 #[allow(unused_imports)]
 pub(crate) use join::*;
-pub use phase35::body_bounds_center;
-pub(crate) use phase35::*;
+pub use body_ops::body_bounds_center;
+pub(crate) use body_ops::*;
 pub use standards::{
     hole_presets, thread_classes, thread_reference, thread_reference_with_class, HoleApplication,
     HoleFit, HoleManufacturingMetadata, HoleStandardPreset, ResolvedStandardGeometry,

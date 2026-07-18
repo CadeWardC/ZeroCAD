@@ -67,7 +67,7 @@ fn rectangle_profile() -> Face {
 }
 
 #[test]
-fn phase1_representation_gate_is_cross_cutting_and_strict() {
+fn representation_gate_is_cross_cutting_and_strict() {
     let policy = TolerancePolicy::STANDARD;
     let axis = Ax2::new(Pnt::origin(), Dir::dz());
     let mut solids = Vec::new();

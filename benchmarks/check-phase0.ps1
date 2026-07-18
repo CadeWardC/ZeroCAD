@@ -30,7 +30,7 @@ $formatEraReferenceFullPath = [System.IO.Path]::GetFullPath($FormatEraReferenceP
 
 function Invoke-CoreMeasurements {
     Write-Host "Measuring the frozen Phase 0 core corpora..."
-    $output = @(& cargo run --quiet --release -p zerocad-core --example phase0_baseline)
+    $output = @(& cargo run --quiet --release -p zerocad-core --example perf_baseline)
     if ($LASTEXITCODE -ne 0) {
         throw "The Phase 0 core measurement runner failed with exit code $LASTEXITCODE."
     }

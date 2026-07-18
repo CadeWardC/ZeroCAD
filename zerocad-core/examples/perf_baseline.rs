@@ -3,7 +3,7 @@
 // benchmarks use canonical operation/document results instead.
 #![allow(deprecated)]
 
-#[path = "../benches/support/phase0_corpus.rs"]
+#[path = "../benches/support/benchmark_corpus.rs"]
 mod corpus;
 
 use serde::Serialize;
@@ -144,7 +144,7 @@ fn main() {
     ];
     let report = BaselineReport {
         schema: 1,
-        profile: "cargo run --release -p zerocad-core --example phase0_baseline",
+        profile: "cargo run --release -p zerocad-core --example perf_baseline",
         tessellation_ms,
         tessellation_triangles,
         corpora,

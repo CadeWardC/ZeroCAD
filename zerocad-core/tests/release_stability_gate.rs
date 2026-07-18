@@ -82,7 +82,7 @@ fn assert_oracle(case: &OracleCase, solid: &Solid) {
 }
 
 #[test]
-fn phase7_curated_occt_differential_oracle() {
+fn curated_occt_differential_oracle() {
     let oracle: Oracle = serde_json::from_str(include_str!("fixtures/occt/phase7-oracle-v1.json"))
         .expect("frozen OCCT oracle JSON");
     assert_eq!(oracle.schema, 1);
@@ -180,7 +180,7 @@ fn phase7_curated_occt_differential_oracle() {
 }
 
 #[test]
-fn phase7_seeded_scale_boolean_and_persistence_stress_smoke() {
+fn seeded_scale_boolean_and_persistence_stress_smoke() {
     let policy = &TolerancePolicy::STANDARD;
     let iterations = std::env::var("ZEROCAD_LONG_STRESS_ITERATIONS")
         .ok()
@@ -263,7 +263,7 @@ fn phase7_seeded_scale_boolean_and_persistence_stress_smoke() {
 }
 
 #[test]
-fn phase7_retained_exceptions_are_owned_and_triggered() {
+fn retained_exceptions_are_owned_and_triggered() {
     validate_phase7_exception_ledger().unwrap();
     assert_eq!(PHASE7_COMPATIBILITY_EXCEPTIONS.len(), 5);
     assert!(PHASE7_COMPATIBILITY_EXCEPTIONS.iter().all(|exception| {

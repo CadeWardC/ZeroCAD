@@ -6,7 +6,7 @@ use zerocad_core::{
     ParametricGraph, SaveOptions, SaveProfile, Unit,
 };
 
-#[path = "support/phase0_corpus.rs"]
+#[path = "support/benchmark_corpus.rs"]
 mod corpus;
 
 fn modeling_pipeline(c: &mut Criterion) {
