@@ -1,0 +1,29 @@
+name: Boolean fuzzing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+jobs:
+  pinned-nightly:
+    name: Boolean fuzz targets (pinned Ubuntu nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly-2026-07-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo +nightly-2026-07-01 install cargo-fuzz --locked
+      - name: Compile fuzz targets
+        working-directory: fuzz
+        run: cargo +nightly-2026-07-01 fuzz build
+      - name: Safety target
+        working-directory: fuzz
+        run: cargo +nightly-2026-07-01 fuzz run boolean_safety -- -max_total_time=300
+      - name: Resolvable target
+        working-directory: fuzz
+        run: cargo +nightly-2026-07-01 fuzz run boolean_resolvable -- -max_total_time=300

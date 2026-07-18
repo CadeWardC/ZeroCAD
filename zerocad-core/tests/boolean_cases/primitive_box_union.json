@@ -1,0 +1,17 @@
+{
+  "stage": "primitive",
+  "case": {
+    "operation": "union",
+    "object": {
+      "primitive": { "kind": "box", "size": [10.0, 10.0, 10.0] },
+      "transform": { "translation": [0.0, 0.0, 0.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.0 }
+    },
+    "tool": {
+      "primitive": { "kind": "box", "size": [10.0, 10.0, 10.0] },
+      "transform": { "translation": [5.0, 0.0, 0.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.0 }
+    },
+    "contact_class": "overlapping",
+    "logarithmic_scale": 0
+  },
+  "expected": "resolved"
+}

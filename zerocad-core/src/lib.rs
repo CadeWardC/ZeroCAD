@@ -1,3 +1,4 @@
+pub mod boolean_case;
 pub mod document;
 pub mod dxf;
 pub mod expr;
@@ -18,6 +19,11 @@ pub mod zcad_format;
 pub const CIRCLE_SEGS: usize = 48;
 
 // Re-export common structures for easy access
+pub use boolean_case::{
+    AnalyticPrimitiveV1, BooleanCaseError, BooleanCaseIdentity, BooleanCaseV1, BooleanContactClass,
+    BooleanOperandV1, BooleanReplayOutcome, BooleanReplaySummary, BooleanVerificationOp,
+    RigidTransformV1,
+};
 pub use document::{
     BodyId, BodyRecord, Document, DocumentRevision, DocumentSemantics, DocumentState,
     FeatureEditorGroup, FeatureEvaluatorKind, FeatureId, FeatureInput, FeatureInputTarget,

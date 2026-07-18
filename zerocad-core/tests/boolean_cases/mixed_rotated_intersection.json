@@ -1,0 +1,17 @@
+{
+  "stage": "mixed_topology",
+  "case": {
+    "operation": "intersect",
+    "object": {
+      "primitive": { "kind": "box", "size": [10.0, 10.0, 10.0] },
+      "transform": { "translation": [0.0, 0.0, 0.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.0 }
+    },
+    "tool": {
+      "primitive": { "kind": "box", "size": [8.0, 8.0, 8.0] },
+      "transform": { "translation": [3.0, 3.0, 1.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.2617993877991494 }
+    },
+    "contact_class": "overlapping",
+    "logarithmic_scale": 0
+  },
+  "expected": "resolved"
+}

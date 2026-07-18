@@ -1,0 +1,17 @@
+{
+  "stage": "imported_brep",
+  "case": {
+    "operation": "union",
+    "object": {
+      "primitive": { "kind": "cylinder", "radius": 4.0, "height": 8.0 },
+      "transform": { "translation": [0.0, 0.0, 0.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.0 }
+    },
+    "tool": {
+      "primitive": { "kind": "sphere", "radius": 4.0 },
+      "transform": { "translation": [0.0, 0.0, 8.0], "rotation_axis": [0.0, 1.0, 0.0], "rotation_radians": 0.0 }
+    },
+    "contact_class": "touching",
+    "logarithmic_scale": 0
+  },
+  "expected": "resolved"
+}

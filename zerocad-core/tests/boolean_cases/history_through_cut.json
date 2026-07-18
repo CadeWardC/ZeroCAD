@@ -1,0 +1,17 @@
+{
+  "stage": "history_extrusion",
+  "case": {
+    "operation": "cut",
+    "object": {
+      "primitive": { "kind": "box", "size": [12.0, 12.0, 8.0] },
+      "transform": { "translation": [0.0, 0.0, 0.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.0 }
+    },
+    "tool": {
+      "primitive": { "kind": "cylinder", "radius": 2.0, "height": 10.0 },
+      "transform": { "translation": [6.0, 6.0, -1.0], "rotation_axis": [0.0, 0.0, 1.0], "rotation_radians": 0.0 }
+    },
+    "contact_class": "overlapping",
+    "logarithmic_scale": 0
+  },
+  "expected": "resolved"
+}

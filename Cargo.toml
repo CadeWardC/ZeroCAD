@@ -9,6 +9,7 @@ members = [
 # the `openrcad` facade path dependency below.
 exclude = [
     "OpenRCAD",
+    "fuzz",
 ]
 
 # Release profile tuned for a lean, fast binary.
@@ -46,4 +47,5 @@ rfd = "0.14"
 ciborium = "0.2"
 zstd = "0.13"
 blake3 = "1.5"
+sha2 = "0.10"
 png = "0.17"
