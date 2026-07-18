@@ -1,0 +1,159 @@
+{
+  "schema": 1,
+  "baseline_commit": "71acd92e1ee152fcd64daa5c91bedd1b8d5cb270",
+  "comparison": {
+    "kernel_policy": "openrcad-standard-v1",
+    "absolute_multiplier": 10.0,
+    "relative_multiplier": 10.0
+  },
+  "cases": [
+    {
+      "name": "small_part",
+      "feature_count": 4,
+      "feature_kind_counts": {
+        "part.box": 1,
+        "part.cut": 1,
+        "part.cylinder": 1,
+        "part.transform": 1
+      },
+      "diagnostic_count": 0,
+      "bodies": [
+        {
+          "id": "through_hole_4",
+          "parts": [
+            {
+              "shell_count": 1,
+              "face_count": 9,
+              "edge_count": 21,
+              "vertex_count": 14,
+              "bounds_min": [0.0, 0.0, 0.0],
+              "bounds_max": [40.0, 30.0, 12.0]
+            }
+          ],
+          "mass": {
+            "volume": 12893.111951436847,
+            "surface_area": 4733.388452746636,
+            "centroid": [20.000000000000338, 15.000000000000066, 5.999999992335651]
+          }
+        }
+      ]
+    },
+    {
+      "name": "dependent_100_feature",
+      "feature_count": 100,
+      "feature_kind_counts": {
+        "part.box": 1,
+        "part.transform": 99
+      },
+      "diagnostic_count": 0,
+      "bodies": [
+        {
+          "id": "move_0100",
+          "parts": [
+            {
+              "shell_count": 1,
+              "face_count": 6,
+              "edge_count": 12,
+              "vertex_count": 8,
+              "bounds_min": [1.9799999557435513, 0.9899999778717756, 0.0],
+              "bounds_max": [21.97999995574355, 12.989999977871776, 8.0]
+            }
+          ],
+          "mass": {
+            "volume": 1920.00820351516,
+            "surface_area": 992.0031695387631,
+            "centroid": [11.98002201318741, 6.990011006593705, 4.0]
+          }
+        }
+      ]
+    },
+    {
+      "name": "dependent_500_feature",
+      "feature_count": 500,
+      "feature_kind_counts": {
+        "part.box": 1,
+        "part.transform": 499
+      },
+      "diagnostic_count": 0,
+      "bodies": [
+        {
+          "id": "move_0500",
+          "parts": [
+            {
+              "shell_count": 1,
+              "face_count": 6,
+              "edge_count": 12,
+              "vertex_count": 8,
+              "bounds_min": [9.979999776929617, 4.9899998884648085, 0.0],
+              "bounds_max": [29.979999776929617, 16.98999988846481, 8.0]
+            }
+          ],
+          "mass": {
+            "volume": 1920.0334016333256,
+            "surface_area": 992.0129051568665,
+            "centroid": [19.98013353347778, 10.99006676673889, 3.999999999999999]
+          }
+        }
+      ]
+    },
+    {
+      "name": "imported_step_box",
+      "feature_count": 1,
+      "feature_kind_counts": {
+        "exchange.step_import": 1
+      },
+      "diagnostic_count": 0,
+      "bodies": [
+        {
+          "id": "import_1",
+          "parts": [
+            {
+              "shell_count": 1,
+              "face_count": 6,
+              "edge_count": 12,
+              "vertex_count": 8,
+              "bounds_min": [0.0, 0.0, 0.0],
+              "bounds_max": [20.0, 12.0, 8.0]
+            }
+          ],
+          "mass": {
+            "volume": 1920.0,
+            "surface_area": 992.0,
+            "centroid": [10.0, 6.0, 4.0]
+          }
+        }
+      ]
+    },
+    {
+      "name": "difficult_through_hole",
+      "feature_count": 4,
+      "feature_kind_counts": {
+        "part.box": 1,
+        "part.cut": 1,
+        "part.cylinder": 1,
+        "part.transform": 1
+      },
+      "diagnostic_count": 0,
+      "bodies": [
+        {
+          "id": "through_hole_4",
+          "parts": [
+            {
+              "shell_count": 1,
+              "face_count": 9,
+              "edge_count": 21,
+              "vertex_count": 14,
+              "bounds_min": [0.0, 0.0, 0.0],
+              "bounds_max": [50.453704833984375, 58.85151290893555, 28.052053451538086]
+            }
+          ],
+          "mass": {
+            "volume": 73845.29419638861,
+            "surface_area": 14393.870023078303,
+            "centroid": [25.226852407002507, 29.42575645446708, 14.02602672392288]
+          }
+        }
+      ]
+    }
+  ]
+}
