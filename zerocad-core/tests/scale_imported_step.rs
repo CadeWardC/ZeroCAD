@@ -9,10 +9,8 @@ fn imported_step_scales_strictly_across_the_scale_factor_matrix() {
     let native =
         make_cylinder_operation_with_policy(&Ax2::new(Pnt::origin(), Dir::dz()), 3.0, 8.0, policy)
             .expect("native cylinder");
-    let path = std::env::temp_dir().join(format!(
-        "zerocad-scale-import-{}.stp",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("zerocad-scale-import-{}.stp", std::process::id()));
     write_step(&native.value, path.to_str().unwrap()).expect("strict STEP write");
     let imported = read_step_operation_with_policy(path.to_str().unwrap(), policy)
         .expect("strict STEP round-trip import");
@@ -73,10 +71,8 @@ fn native_body_intersects_a_strictly_imported_step_body() {
         policy,
     )
     .expect("native STEP source");
-    let path = std::env::temp_dir().join(format!(
-        "zerocad-common-import-{}.stp",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("zerocad-common-import-{}.stp", std::process::id()));
     write_step(&native_tool.value, path.to_str().unwrap()).expect("strict STEP write");
     let imported = read_step_operation_with_policy(path.to_str().unwrap(), policy)
         .expect("strict STEP import");

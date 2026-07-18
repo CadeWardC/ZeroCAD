@@ -18,6 +18,7 @@ fn apply_new(live: &mut Vec<LiveBody>, body: LiveBody) {
     live.push(body);
 }
 
+mod body_ops;
 mod cut;
 mod datum;
 mod direct_edit;
@@ -26,12 +27,13 @@ mod eval;
 mod extrude;
 mod inspection;
 mod join;
-mod body_ops;
 pub mod standards;
 pub mod thread;
 pub mod topo_name;
 mod types;
 
+pub use body_ops::body_bounds_center;
+pub(crate) use body_ops::*;
 #[allow(unused_imports)]
 pub(crate) use cut::*;
 pub(crate) use direct_edit::*;
@@ -48,8 +50,6 @@ pub use inspection::{
 };
 #[allow(unused_imports)]
 pub(crate) use join::*;
-pub use body_ops::body_bounds_center;
-pub(crate) use body_ops::*;
 pub use standards::{
     hole_presets, thread_classes, thread_reference, thread_reference_with_class, HoleApplication,
     HoleFit, HoleManufacturingMetadata, HoleStandardPreset, ResolvedStandardGeometry,

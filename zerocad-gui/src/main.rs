@@ -14,6 +14,7 @@ use zerocad_core::{
     SketchPlane, SketchShape, Unit, Variable, Vec3,
 };
 
+mod body_ops_ui;
 mod bug_report;
 mod combine_ui;
 mod direct_edit_ui;
@@ -32,7 +33,6 @@ mod loft_sweep_ui;
 mod move_ui;
 mod parameters_ui;
 mod pattern_ui;
-mod body_ops_ui;
 mod recovery;
 mod render;
 mod revolve_ui;
@@ -43,6 +43,7 @@ mod sketch_ui;
 mod theme;
 mod thread_ui;
 mod thumbnail;
+use body_ops_ui::{ScaleBodyOp, SplitBodyOp};
 use combine_ui::CombineOp;
 use direct_edit_ui::DirectFaceCommand;
 use edgemod::EdgeModOp;
@@ -55,7 +56,6 @@ use loft_sweep_ui::SweepOp;
 use move_ui::{BodyClipboard, MoveOp};
 use parameters_ui::ParametersDialog;
 use pattern_ui::PatternOp;
-use body_ops_ui::{ScaleBodyOp, SplitBodyOp};
 use revolve_ui::RevolveOp;
 use shell_ui::ShellOp;
 use shortcuts::{Keymap, ShortcutAction};
