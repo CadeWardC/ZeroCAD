@@ -1099,16 +1099,11 @@ impl ParametricGraph {
                 .map(|cp| cp.statuses.clone())
                 .unwrap_or_default();
             let mut diagnostics = crate::mock_kernel::take_diagnostics();
-            diagnostics.extend(statuses.iter().filter_map(|status| {
-                status.reason().map(|message| EvaluationDiagnostic {
-                    feature_id: status.feature_id.clone(),
-                    operation: "feature evaluation".to_string(),
-                    failure_class: "unresolved_feature".to_string(),
-                    fallback: Some("kept last valid body".to_string()),
-                    severity: DiagnosticSeverity::Warning,
-                    message: message.to_string(),
-                })
-            }));
+            diagnostics.extend(
+                statuses
+                    .iter()
+                    .filter_map(super::diagnostics::diagnostic_for_status),
+            );
             let feature_timings = self
                 .eval_cache
                 .borrow()

@@ -676,6 +676,14 @@ impl DocumentRecipeV3 {
         self,
         assets: &RequiredAssetsV1,
     ) -> Result<ParametricGraph, ZcadError> {
+        self.into_graph_with_assets_and_registry(assets, crate::document::FeatureRegistry::get)
+    }
+
+    fn into_graph_with_assets_and_registry(
+        self,
+        assets: &RequiredAssetsV1,
+        registration_for: impl Fn(&str) -> Option<&'static crate::document::FeatureRegistration>,
+    ) -> Result<ParametricGraph, ZcadError> {
         if self.schema_version != DOCUMENT_RECIPE_SCHEMA {
             return Err(ZcadError::Decode(format!(
                 "unsupported document recipe schema {}",
@@ -734,7 +742,7 @@ impl DocumentRecipeV3 {
             if !feature_ids.insert(id.clone()) {
                 return Err(ZcadError::Decode(format!("duplicate feature id '{id}'")));
             }
-            let registration = crate::document::FeatureRegistry::get(kind_id.as_str())
+            let registration = registration_for(kind_id.as_str())
                 .ok_or_else(|| ZcadError::Decode(format!("unknown feature kind '{kind_id}'")))?;
             let decoder = registration
                 .payload_decoder(payload_schema)
@@ -748,8 +756,13 @@ impl DocumentRecipeV3 {
                 (
                     crate::document::FeaturePayloadDecoder::NumericFieldsV1,
                     RecipeFeaturePayload(0, fields, None, None),
-                ) => crate::feature_dto::decode(kind_id.as_str(), payload_schema, fields)
-                    .map_err(ZcadError::Decode)?,
+                ) => crate::feature_dto::decode_with_decoder(
+                    kind_id.as_str(),
+                    payload_schema,
+                    decoder,
+                    fields,
+                )
+                .map_err(ZcadError::Decode)?,
                 (
                     crate::document::FeaturePayloadDecoder::StepAssetV1,
                     RecipeFeaturePayload(1, fields, Some(content_hash), Some(label)),
@@ -2511,6 +2524,79 @@ mod tests {
                     && message.contains("part.box")
                     && message.contains("supported schemas: [1]")
         ));
+    }
+
+    #[test]
+    fn two_phase_decode_accepts_an_injected_test_only_schema_table() {
+        use crate::document::{
+            FeatureEditorGroup, FeatureEvaluatorKind, FeaturePayloadDecoder,
+            FeaturePayloadDecoderRegistration, FeatureRegistration, FeatureRegistry,
+        };
+
+        static TEST_DECODERS: &[FeaturePayloadDecoderRegistration] = &[
+            FeaturePayloadDecoderRegistration {
+                schema: 1,
+                decoder: FeaturePayloadDecoder::NumericFieldsV1,
+            },
+            FeaturePayloadDecoderRegistration {
+                schema: 2,
+                decoder: FeaturePayloadDecoder::NumericFieldsV1,
+            },
+        ];
+        static TEST_BOX_REGISTRATION: FeatureRegistration = FeatureRegistration {
+            kind_id: "part.box",
+            payload_version: 1,
+            payload_decoders: TEST_DECODERS,
+            display_name: "Box",
+            evaluator: FeatureEvaluatorKind::Box,
+            editor_group: FeatureEditorGroup::Solid,
+        };
+
+        let mut graph = ParametricGraph::new();
+        graph.add_feature(FeatureNode {
+            id: "box".into(),
+            name: "Box".into(),
+            feature: FeatureType::Box {
+                w: 1.0,
+                h: 2.0,
+                d: 3.0,
+            },
+        });
+        let (mut recipe, assets) = DocumentRecipeV3::from_graph_with_assets(&graph);
+        recipe
+            .features
+            .iter_mut()
+            .find(|record| record.id == "box")
+            .expect("box record")
+            .payload_schema = 2;
+
+        let restored = recipe
+            .into_graph_with_assets_and_registry(&assets, |kind| {
+                if kind == "part.box" {
+                    Some(&TEST_BOX_REGISTRATION)
+                } else {
+                    FeatureRegistry::get(kind)
+                }
+            })
+            .expect("the injected schema must pass the real two-phase reader");
+        let box_record = restored
+            .graph
+            .node_weights()
+            .find(|record| record.id == "box")
+            .expect("decoded box");
+        assert_eq!(
+            box_record.payload_version, 1,
+            "the test-only schema is normalized to the real current schema"
+        );
+        assert!(matches!(
+            box_record.feature,
+            FeatureType::Box {
+                w: 1.0,
+                h: 2.0,
+                d: 3.0
+            }
+        ));
+        assert_eq!(FeatureRegistry::get("part.box").unwrap().payload_version, 1);
     }
 
     #[test]

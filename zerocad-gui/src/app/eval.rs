@@ -192,8 +192,9 @@ impl ZeroCadApp {
                     self.extrude_preview_inflight = None;
                     match completion.result {
                         Ok(output) => {
-                            if !output.warnings.is_empty() {
-                                log::debug!("extrude preview warnings: {:?}", output.warnings);
+                            let warnings = output.rendered_warnings();
+                            if !warnings.is_empty() {
+                                log::debug!("extrude preview diagnostics: {warnings:?}");
                             }
                             self.extrude_preview_cache =
                                 Some((key, std::sync::Arc::new(output.bodies)));
@@ -211,18 +212,22 @@ impl ZeroCadApp {
                 if self.edge_mod_arc_inflight == Some(key) {
                     self.edge_mod_arc_inflight = None;
                     match completion.result {
-                        Ok(output) if output.warnings.is_empty() => {
+                        Ok(output) if !output.has_diagnostic_warnings() => {
+                            let warnings = output.rendered_warnings();
                             let bodies = std::sync::Arc::new(output.bodies);
-                            self.remember_edge_mod_arc(key, bodies.clone(), &output.warnings);
-                            self.edge_mod_arc_cache = Some((key, bodies, output.warnings));
+                            self.remember_edge_mod_arc(key, bodies.clone(), &warnings);
+                            self.edge_mod_arc_cache = Some((key, bodies, warnings));
                             self.edge_mod_arc_failed = None;
                         }
                         Ok(output) => {
                             self.edge_mod_arc_cache = None;
                             let msg = output
-                                .warnings
-                                .first()
-                                .cloned()
+                                .diagnostics
+                                .iter()
+                                .find(|diagnostic| {
+                                    diagnostic.severity != zerocad_core::DiagnosticSeverity::Info
+                                })
+                                .map(|diagnostic| diagnostic.rendered_message().to_string())
                                 .unwrap_or_else(|| "the blend could not be computed".into());
                             self.status_msg = format!(
                                 "This size does not work here: {msg} Try another size or cancel."
@@ -259,11 +264,12 @@ impl ZeroCadApp {
                         .iter()
                         .filter_map(|s| s.reason().map(|r| (s.feature_id.clone(), r.to_string())))
                         .collect();
+                    let warnings = output.rendered_warnings();
                     self.document
                         .install_evaluation_cache(output.cache_snapshot);
                     self.document
                         .apply_face_reattach_updates(output.face_reattach);
-                    self.apply_eval_result(output.bodies, output.warnings);
+                    self.apply_eval_result(output.bodies, warnings);
                 }
                 Err(err) => {
                     self.error_msg = Some(err.to_string());

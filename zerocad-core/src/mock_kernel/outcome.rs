@@ -8,7 +8,7 @@ use openrcad::topo::{
     TopologyKind,
 };
 
-use crate::{DiagnosticSeverity, EvaluationDiagnostic};
+use crate::{DiagnosticCode, DiagnosticParameterValue, DiagnosticSeverity, EvaluationDiagnostic};
 
 use super::{BooleanFaceHistory, BooleanFaceSource};
 
@@ -229,25 +229,130 @@ fn record_kernel_metadata(
             KernelSeverity::Warning => DiagnosticSeverity::Warning,
             KernelSeverity::Error => DiagnosticSeverity::Error,
         };
-        record_diagnostic(EvaluationDiagnostic {
-            feature_id: active_feature(),
-            operation: operation.to_string(),
-            failure_class: diagnostic.code,
-            fallback: None,
-            severity,
-            message: diagnostic.message,
-        });
+        let kernel_code = diagnostic.code;
+        record_diagnostic(
+            EvaluationDiagnostic::new(
+                active_feature(),
+                operation,
+                DiagnosticCode::kernel(&kernel_code),
+                severity,
+                diagnostic.message,
+            )
+            .with_parameter("kernel_code", kernel_code.clone())
+            .with_failure_class(kernel_code),
+        );
     }
     for action in recovery.actions {
-        record_diagnostic(EvaluationDiagnostic {
-            feature_id: active_feature(),
-            operation: operation.to_string(),
-            failure_class: "kernel_recovery".to_string(),
-            fallback: Some(format!("{action:?}")),
-            severity: DiagnosticSeverity::Info,
-            message: format!("OpenRCAD applied recovery: {action:?}"),
-        });
+        let (action_code, parameters) = recovery_parameters(&action);
+        let fallback = format!("{action:?}");
+        let mut diagnostic = EvaluationDiagnostic::new(
+            active_feature(),
+            operation,
+            DiagnosticCode::kernel_recovery(),
+            DiagnosticSeverity::Info,
+            format!("OpenRCAD applied recovery: {action:?}"),
+        )
+        .with_parameter("action", action_code)
+        .with_failure_class("kernel_recovery")
+        .with_fallback(fallback);
+        diagnostic.parameters.extend(parameters);
+        record_diagnostic(diagnostic);
     }
+}
+
+fn recovery_parameters(
+    action: &openrcad::topo::RecoveryAction,
+) -> (
+    &'static str,
+    std::collections::BTreeMap<String, DiagnosticParameterValue>,
+) {
+    use openrcad::topo::RecoveryAction;
+    let mut parameters = std::collections::BTreeMap::new();
+    let code = match action {
+        RecoveryAction::NearCoincidentSnap { distance } => {
+            parameters.insert(
+                "distance".into(),
+                DiagnosticParameterValue::Decimal(distance.to_string()),
+            );
+            "near_coincident_snap"
+        }
+        RecoveryAction::SewFaces { face_count } => {
+            parameters.insert(
+                "face_count".into(),
+                DiagnosticParameterValue::Unsigned(*face_count as u64),
+            );
+            "sew_faces"
+        }
+        RecoveryAction::CloseGap { distance } => {
+            parameters.insert(
+                "distance".into(),
+                DiagnosticParameterValue::Decimal(distance.to_string()),
+            );
+            "close_gap"
+        }
+        RecoveryAction::HealTJunctions => "heal_t_junctions",
+        RecoveryAction::CollapseSmallEdge { length } => {
+            parameters.insert(
+                "length".into(),
+                DiagnosticParameterValue::Decimal(length.to_string()),
+            );
+            "collapse_small_edge"
+        }
+        RecoveryAction::ConsolidateCollinearEdges { removed_edges } => {
+            parameters.insert(
+                "removed_edges".into(),
+                DiagnosticParameterValue::Unsigned(*removed_edges as u64),
+            );
+            "consolidate_collinear_edges"
+        }
+        RecoveryAction::ReconstructPcurve { face, edge } => {
+            parameters.insert(
+                "face".into(),
+                DiagnosticParameterValue::Unsigned(*face as u64),
+            );
+            parameters.insert(
+                "edge".into(),
+                DiagnosticParameterValue::Unsigned(*edge as u64),
+            );
+            "reconstruct_pcurve"
+        }
+        RecoveryAction::ReconstructPcurves { count } => {
+            parameters.insert(
+                "count".into(),
+                DiagnosticParameterValue::Unsigned(*count as u64),
+            );
+            "reconstruct_pcurves"
+        }
+        RecoveryAction::PromoteImportedTolerance {
+            edge_count,
+            maximum,
+        } => {
+            parameters.insert(
+                "edge_count".into(),
+                DiagnosticParameterValue::Unsigned(*edge_count as u64),
+            );
+            parameters.insert(
+                "maximum".into(),
+                DiagnosticParameterValue::Decimal(maximum.to_string()),
+            );
+            "promote_imported_tolerance"
+        }
+        RecoveryAction::MergeCoplanarFaces { removed_faces } => {
+            parameters.insert(
+                "removed_faces".into(),
+                DiagnosticParameterValue::Unsigned(*removed_faces as u64),
+            );
+            "merge_coplanar_faces"
+        }
+        RecoveryAction::MergeCocylindricalFaces { removed_faces } => {
+            parameters.insert(
+                "removed_faces".into(),
+                DiagnosticParameterValue::Unsigned(*removed_faces as u64),
+            );
+            "merge_cocylindrical_faces"
+        }
+    };
+    (code, parameters)
 }
 
 pub(crate) fn set_feature_context(feature_id: Option<&str>) {

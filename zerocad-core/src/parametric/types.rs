@@ -959,24 +959,235 @@ pub struct EvaluationOutput {
     pub cache_snapshot: EvaluationCacheSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
     Info,
     Warning,
     Error,
 }
 
-/// Machine-readable counterpart to the status-bar warning text. Kernel wrappers
-/// can progressively provide a narrower failure class/fallback without changing
-/// the scheduler or saved-document APIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Stable machine-readable diagnostic identity.
+///
+/// Codes are deliberately separate from rendered English copy. New codes are
+/// append-only; callers compare this type (and structured parameters) rather
+/// than matching substrings in [`EvaluationDiagnostic::message`]. Kernel-owned
+/// codes retain their names under the `kernel.` namespace.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct DiagnosticCode(String);
+
+impl DiagnosticCode {
+    pub const REFERENCE_MISSING: &'static str = "reference.missing";
+    pub const REFERENCE_AMBIGUOUS: &'static str = "reference.ambiguous";
+    pub const PARAMETER_INVALID: &'static str = "parameter.invalid";
+    pub const OPERATION_FAILED: &'static str = "operation.failed";
+    pub const RESULT_INVALID_TOPOLOGY: &'static str = "result.invalid_topology";
+    pub const FEATURE_UNRESOLVED: &'static str = "feature.unresolved";
+    pub const KERNEL_RECOVERY: &'static str = "kernel.recovery";
+
+    pub fn new(code: impl Into<String>) -> Result<Self, String> {
+        let code = code.into();
+        if code.is_empty()
+            || !code.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
+            return Err(format!("invalid diagnostic code '{code}'"));
+        }
+        Ok(Self(code))
+    }
+
+    pub fn feature_unresolved() -> Self {
+        Self(Self::FEATURE_UNRESOLVED.to_string())
+    }
+
+    pub fn reference_missing() -> Self {
+        Self(Self::REFERENCE_MISSING.to_string())
+    }
+
+    pub fn reference_ambiguous() -> Self {
+        Self(Self::REFERENCE_AMBIGUOUS.to_string())
+    }
+
+    pub fn parameter_invalid() -> Self {
+        Self(Self::PARAMETER_INVALID.to_string())
+    }
+
+    pub fn operation_failed() -> Self {
+        Self(Self::OPERATION_FAILED.to_string())
+    }
+
+    pub fn result_invalid_topology() -> Self {
+        Self(Self::RESULT_INVALID_TOPOLOGY.to_string())
+    }
+
+    pub fn kernel(code: &str) -> Self {
+        let normalized = code
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        Self(format!("kernel.{normalized}"))
+    }
+
+    pub fn kernel_recovery() -> Self {
+        Self(Self::KERNEL_RECOVERY.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DiagnosticCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Canonical values accepted by diagnostic parameters. Decimal values are
+/// stored as normalized strings so the diagnostic contract remains `Eq` and
+/// does not inherit NaN or platform-formatting behavior.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum DiagnosticParameterValue {
+    Text(String),
+    Integer(i64),
+    Unsigned(u64),
+    Boolean(bool),
+    Decimal(String),
+}
+
+impl From<&str> for DiagnosticParameterValue {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl From<String> for DiagnosticParameterValue {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<bool> for DiagnosticParameterValue {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl From<i64> for DiagnosticParameterValue {
+    fn from(value: i64) -> Self {
+        Self::Integer(value)
+    }
+}
+
+impl From<u64> for DiagnosticParameterValue {
+    fn from(value: u64) -> Self {
+        Self::Unsigned(value)
+    }
+}
+
+impl From<usize> for DiagnosticParameterValue {
+    fn from(value: usize) -> Self {
+        Self::Unsigned(value as u64)
+    }
+}
+
+/// Machine-readable counterpart to the status-bar warning text. `code` and
+/// `parameters` are the behavioral contract; `message`, `operation`, and
+/// `fallback` are rendered/debugging copy and may improve without changing the
+/// code contract.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EvaluationDiagnostic {
     pub feature_id: String,
     pub operation: String,
+    pub code: DiagnosticCode,
+    pub parameters: std::collections::BTreeMap<String, DiagnosticParameterValue>,
+    /// Compatibility mirror of [`Self::code`] for older diagnostic consumers.
+    /// New code must use `code`.
     pub failure_class: String,
     pub fallback: Option<String>,
     pub severity: DiagnosticSeverity,
     pub message: String,
+}
+
+impl EvaluationDiagnostic {
+    pub fn new(
+        feature_id: impl Into<String>,
+        operation: impl Into<String>,
+        code: DiagnosticCode,
+        severity: DiagnosticSeverity,
+        message: impl Into<String>,
+    ) -> Self {
+        let failure_class = code.to_string();
+        Self {
+            feature_id: feature_id.into(),
+            operation: operation.into(),
+            code,
+            parameters: std::collections::BTreeMap::new(),
+            failure_class,
+            fallback: None,
+            severity,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_parameter(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<DiagnosticParameterValue>,
+    ) -> Self {
+        self.parameters.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn with_fallback(mut self, fallback: impl Into<String>) -> Self {
+        self.fallback = Some(fallback.into());
+        self
+    }
+
+    /// Override the one-cycle compatibility classification without weakening
+    /// the stable `code` contract. This is used only where the pre-typed API
+    /// exposed a different spelling.
+    pub fn with_failure_class(mut self, failure_class: impl Into<String>) -> Self {
+        self.failure_class = failure_class.into();
+        self
+    }
+
+    /// UI copy is intentionally accessed separately from the stable diagnostic
+    /// identity so behavioral tests never need to parse or pin it.
+    pub fn rendered_message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl EvaluationOutput {
+    /// Typed replacement for checking the compatibility `warnings` vector.
+    pub fn has_diagnostic_warnings(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity != DiagnosticSeverity::Info)
+    }
+
+    /// Render warning/error diagnostics for compatibility UI surfaces. The
+    /// diagnostic code and parameters remain authoritative; this copy is not a
+    /// behavioral contract.
+    pub fn rendered_warnings(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity != DiagnosticSeverity::Info)
+            .map(|diagnostic| diagnostic.rendered_message().to_string())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

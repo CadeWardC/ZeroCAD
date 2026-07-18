@@ -84,7 +84,14 @@ impl ModelEvaluator {
                                 request.generation,
                                 started.elapsed(),
                                 output.bodies.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-                                output.warnings.len()
+                                output
+                                    .diagnostics
+                                    .iter()
+                                    .filter(|diagnostic| {
+                                        diagnostic.severity
+                                            != zerocad_core::DiagnosticSeverity::Info
+                                    })
+                                    .count()
                             ),
                             Err(error) => log::warn!(
                                 "[evaluation] failed generation={} elapsed={:?}: {error}",

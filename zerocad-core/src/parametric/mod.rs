@@ -21,6 +21,7 @@ fn apply_new(live: &mut Vec<LiveBody>, body: LiveBody) {
 mod body_ops;
 mod cut;
 mod datum;
+mod diagnostics;
 mod direct_edit;
 mod edge_mod;
 mod eval;

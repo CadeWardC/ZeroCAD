@@ -326,7 +326,23 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
     fields
 }
 
-pub(crate) fn decode(
+pub(crate) fn decode_with_decoder(
+    kind: &str,
+    payload_schema: u16,
+    decoder: crate::document::FeaturePayloadDecoder,
+    fields: NumericFeatureFields,
+) -> Result<FeatureType, String> {
+    match decoder {
+        crate::document::FeaturePayloadDecoder::NumericFieldsV1 => decode_v1(kind, fields),
+        crate::document::FeaturePayloadDecoder::StepAssetV1
+        | crate::document::FeaturePayloadDecoder::StlAssetV1 => Err(format!(
+            "feature kind '{kind}' schema {payload_schema} requires a content-addressed asset payload"
+        )),
+    }
+}
+
+#[cfg(test)]
+fn decode(
     kind: &str,
     payload_schema: u16,
     fields: NumericFeatureFields,
@@ -336,13 +352,7 @@ pub(crate) fn decode(
     let decoder = registration
         .payload_decoder(payload_schema)
         .ok_or_else(|| unsupported_payload_schema(registration, payload_schema))?;
-    match decoder {
-        crate::document::FeaturePayloadDecoder::NumericFieldsV1 => decode_v1(kind, fields),
-        crate::document::FeaturePayloadDecoder::StepAssetV1
-        | crate::document::FeaturePayloadDecoder::StlAssetV1 => Err(format!(
-            "feature kind '{kind}' schema {payload_schema} requires a content-addressed asset payload"
-        )),
-    }
+    decode_with_decoder(kind, payload_schema, decoder, fields)
 }
 
 pub(crate) fn unsupported_payload_schema(

@@ -33,14 +33,14 @@ pub use mock_kernel::MockMesh;
 pub use parametric::{
     body_output_id, boolean_region_plan, complete_selected_circles, edge_wedge_is_concave_mesh,
     AxisBase, BodyInspection, BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef,
-    DatumValue, DiagnosticSeverity, EdgeInspection, EdgePairInspection, EdgeRef,
-    EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic, EvaluationError,
-    EvaluationOutput, EvaluationQuality, EvaluationTimings, ExtrudeMode, FaceInspection,
-    FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
-    HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, ParametricGraph, PatternKind,
-    PlaneBase, ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily,
-    TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution, HOLE_STANDARD_PRESETS,
-    STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
+    DatumValue, DiagnosticCode, DiagnosticParameterValue, DiagnosticSeverity, EdgeInspection,
+    EdgePairInspection, EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation,
+    EvaluationDiagnostic, EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings,
+    ExtrudeMode, FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit,
+    HoleKind, HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, ParametricGraph,
+    PatternKind, PlaneBase, ResolvedStandardGeometry, StandardReference, StandardsDataPack,
+    StandardsFamily, TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution,
+    HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
 };
 pub use release::{
     validate_compatibility_exception_ledger, validate_phase7_exception_ledger,
