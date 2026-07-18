@@ -6,18 +6,29 @@ fn invalid_circular_bite_runout_fails_safely_and_leaves_body() {
         .evaluate_bodies(&std::collections::HashSet::new())
         .unwrap();
     let g = circular_bite_cutoff_edge_graph_with_dist(crate::sketch::CornerKind::Fillet, -1.0);
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("distance must be positive")),
-        "invalid circular-bite fillet should fail safely with a diagnostic, got {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "em"
+                && diagnostic.code.as_str() == DiagnosticCode::PARAMETER_INVALID
+        }),
+        "invalid circular-bite fillet should fail safely: {:?}",
+        output.diagnostics
     );
-    assert_eq!(bodies.len(), 1, "failed oversized fillet keeps one body");
     assert_eq!(
-        bodies[0].1.indices.len(),
+        output.bodies.len(),
+        1,
+        "failed oversized fillet keeps one body"
+    );
+    assert_eq!(
+        output.bodies[0].1.indices.len(),
         unmodified[0].1.indices.len(),
         "invalid circular-bite fillet leaves the body unchanged"
     );
@@ -62,22 +73,29 @@ fn curved_circular_rim_selection_reaches_native_solver_and_fails_safely() {
     });
     g.add_dependency("e", "em_rim");
 
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
-    assert_eq!(bodies.len(), 1, "unsupported rim fillet keeps one body");
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("cut trim requires a cylindrical blend")
-                || w.contains("not watertight and healthy")
-                || w.contains("non-manifold edges")
-                || w.contains("candidate validation failed")),
-        "curved rim fillet should reach the native solver and fail safely, got {warnings:?}"
+    assert_eq!(
+        output.bodies.len(),
+        1,
+        "unsupported rim fillet keeps one body"
     );
     assert!(
-        warnings.iter().all(|w| !w.contains("not supported yet")),
-        "curved rim fillet must not be rejected by the old app-level gate: {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "em_rim"
+                && matches!(
+                    diagnostic.code.as_str(),
+                    DiagnosticCode::OPERATION_FAILED | DiagnosticCode::RESULT_INVALID_TOPOLOGY
+                )
+        }),
+        "curved rim must reach guarded candidate validation: {:?}",
+        output.diagnostics
     );
 }
 
@@ -124,6 +142,32 @@ fn edge_mod_oversized_leaves_body_unchanged_and_warns() {
         plain.indices.len(),
         "oversized fillet must leave the body unchanged"
     );
+}
+
+#[test]
+fn edge_mod_candidate_contract_cold_warm_cancel_and_restore() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let hidden = std::collections::HashSet::new();
+    let cold = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let warm = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert_eq!(cold.1, warm.1);
+    assert_eq!(cold.0.len(), warm.0.len());
+    assert_eq!(cold.0[0].1.indices, warm.0[0].1.indices);
+    assert_eq!(cold.0[0].1.face_ids, warm.0[0].1.face_ids);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+    assert!(matches!(
+        graph.evaluate_request(
+            &hidden,
+            EvaluationQuality::Interactive,
+            &EvaluationCancellation::new(1, cancelled),
+        ),
+        Err(EvaluationError::Cancelled)
+    ));
+    let restored: ParametricGraph =
+        serde_json::from_str(&serde_json::to_string(&graph.clone_document()).unwrap()).unwrap();
+    let rebuilt = restored.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert_eq!(warm.1, rebuilt.1);
+    assert_eq!(warm.0[0].1.indices, rebuilt.0[0].1.indices);
 }
 
 /// Direct repro of the sharp-corner locality rejection: a ~22° wedge prism's

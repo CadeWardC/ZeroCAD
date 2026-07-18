@@ -65,6 +65,7 @@ fn classify_unresolved_message(message: &str) -> DiagnosticCode {
         "invalid topology",
         "positive-volume",
         "non-manifold",
+        "not watertight",
         "display-mesh crack",
     ]
     .iter()
@@ -79,6 +80,8 @@ fn classify_unresolved_message(message: &str) -> DiagnosticCode {
         "must touch or overlap",
         "must overlap",
         "operation declined",
+        "candidate validation failed",
+        "cut trim requires",
     ]
     .iter()
     .any(|needle| message.contains(needle))

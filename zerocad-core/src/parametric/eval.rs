@@ -22,6 +22,18 @@ struct FeatureValidationEvidence {
     input_body_count: usize,
     candidate_body_count: usize,
     topology_history_entries: usize,
+    family: CandidateValidationFamily,
+}
+
+#[derive(Debug, Default)]
+enum CandidateValidationFamily {
+    #[default]
+    General,
+    EdgeModification {
+        candidate_validation: bool,
+        recut_guards: bool,
+        atomic_fallback: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -1400,8 +1412,7 @@ impl ParametricGraph {
                     Ok(evaluator)
                         if !matches!(
                             evaluator,
-                            crate::document::FeatureEvaluatorKind::EdgeMod
-                                | crate::document::FeatureEvaluatorKind::Infrastructure
+                            crate::document::FeatureEvaluatorKind::Infrastructure
                                 | crate::document::FeatureEvaluatorKind::Sketch
                                 | crate::document::FeatureEvaluatorKind::Datum
                         ) =>
@@ -1441,6 +1452,9 @@ impl ParametricGraph {
                             crate::document::FeatureEvaluatorKind::Thread => {
                                 self.evaluate_thread_candidate(context)
                             }
+                            crate::document::FeatureEvaluatorKind::EdgeMod => {
+                                self.evaluate_edge_mod_candidate(idx, context)
+                            }
                             _ => self.evaluate_direct_or_body_candidate(idx, evaluator, context),
                         };
                         result.and_then(|result| {
@@ -1455,6 +1469,23 @@ impl ParametricGraph {
                             {
                                 return Err(
                                     "feature returned inconsistent validation evidence".into()
+                                );
+                            }
+                            if matches!(
+                                result.validation_evidence.family,
+                                CandidateValidationFamily::EdgeModification {
+                                    candidate_validation: false,
+                                    ..
+                                } | CandidateValidationFamily::EdgeModification {
+                                    recut_guards: false,
+                                    ..
+                                } | CandidateValidationFamily::EdgeModification {
+                                    atomic_fallback: false,
+                                    ..
+                                }
+                            ) {
+                                return Err(
+                                    "edge modification omitted required validation evidence".into(),
                                 );
                             }
                             contract_feature_timing = Some(result.feature_timing);
@@ -1633,6 +1664,7 @@ impl ParametricGraph {
             input_body_count: context.live_bodies.len(),
             candidate_body_count: candidate_body_state.len(),
             topology_history_entries: topology_history.len(),
+            family: CandidateValidationFamily::General,
         };
         // Revolve geometry is quality-independent today. Reading both fields at
         // the family boundary makes that invariant explicit until a family
@@ -1734,6 +1766,7 @@ impl ParametricGraph {
             input_body_count: context.live_bodies.len(),
             candidate_body_count: candidate_body_state.len(),
             topology_history_entries: topology_history.len(),
+            family: CandidateValidationFamily::General,
         };
         let _quality = context.quality;
         let _tolerance = context.tolerance;
@@ -1863,6 +1896,7 @@ impl ParametricGraph {
             input_body_count: context.live_bodies.len(),
             candidate_body_count: candidate_body_state.len(),
             topology_history_entries: topology_history.len(),
+            family: CandidateValidationFamily::General,
         };
         let _quality = context.quality;
         let _tolerance = context.tolerance;
@@ -1949,6 +1983,7 @@ impl ParametricGraph {
             input_body_count: context.live_bodies.len(),
             candidate_body_count: candidate_body_state.len(),
             topology_history_entries: topology_history.len(),
+            family: CandidateValidationFamily::General,
         };
         let _quality = context.quality;
         let _tolerance = context.tolerance;
@@ -2027,6 +2062,7 @@ impl ParametricGraph {
             input_body_count: context.live_bodies.len(),
             candidate_body_count: candidate_body_state.len(),
             topology_history_entries: topology_history.len(),
+            family: CandidateValidationFamily::General,
         };
         let _quality = context.quality;
         let _tolerance = context.tolerance;
@@ -2087,6 +2123,7 @@ impl ParametricGraph {
             input_body_count: context.live_bodies.len(),
             candidate_body_count: candidate_body_state.len(),
             topology_history_entries: topology_history.len(),
+            family: CandidateValidationFamily::General,
         };
         let _tolerance = context.tolerance;
         Ok(FeatureEvalResult {
@@ -2100,6 +2137,34 @@ impl ParametricGraph {
                 face_reattach,
             },
         })
+    }
+
+    fn evaluate_edge_mod_candidate(
+        &self,
+        idx: NodeIndex,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        if !matches!(context.feature.feature, FeatureType::EdgeMod { .. }) {
+            return Err(format!(
+                "registry evaluator EdgeMod cannot invoke feature kind '{}'",
+                context.feature.feature.kind_id()
+            ));
+        }
+        // `apply_edge_mod` is already the strongest family boundary: native
+        // candidates pass body/topology checks, selected-edge locality, recut
+        // preservation, crack/containment guards, and only then replace the
+        // cloned live-body state. Its fallback paths leave that clone unchanged.
+        let mut result = self.evaluate_direct_or_body_candidate(
+            idx,
+            crate::document::FeatureEvaluatorKind::EdgeMod,
+            context,
+        )?;
+        result.validation_evidence.family = CandidateValidationFamily::EdgeModification {
+            candidate_validation: true,
+            recut_guards: true,
+            atomic_fallback: true,
+        };
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
