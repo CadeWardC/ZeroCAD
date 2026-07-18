@@ -332,13 +332,17 @@ fn resample_ring_2d(pts: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
     out
 }
 
-/// Loft a solid through `sections` (each: a sketch-plane frame + its outer
-/// boundary in that plane's (u, v)). Sections are resampled to a common vertex
-/// count, unprojected to 3D rings, and skinned. Holes are not lofted in v1
-/// (only the outer boundary of each section is used). `None` when there are
-/// fewer than two sections or the skin fails to close.
+/// Loft a solid through complete material sections. Outer boundaries and holes
+/// are independently resampled, unprojected to 3D, and handed to the kernel's
+/// deterministic [`openrcad::algo::SectionLoops`] correspondence service.
+/// `None` when there are fewer than two sections, hole topology changes, hole
+/// matching is ambiguous, or the skin fails to close.
 pub fn lofted_solid(
-    sections: &[(crate::geometry::CoordinateSystem, Vec<(f32, f32)>)],
+    sections: &[(
+        crate::geometry::CoordinateSystem,
+        Vec<(f32, f32)>,
+        Vec<Vec<(f32, f32)>>,
+    )],
 ) -> Option<KernelSolid> {
     if sections.len() < 2 {
         return None;
@@ -347,29 +351,49 @@ pub fn lofted_solid(
     // triangle doesn't force a fine section down to 3 points and vice-versa.
     let target_n = sections
         .iter()
-        .map(|(_, b)| b.len())
+        .map(|(_, outer, _)| outer.len())
         .max()
         .unwrap_or(0)
         .clamp(3, 256);
-    let mut rings: Vec<Vec<Pnt>> = Vec::with_capacity(sections.len());
-    for (cs, boundary) in sections {
-        if boundary.len() < 3 {
+    let hole_target_n = sections
+        .iter()
+        .flat_map(|(_, _, holes)| holes.iter().map(Vec::len))
+        .max()
+        .map(|count| count.clamp(3, 256));
+    let mut kernel_sections = Vec::with_capacity(sections.len());
+    for (cs, outer, holes) in sections {
+        if outer.len() < 3 || holes.iter().any(|hole| hole.len() < 3) {
             return None;
         }
-        let resampled = resample_ring_2d(boundary, target_n);
-        let ring: Vec<Pnt> = resampled
+        let resampled = resample_ring_2d(outer, target_n);
+        let outer: Vec<Pnt> = resampled
             .iter()
             .map(|&(u, v)| {
                 let p = cs.unproject(u, v);
                 Pnt::new(p.x as f64, p.y as f64, p.z as f64)
             })
             .collect();
-        rings.push(ring);
+        let holes = holes
+            .iter()
+            .map(|hole| {
+                let resampled = resample_ring_2d(hole, hole_target_n?);
+                Some(
+                    resampled
+                        .iter()
+                        .map(|&(u, v)| {
+                            let point = cs.unproject(u, v);
+                            Pnt::new(point.x as f64, point.y as f64, point.z as f64)
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        kernel_sections.push(openrcad::algo::SectionLoops { outer, holes });
     }
     match consume_operation(
         "loft skin",
-        openrcad::algo::skin_polygon_rings_operation_with_policy(
-            &rings,
+        openrcad::algo::skin_section_loops_operation_with_policy(
+            &kernel_sections,
             &TolerancePolicy::STANDARD,
         ),
     ) {
@@ -381,7 +405,7 @@ pub fn lofted_solid(
     }
 }
 
-/// Sweep `profile` (a sketch-plane frame + its outer boundary in (u, v)) along
+/// Sweep a complete material profile (outer boundary plus holes) along
 /// `path_points` (an ordered 3D polyline) using rotation-minimizing frames
 /// (double-reflection method), so the profile is transported without twist.
 /// The profile is placed perpendicular to the path at its start (its drawn
@@ -390,6 +414,7 @@ pub fn lofted_solid(
 pub fn swept_solid(
     profile_cs: &crate::geometry::CoordinateSystem,
     profile_boundary: &[(f32, f32)],
+    profile_holes: &[Vec<(f32, f32)>],
     path_points: &[crate::geometry::Vec3],
 ) -> Option<KernelSolid> {
     use crate::geometry::Vec3;
@@ -404,7 +429,10 @@ pub fn swept_solid(
             path.push(p);
         }
     }
-    if path.len() < 2 || profile_boundary.len() < 3 {
+    if path.len() < 2
+        || profile_boundary.len() < 3
+        || profile_holes.iter().any(|hole| hole.len() < 3)
+    {
         return None;
     }
 
@@ -435,13 +463,22 @@ pub fn swept_solid(
         Pnt::new(w.x as f64, w.y as f64, w.z as f64)
     };
 
-    let mut rings: Vec<Vec<Pnt>> = Vec::with_capacity(m);
-    rings.push(
-        profile_boundary
+    let section_at = |origin: Vec3, right: Vec3, up: Vec3| openrcad::algo::SectionLoops {
+        outer: profile_boundary
             .iter()
-            .map(|&uv| profile_point(path[0], r, s, uv))
+            .map(|&uv| profile_point(origin, right, up, uv))
             .collect(),
-    );
+        holes: profile_holes
+            .iter()
+            .map(|hole| {
+                hole.iter()
+                    .map(|&uv| profile_point(origin, right, up, uv))
+                    .collect()
+            })
+            .collect(),
+    };
+    let mut sections = Vec::with_capacity(m);
+    sections.push(section_at(path[0], r, s));
     for i in 1..m {
         // Double-reflection RMF transport of (r) from frame i-1 to i.
         let v1 = path[i].sub(path[i - 1]);
@@ -466,18 +503,13 @@ pub fn swept_solid(
         r = r_next;
         s = s_next;
         t = t_next;
-        rings.push(
-            profile_boundary
-                .iter()
-                .map(|&uv| profile_point(path[i], r, s, uv))
-                .collect(),
-        );
+        sections.push(section_at(path[i], r, s));
     }
 
     match consume_operation(
         "sweep skin",
-        openrcad::algo::skin_polygon_rings_operation_with_policy(
-            &rings,
+        openrcad::algo::skin_section_loops_operation_with_policy(
+            &sections,
             &TolerancePolicy::STANDARD,
         ),
     ) {
@@ -576,7 +608,7 @@ pub fn helical_thread_solid(
     ];
     // Profile frame: u along the (start) radial direction, v along the axis.
     let profile_cs = CoordinateSystem::new(axis_origin, e1, axis);
-    swept_solid(&profile_cs, &profile, &path)
+    swept_solid(&profile_cs, &profile, &[], &path)
 }
 
 /// The analytic helical thread **wall** (no caps): a handful of large

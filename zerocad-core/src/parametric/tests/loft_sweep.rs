@@ -11,6 +11,22 @@ fn shifted_xy(z: f32) -> CoordinateSystem {
     CoordinateSystem::XY.with_origin(Vec3::new(0.0, 0.0, z))
 }
 
+fn holed_rectangle(
+    outer_min: (f32, f32),
+    outer_max: (f32, f32),
+    hole_min: (f32, f32),
+    hole_max: (f32, f32),
+) -> (SketchCurves, usize) {
+    let mut curves = SketchCurves::new();
+    curves.add_rectangle(outer_min, outer_max);
+    curves.add_rectangle(hole_min, hole_max);
+    let region_index = crate::sketch::detect_regions(&curves)
+        .iter()
+        .position(|region| !region.holes.is_empty())
+        .expect("nested rectangles must expose the material region");
+    (curves, region_index)
+}
+
 // ---- Loft ----------------------------------------------------------------
 
 #[test]
@@ -50,6 +66,38 @@ fn loft_two_squares_is_a_frustum() {
     assert!(
         (v - exact).abs() / exact < 0.02,
         "loft volume {v} vs {exact}"
+    );
+}
+
+#[test]
+fn loft_preserves_section_holes() {
+    let mut graph = ParametricGraph::new();
+    let (bottom, bottom_region) =
+        holed_rectangle((-5.0, -5.0), (5.0, 5.0), (-2.0, -2.0), (2.0, 2.0));
+    let (top, top_region) = holed_rectangle((-5.0, -5.0), (5.0, 5.0), (-2.0, -2.0), (2.0, 2.0));
+    add_sketch_cs(&mut graph, "bottom", shifted_xy(0.0), bottom);
+    add_sketch_cs(&mut graph, "top", shifted_xy(6.0), top);
+    graph.add_feature(FeatureNode {
+        id: "holed_loft".into(),
+        name: "Holed loft".into(),
+        feature: FeatureType::Loft {
+            sections: vec![("bottom".into(), bottom_region), ("top".into(), top_region)],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    graph.add_dependency("bottom", "holed_loft");
+    graph.add_dependency("top", "holed_loft");
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    let actual = volume(&bodies[0].1);
+    let expected = (100.0 - 16.0) * 6.0;
+    assert!(
+        (actual - expected).abs() / expected < 0.02,
+        "holed loft volume {actual} vs {expected}"
     );
 }
 
@@ -145,6 +193,45 @@ fn sweep_square_along_straight_path_is_a_prism() {
     let v = volume(&bodies[0].1);
     // 2×2 profile × length 10 = 40.
     assert!((v - 40.0).abs() / 40.0 < 0.02, "sweep volume {v} vs 40");
+}
+
+#[test]
+fn sweep_preserves_profile_hole() {
+    let mut graph = ParametricGraph::new();
+    let (profile, profile_region) =
+        holed_rectangle((-2.0, -2.0), (2.0, 2.0), (-1.0, -1.0), (1.0, 1.0));
+    add_sketch_cs(&mut graph, "profile", CoordinateSystem::XY, profile);
+    straight_path_sketch(
+        &mut graph,
+        "path",
+        CoordinateSystem::XZ,
+        (0.0, 0.0),
+        (0.0, 10.0),
+    );
+    graph.add_feature(FeatureNode {
+        id: "holed_sweep".into(),
+        name: "Holed sweep".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region,
+            path_sketch: "path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    graph.add_dependency("profile", "holed_sweep");
+    graph.add_dependency("path", "holed_sweep");
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    let actual = volume(&bodies[0].1);
+    let expected = (16.0 - 4.0) * 10.0;
+    assert!(
+        (actual - expected).abs() / expected < 0.02,
+        "holed sweep volume {actual} vs {expected}"
+    );
 }
 
 #[test]

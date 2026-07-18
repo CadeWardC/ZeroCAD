@@ -312,8 +312,8 @@ pub enum FeatureType {
     },
     /// Loft a solid through two or more sketch section profiles (in order).
     /// Each entry is `(sketch_node_id, region_index)`; the loft node depends on
-    /// every section sketch. v1 lofts only the outer boundary of each section
-    /// (holes ignored) with a ruled/planar skin.
+    /// every section sketch. Outer loops and deterministically-corresponded
+    /// holes are skinned together; ambiguous hole matching stays unresolved.
     Loft {
         /// Ordered `(sketch_id, region_index)` sections.
         sections: Vec<(String, usize)>,
@@ -323,8 +323,8 @@ pub enum FeatureType {
         target: Option<String>,
     },
     /// Sweep a profile region along a path sketch's open chain (rotation-
-    /// minimizing frames — no twist). v1: the profile is placed perpendicular
-    /// to the path start; the path must be a single open chain of lines/arcs.
+    /// minimizing frames — no twist). The profile, including holes, is placed
+    /// perpendicular to the path start; the path must be one line/arc chain.
     Sweep {
         /// The profile: `(sketch_id, region_index)`.
         profile_sketch: String,

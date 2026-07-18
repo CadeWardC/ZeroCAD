@@ -4245,7 +4245,8 @@ impl ParametricGraph {
             ));
             return;
         }
-        let mut resolved: Vec<(CoordinateSystem, Vec<(f32, f32)>)> = Vec::new();
+        let mut resolved: Vec<(CoordinateSystem, Vec<(f32, f32)>, Vec<Vec<(f32, f32)>>)> =
+            Vec::new();
         for (sketch_id, region_index) in sections {
             let Some(sketch) = self.sketch_eval_by_id(sketch_cache, sketch_id) else {
                 warnings.push(format!(
@@ -4273,7 +4274,7 @@ impl ParametricGraph {
                 ));
                 return;
             };
-            resolved.push((cs, region.boundary.clone()));
+            resolved.push((cs, region.boundary.clone(), region.holes.clone()));
         }
         let Some(solid) = crate::mock_kernel::lofted_solid(&resolved) else {
             warnings.push(format!(
@@ -4353,7 +4354,8 @@ impl ParametricGraph {
             .iter()
             .map(|&(u, v)| path_cs.unproject(u, v))
             .collect();
-        let Some(solid) = crate::mock_kernel::swept_solid(&profile_cs, &region.boundary, &path_3d)
+        let Some(solid) =
+            crate::mock_kernel::swept_solid(&profile_cs, &region.boundary, &region.holes, &path_3d)
         else {
             warnings.push(format!(
                 "Sweep '{node_id}': the profile could not be swept along the path \
