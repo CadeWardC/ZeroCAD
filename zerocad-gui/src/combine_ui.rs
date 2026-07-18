@@ -57,13 +57,26 @@ impl ZeroCadApp {
 
     fn combine_body_label(&self, id: &str) -> String {
         let owner_id = self.document.body_producer_feature_id(id).unwrap_or(id);
+        let mut owned_outputs: Vec<&str> = self
+            .body_meshes
+            .iter()
+            .filter_map(|(candidate, _)| {
+                (self.document.body_producer_feature_id(candidate) == Some(owner_id))
+                    .then_some(candidate.as_str())
+            })
+            .collect();
+        owned_outputs.sort_by_key(|candidate| usize::from(*candidate != owner_id));
+        let output_index = owned_outputs
+            .iter()
+            .position(|candidate| *candidate == id)
+            .unwrap_or(0);
         self.document
             .graph
             .node_indices()
             .find_map(|index| {
                 let node = &self.document.graph[index];
                 (node.id == owner_id)
-                    .then(|| format!("{} ({id})", body_output_label(&node.name, id)))
+                    .then(|| format!("{} ({id})", body_output_label(&node.name, output_index)))
             })
             .unwrap_or_else(|| id.to_string())
     }

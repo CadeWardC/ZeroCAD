@@ -5,6 +5,7 @@ mod feature_dto;
 pub mod geometry;
 pub mod mock_kernel;
 pub mod parametric;
+pub mod release;
 pub mod sketch;
 pub mod stl;
 pub mod units;
@@ -30,16 +31,22 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    body_output_id, body_output_index, boolean_region_plan,
-    complete_selected_circles, edge_wedge_is_concave_mesh, AxisBase, BodyInspection,
-    BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticSeverity,
-    EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic,
-    EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings, ExtrudeMode,
-    FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
+    body_output_id, boolean_region_plan, complete_selected_circles, edge_wedge_is_concave_mesh,
+    AxisBase, BodyInspection, BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef,
+    DatumValue, DiagnosticSeverity, EdgeInspection, EdgePairInspection, EdgeRef,
+    EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic, EvaluationError,
+    EvaluationOutput, EvaluationQuality, EvaluationTimings, ExtrudeMode, FaceInspection,
+    FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
     HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, ParametricGraph, PatternKind,
-    PlaneBase, ResolvedStandardGeometry, StandardReference, StandardsFamily, TopologyEdgeRef,
-    Variable, VariableDiagnostic, VariableResolution, HOLE_STANDARD_PRESETS, STANDARDS_LIBRARY_ID,
-    STANDARDS_LIBRARY_VERSION,
+    PlaneBase, ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily,
+    TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution, HOLE_STANDARD_PRESETS,
+    STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
+};
+pub use release::{
+    validate_compatibility_exception_ledger, validate_phase7_exception_ledger,
+    validate_phase7_release_evidence, AlphaEvidence, ArtifactEvidence, CompatibilityException,
+    DocumentPerformanceEvidence, InteractionEvidence, Phase7ReleaseEvidence, StartupEvidence,
+    ValidationEvidence, PHASE7_COMPATIBILITY_EXCEPTIONS,
 };
 pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,

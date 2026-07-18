@@ -2,6 +2,12 @@
 //! format, corruption is detected (never a panic), incompatible prototype files
 //! are rejected, and unknown container sections remain safely skippable.
 
+// This suite intentionally exercises the deprecated `.zcad` compatibility
+// adapters alongside the canonical Document APIs. Production use is forbidden
+// by the Phase 2/6 architecture gates; retaining adapter coverage keeps the
+// downstream source-compatibility promise testable without warning noise.
+#![allow(deprecated)]
+
 use std::collections::HashSet;
 use zerocad_core::parametric::{FaceRef, TopologyFaceRef};
 use zerocad_core::zcad_format::{

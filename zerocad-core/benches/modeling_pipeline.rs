@@ -1,7 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use std::collections::HashSet;
 use std::time::Duration;
-use zerocad_core::{read_zcad, write_zcad, ParametricGraph, Unit, ZcadDocument};
+use zerocad_core::{
+    read_document_from_slice, write_document_to_vec, Document, HydrationBundle, LoadOptions,
+    ParametricGraph, SaveOptions, SaveProfile, Unit,
+};
 
 #[path = "support/phase0_corpus.rs"]
 mod corpus;
@@ -49,28 +52,111 @@ fn modeling_pipeline(c: &mut Criterion) {
 
     let bodies = warm.evaluate_bodies(&hidden).unwrap();
     let snapshot = warm.evaluation_cache_snapshot();
-    let hydrated = write_zcad(&ZcadDocument {
-        graph: &warm,
-        thumbnail_png: None,
-        mesh_cache: Some(&bodies),
-        units: Unit::Millimeter,
-        bbox: [0.0; 6],
-        created_unix: Some(0),
-        hidden_nodes: HashSet::new(),
-        evaluation_cache: Some(&snapshot),
-        hydrated_cache_limit: None,
-    })
+    let document = Document::from_graph(warm.clone_document(), Unit::Millimeter);
+    let hydrated = write_document_to_vec(
+        &document,
+        &SaveOptions {
+            profile: SaveProfile::Hydrated {
+                total_accelerator_budget: 128 * 1024 * 1024,
+            },
+        },
+        &HydrationBundle {
+            display_meshes: Some(bodies),
+            evaluation_cache: Some(snapshot),
+            ..Default::default()
+        },
+    )
     .unwrap();
     c.bench_function("phase0_hydrated_open_first_eval_100_feature", |b| {
         b.iter(|| {
-            let loaded = read_zcad(black_box(&hydrated)).unwrap();
-            if let Some(cache) = loaded.evaluation_cache {
-                loaded.graph.install_evaluation_cache(cache);
+            let loaded =
+                read_document_from_slice(black_box(&hydrated), &LoadOptions::default()).unwrap();
+            if let Some(cache) = loaded.accelerators.evaluation_cache {
+                loaded.document.install_evaluation_cache(cache);
             }
-            black_box(loaded.graph.evaluate_bodies(&hidden).unwrap())
+            black_box(loaded.document.evaluate_bodies(&hidden).unwrap())
         })
     });
 }
 
-criterion_group!(benches, modeling_pipeline);
+fn phase6_hotspots(c: &mut Criterion) {
+    let left = openrcad::primitives::make_box_operation(
+        &openrcad::foundation::Pnt::origin(),
+        20.0,
+        16.0,
+        12.0,
+    )
+    .unwrap()
+    .value;
+    let right = openrcad::primitives::make_box_operation(
+        &openrcad::foundation::Pnt::new(8.0, 5.0, 3.0),
+        20.0,
+        16.0,
+        12.0,
+    )
+    .unwrap()
+    .value;
+    c.bench_function("phase6_boolean_common", |b| {
+        b.iter(|| {
+            black_box(
+                openrcad::algo::boolean_operation(
+                    black_box(&left),
+                    black_box(&right),
+                    openrcad::algo::BooleanOp::Common,
+                )
+                .unwrap(),
+            )
+        })
+    });
+
+    let cylinder = openrcad::primitives::make_cylinder_operation(
+        &openrcad::foundation::Ax2::new(
+            openrcad::foundation::Pnt::origin(),
+            openrcad::foundation::Dir::dz(),
+        ),
+        12.0,
+        30.0,
+    )
+    .unwrap()
+    .value;
+    c.bench_function("phase6_checked_tessellation", |b| {
+        b.iter(|| {
+            black_box(openrcad::mesh::tessellate_checked(
+                black_box(&cylinder),
+                0.005,
+                0.05,
+            ))
+        })
+    });
+    let display_mesh = openrcad::mesh::tessellate_checked(&cylinder, 0.005, 0.05).unwrap();
+    c.bench_function("phase6_render_buffer_preparation", |b| {
+        b.iter(|| black_box(display_mesh.gpu_mesh()))
+    });
+
+    let large = Document::from_graph(corpus::five_hundred_feature_history(), Unit::Millimeter);
+    let compact =
+        write_document_to_vec(&large, &SaveOptions::default(), &HydrationBundle::default())
+            .unwrap();
+    c.bench_function("phase6_canonical_save_500_features", |b| {
+        b.iter(|| {
+            black_box(
+                write_document_to_vec(
+                    black_box(&large),
+                    &SaveOptions::default(),
+                    &HydrationBundle::default(),
+                )
+                .unwrap(),
+            )
+        })
+    });
+    c.bench_function("phase6_canonical_open_500_features", |b| {
+        b.iter(|| {
+            black_box(
+                read_document_from_slice(black_box(&compact), &LoadOptions::default()).unwrap(),
+            )
+        })
+    });
+}
+
+criterion_group!(benches, modeling_pipeline, phase6_hotspots);
 criterion_main!(benches);

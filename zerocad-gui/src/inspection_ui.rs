@@ -187,7 +187,7 @@ impl ZeroCadApp {
                 if let Some(section) = &mut self.section_view {
                     ui.label(
                         egui::RichText::new(
-                            "Section mode uses the precise CPU clipping path; GPU acceleration resumes when disabled.",
+                            "The GPU clips arbitrary planes natively; the shared contour builder supplies matching cap outlines to both viewport paths.",
                         )
                         .small()
                         .weak(),
@@ -375,7 +375,7 @@ impl ZeroCadApp {
         }
         let mut entities = Vec::new();
         let mut points = Vec::new();
-        let mut edges = Vec::new();
+        let mut edges: Vec<(String, zerocad_core::EdgeRef)> = Vec::new();
         for (body_id, pick) in &self.selected_body {
             let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == body_id) else {
                 continue;
@@ -394,36 +394,21 @@ impl ZeroCadApp {
                 }
                 BodyPick::Edge(group) => {
                     if let Some(edge) = Self::edge_ref_from_mesh(body_id, mesh, *group) {
-                        let vector = [
-                            edge.p1[0] - edge.p0[0],
-                            edge.p1[1] - edge.p0[1],
-                            edge.p1[2] - edge.p0[2],
-                        ];
-                        edges.push(vector);
-                        let chord =
-                            (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2])
-                                .sqrt();
-                        match edge.curve {
-                            Some(EdgeCurveHint::Circle {
-                                radius,
-                                start,
-                                end,
-                                closed,
-                                ..
-                            }) => {
-                                let sweep = if closed {
-                                    std::f32::consts::TAU
-                                } else {
-                                    (end - start).abs()
-                                };
-                                entities.push(format!(
-                                    "Edge {group}: radius {radius:.6} mm, diameter {:.6} mm, arc length {:.6} mm",
-                                    radius * 2.0,
-                                    radius * sweep
-                                ));
-                            }
-                            _ => entities.push(format!("Edge {group}: length {chord:.6} mm")),
+                        let measured = self.document.inspect_edge(body_id, &edge)?;
+                        if let Some(EdgeCurveHint::Circle { radius, .. }) = edge.curve.as_ref() {
+                            entities.push(format!(
+                                "Edge {group}: {} curve, radius {radius:.6} mm, diameter {:.6} mm, length {:.6} mm",
+                                measured.curve_kind,
+                                radius * 2.0,
+                                measured.length_mm
+                            ));
+                        } else {
+                            entities.push(format!(
+                                "Edge {group}: {} length {:.6} mm",
+                                measured.curve_kind, measured.length_mm
+                            ));
                         }
+                        edges.push((body_id.clone(), edge));
                     }
                 }
                 BodyPick::Face(face_id) => {
@@ -449,18 +434,20 @@ impl ZeroCadApp {
             entities.push(format!("Point distance: {distance:.6} mm"));
         }
         if edges.len() == 2 {
-            let length = |vector: [f32; 3]| {
-                (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt()
-            };
-            let denominator = length(edges[0]) * length(edges[1]);
-            if denominator > 1.0e-8 {
-                let cosine = ((edges[0][0] * edges[1][0]
-                    + edges[0][1] * edges[1][1]
-                    + edges[0][2] * edges[1][2])
-                    / denominator)
-                    .clamp(-1.0, 1.0);
-                entities.push(format!("Edge angle: {:.6}°", cosine.acos().to_degrees()));
-            }
+            let pair = self.document.inspect_edge_pair(
+                &edges[0].0,
+                &edges[0].1,
+                &edges[1].0,
+                &edges[1].1,
+            )?;
+            entities.push(format!(
+                "Edge minimum distance (sampled/refined approximation): {:.6} mm",
+                pair.minimum_distance_mm
+            ));
+            entities.push(format!(
+                "Edge tangent angle at approximate closest points: {:.6}°",
+                pair.tangent_angle_deg
+            ));
         }
         Ok((bodies, entities))
     }

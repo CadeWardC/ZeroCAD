@@ -1,9 +1,15 @@
 use crate::*;
 
 impl ZeroCadApp {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::new_with_settings(settings::AppSettings::load())
+    }
+
+    pub(crate) fn new_with_settings(prefs: settings::AppSettings) -> Self {
         let document = Document::new();
-        let prefs = settings::AppSettings::load();
+        let recovery = recovery::RecoveryManager::new();
+        let recovery_available = recovery.has_recovery();
 
         Self {
             pending_visual: None,
@@ -24,15 +30,21 @@ impl ZeroCadApp {
             frame_preview_plan: None,
             evaluator: evaluation_worker::ModelEvaluator::new(),
             document_worker: document_worker::DocumentWorker::new(),
+            recovery,
             pending_save: None,
             last_slow_frame_log: None,
             export_completions: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             eval_generation: 0,
+            document_revision: 0,
             eval_pending: false,
             eval_started: None,
             egui_ctx: None,
             error_msg: None,
-            status_msg: "Welcome to ZeroCAD. Ready for modeling.".to_string(),
+            status_msg: if recovery_available {
+                "A crash-safe autosave is available from File → Recover Autosave.".to_string()
+            } else {
+                "Welcome to ZeroCAD. Ready for modeling.".to_string()
+            },
             unresolved_features: std::collections::HashMap::new(),
             active_sketch_face_ref: None,
             active_sketch_datum_ref: None,
@@ -137,6 +149,7 @@ impl ZeroCadApp {
             id_counter: 1,
             current_unit: prefs.unit,
             show_preferences: false,
+            show_about: false,
             parameters_dialog: None,
             settings_tab: SettingsTab::General,
             keymap: Keymap::load(),

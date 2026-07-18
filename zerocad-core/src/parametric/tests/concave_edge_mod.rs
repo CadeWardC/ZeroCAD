@@ -101,15 +101,21 @@ fn concave_pocket_edge_fillet_applies_and_adds_wedge() {
 /// unchanged. This asserts the check accepts the real concave band.
 #[test]
 fn concave_pocket_fillet_passes_selected_blend_presence_check() {
-    use openrcad::algo::{boolean, fillet_edges, BooleanOp};
+    use openrcad::algo::{boolean_operation, fillet_edges, BooleanOp};
     use openrcad::foundation::Pnt;
-    use openrcad::primitives::make_box;
+    use openrcad::primitives::make_box_operation;
     use openrcad::topo::Edge;
 
     // 20×20×10 block with a 10×10 pocket sunk 6 deep from the top (floor z=4).
-    let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
-    let tool = make_box(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 7.0);
-    let body = boolean(&block, &tool, BooleanOp::Cut);
+    let block = make_box_operation(&Pnt::origin(), 20.0, 20.0, 10.0)
+        .expect("block fixture should build")
+        .value;
+    let tool = make_box_operation(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 7.0)
+        .expect("pocket tool should build")
+        .value;
+    let body = boolean_operation(&block, &tool, BooleanOp::Cut)
+        .expect("pocket cut should succeed")
+        .value;
     assert!(body.is_watertight(), "pocket fixture must be watertight");
 
     // Concave fillet of the pocket's inner vertical edge at (5,5), z 4..10.

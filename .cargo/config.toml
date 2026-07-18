@@ -1,2 +1,14 @@
+[build]
+# Geometry builds are memory- and CPU-heavy. Keep local builds responsive and
+# avoid spawning one compiler per logical CPU during full workspace gates.
+jobs = 2
+
+[env]
+# Rust's test harness otherwise defaults to the machine's logical CPU count.
+# Rayon is capped too for any geometry code that performs internal parallel work.
+RUST_TEST_THREADS = "2"
+RAYON_NUM_THREADS = "2"
+
 [alias]
 dev = "run -p zerocad-gui"
+test-safe = "test --workspace --jobs 2 -- --test-threads=2"

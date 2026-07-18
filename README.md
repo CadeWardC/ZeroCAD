@@ -13,7 +13,9 @@ engine.
 The authoritative delivery roadmap is
 [`docs/part-design-master-plan.md`](docs/part-design-master-plan.md). It records
 completed phase gates, current work, deferred scope, and the acceptance criteria
-for Part Design 1.0.
+for Part Design 1.0. Phase 7 implementation and its still-open external release
+evidence are recorded in
+[`docs/phase7-completion.md`](docs/phase7-completion.md).
 
 ---
 
@@ -79,6 +81,26 @@ mesh tools.
 ```
 cargo run --release      # release strongly recommended — the geometry kernel is CPU-heavy
 cargo test --workspace
+```
+
+Repository defaults cap compilation and test execution at two concurrent jobs
+(`.cargo/config.toml`), including commands launched from the nested `OpenRCAD/`
+workspace. `cargo test-safe` is the explicit equivalent for the ZeroCAD
+workspace. A developer may override the limits deliberately with `--jobs` and
+`--test-threads`, but full local gates should keep the safe defaults.
+
+Public-alpha builds keep a local crash-safe autosave. **File → Recover Autosave**
+restores it, **File → Export Bug Report…** creates a fully offline ZIP for the
+user to review and share, and **File → About ZeroCAD** displays the exact version,
+git build, platform, and renderer. See the
+[`public alpha guide`](docs/public-alpha-guide.md).
+
+Part Design 1.0 release evidence is deliberately separate from ordinary tests.
+After collecting signed-package, alpha, and reference-hardware measurements,
+validate them with:
+
+```text
+cargo run --release -p zerocad-core --example phase7_release_gate -- target/phase7-release-evidence.json
 ```
 
 ## Keyboard shortcuts
@@ -532,6 +554,9 @@ overlays. Geometry uploads are per-body and content-fingerprinted; unchanged
 scenes reuse their rendered texture. Face hover uses a three-buffer asynchronous
 GPU readback ring, so pointer motion never waits for `device.poll(Wait)`. The CPU
 projector remains the automatic fallback when wgpu is unavailable or disabled.
+Arbitrary section planes are passed to the GPU as world-space clip planes, and
+capped sections use a GPU mesh built from the same contour/triangulation service
+as the CPU fallback so the two viewport paths preserve identical holes.
 
 ---
 

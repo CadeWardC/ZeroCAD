@@ -822,10 +822,19 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
         let curve_3d = if let Some(ref c) = e_data.curve {
             writer.write_curve_ranged(c, Some((e_data.first, e_data.last)))
         } else {
-            // Degenerate edge: write a dummy line at start point
-            let p = brep.vertices[e_data.start].point;
-            let loc_id = writer.write_point(p);
-            let vec_id = writer.write_vector(Dir::new(1.0, 0.0, 0.0), 0.0);
+            // A curve-less topological edge is not necessarily geometrically
+            // collapsed: apex primitives intentionally store their straight
+            // seams by endpoints. Emit that exact chord so a strict reader can
+            // project the authoritative pcurve back to the same 3D boundary.
+            let start = brep.vertices[e_data.start].point;
+            let end = brep.vertices[e_data.end].point;
+            let chord = end - start;
+            let magnitude = chord.magnitude();
+            let direction = chord
+                .normalized()
+                .unwrap_or_else(|| Dir::new(1.0, 0.0, 0.0));
+            let loc_id = writer.write_point(start);
+            let vec_id = writer.write_vector(direction, magnitude);
             let line_id = writer.alloc_id();
             writer.write_line(line_id, format!("LINE('', #{}, #{})", loc_id, vec_id));
             line_id

@@ -1717,10 +1717,11 @@ impl ZeroCadApp {
                         .collect()
                 })
                 .collect();
-            if self
-                .section_view
-                .as_ref()
-                .is_some_and(|section| section.capped)
+            if !gpu_active
+                && self
+                    .section_view
+                    .as_ref()
+                    .is_some_and(|section| section.capped)
             {
                 fill_nested_loops(
                     &painter,

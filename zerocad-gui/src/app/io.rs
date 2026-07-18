@@ -4,7 +4,7 @@ use crate::*;
 /// visibility set has to travel with the graph — an extrude auto-hides its
 /// sketch, so undoing the extrude must also reveal the sketch again.
 impl ZeroCadApp {
-    fn snapshot(&self) -> UndoSnapshot {
+    pub(crate) fn current_document_snapshot(&self) -> Document {
         let mut document = self.document.clone();
         document.state.units = self.current_unit;
         document.state.created_unix = self.doc_created_unix;
@@ -12,7 +12,13 @@ impl ZeroCadApp {
         for hidden in &self.hidden_nodes {
             document.set_visible(hidden.clone(), false);
         }
-        UndoSnapshot { document }
+        document
+    }
+
+    fn snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
+            document: self.current_document_snapshot(),
+        }
     }
 
     /// Restore a snapshot: swap in the graph (rebuilding its skipped id→index
@@ -144,6 +150,7 @@ impl ZeroCadApp {
             profile: state.save_format.profile(self.hydrated_cache_mb),
             started: std::time::Instant::now(),
             dispatched: false,
+            revision: None,
         });
         self.status_msg = if self.eval_pending {
             "Save queued — waiting for the current model update…".to_string()
@@ -182,10 +189,11 @@ impl ZeroCadApp {
                 cache: self.document.evaluation_cache_snapshot(),
             });
             save.dispatched = true;
+            save.revision = Some(self.document_revision);
             self.status_msg = "Saving design…".to_string();
         }
         if let Some(done) = self.document_worker.try_recv() {
-            self.pending_save = None;
+            let saved_revision = self.pending_save.take().and_then(|save| save.revision);
             match done.result {
                 Ok(()) => {
                     let how = if matches!(done.profile, zerocad_core::SaveProfile::Compact) {
@@ -195,6 +203,10 @@ impl ZeroCadApp {
                     };
                     self.status_msg = format!("Design saved to {}{how}", done.path.display());
                     self.recent_files.record(&done.path);
+                    if saved_revision == Some(self.document_revision) {
+                        let snapshot = self.current_document_snapshot();
+                        self.recovery.mark_saved(&snapshot);
+                    }
                     self.defer_onboarding_texture_eviction(&done.path);
                 }
                 Err(error) => self.status_msg = format!("Save failed: {error}"),
@@ -210,6 +222,31 @@ impl ZeroCadApp {
         if let Some(done) = completions.into_iter().last() {
             self.status_msg = done.message.clone();
             self.error_msg = done.error.then_some(done.message);
+        }
+    }
+
+    pub(crate) fn recover_latest_autosave(&mut self) {
+        match self.recovery.load_latest() {
+            Ok(document) => {
+                self.push_undo();
+                self.current_unit = document.state.units;
+                self.doc_created_unix = document.state.created_unix;
+                self.hidden_nodes = document.hidden_entities();
+                self.document = document;
+                self.document.rebuild_node_map();
+                self.selected_node_id = None;
+                self.selected_faces.clear();
+                self.selected_edges.clear();
+                self.selected_body.clear();
+                self.reevaluate_geometry();
+                self.status_msg =
+                    "Recovered the latest crash-safe autosave. Save it to keep it permanently."
+                        .to_string();
+            }
+            Err(error) => {
+                self.status_msg = format!("Recovery failed: {error}");
+                self.error_msg = Some(self.status_msg.clone());
+            }
         }
     }
 
@@ -748,6 +785,8 @@ impl ZeroCadApp {
             )
         };
         self.remember_project(&path);
+        let snapshot = self.current_document_snapshot();
+        self.recovery.mark_saved(&snapshot);
     }
 
     /// Prompt for a path and write all current bodies as one binary STL mesh.
@@ -1031,5 +1070,60 @@ endsolid triangle
             .is_err());
         assert_eq!(app.document.graph.node_count(), 1, "origin only");
         assert!(app.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn phase7_repeated_undo_redo_preserves_document_semantics() {
+        const STACK_DEPTH: usize = 8;
+        let stress_iterations = std::env::var("ZEROCAD_LONG_STRESS_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(12)
+            .clamp(1, 1000);
+        let mut app = ZeroCadApp::new();
+        for index in 0..STACK_DEPTH {
+            app.push_undo();
+            app.document.add_feature(FeatureNode {
+                id: format!("phase7_undo_box_{index}"),
+                name: format!("Undo Box {index}"),
+                feature: FeatureType::Box {
+                    w: 1.0 + index as f32,
+                    h: 2.0,
+                    d: 3.0,
+                },
+            });
+        }
+        let final_count = app.document.graph.node_count();
+        app.document.validate_semantic_contracts().unwrap();
+        for _ in 0..STACK_DEPTH {
+            app.undo();
+            app.document.validate_semantic_contracts().unwrap();
+        }
+        assert_eq!(app.document.graph.node_count(), 1, "origin only after undo");
+        for _ in 0..STACK_DEPTH {
+            app.redo();
+            app.document.validate_semantic_contracts().unwrap();
+        }
+        assert_eq!(app.document.graph.node_count(), final_count);
+
+        // Exercise repeated state transitions without growing the snapshot
+        // stack with the configured iteration count. This keeps a long run's
+        // memory bounded while still validating both directions each cycle.
+        for iteration in 0..stress_iterations {
+            app.undo();
+            app.document.validate_semantic_contracts().unwrap();
+            assert_eq!(
+                app.document.graph.node_count(),
+                final_count - 1,
+                "undo cycle {iteration}"
+            );
+            app.redo();
+            app.document.validate_semantic_contracts().unwrap();
+            assert_eq!(
+                app.document.graph.node_count(),
+                final_count,
+                "redo cycle {iteration}"
+            );
+        }
     }
 }

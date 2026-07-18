@@ -28,14 +28,14 @@ petgraph = { version = "0.6", features = ["serde-1"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 log = "0.4"
-env_logger = "0.10"
+env_logger = { version = "0.10", default-features = false }
 # The GUI viewport shares wgpu with `openrcad-render` (pinned to wgpu 22), so the
 # whole egui/eframe/egui-wgpu stack is held at 0.29 — the release that targets
 # wgpu 22. Bumping either side off this pairing reintroduces the type-mismatch
 # that kept the GPU renderer out of the app.
 wgpu = "22"
 egui-wgpu = "0.29"
-eframe = { version = "0.29", features = ["wgpu"] }
+eframe = { version = "0.29", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
 openrcad = { path = "./OpenRCAD" }
 # The reusable GPU render core (device-injected `RenderCore`), consumed only by
 # the GUI. Deliberately NOT part of the `openrcad` facade — GPU deps stay out of

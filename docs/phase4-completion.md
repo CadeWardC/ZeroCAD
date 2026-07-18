@@ -25,32 +25,43 @@ deliberate v1 boundaries so they cannot be mistaken for unimplemented promises.
   section planes, and exact Common-based interference are covered by the Phase 4
   gate. Sections remain presentation-only and never mutate model topology.
 
-## Deliberate v1 limits and removal phases
+## Phase 6 removal record
 
-- The bundled standards data is a curated ISO/ANSI engineering subset rather
-  than a complete licensed standards catalog. Phase 6 expands coverage through
-  versioned data packs and provenance-reviewed fixtures without changing old
-  documents.
-- Oblique circular projection uses a deterministic exact-point polyline because
-  the sketch model has no analytic ellipse entity. Phase 6 adds an associative
-  ellipse/conic entity, then migrates these projections behind save/load
-  equivalence tests.
-- Point distances are exact and analytic circular edge measurements use stored
-  curve metadata, but general edge distances/angles still consume selectable
-  display-edge geometry. Phase 6 routes these through kernel curve extrema and
-  tangent evaluators.
-- Spline handles are editable, but geometric constraints attach to their points,
-  not native spline tangents/curvature/control polygons. Phase 6 adds native
-  spline constraint targets and solver Jacobians.
-- Arbitrary section planes are rendered correctly by the CPU clipping path. The
-  GPU viewport is intentionally disabled while a section is active. Phase 6
-  adds native GPU clip planes and cap presentation; CPU/GPU image-equivalence
-  tests are the removal gate for the fallback.
+Every scheduled Phase 4 limitation is closed:
+
+- Standards data is append-only and provenance-labelled. Pack v2 expands the
+  bundled range to ISO M3-M24 and ANSI #2-1/2 inch while pack v1 remains
+  identifiable. Features still persist their selected pack version and frozen
+  dimensions, so catalog updates cannot change an existing model.
+- `SketchEntity::Ellipse` stores an analytic ellipse center, major/minor vectors,
+  trim range, and source association. Oblique circular projections now remain
+  one exact associative ellipse through rebuild and `.zcad` save/load; faceting
+  occurs only at the legacy `SketchCurves` consumption boundary. Parabola and
+  hyperbola sketch entities are not part of this implementation.
+- General edge length is integrated from stored kernel curves. Pairwise closest
+  distance and tangent angle use a deterministic 32x32 parameter grid plus
+  bounded refinement after accepting a kernel edge within a 5% endpoint-match
+  threshold. The UI labels those pair measurements as approximations; viewport
+  tessellation quality does not affect them.
+- `SplineTangent` and `SplineCurvature` are durable native constraints with
+  solver residuals/Jacobians, GUI creation/editing, and serialization coverage.
+  The v1 curvature constraint is labelled approximate because it uses the first
+  three control/fit-point handles as a finite difference rather than exact
+  NURBS curvature.
+- The GPU shader clips arbitrary world-space planes. Capped sections are real
+  GPU mesh layers built from the same contour extraction and nested-loop
+  triangulation used by the CPU fallback. Shader image tests prove half-space
+  clipping, and geometry-equivalence tests keep cap area and plane placement
+  backend-independent.
+
+The bundled standards tables remain a redistributable engineering subset, not
+a claim to reproduce every licensed standards publication. Further reviewed
+packs can be appended without reopening Phase 4 or changing existing documents.
 
 ## Public-alpha milestone
 
-The end of Phase 4 is the first public-alpha milestone. An alpha build may be
-published only when the Phase 4 cross-cutting gate, both workspace gates, the
-frozen correctness corpus, and the relative performance comparison all pass.
-The v1 limits above must appear in alpha release notes; none may be represented
-as complete 1.0 behavior.
+Phase 4 completed the feature surface required by public alpha. Actual alpha
+distribution begins after the corrected Phase 6 runtime, persistence,
+interchange, frozen-corpus, and performance gate passes, then runs during and
+alongside Phase 7. The v1 limits above must appear in alpha release notes; none
+may be represented as complete 1.0 behavior.

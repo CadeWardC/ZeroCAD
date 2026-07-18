@@ -17,6 +17,7 @@ impl eframe::App for ZeroCadApp {
         // Swap in any finished background refine.
         self.poll_refine_eval();
         self.poll_document_worker();
+        self.recovery.tick();
         self.tick_speculative_edge_mod(ctx);
         // While the Welcome modal is up the workspace is inert, so its hotkeys
         // are suppressed (the modal reads Esc itself).
@@ -35,6 +36,7 @@ impl eframe::App for ZeroCadApp {
         self.show_save_dialog(ctx);
 
         self.draw_settings_window(ctx);
+        self.draw_about_window(ctx);
 
         self.show_parameters_dialog(ctx);
 

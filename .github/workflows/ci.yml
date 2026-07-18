@@ -28,9 +28,15 @@ jobs:
   # Geometry/parametric engine on Linux. zerocad-core has no GUI dependencies,
   # so it builds and tests cleanly without any system packages — fast coverage
   # of the kernel, STL export, and serialization on a second platform.
-  core-linux:
-    name: Core engine (Linux)
-    runs-on: ubuntu-latest
+  core-unix:
+    name: Core engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      ZEROCAD_LONG_STRESS_ITERATIONS: 96
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,9 +47,13 @@ jobs:
   # OpenRCAD is intentionally a separate workspace, so the jobs above only
   # compile it as a dependency; they do not run the kernel's own regression
   # suites. Geometry changes are not safe unless these tests run as a hard gate.
-  openrcad-linux:
-    name: OpenRCAD kernel (Linux)
-    runs-on: ubuntu-latest
+  openrcad-platforms:
+    name: OpenRCAD kernel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     defaults:
       run:
         working-directory: OpenRCAD
@@ -72,12 +82,11 @@ jobs:
         working-directory: OpenRCAD
         run: cargo fmt --all -- --check
 
-  # Clippy remains advisory while geometry-heavy code still has useful but
-  # non-blocking suggestions.
+  # Phase 7 makes static-analysis execution a hard gate. Individual legacy
+  # lints remain explicitly reviewed in source; command failure is not ignored.
   clippy:
-    name: Clippy (core, advisory)
+    name: Clippy (release gate)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -86,3 +95,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy (core)
         run: cargo clippy -p zerocad-core --all-targets
+      - name: clippy (OpenRCAD workspace)
+        working-directory: OpenRCAD
+        run: cargo clippy --workspace --all-targets

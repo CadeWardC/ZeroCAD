@@ -152,8 +152,9 @@ fn sharp_wedge_fillet_passes_selected_blend_presence_check() {
             Edge::between_points(Pnt::new(-30.0, 8.0, 0.0), Pnt::new(10.0, 0.0, 0.0)),
         ]),
     );
-    let body = openrcad::algo::prism(&tri, GeomVec::new(0.0, 0.0, 6.0))
-        .expect("sharp wedge should extrude");
+    let body = openrcad::algo::prism_operation(&tri, GeomVec::new(0.0, 0.0, 6.0))
+        .expect("sharp wedge should extrude")
+        .value;
     let edge = Edge::between_points(Pnt::new(10.0, 0.0, 0.0), Pnt::new(10.0, 0.0, 6.0));
     let filleted = fillet_edges(&body, std::slice::from_ref(&edge), 2.52)
         .expect("sharp corner fillet should succeed at the kernel");

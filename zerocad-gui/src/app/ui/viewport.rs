@@ -1123,7 +1123,6 @@ impl ZeroCadApp {
                         // or the wgpu backend is unavailable.
                         if self.gpu_render
                             && self.gpu.is_available()
-                            && self.section_view.is_none()
                         {
                             self.render_gpu_scene(rect, ctx);
                         } else {
@@ -1229,6 +1228,36 @@ pub(crate) fn pick_solver_element(
                     // Screen-space radius from a second projected sample.
                     let rim = to_screen((c2.0 + *radius, c2.1));
                     (c.distance(pos) - c.distance(rim)).abs()
+                }
+                SketchEntity::Ellipse {
+                    center,
+                    major_axis,
+                    minor_axis,
+                    start_parameter,
+                    end_parameter,
+                    closed,
+                    ..
+                } => {
+                    let center = point_pos(*center)?;
+                    let sweep = if *closed {
+                        std::f64::consts::TAU
+                    } else {
+                        end_parameter - start_parameter
+                    };
+                    let point = |parameter: f64| {
+                        let (sin, cos) = parameter.sin_cos();
+                        to_screen((
+                            center.0 + major_axis[0] * cos + minor_axis[0] * sin,
+                            center.1 + major_axis[1] * cos + minor_axis[1] * sin,
+                        ))
+                    };
+                    (0..64)
+                        .map(|index| {
+                            let a = *start_parameter + sweep * index as f64 / 64.0;
+                            let b = *start_parameter + sweep * (index + 1) as f64 / 64.0;
+                            seg_dist(point(a), point(b))
+                        })
+                        .fold(f32::INFINITY, f32::min)
                 }
                 SketchEntity::Spline {
                     points,

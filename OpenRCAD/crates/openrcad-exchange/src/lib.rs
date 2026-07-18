@@ -253,7 +253,9 @@ pub fn read_step_str(content: &str) -> io::Result<Solid> {
 mod tests {
     use super::*;
     use openrcad_foundation::{Ax2, Dir, Pnt};
-    use openrcad_primitives::{make_box_operation, make_cylinder_operation, make_sphere_operation};
+    use openrcad_primitives::{
+        make_box_operation, make_cone_operation, make_cylinder_operation, make_sphere_operation,
+    };
 
     fn assert_close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-5, "Expected {} to be close to {}", a, b);
@@ -343,6 +345,49 @@ mod tests {
     fn step_sphere_roundtrip() {
         let s = make_sphere_operation(&Pnt::origin(), 2.5).unwrap().value;
         check_roundtrip(&s, "sphere");
+    }
+
+    #[test]
+    fn step_truncated_and_apex_cones_round_trip_strictly() {
+        let axis = Ax2::new(Pnt::origin(), Dir::dz());
+        let truncated = make_cone_operation(&axis, 4.0, 1.5, 9.0).unwrap().value;
+        let apex = make_cone_operation(&axis, 4.0, 0.0, 9.0).unwrap().value;
+        check_roundtrip(&truncated, "truncated_cone");
+        check_roundtrip(&apex, "apex_cone");
+    }
+
+    #[test]
+    fn step_writer_is_byte_deterministic_for_strict_round_trip() {
+        let original = make_sphere_operation(&Pnt::new(1.0, -2.0, 3.0), 7.0)
+            .unwrap()
+            .value;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("openrcad_deterministic_{}_{nonce}", std::process::id());
+        let first_path = std::env::temp_dir().join(format!("{prefix}_first.stp"));
+        let second_path = std::env::temp_dir().join(format!("{prefix}_second.stp"));
+        let third_path = std::env::temp_dir().join(format!("{prefix}_third.stp"));
+        write_step(&original, first_path.to_str().unwrap()).unwrap();
+        let parsed = read_step_operation(first_path.to_str().unwrap())
+            .unwrap()
+            .value;
+        write_step(&parsed, second_path.to_str().unwrap()).unwrap();
+        let reparsed = read_step_operation(second_path.to_str().unwrap())
+            .unwrap()
+            .value;
+        write_step(&reparsed, third_path.to_str().unwrap()).unwrap();
+        let second = std::fs::read_to_string(&second_path).unwrap();
+        let third = std::fs::read_to_string(&third_path).unwrap();
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
+        let _ = std::fs::remove_file(third_path);
+        assert_eq!(second, third, "canonical STEP normalization must stabilize");
+        assert!(reparsed.has_complete_pcurves());
+        reparsed
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .expect("deterministic STEP round trip remains strict");
     }
 
     #[test]

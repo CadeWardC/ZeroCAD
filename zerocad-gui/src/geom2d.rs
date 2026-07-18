@@ -503,9 +503,28 @@ pub(crate) fn fill_nested_loops(
     loops: &[Vec<egui::Pos2>],
     color: egui::Color32,
 ) {
+    let triangles = triangulate_nested_loops(loops);
+    if triangles.is_empty() {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    for triangle in triangles {
+        let base = mesh.vertices.len() as u32;
+        for vertex in triangle {
+            mesh.colored_vertex(vertex, color);
+        }
+        mesh.add_triangle(base, base + 1, base + 2);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Triangulate an unordered set of coplanar loops while preserving nested
+/// holes. Both viewport backends consume this function, so CPU overlays and
+/// GPU-native section caps cannot disagree about loop nesting or diagonals.
+pub(crate) fn triangulate_nested_loops(loops: &[Vec<egui::Pos2>]) -> Vec<[egui::Pos2; 3]> {
     let loops: Vec<&Vec<egui::Pos2>> = loops.iter().filter(|loop_| loop_.len() >= 3).collect();
     if loops.is_empty() {
-        return;
+        return Vec::new();
     }
     let contains = |polygon: &[egui::Pos2], point: egui::Pos2| {
         let mut inside = false;
@@ -545,6 +564,7 @@ pub(crate) fn fill_nested_loops(
         }
         depth
     };
+    let mut triangles = Vec::new();
     for outer in 0..loops.len() {
         if depth(outer) % 2 != 0 {
             continue;
@@ -553,8 +573,14 @@ pub(crate) fn fill_nested_loops(
             .filter(|index| parents[*index] == Some(outer))
             .map(|index| loops[index].clone())
             .collect();
-        fill_polygon_with_holes(painter, loops[outer], &holes, color);
+        let polygon = if holes.is_empty() {
+            loops[outer].clone()
+        } else {
+            merge_holes(loops[outer], &holes)
+        };
+        triangles.extend(triangulate_simple(&polygon));
     }
+    triangles
 }
 
 #[cfg(test)]

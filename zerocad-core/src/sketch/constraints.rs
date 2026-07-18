@@ -108,7 +108,7 @@ pub enum SketchEntity {
         derived_from: Option<EntityId>,
     },
     /// An analytic ellipse or elliptical arc. `major_axis` and `minor_axis`
-    /// are the two world-in-sketch-plane vectors of the conic; the parameter
+    /// are the two world-in-sketch-plane vectors of the ellipse; the parameter
     /// interval evaluates `center + major*cos(t) + minor*sin(t)`. Keeping the
     /// vectors instead of a faceted outline makes projected circular edges
     /// associative and exact even when viewed obliquely.
@@ -277,6 +277,22 @@ pub enum Constraint {
         circle: EntityId,
         d: crate::sketch::Dimension,
     },
+    /// Align a line with the exact endpoint derivative of a spline.
+    SplineTangent {
+        id: EntityId,
+        spline: EntityId,
+        line: EntityId,
+        at_start: bool,
+    },
+    /// Drive an approximate endpoint-curvature radius. This v1 row uses the
+    /// first three control/fit-point handles as a finite difference and a
+    /// deterministic numerical Jacobian; it is not exact NURBS curvature.
+    SplineCurvature {
+        id: EntityId,
+        spline: EntityId,
+        at_start: bool,
+        radius: crate::sketch::Dimension,
+    },
 }
 
 impl Constraint {
@@ -300,7 +316,9 @@ impl Constraint {
             | Constraint::PointOnObject { id, .. }
             | Constraint::Collinear { id, .. }
             | Constraint::Symmetric { id, .. }
-            | Constraint::Diameter { id, .. } => *id,
+            | Constraint::Diameter { id, .. }
+            | Constraint::SplineTangent { id, .. }
+            | Constraint::SplineCurvature { id, .. } => *id,
         }
     }
 }
@@ -445,10 +463,8 @@ pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::Sket
                     let point = |parameter: f64| {
                         let (sin, cos) = parameter.sin_cos();
                         (
-                            center.0
-                                + (major_axis[0] * cos + minor_axis[0] * sin) as f32,
-                            center.1
-                                + (major_axis[1] * cos + minor_axis[1] * sin) as f32,
+                            center.0 + (major_axis[0] * cos + minor_axis[0] * sin) as f32,
+                            center.1 + (major_axis[1] * cos + minor_axis[1] * sin) as f32,
                         )
                     };
                     for index in 0..segments {
@@ -831,6 +847,16 @@ mod tests {
                     trim: Some((0.1, 0.9)),
                     derived_from: None,
                 },
+                SketchEntity::Ellipse {
+                    id: EntityId(25),
+                    center: EntityId(0),
+                    major_axis: [5.0, 0.0],
+                    minor_axis: [0.0, 2.0],
+                    start_parameter: 0.0,
+                    end_parameter: std::f64::consts::TAU,
+                    closed: true,
+                    derived_from: Some(EntityId(3)),
+                },
             ],
             constraints: vec![
                 Constraint::Coincident {
@@ -932,6 +958,18 @@ mod tests {
                     id: EntityId(24),
                     circle: EntityId(3),
                     d: Dimension::literal(8.0),
+                },
+                Constraint::SplineTangent {
+                    id: EntityId(26),
+                    spline: EntityId(15),
+                    line: EntityId(2),
+                    at_start: true,
+                },
+                Constraint::SplineCurvature {
+                    id: EntityId(27),
+                    spline: EntityId(15),
+                    at_start: false,
+                    radius: Dimension::literal(12.0),
                 },
             ],
             construction: vec![EntityId(2)],

@@ -5,7 +5,14 @@ use super::*;
 
 /// A 2×3×4 box as STEP text, produced by the kernel's own writer.
 fn box_step_data() -> String {
-    let solid = openrcad::primitives::make_box(&openrcad::foundation::Pnt::origin(), 2.0, 3.0, 4.0);
+    let solid = openrcad::primitives::make_box_operation(
+        &openrcad::foundation::Pnt::origin(),
+        2.0,
+        3.0,
+        4.0,
+    )
+    .expect("STEP fixture box should build")
+    .value;
     // Unique per call: tests run in parallel and would otherwise write/delete
     // one shared file from under each other.
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

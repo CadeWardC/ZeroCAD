@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "document_container_version": 5,
+  "captured_on": "2026-07-17",
+  "baseline_sha256": "2e0bd31b04e40facc261898efde387c80e1f74e7dc904f72ac8422db83e5ddbd",
+  "rationale": "Phase 2 intentionally replaced the v4 document representation with the canonical v5 semantic container. This bound reference applies only to save/open time and compact/hydrated byte counts; all topology, kernel, rebuild, executable, startup, and memory metrics remain enforced against phase0-baseline.json.",
+  "corpora": [
+    {
+      "name": "small_part",
+      "compact_save_ms": 3.2344,
+      "compact_open_ms": 0.5922,
+      "compact_bytes": 1112,
+      "hydrated_bytes": 142082
+    },
+    {
+      "name": "dependent_100_feature",
+      "compact_save_ms": 6.7409,
+      "compact_open_ms": 1.7285,
+      "compact_bytes": 3060,
+      "hydrated_bytes": 18778
+    },
+    {
+      "name": "dependent_500_feature",
+      "compact_save_ms": 25.3097,
+      "compact_open_ms": 9.464,
+      "compact_bytes": 10174,
+      "hydrated_bytes": 28089
+    },
+    {
+      "name": "imported_step_box",
+      "compact_save_ms": 8.3646,
+      "compact_open_ms": 0.6564,
+      "compact_bytes": 3023,
+      "hydrated_bytes": 5709
+    },
+    {
+      "name": "difficult_through_hole",
+      "compact_save_ms": 2.6411,
+      "compact_open_ms": 0.185,
+      "compact_bytes": 1127,
+      "hydrated_bytes": 183149
+    }
+  ]
+}

@@ -13,7 +13,7 @@ use zerocad_core::Unit;
 
 /// `%APPDATA%/ZeroCAD` on Windows; `$XDG_CONFIG_HOME` / `$HOME/.config` elsewhere.
 /// `None` if no home dir can be found. Mirrors `shortcuts::config_path`'s base.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))

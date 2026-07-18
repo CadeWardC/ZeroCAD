@@ -237,6 +237,9 @@ impl ZeroCadApp {
                             point_ids.insert(*start);
                             point_ids.insert(*end);
                         }
+                        zerocad_core::sketch::SketchEntity::Ellipse { center, .. } => {
+                            point_ids.insert(*center);
+                        }
                         zerocad_core::sketch::SketchEntity::Spline { points, .. } => {
                             point_ids.extend(points.iter().copied());
                         }
@@ -281,6 +284,10 @@ impl ZeroCadApp {
                                 && point_ids.contains(b)
                                 && entity_ids.contains(axis)
                         }
+                        Constraint::SplineTangent { spline, line, .. } => {
+                            entity_ids.contains(spline) && entity_ids.contains(line)
+                        }
+                        Constraint::SplineCurvature { spline, .. } => entity_ids.contains(spline),
                     }
                 });
             }

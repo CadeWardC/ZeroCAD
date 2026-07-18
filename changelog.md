@@ -6,6 +6,16 @@ All notable changes to ZeroCAD are documented here.
 
 ## [Unreleased]
 
+### Reliability and public alpha
+
+* Added revision-aware crash recovery and background compact autosaves using the
+  same synchronized atomic writer as normal project saves.
+* Added an offline bug-report ZIP containing the current editable document,
+  diagnostics, session log, last panic trace, renderer, version, and git build.
+* Added a genuine OCCT 7.8.1.1 differential oracle, seeded Phase 7 stress gates,
+  cross-platform kernel CI, and an executable Part Design 1.0 evidence validator.
+* Local compilation and tests remain capped at two concurrent jobs by default.
+
 ### 📐 Sketch & 3D Modeling
 
 * **Sketch directly on 3D faces:** You can now draw sketches directly on any flat face of a 3D model. 

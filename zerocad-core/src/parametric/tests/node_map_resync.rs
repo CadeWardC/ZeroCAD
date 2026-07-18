@@ -105,10 +105,20 @@ fn generated_body_output_dependency_resolves_to_owning_feature() {
             copy: true,
         },
     });
+    // Secondary outputs are document semantics, not an identifier convention.
+    // A producer must register them before another feature may depend on them.
+    g.semantics.body_outputs.insert(
+        body_output_id("extrude_2", 1),
+        crate::document::FeatureId::from("extrude_2"),
+    );
     g.add_dependency("extrude_2::body:2", "move_3");
 
     let owner = g.node_map["extrude_2"];
     let child = g.node_map["move_3"];
     assert!(g.graph.find_edge(owner, child).is_some());
-    assert_eq!(body_output_index("extrude_2::body:2"), 1);
+    assert_eq!(
+        g.body_producer_feature_id("extrude_2::body:2"),
+        Some("extrude_2")
+    );
+    assert_eq!(g.body_producer_feature_id("missing::body:2"), None);
 }

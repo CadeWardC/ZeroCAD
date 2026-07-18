@@ -5,7 +5,28 @@
 //! existing document never consults the live table.
 
 pub const STANDARDS_LIBRARY_ID: &str = "org.zerocad.part-design-standards";
-pub const STANDARDS_LIBRARY_VERSION: u32 = 1;
+pub const STANDARDS_LIBRARY_VERSION: u32 = 2;
+
+/// Provenance of the bundled append-only data packs. A document stores the
+/// selected version plus resolved dimensions; retaining prior pack identities
+/// makes upgrades auditable without allowing a table refresh to mutate an
+/// existing feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandardsDataPack {
+    pub version: u32,
+    pub coverage: &'static str,
+}
+
+pub const STANDARDS_DATA_PACKS: &[StandardsDataPack] = &[
+    StandardsDataPack {
+        version: 1,
+        coverage: "curated ISO/ANSI M3-M12 and #10-3/8 inch",
+    },
+    StandardsDataPack {
+        version: 2,
+        coverage: "expanded ISO M3-M24 and ANSI #2-1/2 inch",
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum StandardsFamily {
@@ -740,6 +761,247 @@ pub static HOLE_STANDARD_PRESETS: &[HoleStandardPreset] = &[
         Some(82.0),
         None
     ),
+    // Phase-6 pack v2: larger metric clearance and coarse-thread coverage.
+    hole!(Iso, "ISO 273", "M14", Clearance, Close, None, 15.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M16", Clearance, Close, None, 17.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M18", Clearance, Close, None, 19.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M20", Clearance, Close, None, 21.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M22", Clearance, Close, None, 23.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M24", Clearance, Close, None, 25.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M14", Clearance, Normal, None, 15.5, None, None, None, None),
+    hole!(Iso, "ISO 273", "M16", Clearance, Normal, None, 17.5, None, None, None, None),
+    hole!(Iso, "ISO 273", "M18", Clearance, Normal, None, 20.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M20", Clearance, Normal, None, 22.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M22", Clearance, Normal, None, 24.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M24", Clearance, Normal, None, 26.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M14", Clearance, Loose, None, 17.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M16", Clearance, Loose, None, 18.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M18", Clearance, Loose, None, 21.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M20", Clearance, Loose, None, 24.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M22", Clearance, Loose, None, 26.0, None, None, None, None),
+    hole!(Iso, "ISO 273", "M24", Clearance, Loose, None, 28.0, None, None, None, None),
+    hole!(
+        Iso,
+        "ISO 261 / tap drill",
+        "M14×2",
+        Tapped,
+        Normal,
+        Some("6H"),
+        12.0,
+        None,
+        None,
+        None,
+        Some(2.0)
+    ),
+    hole!(
+        Iso,
+        "ISO 261 / tap drill",
+        "M16×2",
+        Tapped,
+        Normal,
+        Some("6H"),
+        14.0,
+        None,
+        None,
+        None,
+        Some(2.0)
+    ),
+    hole!(
+        Iso,
+        "ISO 261 / tap drill",
+        "M18×2.5",
+        Tapped,
+        Normal,
+        Some("6H"),
+        15.5,
+        None,
+        None,
+        None,
+        Some(2.5)
+    ),
+    hole!(
+        Iso,
+        "ISO 261 / tap drill",
+        "M20×2.5",
+        Tapped,
+        Normal,
+        Some("6H"),
+        17.5,
+        None,
+        None,
+        None,
+        Some(2.5)
+    ),
+    hole!(
+        Iso,
+        "ISO 261 / tap drill",
+        "M22×2.5",
+        Tapped,
+        Normal,
+        Some("6H"),
+        19.5,
+        None,
+        None,
+        None,
+        Some(2.5)
+    ),
+    hole!(
+        Iso,
+        "ISO 261 / tap drill",
+        "M24×3",
+        Tapped,
+        Normal,
+        Some("6H"),
+        21.0,
+        None,
+        None,
+        None,
+        Some(3.0)
+    ),
+    // Small and larger unified-inch sizes omitted from the v1 curated pack.
+    hole!(
+        Ansi,
+        "ASME B18.2.8",
+        "#2",
+        Clearance,
+        Normal,
+        None,
+        inch(0.089),
+        None,
+        None,
+        None,
+        None
+    ),
+    hole!(
+        Ansi,
+        "ASME B18.2.8",
+        "#4",
+        Clearance,
+        Normal,
+        None,
+        inch(0.116),
+        None,
+        None,
+        None,
+        None
+    ),
+    hole!(
+        Ansi,
+        "ASME B18.2.8",
+        "#6",
+        Clearance,
+        Normal,
+        None,
+        inch(0.144),
+        None,
+        None,
+        None,
+        None
+    ),
+    hole!(
+        Ansi,
+        "ASME B18.2.8",
+        "#8",
+        Clearance,
+        Normal,
+        None,
+        inch(0.169),
+        None,
+        None,
+        None,
+        None
+    ),
+    hole!(
+        Ansi,
+        "ASME B18.2.8",
+        "1/2",
+        Clearance,
+        Normal,
+        None,
+        inch(0.531),
+        None,
+        None,
+        None,
+        None
+    ),
+    hole!(
+        Ansi,
+        "ASME B1.1 / tap drill",
+        "#2-56 UNC",
+        Tapped,
+        Normal,
+        Some("2B"),
+        inch(0.070),
+        None,
+        None,
+        None,
+        Some(inch(1.0 / 56.0))
+    ),
+    hole!(
+        Ansi,
+        "ASME B1.1 / tap drill",
+        "#4-40 UNC",
+        Tapped,
+        Normal,
+        Some("2B"),
+        inch(0.089),
+        None,
+        None,
+        None,
+        Some(inch(1.0 / 40.0))
+    ),
+    hole!(
+        Ansi,
+        "ASME B1.1 / tap drill",
+        "#6-32 UNC",
+        Tapped,
+        Normal,
+        Some("2B"),
+        inch(0.1065),
+        None,
+        None,
+        None,
+        Some(inch(1.0 / 32.0))
+    ),
+    hole!(
+        Ansi,
+        "ASME B1.1 / tap drill",
+        "#8-32 UNC",
+        Tapped,
+        Normal,
+        Some("2B"),
+        inch(0.136),
+        None,
+        None,
+        None,
+        Some(inch(1.0 / 32.0))
+    ),
+    hole!(
+        Ansi,
+        "ASME B1.1 / tap drill",
+        "3/8-16 UNC",
+        Tapped,
+        Normal,
+        Some("2B"),
+        inch(0.3125),
+        None,
+        None,
+        None,
+        Some(inch(1.0 / 16.0))
+    ),
+    hole!(
+        Ansi,
+        "ASME B1.1 / tap drill",
+        "1/2-13 UNC",
+        Tapped,
+        Normal,
+        Some("2B"),
+        inch(0.4219),
+        None,
+        None,
+        None,
+        Some(inch(1.0 / 13.0))
+    ),
 ];
 
 pub fn hole_presets(
@@ -845,6 +1107,36 @@ mod tests {
                 preset.application,
                 preset.fit,
             )));
+        }
+    }
+
+    #[test]
+    fn phase6_data_pack_is_append_only_and_covers_large_metric_and_inch_sizes() {
+        assert_eq!(
+            STANDARDS_DATA_PACKS
+                .iter()
+                .map(|pack| pack.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            STANDARDS_DATA_PACKS.last().unwrap().version,
+            STANDARDS_LIBRARY_VERSION
+        );
+        for (family, application, designation) in [
+            (StandardsFamily::Iso, HoleApplication::Clearance, "M24"),
+            (StandardsFamily::Iso, HoleApplication::Tapped, "M24×3"),
+            (StandardsFamily::Ansi, HoleApplication::Clearance, "#2"),
+            (StandardsFamily::Ansi, HoleApplication::Tapped, "1/2-13 UNC"),
+        ] {
+            assert!(
+                HOLE_STANDARD_PRESETS.iter().any(|preset| {
+                    preset.family == family
+                        && preset.application == application
+                        && preset.designation == designation
+                }),
+                "missing {family:?} {designation} {application:?}"
+            );
         }
     }
 }

@@ -62,6 +62,34 @@ pub(crate) fn apply_face_offset(
         );
         return;
     }
+    if let Some((body_index, component_index, cone)) =
+        selected_conical_face(target, reference, live)
+    {
+        apply_conical_face_offset(
+            node_id,
+            body_index,
+            component_index,
+            cone,
+            distance,
+            live,
+            warnings,
+        );
+        return;
+    }
+    if let Some((body_index, component_index, sphere)) =
+        selected_spherical_face(target, reference, live)
+    {
+        apply_spherical_face_offset(
+            node_id,
+            body_index,
+            component_index,
+            sphere,
+            distance,
+            live,
+            warnings,
+        );
+        return;
+    }
     let Some((body_index, component_index, face, normal)) =
         resolve_planar_edit_face(target, reference, live, node_id, "Press/Pull", warnings)
     else {
@@ -164,8 +192,11 @@ pub(crate) fn apply_face_move(
     let distance = translation.dot(normal);
     let tangential = translation.sub(normal.mul(distance));
     if tangential.length() > 1.0e-4 {
+        if try_move_parallelepiped_face(node_id, target, reference, translation, live, warnings) {
+            return;
+        }
         warnings.push(format!(
-            "Move face '{node_id}': Phase 5 supports planar translation along the face normal; tangential moves are not approximated."
+            "Move face '{node_id}': tangential neighborhood surgery is supported for planar six-face blocks; this face is not in that exact set."
         ));
         return;
     }
@@ -187,15 +218,63 @@ pub(crate) fn apply_face_thicken(
         ));
         return;
     }
-    if let Some((_, _, cylinder)) = selected_cylindrical_face(target, reference, live) {
-        apply_cylindrical_face_thicken(node_id, cylinder, thickness, reverse, live, warnings);
+    if let Some((body_index, component_index, cylinder)) =
+        selected_cylindrical_face(target, reference, live)
+    {
+        let source = live[body_index].clone();
+        apply_cylindrical_face_thicken(
+            node_id,
+            body_index,
+            component_index,
+            source,
+            cylinder,
+            thickness,
+            reverse,
+            live,
+            warnings,
+        );
         return;
     }
-    let Some((_, _, face, mut normal)) =
+    if let Some((body_index, component_index, cone)) =
+        selected_conical_face(target, reference, live)
+    {
+        let source = live[body_index].clone();
+        apply_conical_face_thicken(
+            node_id,
+            body_index,
+            component_index,
+            source,
+            cone,
+            thickness,
+            reverse,
+            live,
+            warnings,
+        );
+        return;
+    }
+    if let Some((body_index, component_index, sphere)) =
+        selected_spherical_face(target, reference, live)
+    {
+        let source = live[body_index].clone();
+        apply_spherical_face_thicken(
+            node_id,
+            body_index,
+            component_index,
+            source,
+            sphere,
+            thickness,
+            reverse,
+            live,
+            warnings,
+        );
+        return;
+    }
+    let Some((body_index, component_index, face, mut normal)) =
         resolve_planar_edit_face(target, reference, live, node_id, "Thicken face", warnings)
     else {
         return;
     };
+    let source = live[body_index].clone();
     if reverse {
         normal = normal.map(|component| -component);
     }
@@ -220,25 +299,15 @@ pub(crate) fn apply_face_thicken(
             return;
         }
     };
-    let mut mesh = match MockMesh::try_from_solid(&solid) {
-        Ok(mesh) => mesh,
-        Err(reason) => {
-            warnings.push(format!(
-                "Thicken face '{node_id}': valid result could not be displayed ({reason})."
-            ));
-            return;
-        }
-    };
-    stamp_generated_face_refs(&mut mesh, node_id, "thicken");
-    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
-    apply_new(
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        vec![solid],
+        None,
         live,
-        LiveBody {
-            id: node_id.to_string(),
-            parts: vec![solid],
-            pristine: Some(std::sync::Arc::new(mesh)),
-            sketch_source: None,
-        },
+        warnings,
     );
 }
 
@@ -262,6 +331,50 @@ fn selected_cylindrical_face(
     }
     let cylinder = crate::mock_kernel::cylinder_face_near(part, resolved.face.centroid)?;
     Some((body_index, resolved.component_index, cylinder))
+}
+
+fn selected_conical_face(
+    target: &str,
+    reference: &FaceRef,
+    live: &[LiveBody],
+) -> Option<(usize, usize, crate::mock_kernel::ConeFaceInfo)> {
+    let body_index = live.iter().position(|body| body.id == target)?;
+    let body = &live[body_index];
+    let resolved = resolve_face_on_body(body, reference)?;
+    let part = body.parts.get(resolved.component_index)?;
+    if !crate::mock_kernel::kernel_faces_matching(
+        part,
+        resolved.face.centroid,
+        resolved.face.normal,
+    )
+    .is_empty()
+    {
+        return None;
+    }
+    crate::mock_kernel::cone_face_near(part, resolved.face.centroid)
+        .map(|info| (body_index, resolved.component_index, info))
+}
+
+fn selected_spherical_face(
+    target: &str,
+    reference: &FaceRef,
+    live: &[LiveBody],
+) -> Option<(usize, usize, crate::mock_kernel::SphereFaceInfo)> {
+    let body_index = live.iter().position(|body| body.id == target)?;
+    let body = &live[body_index];
+    let resolved = resolve_face_on_body(body, reference)?;
+    let part = body.parts.get(resolved.component_index)?;
+    if !crate::mock_kernel::kernel_faces_matching(
+        part,
+        resolved.face.centroid,
+        resolved.face.normal,
+    )
+    .is_empty()
+    {
+        return None;
+    }
+    crate::mock_kernel::sphere_face_near(part, resolved.face.centroid)
+        .map(|info| (body_index, resolved.component_index, info))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -383,8 +496,12 @@ fn apply_cylindrical_face_offset(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_cylindrical_face_thicken(
     node_id: &str,
+    body_index: usize,
+    component_index: usize,
+    source: LiveBody,
     cylinder: crate::mock_kernel::CylinderFaceInfo,
     thickness: f32,
     reverse: bool,
@@ -410,25 +527,15 @@ fn apply_cylindrical_face_thicken(
         ));
         return;
     };
-    let mut mesh = match MockMesh::try_from_solid(&solid) {
-        Ok(mesh) => mesh,
-        Err(reason) => {
-            warnings.push(format!(
-                "Thicken face '{node_id}': analytic result could not be displayed ({reason})."
-            ));
-            return;
-        }
-    };
-    stamp_generated_face_refs(&mut mesh, node_id, "thicken");
-    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
-    apply_new(
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        vec![solid],
+        None,
         live,
-        LiveBody {
-            id: node_id.to_string(),
-            parts: vec![solid],
-            pristine: Some(std::sync::Arc::new(mesh)),
-            sketch_source: None,
-        },
+        warnings,
     );
 }
 
@@ -460,6 +567,475 @@ fn cylindrical_annulus(
         std::f64::consts::TAU,
         &[],
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_conical_face_offset(
+    node_id: &str,
+    body_index: usize,
+    component_index: usize,
+    cone: crate::mock_kernel::ConeFaceInfo,
+    distance: f32,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let source = live[body_index].clone();
+    let component = &source.parts[component_index];
+    let normal_radius_delta = distance / cone.semi_angle.cos().abs().max(1.0e-4);
+    let signed_delta = if cone.internal {
+        -normal_radius_delta
+    } else {
+        normal_radius_delta
+    };
+    let first = cone.radius_at(cone.axial_min);
+    let last = cone.radius_at(cone.axial_max);
+    let new_first = first + signed_delta;
+    let new_last = last + signed_delta;
+    if new_first <= 1.0e-5 || new_last < -1.0e-5 {
+        warnings.push(format!(
+            "Press/Pull '{node_id}': conical offset collapses or crosses the apex."
+        ));
+        return;
+    }
+    let axis = Vec3::new(cone.dir[0], cone.dir[1], cone.dir[2]).normalize();
+    let origin =
+        Vec3::new(cone.origin[0], cone.origin[1], cone.origin[2]).add(axis.mul(cone.axial_min));
+    let length = cone.axial_max - cone.axial_min;
+    let plane_count = component
+        .faces()
+        .iter()
+        .filter(|face| matches!(face.surface(), Some(openrcad::geom::GeomSurface::Plane(_))))
+        .count();
+    let cone_count = component
+        .faces()
+        .iter()
+        .filter(|face| matches!(face.surface(), Some(openrcad::geom::GeomSurface::Cone(_))))
+        .count();
+    let plain_cone = plane_count >= 1 && plane_count + cone_count == component.face_count();
+    if !cone.internal && plain_cone {
+        let Some(rebuilt) = crate::mock_kernel::cone_tool_at(
+            origin,
+            axis,
+            f64::from(new_first),
+            f64::from(new_last.max(0.0)),
+            f64::from(length),
+        ) else {
+            warnings.push(format!(
+                "Press/Pull '{node_id}': could not rebuild the analytic cone."
+            ));
+            return;
+        };
+        commit_component_replacement(
+            node_id,
+            body_index,
+            component_index,
+            source,
+            vec![rebuilt],
+            None,
+            live,
+            warnings,
+        );
+        return;
+    }
+    let (inner_first, outer_first) = if signed_delta > 0.0 {
+        (first, new_first)
+    } else {
+        (new_first, first)
+    };
+    let (inner_last, outer_last) = if signed_delta > 0.0 {
+        (last, new_last)
+    } else {
+        (new_last, last)
+    };
+    let Some(tool) = conical_annulus(
+        origin,
+        axis,
+        inner_first,
+        inner_last.max(0.0),
+        outer_first,
+        outer_last.max(0.0),
+        length,
+    ) else {
+        warnings.push(format!(
+            "Press/Pull '{node_id}': could not build the analytic conical offset tool."
+        ));
+        return;
+    };
+    let adds_material = if cone.internal {
+        signed_delta < 0.0
+    } else {
+        signed_delta > 0.0
+    };
+    let (edited, histories) = if adds_material {
+        match crate::mock_kernel::union_with_history_diagnostic(component, &tool, None) {
+            Ok((solid, history)) => (vec![solid], vec![history]),
+            Err(reason) => {
+                warnings.push(format!(
+                    "Press/Pull '{node_id}': conical addition failed ({reason})."
+                ));
+                return;
+            }
+        }
+    } else {
+        match crate::mock_kernel::difference_bodies_with_history(component, &tool, None) {
+            Some(outcome) if !outcome.bodies.is_empty() => (outcome.bodies, outcome.face_history),
+            _ => {
+                warnings.push(format!("Press/Pull '{node_id}': conical removal failed."));
+                return;
+            }
+        }
+    };
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        edited,
+        Some(histories),
+        live,
+        warnings,
+    );
+}
+
+fn apply_spherical_face_offset(
+    node_id: &str,
+    body_index: usize,
+    component_index: usize,
+    sphere: crate::mock_kernel::SphereFaceInfo,
+    distance: f32,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let source = live[body_index].clone();
+    let component = &source.parts[component_index];
+    let delta = if sphere.internal { -distance } else { distance };
+    let new_radius = sphere.radius + delta;
+    if new_radius <= 1.0e-5 {
+        warnings.push(format!(
+            "Press/Pull '{node_id}': spherical offset collapses the radius."
+        ));
+        return;
+    }
+    let plain_sphere = component
+        .faces()
+        .iter()
+        .all(|face| matches!(face.surface(), Some(openrcad::geom::GeomSurface::Sphere(_))));
+    if !sphere.internal && plain_sphere {
+        let Some(rebuilt) = sphere_solid(sphere.center, new_radius) else {
+            warnings.push(format!(
+                "Press/Pull '{node_id}': could not rebuild the analytic sphere."
+            ));
+            return;
+        };
+        commit_component_replacement(
+            node_id,
+            body_index,
+            component_index,
+            source,
+            vec![rebuilt],
+            None,
+            live,
+            warnings,
+        );
+        return;
+    }
+    let (inner, outer) = if delta > 0.0 {
+        (sphere.radius, new_radius)
+    } else {
+        (new_radius, sphere.radius)
+    };
+    let Some(tool) = spherical_annulus(sphere.center, inner, outer) else {
+        warnings.push(format!(
+            "Press/Pull '{node_id}': could not build the analytic spherical offset tool."
+        ));
+        return;
+    };
+    let adds_material = if sphere.internal {
+        delta < 0.0
+    } else {
+        delta > 0.0
+    };
+    let (edited, histories) = if adds_material {
+        match crate::mock_kernel::union_with_history_diagnostic(component, &tool, None) {
+            Ok((solid, history)) => (vec![solid], vec![history]),
+            Err(reason) => {
+                warnings.push(format!(
+                    "Press/Pull '{node_id}': spherical addition failed ({reason})."
+                ));
+                return;
+            }
+        }
+    } else {
+        match crate::mock_kernel::difference_bodies_with_history(component, &tool, None) {
+            Some(outcome) if !outcome.bodies.is_empty() => (outcome.bodies, outcome.face_history),
+            _ => {
+                warnings.push(format!("Press/Pull '{node_id}': spherical removal failed."));
+                return;
+            }
+        }
+    };
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        edited,
+        Some(histories),
+        live,
+        warnings,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_conical_face_thicken(
+    node_id: &str,
+    body_index: usize,
+    component_index: usize,
+    source: LiveBody,
+    cone: crate::mock_kernel::ConeFaceInfo,
+    thickness: f32,
+    reverse: bool,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let delta = thickness / cone.semi_angle.cos().abs().max(1.0e-4);
+    let increase = (!cone.internal) ^ reverse;
+    let signed = if increase { delta } else { -delta };
+    let first = cone.radius_at(cone.axial_min);
+    let last = cone.radius_at(cone.axial_max);
+    let shifted_first = first + signed;
+    let shifted_last = last + signed;
+    if shifted_first <= 1.0e-5 || shifted_last < -1.0e-5 {
+        warnings.push(format!(
+            "Thicken face '{node_id}': thickness crosses the conical apex."
+        ));
+        return;
+    }
+    let axis = Vec3::new(cone.dir[0], cone.dir[1], cone.dir[2]).normalize();
+    let origin =
+        Vec3::new(cone.origin[0], cone.origin[1], cone.origin[2]).add(axis.mul(cone.axial_min));
+    let Some(solid) = conical_annulus(
+        origin,
+        axis,
+        first.min(shifted_first),
+        last.min(shifted_last).max(0.0),
+        first.max(shifted_first),
+        last.max(shifted_last).max(0.0),
+        cone.axial_max - cone.axial_min,
+    ) else {
+        warnings.push(format!(
+            "Thicken face '{node_id}': conical shell construction failed."
+        ));
+        return;
+    };
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        vec![solid],
+        None,
+        live,
+        warnings,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_spherical_face_thicken(
+    node_id: &str,
+    body_index: usize,
+    component_index: usize,
+    source: LiveBody,
+    sphere: crate::mock_kernel::SphereFaceInfo,
+    thickness: f32,
+    reverse: bool,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let increase = (!sphere.internal) ^ reverse;
+    let shifted = if increase {
+        sphere.radius + thickness
+    } else {
+        sphere.radius - thickness
+    };
+    if shifted <= 1.0e-5 {
+        warnings.push(format!(
+            "Thicken face '{node_id}': thickness collapses the spherical inner radius."
+        ));
+        return;
+    }
+    let Some(solid) = spherical_annulus(
+        sphere.center,
+        sphere.radius.min(shifted),
+        sphere.radius.max(shifted),
+    ) else {
+        warnings.push(format!(
+            "Thicken face '{node_id}': spherical shell construction failed."
+        ));
+        return;
+    };
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        vec![solid],
+        None,
+        live,
+        warnings,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conical_annulus(
+    origin: Vec3,
+    axis: Vec3,
+    inner_first: f32,
+    inner_last: f32,
+    outer_first: f32,
+    outer_last: f32,
+    length: f32,
+) -> Option<KernelSolid> {
+    let outer = crate::mock_kernel::cone_tool_at(
+        origin,
+        axis,
+        f64::from(outer_first),
+        f64::from(outer_last),
+        f64::from(length),
+    )?;
+    let inner = crate::mock_kernel::cone_tool_at(
+        origin,
+        axis,
+        f64::from(inner_first),
+        f64::from(inner_last),
+        f64::from(length),
+    )?;
+    nested_void_solid(outer, inner)
+}
+
+fn sphere_solid(center: [f32; 3], radius: f32) -> Option<KernelSolid> {
+    crate::mock_kernel::consume_operation(
+        "sphere primitive",
+        openrcad::primitives::make_sphere_operation(
+            &openrcad::foundation::Pnt::new(
+                f64::from(center[0]),
+                f64::from(center[1]),
+                f64::from(center[2]),
+            ),
+            f64::from(radius),
+        ),
+    )
+    .ok()
+    .map(|outcome| outcome.solid)
+}
+
+fn spherical_annulus(center: [f32; 3], inner: f32, outer: f32) -> Option<KernelSolid> {
+    let outer = sphere_solid(center, outer)?;
+    let inner = sphere_solid(center, inner)?;
+    nested_void_solid(outer, inner)
+}
+
+/// Construct a material shell from two exact, nested analytic boundaries.
+/// Boolean subtraction has no intersection curve when the bodies are strictly
+/// nested, so representing the reversed inner boundary directly is both more
+/// exact and more deterministic.
+fn nested_void_solid(outer: KernelSolid, inner: KernelSolid) -> Option<KernelSolid> {
+    let inner_shell =
+        openrcad::topo::Shell::from_faces(inner.faces().into_iter().map(|face| face.reversed()));
+    KernelSolid::from_shells([outer.shell(), inner_shell])
+}
+
+fn try_move_parallelepiped_face(
+    node_id: &str,
+    target: &str,
+    reference: &FaceRef,
+    translation: Vec3,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let Some((body_index, component_index, selected, _)) =
+        resolve_planar_edit_face(target, reference, live, node_id, "Move face", warnings)
+    else {
+        return false;
+    };
+    let source = live[body_index].clone();
+    let component = &source.parts[component_index];
+    if component.face_count() != 6
+        || component.vertex_count() != 8
+        || component
+            .faces()
+            .iter()
+            .any(|face| !matches!(face.surface(), Some(openrcad::geom::GeomSurface::Plane(_))))
+    {
+        return false;
+    }
+    let selected_plane = match selected.surface() {
+        Some(openrcad::geom::GeomSurface::Plane(plane)) => *plane,
+        _ => return false,
+    };
+    let Some(selected_anchor) = selected
+        .outer_wire()
+        .and_then(|wire| wire.edges().first().map(|edge| edge.source().point()))
+    else {
+        return false;
+    };
+    let selected_normal = openrcad::foundation::Vec::from_dir(selected_plane.normal());
+    let opposite = component
+        .faces()
+        .into_iter()
+        .filter(|face| face.id() != selected.id())
+        .filter_map(|face| match face.surface() {
+            Some(openrcad::geom::GeomSurface::Plane(plane))
+                if plane.normal().dot(&selected_plane.normal()).abs() > 1.0 - 1.0e-8 =>
+            {
+                let anchor = face
+                    .outer_wire()
+                    .and_then(|wire| wire.edges().first().map(|edge| edge.source().point()))?;
+                let separation = (selected_anchor - anchor).dot(&selected_normal).abs();
+                Some((separation, face, anchor))
+            }
+            _ => None,
+        })
+        .max_by(|(left, _, _), (right, _, _)| left.total_cmp(right));
+    let Some((separation, opposite, opposite_anchor)) = opposite else {
+        return false;
+    };
+    if separation <= 1.0e-5 {
+        return false;
+    }
+    let current = selected_anchor - opposite_anchor;
+    let sweep = openrcad::foundation::Vec::new(
+        current.x() + f64::from(translation.x),
+        current.y() + f64::from(translation.y),
+        current.z() + f64::from(translation.z),
+    );
+    let rebuilt = match crate::mock_kernel::consume_operation(
+        "tangential move face",
+        openrcad::algo::prism_operation_with_policy(
+            &opposite,
+            sweep,
+            &openrcad::foundation::TolerancePolicy::STANDARD,
+        ),
+    ) {
+        Ok(outcome) => outcome.solid,
+        Err(reason) => {
+            warnings.push(format!(
+                "Move face '{node_id}': exact tangential rebuild failed ({reason})."
+            ));
+            return true;
+        }
+    };
+    commit_component_replacement(
+        node_id,
+        body_index,
+        component_index,
+        source,
+        vec![rebuilt],
+        None,
+        live,
+        warnings,
+    );
+    true
 }
 
 pub(crate) fn apply_face_delete(
@@ -503,12 +1079,6 @@ pub(crate) fn apply_face_delete(
     };
     let axis = Vec3::new(cylinder.dir[0], cylinder.dir[1], cylinder.dir[2]).normalize();
     let axis_origin = Vec3::new(cylinder.origin[0], cylinder.origin[1], cylinder.origin[2]);
-    if !cylinder.internal {
-        warnings.push(format!(
-            "Delete face '{node_id}': deleting an external cylindrical wall would require general surface healing and is not supported."
-        ));
-        return;
-    }
     // A delete-face heal fills exactly the trimmed wall span. Overshooting here
     // would create small bosses beyond the adjacent cap faces rather than
     // merely replacing the removed volume.
@@ -522,15 +1092,25 @@ pub(crate) fn apply_face_delete(
         ));
         return;
     };
-    let (edited, histories) = match crate::mock_kernel::union_with_history_diagnostic(
-        component, &tool, None,
-    ) {
-        Ok((solid, history)) => (vec![solid], vec![history]),
-        Err(reason) => {
-            warnings.push(format!(
-                "Delete face '{node_id}': cylindrical hole healing failed ({reason}); the source was left unchanged."
-            ));
-            return;
+    let (edited, histories) = if cylinder.internal {
+        match crate::mock_kernel::union_with_history_diagnostic(component, &tool, None) {
+            Ok((solid, history)) => (vec![solid], vec![history]),
+            Err(reason) => {
+                warnings.push(format!(
+                    "Delete face '{node_id}': cylindrical hole healing failed ({reason}); the source was left unchanged."
+                ));
+                return;
+            }
+        }
+    } else {
+        match crate::mock_kernel::difference_bodies_with_history(component, &tool, None) {
+            Some(outcome) if !outcome.bodies.is_empty() => (outcome.bodies, outcome.face_history),
+            _ => {
+                warnings.push(format!(
+                    "Delete face '{node_id}': removing this external cylindrical wall would erase the complete component; the source was left unchanged."
+                ));
+                return;
+            }
         }
     };
     let component_index = resolved.component_index;
@@ -602,7 +1182,7 @@ fn resolve_planar_edit_face(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn commit_component_replacement(
+pub(crate) fn commit_component_replacement(
     node_id: &str,
     body_index: usize,
     component_index: usize,
@@ -611,19 +1191,7 @@ fn commit_component_replacement(
     histories: Option<Vec<crate::mock_kernel::BooleanFaceHistory>>,
     live: &mut Vec<LiveBody>,
     warnings: &mut Vec<String>,
-) {
-    if edited.iter().any(|solid| {
-        !solid.is_watertight()
-            || !solid.health_report().is_healthy()
-            || solid
-                .validate_strict_with_policy(&openrcad::foundation::TolerancePolicy::STANDARD)
-                .is_err()
-    }) {
-        warnings.push(format!(
-            "Direct edit '{node_id}': strict topology validation rejected the replacement; the source was left unchanged."
-        ));
-        return;
-    }
+) -> bool {
     let exact_history = source.parts.len() == 1 && component_index == 0;
     let mut parts = source.parts.clone();
     parts.remove(component_index);
@@ -654,16 +1222,73 @@ fn commit_component_replacement(
         }
         (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh))
     });
-    live.remove(body_index);
-    apply_new(
-        live,
-        LiveBody {
+    commit_body_outputs(
+        node_id,
+        body_index,
+        vec![LiveBody {
             id: node_id.to_string(),
             parts,
             pristine,
             sketch_source: None,
-        },
-    );
+        }],
+        live,
+        warnings,
+    )
+}
+
+/// Atomic replacement boundary shared by direct edits that yield one or more
+/// bodies. Every output is accepted by the same representation and
+/// tessellation gate before the source collection is mutated.
+pub(crate) fn commit_body_outputs(
+    node_id: &str,
+    body_index: usize,
+    outputs: Vec<LiveBody>,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if outputs.is_empty() || outputs.iter().any(|body| body.parts.is_empty()) {
+        warnings.push(format!(
+            "Direct edit '{node_id}': replacement produced an empty body; the source was left unchanged."
+        ));
+        return false;
+    }
+    for output in &outputs {
+        for (part_index, solid) in output.parts.iter().enumerate() {
+            if let Err(reason) = replacement_solid_commit_check(solid) {
+                warnings.push(format!(
+                    "Direct edit '{node_id}': output '{}' part {} failed the runtime commit gate ({reason}); the source was left unchanged.",
+                    output.id,
+                    part_index + 1
+                ));
+                return false;
+            }
+        }
+    }
+
+    live.remove(body_index);
+    for output in outputs {
+        apply_new(live, output);
+    }
+    true
+}
+
+fn replacement_solid_commit_check(solid: &KernelSolid) -> Result<(), String> {
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+    if !solid.is_watertight() {
+        return Err("the solid is not watertight".to_string());
+    }
+    if !solid.health_report().is_healthy() {
+        return Err("the topology health report is not clean".to_string());
+    }
+    if !solid.has_complete_pcurves() {
+        return Err("surface-backed coedges do not have complete pcurve coverage".to_string());
+    }
+    solid
+        .validate_strict_with_policy(&policy)
+        .map_err(|error| format!("strict topology validation failed: {error}"))?;
+    openrcad::mesh::tessellate_checked_with_policy(solid, 0.05, 0.25, &policy)
+        .map_err(|error| format!("checked tessellation failed: {error}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

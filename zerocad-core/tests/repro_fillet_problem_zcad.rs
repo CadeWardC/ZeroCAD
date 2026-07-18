@@ -18,7 +18,7 @@
 //! and may not be committed).
 
 use std::collections::HashSet;
-use zerocad_core::read_zcad;
+use zerocad_core::{read_document_from_slice, LoadOptions};
 
 #[test]
 fn fillet_problem_zcad_fillets_without_warning() {
@@ -27,10 +27,10 @@ fn fillet_problem_zcad_fillets_without_warning() {
         eprintln!("skipping: {path} not found");
         return;
     };
-    let loaded = read_zcad(&bytes).expect("parse .zcad");
+    let loaded = read_document_from_slice(&bytes, &LoadOptions::default()).expect("parse .zcad");
 
     let (_bodies, warnings) = loaded
-        .graph
+        .document
         .evaluate_bodies_with_warnings(&HashSet::new())
         .expect("evaluate model");
 

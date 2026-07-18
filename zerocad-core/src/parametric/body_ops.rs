@@ -146,7 +146,7 @@ pub(crate) fn apply_body_split(
         return;
     }
     let split_plane = match face {
-        Some(reference) => match resolved_split_face(live, reference) {
+        Some(reference) => match resolved_split_face(live, target, reference) {
             Ok(SplitFaceSurface::Plane(plane)) => plane,
             Ok(SplitFaceSurface::Cylinder(cylinder)) => {
                 apply_body_split_by_cylinder(
@@ -154,6 +154,17 @@ pub(crate) fn apply_body_split(
                     target_index,
                     target_body,
                     cylinder,
+                    live,
+                    warnings,
+                );
+                return;
+            }
+            Ok(SplitFaceSurface::BoundedTool(parts)) => {
+                apply_body_split_by_bounded_tool(
+                    node_id,
+                    target_index,
+                    target_body,
+                    parts,
                     live,
                     warnings,
                 );
@@ -382,9 +393,14 @@ fn plane_from_coordinate_system(cs: CoordinateSystem) -> openrcad::geom::Plane {
 enum SplitFaceSurface {
     Plane(openrcad::geom::Plane),
     Cylinder(crate::mock_kernel::CylinderFaceInfo),
+    BoundedTool(Vec<KernelSolid>),
 }
 
-fn resolved_split_face(live: &[LiveBody], reference: &FaceRef) -> Result<SplitFaceSurface, String> {
+fn resolved_split_face(
+    live: &[LiveBody],
+    target: &str,
+    reference: &FaceRef,
+) -> Result<SplitFaceSurface, String> {
     let body = if let Some(body_id) = reference
         .topology
         .as_ref()
@@ -441,11 +457,102 @@ fn resolved_split_face(live: &[LiveBody], reference: &FaceRef) -> Result<SplitFa
     if let Some(plane) = plane {
         return Ok(SplitFaceSurface::Plane(plane));
     }
-    crate::mock_kernel::cylinder_face_near(part, resolved.face.centroid)
-        .map(SplitFaceSurface::Cylinder)
-        .ok_or_else(|| {
-            "the selected face is neither planar nor a supported analytic cylinder".to_string()
-        })
+    if let Some(cylinder) = crate::mock_kernel::cylinder_face_near(part, resolved.face.centroid) {
+        return Ok(SplitFaceSurface::Cylinder(cylinder));
+    }
+    // A non-analytic face selected on a different live B-Rep body denotes that
+    // body's bounded volume as the split tool. Planes and cylinders retain the
+    // established infinite-surface split semantics above.
+    if body.id != target && !body.parts.is_empty() {
+        return Ok(SplitFaceSurface::BoundedTool(body.parts.clone()));
+    }
+    Err("the selected face is neither planar nor a supported analytic cylinder".to_string())
+}
+
+fn apply_body_split_by_bounded_tool(
+    node_id: &str,
+    target_index: usize,
+    target_body: LiveBody,
+    tools: Vec<KernelSolid>,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    for part in &target_body.parts {
+        for tool in &tools {
+            match crate::mock_kernel::common_bodies_with_history(part, tool, None) {
+                Ok(outcome) => inside.extend(outcome.bodies),
+                Err(crate::mock_kernel::CommonBodiesError::Empty) => {}
+                Err(crate::mock_kernel::CommonBodiesError::Failed(reason)) => {
+                    warnings.push(format!(
+                        "Split body '{node_id}': bounded-tool inside classification failed ({reason}); the source was left unchanged."
+                    ));
+                    return;
+                }
+            }
+        }
+        let mut remaining = vec![part.clone()];
+        for tool in &tools {
+            let mut next = Vec::new();
+            for candidate in remaining {
+                match crate::mock_kernel::difference_bodies_with_history(&candidate, tool, None) {
+                    Some(outcome) => next.extend(outcome.bodies),
+                    None => {
+                        // `None` may mean complete consumption. Confirm with a
+                        // positive common before accepting it as an empty side.
+                        if matches!(
+                            crate::mock_kernel::common_bodies_with_history(&candidate, tool, None),
+                            Err(crate::mock_kernel::CommonBodiesError::Empty)
+                        ) {
+                            next.push(candidate);
+                        }
+                    }
+                }
+            }
+            remaining = next;
+        }
+        outside.extend(remaining);
+    }
+    inside.sort_by_key(crate::mock_kernel::part_key);
+    outside.sort_by_key(crate::mock_kernel::part_key);
+    if inside.is_empty() || outside.is_empty() {
+        warnings.push(format!(
+            "Split body '{node_id}': the bounded face tool does not divide the target into two positive volumes."
+        ));
+        return;
+    }
+    let source_volume: f64 = target_body.parts.iter().filter_map(solid_volume).sum();
+    let result_volume: f64 = inside.iter().chain(&outside).filter_map(solid_volume).sum();
+    if source_volume <= 0.0
+        || (source_volume - result_volume).abs() > source_volume * 2.0e-3 + 1.0e-5
+    {
+        warnings.push(format!(
+            "Split body '{node_id}': bounded-tool split failed volume conservation; the source was left unchanged."
+        ));
+        return;
+    }
+    let positive_id = body_output_id(node_id, 1);
+    commit_body_outputs(
+        node_id,
+        target_index,
+        vec![
+            LiveBody {
+                id: node_id.to_string(),
+                parts: inside,
+                pristine: None,
+                sketch_source: None,
+            },
+            LiveBody {
+                id: positive_id,
+                parts: outside,
+                pristine: None,
+                sketch_source: None,
+            },
+        ],
+        live,
+        warnings,
+    );
 }
 
 fn apply_body_split_by_cylinder(

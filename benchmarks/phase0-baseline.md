@@ -44,11 +44,24 @@ It rebuilds the release GUI, measures startup and memory, runs the core corpus
 runner, and fails if a measured time, footprint, or file size is more than 10%
 above the committed baseline. A 0.5 ms absolute noise floor applies only to the
 short core timers; file sizes and application measurements keep the strict
-relative threshold. Use `-SkipGui` for a core-only check and
+relative threshold.
+
+Phase 2 intentionally changed the document container from the frozen v4 recipe
+to the canonical v5 semantic representation. For only the container-dependent
+save/open timers and compact/hydrated byte counts, the harness uses
+`benchmarks/phase2-v5-format-reference.json`. That reference records the format
+transition rather than forgiving it: it is cryptographically bound to the
+immutable Phase 0 JSON SHA-256, reports the original v4 delta, and rejects any
+additional regression over 10%. Feature/body/triangle counts, rebuild and
+tessellation timing, executable size, startup, and memory continue to compare
+directly with `phase0-baseline.json`.
+
+Use `-FormatEraReferencePath` to audit an alternate checked-in format reference,
+`-SkipGui` for a core-only check, and
 `-OutputPath target/phase0-current.json` to retain a fresh report. The script
-refuses to overwrite the frozen baseline; changes to that file require an
-explicit, reviewed edit with the correctness justification recorded alongside
-it. A retained report can be checked again without remeasuring by passing
+refuses to overwrite either committed reference; changes require an explicit,
+reviewed edit with the correctness justification recorded alongside them. A
+retained report can be checked again without remeasuring by passing
 `-CurrentReportPath target/phase0-current.json`.
 
 The core-only reproducible runner is:

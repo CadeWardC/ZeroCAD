@@ -118,6 +118,30 @@ pub struct CylinderFaceInfo {
     pub internal: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConeFaceInfo {
+    pub origin: [f32; 3],
+    pub dir: [f32; 3],
+    pub reference_radius: f32,
+    pub semi_angle: f32,
+    pub axial_min: f32,
+    pub axial_max: f32,
+    pub internal: bool,
+}
+
+impl ConeFaceInfo {
+    pub fn radius_at(self, axial: f32) -> f32 {
+        self.reference_radius + axial * self.semi_angle.tan()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SphereFaceInfo {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub internal: bool,
+}
+
 /// Find the cylindrical face of `solid` whose wall passes closest to `centroid`
 /// (the captured pick point) and report its axis/radius/axial-extent. The extent
 /// is measured from the tessellated vertices that lie on that cylinder, so it
@@ -193,6 +217,109 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
         axial_max: amax,
         internal,
     })
+}
+
+/// Resolve the conical face whose analytic support is closest to a captured
+/// pick point, including the exact axial trim recovered from vertices on that
+/// support surface.
+pub fn cone_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<ConeFaceInfo> {
+    let mut best: Option<(f32, ConeFaceInfo)> = None;
+    for face in solid.shell().faces() {
+        let Some(GeomSurface::Cone(cone)) = face.surface() else {
+            continue;
+        };
+        let position = cone.position();
+        let location = position.location();
+        let direction = position.direction();
+        let origin = [
+            location.x() as f32,
+            location.y() as f32,
+            location.z() as f32,
+        ];
+        let dir = [
+            direction.x() as f32,
+            direction.y() as f32,
+            direction.z() as f32,
+        ];
+        let relative = [
+            centroid[0] - origin[0],
+            centroid[1] - origin[1],
+            centroid[2] - origin[2],
+        ];
+        let axial = relative[0] * dir[0] + relative[1] * dir[1] + relative[2] * dir[2];
+        let radial = magnitude3([
+            relative[0] - dir[0] * axial,
+            relative[1] - dir[1] * axial,
+            relative[2] - dir[2] * axial,
+        ]);
+        let info = ConeFaceInfo {
+            origin,
+            dir,
+            reference_radius: cone.ref_radius() as f32,
+            semi_angle: cone.semi_angle() as f32,
+            axial_min: f32::INFINITY,
+            axial_max: f32::NEG_INFINITY,
+            internal: face.orientation() == Orientation::Reversed,
+        };
+        let error = (radial - info.radius_at(axial)).abs();
+        if best.as_ref().is_none_or(|(best, _)| error < *best) {
+            best = Some((error, info));
+        }
+    }
+    let (_, mut info) = best?;
+    let scale = info.reference_radius.abs().max(1.0);
+    let tolerance = scale * 0.05 + 0.05;
+    for vertex in solid.vertices() {
+        let point = vertex.point();
+        let relative = [
+            point.x() as f32 - info.origin[0],
+            point.y() as f32 - info.origin[1],
+            point.z() as f32 - info.origin[2],
+        ];
+        let axial =
+            relative[0] * info.dir[0] + relative[1] * info.dir[1] + relative[2] * info.dir[2];
+        let radial = magnitude3([
+            relative[0] - info.dir[0] * axial,
+            relative[1] - info.dir[1] * axial,
+            relative[2] - info.dir[2] * axial,
+        ]);
+        if (radial - info.radius_at(axial)).abs() <= tolerance {
+            info.axial_min = info.axial_min.min(axial);
+            info.axial_max = info.axial_max.max(axial);
+        }
+    }
+    (info.axial_min.is_finite() && info.axial_max - info.axial_min > 1.0e-4).then_some(info)
+}
+
+pub fn sphere_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<SphereFaceInfo> {
+    solid
+        .shell()
+        .faces()
+        .into_iter()
+        .filter_map(|face| {
+            let GeomSurface::Sphere(sphere) = face.surface()? else {
+                return None;
+            };
+            let center = sphere.center();
+            let info = SphereFaceInfo {
+                center: [center.x() as f32, center.y() as f32, center.z() as f32],
+                radius: sphere.radius() as f32,
+                internal: face.orientation() == Orientation::Reversed,
+            };
+            let error = (magnitude3([
+                centroid[0] - info.center[0],
+                centroid[1] - info.center[1],
+                centroid[2] - info.center[2],
+            ]) - info.radius)
+                .abs();
+            Some((error, info))
+        })
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map(|(_, info)| info)
+}
+
+fn magnitude3(vector: [f32; 3]) -> f32 {
+    (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt()
 }
 
 pub fn solid_has_cylindrical_face(solid: &KernelSolid) -> bool {

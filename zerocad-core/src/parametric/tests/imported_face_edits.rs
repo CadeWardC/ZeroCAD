@@ -67,6 +67,13 @@ fn top_face(graph: &ParametricGraph) -> FaceRef {
 }
 
 fn assert_strict_output(graph: &ParametricGraph, body_id: &str) {
+    let (display_bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("evaluate direct-edit result");
+    assert!(
+        display_bodies.iter().any(|(id, _)| id == body_id),
+        "missing display body {body_id}; warnings={warnings:?}"
+    );
     let bodies = graph
         .debug_kernel_solids(&std::collections::HashSet::new())
         .expect("evaluate strict body");
@@ -217,27 +224,121 @@ fn imported_planar_face_move_and_thicken_use_exact_prisms() {
 }
 
 #[test]
-fn tangential_move_fails_atomically_with_a_diagnostic() {
+fn tangential_move_rebuilds_an_imported_block_exactly() {
     let mut graph = imported_box_graph();
     let face = top_face(&graph);
     graph.add_feature(FeatureNode {
-        id: "bad_move".into(),
-        name: "Bad Move".into(),
+        id: "tangential_move".into(),
+        name: "Tangential Move".into(),
         feature: FeatureType::FaceMove {
             target: "foreign_box".into(),
             face,
             translation: [1.0, 0.0, 2.0],
         },
     });
-    graph.add_dependency("foreign_box", "bad_move");
+    graph.add_dependency("foreign_box", "tangential_move");
     let (bodies, warnings) = graph
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
-        .expect("atomic failure");
-    assert!(bodies.iter().any(|(id, _)| id == "foreign_box"));
-    assert!(!bodies.iter().any(|(id, _)| id == "bad_move"));
-    assert!(warnings
+        .expect("exact tangential move");
+    assert!(warnings.is_empty(), "warnings={warnings:?}");
+    assert!(!bodies.iter().any(|(id, _)| id == "foreign_box"));
+    let moved = bodies
         .iter()
-        .any(|warning| warning.contains("tangential")));
+        .find(|(id, _)| id == "tangential_move")
+        .expect("moved block");
+    assert!((moved.1.mass_properties().unwrap().volume - 1_200.0).abs() < 1.0);
+    assert_strict_output(&graph, "tangential_move");
+}
+
+fn imported_analytic_graph(solid: &KernelSolid, id: &str) -> ParametricGraph {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: id.into(),
+        name: format!("Foreign {id}"),
+        feature: FeatureType::Import {
+            step_data: step_text(solid, id),
+            label: format!("{id}.step"),
+        },
+    });
+    graph
+}
+
+fn middle_curved_face(graph: &ParametricGraph) -> FaceRef {
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("analytic import");
+    assert!(warnings.is_empty(), "warnings={warnings:?}");
+    captured_face(
+        bodies[0]
+            .1
+            .face_refs
+            .iter()
+            .max_by(|left, right| {
+                let radial_sq = |face: &&crate::mock_kernel::MeshFaceRef| {
+                    face.centroid[0] * face.centroid[0] + face.centroid[1] * face.centroid[1]
+                };
+                radial_sq(left).total_cmp(&radial_sq(right))
+            })
+            .expect("curved face"),
+    )
+}
+
+#[test]
+fn conical_and_spherical_faces_offset_and_thicken_exactly() {
+    use openrcad::foundation::{Ax2, Dir, Pnt};
+    let cone = openrcad::primitives::make_cone_operation(
+        &Ax2::new(Pnt::origin(), Dir::dz()),
+        4.0,
+        2.0,
+        10.0,
+    )
+    .expect("cone")
+    .value;
+    let mut offset_cone = imported_analytic_graph(&cone, "foreign_cone");
+    let face = middle_curved_face(&offset_cone);
+    let imported_cone = offset_cone
+        .debug_kernel_solids(&std::collections::HashSet::new())
+        .expect("evaluate imported cone");
+    assert!(
+        crate::mock_kernel::cone_face_near(&imported_cone[0].1[0], face.centroid).is_some(),
+        "imported cone must preserve its analytic support"
+    );
+    offset_cone.add_feature(FeatureNode {
+        id: "offset_cone".into(),
+        name: "Offset cone".into(),
+        feature: FeatureType::FaceOffset {
+            target: "foreign_cone".into(),
+            face,
+            distance: 0.5,
+            distance_expr: None,
+        },
+    });
+    offset_cone.add_dependency("foreign_cone", "offset_cone");
+    assert_strict_output(&offset_cone, "offset_cone");
+
+    let sphere = openrcad::primitives::make_sphere_operation(&Pnt::origin(), 4.0)
+        .expect("sphere")
+        .value;
+    let mut thick_sphere = imported_analytic_graph(&sphere, "foreign_sphere");
+    let face = middle_curved_face(&thick_sphere);
+    thick_sphere.add_feature(FeatureNode {
+        id: "thicken_sphere".into(),
+        name: "Thicken sphere".into(),
+        feature: FeatureType::FaceThicken {
+            target: "foreign_sphere".into(),
+            face,
+            thickness: 0.5,
+            thickness_expr: None,
+            reverse: false,
+        },
+    });
+    thick_sphere.add_dependency("foreign_sphere", "thicken_sphere");
+    assert_strict_output(&thick_sphere, "thicken_sphere");
+    let measured = thick_sphere
+        .inspect_body("thicken_sphere")
+        .expect("spherical thicken");
+    let expected = 4.0 / 3.0 * std::f64::consts::PI * (4.5_f64.powi(3) - 4.0_f64.powi(3));
+    assert!((measured.volume_mm3.unwrap() - expected).abs() < 2.0);
 }
 
 fn imported_bored_box_graph() -> ParametricGraph {
@@ -318,6 +419,55 @@ fn delete_internal_cylindrical_face_heals_an_imported_hole() {
         .volume;
     assert!((volume - 1_000.0).abs() < 1.0, "volume={volume}");
     assert_strict_output(&graph, "delete_hole");
+}
+
+#[test]
+fn delete_external_cylindrical_boss_restores_the_supporting_body() {
+    use openrcad::foundation::{Ax2, Dir, Pnt};
+    let block = openrcad::primitives::make_box_operation(&Pnt::origin(), 10.0, 10.0, 10.0)
+        .expect("boss block")
+        .value;
+    let boss = openrcad::primitives::make_cylinder_operation(
+        &Ax2::new(Pnt::new(5.0, 5.0, 10.0), Dir::dz()),
+        2.0,
+        4.0,
+    )
+    .expect("boss")
+    .value;
+    let fused = openrcad::algo::boolean_operation(&block, &boss, openrcad::algo::BooleanOp::Fuse)
+        .expect("fused boss")
+        .value;
+    let mut graph = imported_analytic_graph(&fused, "foreign_boss");
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("import boss");
+    assert!(warnings.is_empty(), "warnings={warnings:?}");
+    let expected = [5.0_f32, 5.0, 12.0];
+    let wall = bodies[0]
+        .1
+        .face_refs
+        .iter()
+        .min_by(|left, right| {
+            let distance = |face: &crate::mock_kernel::MeshFaceRef| {
+                (0..3)
+                    .map(|axis| (face.centroid[axis] - expected[axis]).powi(2))
+                    .sum::<f32>()
+            };
+            distance(left).total_cmp(&distance(right))
+        })
+        .expect("external cylindrical wall");
+    graph.add_feature(FeatureNode {
+        id: "delete_boss".into(),
+        name: "Delete boss".into(),
+        feature: FeatureType::FaceDelete {
+            target: "foreign_boss".into(),
+            face: captured_face(wall),
+        },
+    });
+    graph.add_dependency("foreign_boss", "delete_boss");
+    let measured = graph.inspect_body("delete_boss").expect("healed boss");
+    assert!((measured.volume_mm3.expect("healed volume") - 1_000.0).abs() < 1.0);
+    assert_strict_output(&graph, "delete_boss");
 }
 
 fn imported_cylinder_graph() -> ParametricGraph {
@@ -492,6 +642,88 @@ fn cylindrical_reference_face_splits_a_body_into_inside_and_outside() {
     assert!((inside + outside - 1_000.0).abs() < 1.0);
     assert!((inside - std::f64::consts::PI * 90.0).abs() < 1.0);
     assert_strict_output(&graph, "curved_split");
+    assert_strict_output(&graph, &outside_id);
+}
+
+#[test]
+fn bounded_conical_reference_splits_with_volume_conservation() {
+    let cone = openrcad::primitives::make_cone_operation(
+        &openrcad::foundation::Ax2::new(
+            openrcad::foundation::Pnt::new(5.0, 5.0, -2.0),
+            openrcad::foundation::Dir::dz(),
+        ),
+        4.0,
+        1.0,
+        14.0,
+    )
+    .expect("cone split tool")
+    .value;
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "bounded_target".into(),
+        name: "Bounded split target".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "bounded_tool".into(),
+        name: "Bounded conical tool".into(),
+        feature: FeatureType::Import {
+            step_data: step_text(&cone, "bounded-cone"),
+            label: "bounded-cone.step".into(),
+        },
+    });
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("bounded split references");
+    assert!(warnings.is_empty(), "warnings={warnings:?}");
+    let tool = bodies
+        .iter()
+        .find(|(id, _)| id == "bounded_tool")
+        .expect("bounded tool body");
+    let reference = captured_face(
+        tool.1
+            .face_refs
+            .iter()
+            .max_by(|left, right| {
+                let radial_sq = |face: &&crate::mock_kernel::MeshFaceRef| {
+                    (face.centroid[0] - 5.0).powi(2) + (face.centroid[1] - 5.0).powi(2)
+                };
+                radial_sq(left).total_cmp(&radial_sq(right))
+            })
+            .expect("conical reference face"),
+    );
+    graph.add_feature(FeatureNode {
+        id: "bounded_split".into(),
+        name: "Bounded curved split".into(),
+        feature: FeatureType::BodySplit {
+            target: "bounded_target".into(),
+            plane: PlaneBase::XY,
+            face: Some(reference),
+        },
+    });
+    graph.add_dependency("bounded_target", "bounded_split");
+    graph.add_dependency("bounded_tool", "bounded_split");
+
+    let (outputs, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("bounded curved split");
+    assert!(
+        outputs.iter().any(|(id, _)| id == "bounded_split"),
+        "warnings={warnings:?}; outputs={:?}",
+        outputs.iter().map(|(id, _)| id).collect::<Vec<_>>()
+    );
+    let inside = graph.inspect_body("bounded_split").expect("inside body");
+    let outside_id = body_output_id("bounded_split", 1);
+    let outside = graph.inspect_body(&outside_id).expect("outside body");
+    let inside_volume = inside.volume_mm3.expect("inside volume");
+    let outside_volume = outside.volume_mm3.expect("outside volume");
+    assert!(inside_volume > 1.0 && inside_volume < 999.0);
+    assert!((inside_volume + outside_volume - 1_000.0).abs() < 2.0);
+    assert_strict_output(&graph, "bounded_split");
     assert_strict_output(&graph, &outside_id);
 }
 

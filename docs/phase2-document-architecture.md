@@ -108,10 +108,11 @@ feature no longer exists and report each recovery as a diagnostic.
   resolve, invoke, validate, diagnostic/status recording, commit, and checkpoint
   caching. Feature payload destructuring occurs only after exact registry
   dispatch; there is no central `FeatureType` family match and every body
-  mutation reaches the common New/Join/Cut operation services. There is no
-  user-facing Intersect feature yet; the kernel Common service is already the
-  shared intersection operation when one is introduced. **Phase 3 closure:**
-  complete.
+  mutation reaches the shared operation and commit services. Phase 3.5 added
+  user-facing Intersect through that same Common adapter. The architecture gate
+  now exercises record validation, semantic output ownership, evaluation, and
+  canonical save/load behavior instead of searching implementation text.
+  **Phase 3 closure:** complete.
 
 
 ## Migration rules

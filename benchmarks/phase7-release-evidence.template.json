@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "artifact": {
+    "signed_package": false,
+    "stripped_executable_bytes": 0,
+    "compressed_distribution_bytes": 0,
+    "installed_footprint_bytes": 0
+  },
+  "startup": {
+    "sample_count": 0,
+    "includes_installed_first_launch": false,
+    "median_ms": 0.0,
+    "p95_ms": 0.0,
+    "warm_ms": 0.0,
+    "idle_working_set_bytes": 0
+  },
+  "interaction": {
+    "trailing_edit_ms": 0.0,
+    "full_rebuild_ms": 0.0,
+    "viewport_triangles": 0,
+    "viewport_fps": 0.0
+  },
+  "documents": {
+    "save_100_ms": 0.0,
+    "open_100_ms": 0.0,
+    "save_500_ms": 0.0,
+    "open_500_ms": 0.0,
+    "hydrated_first_display_ms": 0.0,
+    "hydrated_first_edit_warm_ratio": 0.0,
+    "streaming_memory_contract_passed": false
+  },
+  "validation": {
+    "zero_cad_workspace_passed": false,
+    "openrcad_workspace_passed": false,
+    "long_form_stress_passed": false,
+    "occt_differential_passed": false,
+    "occt_case_count": 0,
+    "frozen_phase0_passed": false,
+    "maximum_relative_regression_percent": 100.0,
+    "warning_review_complete": false
+  },
+  "alpha": {
+    "participant_sessions": 0,
+    "curated_foreign_models": 0,
+    "accepted_defects": 0,
+    "frozen_regressions": 0,
+    "unresolved_release_blockers": 1
+  }
+}

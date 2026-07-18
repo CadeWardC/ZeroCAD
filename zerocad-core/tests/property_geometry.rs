@@ -2,9 +2,9 @@
 //! preserve. Inputs deliberately stay in ordinary mechanical-part ranges: this
 //! is a required regression gate, not a catalogue of unsupported degeneracies.
 
-use openrcad::algo::{boolean_checked, BooleanOp};
+use openrcad::algo::{boolean_operation, BooleanOp};
 use openrcad::foundation::{Ax2, Dir, Pnt};
-use openrcad::primitives::{make_box, make_cylinder};
+use openrcad::primitives::{make_box_operation, make_cylinder_operation};
 use proptest::prelude::*;
 
 fn finite_solid(solid: &openrcad::topo::Solid) -> bool {
@@ -31,23 +31,29 @@ proptest! {
         height in 2.0f64..40.0,
         radius_ratio in 0.08f64..0.35,
     ) {
-        let block = make_box(&Pnt::origin(), width, depth, height);
+        let block = make_box_operation(&Pnt::origin(), width, depth, height)
+            .expect("bounded box must build")
+            .value;
         let radius = width.min(depth) * radius_ratio;
-        let drill = make_cylinder(
+        let drill = make_cylinder_operation(
             &Ax2::new(Pnt::new(width * 0.5, depth * 0.5, -1.0), Dir::dz()),
             radius,
             height + 2.0,
-        );
+        )
+        .expect("bounded drill must build")
+        .value;
 
-        let cut = boolean_checked(&block, &drill, BooleanOp::Cut)
-            .expect("a bounded central through-hole must resolve");
+        let cut = boolean_operation(&block, &drill, BooleanOp::Cut)
+            .expect("a bounded central through-hole must resolve")
+            .value;
         prop_assert!(cut.is_watertight());
         prop_assert!(cut.health_report().is_healthy());
         prop_assert!(finite_solid(&cut));
 
         // The same immutable operands must produce the same coarse topology.
-        let again = boolean_checked(&block, &drill, BooleanOp::Cut)
-            .expect("repeated deterministic cut must resolve");
+        let again = boolean_operation(&block, &drill, BooleanOp::Cut)
+            .expect("repeated deterministic cut must resolve")
+            .value;
         prop_assert_eq!(cut.vertex_count(), again.vertex_count());
         prop_assert_eq!(cut.edge_count(), again.edge_count());
         prop_assert_eq!(cut.face_count(), again.face_count());

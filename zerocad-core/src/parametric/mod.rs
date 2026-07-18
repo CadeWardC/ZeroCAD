@@ -43,7 +43,9 @@ pub(crate) use eval::*;
 #[allow(unused_imports)]
 pub(crate) use extrude::*;
 pub use extrude::{boolean_region_plan, complete_selected_circles, BooleanRegionPlan};
-pub use inspection::{BodyInspection, FaceInspection, InterferencePair};
+pub use inspection::{
+    BodyInspection, EdgeInspection, EdgePairInspection, FaceInspection, InterferencePair,
+};
 #[allow(unused_imports)]
 pub(crate) use join::*;
 pub use phase35::body_bounds_center;
@@ -51,8 +53,8 @@ pub(crate) use phase35::*;
 pub use standards::{
     hole_presets, thread_classes, thread_reference, thread_reference_with_class, HoleApplication,
     HoleFit, HoleManufacturingMetadata, HoleStandardPreset, ResolvedStandardGeometry,
-    StandardReference, StandardsFamily, HOLE_STANDARD_PRESETS, STANDARDS_LIBRARY_ID,
-    STANDARDS_LIBRARY_VERSION,
+    StandardReference, StandardsDataPack, StandardsFamily, HOLE_STANDARD_PRESETS,
+    STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
 };
 pub use thread::{
     closest_preset, default_depth_mm, ThreadPreset, ThreadStandard, METRIC_COARSE, UNIFIED_COARSE,

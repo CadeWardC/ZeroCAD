@@ -7,8 +7,8 @@ use openrcad::geom::GeomSurface;
 use std::collections::HashSet;
 use std::f32::consts::TAU;
 use zerocad_core::mock_kernel::{
-    chamfer_edge_with_hint, cylinder_face_near, cylinder_solid, threaded_replace_cylinder_wall,
-    EdgeCurveHint, KernelSolid, MockMesh, ThreadSpec,
+    chamfer_edge_with_hint, cylinder_face_near, cylinder_solid,
+    threaded_replace_cylinder_wall_with_policy, EdgeCurveHint, KernelSolid, MockMesh, ThreadSpec,
 };
 use zerocad_core::parametric::FaceRef;
 use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, ParametricGraph};
@@ -196,8 +196,15 @@ fn kernel_partial_runout_mesh_is_clean() {
         segments_per_turn: 16,
         starts: 1,
     };
-    let threaded = threaded_replace_cylinder_wall(&solid, &info, &spec, Some(10.0), false)
-        .expect("partial thread");
+    let threaded = threaded_replace_cylinder_wall_with_policy(
+        &solid,
+        &info,
+        &spec,
+        Some(10.0),
+        false,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+    )
+    .expect("partial thread");
     assert!(threaded.is_watertight());
     zerocad_core::mock_kernel::try_display_mesh_from_part(&threaded)
         .expect("partial-thread render mesh must pass manifold + winding checks");
@@ -234,8 +241,15 @@ fn kernel_chamfer_cut_through(chamfer: f32, label: &str) {
         segments_per_turn: 16,
         starts: 1,
     };
-    let threaded = threaded_replace_cylinder_wall(&chamfered, &info, &spec, None, false)
-        .expect("chamfered wall must thread, not fall back");
+    let threaded = threaded_replace_cylinder_wall_with_policy(
+        &chamfered,
+        &info,
+        &spec,
+        None,
+        false,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+    )
+    .expect("chamfered wall must thread, not fall back");
     assert!(
         threaded.is_watertight(),
         "{label}: threaded chamfered rod watertight"

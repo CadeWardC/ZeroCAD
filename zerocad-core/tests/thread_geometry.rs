@@ -105,7 +105,7 @@ fn left_handed_thread_also_builds() {
 
 #[test]
 fn threaded_cylinder_probe_timing() {
-    use zerocad_core::mock_kernel::threaded_cylinder_solid;
+    use zerocad_core::mock_kernel::threaded_cylinder_solid_with_policy;
     // Same shape as the feature-level test: r=4 h=5, pitch 1.5, depth 0.5.
     let spec = ThreadSpec {
         mean_radius: 4.0,
@@ -119,8 +119,16 @@ fn threaded_cylinder_probe_timing() {
         starts: 1,
     };
     let t0 = std::time::Instant::now();
-    let solid = threaded_cylinder_solid(Vec3::ZERO, Vec3::Y, 4.0, 0.0, 5.0, &spec)
-        .expect("threaded cylinder should build");
+    let solid = threaded_cylinder_solid_with_policy(
+        Vec3::ZERO,
+        Vec3::Y,
+        4.0,
+        0.0,
+        5.0,
+        &spec,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+    )
+    .expect("threaded cylinder should build");
     let build = t0.elapsed();
     let t1 = std::time::Instant::now();
     let mesh = try_display_mesh_from_part(&solid).expect("threaded cylinder should tessellate");

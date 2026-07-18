@@ -12,7 +12,7 @@
 
 use openrcad::algo::fillet_edges;
 use openrcad::foundation::Pnt;
-use openrcad::primitives::make_box;
+use openrcad::primitives::make_box_operation;
 use openrcad::topo::Edge;
 use std::collections::HashMap;
 use zerocad_core::MockMesh;
@@ -53,7 +53,9 @@ fn mitered_corner_render_mesh_is_manifold() {
         (10.0, 10.0, 6.0, 1.26),
         (5.0, 5.0, 5.0, 1.0),
     ] {
-        let cube = make_box(&Pnt::origin(), w, h, d);
+        let cube = make_box_operation(&Pnt::origin(), w, h, d)
+            .expect("miter fixture should build")
+            .value;
         let front_top = Edge::between_points(Pnt::new(0.0, 0.0, d), Pnt::new(w, 0.0, d));
         let right_top = Edge::between_points(Pnt::new(w, 0.0, d), Pnt::new(w, h, d));
         let s = fillet_edges(&cube, &[front_top, right_top], r)

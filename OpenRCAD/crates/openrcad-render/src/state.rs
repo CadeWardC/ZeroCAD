@@ -214,6 +214,7 @@ impl State {
             color: [0.72, 0.74, 0.78],
             viewport_px: [self.config.width as f32, self.config.height as f32],
             edge_px: 1.5,
+            clip_plane: None,
         };
         self.core.write_globals(&self.queue, &globals);
 

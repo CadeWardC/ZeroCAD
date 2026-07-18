@@ -37,6 +37,24 @@ pub struct FaceInspection {
     pub area_mm2: f64,
 }
 
+/// Exact kernel-curve measurements for a selected edge. The tangent is sampled
+/// at the edge parameter midpoint and normalized; length is integrated from the
+/// stored 3D curve, never from viewport chords.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeInspection {
+    pub body_id: String,
+    pub length_mm: f64,
+    pub midpoint: [f64; 3],
+    pub tangent: [f64; 3],
+    pub curve_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePairInspection {
+    pub minimum_distance_mm: f64,
+    pub tangent_angle_deg: f64,
+}
+
 impl ParametricGraph {
     /// Measure one evaluated body from strict, fine tessellations of its B-Rep
     /// parts. This path never reads the viewport mesh and therefore remains
@@ -140,6 +158,60 @@ impl ParametricGraph {
         })
     }
 
+    /// Measure a captured edge from the evaluated B-Rep curve. Closed circular
+    /// display groups retain an exact analytic hint because one logical rim may
+    /// consist of several physical coedges; every other B-Rep edge is resolved
+    /// against the selected endpoints and integrated directly.
+    pub fn inspect_edge(
+        &self,
+        body_id: &str,
+        reference: &EdgeRef,
+    ) -> Result<EdgeInspection, String> {
+        let hidden = std::collections::HashSet::new();
+        let (live, _) = self.build_live(&hidden, false)?;
+        let body = live
+            .iter()
+            .find(|body| body.id == body_id)
+            .ok_or_else(|| format!("body '{body_id}' does not exist"))?;
+        inspect_live_edge(body, reference)
+    }
+
+    /// Approximate minimum separation and tangent angle for two selected
+    /// kernel curves. Edge resolution accepts the nearest endpoint match within
+    /// five percent of the captured edge scale; closest parameters come from a
+    /// deterministic 32x32 grid followed by bounded refinement. The result is
+    /// independent of viewport tessellation, but is not an exact curve-extrema
+    /// solver.
+    pub fn inspect_edge_pair(
+        &self,
+        first_body: &str,
+        first: &EdgeRef,
+        second_body: &str,
+        second: &EdgeRef,
+    ) -> Result<EdgePairInspection, String> {
+        let hidden = std::collections::HashSet::new();
+        let (live, _) = self.build_live(&hidden, false)?;
+        let first_live = live
+            .iter()
+            .find(|body| body.id == first_body)
+            .ok_or_else(|| format!("body '{first_body}' does not exist"))?;
+        let second_live = live
+            .iter()
+            .find(|body| body.id == second_body)
+            .ok_or_else(|| format!("body '{second_body}' does not exist"))?;
+        let first_curve = resolved_inspection_curve(first_live, first)?;
+        let second_curve = resolved_inspection_curve(second_live, second)?;
+        let (first_parameter, second_parameter, distance) =
+            closest_curve_parameters(&first_curve, &second_curve);
+        let first_tangent = first_curve.tangent(first_parameter);
+        let second_tangent = second_curve.tangent(second_parameter);
+        let cosine = dot3(first_tangent, second_tangent).clamp(-1.0, 1.0);
+        Ok(EdgePairInspection {
+            minimum_distance_mm: distance,
+            tangent_angle_deg: cosine.acos().to_degrees(),
+        })
+    }
+
     /// Exact Common-based interference check. Contact-only pairs are omitted;
     /// every returned row has strictly more than `minimum_volume_mm3` common
     /// volume. Inputs are sorted/deduplicated for deterministic pair order.
@@ -212,6 +284,351 @@ impl ParametricGraph {
         }
         Ok(reports)
     }
+}
+
+#[derive(Clone)]
+enum InspectionCurve {
+    Kernel(openrcad::topo::Edge),
+    Circle {
+        center: [f64; 3],
+        axis: [f64; 3],
+        x_dir: [f64; 3],
+        radius: f64,
+        first: f64,
+        last: f64,
+    },
+    Segment {
+        first: [f64; 3],
+        last: [f64; 3],
+    },
+}
+
+impl InspectionCurve {
+    fn bounds(&self) -> (f64, f64) {
+        match self {
+            Self::Kernel(edge) => (edge.first(), edge.last()),
+            Self::Circle { first, last, .. } => (*first, *last),
+            Self::Segment { .. } => (0.0, 1.0),
+        }
+    }
+
+    fn point(&self, parameter: f64) -> [f64; 3] {
+        use openrcad::geom::Curve;
+        match self {
+            Self::Kernel(edge) => edge.curve().map_or_else(
+                || {
+                    let (first, last) = (edge.start().point(), edge.end().point());
+                    let span = (edge.last() - edge.first()).abs().max(f64::EPSILON);
+                    let fraction = ((parameter - edge.first()) / span).clamp(0.0, 1.0);
+                    [
+                        first.x() + (last.x() - first.x()) * fraction,
+                        first.y() + (last.y() - first.y()) * fraction,
+                        first.z() + (last.z() - first.z()) * fraction,
+                    ]
+                },
+                |curve| {
+                    let point = curve.point(parameter);
+                    [point.x(), point.y(), point.z()]
+                },
+            ),
+            Self::Circle {
+                center,
+                axis,
+                x_dir,
+                radius,
+                ..
+            } => {
+                let y_dir = cross3(*axis, *x_dir);
+                let (sin, cos) = parameter.sin_cos();
+                [
+                    center[0] + radius * (x_dir[0] * cos + y_dir[0] * sin),
+                    center[1] + radius * (x_dir[1] * cos + y_dir[1] * sin),
+                    center[2] + radius * (x_dir[2] * cos + y_dir[2] * sin),
+                ]
+            }
+            Self::Segment { first, last } => {
+                let t = parameter.clamp(0.0, 1.0);
+                [
+                    first[0] + (last[0] - first[0]) * t,
+                    first[1] + (last[1] - first[1]) * t,
+                    first[2] + (last[2] - first[2]) * t,
+                ]
+            }
+        }
+    }
+
+    fn derivative(&self, parameter: f64) -> [f64; 3] {
+        use openrcad::geom::Curve;
+        match self {
+            Self::Kernel(edge) => edge.curve().map_or_else(
+                || {
+                    let first = edge.start().point();
+                    let last = edge.end().point();
+                    [
+                        last.x() - first.x(),
+                        last.y() - first.y(),
+                        last.z() - first.z(),
+                    ]
+                },
+                |curve| {
+                    let derivative = curve.d1(parameter).1;
+                    [derivative.x(), derivative.y(), derivative.z()]
+                },
+            ),
+            Self::Circle {
+                axis,
+                x_dir,
+                radius,
+                ..
+            } => {
+                let y_dir = cross3(*axis, *x_dir);
+                let (sin, cos) = parameter.sin_cos();
+                [
+                    radius * (-x_dir[0] * sin + y_dir[0] * cos),
+                    radius * (-x_dir[1] * sin + y_dir[1] * cos),
+                    radius * (-x_dir[2] * sin + y_dir[2] * cos),
+                ]
+            }
+            Self::Segment { first, last } => {
+                [last[0] - first[0], last[1] - first[1], last[2] - first[2]]
+            }
+        }
+    }
+
+    fn tangent(&self, parameter: f64) -> [f64; 3] {
+        normalize3(self.derivative(parameter))
+    }
+
+    fn length(&self) -> f64 {
+        let (first, last) = self.bounds();
+        if let Self::Circle { radius, .. } = self {
+            return radius * (last - first).abs();
+        }
+        let speed = |parameter: f64| magnitude3(self.derivative(parameter));
+        let middle = (first + last) * 0.5;
+        let whole = simpson(first, last, speed(first), speed(middle), speed(last));
+        adaptive_simpson(
+            &speed,
+            first,
+            last,
+            speed(first),
+            speed(middle),
+            speed(last),
+            whole,
+            12,
+        )
+    }
+}
+
+fn inspect_live_edge(body: &LiveBody, reference: &EdgeRef) -> Result<EdgeInspection, String> {
+    let curve = resolved_inspection_curve(body, reference)?;
+    let (first, last) = curve.bounds();
+    let parameter = (first + last) * 0.5;
+    let curve_kind = match &curve {
+        InspectionCurve::Kernel(edge) => edge.curve().map_or("degenerate", |curve| match curve {
+            openrcad::geom::GeomCurve::Line(_) => "line",
+            openrcad::geom::GeomCurve::Circle(_) => "circle",
+            openrcad::geom::GeomCurve::Ellipse(_) => "ellipse",
+            openrcad::geom::GeomCurve::Parabola(_) => "parabola",
+            openrcad::geom::GeomCurve::Hyperbola(_) => "hyperbola",
+            openrcad::geom::GeomCurve::BSpline(_) => "b-spline",
+            openrcad::geom::GeomCurve::Helix(_) => "helix",
+        }),
+        InspectionCurve::Circle { .. } => "circle",
+        InspectionCurve::Segment { .. } => "line",
+    };
+    Ok(EdgeInspection {
+        body_id: body.id.clone(),
+        length_mm: curve.length(),
+        midpoint: curve.point(parameter),
+        tangent: curve.tangent(parameter),
+        curve_kind: curve_kind.to_string(),
+    })
+}
+
+fn resolved_inspection_curve(
+    body: &LiveBody,
+    reference: &EdgeRef,
+) -> Result<InspectionCurve, String> {
+    if let Some(crate::mock_kernel::EdgeCurveHint::Circle {
+        center,
+        axis,
+        x_dir,
+        radius,
+        start,
+        end,
+        closed,
+    }) = &reference.curve
+    {
+        return Ok(InspectionCurve::Circle {
+            center: center.map(f64::from),
+            axis: normalize3(axis.map(f64::from)),
+            x_dir: normalize3(x_dir.map(f64::from)),
+            radius: f64::from(*radius),
+            first: f64::from(*start),
+            last: if *closed {
+                f64::from(*start) + std::f64::consts::TAU
+            } else {
+                f64::from(*end)
+            },
+        });
+    }
+    let captured_first = reference.p0.map(f64::from);
+    let captured_last = reference.p1.map(f64::from);
+    let endpoint_score = |edge: &openrcad::topo::Edge| {
+        let first = edge.start().point();
+        let last = edge.end().point();
+        let first = [first.x(), first.y(), first.z()];
+        let last = [last.x(), last.y(), last.z()];
+        (distance3d(first, captured_first) + distance3d(last, captured_last))
+            .min(distance3d(first, captured_last) + distance3d(last, captured_first))
+    };
+    let exact = body
+        .parts
+        .iter()
+        .flat_map(KernelSolid::edges)
+        .min_by(|left, right| endpoint_score(left).total_cmp(&endpoint_score(right)));
+    if let Some(edge) = exact {
+        let model_scale = distance3d(captured_first, captured_last).max(1.0);
+        if endpoint_score(&edge) <= model_scale * 0.05 + 1.0e-3 {
+            return Ok(InspectionCurve::Kernel(edge));
+        }
+    }
+    if body.parts.is_empty()
+        || matches!(
+            reference.curve,
+            Some(crate::mock_kernel::EdgeCurveHint::Line)
+        )
+    {
+        return Ok(InspectionCurve::Segment {
+            first: captured_first,
+            last: captured_last,
+        });
+    }
+    Err("selected edge could not be resolved to an evaluated kernel curve".to_string())
+}
+
+fn closest_curve_parameters(first: &InspectionCurve, second: &InspectionCurve) -> (f64, f64, f64) {
+    let (first_min, first_max) = first.bounds();
+    let (second_min, second_max) = second.bounds();
+    let samples = 32;
+    let mut best = (first_min, second_min, f64::INFINITY);
+    for first_index in 0..=samples {
+        let first_parameter =
+            first_min + (first_max - first_min) * first_index as f64 / samples as f64;
+        let first_point = first.point(first_parameter);
+        for second_index in 0..=samples {
+            let second_parameter =
+                second_min + (second_max - second_min) * second_index as f64 / samples as f64;
+            let distance = distance3d(first_point, second.point(second_parameter));
+            if distance < best.2 {
+                best = (first_parameter, second_parameter, distance);
+            }
+        }
+    }
+    let mut first_span = (first_max - first_min).abs() / samples as f64;
+    let mut second_span = (second_max - second_min).abs() / samples as f64;
+    for _ in 0..18 {
+        for (first_delta, second_delta) in [
+            (-first_span, 0.0),
+            (first_span, 0.0),
+            (0.0, -second_span),
+            (0.0, second_span),
+            (-first_span, -second_span),
+            (-first_span, second_span),
+            (first_span, -second_span),
+            (first_span, second_span),
+        ] {
+            let first_parameter = (best.0 + first_delta).clamp(first_min, first_max);
+            let second_parameter = (best.1 + second_delta).clamp(second_min, second_max);
+            let distance = distance3d(first.point(first_parameter), second.point(second_parameter));
+            if distance < best.2 {
+                best = (first_parameter, second_parameter, distance);
+            }
+        }
+        first_span *= 0.5;
+        second_span *= 0.5;
+    }
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adaptive_simpson(
+    function: &impl Fn(f64) -> f64,
+    first: f64,
+    last: f64,
+    first_value: f64,
+    middle_value: f64,
+    last_value: f64,
+    whole: f64,
+    depth: u8,
+) -> f64 {
+    let middle = (first + last) * 0.5;
+    let left_middle = (first + middle) * 0.5;
+    let right_middle = (middle + last) * 0.5;
+    let left_middle_value = function(left_middle);
+    let right_middle_value = function(right_middle);
+    let left = simpson(first, middle, first_value, left_middle_value, middle_value);
+    let right = simpson(middle, last, middle_value, right_middle_value, last_value);
+    if depth == 0 || (left + right - whole).abs() <= 1.0e-9 * (1.0 + whole.abs()) {
+        return left + right + (left + right - whole) / 15.0;
+    }
+    adaptive_simpson(
+        function,
+        first,
+        middle,
+        first_value,
+        left_middle_value,
+        middle_value,
+        left,
+        depth - 1,
+    ) + adaptive_simpson(
+        function,
+        middle,
+        last,
+        middle_value,
+        right_middle_value,
+        last_value,
+        right,
+        depth - 1,
+    )
+}
+
+fn simpson(first: f64, last: f64, first_value: f64, middle_value: f64, last_value: f64) -> f64 {
+    (last - first).abs() * (first_value + 4.0 * middle_value + last_value) / 6.0
+}
+
+fn dot3(first: [f64; 3], second: [f64; 3]) -> f64 {
+    first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
+}
+
+fn cross3(first: [f64; 3], second: [f64; 3]) -> [f64; 3] {
+    [
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    ]
+}
+
+fn magnitude3(vector: [f64; 3]) -> f64 {
+    dot3(vector, vector).sqrt()
+}
+
+fn normalize3(vector: [f64; 3]) -> [f64; 3] {
+    let magnitude = magnitude3(vector);
+    if magnitude <= f64::EPSILON {
+        [0.0; 3]
+    } else {
+        vector.map(|coordinate| coordinate / magnitude)
+    }
+}
+
+fn distance3d(first: [f64; 3], second: [f64; 3]) -> f64 {
+    magnitude3([
+        first[0] - second[0],
+        first[1] - second[1],
+        first[2] - second[2],
+    ])
 }
 
 fn inspect_live_body(body: &LiveBody, density_g_cm3: f64) -> Result<BodyInspection, String> {
@@ -412,5 +829,66 @@ mod tests {
             .collect::<Vec<_>>();
         areas.sort_by(f64::total_cmp);
         assert_eq!(areas, [200.0, 200.0, 300.0, 300.0, 600.0, 600.0]);
+    }
+
+    #[test]
+    fn exact_edge_measurement_uses_kernel_curves_and_analytic_hints() {
+        let mut graph = ParametricGraph::new();
+        graph.add_feature(FeatureNode {
+            id: "box_1".to_string(),
+            name: "Box".to_string(),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 20.0,
+                d: 30.0,
+            },
+        });
+        let (bodies, warnings) = graph
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .unwrap();
+        assert!(warnings.is_empty());
+        let first = &bodies[0].1.edge_refs[0];
+        let line = EdgeRef {
+            p0: first.p0,
+            p1: first.p1,
+            n1: first.n1,
+            n2: first.n2,
+            curve: first.curve.clone(),
+            topology: first.topology.as_ref().map(|topology| TopologyEdgeRef {
+                body_id: topology.body_id.clone(),
+                topology_version: topology.topology_version,
+                edge_id: topology.edge_id.clone(),
+                adjacent_face_ids: topology.adjacent_face_ids.clone(),
+                curve_kind: topology.curve_kind.clone(),
+                adjacent_surface_kinds: topology.adjacent_surface_kinds.clone(),
+                producer_feature_id: topology.producer_feature_id.clone(),
+                source_entity_id: topology.source_entity_id.clone(),
+            }),
+        };
+        let measured = graph.inspect_edge("box_1", &line).unwrap();
+        assert_eq!(measured.curve_kind, "line");
+        assert!([10.0, 20.0, 30.0]
+            .into_iter()
+            .any(|length| (measured.length_mm - length).abs() < 1.0e-8));
+
+        let circle = EdgeRef {
+            p0: [5.0, 0.0, 0.0],
+            p1: [5.0, 0.0, 0.0],
+            n1: [0.0; 3],
+            n2: [0.0; 3],
+            curve: Some(crate::mock_kernel::EdgeCurveHint::Circle {
+                center: [0.0; 3],
+                axis: [0.0, 0.0, 1.0],
+                x_dir: [1.0, 0.0, 0.0],
+                radius: 5.0,
+                start: 0.0,
+                end: std::f32::consts::TAU,
+                closed: true,
+            }),
+            topology: None,
+        };
+        let measured_circle = graph.inspect_edge("box_1", &circle).unwrap();
+        assert_eq!(measured_circle.curve_kind, "circle");
+        assert!((measured_circle.length_mm - 10.0 * std::f64::consts::PI).abs() < 1.0e-8);
     }
 }

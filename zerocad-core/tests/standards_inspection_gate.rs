@@ -325,6 +325,33 @@ fn projected_edges_and_reference_dimensions_round_trip_with_dependencies() {
         &mut next,
     )
     .expect("project source edge");
+    zerocad_core::sketch::append_projected_edge(
+        &mut solver,
+        "source_box".to_string(),
+        zerocad_core::parametric::EdgeRef {
+            p0: [5.0, 0.0, 0.0],
+            p1: [5.0, 0.0, 0.0],
+            n1: [0.0; 3],
+            n2: [0.0; 3],
+            curve: Some(zerocad_core::mock_kernel::EdgeCurveHint::Circle {
+                center: [0.0; 3],
+                axis: [
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
+                x_dir: [0.0, 1.0, 0.0],
+                radius: 5.0,
+                start: 0.0,
+                end: std::f32::consts::TAU,
+                closed: true,
+            }),
+            topology: None,
+        },
+        CoordinateSystem::XY,
+        &mut next,
+    )
+    .expect("project oblique circle as ellipse");
     let projection = &solver.projected_edges[0];
     let dimension_id = EntityId(next);
     next += 1;
@@ -382,7 +409,11 @@ fn projected_edges_and_reference_dimensions_round_trip_with_dependencies() {
             _ => None,
         })
         .expect("persisted solver model");
-    assert_eq!(model.projected_edges.len(), 1);
+    assert_eq!(model.projected_edges.len(), 2);
     assert!(model.is_driven_dimension(dimension_id));
     assert!(model.is_projected_entity(model.projected_edges[0].entity_ids[0]));
+    assert!(model
+        .entities
+        .iter()
+        .any(|entity| matches!(entity, zerocad_core::sketch::SketchEntity::Ellipse { .. })));
 }

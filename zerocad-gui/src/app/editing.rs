@@ -891,7 +891,11 @@ impl ZeroCadApp {
         }) + self
             .body_meshes
             .iter()
-            .filter(|(body_id, _)| zerocad_core::body_output_index(body_id) > 0)
+            .filter(|(body_id, _)| {
+                self.document
+                    .body_producer_feature_id(body_id)
+                    .is_some_and(|producer| producer != body_id)
+            })
             .count();
         format!("Body_{}", n)
     }
@@ -958,9 +962,13 @@ mod snap_tests {
                 d: 10.0,
             },
         });
+        app.document.semantics.body_outputs.insert(
+            "opaque-secondary-output".to_string(),
+            zerocad_core::document::FeatureId::from("extrude_5"),
+        );
         app.body_meshes = std::sync::Arc::new(vec![
             ("extrude_5".to_string(), MockMesh::empty()),
-            ("extrude_5::body:2".to_string(), MockMesh::empty()),
+            ("opaque-secondary-output".to_string(), MockMesh::empty()),
         ]);
 
         assert_eq!(app.next_body_name(), "Body_3");

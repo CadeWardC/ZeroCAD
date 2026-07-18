@@ -468,4 +468,67 @@ mod tests {
         assert!(model.point(follower).unwrap().pos.1.abs() < 1.0e-8);
         assert_eq!(model.projected_edges[0].source.p1, [12.0, 0.0, 0.0]);
     }
+
+    #[test]
+    fn oblique_circle_projects_as_one_associative_analytic_ellipse() {
+        let edge = EdgeRef {
+            p0: [5.0, 0.0, 0.0],
+            p1: [5.0, 0.0, 0.0],
+            n1: [0.0; 3],
+            n2: [0.0; 3],
+            curve: Some(EdgeCurveHint::Circle {
+                center: [0.0, 0.0, 0.0],
+                axis: [
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
+                x_dir: [1.0, 0.0, 0.0],
+                radius: 5.0,
+                start: 0.0,
+                end: std::f32::consts::TAU,
+                closed: true,
+            }),
+            topology: None,
+        };
+        let mut model = SketchSolverModel::default();
+        let mut next = 100;
+        append_projected_edge(
+            &mut model,
+            "tilted-cylinder".to_string(),
+            edge.clone(),
+            CoordinateSystem::XY,
+            &mut next,
+        )
+        .expect("analytic ellipse projection");
+
+        assert_eq!(model.entities.len(), 1);
+        assert!(matches!(model.entities[0], SketchEntity::Ellipse { .. }));
+        assert_eq!(model.projected_edges[0].entity_ids.len(), 1);
+        assert_eq!(model.projected_edges[0].point_ids.len(), 1);
+        let old_id = model.entities[0].id();
+        rebuild_projected_edge(&mut model, 0, edge, CoordinateSystem::XY)
+            .expect("compatible ellipse refresh");
+        assert_eq!(model.entities[0].id(), old_id);
+
+        let construction = super::super::bake_construction_curves(&model);
+        assert_eq!(construction.segments.len(), 64);
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for point in construction
+            .segments
+            .iter()
+            .flat_map(|segment| [segment.a, segment.b])
+        {
+            min[0] = min[0].min(point.0);
+            min[1] = min[1].min(point.1);
+            max[0] = max[0].max(point.0);
+            max[1] = max[1].max(point.1);
+        }
+        assert!((min[0] + 5.0).abs() < 1.0e-4 && (max[0] - 5.0).abs() < 1.0e-4);
+        assert!(
+            min[1] > -4.0 && max[1] < 4.0,
+            "oblique minor axis must contract"
+        );
+    }
 }

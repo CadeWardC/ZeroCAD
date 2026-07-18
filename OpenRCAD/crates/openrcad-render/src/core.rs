@@ -52,6 +52,9 @@ pub struct SceneGlobals {
     pub viewport_px: [f32; 2],
     /// Wireframe line width in pixels (before the 1px anti-alias feather).
     pub edge_px: f32,
+    /// Optional world-space clipping half-space `(nx, ny, nz, d)`, keeping
+    /// points where `dot(n, point) + d >= 0`. `None` disables clipping.
+    pub clip_plane: Option<[f32; 4]>,
 }
 
 impl Default for SceneGlobals {
@@ -63,15 +66,16 @@ impl Default for SceneGlobals {
             color: [0.72, 0.74, 0.78],
             viewport_px: [1.0, 1.0],
             edge_px: 1.5,
+            clip_plane: None,
         }
     }
 }
 
 impl SceneGlobals {
-    /// Pack into the 28-float `struct Globals` layout `shader.wgsl` expects,
+    /// Pack into the 32-float `struct Globals` layout `shader.wgsl` expects,
     /// overriding the surface color/alpha and the face-tint switch.
-    fn pack(&self, color: [f32; 3], alpha: f32, face_tint: bool) -> [f32; 28] {
-        let mut g = [0.0f32; 28];
+    fn pack(&self, color: [f32; 3], alpha: f32, face_tint: bool) -> [f32; 32] {
+        let mut g = [0.0f32; 32];
         for (c, col) in self.view_proj.iter().enumerate() {
             for (r, &v) in col.iter().enumerate() {
                 g[c * 4 + r] = v;
@@ -89,11 +93,13 @@ impl SceneGlobals {
         g[25] = self.viewport_px[0].max(1.0);
         g[26] = self.viewport_px[1].max(1.0);
         g[27] = self.edge_px.max(0.1);
+        let clip = self.clip_plane.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        g[28..32].copy_from_slice(&clip);
         g
     }
 
     /// The base-scene packing: the globals' own color, opaque, face tint on.
-    fn to_bytes(self) -> [f32; 28] {
+    fn to_bytes(self) -> [f32; 32] {
         self.pack(self.color, 1.0, true)
     }
 }
@@ -436,7 +442,7 @@ impl RenderCore {
     ) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("openrcad-render globals"),
-            size: std::mem::size_of::<[f32; 28]>() as u64,
+            size: std::mem::size_of::<[f32; 32]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -771,7 +777,7 @@ impl RenderCore {
             .map(|(mesh, style)| {
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("openrcad-render layer globals"),
-                    size: std::mem::size_of::<[f32; 28]>() as u64,
+                    size: std::mem::size_of::<[f32; 32]>() as u64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });

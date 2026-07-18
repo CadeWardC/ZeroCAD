@@ -124,6 +124,35 @@ impl ZeroCadApp {
 
                 ui.separator();
 
+                let mut recover_clicked = false;
+                ui.add_enabled_ui(self.recovery.has_recovery(), |ui| {
+                    recover_clicked = icons::Icon::Download
+                        .menu_button(ui, "Recover Autosave")
+                        .on_hover_text("Restore the latest crash-safe local recovery document")
+                        .clicked();
+                });
+                if recover_clicked {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.recover_latest_autosave();
+                }
+
+                if icons::Icon::Download.menu_button(ui, "Export Bug Report…").on_hover_text(
+                    "Create an offline ZIP containing this document, build identity, diagnostics, and session log",
+                ).clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.export_bug_report();
+                }
+
+                if icons::Icon::Settings
+                    .menu_button(ui, "About ZeroCAD")
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.show_about = true;
+                }
+
+                ui.separator();
+
                 if icons::Icon::Exit.menu_button(ui, "Exit ZeroCAD").clicked() {
                     ui.memory_mut(|mem| mem.close_popup());
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

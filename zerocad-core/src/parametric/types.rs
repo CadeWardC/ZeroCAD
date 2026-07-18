@@ -35,18 +35,6 @@ pub fn body_output_id(feature_id: &str, output_index: usize) -> String {
     }
 }
 
-/// Zero-based output index encoded in a runtime body id.
-pub fn body_output_index(body_id: &str) -> usize {
-    let Some((_, suffix)) = body_id.rsplit_once(BODY_OUTPUT_SEPARATOR) else {
-        return 0;
-    };
-    suffix
-        .parse::<usize>()
-        .ok()
-        .filter(|number| *number >= 2)
-        .map_or(0, |number| number - 1)
-}
-
 /// A single named, dimensioned value inside a [`FeatureType::VariableSet`].
 /// `value` is expressed in `unit` (the same units offered in Settings), so the
 /// UI can display it directly and convert to the base unit when needed.

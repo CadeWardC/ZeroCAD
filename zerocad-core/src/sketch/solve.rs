@@ -126,6 +126,22 @@ struct ResidualRow {
     value_and_grad: Box<ResidualFunction>,
 }
 
+fn numerical_row(indices: Vec<usize>, value: impl Fn(&[f64]) -> f64 + 'static) -> ResidualRow {
+    ResidualRow {
+        value_and_grad: Box::new(move |system| {
+            let base = value(&system.x);
+            let mut gradient = Vec::with_capacity(indices.len());
+            for &index in &indices {
+                let step = 1.0e-6 * (1.0 + system.x[index].abs());
+                let mut perturbed = system.x.clone();
+                perturbed[index] += step;
+                gradient.push((index, (value(&perturbed) - base) / step));
+            }
+            (base, gradient)
+        }),
+    }
+}
+
 fn point_on_line_row(
     px: usize,
     py: usize,
@@ -229,6 +245,34 @@ impl System {
             }
             _ => None,
         })
+    }
+
+    /// First three native spline handles in endpoint order. The v1 curvature
+    /// constraint deliberately uses their finite difference, not an exact
+    /// derivative of the rendered NURBS/interpolating curve.
+    fn spline_endpoint_params(
+        &self,
+        model: &SketchSolverModel,
+        spline: EntityId,
+        at_start: bool,
+    ) -> Option<[(usize, usize); 3]> {
+        let points = model.entities.iter().find_map(|entity| match entity {
+            SketchEntity::Spline { id, points, .. } if *id == spline && points.len() >= 3 => {
+                Some(points)
+            }
+            _ => None,
+        })?;
+        let ids = if at_start {
+            [points[0], points[1], points[2]]
+        } else {
+            let last = points.len() - 1;
+            [points[last], points[last - 1], points[last - 2]]
+        };
+        Some([
+            (self.px(ids[0])?, self.py(ids[0])?),
+            (self.px(ids[1])?, self.py(ids[1])?),
+            (self.px(ids[2])?, self.py(ids[2])?),
+        ])
     }
 
     fn assemble_rows(&mut self, model: &SketchSolverModel, vars: &HashMap<String, f64>) {
@@ -611,6 +655,52 @@ impl System {
                         });
                     }
                 }
+                Constraint::SplineTangent {
+                    spline,
+                    line,
+                    at_start,
+                    ..
+                } => {
+                    if let (Some(points), Some(line)) = (
+                        self.spline_endpoint_params(model, *spline, *at_start),
+                        self.line_params(model, *line),
+                    ) {
+                        self.push_cross_or_dot(
+                            (points[0].0, points[0].1, points[1].0, points[1].1),
+                            line,
+                            true,
+                        );
+                    }
+                }
+                Constraint::SplineCurvature {
+                    spline,
+                    at_start,
+                    radius,
+                    ..
+                } => {
+                    if let Some(points) = self.spline_endpoint_params(model, *spline, *at_start) {
+                        let target = (radius.resolve(vars) as f64).abs().max(1.0e-9);
+                        let indices = points
+                            .into_iter()
+                            .flat_map(|(x, y)| [x, y])
+                            .collect::<Vec<_>>();
+                        self.rows.push(numerical_row(indices, move |values| {
+                            let [(x0, y0), (x1, y1), (x2, y2)] = points;
+                            let first = [values[x1] - values[x0], values[y1] - values[y0]];
+                            let second = [
+                                values[x2] - 2.0 * values[x1] + values[x0],
+                                values[y2] - 2.0 * values[y1] + values[y0],
+                            ];
+                            let first_squared = first[0] * first[0] + first[1] * first[1];
+                            if first_squared <= 1.0e-18 {
+                                return 1.0 / target;
+                            }
+                            let curvature = (first[0] * second[1] - first[1] * second[0]).abs()
+                                / first_squared.powf(1.5);
+                            curvature - 1.0 / target
+                        }));
+                    }
+                }
             }
         }
 
@@ -851,6 +941,7 @@ pub fn has_variable_bound_constraint(model: &SketchSolverModel) -> bool {
                 | Constraint::DistanceY { d, .. }
                 | Constraint::Diameter { d, .. } => d.expr.is_some(),
                 Constraint::Angle { angle_deg, .. } => angle_deg.expr.is_some(),
+                Constraint::SplineCurvature { radius, .. } => radius.expr.is_some(),
                 _ => false,
             }
     })
@@ -879,6 +970,88 @@ mod tests {
         let ids = EntityId::sequence(1);
         let (model, _) = promote_shapes_to_entities(&shapes, &ids, &vars, 1);
         (model, vars)
+    }
+
+    #[test]
+    fn spline_endpoint_tangent_and_curvature_have_solver_rows() {
+        use crate::sketch::{SplineContinuity, SplineKind};
+
+        let points = vec![
+            super::super::SketchPoint {
+                id: EntityId(1),
+                pos: (0.0, 0.0),
+            },
+            super::super::SketchPoint {
+                id: EntityId(2),
+                pos: (1.0, 0.0),
+            },
+            super::super::SketchPoint {
+                id: EntityId(3),
+                pos: (2.0, 1.0),
+            },
+            super::super::SketchPoint {
+                id: EntityId(4),
+                pos: (2.0, 0.0),
+            },
+        ];
+        let spline = EntityId(10);
+        let line = EntityId(11);
+        let mut model = SketchSolverModel {
+            points,
+            entities: vec![
+                SketchEntity::Spline {
+                    id: spline,
+                    points: vec![EntityId(1), EntityId(2), EntityId(3)],
+                    kind: SplineKind::ControlPoint,
+                    degree: 2,
+                    knots: Vec::new(),
+                    weights: Vec::new(),
+                    closed: false,
+                    periodic: false,
+                    continuity: SplineContinuity::Curvature,
+                    trim: None,
+                    derived_from: None,
+                },
+                SketchEntity::Line {
+                    id: line,
+                    p0: EntityId(1),
+                    p1: EntityId(4),
+                    derived_from: None,
+                },
+            ],
+            constraints: vec![
+                Constraint::SplineTangent {
+                    id: EntityId(20),
+                    spline,
+                    line,
+                    at_start: true,
+                },
+                Constraint::SplineCurvature {
+                    id: EntityId(21),
+                    spline,
+                    at_start: true,
+                    radius: Dimension::literal(1.0),
+                },
+            ],
+            ..Default::default()
+        };
+        for (offset, point) in [EntityId(1), EntityId(2), EntityId(3), EntityId(4)]
+            .into_iter()
+            .enumerate()
+        {
+            model.constraints.push(Constraint::Fixed {
+                id: EntityId(30 + offset as u32),
+                p: point,
+            });
+        }
+        let report = solve_model(&model, &HashMap::new());
+        assert_eq!(report.outcome, SolveOutcome::Converged);
+        assert!(report.residual < 1.0e-8);
+
+        if let Constraint::SplineCurvature { radius, .. } = &mut model.constraints[1] {
+            radius.expr = Some("r".to_string());
+        }
+        assert!(has_variable_bound_constraint(&model));
     }
 
     #[test]

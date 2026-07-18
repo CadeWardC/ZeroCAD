@@ -3,7 +3,7 @@
 This is the canonical, tracked roadmap for ZeroCAD Part Design and the OpenRCAD
 kernel work that supports it. It supersedes the original planning attachment;
 that attachment remains unchanged as a historical source artifact. This copy
-uses UTF-8 text, reflects work completed through Phase 5, and incorporates the
+uses UTF-8 text, reflects work completed through Phase 6, and incorporates the
 Phase 3.5 amendment and the revised Phases 5–7.
 
 ## Goal and architecture
@@ -191,8 +191,8 @@ Common-based interference checking.
 The finish pass added associative, curve-aware edge projection, driven/reference
 dimensions, density-derived mass, user-selectable thread classes, arbitrary
 origin/datum/selected-face section planes, and explicit section/interference
-coverage in the cross-cutting gate. The intentional v1 boundaries and their
-removal phases are tracked in [`phase4-completion.md`](phase4-completion.md).
+coverage in the cross-cutting gate. Phase 6 closed the intentional v1 boundaries;
+the removal record is tracked in [`phase4-completion.md`](phase4-completion.md).
 
 ### Sketch and profile creation
 
@@ -256,9 +256,10 @@ within the current absolute footprint ceilings. Its 1.440-second cold start
 remains above the Phase 7 sub-one-second release invariant and is retained as
 measured stabilization work rather than being normalized away.
 
-Milestone: the Phase 4 finish gate defines the first public alpha. Alpha builds
-must publish the v1 limits in the completion ledger and pass both workspace
-gates, the frozen corpus, and the relative performance comparison.
+Milestone: the Phase 4 finish gate defines the feature surface required for a
+public alpha, but does not itself authorize one. The actual public-alpha entry
+gate is the corrected Phase 6 runtime, persistence, interchange, frozen-corpus,
+and performance gate below.
 
 ## Phase 5 — Imported-part editing and mesh intake (complete)
 
@@ -277,8 +278,8 @@ in [`phase5-completion.md`](phase5-completion.md).
   healing, strict validation, and per-operation topology history so direct edits
   participate in naming and downstream Part Design operations.
 - Close the Phase 3.5 curved-split deferral for analytic cylindrical faces.
-  General bounded-face and non-analytic curved split tools remain structured
-  failures until the local topology-surgery work in Phase 6.
+  Phase 6 extends this with strict bounded solid tools; difficult B-spline-heavy
+  tools retain atomic structured failure until their named Phase 7 trigger.
 
 ### STL mesh bodies
 
@@ -299,44 +300,79 @@ legacy boundary fails atomically. Imported STL bodies pass manifold and winding
 diagnostics plus display, selection, transform, measurement, section, and export
 tests without being treated as B-Reps.
 
-## Phase 6 — Exchange, performance, and architecture cleanup
+## Phase 6 — Exchange, performance, and architecture cleanup (complete)
 
-- Broaden STEP interoperability and round-trip fixtures without weakening the
-  strict internal representation.
-- Complete remaining evaluator/container migration only behind equivalence and
-  file-compatibility tests.
-- Remove temporary ledgers, allowlists, wrappers, and dual conventions once
-  their named replacement gates pass.
-- Profile rebuild, boolean, tessellation, rendering, and large-document paths;
-  use deterministic caches and cancellation without changing results.
-- Treat startup as an active Phase 6 blocker: run
-  `benchmarks/profile-startup.ps1` over seven fresh release-process launches,
-  retain the sample report, and profile initialization until both median and
-  p95 are below the one-second release invariant. Requiring both prevents warm
-  launches from hiding an unstable cold launch.
-- Close every item in the Phase 4 completion ledger: expand versioned standards
-  packs, add analytic projected ellipse/conic geometry, route general edge
-  inspection through exact kernel curves, and add spline-native constraints.
-- Extend direct topology surgery beyond the Phase 5 exact set: tangential face
-  moves, external/general Delete Face healing, conical and spherical offsets and
-  thickening, and bounded or non-analytic curved Split Body tools.
-- Add GPU-native arbitrary section clip planes and caps. CPU/GPU image
-  equivalence is required before removing the correct CPU fallback.
-- Maintain the Phase 0 performance comparison and investigate every material
-  regression rather than refreshing the baseline to hide it.
+Phase 6 closes the scheduled migration and Phase 4 representation debt while
+extending the exact Phase 5 direct-edit set:
 
-Gate: every scheduled migration ledger, compatibility allowlist, obsolete
-wrapper, and dual ownership/container convention is empty. STEP round-trip and
-cross-version fixtures pass, the frozen correctness corpus is unchanged, the
-relative performance harness is green, and the remaining distance to the Phase
-7 absolute budgets is measured. The dedicated seven-sample startup profile must
-also pass its sub-one-second median and p95 gates. Any unavoidable release exception moves to
-Phase 7 with an owner, reason, user impact, and removal trigger.
+- Strict STEP interoperability now includes self-generated deterministic round
+  trips for the supported planar, cylindrical, conical, spherical, trimmed,
+  seam, truncated, and apex-cone cases. A byte-frozen FreeCAD AP214 cube from
+  Mayo is the successful third-party import fixture. The separate byte-frozen
+  NIST AP203 bracket retains its deterministic unsupported
+  `INTERSECTION_CURVE` classification.
+- Persisted semantic output provenance is the only body-ownership source. The
+  old identifier parser and repair convention are deleted; registry-driven
+  evaluator/container contracts remain guarded by equivalence and canonical
+  file tests. Production compatibility allowlists are empty.
+- Versioned standards pack v2, analytic projected ellipses, kernel-curve
+  inspection, and native spline tangent/curvature constraints close the Phase 4
+  removal ledger. Edge-pair closest points use a labelled deterministic 32x32
+  search plus refinement, and v1 spline curvature uses a labelled three-handle
+  finite difference; neither is represented as an exact NURBS extrema or
+  curvature solve.
+- Tangential moves for imported six-planar blocks, external cylindrical-boss
+  deletion, conical/spherical offset and thickening, and strict bounded-tool
+  splits extend the Phase 5 exact set. General local-surgery exceptions moved to
+  Phase 7 with an owner, reason, user impact, and executable removal trigger.
+- Arbitrary section planes and cap surfaces render natively on the GPU. The CPU
+  fallback and GPU path share contour construction and triangulation, with
+  shader clipping and cap-geometry equivalence tests.
+- Criterion coverage profiles cold/warm rebuilds, Common booleans, checked
+  tessellation, render-buffer preparation, canonical 500-feature save/open, and
+  hydrated first edit. Evaluation caches and cancellation remain deterministic
+  under their existing cold/warm equivalence gates.
+- Startup initialization loads settings once, probes only the selected/primary
+  backend, and keeps debug logging out of normal builds. The seven-fresh-process
+  median/p95 harness is retained as a release gate. A settled artifact passes;
+  the freshly linked unsigned Windows first-launch cost is a named Phase 7
+  packaging blocker with an executable removal trigger.
+- The original Phase 0 JSON baseline remains byte-unchanged. The harness also
+  retains a post-v5 format-era reference for the intentionally larger semantic
+  recipe, so it reports the original delta while rejecting any additional
+  greater-than-10% regression instead of granting an open-ended waiver.
+
+Gate: `zerocad-core/tests/phase6_gate.rs`, the complete workspace suites, strict
+STEP tests, frozen corpus, format-era relative comparison, seven-sample startup
+profile on the settled release artifact, formatting, checks, and all-target
+clippy pass. The measured record, including the non-passing freshly linked first
+launch, and the exact Phase 7 handoff are in
+[`phase6-completion.md`](phase6-completion.md).
+
+### Public-alpha milestone
+
+Public alpha begins after this corrected Phase 6 gate passes and continues
+during/alongside Phase 7. Alpha feedback is intentionally collected before the
+Part Design 1.0 contract freezes, especially for foreign STEP data, direct
+edits, semantic body ownership, and recovery diagnostics. Phase 7 completion is
+the 1.0 release gate; it is not deferred until after 1.0 and is not the first
+external validation of the product.
 
 ## Phase 7 — Stabilization and Part Design 1.0
 
+Engineering implementation and the still-open external evidence are tracked in
+[`phase7-completion.md`](phase7-completion.md). Crash-safe autosave, offline bug
+bundles, build identity, the machine-checked exception ledger, bounded stress
+suites, the frozen OCCT 7.8.1.1 differential oracle, cross-platform CI, and the
+absolute release-evidence validator are present. This does not declare 1.0:
+signed installed-first-launch, public-alpha/customer-model, and reference-hardware
+measurements must still be supplied honestly and pass the executable gate.
+
 - Run long-form randomized, scale, imported-part, save/load, undo/redo, and
   cross-platform stress suites.
+- Triage public-alpha crash reports and curated customer models throughout the
+  phase; every accepted kernel or persistence defect receives a frozen
+  regression before closure.
 - Run a curated OCCT differential-oracle suite for primitives, imports,
   booleans, direct edits, mass properties, and failure classification. OCCT is
   test-oracle-only and is never linked into or shipped with ZeroCAD/OpenRCAD.
@@ -344,6 +380,9 @@ Phase 7 with an owner, reason, user impact, and removal trigger.
   documentation, examples, migration notes, and crash-safe persistence.
 - Triage all compatibility and strict-validation exceptions; every retained
   exception needs an owner, reason, and removal trigger.
+- Close the signed-package first-launch blocker: a seven-sample run that begins
+  with the installed artifact's first execution must record both median and p95
+  below 1 second on the reference machine.
 - Ship only when both workspaces are warning-reviewed, all gates are green, and
   the frozen corpus and performance harness pass unchanged.
 
@@ -377,6 +416,32 @@ normalization.
 
 Gate: all absolute limits above, the relative 10% comparison, long-form stress
 suites, compatibility checks, and both workspace gates pass on a release build.
+
+## Phase 8 — Post-1.0 feedback refinements (optional)
+
+The original feedback-tooling proposal was pulled forward into Phase 7 because
+public alpha runs before the 1.0 freeze. The following are therefore completed
+release infrastructure, not post-1.0 deferrals:
+
+- **Application panic hook and crash-safe autosave.** Install an app-boundary
+  panic hook that writes a recovery `.zcad` plus a stack trace to a known
+  location before exit, and add periodic/edit-triggered autosave. Build on the
+  existing atomic synced save with `.previous` backup. (If any one item is pulled
+  earlier, make it this — it protects alpha users' work and is the highest-value
+  piece for surfacing the runtime-gate defects the alpha is meant to find.)
+- **"Report a bug" export bundle.** One command that packages the current
+  document, the session log, the app version/build id, and `adapter_info()` into
+  a single shareable archive. No network upload; fully offline and user-initiated.
+- **Version and build stamp.** Embed `CARGO_PKG_VERSION` and the git hash, expose
+  them in an About dialog, and include them automatically in the bug bundle so
+  every report identifies its exact build.
+
+No telemetry, crash upload, or automatic feedback channel is added; the app stays
+offline and the user always initiates any report.
+
+Optional post-1.0 work is limited to report redaction previews, user-selected
+extra attachments, and triage workflow integrations. None may turn the offline,
+user-initiated report into automatic collection or upload.
 
 ## Required handoff gates
 

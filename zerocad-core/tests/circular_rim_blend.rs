@@ -233,14 +233,20 @@ fn rim_edge_mod_reaches_native_solver_and_degrades_safely() {
 /// analytic open-chain solver with flush end trims.
 fn bitten_box() -> KernelSolid {
     use openrcad::foundation::{Ax2, Dir, Pnt};
-    let block = openrcad::primitives::make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
-    let drill = openrcad::primitives::make_cylinder(
+    let block =
+        openrcad::primitives::make_box_operation(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0)
+            .expect("bite block should build")
+            .value;
+    let drill = openrcad::primitives::make_cylinder_operation(
         &Ax2::new(Pnt::new(20.0, 8.0, -1.0), Dir::dz()),
         14.0,
         12.0,
-    );
-    openrcad::algo::boolean_checked(&block, &drill, openrcad::algo::BooleanOp::Cut)
+    )
+    .expect("bite cylinder should build")
+    .value;
+    openrcad::algo::boolean_operation(&block, &drill, openrcad::algo::BooleanOp::Cut)
         .expect("bite cut should be clean")
+        .value
 }
 
 fn bite_rim_hint() -> EdgeCurveHint {

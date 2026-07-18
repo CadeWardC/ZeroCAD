@@ -81,6 +81,7 @@ fn render_core_draws_a_triangle_offscreen() {
         color: [1.0, 1.0, 1.0],
         viewport_px: [SIZE as f32, SIZE as f32],
         edge_px: 1.5,
+        clip_plane: None,
     };
     core.render_to(&device, &queue, &target, &globals);
 
@@ -102,6 +103,36 @@ fn render_core_draws_a_triangle_offscreen() {
     assert!(
         corner[0] < 30 && corner[1] < 30 && corner[2] < 30,
         "expected the corner to keep the clear color, got {corner:?}"
+    );
+
+    // The same geometry clipped by the arbitrary world plane x >= 0 must
+    // retain only the right half. This exercises real fragment clipping rather
+    // than merely checking the uniform packing contract.
+    let clipped_target = OffscreenTarget::new(&device, format, SAMPLE_COUNT, SIZE, SIZE);
+    let clipped_globals = SceneGlobals {
+        clip_plane: Some([1.0, 0.0, 0.0, 0.0]),
+        ..globals
+    };
+    core.render_to(&device, &queue, &clipped_target, &clipped_globals);
+    let clipped = read_back(&device, &queue, clipped_target.color_texture(), SIZE, SIZE);
+    let mut lit_left = 0usize;
+    let mut lit_right = 0usize;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let offset = ((y * SIZE + x) * 4) as usize;
+            if clipped[offset] > 30 || clipped[offset + 1] > 30 || clipped[offset + 2] > 30 {
+                if x < SIZE / 2 {
+                    lit_left += 1;
+                } else {
+                    lit_right += 1;
+                }
+            }
+        }
+    }
+    assert!(lit_right > 200, "clipped triangle disappeared: {lit_right}");
+    assert!(
+        lit_left * 20 < lit_right,
+        "clip leaked across the plane: left={lit_left}, right={lit_right}"
     );
 }
 
@@ -164,6 +195,7 @@ fn face_state_texture_wraps_beyond_one_row() {
         color: [1.0, 1.0, 1.0],
         viewport_px: [SIZE as f32, SIZE as f32],
         edge_px: 1.5,
+        clip_plane: None,
     };
     core.render_to(&device, &queue, &target, &globals);
 
@@ -243,6 +275,7 @@ fn translucent_layer_blends_over_base_scene() {
         color: [1.0, 1.0, 1.0],
         viewport_px: [SIZE as f32, SIZE as f32],
         edge_px: 1.5,
+        clip_plane: None,
     };
     core.render_to(&device, &queue, &target, &globals);
 
@@ -332,6 +365,7 @@ fn pick_pass_reads_back_the_nearer_face_id() {
         color: [1.0, 1.0, 1.0],
         viewport_px: [SIZE as f32, SIZE as f32],
         edge_px: 1.5,
+        clip_plane: None,
     };
     core.render_pick(&device, &queue, &pick, &globals);
 
@@ -397,6 +431,7 @@ fn msaa_off_renders_with_thick_edges() {
         color: [1.0, 1.0, 1.0],
         viewport_px: [SIZE as f32, SIZE as f32],
         edge_px: 6.0, // deliberately wide so the stroke is unmistakable
+        clip_plane: None,
     };
     core.render_to(&device, &queue, &target, &globals);
 

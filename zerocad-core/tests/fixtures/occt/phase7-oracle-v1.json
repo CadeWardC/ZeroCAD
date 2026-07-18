@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "generator": "tools/phase7_occt_oracle.py",
+  "occt_version": "7.8.1.1",
+  "step_fixture": "zerocad-core/tests/fixtures/step/mayo-freecad-cube.step",
+  "step_fixture_sha256": "e927cffb0dddb9415f541d57132ae5f3f8013a7c4d8baf01669e052030dfdf0a",
+  "cases": [
+    {
+      "id": "primitive_box",
+      "category": "primitive",
+      "classification": "solid",
+      "volume": 480.0,
+      "surface_area": 376.0,
+      "centroid": [
+        4.999999999999999,
+        4.0,
+        2.9999999999999996
+      ]
+    },
+    {
+      "id": "primitive_cylinder",
+      "category": "primitive",
+      "classification": "solid",
+      "volume": 226.19467105846508,
+      "surface_area": 207.34511513692638,
+      "centroid": [
+        -7.69615700699814e-16,
+        1.0192687709106808e-16,
+        4.000000000000001
+      ]
+    },
+    {
+      "id": "boolean_fuse_boxes",
+      "category": "boolean",
+      "classification": "solid",
+      "volume": 1499.9999999999993,
+      "surface_area": 799.9999999999999,
+      "centroid": [
+        7.5000000000000036,
+        5.0000000000000036,
+        5.000000000000003
+      ]
+    },
+    {
+      "id": "boolean_cut_through_hole",
+      "category": "boolean",
+      "classification": "solid",
+      "volume": 404.60177631384494,
+      "surface_area": 426.26548245743663,
+      "centroid": [
+        5.0,
+        4.0,
+        3.0
+      ]
+    },
+    {
+      "id": "boolean_common_boxes",
+      "category": "boolean",
+      "classification": "solid",
+      "volume": 499.9999999999999,
+      "surface_area": 399.99999999999994,
+      "centroid": [
+        7.500000000000001,
+        5.0,
+        5.0
+      ]
+    },
+    {
+      "id": "import_mayo_cube",
+      "category": "import",
+      "classification": "solid",
+      "volume": 999.9999999999998,
+      "surface_area": 599.9999999999999,
+      "centroid": [
+        5.0,
+        5.0,
+        5.0
+      ]
+    },
+    {
+      "id": "direct_uniform_scale",
+      "category": "direct_edit",
+      "classification": "solid",
+      "volume": 3840.0,
+      "surface_area": 1504.0,
+      "centroid": [
+        9.999999999999998,
+        8.0,
+        5.999999999999999
+      ]
+    },
+    {
+      "id": "failure_disjoint_common",
+      "category": "failure_classification",
+      "classification": "empty_or_contact",
+      "volume": 0.0,
+      "surface_area": 0.0,
+      "centroid": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "failure_tangent_common",
+      "category": "failure_classification",
+      "classification": "empty_or_contact",
+      "volume": 0.0,
+      "surface_area": 0.0,
+      "centroid": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  ]
+}

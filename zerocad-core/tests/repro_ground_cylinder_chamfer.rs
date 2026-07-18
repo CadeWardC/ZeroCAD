@@ -206,7 +206,8 @@ fn ground_cylinder_native_tool_chamfer_aabb_probe() {
     // Mirror edge_mod_keeps_body's second condition: enclosed-volume ratio from
     // a coarse tessellation (divergence theorem).
     let vol = |s: &zerocad_core::mock_kernel::KernelSolid| -> f64 {
-        let mesh = openrcad::mesh::tessellate(s, 0.5, std::f64::consts::PI);
+        let mesh = openrcad::mesh::tessellate_checked(s, 0.5, std::f64::consts::PI)
+            .expect("strict coarse tessellation");
         let mut vol6 = 0.0f64;
         for tri in &mesh.triangles {
             let a = mesh.vertices[tri[0] as usize];
@@ -224,7 +225,8 @@ fn ground_cylinder_native_tool_chamfer_aabb_probe() {
 
     // Per-face signed volume contribution at the coarse volume-gate tolerance:
     // a consistently-outward-wound closed mesh sums to the true volume.
-    let coarse = openrcad::mesh::tessellate(&out, 0.5, std::f64::consts::PI);
+    let coarse = openrcad::mesh::tessellate_checked(&out, 0.5, std::f64::consts::PI)
+        .expect("strict result tessellation");
     let mut per_face = std::collections::HashMap::<u32, (usize, f64, f64)>::new();
     for (t, tri) in coarse.triangles.iter().enumerate() {
         let a = coarse.vertices[tri[0] as usize];

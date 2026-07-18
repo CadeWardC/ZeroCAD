@@ -14,6 +14,7 @@ use zerocad_core::{
     SketchPlane, SketchShape, Unit, Variable, Vec3,
 };
 
+mod bug_report;
 mod combine_ui;
 mod direct_edit_ui;
 mod document_worker;
@@ -32,6 +33,7 @@ mod move_ui;
 mod parameters_ui;
 mod pattern_ui;
 mod phase35_ui;
+mod recovery;
 mod render;
 mod revolve_ui;
 mod settings;
@@ -62,29 +64,52 @@ use theme::{apply_premium_dark_theme, apply_premium_light_theme, Palette};
 use thread_ui::ThreadOp;
 use zerocad_core::parametric::FaceRef;
 
+fn automatic_wgpu_backends() -> wgpu::Backends {
+    #[cfg(target_os = "windows")]
+    {
+        return wgpu::Backends::DX12;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return wgpu::Backends::VULKAN;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return wgpu::Backends::METAL;
+    }
+    #[allow(unreachable_code)]
+    wgpu::Backends::PRIMARY
+}
+
 fn main() -> eframe::Result<()> {
+    recovery::install_panic_hook();
     let mut builder = env_logger::Builder::from_default_env();
     if std::env::var("RUST_LOG").is_err() {
-        builder.filter_level(log::LevelFilter::Debug);
+        builder.filter_level(log::LevelFilter::Info);
     }
+    builder.target(env_logger::Target::Pipe(Box::new(
+        recovery::SessionLogWriter::new(),
+    )));
     builder.init();
 
     log::info!("========================================================");
     log::info!("Starting ZeroCAD - Premium 3D Parametric CAD Designer...");
-    log::info!("Console debug logger initialized at level: DEBUG");
+    log::info!("Application logger initialized");
     log::info!("========================================================");
 
     // The user's persisted backend preference (Settings → Viewport) narrows
     // which wgpu backends the adapter search may pick. The WGPU_BACKEND env var
     // still overrides everything, as a debugging escape hatch.
-    let backends = match settings::AppSettings::load().backend {
-        settings::GraphicsBackend::Auto => wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+    let app_settings = settings::AppSettings::load();
+    let backends = match app_settings.backend {
+        settings::GraphicsBackend::Auto => automatic_wgpu_backends(),
         settings::GraphicsBackend::Vulkan => wgpu::Backends::VULKAN,
         settings::GraphicsBackend::Dx12 => wgpu::Backends::DX12,
         settings::GraphicsBackend::OpenGl => wgpu::Backends::GL,
     };
 
-    let run = |renderer: eframe::Renderer| -> eframe::Result<()> {
+    let run = |supported_backends: wgpu::Backends| -> eframe::Result<()> {
+        let app_settings = app_settings.clone();
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("ZeroCAD - 3D Parametric CAD Designer")
@@ -93,9 +118,10 @@ fn main() -> eframe::Result<()> {
             // openrcad-render, embedded as an egui texture. That requires eframe
             // to run on the wgpu backend so `frame.wgpu_render_state()` yields
             // the device/queue the render core draws with.
-            renderer,
+            renderer: eframe::Renderer::Wgpu,
             wgpu_options: egui_wgpu::WgpuConfiguration {
-                supported_backends: wgpu::util::backend_bits_from_env().unwrap_or(backends),
+                supported_backends: wgpu::util::backend_bits_from_env()
+                    .unwrap_or(supported_backends),
                 ..Default::default()
             },
             ..Default::default()
@@ -103,19 +129,17 @@ fn main() -> eframe::Result<()> {
         eframe::run_native(
             "ZeroCAD",
             options,
-            Box::new(|_cc| Ok(Box::new(ZeroCadApp::new()))),
+            Box::new(move |_cc| Ok(Box::new(ZeroCadApp::new_with_settings(app_settings)))),
         )
     };
 
-    // Prefer wgpu (GPU viewport). If wgpu itself cannot start on this machine
-    // (no usable adapter/driver for the requested backends), fall back to the
-    // glow (OpenGL) backend: the app then runs entirely on the CPU renderer
-    // path — `wgpu_render_state()` is None there, so the viewport quietly skips
-    // its GPU compositor.
-    match run(eframe::Renderer::Wgpu) {
-        Err(eframe::Error::Wgpu(err)) => {
-            log::warn!("wgpu renderer unavailable ({err}); falling back to glow + CPU viewport");
-            run(eframe::Renderer::Glow)
+    // Wgpu owns the embedded GPU viewport. If the selected native backend has
+    // no usable adapter, retry through wgpu's OpenGL backend; this preserves
+    // the OpenGL escape hatch without shipping eframe's second renderer stack.
+    match run(backends) {
+        Err(eframe::Error::Wgpu(err)) if backends != wgpu::Backends::GL => {
+            log::warn!("native wgpu backend unavailable ({err}); retrying through OpenGL");
+            run(wgpu::Backends::GL)
         }
         other => other,
     }
@@ -407,8 +431,7 @@ pub enum BodyPick {
 /// Browser label for one runtime body emitted by a feature. The first output
 /// keeps the feature's label; numbered `Body_N` labels continue naturally for
 /// later disconnected outputs (Body_1, Body_2, ...).
-pub(crate) fn body_output_label(feature_label: &str, body_id: &str) -> String {
-    let output_index = zerocad_core::body_output_index(body_id);
+pub(crate) fn body_output_label(feature_label: &str, output_index: usize) -> String {
     if output_index == 0 {
         return feature_label.to_string();
     }
@@ -428,9 +451,9 @@ mod body_output_label_tests {
 
     #[test]
     fn disconnected_outputs_receive_separate_body_numbers() {
-        assert_eq!(body_output_label("Body_1", "extrude_5"), "Body_1");
-        assert_eq!(body_output_label("Body_1", "extrude_5::body:2"), "Body_2");
-        assert_eq!(body_output_label("Body_1", "extrude_5::body:3"), "Body_3");
+        assert_eq!(body_output_label("Body_1", 0), "Body_1");
+        assert_eq!(body_output_label("Body_1", 1), "Body_2");
+        assert_eq!(body_output_label("Body_1", 2), "Body_3");
     }
 }
 
@@ -536,6 +559,7 @@ struct PendingSave {
     profile: zerocad_core::SaveProfile,
     started: std::time::Instant,
     dispatched: bool,
+    revision: Option<u64>,
 }
 
 struct ExportCompletion {
@@ -603,10 +627,14 @@ struct ZeroCadApp {
     /// generation.
     evaluator: evaluation_worker::ModelEvaluator,
     document_worker: document_worker::DocumentWorker,
+    recovery: recovery::RecoveryManager,
     pending_save: Option<PendingSave>,
     last_slow_frame_log: Option<std::time::Instant>,
     export_completions: std::sync::Arc<std::sync::Mutex<Vec<ExportCompletion>>>,
     eval_generation: u64,
+    /// Monotonic committed-document revision used to avoid clearing a newer
+    /// autosave when an older background Save finishes.
+    document_revision: u64,
     /// True while a background refine is in flight (drives a "Refining…" hint).
     eval_pending: bool,
     eval_started: Option<std::time::Instant>,
@@ -923,6 +951,8 @@ struct ZeroCadApp {
 
     /// Whether the Settings window is open.
     show_preferences: bool,
+    /// Whether the build/version and offline-report information window is open.
+    show_about: bool,
     /// Centralized parameter table, staged until Apply for atomic validation.
     parameters_dialog: Option<ParametersDialog>,
     /// Which tab is selected in the Settings window.

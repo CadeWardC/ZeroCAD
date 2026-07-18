@@ -22,6 +22,9 @@ struct Globals {
     // highlight texture; others disable it). y, z: viewport size in pixels.
     // w: wireframe line width in pixels.
     params: vec4<f32>,
+    // World-space half-space. The disabled value is (0,0,0,1), which keeps
+    // every fragment. Otherwise keep dot(xyz, world_position) + w >= 0.
+    clip_plane: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -39,6 +42,7 @@ struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) face_id: f32,
+    @location(2) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -51,11 +55,15 @@ fn vs_main(
     out.clip_pos = globals.view_proj * vec4<f32>(position, 1.0);
     out.normal = normal;
     out.face_id = face_id;
+    out.world_pos = position;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if dot(vec4<f32>(in.world_pos, 1.0), globals.clip_plane) < 0.0 {
+        discard;
+    }
     let n = normalize(in.normal);
     let l = normalize(globals.light.xyz);
     // Two-sided so back faces of an open shell still read.
@@ -89,6 +97,7 @@ struct EdgeOut {
     @builtin(position) clip_pos: vec4<f32>,
     // Signed distance from the segment centreline, in pixels.
     @location(0) across_px: f32,
+    @location(1) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -105,6 +114,7 @@ fn vs_edge(
     if ca.w <= 0.0 || cb.w <= 0.0 {
         out.clip_pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
         out.across_px = 0.0;
+        out.world_pos = a;
         return out;
     }
 
@@ -135,11 +145,15 @@ fn vs_edge(
     let z = mix(ca.z, cb.z, t);
     out.clip_pos = vec4<f32>(sp / half_px * w, z, w);
     out.across_px = s * ext;
+    out.world_pos = mix(a, b, t);
     return out;
 }
 
 @fragment
 fn fs_edge(in: EdgeOut) -> @location(0) vec4<f32> {
+    if dot(vec4<f32>(in.world_pos, 1.0), globals.clip_plane) < 0.0 {
+        discard;
+    }
     // Anti-aliased coverage: full inside the line body, fading over the 1px
     // feather; multiplied by the owning geometry's alpha so a translucent
     // ghost's wireframe fades with its fill.
@@ -154,5 +168,8 @@ fn fs_edge(in: EdgeOut) -> @location(0) vec4<f32> {
 // pixel-under-cursor face picking and hover.
 @fragment
 fn fs_pick(in: VsOut) -> @location(0) u32 {
+    if dot(vec4<f32>(in.world_pos, 1.0), globals.clip_plane) < 0.0 {
+        discard;
+    }
     return u32(round(in.face_id)) + 1u;
 }

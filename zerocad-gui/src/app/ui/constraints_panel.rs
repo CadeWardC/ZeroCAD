@@ -281,6 +281,34 @@ impl ZeroCadApp {
                             circle: sel.circles[0],
                         });
                     }
+                    let spline_tangent_ok = sel.points.is_empty()
+                        && sel.lines.len() == 1
+                        && sel.circles.is_empty()
+                        && sel.splines.len() == 1;
+                    for (label, at_start) in [("⌁ Spline tangent S", true), ("⌁ Spline tangent E", false)] {
+                        if btn(ui, label, "Align a line to a native spline endpoint derivative", spline_tangent_ok) {
+                            add = Some(Constraint::SplineTangent {
+                                id: alloc(),
+                                spline: sel.splines[0],
+                                line: sel.lines[0],
+                                at_start,
+                            });
+                        }
+                    }
+                    let spline_only = sel.points.is_empty()
+                        && sel.lines.is_empty()
+                        && sel.circles.is_empty()
+                        && sel.splines.len() == 1;
+                    for (label, at_start) in [("◠ Curvature S", true), ("◠ Curvature E", false)] {
+                        if btn(ui, label, "Approximate endpoint curvature from the first three spline handles (v1; not exact NURBS curvature)", spline_only) {
+                            add = Some(Constraint::SplineCurvature {
+                                id: alloc(),
+                                spline: sel.splines[0],
+                                at_start,
+                                radius: Dimension::literal(self.current_spline_radius(sel.splines[0], at_start)),
+                            });
+                        }
+                    }
                     let equal_ok = only(0, 2, 0) || only(0, 0, 2);
                     if btn(
                         ui,
@@ -675,6 +703,10 @@ impl ZeroCadApp {
                 match e {
                     SketchEntity::Line { .. } => sel.lines.push(id),
                     SketchEntity::Circle { .. } | SketchEntity::Arc { .. } => sel.circles.push(id),
+                    // An associative projected ellipse exposes its center point,
+                    // but radius/concentric constraints do not apply to its two
+                    // independent analytic axes.
+                    SketchEntity::Ellipse { .. } => {}
                     SketchEntity::Spline { .. } => sel.splines.push(id),
                 }
             }
@@ -745,6 +777,47 @@ impl ZeroCadApp {
             .unwrap_or(0.0)
     }
 
+    fn current_spline_radius(&self, id: EntityId, at_start: bool) -> f32 {
+        let Some(model) = &self.sketch_solver_model else {
+            return 10.0;
+        };
+        let Some(points) = model.entities.iter().find_map(|entity| match entity {
+            SketchEntity::Spline {
+                id: entity_id,
+                points,
+                ..
+            } if *entity_id == id && points.len() >= 3 => Some(points),
+            _ => None,
+        }) else {
+            return 10.0;
+        };
+        let ids = if at_start {
+            [points[0], points[1], points[2]]
+        } else {
+            let last = points.len() - 1;
+            [points[last], points[last - 1], points[last - 2]]
+        };
+        let (Some(first), Some(second), Some(third)) = (
+            model.point(ids[0]).map(|point| point.pos),
+            model.point(ids[1]).map(|point| point.pos),
+            model.point(ids[2]).map(|point| point.pos),
+        ) else {
+            return 10.0;
+        };
+        let tangent = [second.0 - first.0, second.1 - first.1];
+        let second_derivative = [
+            third.0 - 2.0 * second.0 + first.0,
+            third.1 - 2.0 * second.1 + first.1,
+        ];
+        let length_squared = tangent[0] * tangent[0] + tangent[1] * tangent[1];
+        let cross = (tangent[0] * second_derivative[1] - tangent[1] * second_derivative[0]).abs();
+        if cross <= 1.0e-12 || length_squared <= 1.0e-12 {
+            1.0e6
+        } else {
+            (length_squared.powf(1.5) / cross) as f32
+        }
+    }
+
     fn measured_constraint_value(&self, constraint: &Constraint) -> f32 {
         match constraint {
             Constraint::Distance { a, b, .. } => self.current_point_distance(*a, *b),
@@ -753,6 +826,9 @@ impl ZeroCadApp {
             Constraint::Radius { circle, .. } => self.current_circle_radius(*circle),
             Constraint::Diameter { circle, .. } => self.current_circle_radius(*circle) * 2.0,
             Constraint::Angle { a, b, .. } => self.current_line_angle(*a, *b),
+            Constraint::SplineCurvature {
+                spline, at_start, ..
+            } => self.current_spline_radius(*spline, *at_start),
             _ => 0.0,
         }
     }
@@ -795,6 +871,11 @@ impl ZeroCadApp {
                     let c = pos(*center)?;
                     Some((c.0 + radius * 0.7, c.1 + radius * 0.7))
                 }
+                SketchEntity::Spline {
+                    id: entity_id,
+                    points,
+                    ..
+                } if *entity_id == id => points.first().and_then(|point| pos(*point)),
                 _ => None,
             })
         };
@@ -846,6 +927,8 @@ impl ZeroCadApp {
                 Constraint::Collinear { a, .. } => ("⫽", entity_anchor(*a)),
                 Constraint::Symmetric { a, .. } => ("S", pos(*a)),
                 Constraint::Diameter { circle, .. } => ("⌀", entity_anchor(*circle)),
+                Constraint::SplineTangent { spline, .. } => ("⌁", entity_anchor(*spline)),
+                Constraint::SplineCurvature { spline, .. } => ("◠", entity_anchor(*spline)),
             };
             let Some(anchor) = anchor else { continue };
             let base = to_screen(anchor);
@@ -892,6 +975,9 @@ fn constraint_dimension(constraint: &Constraint) -> Option<(&'static str, Dimens
         Constraint::Radius { r, .. } => Some(("Radius", r.clone())),
         Constraint::Diameter { d, .. } => Some(("Diameter", d.clone())),
         Constraint::Angle { angle_deg, .. } => Some(("Angle (degrees)", angle_deg.clone())),
+        Constraint::SplineCurvature { radius, .. } => {
+            Some(("Approx. spline curvature radius", radius.clone()))
+        }
         _ => None,
     }
 }
@@ -904,6 +990,7 @@ fn set_constraint_dimension(constraint: &mut Constraint, dimension: Dimension) {
         | Constraint::Diameter { d, .. } => *d = dimension,
         Constraint::Radius { r, .. } => *r = dimension,
         Constraint::Angle { angle_deg, .. } => *angle_deg = dimension,
+        Constraint::SplineCurvature { radius, .. } => *radius = dimension,
         _ => {}
     }
 }
@@ -989,6 +1076,33 @@ pub(crate) fn constraint_label(c: &Constraint) -> String {
             d.expr
                 .as_deref()
                 .map_or_else(|| format!("{:.3}", d.value), str::to_string)
+        ),
+        Constraint::SplineTangent {
+            id,
+            spline,
+            line,
+            at_start,
+        } => format!(
+            "c{} ⌁ Spline tangent {} e{} to e{}",
+            id.0,
+            if *at_start { "start" } else { "end" },
+            spline.0,
+            line.0
+        ),
+        Constraint::SplineCurvature {
+            id,
+            spline,
+            at_start,
+            radius,
+        } => format!(
+            "c{} ◠ Spline curvature {} e{} = {}",
+            id.0,
+            if *at_start { "start" } else { "end" },
+            spline.0,
+            radius
+                .expr
+                .as_deref()
+                .map_or_else(|| format!("{:.3}", radius.value), str::to_string)
         ),
     }
 }

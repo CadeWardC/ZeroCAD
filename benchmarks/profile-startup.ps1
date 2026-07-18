@@ -9,7 +9,11 @@ param(
     [ValidateRange(1, 120)]
     [int] $StartupTimeoutSeconds = 30,
     [string] $OutputPath,
-    [switch] $SkipBuild
+    [switch] $SkipBuild,
+    [string] $ExecutablePath,
+    [switch] $SignedPackage,
+    [switch] $InstalledArtifact,
+    [switch] $Phase7ReleaseGate
 )
 
 Set-StrictMode -Version Latest
@@ -21,6 +25,9 @@ if (-not $OutputPath) {
 }
 $outputFullPath = [System.IO.Path]::GetFullPath($OutputPath)
 
+if ($ExecutablePath -and -not $SkipBuild) {
+    throw "Use -SkipBuild with -ExecutablePath so the installed artifact is not replaced by a local build."
+}
 if (-not $SkipBuild) {
     Write-Host "Building the release GUI once before startup sampling..."
     & cargo build --quiet --release -p zerocad-gui
@@ -29,7 +36,11 @@ if (-not $SkipBuild) {
     }
 }
 
-$executable = Join-Path $repoRoot "target/release/zerocad-gui.exe"
+$executable = if ($ExecutablePath) {
+    [System.IO.Path]::GetFullPath($ExecutablePath)
+} else {
+    Join-Path $repoRoot "target/release/zerocad-gui.exe"
+}
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "The release GUI executable was not found at $executable."
 }
@@ -90,10 +101,14 @@ for ($sample = 1; $sample -le $Samples; $sample++) {
 $times = [double[]] @($measurements | ForEach-Object { $_.startup_ms })
 $median = Get-Percentile -Values $times -Percentile 0.5
 $p95 = Get-Percentile -Values $times -Percentile 0.95
-$passes = $median -lt $TargetMedianMs -and $p95 -lt $TargetP95Ms
+$performancePasses = $median -lt $TargetMedianMs -and $p95 -lt $TargetP95Ms
+$releaseIdentityPasses = -not $Phase7ReleaseGate -or ($SignedPackage -and $InstalledArtifact)
+$passes = $performancePasses -and $releaseIdentityPasses
 $report = [ordered]@{
     measured_utc = [DateTime]::UtcNow.ToString("o")
     executable = $executable
+    signed_package = [bool] $SignedPackage
+    includes_installed_first_launch = [bool] $InstalledArtifact
     target_median_ms = $TargetMedianMs
     target_p95_ms = $TargetP95Ms
     sample_count = $Samples
@@ -119,6 +134,10 @@ if ($parent) {
 Write-Host ("Startup median: {0:N3} ms (target < {1:N3}); p95: {2:N3} ms (target < {3:N3})" -f $median, $TargetMedianMs, $p95, $TargetP95Ms)
 Write-Host "Report: $outputFullPath"
 if (-not $passes) {
-    Write-Error "The startup median or p95 exceeds the Phase 7 absolute budget."
+    if (-not $performancePasses) {
+        Write-Error "The startup median or p95 exceeds the Phase 7 absolute budget."
+    } else {
+        Write-Error "The Phase 7 startup gate requires -SignedPackage and -InstalledArtifact."
+    }
     exit 1
 }

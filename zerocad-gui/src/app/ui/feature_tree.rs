@@ -57,7 +57,7 @@ impl ZeroCadApp {
                                     .map(|name| (id.to_string(), name.clone()))
                             })
                             .collect();
-                        let mut outputs: Vec<BrowserRow> = self
+                        let mut output_ids: Vec<String> = self
                             .body_meshes
                             .iter()
                             .filter(|(id, _)| {
@@ -65,9 +65,22 @@ impl ZeroCadApp {
                                     && self.document.semantic_body_id_for_runtime_body(id).as_ref()
                                         == Some(&body.id)
                             })
-                            .map(|(id, _)| (id.clone(), body_output_label(&body.name, id)))
+                            .map(|(id, _)| id.clone())
                             .collect();
-                        outputs.sort_by_key(|(id, _)| zerocad_core::body_output_index(id));
+                        output_ids.sort_by_key(|id| {
+                            usize::from(
+                                self.document
+                                    .body_producer_feature_id(id)
+                                    .is_none_or(|owner| owner != id),
+                            )
+                        });
+                        let outputs = output_ids
+                            .into_iter()
+                            .enumerate()
+                            .map(|(output_index, id)| {
+                                (id, body_output_label(&body.name, output_index))
+                            })
+                            .collect();
                         (body.id.to_string(), body.name.clone(), timeline, outputs)
                     })
                     .collect();
@@ -355,7 +368,7 @@ impl ZeroCadApp {
                 self.selected_body
                     .contains(&(id.to_string(), BodyPick::Whole))
                     || (self.selected_body.is_empty()
-                        && zerocad_core::body_output_index(id) == 0
+                        && id == owner_id
                         && self.selected_node_id.as_deref() == Some(owner_id.as_str()))
             } else {
                 self.selected_node_id.as_deref() == Some(owner_id.as_str())

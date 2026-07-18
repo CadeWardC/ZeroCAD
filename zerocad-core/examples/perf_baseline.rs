@@ -1,3 +1,8 @@
+// This byte-frozen runner intentionally retains the pre-migration public APIs
+// whose exact costs define the Phase 0 baseline. Production and current
+// benchmarks use canonical operation/document results instead.
+#![allow(deprecated)]
+
 #[path = "../benches/support/phase0_corpus.rs"]
 mod corpus;
 

@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string] $BaselinePath,
+    [string] $FormatEraReferencePath,
     [string] $CurrentReportPath,
     [string] $OutputPath,
     [ValidateRange(0.0, 1000.0)]
@@ -22,6 +23,10 @@ if (-not $BaselinePath) {
     $BaselinePath = Join-Path $PSScriptRoot "phase0-baseline.json"
 }
 $baselineFullPath = [System.IO.Path]::GetFullPath($BaselinePath)
+if (-not $FormatEraReferencePath) {
+    $FormatEraReferencePath = Join-Path $PSScriptRoot "phase2-v5-format-reference.json"
+}
+$formatEraReferenceFullPath = [System.IO.Path]::GetFullPath($FormatEraReferencePath)
 
 function Invoke-CoreMeasurements {
     Write-Host "Measuring the frozen Phase 0 core corpora..."
@@ -136,7 +141,9 @@ function Compare-Reports {
     param(
         [object] $Baseline,
         [object] $Current,
-        [double] $AllowedPercent
+        [double] $AllowedPercent,
+        [AllowNull()]
+        [object] $FormatEraReference
     )
 
     if ([int] $Baseline.schema -ne [int] $Current.schema) {
@@ -171,6 +178,12 @@ function Compare-Reports {
     foreach ($corpus in @($Baseline.corpora)) {
         $baselineCorpora[[string] $corpus.name] = $corpus
     }
+    $formatEraCorpora = @{}
+    if ($null -ne $FormatEraReference) {
+        foreach ($corpus in @($FormatEraReference.corpora)) {
+            $formatEraCorpora[[string] $corpus.name] = $corpus
+        }
+    }
 
     $currentNames = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($corpus in @($Current.corpora)) {
@@ -197,19 +210,44 @@ function Compare-Reports {
             )
         }
 
-        foreach ($metric in @(
-            "cold_rebuild_ms",
-            "warm_rebuild_ms",
-            "compact_save_ms",
-            "compact_open_ms"
-        )) {
+        foreach ($metric in @("cold_rebuild_ms", "warm_rebuild_ms")) {
             Add-RegressionCheck $failures "$name.$metric" `
                 ([double] $frozen.$metric) ([double] $corpus.$metric) `
                 $AllowedPercent $TimingNoiseFloorMs
         }
-        foreach ($metric in @("compact_bytes", "hydrated_bytes")) {
+
+        $formatFrozen = if ($formatEraCorpora.ContainsKey($name)) {
+            $formatEraCorpora[$name]
+        }
+        else {
+            $frozen
+        }
+        foreach ($metric in @("compact_save_ms", "compact_open_ms")) {
+            if ($formatFrozen -ne $frozen) {
+                $original = [double] $frozen.$metric
+                $currentValue = [double] $corpus.$metric
+                $change = (($currentValue / $original) - 1.0) * 100.0
+                Write-Host ((
+                    "Format-era note: {0}.{1} is {2:N2}% from the original v4 baseline; " +
+                    "additional regression is enforced against the bound v5 reference."
+                ) -f $name, $metric, $change) -ForegroundColor DarkYellow
+            }
             Add-RegressionCheck $failures "$name.$metric" `
-                ([double] $frozen.$metric) ([double] $corpus.$metric) $AllowedPercent
+                ([double] $formatFrozen.$metric) ([double] $corpus.$metric) `
+                $AllowedPercent $TimingNoiseFloorMs
+        }
+        foreach ($metric in @("compact_bytes", "hydrated_bytes")) {
+            if ($formatFrozen -ne $frozen) {
+                $original = [double] $frozen.$metric
+                $currentValue = [double] $corpus.$metric
+                $change = (($currentValue / $original) - 1.0) * 100.0
+                Write-Host ((
+                    "Format-era note: {0}.{1} is {2:N2}% from the original v4 baseline; " +
+                    "additional regression is enforced against the bound v5 reference."
+                ) -f $name, $metric, $change) -ForegroundColor DarkYellow
+            }
+            Add-RegressionCheck $failures "$name.$metric" `
+                ([double] $formatFrozen.$metric) ([double] $corpus.$metric) $AllowedPercent
         }
     }
 
@@ -239,6 +277,18 @@ try {
     }
 
     $baseline = Get-Content -Raw -LiteralPath $baselineFullPath | ConvertFrom-Json
+    $formatEraReference = $null
+    if (Test-Path -LiteralPath $formatEraReferenceFullPath -PathType Leaf) {
+        $formatEraReference = Get-Content -Raw -LiteralPath $formatEraReferenceFullPath |
+            ConvertFrom-Json
+        if ([int] $formatEraReference.schema -ne [int] $baseline.schema) {
+            throw "Format-era reference schema $($formatEraReference.schema) does not match baseline schema $($baseline.schema)."
+        }
+        $baselineDigest = (Get-FileHash -LiteralPath $baselineFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ([string] $formatEraReference.baseline_sha256 -ne $baselineDigest) {
+            throw "The format-era reference is not bound to the current frozen Phase 0 baseline."
+        }
+    }
     if ($CurrentReportPath) {
         $currentFullPath = [System.IO.Path]::GetFullPath($CurrentReportPath)
         if (-not (Test-Path -LiteralPath $currentFullPath -PathType Leaf)) {
@@ -266,6 +316,9 @@ try {
         if ($outputFullPath -eq $baselineFullPath) {
             throw "Refusing to overwrite the frozen baseline; choose a separate output path."
         }
+        if ($outputFullPath -eq $formatEraReferenceFullPath) {
+            throw "Refusing to overwrite the format-era reference; choose a separate output path."
+        }
         $outputDirectory = Split-Path -Parent $outputFullPath
         if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory)) {
             New-Item -ItemType Directory -Path $outputDirectory | Out-Null
@@ -274,7 +327,7 @@ try {
         Write-Host "Wrote current measurements to $outputFullPath"
     }
 
-    $gatePassed = Compare-Reports $baseline $current $AllowedRegressionPercent
+    $gatePassed = Compare-Reports $baseline $current $AllowedRegressionPercent $formatEraReference
 }
 finally {
     Pop-Location

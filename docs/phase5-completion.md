@@ -12,18 +12,22 @@ not mistaken for missing validation or an unsafe approximation.
   build a pcurve-complete prism and then add or remove material transactionally.
   Analytic cylindrical walls use exact radius reconstruction or a revolved
   annular tool. Strict topology and checked tessellation gate the replacement.
-- **Move Face.** A planar face can move along its normal. A translation with a
-  tangential component fails with a diagnostic and leaves the source body
-  untouched.
-- **Thicken.** Planar faces create exact prismatic bodies and cylindrical faces
-  create exact revolved annular bodies. Thickness must remain finite, positive,
-  and non-collapsing.
-- **Delete Face.** An internal cylindrical wall is healed by filling its exact
-  trimmed axial span. The regression proves that healing a through-hole restores
-  the original volume without creating cap bosses.
-- **Curved Split Body.** A selected analytic cylindrical face divides a target
-  into deterministic inside and outside bodies. Both bodies must be positive,
-  strict, watertight, pcurve-complete, and volume-conserving before either is
+- **Move Face.** A planar face can move along its normal. Phase 6 additionally
+  rebuilds six-planar-face imported blocks for finite tangential translations,
+  preserving strict topology and named-face reattachment transactionally.
+- **Thicken.** Planar faces create exact prismatic bodies, cylindrical and
+  conical faces create exact revolved annular bodies, and spherical faces create
+  exact nested-shell bodies. Thickness must remain finite, positive, and
+  non-collapsing.
+- **Delete Face.** Internal cylindrical walls are healed by filling their exact
+  trimmed axial span; external cylindrical bosses are removed with their exact
+  analytic tool. Regressions prove through-hole fill and boss removal restore
+  the host volume without introducing caps or cavities.
+- **Curved Split Body.** Analytic cylindrical faces retain their infinite
+  divider semantics. Other selected strict solids act as bounded tools, which
+  closes the locally bounded split contract and is frozen by a conical-tool
+  regression. Both results must be positive, strict, watertight,
+  pcurve-complete, non-overlapping, and volume-conserving before either is
   committed.
 - **History and document behavior.** Exact boolean history is consumed by the
   existing naming adapter when available; conservative geometric naming covers
@@ -62,24 +66,39 @@ not mistaken for missing validation or an unsafe approximation.
 - Dedicated STL fixtures assert both non-manifold-edge and disconnected-component
   counts and their user-facing diagnostics.
 
-## Deliberate exact-set limits and removal phase
+## Phase 7 owned exceptions
 
-- General tangential Move Face needs neighborhood surgery rather than a face
-  offset. Phase 6 adds it behind imported-part reattachment fixtures.
-- Delete Face currently heals internal analytic cylindrical holes. External
-  walls, planar patch deletion, blends, and general surface gaps require a
-  deterministic patch-and-sew service in Phase 6.
-- Direct offset and thickening support planar and cylindrical surfaces. Conical,
-  spherical, toroidal, spline, and mixed-surface neighborhoods fail explicitly
-  until Phase 6 supplies exact local replacement and intersection curves.
-- Split Body accepts infinite planes and analytic cylindrical dividing
-  surfaces. A selected planar face currently contributes its plane rather than
-  acting as a locally bounded knife; general bounded or non-analytic curved
-  tools move to Phase 6.
-- STL units are not encoded by the format and are interpreted in document
-  units. Automatic repair, decimation, and surface-recognizing mesh-to-BRep stay
-  out of Part Design 1.0 unless introduced as explicit operations with their own
-  validation and provenance contracts.
+These are structured capability boundaries, not silent fallback paths. Each is
+owned and has an explicit removal trigger:
+
+- **General tangential Move Face.** Owner: OpenRCAD local-topology surgery.
+  Reason: arbitrary neighborhoods require extending/re-intersecting adjacent
+  surfaces rather than translating one face. User impact: Phase 6 supports the
+  common imported six-plane block; other neighborhoods fail atomically with a
+  diagnostic. Trigger: a strict imported-part fixture matrix covering analytic,
+  blend-adjacent, concave, and multi-loop neighborhoods with stable naming.
+- **General Delete Face patch-and-sew.** Owner: OpenRCAD healing/sewing. Reason:
+  planar exterior patches, blends, and mixed-surface gaps need deterministic
+  surface extension and trimming. User impact: internal cylindrical holes and
+  external cylindrical bosses are supported; other selections remain unchanged
+  and diagnosed. Trigger: patch history, pcurve reconstruction, and strict
+  watertight tests for planar, filleted, conical, and multi-face deletions.
+- **Non-analytic offset/thicken.** Owner: OpenRCAD surface-offset algorithms.
+  Reason: toroidal, spline, and mixed neighborhoods need exact intersection and
+  self-intersection classification. User impact: planar, cylindrical, conical,
+  and spherical surfaces are supported; the rest fail explicitly. Trigger: an
+  exact offset/intersection service passing scale, seam, and collapse matrices.
+- **Difficult non-analytic bounded splits.** Owner: OpenRCAD boolean
+  arrangements. Reason: the bounded-tool contract accepts any strict solid, but
+  success for B-spline-heavy tools is limited by the current intersection
+  engine. User impact: analytic bounded tools work; an unsupported tool fails
+  before commit. Trigger: curated STEP B-spline tool fixtures pass split,
+  conservation, pcurve, and downstream-operation gates.
+- **STL interpretation and repair.** Owner: post-1.0 mesh operations. Reason:
+  STL encodes no units and automatic repair/decimation changes source geometry.
+  User impact: input is interpreted in document units and diagnosed exactly as
+  supplied. Trigger: explicit provenance-bearing repair/decimation features;
+  surface-recognizing mesh-to-BRep remains outside Part Design 1.0.
 
 ## Verification record
 

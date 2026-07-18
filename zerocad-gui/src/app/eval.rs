@@ -96,6 +96,9 @@ impl ZeroCadApp {
     /// OpenRCAD's rolling-ball builder directly, so there is no separate
     /// faceted-preview/arc-refine swap.
     pub(crate) fn reevaluate_geometry(&mut self) {
+        self.document_revision = self.document_revision.wrapping_add(1);
+        let snapshot = self.current_document_snapshot();
+        self.recovery.note_edit(snapshot);
         self.spawn_refine_eval();
         self.status_msg = "Updating model...".to_string();
     }

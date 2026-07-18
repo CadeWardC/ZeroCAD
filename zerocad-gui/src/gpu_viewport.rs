@@ -72,6 +72,8 @@ pub(crate) struct SceneFrame<'a> {
     pub samples: u32,
     /// Wireframe line width in physical pixels.
     pub edge_px: f32,
+    /// World-space section half-space passed directly to the GPU shader.
+    pub clip_plane: Option<[f32; 4]>,
 }
 
 /// Per-body upload cache entry: geometry fingerprint + the derived face-id
@@ -455,6 +457,7 @@ impl GpuViewport {
             color: BODY_COLOR,
             viewport_px: [px_w as f32, px_h as f32],
             edge_px: frame.edge_px,
+            clip_plane: frame.clip_plane,
         };
 
         let mut render_key = view_proj_hash(&globals.view_proj);
@@ -467,6 +470,9 @@ impl GpuViewport {
         mix(((px_w as u64) << 32) | px_h as u64);
         mix(samples as u64);
         mix(frame.draw_bodies as u64);
+        for component in frame.clip_plane.unwrap_or([0.0, 0.0, 0.0, 1.0]) {
+            mix(component.to_bits() as u64);
+        }
         for (node, face) in frame.selected_faces {
             for byte in node.as_bytes() {
                 mix(*byte as u64);
@@ -994,6 +1000,112 @@ fn mock_meshes_to_layer_soup<'a>(meshes: impl Iterator<Item = &'a MockMesh>) -> 
     }
 }
 
+/// Build the filled surface that closes a clipped viewport body. The contour
+/// extractor is shared with the CPU section path and loop triangulation is
+/// shared through `geom2d`, leaving only projection/unprojection backend-local.
+fn section_cap_mesh<'a>(
+    meshes: impl Iterator<Item = &'a MockMesh>,
+    section: &SectionView,
+) -> Option<GpuMesh> {
+    let (origin, normal) = section.plane();
+    let mut contours = Vec::new();
+    for mesh in meshes {
+        let clipped = zerocad_core::mock_kernel::clip_mesh_by_plane(
+            mesh,
+            origin,
+            normal,
+            section.keep_positive,
+        )
+        .ok()?;
+        contours.extend(clipped.contours);
+    }
+    if contours.is_empty() {
+        return None;
+    }
+
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let normalize = |value: [f32; 3]| {
+        let length = (value[0] * value[0] + value[1] * value[1] + value[2] * value[2]).sqrt();
+        [value[0] / length, value[1] / length, value[2] / length]
+    };
+    let reference = if normal[2].abs() < 0.9 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let u = normalize(cross(reference, normal));
+    let v = cross(normal, u);
+    let project = |point: [f32; 3]| {
+        let relative = [
+            point[0] - origin[0],
+            point[1] - origin[1],
+            point[2] - origin[2],
+        ];
+        egui::pos2(
+            relative[0] * u[0] + relative[1] * u[1] + relative[2] * u[2],
+            relative[0] * v[0] + relative[1] * v[1] + relative[2] * v[2],
+        )
+    };
+    let loops: Vec<Vec<egui::Pos2>> = contours
+        .iter()
+        .map(|contour| contour.iter().copied().map(project).collect())
+        .collect();
+    let triangles = crate::geom2d::triangulate_nested_loops(&loops);
+    if triangles.is_empty() {
+        return None;
+    }
+
+    let mut span: f32 = 0.0;
+    for contour in &contours {
+        for point in contour {
+            span = span.max((point[0] - origin[0]).abs());
+            span = span.max((point[1] - origin[1]).abs());
+            span = span.max((point[2] - origin[2]).abs());
+        }
+    }
+    // Bias the cap a microscopic distance into the retained half-space. This
+    // prevents a round-off-negative plane dot product from clipping the cap
+    // itself without creating a visibly separate sheet.
+    let kept_normal = if section.keep_positive {
+        normal
+    } else {
+        [-normal[0], -normal[1], -normal[2]]
+    };
+    let bias = (span * 1.0e-6).max(1.0e-7);
+    let outward = [-kept_normal[0], -kept_normal[1], -kept_normal[2]];
+    let unproject = |point: egui::Pos2| {
+        [
+            origin[0] + u[0] * point.x + v[0] * point.y + kept_normal[0] * bias,
+            origin[1] + u[1] * point.x + v[1] * point.y + kept_normal[1] * bias,
+            origin[2] + u[2] * point.x + v[2] * point.y + kept_normal[2] * bias,
+        ]
+    };
+
+    let mut positions = Vec::with_capacity(triangles.len() * 9);
+    let mut normals = Vec::with_capacity(triangles.len() * 9);
+    let mut face_ids = Vec::with_capacity(triangles.len());
+    for triangle in triangles {
+        for point in triangle {
+            positions.extend_from_slice(&unproject(point));
+            normals.extend_from_slice(&outward);
+        }
+        face_ids.push(0);
+    }
+    let vertex_count = positions.len() / 3;
+    Some(GpuMesh {
+        positions,
+        normals,
+        indices: (0..vertex_count as u32).collect(),
+        face_ids,
+    })
+}
+
 impl ZeroCadApp {
     /// Render the scene (committed bodies + this frame's operation preview) to
     /// the GPU offscreen texture and stash the resulting egui texture id in
@@ -1134,6 +1246,22 @@ impl ZeroCadApp {
                 },
             ));
         }
+        if let Some(section) = self.section_view.as_ref().filter(|section| section.capped) {
+            let source = plan.preview_bodies.as_ref().unwrap_or(&self.body_meshes);
+            if let Some(cap) = section_cap_mesh(source.iter().map(|(_, mesh)| mesh), section) {
+                layers.push((
+                    cap,
+                    LayerStyle {
+                        color: srgb8_to_linear(245, 120, 70),
+                        alpha: 210.0 / 255.0,
+                        cull_back: false,
+                        draw_edges: false,
+                        face_tint: false,
+                        xray: false,
+                    },
+                ));
+            }
+        }
 
         let cam = CameraParams {
             pitch: self.camera_pitch,
@@ -1216,6 +1344,18 @@ impl ZeroCadApp {
             px_h,
             samples,
             edge_px,
+            clip_plane: self.section_view.as_ref().map(|section| {
+                let (origin, mut normal) = section.plane();
+                if !section.keep_positive {
+                    normal = normal.map(|component| -component);
+                }
+                [
+                    normal[0],
+                    normal[1],
+                    normal[2],
+                    -(normal[0] * origin[0] + normal[1] * origin[1] + normal[2] * origin[2]),
+                ]
+            }),
         };
         let prepare_elapsed = prepare_started.elapsed();
         if prepare_elapsed >= std::time::Duration::from_millis(4) {
@@ -1275,6 +1415,45 @@ mod tests {
         assert_eq!(ids, vec![0, 1, 2]);
         // The same MockMesh face id in different bodies stays a distinct face.
         assert_ne!(map[&("a".to_string(), 7)], map[&("b".to_string(), 7)]);
+    }
+
+    #[test]
+    fn arbitrary_section_cap_is_gpu_geometry_on_the_retained_plane() {
+        let body = MockMesh::make_box(10.0, 8.0, 6.0);
+        let section = SectionView {
+            origin: [5.0, 4.0, 3.0],
+            normal: [0.3, 0.4, 0.5],
+            offset: 0.0,
+            keep_positive: true,
+            capped: true,
+        };
+        let cap = section_cap_mesh(std::iter::once(&body), &section)
+            .expect("an oblique box section should produce a GPU cap");
+        assert!(!cap.indices.is_empty());
+        assert_eq!(cap.positions.len(), cap.normals.len());
+        assert_eq!(cap.indices.len() / 3, cap.face_ids.len());
+
+        let (origin, normal) = section.plane();
+        let mut area = 0.0_f32;
+        for triangle in cap.positions.chunks_exact(9) {
+            for point in triangle.chunks_exact(3) {
+                let signed = (point[0] - origin[0]) * normal[0]
+                    + (point[1] - origin[1]) * normal[1]
+                    + (point[2] - origin[2]) * normal[2];
+                assert!(signed >= 0.0, "cap vertex escaped the retained half-space");
+                assert!(signed < 1.0e-3, "cap bias must remain visually negligible");
+            }
+            let a = [triangle[0], triangle[1], triangle[2]];
+            let ab = [triangle[3] - a[0], triangle[4] - a[1], triangle[5] - a[2]];
+            let ac = [triangle[6] - a[0], triangle[7] - a[1], triangle[8] - a[2]];
+            let cross = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            area += 0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+        }
+        assert!(area > 1.0, "section cap must contain non-degenerate area");
     }
 
     /// Reference reimplementation of `render.rs`'s `project_3d`, returning the
