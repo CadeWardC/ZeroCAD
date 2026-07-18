@@ -1401,7 +1401,9 @@ impl ParametricGraph {
                         | crate::document::FeatureEvaluatorKind::Loft
                         | crate::document::FeatureEvaluatorKind::Sweep
                         | crate::document::FeatureEvaluatorKind::Shell
-                        | crate::document::FeatureEvaluatorKind::Hole),
+                        | crate::document::FeatureEvaluatorKind::Hole
+                        | crate::document::FeatureEvaluatorKind::Pattern
+                        | crate::document::FeatureEvaluatorKind::BodyTransform),
                     ) => {
                         let context = FeatureEvalContext {
                             feature: node,
@@ -1430,6 +1432,10 @@ impl ParametricGraph {
                             crate::document::FeatureEvaluatorKind::Shell
                             | crate::document::FeatureEvaluatorKind::Hole => {
                                 self.evaluate_shell_or_hole_candidate(evaluator, context)
+                            }
+                            crate::document::FeatureEvaluatorKind::Pattern
+                            | crate::document::FeatureEvaluatorKind::BodyTransform => {
+                                self.evaluate_pattern_or_transform_candidate(evaluator, context)
                             }
                             _ => unreachable!(),
                         };
@@ -1868,6 +1874,92 @@ impl ParametricGraph {
         })
     }
 
+    fn evaluate_pattern_or_transform_candidate(
+        &self,
+        evaluator: crate::document::FeatureEvaluatorKind,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        let started = std::time::Instant::now();
+        if context
+            .cancellation
+            .is_some_and(EvaluationCancellation::is_cancelled)
+        {
+            return Err("model evaluation was superseded".into());
+        }
+        let mut candidate_body_state = context.live_bodies.to_vec();
+        let mut warnings = Vec::new();
+        match evaluator {
+            crate::document::FeatureEvaluatorKind::Pattern => {
+                let FeatureType::Pattern { source, kind } = &context.feature.feature else {
+                    return Err(format!(
+                        "registry evaluator Pattern cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                apply_pattern(
+                    context.feature_id.as_str(),
+                    source,
+                    kind,
+                    context.variables,
+                    context.datums,
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            crate::document::FeatureEvaluatorKind::BodyTransform => {
+                let FeatureType::BodyTransform {
+                    source,
+                    translation,
+                    copy,
+                } = &context.feature.feature
+                else {
+                    return Err(format!(
+                        "registry evaluator BodyTransform cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                apply_body_transform(
+                    context.feature_id.as_str(),
+                    source,
+                    *translation,
+                    *copy,
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            _ => return Err("non Pattern/Transform family reached the contract".into()),
+        }
+        let diagnostics = warnings
+            .into_iter()
+            .filter_map(|message| {
+                super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                    feature_id: context.feature_id.to_string(),
+                    feature_name: context.feature.name.clone(),
+                    state: ResolutionState::Unresolved(message),
+                })
+            })
+            .collect();
+        let topology_history = Vec::new();
+        let validation_evidence = FeatureValidationEvidence {
+            input_body_count: context.live_bodies.len(),
+            candidate_body_count: candidate_body_state.len(),
+            topology_history_entries: topology_history.len(),
+        };
+        let _quality = context.quality;
+        let _tolerance = context.tolerance;
+        Ok(FeatureEvalResult {
+            candidate_body_state,
+            topology_history,
+            diagnostics,
+            validation_evidence,
+            feature_timing: started.elapsed(),
+            writebacks: RevisionBoundWritebacks {
+                producing_revision: context.document_revision,
+                face_reattach: FaceReattach::default(),
+            },
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn invoke_registered_feature(
         &self,
@@ -2071,21 +2163,10 @@ impl ParametricGraph {
                 return Err("Revolve must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Pattern => {
-                let FeatureType::Pattern { source, kind } = &node.feature else {
-                    return Err(payload_mismatch());
-                };
-                apply_pattern(&node.id, source, kind, vars, datums, live, warnings);
+                return Err("Pattern must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::BodyTransform => {
-                let FeatureType::BodyTransform {
-                    source,
-                    translation,
-                    copy,
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                apply_body_transform(&node.id, source, *translation, *copy, live, warnings);
+                return Err("BodyTransform must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::BodyJoin => {
                 let FeatureType::BodyJoin { sources } = &node.feature else {

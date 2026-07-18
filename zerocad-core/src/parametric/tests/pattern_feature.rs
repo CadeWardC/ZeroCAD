@@ -371,12 +371,63 @@ fn missing_source_warns() {
             },
         },
     });
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
-    assert_eq!(bodies.len(), 1); // just the box
+    assert_eq!(output.bodies.len(), 1); // just the box
     assert!(
-        warnings.iter().any(|w| w.contains("pattern_2")),
-        "warnings: {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "pattern_2"
+                && diagnostic.code.as_str() == DiagnosticCode::REFERENCE_MISSING
+        }),
+        "diagnostics: {:?}",
+        output.diagnostics
     );
+}
+
+#[test]
+fn pattern_candidate_contract_cold_warm_cancel_and_restore() {
+    let mut graph = ParametricGraph::new();
+    add_box(&mut graph, "box_contract", 2.0, 2.0, 2.0);
+    add_pattern(
+        &mut graph,
+        "pattern_contract",
+        "box_contract",
+        PatternKind::Linear {
+            dir: AxisBase::X,
+            spacing: 5.0,
+            spacing_expr: None,
+            count: 3,
+        },
+    );
+    let hidden = std::collections::HashSet::new();
+    let cold = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let warm = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert!(cold.1.is_empty() && warm.1.is_empty());
+    assert_eq!(cold.0.len(), warm.0.len());
+    for ((cold_id, cold_mesh), (warm_id, warm_mesh)) in cold.0.iter().zip(&warm.0) {
+        assert_eq!(cold_id, warm_id);
+        assert_eq!(cold_mesh.indices, warm_mesh.indices);
+    }
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+    assert!(matches!(
+        graph.evaluate_request(
+            &hidden,
+            EvaluationQuality::Interactive,
+            &EvaluationCancellation::new(1, cancelled),
+        ),
+        Err(EvaluationError::Cancelled)
+    ));
+    let restored: ParametricGraph =
+        serde_json::from_str(&serde_json::to_string(&graph.clone_document()).unwrap()).unwrap();
+    assert!(restored
+        .evaluate_bodies_with_warnings(&hidden)
+        .unwrap()
+        .1
+        .is_empty());
 }
