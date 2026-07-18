@@ -70,7 +70,7 @@ fn geometry_safety_net_is_enabled() {
 #[test]
 fn cross_cutting_and_construction_equivalence_gates_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let gate = fs::read_to_string(root.join("tests/phase3_operation_gate.rs"))
+    let gate = fs::read_to_string(root.join("tests/native_operation_gate.rs"))
         .expect("Phase 3 operation gate must exist");
     for operation in [
         "STEP import",

@@ -1,4 +1,4 @@
-//! Phase 3.5 body-operation dialogs: planar Split and uniform Scale.
+//! Body-operation dialogs: planar Split and uniform Scale.
 
 use crate::*;
 use zerocad_core::parametric::{body_bounds_center, FaceRef};
