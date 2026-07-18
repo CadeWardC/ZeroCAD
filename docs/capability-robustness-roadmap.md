@@ -19,23 +19,43 @@ they are not active vNext release gates.
   previous recorded baseline contain release and CI infrastructure only.
 - The Part Design 1.0 candidate is explicitly superseded. No release branch or
   tag is created, and published history is not rewritten.
-- The four-file rustfmt drift is closed; ZeroCAD formatting, check, full tests,
-  and core clippy complete successfully. Clippy retains the previously reviewed
-  advisory warnings.
-- The separate OpenRCAD formatting and locked workspace test gates complete
-  successfully.
-- Foundation 1A's first slice is implemented: registry-owned schema/storage
-  decoder dispatch, two-phase decode before graph construction, current-schema
-  normalization, and rejection tests for unregistered older/newer payload
-  schemas. No fictional historical schema was added.
+- Gate 0 and Foundations 1A-1E are implemented as 27 bisectable commits after
+  the named baseline. `.zcad` v5 framing, v1 payload bytes, published tags, and
+  serialized identifier strings remain unchanged.
+- Foundation 1A owns version-aware two-phase payload decoding and typed
+  diagnostics. Behavioral tests assert codes and parameters; a small renderer
+  suite owns exact English copy. Synthetic multi-schema coverage uses an
+  injected test-only decoder table rather than a fictional persisted schema.
+- Foundation 1B uses candidate evaluator contracts, typed feature/body
+  identities, a single orchestrator transaction boundary, self-healing node
+  maps, isolated mesh support, and parsed durable topology names. Every migrated
+  family has cold/warm, cancellation, rollback, and lifecycle coverage.
+- Foundation 1C reprojects durable references, suspends missing names, stages
+  explicit legacy backfill, separates geometry and diagnostic cache
+  dependencies, traces checkpoint/tessellation reuse, binds writebacks to
+  document revisions, and preserves both whole-document and working-sketch undo.
+- Foundation 1D provides canonical Boolean cases, deterministic Windows replay,
+  WSL2/nightly fuzz lanes, derived tolerance contexts, scale/aspect/far-origin
+  sweeps, recovery certificates, and an explicit release-unwind guard. The
+  property sweeps landed in the same commit as removal of the unit-scale floor.
+- Foundation 1E provides provenance-bearing analytic arrangements, typed staged
+  ellipse/spline support, a shared material offset engine, and hole-aware
+  deterministic Loft/Sweep skinning.
+- ZeroCAD formatting, check, full tests, and core clippy complete successfully.
+  Foundation 1 introduced no new clippy warnings; the previously reviewed
+  advisory backlog remains. The nested OpenRCAD formatting, locked check, and
+  locked workspace tests also complete successfully.
 - Gate 0's first semantic golden is committed in
   `zerocad-core/tests/fixtures/semantic/vnext-baseline-v1.json`. Its comparator
   freezes document/output structure exactly, derives geometry tolerances from
   the OpenRCAD standard policy, and deliberately excludes triangle order and raw
   mesh buffers.
-- The benchmark reference is the existing Lenovo 82XU (Ryzen 7 7840HS, 16 GiB,
-  Windows 11, Rust 1.94). The release-mode modeling profiler and its p50/p95
-  evidence remain implementation work in this roadmap.
+- The release-mode modeling percentile gate is implemented for the existing
+  Lenovo 82XU (Ryzen 7 7840HS, 16 GiB, Windows 11, Rust 1.94). It enforces five
+  warmups, 31 samples, nearest-rank p50/p95, AC power, and the effective **Best
+  performance** overlay. Smoke output is marked non-evidence. A valid reference
+  run remains pending because this machine currently reports the **Better
+  battery** overlay; the runner refuses to mislabel that result.
 
 ## Delivery principles
 
