@@ -1832,7 +1832,7 @@ impl ParametricGraph {
 
     fn evaluate_loft_or_sweep_candidate(
         &self,
-        evaluator: crate::document::FeatureEvaluatorKind,
+        family: crate::document::FeatureEvaluatorKind,
         context: FeatureEvalContext<'_>,
     ) -> Result<FeatureEvalResult, String> {
         let started = std::time::Instant::now();
@@ -1844,7 +1844,7 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
-        match evaluator {
+        match family {
             crate::document::FeatureEvaluatorKind::Loft => {
                 let FeatureType::Loft {
                     sections,
@@ -1931,7 +1931,7 @@ impl ParametricGraph {
 
     fn evaluate_shell_or_hole_candidate(
         &self,
-        evaluator: crate::document::FeatureEvaluatorKind,
+        family: crate::document::FeatureEvaluatorKind,
         context: FeatureEvalContext<'_>,
     ) -> Result<FeatureEvalResult, String> {
         let started = std::time::Instant::now();
@@ -1943,7 +1943,7 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
-        match evaluator {
+        match family {
             crate::document::FeatureEvaluatorKind::Shell => {
                 let FeatureType::Shell {
                     target,
@@ -2061,7 +2061,7 @@ impl ParametricGraph {
 
     fn evaluate_pattern_or_transform_candidate(
         &self,
-        evaluator: crate::document::FeatureEvaluatorKind,
+        family: crate::document::FeatureEvaluatorKind,
         context: FeatureEvalContext<'_>,
     ) -> Result<FeatureEvalResult, String> {
         let started = std::time::Instant::now();
@@ -2073,7 +2073,7 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
-        match evaluator {
+        match family {
             crate::document::FeatureEvaluatorKind::Pattern => {
                 let FeatureType::Pattern { source, kind } = &context.feature.feature else {
                     return Err(format!(
@@ -2330,7 +2330,7 @@ impl ParametricGraph {
     fn invoke_registered_feature(
         &self,
         idx: NodeIndex,
-        evaluator: crate::document::FeatureEvaluatorKind,
+        implementation: crate::document::FeatureEvaluatorKind,
         vars: &HashMap<String, f64>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         datums: &HashMap<String, DatumValue>,
@@ -2341,12 +2341,15 @@ impl ParametricGraph {
         let node = &self.graph[idx];
         let payload_mismatch = || {
             format!(
-                "registry evaluator {evaluator:?} cannot invoke feature kind '{}'",
+                "registry evaluator {implementation:?} cannot invoke feature kind '{}'",
                 node.feature.kind_id()
             )
         };
 
-        match evaluator {
+        // The orchestrator owns the one exact registry transaction dispatch.
+        // This switch selects an implementation inside its already isolated
+        // direct/body candidate family and must not become another commit path.
+        match implementation {
             crate::document::FeatureEvaluatorKind::Box => {
                 let FeatureType::Box { w, h, d } = &node.feature else {
                     return Err(payload_mismatch());
