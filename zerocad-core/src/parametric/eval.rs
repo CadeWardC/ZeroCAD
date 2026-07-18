@@ -4248,8 +4248,7 @@ impl ParametricGraph {
             ));
             return;
         }
-        let mut resolved: Vec<(CoordinateSystem, Vec<(f32, f32)>, Vec<Vec<(f32, f32)>>)> =
-            Vec::new();
+        let mut resolved: Vec<crate::mock_kernel::LoftSectionProfile> = Vec::new();
         for (sketch_id, region_index) in sections {
             let Some(sketch) = self.sketch_eval_by_id(sketch_cache, sketch_id) else {
                 warnings.push(format!(

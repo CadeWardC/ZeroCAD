@@ -337,13 +337,7 @@ fn resample_ring_2d(pts: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
 /// deterministic [`openrcad::algo::SectionLoops`] correspondence service.
 /// `None` when there are fewer than two sections, hole topology changes, hole
 /// matching is ambiguous, or the skin fails to close.
-pub fn lofted_solid(
-    sections: &[(
-        crate::geometry::CoordinateSystem,
-        Vec<(f32, f32)>,
-        Vec<Vec<(f32, f32)>>,
-    )],
-) -> Option<KernelSolid> {
+pub fn lofted_solid(sections: &[super::LoftSectionProfile]) -> Option<KernelSolid> {
     if sections.len() < 2 {
         return None;
     }

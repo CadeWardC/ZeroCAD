@@ -22,6 +22,12 @@ use openrcad::topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
 use crate::geometry::Vec3;
 
+pub(crate) type LoftSectionProfile = (
+    crate::geometry::CoordinateSystem,
+    Vec<(f32, f32)>,
+    Vec<Vec<(f32, f32)>>,
+);
+
 mod arc_display;
 mod blend;
 mod boolean;

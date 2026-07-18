@@ -497,7 +497,7 @@ pub(crate) fn analytic_loop_to_wire<P>(
                     spline.multiplicities().to_vec(),
                 )))
             }
-            GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => return None,
+            GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => None,
         }
     }
 
