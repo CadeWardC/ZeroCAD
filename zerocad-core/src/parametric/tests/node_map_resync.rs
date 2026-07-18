@@ -54,6 +54,104 @@ fn re_extrude_after_remove_feature_builds_a_body() {
     );
 }
 
+/// Full lifecycle regression for the historical serde-skip trap: capture an
+/// undo snapshot, restore it, serialize/load once more, delete the original
+/// body feature (which swap-moves the arena), and re-extrude the surviving
+/// sketch. Every restore/delete boundary must rederive or self-heal `node_map`.
+#[test]
+fn undo_load_delete_and_re_extrude_preserves_dependency_wiring() {
+    let mut original = ParametricGraph::new();
+    add_sketch(
+        &mut original,
+        "sketch_1",
+        rect_sketch((0.0, 0.0), (10.0, 10.0)),
+    );
+    add_extrude(
+        &mut original,
+        "extrude_2",
+        "sketch_1",
+        5.0,
+        ExtrudeMode::NewBody,
+    );
+
+    let undo_snapshot = serde_json::to_string(&original.clone_document()).unwrap();
+    original.add_feature(FeatureNode {
+        id: "box_3".into(),
+        name: "Transient edit".into(),
+        feature: FeatureType::Box {
+            w: 2.0,
+            h: 2.0,
+            d: 2.0,
+        },
+    });
+    let restored: ParametricGraph = serde_json::from_str(&undo_snapshot).unwrap();
+
+    // A second round trip represents canonical document loading after undo.
+    let loaded_bytes = serde_json::to_vec(&restored).unwrap();
+    let mut loaded: ParametricGraph = serde_json::from_slice(&loaded_bytes).unwrap();
+    assert!(loaded.remove_feature("extrude_2"));
+    add_extrude(
+        &mut loaded,
+        "extrude_4",
+        "sketch_1",
+        7.0,
+        ExtrudeMode::NewBody,
+    );
+
+    assert_eq!(body_count(&loaded), 1);
+    let sketch = loaded.node_map["sketch_1"];
+    let extrude = loaded.node_map["extrude_4"];
+    assert!(loaded.graph.find_edge(sketch, extrude).is_some());
+}
+
+#[test]
+fn evaluator_family_dependency_matrix_is_explicit() {
+    use crate::document::FeatureEvaluatorKind as Family;
+
+    // Infrastructure/sketch/datum are pre-pass families. Every body family is
+    // listed here so typed-ID migration cannot silently omit a newly registered
+    // evaluator from lifecycle coverage.
+    let body_families = [
+        Family::Box,
+        Family::Cylinder,
+        Family::Extrude,
+        Family::EdgeMod,
+        Family::Import,
+        Family::Revolve,
+        Family::Loft,
+        Family::Sweep,
+        Family::Shell,
+        Family::Hole,
+        Family::Pattern,
+        Family::BodyTransform,
+        Family::Thread,
+        Family::BodyJoin,
+        Family::BodyCut,
+        Family::BodyIntersect,
+        Family::BodySplit,
+        Family::BodyScale,
+        Family::FaceOffset,
+        Family::FaceMove,
+        Family::FaceDelete,
+        Family::FaceThicken,
+        Family::ImportStl,
+    ];
+    let registered: Vec<_> = crate::document::FeatureRegistry::BUILTINS
+        .iter()
+        .map(|registration| registration.evaluator)
+        .filter(|family| {
+            !matches!(
+                family,
+                Family::Infrastructure | Family::Sketch | Family::Datum
+            )
+        })
+        .collect();
+    assert_eq!(registered.len(), body_families.len());
+    for family in body_families {
+        assert!(registered.contains(&family), "missing family {family:?}");
+    }
+}
+
 /// Even a raw `graph.remove_node` (bypassing `remove_feature`) must not poison
 /// later `add_dependency` calls: the lookup self-heals on a stale entry.
 #[test]
