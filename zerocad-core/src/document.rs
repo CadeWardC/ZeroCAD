@@ -47,9 +47,77 @@ macro_rules! string_id {
             }
         }
 
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl From<&$name> for String {
+            fn from(value: &$name) -> Self {
+                value.0.clone()
+            }
+        }
+
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.as_str() == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.as_str() == *other
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                self.as_str() == other
+            }
+        }
+
+        impl PartialEq<$name> for str {
+            fn eq(&self, other: &$name) -> bool {
+                self == other.as_str()
+            }
+        }
+
+        impl PartialEq<$name> for &str {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.as_str()
+            }
+        }
+
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                self.as_str() == other.as_str()
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = str;
+
+            fn deref(&self) -> &Self::Target {
+                self.as_str()
             }
         }
     };

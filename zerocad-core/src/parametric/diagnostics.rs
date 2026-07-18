@@ -21,7 +21,7 @@ pub(crate) fn diagnostic_for_status(status: &FeatureStatus) -> Option<Evaluation
             DiagnosticSeverity::Warning,
             message,
         )
-        .with_parameter("feature_id", status.feature_id.clone())
+        .with_parameter("feature_id", status.feature_id.to_string())
         .with_parameter("feature_name", status.feature_name.clone())
         // `unresolved_feature` was the public pre-typed classification. Keep it
         // for one compatibility cycle while `code` carries the new contract.

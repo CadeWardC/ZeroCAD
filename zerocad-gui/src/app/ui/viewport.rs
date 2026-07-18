@@ -850,8 +850,10 @@ impl ZeroCadApp {
                                         // one the extrude will store. Edge picking
                                         // above stays on the drawn curves only.
                                         let mut region_curves = curves.clone();
-                                        if let Some(b) =
-                                            self.document.sketch_face_boundaries.get(&node.id)
+                                        if let Some(b) = self
+                                            .document
+                                            .sketch_face_boundaries
+                                            .get(node.id.as_str())
                                         {
                                             region_curves.extend_curves(b);
                                         }

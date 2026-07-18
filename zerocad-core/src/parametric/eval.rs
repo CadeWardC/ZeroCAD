@@ -116,7 +116,7 @@ impl ParametricGraph {
             crate::document::SequenceKey(0),
         );
         let idx = self.graph.add_node(origin);
-        self.node_map.insert("origin".to_string(), idx);
+        self.node_map.insert("origin".into(), idx);
     }
 
     fn next_sequence(&self) -> crate::document::SequenceKey {
@@ -138,7 +138,7 @@ impl ParametricGraph {
         let feature_id = crate::document::FeatureId::from(id.as_str());
         let name = record.name.clone();
         let idx = self.graph.add_node(record);
-        self.node_map.insert(id, idx);
+        self.node_map.insert(id.into(), idx);
         if let Some(body_id) = body {
             self.semantics
                 .body_outputs
@@ -282,7 +282,7 @@ impl ParametricGraph {
             !body.timeline.is_empty()
         });
         for idx in self.graph.node_indices() {
-            self.node_map.insert(self.graph[idx].id.clone(), idx);
+            self.node_map.insert(self.graph[idx].id.clone().into(), idx);
             if let Some(body) = &self.graph[idx].body {
                 self.semantics
                     .body_outputs
@@ -1271,7 +1271,10 @@ impl ParametricGraph {
         hidden: &std::collections::HashSet<String>,
     ) -> Result<Vec<(String, Vec<crate::mock_kernel::KernelSolid>)>, String> {
         let (live, _) = self.build_live(hidden, false)?;
-        Ok(live.into_iter().map(|b| (b.id, b.parts)).collect())
+        Ok(live
+            .into_iter()
+            .map(|b| (b.id.to_string(), b.parts))
+            .collect())
     }
 
     pub(crate) fn build_live(
@@ -1399,7 +1402,7 @@ impl ParametricGraph {
             let warn_before = warnings.len();
             if self.is_feature_suppressed(&node.id) {
                 statuses.push(FeatureStatus {
-                    feature_id: node.id.clone(),
+                    feature_id: node.id.clone().into(),
                     feature_name: node.name.clone(),
                     state: ResolutionState::Suppressed,
                 });
@@ -1548,7 +1551,7 @@ impl ParametricGraph {
                     ResolutionState::Resolved
                 };
                 statuses.push(FeatureStatus {
-                    feature_id: node.id.clone(),
+                    feature_id: node.id.clone().into(),
                     feature_name: node.name.clone(),
                     state,
                 });
@@ -1653,7 +1656,7 @@ impl ParametricGraph {
             .into_iter()
             .filter_map(|message| {
                 super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.to_string(),
+                    feature_id: context.feature_id.clone(),
                     feature_name: context.feature.name.clone(),
                     state: ResolutionState::Unresolved(message),
                 })
@@ -1755,7 +1758,7 @@ impl ParametricGraph {
             .into_iter()
             .filter_map(|message| {
                 super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.to_string(),
+                    feature_id: context.feature_id.clone(),
                     feature_name: context.feature.name.clone(),
                     state: ResolutionState::Unresolved(message),
                 })
@@ -1885,7 +1888,7 @@ impl ParametricGraph {
             .into_iter()
             .filter_map(|message| {
                 super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.to_string(),
+                    feature_id: context.feature_id.clone(),
                     feature_name: context.feature.name.clone(),
                     state: ResolutionState::Unresolved(message),
                 })
@@ -1972,7 +1975,7 @@ impl ParametricGraph {
             .into_iter()
             .filter_map(|message| {
                 super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.to_string(),
+                    feature_id: context.feature_id.clone(),
                     feature_name: context.feature.name.clone(),
                     state: ResolutionState::Unresolved(message),
                 })
@@ -2051,7 +2054,7 @@ impl ParametricGraph {
             .into_iter()
             .filter_map(|message| {
                 super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.to_string(),
+                    feature_id: context.feature_id.clone(),
                     feature_name: context.feature.name.clone(),
                     state: ResolutionState::Unresolved(message),
                 })
@@ -2112,7 +2115,7 @@ impl ParametricGraph {
             .into_iter()
             .filter_map(|message| {
                 super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.to_string(),
+                    feature_id: context.feature_id.clone(),
                     feature_name: context.feature.name.clone(),
                     state: ResolutionState::Unresolved(message),
                 })
@@ -2218,7 +2221,7 @@ impl ParametricGraph {
                 apply_new(
                     live,
                     LiveBody {
-                        id: node.id.clone(),
+                        id: node.id.clone().into(),
                         parts: vec![solid],
                         pristine: Some(pristine.into()),
                         sketch_source: Some(source),
@@ -2239,7 +2242,7 @@ impl ParametricGraph {
                     apply_new(
                         live,
                         LiveBody {
-                            id: node.id.clone(),
+                            id: node.id.clone().into(),
                             parts: vec![solid],
                             pristine: Some(pristine.into()),
                             sketch_source: None,
@@ -2273,7 +2276,7 @@ impl ParametricGraph {
                         apply_new(
                             live,
                             LiveBody {
-                                id: node.id.clone(),
+                                id: node.id.clone().into(),
                                 parts: vec![solid],
                                 pristine: Some(pristine.into()),
                                 sketch_source: None,
@@ -2310,7 +2313,7 @@ impl ParametricGraph {
                         apply_new(
                             live,
                             LiveBody {
-                                id: node.id.clone(),
+                                id: node.id.clone().into(),
                                 parts: Vec::new(),
                                 pristine: Some(mesh.into()),
                                 sketch_source: None,
@@ -2632,7 +2635,8 @@ impl ParametricGraph {
             h.write_u8(self.is_feature_suppressed(&node.id) as u8);
             fold_feature(&mut h, &node.feature);
         }
-        let mut datum_refs: Vec<(&String, &String)> = self.sketch_datum_refs.iter().collect();
+        let mut datum_refs: Vec<(&crate::document::FeatureId, &crate::document::FeatureId)> =
+            self.sketch_datum_refs.iter().collect();
         datum_refs.sort();
         for (sketch_id, datum_id) in datum_refs {
             h.write(sketch_id.as_bytes());
@@ -2703,7 +2707,7 @@ impl ParametricGraph {
                 // recognizers downstream depend on that).
                 let face_boundary = self
                     .sketch_face_boundaries
-                    .get(&self.graph[idx].id)
+                    .get(self.graph[idx].id.as_str())
                     .cloned();
                 // Fail-loud: a variable-driven constraint model that no longer
                 // solves keeps its last-valid geometry, and the failure reason
@@ -2920,23 +2924,23 @@ impl ParametricGraph {
         // attachment re-derives from wherever the face is now; otherwise the
         // sketch's saved plane. A datum that no longer resolves fails loud and
         // falls back to the saved plane snapshot.
-        let datum_cs =
-            self.sketch_datum_refs
-                .get(sketch_id)
-                .and_then(|datum_id| match datums.get(datum_id) {
-                    Some(DatumValue::Plane(cs)) => Some(*cs),
-                    _ => {
-                        warnings.push(format!(
-                            "Extrude '{node_id}': sketch '{sketch_id}' is attached to datum plane \
+        let datum_cs = self
+            .sketch_datum_refs
+            .get(sketch_id.as_str())
+            .and_then(|datum_id| match datums.get(datum_id.as_str()) {
+                Some(DatumValue::Plane(cs)) => Some(*cs),
+                _ => {
+                    warnings.push(format!(
+                        "Extrude '{node_id}': sketch '{sketch_id}' is attached to datum plane \
                          '{datum_id}', which did not resolve; using the sketch's saved plane."
-                        ));
-                        None
-                    }
-                });
+                    ));
+                    None
+                }
+            });
         let cs_owned = datum_cs
             .or_else(|| {
                 self.sketch_face_refs
-                    .get(sketch_id)
+                    .get(sketch_id.as_str())
                     .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
             })
             .unwrap_or(sketch.cs);
@@ -2955,7 +2959,7 @@ impl ParametricGraph {
         let mut refreshed: Option<(Vec<Region>, Vec<usize>)> = None;
         if let (Some(stored_boundary), Some(face_ref)) = (
             sketch.face_boundary.as_ref(),
-            self.sketch_face_refs.get(sketch_id),
+            self.sketch_face_refs.get(sketch_id.as_str()),
         ) {
             if let Some(fresh_boundary) = rederive_face_boundary(face_ref, live, cs) {
                 if hash_curves(&fresh_boundary) != hash_curves(stored_boundary) {
@@ -2996,12 +3000,14 @@ impl ParametricGraph {
                     let selection_survives = region_indices.is_empty() || !remapped.is_empty();
                     if !fresh_regions.is_empty() && selection_survives {
                         let mut pending = self.pending_face_reattach.borrow_mut();
-                        pending.boundaries.insert(sketch_id.clone(), fresh_boundary);
-                        pending.planes.insert(sketch_id.clone(), *cs);
+                        pending
+                            .boundaries
+                            .insert(sketch_id.as_str().into(), fresh_boundary);
+                        pending.planes.insert(sketch_id.as_str().into(), *cs);
                         if remapped != region_indices {
                             pending
                                 .region_indices
-                                .insert(node_id.to_string(), remapped.clone());
+                                .insert(node_id.into(), remapped.clone());
                         }
                         refreshed = Some((fresh_regions, remapped));
                     }
@@ -3419,7 +3425,7 @@ impl ParametricGraph {
                     apply_new(
                         live,
                         LiveBody {
-                            id: node_id.to_string(),
+                            id: node_id.into(),
                             parts,
                             // Per-region meshes retain the shared sketch boundary.
                             // Tessellate the fused B-Rep after a successful union so
@@ -3509,7 +3515,7 @@ impl ParametricGraph {
                         apply_new(
                             live,
                             LiveBody {
-                                id: output_id,
+                                id: output_id.into(),
                                 parts,
                                 pristine: (!mesh.indices.is_empty())
                                     .then(|| std::sync::Arc::new(mesh)),
@@ -3731,7 +3737,7 @@ fn apply_body_transform(
     apply_new(
         live,
         LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts,
             pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
             sketch_source: None,
@@ -3776,17 +3782,17 @@ impl ParametricGraph {
         }
         // Same plane priority as extrude: datum attachment, face attachment,
         // saved plane.
-        let datum_cs =
-            self.sketch_datum_refs
-                .get(sketch_id)
-                .and_then(|datum_id| match datums.get(datum_id) {
-                    Some(DatumValue::Plane(cs)) => Some(*cs),
-                    _ => None,
-                });
+        let datum_cs = self
+            .sketch_datum_refs
+            .get(sketch_id.as_str())
+            .and_then(|datum_id| match datums.get(datum_id.as_str()) {
+                Some(DatumValue::Plane(cs)) => Some(*cs),
+                _ => None,
+            });
         let cs_owned = datum_cs
             .or_else(|| {
                 self.sketch_face_refs
-                    .get(sketch_id)
+                    .get(sketch_id.as_str())
                     .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
             })
             .unwrap_or(sketch.cs);
@@ -3885,7 +3891,7 @@ impl ParametricGraph {
                     apply_new(
                         live,
                         LiveBody {
-                            id: node_id.to_string(),
+                            id: node_id.into(),
                             parts: newbody_parts,
                             pristine: (!newbody_mesh.indices.is_empty())
                                 .then(|| std::sync::Arc::new(newbody_mesh)),
@@ -3931,13 +3937,12 @@ impl ParametricGraph {
         datums: &HashMap<String, DatumValue>,
         live: &[LiveBody],
     ) -> CoordinateSystem {
-        let datum_cs =
-            self.sketch_datum_refs
-                .get(sketch_id)
-                .and_then(|datum_id| match datums.get(datum_id) {
-                    Some(DatumValue::Plane(cs)) => Some(*cs),
-                    _ => None,
-                });
+        let datum_cs = self.sketch_datum_refs.get(sketch_id).and_then(|datum_id| {
+            match datums.get(datum_id.as_str()) {
+                Some(DatumValue::Plane(cs)) => Some(*cs),
+                _ => None,
+            }
+        });
         datum_cs
             .or_else(|| {
                 self.sketch_face_refs
@@ -4090,7 +4095,7 @@ impl ParametricGraph {
                 apply_new(
                     live,
                     LiveBody {
-                        id: node_id.to_string(),
+                        id: node_id.into(),
                         parts: vec![solid],
                         pristine: Some(mesh.into()),
                         sketch_source: None,
@@ -4768,7 +4773,7 @@ fn apply_pattern(
                 LiveBody {
                     // Mirror+Join modifies the selected source body; the Pattern node
                     // is an operation, not a second body identity.
-                    id: source.to_string(),
+                    id: source.into(),
                     parts: joined_parts,
                     pristine,
                     sketch_source: None,
@@ -4792,7 +4797,7 @@ fn apply_pattern(
         apply_new(
             live,
             LiveBody {
-                id: node_id.to_string(),
+                id: node_id.into(),
                 parts: new_parts,
                 pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
                 sketch_source: None,
@@ -5650,7 +5655,7 @@ impl ParametricGraph {
         live.into_iter()
             .filter(|body| {
                 let producer = self.body_producer_feature_id(&body.id);
-                !hidden.contains(&body.id)
+                !hidden.contains(body.id.as_str())
                     && producer.is_none_or(|producer| !hidden.contains(producer))
             })
             .collect()
@@ -5733,7 +5738,7 @@ fn tessellate_bodies_with_cancel(
             }
         };
         if !mesh.indices.is_empty() {
-            bodies.push((body.id, mesh));
+            bodies.push((body.id.to_string(), mesh));
         }
     }
     Ok(bodies)

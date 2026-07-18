@@ -42,7 +42,7 @@ fn serde_restore_rederives_node_map_before_the_first_evaluation() {
     assert_eq!(restored.node_map.len(), restored.graph.node_count());
     for index in restored.graph.node_indices() {
         assert_eq!(
-            restored.node_map.get(&restored.graph[index].id),
+            restored.node_map.get(restored.graph[index].id.as_str()),
             Some(&index)
         );
     }

@@ -223,7 +223,10 @@ pub(crate) fn edge_ref_from_mesh_candidate(
     requested: &TopologyEdgeRef,
 ) -> EdgeRef {
     let mut topology = candidate.topology.as_ref().map(|topology| TopologyEdgeRef {
-        body_id: topology.body_id.clone().or_else(|| Some(body.id.clone())),
+        body_id: topology
+            .body_id
+            .clone()
+            .or_else(|| Some(body.id.to_string())),
         topology_version: topology.topology_version,
         edge_id: topology.edge_id.clone(),
         adjacent_face_ids: topology.adjacent_face_ids.clone(),
@@ -345,7 +348,7 @@ fn resolved_face_from_mesh_face(
         .topology
         .as_ref()
         .map(|t| TopologyFaceRef {
-            body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
+            body_id: t.body_id.clone().or_else(|| Some(body.id.to_string())),
             component_id: t.component_id.clone(),
             topology_version: t.topology_version,
             face_id: t.face_id.clone(),
@@ -380,7 +383,7 @@ fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<Resol
                     .topology
                     .as_ref()
                     .map(|t| TopologyFaceRef {
-                        body_id: t.body_id.clone().or_else(|| Some(body.id.clone())),
+                        body_id: t.body_id.clone().or_else(|| Some(body.id.to_string())),
                         component_id: t.component_id.clone(),
                         topology_version: t.topology_version,
                         face_id: t.face_id.clone(),

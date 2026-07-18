@@ -810,7 +810,7 @@ fn corrupt_disposable_preview_is_dropped_with_a_diagnostic() {
 fn connected_component_face_identity_round_trips() {
     let mut pg = sample_graph();
     pg.sketch_face_refs.insert(
-        "attached_sketch".to_string(),
+        "attached_sketch".into(),
         FaceRef {
             centroid: [4.0, 5.0, 6.0],
             normal: [1.0, 0.0, 0.0],

@@ -460,7 +460,7 @@ pub(crate) fn provenance_fragment_stable_id(
 /// fresh tessellation from `parts`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LiveBody {
-    pub(crate) id: String,
+    pub(crate) id: crate::document::BodyId,
     pub(crate) parts: Vec<KernelSolid>,
     pub(crate) pristine: Option<std::sync::Arc<MockMesh>>,
     pub(crate) sketch_source: Option<SketchExtrudeSource>,

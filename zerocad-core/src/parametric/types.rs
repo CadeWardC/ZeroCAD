@@ -745,13 +745,13 @@ pub struct ParametricGraph {
     /// the body when it changes instead of staying frozen. Persisted; empty for
     /// origin-plane sketches and legacy documents.
     #[serde(default)]
-    pub sketch_face_refs: HashMap<String, FaceRef>,
+    pub sketch_face_refs: HashMap<crate::document::FeatureId, FaceRef>,
     /// For a sketch placed on a datum plane: the datum node id, keyed by sketch
     /// node id. On rebuild the sketch's plane is re-derived from the datum's
     /// current resolution (so editing the datum moves everything sketched on
     /// it). Persisted; empty for origin-plane and face-attached sketches.
     #[serde(default)]
-    pub sketch_datum_refs: HashMap<String, String>,
+    pub sketch_datum_refs: HashMap<crate::document::FeatureId, crate::document::FeatureId>,
     /// For a sketch placed on a body face: that face's boundary loops (outer
     /// wire + holes), projected into the sketch's 2D plane at creation time and
     /// keyed by sketch node id. These are *reference* curves — never drawn by
@@ -762,9 +762,9 @@ pub struct ParametricGraph {
     /// but the projected outline does not. Persisted; empty for origin-plane /
     /// datum sketches and legacy documents.
     #[serde(default)]
-    pub sketch_face_boundaries: HashMap<String, crate::sketch::SketchCurves>,
+    pub sketch_face_boundaries: HashMap<crate::document::FeatureId, crate::sketch::SketchCurves>,
     #[serde(skip)]
-    pub(crate) node_map: HashMap<String, NodeIndex>,
+    pub(crate) node_map: HashMap<crate::document::FeatureId, NodeIndex>,
     /// Memoized planar-arrangement results, keyed by a content hash of a
     /// sketch's curves (see [`hash_curves`]). [`detect_regions`] is a pure,
     /// O(n²) function of the curves, so the same sketch yields the same regions
@@ -803,11 +803,11 @@ struct PersistedParametricGraph {
     #[serde(default)]
     semantics: crate::document::DocumentSemantics,
     #[serde(default)]
-    sketch_face_refs: HashMap<String, FaceRef>,
+    sketch_face_refs: HashMap<crate::document::FeatureId, FaceRef>,
     #[serde(default)]
-    sketch_datum_refs: HashMap<String, String>,
+    sketch_datum_refs: HashMap<crate::document::FeatureId, crate::document::FeatureId>,
     #[serde(default)]
-    sketch_face_boundaries: HashMap<String, crate::sketch::SketchCurves>,
+    sketch_face_boundaries: HashMap<crate::document::FeatureId, crate::sketch::SketchCurves>,
 }
 
 impl<'de> serde::Deserialize<'de> for ParametricGraph {
@@ -838,16 +838,16 @@ impl<'de> serde::Deserialize<'de> for ParametricGraph {
 pub struct FaceReattach {
     /// Sketch node id → the face outline re-projected from where the face is
     /// now (replaces the `sketch_face_boundaries` snapshot).
-    pub boundaries: HashMap<String, crate::sketch::SketchCurves>,
+    pub boundaries: HashMap<crate::document::FeatureId, crate::sketch::SketchCurves>,
     /// Sketch node id → the re-derived placement plane the refreshed outline
     /// was projected into. Written back to the sketch feature's saved `cs` so
     /// the GUI draws the sketch (and its outline) where the evaluator actually
     /// built from.
-    pub planes: HashMap<String, crate::geometry::CoordinateSystem>,
+    pub planes: HashMap<crate::document::FeatureId, crate::geometry::CoordinateSystem>,
     /// Extrude node id → its `region_indices` remapped onto the regions of the
     /// refreshed outline (an old index keeps its region by material-point
     /// containment).
-    pub region_indices: HashMap<String, Vec<usize>>,
+    pub region_indices: HashMap<crate::document::FeatureId, Vec<usize>>,
 }
 
 /// Checkpoints of [`evaluate_bodies_inner`], one per processed body node, in
@@ -912,7 +912,7 @@ pub enum ResolutionState {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FeatureStatus {
     /// The node id of the feature this status is for.
-    pub feature_id: String,
+    pub feature_id: crate::document::FeatureId,
     /// The feature's display name, for the tree/status UI.
     pub feature_name: String,
     /// Whether it resolved, and why not if it did not.

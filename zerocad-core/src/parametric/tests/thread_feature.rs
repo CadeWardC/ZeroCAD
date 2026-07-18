@@ -135,7 +135,7 @@ fn thread_targets_clicked_cylinder_across_multipart_body() {
         .expect("plain shaft mass properties")
         .volume;
     let mut body = LiveBody {
-        id: "joined_1".to_string(),
+        id: "joined_1".into(),
         parts: vec![flange, shaft],
         pristine: None,
         sketch_source: None,

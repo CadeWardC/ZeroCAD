@@ -180,7 +180,7 @@ pub(crate) fn apply_body_cut(
         apply_new(
             live,
             LiveBody {
-                id: node_id.to_string(),
+                id: node_id.into(),
                 parts: result_parts,
                 pristine,
                 sketch_source: None,

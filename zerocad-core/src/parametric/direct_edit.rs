@@ -1226,7 +1226,7 @@ pub(crate) fn commit_component_replacement(
         node_id,
         body_index,
         vec![LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts,
             pristine,
             sketch_source: None,

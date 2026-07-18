@@ -1125,8 +1125,7 @@ fn sketch_on_face_plane_follows_the_body() {
         "on_face_sketch",
         rect_sketch((2.0, 2.0), (6.0, 6.0)),
     );
-    g.sketch_face_refs
-        .insert("on_face_sketch".to_string(), face);
+    g.sketch_face_refs.insert("on_face_sketch".into(), face);
     g.add_dependency("base", "on_face_sketch");
     add_extrude(&mut g, "boss", "on_face_sketch", 3.0, ExtrudeMode::NewBody);
 

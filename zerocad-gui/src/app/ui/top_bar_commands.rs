@@ -156,7 +156,7 @@ impl ZeroCadApp {
                         }
                         self.document
                             .sketch_face_refs
-                            .insert(sketch_id.clone(), fref);
+                            .insert(sketch_id.as_str().into(), fref);
                     }
                     // The projected face outline persists with the sketch so
                     // rebuilds (and later edit sessions) detect the same
@@ -164,7 +164,7 @@ impl ZeroCadApp {
                     if self.active_sketch_on_face && !self.active_face_boundary.is_empty() {
                         self.document
                             .sketch_face_boundaries
-                            .insert(sketch_id.clone(), self.active_face_boundary.clone());
+                            .insert(sketch_id.as_str().into(), self.active_face_boundary.clone());
                     }
                     // A sketch placed on a datum plane records the datum + a
                     // dependency, so its plane re-derives from the datum's current
@@ -173,7 +173,7 @@ impl ZeroCadApp {
                         self.document.add_dependency(&datum_id, &sketch_id);
                         self.document
                             .sketch_datum_refs
-                            .insert(sketch_id.clone(), datum_id);
+                            .insert(sketch_id.as_str().into(), datum_id.into());
                     }
                     self.selected_node_id = Some(sketch_id);
                     self.reset_sketch_state();

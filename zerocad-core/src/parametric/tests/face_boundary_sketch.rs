@@ -32,10 +32,8 @@ fn box_with_face_sketch(drawn: SketchCurves) -> ParametricGraph {
     add_sketch_cs(&mut g, "sketch_2", top_face_cs(), drawn);
     g.add_dependency("box_1", "sketch_2");
     // The projected top-face outline, as the GUI captures it at sketch start.
-    g.sketch_face_boundaries.insert(
-        "sketch_2".to_string(),
-        rect_sketch((0.0, 0.0), (10.0, 10.0)),
-    );
+    g.sketch_face_boundaries
+        .insert("sketch_2".into(), rect_sketch((0.0, 0.0), (10.0, 10.0)));
     g
 }
 
@@ -102,9 +100,9 @@ fn face_outline_rederives_when_the_body_changes() {
 
     // Outline-only sketch on that face + a boss extruded from it (all regions).
     add_sketch_cs(&mut g, "face_sketch", cs, SketchCurves::new());
-    g.sketch_face_refs.insert("face_sketch".to_string(), face);
+    g.sketch_face_refs.insert("face_sketch".into(), face);
     g.sketch_face_boundaries
-        .insert("face_sketch".to_string(), boundary);
+        .insert("face_sketch".into(), boundary);
     g.add_dependency("base", "face_sketch");
     add_extrude(&mut g, "boss", "face_sketch", 3.0, ExtrudeMode::NewBody);
 

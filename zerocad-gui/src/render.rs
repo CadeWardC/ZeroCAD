@@ -1985,7 +1985,7 @@ impl ZeroCadApp {
                     solver.as_ref(),
                     &var_map,
                 );
-                if let Some(b) = self.document.sketch_face_boundaries.get(&node.id) {
+                if let Some(b) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
                     eff.extend_curves(b);
                 }
                 let curves = &eff;

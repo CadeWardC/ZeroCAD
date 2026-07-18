@@ -267,11 +267,11 @@ fn insert_pending_face_sketch(graph: &mut zerocad_core::ParametricGraph, p: &Pen
     if let Some(fref) = &p.fref {
         graph
             .sketch_face_refs
-            .insert(p.sketch_id.clone(), fref.clone());
+            .insert(p.sketch_id.as_str().into(), fref.clone());
     }
     graph
         .sketch_face_boundaries
-        .insert(p.sketch_id.clone(), p.boundary.clone());
+        .insert(p.sketch_id.as_str().into(), p.boundary.clone());
 }
 
 impl ZeroCadApp {

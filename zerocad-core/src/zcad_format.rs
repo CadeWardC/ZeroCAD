@@ -45,6 +45,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::document::FeatureId;
 use crate::mock_kernel::MockMesh;
 use crate::parametric::{FaceRef, FeatureNode, ParametricGraph};
 use crate::sketch::SketchCurves;
@@ -626,22 +627,24 @@ impl DocumentRecipeV3 {
             (a.parent.as_str(), a.child.as_str()).cmp(&(b.parent.as_str(), b.child.as_str()))
         });
 
-        let sorted_pairs = |map: &std::collections::HashMap<String, String>| {
-            let mut pairs: Vec<(String, String)> =
-                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let sorted_pairs = |map: &std::collections::HashMap<FeatureId, FeatureId>| {
+            let mut pairs: Vec<(String, String)> = map
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             pairs
         };
         let mut sketch_face_refs: Vec<(String, FaceRef)> = graph
             .sketch_face_refs
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         sketch_face_refs.sort_by(|a, b| a.0.cmp(&b.0));
         let mut sketch_face_boundaries: Vec<(String, SketchCurves)> = graph
             .sketch_face_boundaries
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         sketch_face_boundaries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -850,9 +853,18 @@ impl DocumentRecipeV3 {
                 .add_dependency_for_load(&dependency.parent, &dependency.child)
                 .map_err(ZcadError::Decode)?;
         }
-        graph.sketch_face_refs = sketch_face_refs.into_iter().collect();
-        graph.sketch_datum_refs = sketch_datum_refs.into_iter().collect();
-        graph.sketch_face_boundaries = sketch_face_boundaries.into_iter().collect();
+        graph.sketch_face_refs = sketch_face_refs
+            .into_iter()
+            .map(|(feature_id, reference)| (feature_id.into(), reference))
+            .collect();
+        graph.sketch_datum_refs = sketch_datum_refs
+            .into_iter()
+            .map(|(sketch_id, datum_id)| (sketch_id.into(), datum_id.into()))
+            .collect();
+        graph.sketch_face_boundaries = sketch_face_boundaries
+            .into_iter()
+            .map(|(feature_id, curves)| (feature_id.into(), curves))
+            .collect();
         let mut body_records = BTreeMap::new();
         for body in bodies {
             if body_records.insert(body.id.clone(), body).is_some() {

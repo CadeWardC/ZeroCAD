@@ -18,7 +18,7 @@ fn graph_with_datum_sketch(offset: f32) -> ParametricGraph {
     });
     add_sketch(&mut g, "sketch_2", rect_sketch((0.0, 0.0), (4.0, 4.0)));
     g.sketch_datum_refs
-        .insert("sketch_2".to_string(), "datum_1".to_string());
+        .insert("sketch_2".into(), "datum_1".into());
     g.add_dependency("datum_1", "sketch_2");
     add_extrude(&mut g, "extrude_3", "sketch_2", 2.0, ExtrudeMode::NewBody);
     g
@@ -77,7 +77,7 @@ fn missing_datum_falls_back_to_saved_plane_with_warning() {
     // Point the sketch at a datum that doesn't exist: the extrude must fall
     // back to the sketch's saved plane (XY) and warn, not vanish.
     g.sketch_datum_refs
-        .insert("sketch_2".to_string(), "datum_99".to_string());
+        .insert("sketch_2".into(), "datum_99".into());
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();

@@ -274,8 +274,8 @@ impl ParametricGraph {
                 }
                 if volume > minimum_volume_mm3 {
                     reports.push(InterferencePair {
-                        first_body: first.id.clone(),
-                        second_body: second.id.clone(),
+                        first_body: first.id.to_string(),
+                        second_body: second.id.to_string(),
                         volume_mm3: volume,
                         centroid: centroid_sum.map(|component| component / volume),
                     });
@@ -438,7 +438,7 @@ fn inspect_live_edge(body: &LiveBody, reference: &EdgeRef) -> Result<EdgeInspect
         InspectionCurve::Segment { .. } => "line",
     };
     Ok(EdgeInspection {
-        body_id: body.id.clone(),
+        body_id: body.id.to_string(),
         length_mm: curve.length(),
         midpoint: curve.point(parameter),
         tangent: curve.tangent(parameter),
@@ -665,7 +665,7 @@ fn inspect_live_body(body: &LiveBody, density_g_cm3: f64) -> Result<BodyInspecti
         ));
     }
     Ok(BodyInspection {
-        body_id: body.id.clone(),
+        body_id: body.id.to_string(),
         part_count: body.parts.len(),
         volume_mm3: Some(volume),
         surface_area_mm2: surface_area,

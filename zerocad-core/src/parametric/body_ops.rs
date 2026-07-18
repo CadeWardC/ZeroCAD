@@ -113,7 +113,7 @@ pub(crate) fn apply_body_intersect(
     apply_new(
         live,
         LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts: result_parts,
             pristine,
             sketch_source: None,
@@ -276,7 +276,7 @@ pub(crate) fn apply_body_split(
     apply_new(
         live,
         LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts: negative,
             pristine: negative_mesh,
             sketch_source: None,
@@ -285,7 +285,7 @@ pub(crate) fn apply_body_split(
     apply_new(
         live,
         LiveBody {
-            id: positive_id,
+            id: positive_id.into(),
             parts: positive,
             pristine: positive_mesh,
             sketch_source: None,
@@ -363,7 +363,7 @@ pub(crate) fn apply_body_scale(
     apply_new(
         live,
         LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts,
             pristine,
             sketch_source: None,
@@ -538,13 +538,13 @@ fn apply_body_split_by_bounded_tool(
         target_index,
         vec![
             LiveBody {
-                id: node_id.to_string(),
+                id: node_id.into(),
                 parts: inside,
                 pristine: None,
                 sketch_source: None,
             },
             LiveBody {
-                id: positive_id,
+                id: positive_id.into(),
                 parts: outside,
                 pristine: None,
                 sketch_source: None,
@@ -687,7 +687,7 @@ fn apply_body_split_by_cylinder(
     apply_new(
         live,
         LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts: inside,
             pristine: inside_mesh,
             sketch_source: None,
@@ -696,7 +696,7 @@ fn apply_body_split_by_cylinder(
     apply_new(
         live,
         LiveBody {
-            id: positive_id,
+            id: positive_id.into(),
             parts: outside,
             pristine: outside_mesh,
             sketch_source: None,

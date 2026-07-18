@@ -86,7 +86,7 @@ impl ZeroCadApp {
                 let face_boundary = self
                     .document
                     .sketch_face_boundaries
-                    .get(&self.document.graph[idx].id)
+                    .get(self.document.graph[idx].id.as_str())
                     .cloned();
                 let node = &mut self.document.graph[idx];
 

@@ -135,7 +135,11 @@ impl ZeroCadApp {
         // mid-edit on such a sketch, refresh its live reference outline too.
         if self.document.apply_face_reattach() {
             if let Some(editing_id) = self.editing_sketch_id.clone() {
-                if let Some(b) = self.document.sketch_face_boundaries.get(&editing_id) {
+                if let Some(b) = self
+                    .document
+                    .sketch_face_boundaries
+                    .get(editing_id.as_str())
+                {
                     self.active_face_boundary = b.clone();
                     self.recompute_sketch_regions();
                 }
@@ -262,7 +266,10 @@ impl ZeroCadApp {
                     self.unresolved_features = output
                         .statuses
                         .iter()
-                        .filter_map(|s| s.reason().map(|r| (s.feature_id.clone(), r.to_string())))
+                        .filter_map(|s| {
+                            s.reason()
+                                .map(|r| (s.feature_id.to_string(), r.to_string()))
+                        })
                         .collect();
                     let warnings = output.rendered_warnings();
                     self.document

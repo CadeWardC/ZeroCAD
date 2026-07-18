@@ -196,7 +196,7 @@ impl ZeroCadApp {
         let target = if matches!(op.mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
             self.document
                 .sketch_face_refs
-                .get(&op.profile_sketch)
+                .get(op.profile_sketch.as_str())
                 .and_then(|fref| fref.topology.as_ref())
                 .and_then(|t| t.body_id.clone())
         } else {

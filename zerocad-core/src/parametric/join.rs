@@ -96,7 +96,7 @@ pub(crate) fn apply_body_join(
     apply_new(
         live,
         LiveBody {
-            id: node_id.to_string(),
+            id: node_id.into(),
             parts,
             pristine: None,
             sketch_source: None,
