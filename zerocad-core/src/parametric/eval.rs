@@ -1396,35 +1396,46 @@ impl ParametricGraph {
                 let mut candidate_live = live.clone();
                 let mut feature_warnings = Vec::new();
                 let invocation = match self.resolve_feature_evaluator(node) {
-                    Ok(crate::document::FeatureEvaluatorKind::Revolve) => self
-                        .evaluate_revolve_candidate(
-                            idx,
-                            FeatureEvalContext {
-                                feature: node,
-                                feature_id: crate::document::FeatureId::from(node.id.as_str()),
-                                variables: &vars,
-                                sketches: &sketch_cache,
-                                datums: &datums,
-                                quality: if draft {
-                                    EvaluationQuality::Interactive
-                                } else {
-                                    EvaluationQuality::Final
-                                },
-                                cancellation,
-                                tolerance: &openrcad::foundation::TolerancePolicy::STANDARD,
-                                document_revision: 0,
-                                live_bodies: &live,
+                    Ok(
+                        evaluator @ (crate::document::FeatureEvaluatorKind::Revolve
+                        | crate::document::FeatureEvaluatorKind::Loft
+                        | crate::document::FeatureEvaluatorKind::Sweep),
+                    ) => {
+                        let context = FeatureEvalContext {
+                            feature: node,
+                            feature_id: crate::document::FeatureId::from(node.id.as_str()),
+                            variables: &vars,
+                            sketches: &sketch_cache,
+                            datums: &datums,
+                            quality: if draft {
+                                EvaluationQuality::Interactive
+                            } else {
+                                EvaluationQuality::Final
                             },
-                        )
-                        .and_then(|result| {
+                            cancellation,
+                            tolerance: &openrcad::foundation::TolerancePolicy::STANDARD,
+                            document_revision: 0,
+                            live_bodies: &live,
+                        };
+                        let result = match evaluator {
+                            crate::document::FeatureEvaluatorKind::Revolve => {
+                                self.evaluate_revolve_candidate(idx, context)
+                            }
+                            crate::document::FeatureEvaluatorKind::Loft
+                            | crate::document::FeatureEvaluatorKind::Sweep => {
+                                self.evaluate_loft_or_sweep_candidate(evaluator, context)
+                            }
+                            _ => unreachable!(),
+                        };
+                        result.and_then(|result| {
                             if result.writebacks.producing_revision != 0 {
-                                return Err("revolve returned a stale writeback revision".into());
+                                return Err("feature returned a stale writeback revision".into());
                             }
                             if !result.writebacks.face_reattach.boundaries.is_empty()
                                 || !result.writebacks.face_reattach.planes.is_empty()
                                 || !result.writebacks.face_reattach.region_indices.is_empty()
                             {
-                                return Err("revolve returned unsupported writebacks".into());
+                                return Err("feature returned unsupported writebacks".into());
                             }
                             if result.validation_evidence.input_body_count != live.len()
                                 || result.validation_evidence.candidate_body_count
@@ -1433,7 +1444,7 @@ impl ParametricGraph {
                                     != result.topology_history.len()
                             {
                                 return Err(
-                                    "revolve returned inconsistent validation evidence".into()
+                                    "feature returned inconsistent validation evidence".into()
                                 );
                             }
                             contract_feature_timing = Some(result.feature_timing);
@@ -1445,7 +1456,8 @@ impl ParametricGraph {
                                     .map(|diagnostic| diagnostic.rendered_message().to_string()),
                             );
                             Ok(())
-                        }),
+                        })
+                    }
                     Ok(evaluator) => self.invoke_registered_feature(
                         idx,
                         evaluator,
@@ -1608,6 +1620,104 @@ impl ParametricGraph {
         // Revolve geometry is quality-independent today. Reading both fields at
         // the family boundary makes that invariant explicit until a family
         // genuinely needs a preview-specific implementation.
+        let _quality = context.quality;
+        let _tolerance = context.tolerance;
+        Ok(FeatureEvalResult {
+            candidate_body_state,
+            topology_history,
+            diagnostics,
+            validation_evidence,
+            feature_timing: started.elapsed(),
+            writebacks: RevisionBoundWritebacks {
+                producing_revision: context.document_revision,
+                face_reattach: FaceReattach::default(),
+            },
+        })
+    }
+
+    fn evaluate_loft_or_sweep_candidate(
+        &self,
+        evaluator: crate::document::FeatureEvaluatorKind,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        let started = std::time::Instant::now();
+        if context
+            .cancellation
+            .is_some_and(EvaluationCancellation::is_cancelled)
+        {
+            return Err("model evaluation was superseded".into());
+        }
+        let mut candidate_body_state = context.live_bodies.to_vec();
+        let mut warnings = Vec::new();
+        match evaluator {
+            crate::document::FeatureEvaluatorKind::Loft => {
+                let FeatureType::Loft {
+                    sections,
+                    mode,
+                    target,
+                } = &context.feature.feature
+                else {
+                    return Err(format!(
+                        "registry evaluator Loft cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                self.apply_loft(
+                    context.feature_id.as_str(),
+                    sections,
+                    *mode,
+                    target.as_deref(),
+                    context.sketches,
+                    context.datums,
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            crate::document::FeatureEvaluatorKind::Sweep => {
+                let FeatureType::Sweep {
+                    profile_sketch,
+                    profile_region,
+                    path_sketch,
+                    mode,
+                    target,
+                } = &context.feature.feature
+                else {
+                    return Err(format!(
+                        "registry evaluator Sweep cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                self.apply_sweep(
+                    context.feature_id.as_str(),
+                    profile_sketch,
+                    *profile_region,
+                    path_sketch,
+                    *mode,
+                    target.as_deref(),
+                    context.sketches,
+                    context.datums,
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            _ => return Err("non-skinning family reached the Loft/Sweep contract".into()),
+        }
+        let diagnostics = warnings
+            .into_iter()
+            .filter_map(|message| {
+                super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                    feature_id: context.feature_id.to_string(),
+                    feature_name: context.feature.name.clone(),
+                    state: ResolutionState::Unresolved(message),
+                })
+            })
+            .collect();
+        let topology_history = Vec::new();
+        let validation_evidence = FeatureValidationEvidence {
+            input_body_count: context.live_bodies.len(),
+            candidate_body_count: candidate_body_state.len(),
+            topology_history_entries: topology_history.len(),
+        };
         let _quality = context.quality;
         let _tolerance = context.tolerance;
         Ok(FeatureEvalResult {
@@ -2025,48 +2135,10 @@ impl ParametricGraph {
                 );
             }
             crate::document::FeatureEvaluatorKind::Loft => {
-                let FeatureType::Loft {
-                    sections,
-                    mode,
-                    target,
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                self.apply_loft(
-                    &node.id,
-                    sections,
-                    *mode,
-                    target.as_deref(),
-                    sketch_cache,
-                    datums,
-                    live,
-                    warnings,
-                );
+                return Err("Loft must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Sweep => {
-                let FeatureType::Sweep {
-                    profile_sketch,
-                    profile_region,
-                    path_sketch,
-                    mode,
-                    target,
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                self.apply_sweep(
-                    &node.id,
-                    profile_sketch,
-                    *profile_region,
-                    path_sketch,
-                    *mode,
-                    target.as_deref(),
-                    sketch_cache,
-                    datums,
-                    live,
-                    warnings,
-                );
+                return Err("Sweep must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Shell => {
                 let FeatureType::Shell {

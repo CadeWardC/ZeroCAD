@@ -72,13 +72,22 @@ fn loft_needs_two_sections() {
         },
     });
     g.add_dependency("sketch_1", "loft_2");
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
-    assert!(bodies.is_empty());
+    assert!(output.bodies.is_empty());
     assert!(
-        warnings.iter().any(|w| w.contains("loft_2")),
-        "warnings: {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "loft_2"
+                && diagnostic.code.as_str() == DiagnosticCode::FEATURE_UNRESOLVED
+        }),
+        "diagnostics: {:?}",
+        output.diagnostics
     );
 }
 
@@ -207,12 +216,121 @@ fn sweep_rejects_branching_path() {
     });
     g.add_dependency("profile", "sweep_1");
     g.add_dependency("path", "sweep_1");
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
-    assert!(bodies.is_empty());
+    assert!(output.bodies.is_empty());
     assert!(
-        warnings.iter().any(|w| w.contains("sweep_1")),
-        "warnings: {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "sweep_1"
+                && diagnostic.code.as_str() == DiagnosticCode::FEATURE_UNRESOLVED
+        }),
+        "diagnostics: {:?}",
+        output.diagnostics
     );
+}
+
+fn assert_skinning_contract(graph: &ParametricGraph, feature_id: &str) {
+    let hidden = std::collections::HashSet::new();
+    let cold = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let warm = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert!(cold.1.is_empty() && warm.1.is_empty());
+    assert_eq!(cold.0.len(), warm.0.len());
+    for ((cold_id, cold_mesh), (warm_id, warm_mesh)) in cold.0.iter().zip(&warm.0) {
+        assert_eq!(cold_id, warm_id);
+        assert_eq!(cold_mesh.indices, warm_mesh.indices);
+        assert_eq!(cold_mesh.face_ids, warm_mesh.face_ids);
+    }
+    let mesh = warm
+        .0
+        .iter()
+        .find(|(id, _)| id == feature_id)
+        .map(|(_, mesh)| mesh)
+        .expect("family output body");
+    assert!(!mesh.face_refs.is_empty());
+    assert!(mesh.face_refs.iter().all(|face| {
+        face.topology
+            .as_ref()
+            .and_then(|topology| topology.face_id.as_deref())
+            .is_some_and(|name| super::super::topo_name::TopoName::parse(name).is_durable())
+    }));
+
+    let cancelled_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+    assert!(matches!(
+        graph.evaluate_request(
+            &hidden,
+            EvaluationQuality::Interactive,
+            &EvaluationCancellation::new(1, cancelled_generation),
+        ),
+        Err(EvaluationError::Cancelled)
+    ));
+
+    let loaded: ParametricGraph =
+        serde_json::from_str(&serde_json::to_string(&graph.clone_document()).unwrap()).unwrap();
+    let rebuilt = loaded.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert!(rebuilt.1.is_empty(), "load warnings: {:?}", rebuilt.1);
+    assert!(rebuilt.0.iter().any(|(id, _)| id == feature_id));
+}
+
+#[test]
+fn loft_and_sweep_candidate_contract_gates() {
+    let mut loft = ParametricGraph::new();
+    add_sketch_cs(
+        &mut loft,
+        "loft_profile_1",
+        shifted_xy(0.0),
+        rect_sketch((0.0, 0.0), (4.0, 4.0)),
+    );
+    add_sketch_cs(
+        &mut loft,
+        "loft_profile_2",
+        shifted_xy(5.0),
+        rect_sketch((1.0, 1.0), (3.0, 3.0)),
+    );
+    loft.add_feature(FeatureNode {
+        id: "loft_contract".into(),
+        name: "Loft contract".into(),
+        feature: FeatureType::Loft {
+            sections: vec![("loft_profile_1".into(), 0), ("loft_profile_2".into(), 0)],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    loft.add_dependency("loft_profile_1", "loft_contract");
+    loft.add_dependency("loft_profile_2", "loft_contract");
+    assert_skinning_contract(&loft, "loft_contract");
+
+    let mut sweep = ParametricGraph::new();
+    add_sketch_cs(
+        &mut sweep,
+        "sweep_profile",
+        CoordinateSystem::XY,
+        rect_sketch((-0.5, -0.5), (0.5, 0.5)),
+    );
+    straight_path_sketch(
+        &mut sweep,
+        "sweep_path",
+        CoordinateSystem::XZ,
+        (0.0, 0.0),
+        (0.0, 4.0),
+    );
+    sweep.add_feature(FeatureNode {
+        id: "sweep_contract".into(),
+        name: "Sweep contract".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "sweep_profile".into(),
+            profile_region: 0,
+            path_sketch: "sweep_path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    sweep.add_dependency("sweep_profile", "sweep_contract");
+    sweep.add_dependency("sweep_path", "sweep_contract");
+    assert_skinning_contract(&sweep, "sweep_contract");
 }
