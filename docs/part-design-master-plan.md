@@ -6,6 +6,12 @@ that attachment remains unchanged as a historical source artifact. This copy
 uses UTF-8 text, reflects work completed through Phase 6, and incorporates the
 Phase 3.5 amendment and the revised Phases 5–7.
 
+The post-candidate capability work is tracked in
+[`capability-robustness-roadmap.md`](capability-robustness-roadmap.md). That
+roadmap records the explicit decision to supersede the 1.0 candidate at the
+named vNext baseline. The still-open Phase 7 external evidence below is retained
+as historical release-candidate evidence rather than an active vNext gate.
+
 ## Goal and architecture
 
 ZeroCAD is a history-based parametric CAD application built on the in-tree,

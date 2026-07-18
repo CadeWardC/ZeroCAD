@@ -16,6 +16,10 @@ completed phase gates, current work, deferred scope, and the acceptance criteria
 for Part Design 1.0. Phase 7 implementation and its still-open external release
 evidence are recorded in
 [`docs/phase7-completion.md`](docs/phase7-completion.md).
+The next capability cycle is staged separately in
+[`docs/capability-robustness-roadmap.md`](docs/capability-robustness-roadmap.md);
+it explicitly supersedes the Part Design 1.0 candidate at a named vNext
+baseline while preserving the earlier release evidence as history.
 
 ---
 
