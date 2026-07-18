@@ -713,44 +713,66 @@ impl DocumentRecipeV3 {
                 ));
             }
         }
-        let mut graph = ParametricGraph::new();
+        // Decode every feature before constructing the graph. A malformed late
+        // record therefore cannot leave even an internal partially built graph;
+        // graph construction begins only after the complete payload set passes.
+        let mut decoded_features = Vec::with_capacity(features.len());
         let mut feature_ids = HashSet::new();
         for record in features {
-            if !feature_ids.insert(record.id.clone()) {
-                return Err(ZcadError::Decode(format!(
-                    "duplicate feature id '{}'",
-                    record.id
-                )));
+            let RecipeFeature {
+                id,
+                name,
+                creation_order: _,
+                payload_schema,
+                payload,
+                kind_id,
+                sequence,
+                inputs,
+                state,
+                body,
+            } = record;
+            if !feature_ids.insert(id.clone()) {
+                return Err(ZcadError::Decode(format!("duplicate feature id '{id}'")));
             }
-            let feature = match record.payload {
-                RecipeFeaturePayload(0, fields, None, None) => {
-                    crate::feature_dto::decode(record.kind_id.as_str(), fields)
-                        .map_err(ZcadError::Decode)?
-                }
-                RecipeFeaturePayload(1, fields, Some(content_hash), Some(label))
-                    if fields.is_empty() =>
-                {
+            let registration = crate::document::FeatureRegistry::get(kind_id.as_str())
+                .ok_or_else(|| ZcadError::Decode(format!("unknown feature kind '{kind_id}'")))?;
+            let decoder = registration
+                .payload_decoder(payload_schema)
+                .ok_or_else(|| {
+                    ZcadError::Decode(crate::feature_dto::unsupported_payload_schema(
+                        registration,
+                        payload_schema,
+                    ))
+                })?;
+            let feature = match (decoder, payload) {
+                (
+                    crate::document::FeaturePayloadDecoder::NumericFieldsV1,
+                    RecipeFeaturePayload(0, fields, None, None),
+                ) => crate::feature_dto::decode(kind_id.as_str(), payload_schema, fields)
+                    .map_err(ZcadError::Decode)?,
+                (
+                    crate::document::FeaturePayloadDecoder::StepAssetV1,
+                    RecipeFeaturePayload(1, fields, Some(content_hash), Some(label)),
+                ) if fields.is_empty() => {
                     let bytes = asset_map.get(&content_hash).ok_or_else(|| {
                         ZcadError::Decode(format!(
-                            "STEP import '{}' references missing required asset",
-                            record.id
+                            "STEP import '{id}' references missing required asset"
                         ))
                     })?;
                     let step_data = String::from_utf8(bytes.to_vec()).map_err(|_| {
                         ZcadError::Decode(format!(
-                            "STEP import '{}' required asset is not UTF-8",
-                            record.id
+                            "STEP import '{id}' required asset is not UTF-8"
                         ))
                     })?;
                     crate::parametric::FeatureType::Import { step_data, label }
                 }
-                RecipeFeaturePayload(2, fields, Some(content_hash), Some(label))
-                    if fields.is_empty() =>
-                {
+                (
+                    crate::document::FeaturePayloadDecoder::StlAssetV1,
+                    RecipeFeaturePayload(2, fields, Some(content_hash), Some(label)),
+                ) if fields.is_empty() => {
                     let bytes = asset_map.get(&content_hash).ok_or_else(|| {
                         ZcadError::Decode(format!(
-                            "STL import '{}' references missing required asset",
-                            record.id
+                            "STL import '{id}' references missing required asset"
                         ))
                     })?;
                     crate::parametric::FeatureType::ImportStl {
@@ -758,57 +780,57 @@ impl DocumentRecipeV3 {
                         label,
                     }
                 }
-                RecipeFeaturePayload(tag, _, _, _) => {
+                (_, RecipeFeaturePayload(tag, _, _, _)) => {
                     return Err(ZcadError::Decode(format!(
-                        "feature '{}' has malformed payload envelope tag {tag}",
-                        record.id
+                        "feature '{id}' kind '{kind_id}' schema {payload_schema} has malformed payload envelope tag {tag}"
                     )))
                 }
             };
             let expected = feature.kind_id();
-            if record.kind_id.as_str() != expected {
+            if kind_id.as_str() != expected {
                 return Err(ZcadError::Decode(format!(
-                    "feature '{}' declares kind '{}' but contains '{}' payload",
-                    record.id, record.kind_id, expected
+                    "feature '{id}' declares kind '{kind_id}' but contains '{expected}' payload"
                 )));
             }
-            let registration = crate::document::FeatureRegistry::get(record.kind_id.as_str())
-                .ok_or_else(|| {
-                    ZcadError::Decode(format!("unknown feature kind '{}'", record.kind_id))
-                })?;
-            if record.payload_schema != registration.payload_version {
-                return Err(ZcadError::Decode(format!(
-                    "unsupported payload version {} for feature kind '{}'",
-                    record.payload_schema, record.kind_id
-                )));
-            }
-            if record.id == "origin" {
+            decoded_features.push((
+                FeatureNode { id, name, feature },
+                kind_id,
+                registration.payload_version,
+                sequence,
+                inputs,
+                state,
+                body,
+            ));
+        }
+
+        let mut graph = ParametricGraph::new();
+        for (node, kind_id, payload_version, sequence, inputs, state, body) in decoded_features {
+            if node.id == "origin" {
                 let origin = graph
                     .graph
                     .node_weights_mut()
                     .find(|feature| feature.id == "origin")
                     .expect("new graph must contain origin");
-                origin.name = record.name;
-                origin.kind_id = record.kind_id;
-                origin.payload_version = record.payload_schema;
-                origin.sequence = record.sequence;
-                origin.inputs = record.inputs;
-                origin.state = record.state;
-                origin.body = record.body;
+                origin.name = node.name;
+                origin.kind_id = kind_id;
+                origin.payload_version = payload_version;
+                origin.sequence = sequence;
+                origin.inputs = inputs;
+                origin.state = state;
+                origin.body = body;
                 continue;
             }
-            let idx = graph.add_feature(FeatureNode {
-                id: record.id,
-                name: record.name,
-                feature,
-            });
+            let idx = graph.add_feature(node);
             let stored = &mut graph.graph[idx];
-            stored.kind_id = record.kind_id;
-            stored.payload_version = record.payload_schema;
-            stored.sequence = record.sequence;
-            stored.inputs = record.inputs;
-            stored.state = record.state;
-            stored.body = record.body;
+            stored.kind_id = kind_id;
+            // Decoders always produce the current in-memory representation. A
+            // later explicit save therefore writes the registry's current
+            // schema instead of preserving a historical schema number.
+            stored.payload_version = payload_version;
+            stored.sequence = sequence;
+            stored.inputs = inputs;
+            stored.state = state;
+            stored.body = body;
         }
         for dependency in dependencies {
             graph
@@ -2457,6 +2479,38 @@ mod tests {
             })
             .collect();
         assert_eq!(meshes, [bytes.as_slice(), bytes.as_slice()]);
+    }
+
+    #[test]
+    fn recipe_rejects_unregistered_payload_schemas_before_graph_construction() {
+        let mut graph = ParametricGraph::new();
+        graph.add_feature(FeatureNode {
+            id: "box".into(),
+            name: "Box".into(),
+            feature: FeatureType::Box {
+                w: 1.0,
+                h: 2.0,
+                d: 3.0,
+            },
+        });
+        let (mut recipe, assets) = DocumentRecipeV3::from_graph_with_assets(&graph);
+        let box_record = recipe
+            .features
+            .iter_mut()
+            .find(|record| record.id == "box")
+            .expect("box record");
+        box_record.payload_schema = 2;
+
+        let error = recipe
+            .into_graph_with_assets(&assets)
+            .expect_err("unknown newer feature schema must fail");
+        assert!(matches!(
+            error,
+            ZcadError::Decode(message)
+                if message.contains("unsupported payload schema 2")
+                    && message.contains("part.box")
+                    && message.contains("supported schemas: [1]")
+        ));
     }
 
     #[test]

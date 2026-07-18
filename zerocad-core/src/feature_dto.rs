@@ -326,7 +326,41 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
     fields
 }
 
-pub(crate) fn decode(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType, String> {
+pub(crate) fn decode(
+    kind: &str,
+    payload_schema: u16,
+    fields: NumericFeatureFields,
+) -> Result<FeatureType, String> {
+    let registration = crate::document::FeatureRegistry::get(kind)
+        .ok_or_else(|| format!("unknown feature kind '{kind}'"))?;
+    let decoder = registration
+        .payload_decoder(payload_schema)
+        .ok_or_else(|| unsupported_payload_schema(registration, payload_schema))?;
+    match decoder {
+        crate::document::FeaturePayloadDecoder::NumericFieldsV1 => decode_v1(kind, fields),
+        crate::document::FeaturePayloadDecoder::StepAssetV1
+        | crate::document::FeaturePayloadDecoder::StlAssetV1 => Err(format!(
+            "feature kind '{kind}' schema {payload_schema} requires a content-addressed asset payload"
+        )),
+    }
+}
+
+pub(crate) fn unsupported_payload_schema(
+    registration: &crate::document::FeatureRegistration,
+    payload_schema: u16,
+) -> String {
+    let supported: Vec<_> = registration
+        .payload_decoders
+        .iter()
+        .map(|decoder| decoder.schema)
+        .collect();
+    format!(
+        "unsupported payload schema {payload_schema} for feature kind '{}'; supported schemas: {supported:?}",
+        registration.kind_id
+    )
+}
+
+fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType, String> {
     let feature = match kind {
         "core.origin" => FeatureType::Origin,
         "part.box" => FeatureType::Box {
@@ -526,7 +560,7 @@ mod tests {
             tool: "tool".into(),
             keep_tool: true,
         };
-        let decoded = decode("part.intersect", encode(&intersect)).unwrap();
+        let decoded = decode("part.intersect", 1, encode(&intersect)).unwrap();
         assert!(matches!(
             decoded,
             FeatureType::BodyIntersect { target, tool, keep_tool }
@@ -538,7 +572,7 @@ mod tests {
             plane: PlaneBase::Datum("datum".into()),
             face: None,
         };
-        let decoded = decode("part.split", encode(&split)).unwrap();
+        let decoded = decode("part.split", 1, encode(&split)).unwrap();
         assert!(matches!(
             decoded,
             FeatureType::BodySplit {
@@ -554,7 +588,7 @@ mod tests {
             factor_expr: Some("scale_factor".into()),
             center: [1.0, 2.0, 3.0],
         };
-        let decoded = decode("part.scale", encode(&scale)).unwrap();
+        let decoded = decode("part.scale", 1, encode(&scale)).unwrap();
         assert!(matches!(
             decoded,
             FeatureType::BodyScale {
@@ -583,7 +617,7 @@ mod tests {
             distance_expr: Some("-wall".into()),
         };
         assert!(matches!(
-            decode("direct.face_offset", encode(&offset)).unwrap(),
+            decode("direct.face_offset", 1, encode(&offset)).unwrap(),
             FeatureType::FaceOffset {
                 target,
                 distance,
@@ -597,7 +631,7 @@ mod tests {
             translation: [0.0, 0.0, 4.0],
         };
         assert!(matches!(
-            decode("direct.face_move", encode(&moved)).unwrap(),
+            decode("direct.face_move", 1, encode(&moved)).unwrap(),
             FeatureType::FaceMove { translation, .. } if translation == [0.0, 0.0, 4.0]
         ));
         let deleted = FeatureType::FaceDelete {
@@ -605,7 +639,7 @@ mod tests {
             face: face.clone(),
         };
         assert!(matches!(
-            decode("direct.face_delete", encode(&deleted)).unwrap(),
+            decode("direct.face_delete", 1, encode(&deleted)).unwrap(),
             FeatureType::FaceDelete { target, .. } if target == "imported"
         ));
         let thickened = FeatureType::FaceThicken {
@@ -616,7 +650,7 @@ mod tests {
             reverse: true,
         };
         assert!(matches!(
-            decode("direct.face_thicken", encode(&thickened)).unwrap(),
+            decode("direct.face_thicken", 1, encode(&thickened)).unwrap(),
             FeatureType::FaceThicken {
                 thickness,
                 thickness_expr: Some(expression),
@@ -624,5 +658,25 @@ mod tests {
                 ..
             } if thickness == 1.25 && expression == "sheet"
         ));
+    }
+
+    #[test]
+    fn payload_decoder_dispatch_is_schema_aware() {
+        let feature = FeatureType::Box {
+            w: 1.0,
+            h: 2.0,
+            d: 3.0,
+        };
+        assert!(matches!(
+            decode("part.box", 1, encode(&feature)),
+            Ok(FeatureType::Box { w, h, d }) if w == 1.0 && h == 2.0 && d == 3.0
+        ));
+
+        for unsupported in [0, 2] {
+            let error = decode("part.box", unsupported, encode(&feature))
+                .expect_err("unregistered payload schema must fail");
+            assert!(error.contains(&format!("unsupported payload schema {unsupported}")));
+            assert!(error.contains("supported schemas: [1]"));
+        }
     }
 }

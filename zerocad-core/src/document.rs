@@ -660,11 +660,56 @@ fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureRegistration {
     pub kind_id: &'static str,
+    /// Schema written for a newly saved feature of this kind.
     pub payload_version: u16,
+    /// Every schema this build can decode, paired with its storage/decoder path.
+    /// Historical schemas stay here after `payload_version` advances.
+    pub payload_decoders: &'static [FeaturePayloadDecoderRegistration],
     pub display_name: &'static str,
     pub evaluator: FeatureEvaluatorKind,
     pub editor_group: FeatureEditorGroup,
 }
+
+impl FeatureRegistration {
+    pub fn payload_decoder(&self, schema: u16) -> Option<FeaturePayloadDecoder> {
+        self.payload_decoders
+            .iter()
+            .find(|registration| registration.schema == schema)
+            .map(|registration| registration.decoder)
+    }
+}
+
+/// Storage and decoding path for one feature-payload schema.
+///
+/// The enum makes the recipe reader dispatch on `(kind_id, payload_schema)`
+/// before it interprets the payload envelope. Future schema-specific decoders
+/// receive their own variant rather than changing the meaning of an old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeaturePayloadDecoder {
+    NumericFieldsV1,
+    StepAssetV1,
+    StlAssetV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeaturePayloadDecoderRegistration {
+    pub schema: u16,
+    pub decoder: FeaturePayloadDecoder,
+}
+
+const NUMERIC_FIELDS_V1: &[FeaturePayloadDecoderRegistration] =
+    &[FeaturePayloadDecoderRegistration {
+        schema: 1,
+        decoder: FeaturePayloadDecoder::NumericFieldsV1,
+    }];
+const STEP_ASSET_V1: &[FeaturePayloadDecoderRegistration] = &[FeaturePayloadDecoderRegistration {
+    schema: 1,
+    decoder: FeaturePayloadDecoder::StepAssetV1,
+}];
+const STL_ASSET_V1: &[FeaturePayloadDecoderRegistration] = &[FeaturePayloadDecoderRegistration {
+    schema: 1,
+    decoder: FeaturePayloadDecoder::StlAssetV1,
+}];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureEvaluatorKind {
@@ -752,8 +797,10 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::Infrastructure,
             FeatureEditorGroup::Document,
         ),
-        registration(
+        registration_with_payload(
             "exchange.step_import",
+            1,
+            STEP_ASSET_V1,
             "STEP Import",
             FeatureEvaluatorKind::Import,
             FeatureEditorGroup::Exchange,
@@ -878,8 +925,10 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::FaceThicken,
             FeatureEditorGroup::Modify,
         ),
-        registration(
+        registration_with_payload(
             "exchange.stl_import",
+            1,
+            STL_ASSET_V1,
             "STL Import",
             FeatureEvaluatorKind::ImportStl,
             FeatureEditorGroup::Exchange,
@@ -910,9 +959,28 @@ const fn registration(
     evaluator: FeatureEvaluatorKind,
     editor_group: FeatureEditorGroup,
 ) -> FeatureRegistration {
+    registration_with_payload(
+        kind_id,
+        1,
+        NUMERIC_FIELDS_V1,
+        display_name,
+        evaluator,
+        editor_group,
+    )
+}
+
+const fn registration_with_payload(
+    kind_id: &'static str,
+    payload_version: u16,
+    payload_decoders: &'static [FeaturePayloadDecoderRegistration],
+    display_name: &'static str,
+    evaluator: FeatureEvaluatorKind,
+    editor_group: FeatureEditorGroup,
+) -> FeatureRegistration {
     FeatureRegistration {
         kind_id,
-        payload_version: 1,
+        payload_version,
+        payload_decoders,
         display_name,
         evaluator,
         editor_group,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::document::{
-    FeatureEditorGroup, FeatureEvaluatorKind, FeatureId, FeatureInputTarget, FeatureRegistry,
-    FeatureState, SelectorResolutionTier, SequenceKey,
+    FeatureEditorGroup, FeatureEvaluatorKind, FeatureId, FeatureInputTarget, FeaturePayloadDecoder,
+    FeatureRegistry, FeatureState, SelectorResolutionTier, SequenceKey,
 };
 use std::collections::HashSet;
 
@@ -51,6 +51,41 @@ fn stable_kind_registry_covers_every_builtin_without_duplicate_ids() {
     let extrude = FeatureRegistry::get("part.extrude").unwrap();
     assert_eq!(extrude.evaluator, FeatureEvaluatorKind::Extrude);
     assert_eq!(extrude.editor_group, FeatureEditorGroup::Solid);
+    for registration in FeatureRegistry::BUILTINS {
+        assert!(
+            registration
+                .payload_decoder(registration.payload_version)
+                .is_some(),
+            "{} must decode its current payload schema",
+            registration.kind_id
+        );
+        let mut schemas: Vec<_> = registration
+            .payload_decoders
+            .iter()
+            .map(|decoder| decoder.schema)
+            .collect();
+        let original_len = schemas.len();
+        schemas.sort_unstable();
+        schemas.dedup();
+        assert_eq!(
+            schemas.len(),
+            original_len,
+            "{} has duplicate payload decoders",
+            registration.kind_id
+        );
+    }
+    assert_eq!(
+        FeatureRegistry::get("exchange.step_import")
+            .unwrap()
+            .payload_decoder(1),
+        Some(FeaturePayloadDecoder::StepAssetV1)
+    );
+    assert_eq!(
+        FeatureRegistry::get("exchange.stl_import")
+            .unwrap()
+            .payload_decoder(1),
+        Some(FeaturePayloadDecoder::StlAssetV1)
+    );
 }
 
 #[test]
