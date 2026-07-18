@@ -38,12 +38,12 @@ type QPoint = (i64, i64, i64);
 
 /// Quantize a point to a fine integer grid so coincident endpoints from
 /// independently-built edges compare equal (matches `manifold_report`'s grid).
-fn quantize(p: &Pnt) -> QPoint {
-    const GRID: f64 = 1.0e6;
+fn quantize(p: &Pnt, quantum: f64) -> QPoint {
+    let grid = 1.0 / quantum.max(f64::MIN_POSITIVE);
     (
-        (p.x() * GRID).round() as i64,
-        (p.y() * GRID).round() as i64,
-        (p.z() * GRID).round() as i64,
+        (p.x() * grid).round() as i64,
+        (p.y() * grid).round() as i64,
+        (p.z() * grid).round() as i64,
     )
 }
 
@@ -76,7 +76,7 @@ fn loops_for_faces(brep: &BRep, face_ids: &[FaceId]) -> HashSet<LoopId> {
 /// cannot be threaded into one closed cycle (a genuine gap or a pinch point),
 /// so nothing is silently corrupted. Preserves the first co-edge's orientation,
 /// and therefore the loop's winding sense.
-fn rethread_loop(brep: &BRep, edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge>> {
+fn rethread_loop(brep: &BRep, edges: &[OrientedEdge], quantum: f64) -> Option<Vec<OrientedEdge>> {
     let n = edges.len();
     if n < 3 {
         return None;
@@ -86,7 +86,7 @@ fn rethread_loop(brep: &BRep, edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge
         let e = brep.edges.get(oe.id)?;
         let ps = brep.vertices.get(e.start)?.point;
         let pe = brep.vertices.get(e.end)?.point;
-        Some((quantize(&ps), quantize(&pe)))
+        Some((quantize(&ps, quantum), quantize(&pe, quantum)))
     };
     // Oriented (traversal start, traversal end) of a co-edge.
     let oriented = |oe: &OrientedEdge| -> Option<(QPoint, QPoint)> {
@@ -203,7 +203,7 @@ fn newell_normal(points: &[Pnt]) -> Option<FVec> {
 /// True if every undirected boundary edge (matched by quantized endpoint
 /// position) is used by exactly two face loops — the watertight 2-manifold
 /// condition. Open intermediate shells return `false`.
-fn shell_is_closed(brep: &BRep, face_ids: &[FaceId]) -> bool {
+fn shell_is_closed(brep: &BRep, face_ids: &[FaceId], quantum: f64) -> bool {
     let mut counts: HashMap<(QPoint, QPoint), usize> = HashMap::new();
     for &f_id in face_ids {
         let Some(f) = brep.faces.get(f_id) else {
@@ -226,7 +226,7 @@ fn shell_is_closed(brep: &BRep, face_ids: &[FaceId]) -> bool {
                 else {
                     continue;
                 };
-                let (qa, qb) = (quantize(&a.point), quantize(&b.point));
+                let (qa, qb) = (quantize(&a.point, quantum), quantize(&b.point, quantum));
                 let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
                 *counts.entry(key).or_insert(0) += 1;
             }
@@ -294,7 +294,7 @@ fn signed_volume(brep: &BRep, face_ids: &[FaceId]) -> f64 {
 ///    negative, flip every face's orientation flag so the shell faces outward.
 ///    Flipping all flags together preserves both the per-face agreement and the
 ///    cross-edge winding consistency.
-fn canonicalize_shell_orientation(brep: &mut BRep, face_ids: &[FaceId]) {
+fn canonicalize_shell_orientation(brep: &mut BRep, face_ids: &[FaceId], quantum: f64) {
     // 1. Align each planar face's stored normal with its loop winding.
     for &f_id in face_ids {
         let Some(outer) = brep.faces.get(f_id).and_then(|f| f.outer_wire) else {
@@ -318,7 +318,7 @@ fn canonicalize_shell_orientation(brep: &mut BRep, face_ids: &[FaceId]) {
 
     // 2. Orient the whole shell outward — only when it is closed (an open
     //    intermediate shell has no well-defined inside).
-    if !shell_is_closed(brep, face_ids) {
+    if !shell_is_closed(brep, face_ids, quantum) {
         return;
     }
     if signed_volume(brep, face_ids) < 0.0 {
@@ -872,7 +872,7 @@ fn sew_impl(faces: &[Face], policy: &TolerancePolicy) -> Shell {
             Some(l) => l.edges.clone(),
             None => continue,
         };
-        if let Some(threaded) = rethread_loop(&brep, &edges) {
+        if let Some(threaded) = rethread_loop(&brep, &edges, policy.sewing) {
             if let Some(l) = brep.loops.get_mut(l_id) {
                 l.edges = threaded;
             }
@@ -1007,7 +1007,7 @@ fn sew_impl(faces: &[Face], policy: &TolerancePolicy) -> Shell {
     // its winding and (for a closed shell) orient the whole shell outward. Step 7
     // only makes windings mutually consistent; this reconciles them with the
     // stored surface normals and fixes a globally-inward shell.
-    canonicalize_shell_orientation(&mut brep, &face_ids);
+    canonicalize_shell_orientation(&mut brep, &face_ids, policy.sewing);
 
     // 8. Garbage-collect orphan entities. `BRep::merge` copies *every* entity of
     // each source arena, so faces assembled from edges borrowed from another

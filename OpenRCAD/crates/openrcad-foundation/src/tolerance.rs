@@ -4,6 +4,7 @@
 //! rather than an ad-hoc `1e-9` literal, so the tolerance policy lives in
 //! exactly one place and can be tuned globally.
 
+use crate::bnd::BndBox;
 use crate::xyz::{Xy, Xyz};
 use serde::{Deserialize, Serialize};
 
@@ -138,6 +139,111 @@ impl TolerancePolicy {
 impl Default for TolerancePolicy {
     fn default() -> Self {
         Self::STANDARD
+    }
+}
+
+/// Operation-local tolerances derived from document policy and numerical
+/// conditioning. This is runtime context, never persisted as document intent.
+///
+/// `model_scale` is the actual bounds diagonal; it is deliberately not floored
+/// to one model unit. Very small parts therefore retain their real scale while
+/// the arithmetic floor still accounts for large world translations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToleranceContext {
+    pub policy: TolerancePolicy,
+    pub model_scale: f64,
+    pub local_feature_size: f64,
+    pub translation_magnitude: f64,
+    pub conditioning: f64,
+    pub arithmetic_floor: f64,
+    pub convergence: f64,
+    pub welding: f64,
+    pub quantization: f64,
+}
+
+impl ToleranceContext {
+    /// Derive context from all operation bounds and the smallest feature that
+    /// the operation must preserve. Invalid/absent optional hints fall back to
+    /// the real non-zero bounds scale, never to an artificial unit length.
+    pub fn derive(
+        policy: &TolerancePolicy,
+        bounds: &[BndBox],
+        local_feature_size: Option<f64>,
+        conditioning: f64,
+    ) -> Result<Self, TolerancePolicyError> {
+        policy.validate()?;
+
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for bounds in bounds {
+            let Some((min, max)) = bounds.corners() else {
+                continue;
+            };
+            for (axis, (min, max)) in [(min.x(), max.x()), (min.y(), max.y()), (min.z(), max.z())]
+                .into_iter()
+                .enumerate()
+            {
+                lo[axis] = lo[axis].min(min);
+                hi[axis] = hi[axis].max(max);
+            }
+        }
+        let valid_bounds = lo.iter().chain(&hi).all(|value| value.is_finite())
+            && (0..3).all(|axis| hi[axis] >= lo[axis]);
+        let model_scale = if valid_bounds {
+            ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt()
+        } else {
+            0.0
+        };
+        let translation_magnitude = if valid_bounds {
+            lo.iter()
+                .chain(&hi)
+                .map(|value| value.abs())
+                .fold(0.0, f64::max)
+        } else {
+            0.0
+        };
+        let conditioning = if conditioning.is_finite() && conditioning > 0.0 {
+            conditioning.max(1.0)
+        } else {
+            1.0
+        };
+        let local_feature_size = local_feature_size
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .or_else(|| (model_scale > 0.0).then_some(model_scale))
+            .unwrap_or(policy.resolution);
+        let arithmetic_floor = policy.resolution.max(
+            translation_magnitude
+                .max(model_scale)
+                .mul_add(f64::EPSILON * conditioning, 0.0),
+        );
+        let stage = |value: f64| value.max(arithmetic_floor);
+        let mut effective = *policy;
+        effective.linear = stage(effective.linear);
+        effective.approximation = stage(effective.approximation);
+        effective.intersection = stage(effective.intersection);
+        effective.classification = stage(effective.classification);
+        effective.sewing = stage(effective.sewing);
+        effective.pcurve_consistency = stage(effective.pcurve_consistency);
+        effective.resolution = arithmetic_floor.min(effective.linear);
+
+        let convergence = stage(
+            (local_feature_size * f64::EPSILON.sqrt() * conditioning).min(policy.approximation),
+        );
+        let welding = effective.sewing;
+        let quantization = (local_feature_size * policy.snap_relative)
+            .clamp(arithmetic_floor, policy.snap_max.max(arithmetic_floor));
+
+        Ok(Self {
+            policy: effective,
+            model_scale,
+            local_feature_size,
+            translation_magnitude,
+            conditioning,
+            arithmetic_floor,
+            convergence,
+            welding,
+            quantization,
+        })
     }
 }
 
@@ -287,5 +393,65 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn context_preserves_sub_unit_scale_and_accounts_for_translation() {
+        let mut local = BndBox::new();
+        local.add(&crate::Pnt::new(1.0e9, 0.0, 0.0));
+        local.add(&crate::Pnt::new(1.0e9 + 1.0e-3, 2.0e-3, 3.0e-3));
+        let context =
+            ToleranceContext::derive(&TolerancePolicy::STANDARD, &[local], Some(2.0e-4), 8.0)
+                .unwrap();
+        assert!(context.model_scale < 1.0, "there is no unit-scale floor");
+        assert_eq!(context.local_feature_size, 2.0e-4);
+        assert!(context.translation_magnitude >= 1.0e9);
+        assert!(context.arithmetic_floor > TolerancePolicy::STANDARD.resolution);
+        assert!(context.policy.intersection >= context.arithmetic_floor);
+        assert!(context.quantization < 1.0e-4);
+    }
+
+    #[test]
+    fn context_property_sweep_has_no_unit_floor() {
+        let scales = [1.0e-3, 1.0e-1, 1.0, 10.0, 1.0e3];
+        let aspects = [1.0, 10.0, 100.0];
+        let origins = [[0.0, 0.0, 0.0], [1.0e9, -1.0e9, 5.0e8]];
+
+        for scale in scales {
+            for aspect in aspects {
+                for origin in origins {
+                    let mut bounds = BndBox::new();
+                    bounds.add(&crate::Pnt::new(origin[0], origin[1], origin[2]));
+                    bounds.add(&crate::Pnt::new(
+                        origin[0] + 8.0 * scale * aspect,
+                        origin[1] + 4.0 * scale,
+                        origin[2] + 2.0 * scale,
+                    ));
+                    let context = ToleranceContext::derive(
+                        &TolerancePolicy::STANDARD,
+                        &[bounds],
+                        Some(2.0 * scale),
+                        aspect,
+                    )
+                    .unwrap();
+
+                    assert!(context.model_scale.is_finite() && context.model_scale > 0.0);
+                    assert_eq!(context.local_feature_size, 2.0 * scale);
+                    assert!(context.arithmetic_floor >= TolerancePolicy::STANDARD.resolution);
+                    assert!(context.policy.intersection >= context.arithmetic_floor);
+                    assert!(context.convergence >= context.arithmetic_floor);
+                    assert!(context.quantization >= context.arithmetic_floor);
+                    assert!(
+                        context.quantization
+                            <= TolerancePolicy::STANDARD
+                                .snap_max
+                                .max(context.arithmetic_floor)
+                    );
+                    if origin == [0.0, 0.0, 0.0] && scale == 1.0e-3 && aspect == 1.0 {
+                        assert!(context.model_scale < 1.0, "unit-scale floor returned");
+                    }
+                }
+            }
+        }
     }
 }

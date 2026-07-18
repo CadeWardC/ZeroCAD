@@ -27,3 +27,9 @@ bench = false
 
 [workspace]
 members = ["."]
+
+# Recovery and resolvability targets exercise the guarded boolean boundary;
+# aborting would bypass its catch_unwind contract and turn a classified kernel
+# failure into a process crash before the harness can promote the case.
+[profile.release]
+panic = "unwind"

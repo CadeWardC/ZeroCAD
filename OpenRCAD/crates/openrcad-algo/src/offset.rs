@@ -1,4 +1,4 @@
-use openrcad_foundation::{tolerance, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
+use openrcad_foundation::{tolerance, Dir, Pnt, ToleranceContext, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{GeomCurve, GeomSurface, OffsetSurface, Plane, Surface};
 use openrcad_topo::{Edge, Face, Solid, Vertex, Wire};
 use std::collections::HashMap;
@@ -25,6 +25,10 @@ pub fn shell_solid_with_policy(
     policy
         .validate()
         .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    let tolerance_context =
+        ToleranceContext::derive(policy, &[solid.bounding_box()], Some(thickness.abs()), 1.0)
+            .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    let policy = &tolerance_context.policy;
     if thickness.abs() <= policy.linear {
         return Ok(solid.clone());
     }
@@ -62,11 +66,16 @@ fn shell_planar_general(
         return Err(BlendError::UnsupportedShape);
     }
     let faces = solid.shell().faces();
+    let context =
+        ToleranceContext::derive(policy, &[solid.bounding_box()], Some(thickness.abs()), 1.0)
+            .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    let quantum = context.quantization;
+    let grid = 1.0 / quantum;
     let quant = |p: &Pnt| {
         (
-            (p.x() * 1.0e6).round() as i64,
-            (p.y() * 1.0e6).round() as i64,
-            (p.z() * 1.0e6).round() as i64,
+            (p.x() * grid).round() as i64,
+            (p.y() * grid).round() as i64,
+            (p.z() * grid).round() as i64,
         )
     };
 
@@ -116,8 +125,9 @@ fn shell_planar_general(
             let (_, n) = planes[fi];
             let dup = distinct.iter().any(|&fj| {
                 let (pj, nj) = planes[fj];
-                n.dot(&nj).abs() > 1.0 - 1e-9
-                    && ((planes[fi].0 - pj).dot(&GeomVec::from_dir(nj))).abs() < 1e-6
+                n.dot(&nj).abs() > 1.0 - context.policy.angular
+                    && ((planes[fi].0 - pj).dot(&GeomVec::from_dir(nj))).abs()
+                        < context.policy.classification
             });
             if !dup {
                 distinct.push(fi);
@@ -135,7 +145,7 @@ fn shell_planar_general(
             rhs[r] = n.x() * p.x() + n.y() * p.y() + n.z() * p.z() - thickness;
         }
         let det = det3(&rows);
-        if det.abs() < 1e-12 {
+        if det.abs() < context.policy.angular {
             return Err(BlendError::UnsupportedShape);
         }
         let x = solve3(&rows, &rhs, det);
@@ -147,9 +157,9 @@ fn shell_planar_general(
     // meet on the wrong side — thickness ≥ the local feature size).
     for (key, off) in &offset_of {
         let orig = Pnt::new(
-            key.0 as f64 / 1.0e6,
-            key.1 as f64 / 1.0e6,
-            key.2 as f64 / 1.0e6,
+            key.0 as f64 * quantum,
+            key.1 as f64 * quantum,
+            key.2 as f64 * quantum,
         );
         if orig.distance(off) > thickness.abs() * 10.0 {
             return Err(BlendError::ParameterTooLarge {

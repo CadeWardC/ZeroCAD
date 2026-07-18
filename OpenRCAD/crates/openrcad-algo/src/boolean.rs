@@ -1,7 +1,7 @@
 use crate::BooleanOp;
 use core::f64::consts::TAU;
 use openrcad_foundation::{
-    CancellationProbe, NeverCancelled, TolerancePolicy, TolerancePolicyError,
+    CancellationProbe, NeverCancelled, ToleranceContext, TolerancePolicy, TolerancePolicyError,
 };
 use openrcad_foundation::{Dir, Pnt, Trsf, Vec as GeomVec};
 use openrcad_geom::{Circle, Curve, GeomCurve, GeomSurface, Surface};
@@ -294,6 +294,8 @@ pub fn boolean_operation_with_classes_policy_and_cancel(
         .map_err(|_| BooleanError::Cancelled)?;
     validate_operand(BooleanInput::Object, object, policy)?;
     validate_operand(BooleanInput::Tool, tool, policy)?;
+    let tolerance_context = boolean_tolerance_context(object, tool, policy);
+    let policy = &tolerance_context.policy;
 
     let (result, face_history, mut recovery) = catch_unwind(AssertUnwindSafe(|| {
         boolean_impl(
@@ -388,6 +390,8 @@ pub fn boolean_bodies_operation_with_classes_policy_and_cancel(
         .map_err(|_| BooleanError::Cancelled)?;
     validate_operand(BooleanInput::Object, object, policy)?;
     validate_operand(BooleanInput::Tool, tool, policy)?;
+    let tolerance_context = boolean_tolerance_context(object, tool, policy);
+    let policy = &tolerance_context.policy;
 
     let (combined, packed_history, mut recovery) = catch_unwind(AssertUnwindSafe(|| {
         boolean_impl(
@@ -1505,7 +1509,23 @@ fn planar_faces(solid: &Solid) -> Vec<PlanarFaceInfo> {
     out
 }
 
-/// Diagonal of the solid's bounding box (≥ 1.0), the length scale for fuzz.
+/// Derive the operation-local numerical scale without imposing a unit floor.
+fn boolean_tolerance_context(
+    object: &Solid,
+    tool: &Solid,
+    policy: &TolerancePolicy,
+) -> ToleranceContext {
+    let bounds = [object.bounding_box(), tool.bounding_box()];
+    let local_feature_size = bounds
+        .iter()
+        .filter_map(|bounds| bounds.corners())
+        .flat_map(|(lo, hi)| [hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z()])
+        .filter(|extent| extent.is_finite() && *extent > 0.0)
+        .min_by(f64::total_cmp);
+    ToleranceContext::derive(policy, &bounds, local_feature_size, 1.0)
+        .expect("validated policy produces a tolerance context")
+}
+
 fn bbox_diag(solid: &Solid) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
@@ -1521,11 +1541,9 @@ fn bbox_diag(solid: &Solid) -> f64 {
         }
     }
     if lo[0] > hi[0] {
-        return 1.0;
+        return 0.0;
     }
-    ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2))
-        .sqrt()
-        .max(1.0)
+    ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt()
 }
 
 #[inline]

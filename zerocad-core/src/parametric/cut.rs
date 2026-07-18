@@ -255,6 +255,27 @@ pub(crate) fn cut_part_one_dir(
     let changed_difference = |label: &str, tool: &KernelSolid| {
         let outcome = crate::mock_kernel::difference_bodies_with_history(part, tool, obj_classes)?;
         if cut_parts_changed(part, &outcome.bodies) {
+            if label == "expanded" {
+                let Some(exact_tool) = exact.as_ref() else {
+                    recut_debug("expanded cut candidate rejected: no exact reference tool");
+                    return None;
+                };
+                match super::recovery_certificate::certify_expanded_cut(
+                    part,
+                    exact_tool,
+                    tool,
+                    &outcome.bodies,
+                ) {
+                    Ok(certificate) => recut_debug(format!(
+                        "expanded cut recovery certified: {}",
+                        certificate.summary()
+                    )),
+                    Err(error) => {
+                        recut_debug(format!("expanded cut candidate rejected: {error}"));
+                        return None;
+                    }
+                }
+            }
             recut_debug(format!("cut variant '{label}' changed part"));
             Some(CutOutcome {
                 parts: outcome.bodies,

@@ -264,19 +264,40 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
         _ => None,
     };
 
-    for variant in [
-        tool.smooth.as_ref(),
-        tool.exact.as_ref(),
-        tool.dipped.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (label, variant) in [
+        ("smooth", tool.smooth.as_ref()),
+        ("exact", tool.exact.as_ref()),
+        ("dipped", tool.dipped.as_ref()),
+    ] {
+        let Some(variant) = variant else {
+            continue;
+        };
         let Some((parts, history)) =
             union_variant_into_parts(&body.parts, variant, input_names.is_some())
         else {
             continue;
         };
+
+        if label == "dipped" {
+            let Some(exact) = tool.exact.as_ref() else {
+                log::debug!("dipped join candidate rejected: no exact reference tool");
+                continue;
+            };
+            match super::recovery_certificate::certify_dipped_join(
+                &body.parts,
+                exact,
+                variant,
+                &parts,
+            ) {
+                Ok(certificate) => {
+                    log::debug!("dipped join recovery certified: {}", certificate.summary());
+                }
+                Err(error) => {
+                    log::debug!("dipped join candidate rejected: {error}");
+                    continue;
+                }
+            }
+        }
 
         let named = match (&history, &input_names, &input_mesh, parts.as_slice()) {
             (Some(history), Some(names), Some(mesh), [part]) => {

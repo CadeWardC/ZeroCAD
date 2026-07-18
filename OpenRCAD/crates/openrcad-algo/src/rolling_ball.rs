@@ -1079,7 +1079,7 @@ fn merged_coplanar_cap(caps: &[Face]) -> Option<Face> {
 /// corners under that drift — they then fall to the flat-trim crease (the user's
 /// "becomes flat near the miter"). Scale the tolerance to the radius instead.
 fn corner_tol(r: f64) -> f64 {
-    (1e-4 * r.max(1.0)).max(10.0 * tolerance::CONFUSION)
+    (1e-4 * r.abs()).max(10.0 * tolerance::CONFUSION)
 }
 
 /// The endpoint of `edge` nearest to `point`.
@@ -1139,7 +1139,7 @@ fn corner_sphere_blend(
         center,
         cyl.position().location(),
         cyl.position().direction(),
-    ) > 1e-5 * r.max(1.0) + 1e-6
+    ) > 1e-5 * r.abs() + 1e-6
     {
         return None;
     }
@@ -1660,7 +1660,7 @@ fn try_tangent_curved_wall_runout(
         center,
         wall_cyl.position().location(),
         wall_cyl.position().direction(),
-    ) <= 1.0e-5 * radius.max(1.0) + 1.0e-6
+    ) <= 1.0e-5 * radius.abs() + 1.0e-6
     {
         return Ok(false);
     }
@@ -1779,7 +1779,9 @@ fn wall_crosses_blend_at_corner(cap: &Face, wall_cyl: &CylindricalSurface, corne
     let axis = GeomVec::from_dir(wall_cyl.position().direction());
     let v = corner - axis_pt;
     let radial = v - axis * v.dot(&axis);
-    if (radial.magnitude() - wall_cyl.radius()).abs() > 1.0e-4 * wall_cyl.radius().max(1.0) {
+    if (radial.magnitude() - wall_cyl.radius()).abs()
+        > (1.0e-4 * wall_cyl.radius().abs()).max(10.0 * tolerance::CONFUSION)
+    {
         return false;
     }
     face_contains_point(cap, corner)
@@ -1799,7 +1801,9 @@ fn wall_is_tangent_to_selected_side(
         return Ok(false);
     };
     let radial_vec = GeomVec::from_dir(radial_dir);
-    if (radial.magnitude() - wall_cyl.radius()).abs() > 1.0e-4 * wall_cyl.radius().max(1.0) {
+    if (radial.magnitude() - wall_cyl.radius()).abs()
+        > (1.0e-4 * wall_cyl.radius().abs()).max(10.0 * tolerance::CONFUSION)
+    {
         return Ok(false);
     }
 
@@ -2667,7 +2671,7 @@ fn try_corner_mixed_side_miter(
     let quarter = |center: Pnt, p: Pnt, q: Pnt| {
         (center.distance(&p) - radius).abs() <= tol
             && (center.distance(&q) - radius).abs() <= tol
-            && (p - center).dot(&(q - center)).abs() <= tol * radius.max(1.0)
+            && (p - center).dot(&(q - center)).abs() <= tol * radius.abs().max(tolerance::CONFUSION)
     };
     if !quarter(old_center, k, c) || !quarter(center, a, b) {
         return false;
@@ -3690,7 +3694,7 @@ fn try_corner_circular_band_miter(
         w_lo.min(w_hi),
         w_lo.max(w_hi),
     );
-    if g_tor(rail_pt(0.0, t_a)).abs() > 1e-4 * radius.max(1.0) {
+    if g_tor(rail_pt(0.0, t_a)).abs() > (1e-4 * radius.abs()).max(10.0 * tolerance::CONFUSION) {
         return false;
     }
 
@@ -5086,7 +5090,7 @@ fn miter_retract_band_at_end(
     // The old end trim spans the full blend cross-section; its far endpoint must
     // land on `b_shared` for the retraction to be sound. Allow the small drift a
     // chorded flush section accumulates.
-    let end_tol = 1e-3 * (old_end.distance(&b_shared)).max(1.0);
+    let end_tol = (1e-3 * old_end.distance(&b_shared)).max(10.0 * tolerance::CONFUSION);
     let edges = face
         .outer_wire()
         .ok_or(RollingBallError::UnsupportedTrimTopology)?
@@ -5379,7 +5383,7 @@ fn blend_open_circular_chain(
 
         let (rho0, h0) = (geom.major_radius, h_plane);
         let ua = minimize_scalar(|u| g(rho0, h0, u).abs(), near - 0.7, near + 0.7);
-        if g(rho0, h0, ua).abs() > 1e-4 * dist.max(1.0) {
+        if g(rho0, h0, ua).abs() > (1e-4 * dist.abs()).max(10.0 * tolerance::CONFUSION) {
             return Err(RollingBallError::UnsupportedTrimTopology);
         }
         let mut pts = vec![ring_pt(rho0, h0, ua)];
@@ -6120,7 +6124,7 @@ fn rolling_ball_plane_perp_cylinder(
             .ok_or(RollingBallError::DegenerateSpine)?,
     );
     // The edge must actually lie on the cylinder wall.
-    if (radial_vec.magnitude() - r_cyl).abs() > 1e-6 * r_cyl.max(1.0) + 1e-6 {
+    if (radial_vec.magnitude() - r_cyl).abs() > 1e-6 * r_cyl.abs() + 1e-6 {
         return Err(RollingBallError::UnsolvableAdjacency {
             reason: AdjacencyReason::UnsupportedSurfacePair,
         });

@@ -273,3 +273,31 @@ fn retained_exceptions_are_owned_and_triggered() {
             && !exception.user_impact.contains("silent")
     }));
 }
+
+#[test]
+fn guarded_kernel_workspaces_keep_release_unwinding() {
+    fn release_profile(manifest: &str) -> &str {
+        manifest
+            .split("[profile.release]")
+            .nth(1)
+            .expect("manifest must declare an explicit release profile")
+            .split("\n[")
+            .next()
+            .expect("release profile body")
+    }
+
+    for (name, manifest) in [
+        ("ZeroCAD", include_str!("../../Cargo.toml")),
+        ("OpenRCAD", include_str!("../../OpenRCAD/Cargo.toml")),
+        ("boolean fuzz", include_str!("../../fuzz/Cargo.toml")),
+    ] {
+        let profile = release_profile(manifest);
+        assert!(
+            profile
+                .lines()
+                .any(|line| line.trim() == "panic = \"unwind\""),
+            "{name} release profile must preserve catch_unwind recovery"
+        );
+        assert!(!profile.contains("panic = \"abort\""));
+    }
+}

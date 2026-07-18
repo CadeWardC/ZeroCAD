@@ -54,7 +54,7 @@ pub mod prelude {
         load_zcad, read_zcad, save_zcad, write_zcad, CachedMesh, Document, DocumentError,
         FeatureId, LoadedZcad, Operation, SketchId, ZcadDocument, ZcadError, ZcadMetadata,
     };
-    pub use crate::foundation::{Ax1, Ax2, Ax3, Dir, Pnt, TolerancePolicy, Trsf};
+    pub use crate::foundation::{Ax1, Ax2, Ax3, Dir, Pnt, ToleranceContext, TolerancePolicy, Trsf};
     // OpenRCAD's 3D vector is `gp_Vec`-style `Vec`; alias it so a glob import of
     // the prelude never shadows `std::vec::Vec`.
     pub use crate::foundation::Vec as GeomVec;
