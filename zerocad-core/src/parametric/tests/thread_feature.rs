@@ -74,13 +74,18 @@ fn external_thread_feature_evaluates_and_keeps_body() {
         1.5,
         0.5,
     );
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
 
     // The body must survive regardless of whether the helical boolean succeeded
     // (cosmetic fallback) — never deleted, never a panic.
-    let mesh = body_mesh(&bodies, "cyl_1");
+    let mesh = body_mesh(&output.bodies, "cyl_1");
     assert!(
         !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
         "threaded body keeps a valid mesh"
@@ -104,8 +109,12 @@ fn external_thread_feature_evaluates_and_keeps_body() {
     }
     // The face must resolve — a missing cylinder would warn "no cylindrical face".
     assert!(
-        !warnings.iter().any(|w| w.contains("no cylindrical face")),
-        "cylindrical face should resolve: {warnings:?}"
+        !output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "thread_2"
+                && diagnostic.code.as_str() == DiagnosticCode::REFERENCE_MISSING
+        }),
+        "cylindrical face should resolve: {:?}",
+        output.diagnostics
     );
 }
 
@@ -210,18 +219,24 @@ fn internal_thread_taps_a_drilled_hole() {
         1.0,
         0.6,
     );
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
 
-    let mesh = body_mesh(&bodies, "box_1");
+    let mesh = body_mesh(&output.bodies, "box_1");
     assert!(
         !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
         "tapped body keeps a valid mesh"
     );
     assert!(
-        !warnings.iter().any(|w| w.contains("cosmetic")),
-        "internal thread should cut real geometry, not fall back: {warnings:?}"
+        !output.has_diagnostic_warnings(),
+        "internal thread should cut real geometry: {:?}",
+        output.diagnostics
     );
     if let Some(props) = mesh.mass_properties() {
         let plain = 20.0 * 20.0 * 10.0 - std::f64::consts::PI * 9.0 * 10.0;
@@ -260,11 +275,56 @@ fn thread_on_missing_body_warns_not_panics() {
         1.5,
         0.5,
     );
-    let (_bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
         .unwrap();
     assert!(
-        warnings.iter().any(|w| w.contains("no longer exists")),
-        "missing target should warn: {warnings:?}"
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.feature_id == "thread_2"
+                && diagnostic.code.as_str() == DiagnosticCode::REFERENCE_MISSING
+        }),
+        "missing target should diagnose: {:?}",
+        output.diagnostics
     );
+}
+
+#[test]
+fn thread_candidate_contract_cold_warm_cancel_and_restore() {
+    let mut graph = ParametricGraph::new();
+    add_cylinder(&mut graph, "thread_contract_body", 4.0, 5.0);
+    add_thread(
+        &mut graph,
+        "thread_contract",
+        "thread_contract_body",
+        [4.0, 2.5, 0.0],
+        [1.0, 0.0, 0.0],
+        false,
+        1.5,
+        0.5,
+    );
+    let hidden = std::collections::HashSet::new();
+    let cold = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    let warm = graph.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert_eq!(cold.1, warm.1);
+    assert_eq!(cold.0.len(), warm.0.len());
+    assert_eq!(cold.0[0].1.indices, warm.0[0].1.indices);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+    assert!(matches!(
+        graph.evaluate_request(
+            &hidden,
+            EvaluationQuality::Interactive,
+            &EvaluationCancellation::new(1, cancelled),
+        ),
+        Err(EvaluationError::Cancelled)
+    ));
+    let restored: ParametricGraph =
+        serde_json::from_str(&serde_json::to_string(&graph.clone_document()).unwrap()).unwrap();
+    let rebuilt = restored.evaluate_bodies_with_warnings(&hidden).unwrap();
+    assert_eq!(warm.1, rebuilt.1);
+    assert_eq!(warm.0[0].1.indices, rebuilt.0[0].1.indices);
 }

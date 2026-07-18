@@ -1403,7 +1403,8 @@ impl ParametricGraph {
                         | crate::document::FeatureEvaluatorKind::Shell
                         | crate::document::FeatureEvaluatorKind::Hole
                         | crate::document::FeatureEvaluatorKind::Pattern
-                        | crate::document::FeatureEvaluatorKind::BodyTransform),
+                        | crate::document::FeatureEvaluatorKind::BodyTransform
+                        | crate::document::FeatureEvaluatorKind::Thread),
                     ) => {
                         let context = FeatureEvalContext {
                             feature: node,
@@ -1436,6 +1437,9 @@ impl ParametricGraph {
                             crate::document::FeatureEvaluatorKind::Pattern
                             | crate::document::FeatureEvaluatorKind::BodyTransform => {
                                 self.evaluate_pattern_or_transform_candidate(evaluator, context)
+                            }
+                            crate::document::FeatureEvaluatorKind::Thread => {
+                                self.evaluate_thread_candidate(context)
                             }
                             _ => unreachable!(),
                         };
@@ -1960,6 +1964,84 @@ impl ParametricGraph {
         })
     }
 
+    fn evaluate_thread_candidate(
+        &self,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        let started = std::time::Instant::now();
+        if context
+            .cancellation
+            .is_some_and(EvaluationCancellation::is_cancelled)
+        {
+            return Err("model evaluation was superseded".into());
+        }
+        let FeatureType::Thread {
+            target,
+            face,
+            internal,
+            pitch,
+            depth,
+            angle_deg,
+            right_handed,
+            starts,
+            length,
+            flip,
+            ..
+        } = &context.feature.feature
+        else {
+            return Err(format!(
+                "registry evaluator Thread cannot invoke feature kind '{}'",
+                context.feature.feature.kind_id()
+            ));
+        };
+        let mut candidate_body_state = context.live_bodies.to_vec();
+        let mut warnings = Vec::new();
+        apply_thread(
+            context.feature_id.as_str(),
+            target,
+            face,
+            *internal,
+            *pitch,
+            *depth,
+            *angle_deg,
+            *right_handed,
+            *starts,
+            *length,
+            *flip,
+            &mut candidate_body_state,
+            &mut warnings,
+        );
+        let diagnostics = warnings
+            .into_iter()
+            .filter_map(|message| {
+                super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                    feature_id: context.feature_id.to_string(),
+                    feature_name: context.feature.name.clone(),
+                    state: ResolutionState::Unresolved(message),
+                })
+            })
+            .collect();
+        let topology_history = Vec::new();
+        let validation_evidence = FeatureValidationEvidence {
+            input_body_count: context.live_bodies.len(),
+            candidate_body_count: candidate_body_state.len(),
+            topology_history_entries: topology_history.len(),
+        };
+        let _quality = context.quality;
+        let _tolerance = context.tolerance;
+        Ok(FeatureEvalResult {
+            candidate_body_state,
+            topology_history,
+            diagnostics,
+            validation_evidence,
+            feature_timing: started.elapsed(),
+            writebacks: RevisionBoundWritebacks {
+                producing_revision: context.document_revision,
+                face_reattach: FaceReattach::default(),
+            },
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn invoke_registered_feature(
         &self,
@@ -2318,37 +2400,7 @@ impl ParametricGraph {
                 );
             }
             crate::document::FeatureEvaluatorKind::Thread => {
-                let FeatureType::Thread {
-                    target,
-                    face,
-                    internal,
-                    pitch,
-                    depth,
-                    angle_deg,
-                    right_handed,
-                    starts,
-                    length,
-                    flip,
-                    ..
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                apply_thread(
-                    &node.id,
-                    target,
-                    face,
-                    *internal,
-                    *pitch,
-                    *depth,
-                    *angle_deg,
-                    *right_handed,
-                    *starts,
-                    *length,
-                    *flip,
-                    live,
-                    warnings,
-                );
+                return Err("Thread must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Loft => {
                 return Err("Loft must be invoked through FeatureEvalResult".into());
