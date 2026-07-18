@@ -53,6 +53,21 @@ pub enum TopoName {
         node: String,
         tool_face: usize,
     },
+    IndexedFace {
+        kind: IndexedFaceKind,
+        node: String,
+        face: usize,
+    },
+    RevolveFace {
+        node: String,
+        region: usize,
+        face: usize,
+    },
+    PatternFace {
+        node: String,
+        instance: usize,
+        face: usize,
+    },
     /// `entity:{id}:{role}` — solver-created sketch entity provenance.
     Entity { id: u32, role: String },
     /// `mesh:{group}` — reconstructed (non-durable) identity.
@@ -73,6 +88,14 @@ pub enum BooleanOpKind {
     Join,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedFaceKind {
+    Import,
+    Loft,
+    Sweep,
+    Stl,
+}
+
 impl TopoName {
     pub fn parse(s: &str) -> TopoName {
         parse_name(s).unwrap_or_else(|| TopoName::Unrecognized(s.to_string()))
@@ -89,9 +112,11 @@ impl TopoName {
     pub fn owner_node(&self) -> Option<&str> {
         match self {
             TopoName::SketchFace { body, .. } | TopoName::SketchEdge { body, .. } => Some(body),
-            TopoName::PrimitiveFace { node, .. } | TopoName::GeneratedFace { node, .. } => {
-                Some(node)
-            }
+            TopoName::PrimitiveFace { node, .. }
+            | TopoName::GeneratedFace { node, .. }
+            | TopoName::IndexedFace { node, .. }
+            | TopoName::RevolveFace { node, .. }
+            | TopoName::PatternFace { node, .. } => Some(node),
             _ => None,
         }
     }
@@ -140,6 +165,23 @@ impl std::fmt::Display for TopoName {
                 BooleanOpKind::Cut => write!(f, "cut:{node}:tool-face:{tool_face}"),
                 BooleanOpKind::Join => write!(f, "join:{node}:tool-face:{tool_face}"),
             },
+            TopoName::IndexedFace { kind, node, face } => {
+                let kind = match kind {
+                    IndexedFaceKind::Import => "import",
+                    IndexedFaceKind::Loft => "loft",
+                    IndexedFaceKind::Sweep => "sweep",
+                    IndexedFaceKind::Stl => "stl",
+                };
+                write!(f, "{kind}:{node}:face:{face}")
+            }
+            TopoName::RevolveFace { node, region, face } => {
+                write!(f, "revolve:{node}:region:{region}:face:{face}")
+            }
+            TopoName::PatternFace {
+                node,
+                instance,
+                face,
+            } => write!(f, "pattern:{node}:inst:{instance}:face:{face}"),
             TopoName::Entity { id, role } => write!(f, "entity:{id}:{role}"),
             TopoName::MeshGroup(g) => write!(f, "mesh:{g}"),
             TopoName::Unrecognized(s) => f.write_str(s),
@@ -229,6 +271,55 @@ fn parse_name(s: &str) -> Option<TopoName> {
             }
         }
     }
+    for (prefix, kind) in [
+        ("import:", IndexedFaceKind::Import),
+        ("loft:", IndexedFaceKind::Loft),
+        ("sweep:", IndexedFaceKind::Sweep),
+        ("stl:", IndexedFaceKind::Stl),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            let face_idx = rest.rfind(":face:")?;
+            let node = &rest[..face_idx];
+            let face = rest[face_idx + 6..].parse().ok()?;
+            if !node.is_empty() {
+                return Some(TopoName::IndexedFace {
+                    kind,
+                    node: node.to_string(),
+                    face,
+                });
+            }
+        }
+    }
+    if let Some(rest) = s.strip_prefix("revolve:") {
+        let region_idx = rest.find(":region:")?;
+        let node = &rest[..region_idx];
+        let after_region = &rest[region_idx + 8..];
+        let face_idx = after_region.find(":face:")?;
+        let region = after_region[..face_idx].parse().ok()?;
+        let face = after_region[face_idx + 6..].parse().ok()?;
+        if !node.is_empty() {
+            return Some(TopoName::RevolveFace {
+                node: node.to_string(),
+                region,
+                face,
+            });
+        }
+    }
+    if let Some(rest) = s.strip_prefix("pattern:") {
+        let instance_idx = rest.find(":inst:")?;
+        let node = &rest[..instance_idx];
+        let after_instance = &rest[instance_idx + 6..];
+        let face_idx = after_instance.find(":face:")?;
+        let instance = after_instance[..face_idx].parse().ok()?;
+        let face = after_instance[face_idx + 6..].parse().ok()?;
+        if !node.is_empty() {
+            return Some(TopoName::PatternFace {
+                node: node.to_string(),
+                instance,
+                face,
+            });
+        }
+    }
     if let Some(rest) = s.strip_prefix("entity:") {
         let sep = rest.find(':')?;
         let id: u32 = rest[..sep].parse().ok()?;
@@ -271,6 +362,12 @@ mod tests {
             "cyl_cyl_2:face:top",
             "cut:extrude_5:tool-face:3",
             "join:extrude_7:tool-face:0",
+            "import:import_4:face:2",
+            "loft:loft_5:face:7",
+            "sweep:sweep_6:face:3",
+            "stl:import_7:face:11",
+            "revolve:revolve_8:region:2:face:4",
+            "pattern:pattern_9:inst:3:face:6",
             "entity:12:line",
             "mesh:4",
         ];

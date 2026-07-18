@@ -1,5 +1,46 @@
 use super::*;
 
+/// Read-only inputs presented to one feature-family evaluator. The outer
+/// orchestrator owns scheduling, checkpoint selection, validation, atomic
+/// commit, status recording, and caching; family evaluators can only return a
+/// candidate [`FeatureEvalResult`].
+struct FeatureEvalContext<'a> {
+    feature: &'a FeatureRecord,
+    feature_id: crate::document::FeatureId,
+    variables: &'a HashMap<String, f64>,
+    sketches: &'a HashMap<NodeIndex, SketchEval>,
+    datums: &'a HashMap<String, DatumValue>,
+    quality: EvaluationQuality,
+    cancellation: Option<&'a EvaluationCancellation>,
+    tolerance: &'a openrcad::foundation::TolerancePolicy,
+    document_revision: u64,
+    live_bodies: &'a [LiveBody],
+}
+
+#[derive(Debug, Default)]
+struct FeatureValidationEvidence {
+    input_body_count: usize,
+    candidate_body_count: usize,
+    topology_history_entries: usize,
+}
+
+#[derive(Debug)]
+struct RevisionBoundWritebacks {
+    producing_revision: u64,
+    face_reattach: FaceReattach,
+}
+
+/// Candidate-only output from a feature-family evaluator. None of this state is
+/// authoritative until the orchestrator validates it and commits it atomically.
+struct FeatureEvalResult {
+    candidate_body_state: Vec<LiveBody>,
+    topology_history: Vec<openrcad::topo::TopologyHistory>,
+    diagnostics: Vec<EvaluationDiagnostic>,
+    validation_evidence: FeatureValidationEvidence,
+    feature_timing: std::time::Duration,
+    writebacks: RevisionBoundWritebacks,
+}
+
 impl ParametricGraph {
     pub fn new() -> Self {
         let mut pg = Self {
@@ -1339,6 +1380,7 @@ impl ParametricGraph {
                 continue;
             }
             let feature_started = std::time::Instant::now();
+            let mut contract_feature_timing = None;
             let node = &self.graph[idx];
             crate::mock_kernel::set_feature_context(Some(&node.id));
             let warn_before = warnings.len();
@@ -1354,6 +1396,56 @@ impl ParametricGraph {
                 let mut candidate_live = live.clone();
                 let mut feature_warnings = Vec::new();
                 let invocation = match self.resolve_feature_evaluator(node) {
+                    Ok(crate::document::FeatureEvaluatorKind::Revolve) => self
+                        .evaluate_revolve_candidate(
+                            idx,
+                            FeatureEvalContext {
+                                feature: node,
+                                feature_id: crate::document::FeatureId::from(node.id.as_str()),
+                                variables: &vars,
+                                sketches: &sketch_cache,
+                                datums: &datums,
+                                quality: if draft {
+                                    EvaluationQuality::Interactive
+                                } else {
+                                    EvaluationQuality::Final
+                                },
+                                cancellation,
+                                tolerance: &openrcad::foundation::TolerancePolicy::STANDARD,
+                                document_revision: 0,
+                                live_bodies: &live,
+                            },
+                        )
+                        .and_then(|result| {
+                            if result.writebacks.producing_revision != 0 {
+                                return Err("revolve returned a stale writeback revision".into());
+                            }
+                            if !result.writebacks.face_reattach.boundaries.is_empty()
+                                || !result.writebacks.face_reattach.planes.is_empty()
+                                || !result.writebacks.face_reattach.region_indices.is_empty()
+                            {
+                                return Err("revolve returned unsupported writebacks".into());
+                            }
+                            if result.validation_evidence.input_body_count != live.len()
+                                || result.validation_evidence.candidate_body_count
+                                    != result.candidate_body_state.len()
+                                || result.validation_evidence.topology_history_entries
+                                    != result.topology_history.len()
+                            {
+                                return Err(
+                                    "revolve returned inconsistent validation evidence".into()
+                                );
+                            }
+                            contract_feature_timing = Some(result.feature_timing);
+                            candidate_live = result.candidate_body_state;
+                            feature_warnings.extend(
+                                result
+                                    .diagnostics
+                                    .into_iter()
+                                    .map(|diagnostic| diagnostic.rendered_message().to_string()),
+                            );
+                            Ok(())
+                        }),
                     Ok(evaluator) => self.invoke_registered_feature(
                         idx,
                         evaluator,
@@ -1408,7 +1500,8 @@ impl ParametricGraph {
                 live: live.clone(),
                 warnings: warnings.clone(),
                 statuses: statuses.clone(),
-                feature_duration: feature_started.elapsed(),
+                feature_duration: contract_feature_timing
+                    .unwrap_or_else(|| feature_started.elapsed()),
             });
             crate::mock_kernel::set_feature_context(None);
         }
@@ -1437,6 +1530,97 @@ impl ParametricGraph {
             return Err("runtime feature disagrees with its registered semantic contract".into());
         }
         Ok(registration.evaluator)
+    }
+
+    fn evaluate_revolve_candidate(
+        &self,
+        idx: NodeIndex,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        let started = std::time::Instant::now();
+        if context
+            .cancellation
+            .is_some_and(EvaluationCancellation::is_cancelled)
+        {
+            return Err("model evaluation was superseded".into());
+        }
+        let FeatureType::Revolve {
+            axis,
+            angle_deg,
+            angle_expr,
+            region_indices,
+            mode,
+            target,
+        } = &context.feature.feature
+        else {
+            return Err(format!(
+                "registry evaluator Revolve cannot invoke feature kind '{}'",
+                context.feature.feature.kind_id()
+            ));
+        };
+        let effective_angle = match angle_expr.as_ref() {
+            Some(expression) => match crate::expr::eval(expression, context.variables) {
+                Ok(value) => value as f32,
+                Err(_) => *angle_deg,
+            },
+            None => *angle_deg,
+        };
+        let mut candidate_body_state = context.live_bodies.to_vec();
+        let mut warnings = Vec::new();
+        if let Some(expression) = angle_expr.as_ref() {
+            if crate::expr::eval(expression, context.variables).is_err() {
+                warnings.push(format!(
+                    "Revolve '{}': angle expression \"{}\" no longer evaluates; using last value {:.3}.",
+                    context.feature_id, expression, angle_deg
+                ));
+            }
+        }
+        self.apply_revolve(
+            idx,
+            context.feature_id.as_str(),
+            axis,
+            effective_angle,
+            region_indices,
+            *mode,
+            target.as_deref(),
+            context.sketches,
+            context.datums,
+            &mut candidate_body_state,
+            &mut warnings,
+        );
+
+        let diagnostics = warnings
+            .into_iter()
+            .filter_map(|message| {
+                super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                    feature_id: context.feature_id.to_string(),
+                    feature_name: context.feature.name.clone(),
+                    state: ResolutionState::Unresolved(message),
+                })
+            })
+            .collect();
+        let topology_history = Vec::new();
+        let validation_evidence = FeatureValidationEvidence {
+            input_body_count: context.live_bodies.len(),
+            candidate_body_count: candidate_body_state.len(),
+            topology_history_entries: topology_history.len(),
+        };
+        // Revolve geometry is quality-independent today. Reading both fields at
+        // the family boundary makes that invariant explicit until a family
+        // genuinely needs a preview-specific implementation.
+        let _quality = context.quality;
+        let _tolerance = context.tolerance;
+        Ok(FeatureEvalResult {
+            candidate_body_state,
+            topology_history,
+            diagnostics,
+            validation_evidence,
+            feature_timing: started.elapsed(),
+            writebacks: RevisionBoundWritebacks {
+                producing_revision: context.document_revision,
+                face_reattach: FaceReattach::default(),
+            },
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1639,44 +1823,7 @@ impl ParametricGraph {
                 );
             }
             crate::document::FeatureEvaluatorKind::Revolve => {
-                let FeatureType::Revolve {
-                    axis,
-                    angle_deg,
-                    angle_expr,
-                    region_indices,
-                    mode,
-                    target,
-                } = &node.feature
-                else {
-                    return Err(payload_mismatch());
-                };
-                let eff_angle = match angle_expr.as_ref() {
-                    Some(e) => match crate::expr::eval(e, vars) {
-                        Ok(v) => v as f32,
-                        Err(_) => {
-                            warnings.push(format!(
-                                "Revolve '{}': angle expression \"{}\" no longer \
-                                 evaluates; using last value {:.3}.",
-                                node.id, e, angle_deg
-                            ));
-                            *angle_deg
-                        }
-                    },
-                    None => *angle_deg,
-                };
-                self.apply_revolve(
-                    idx,
-                    &node.id,
-                    axis,
-                    eff_angle,
-                    region_indices,
-                    *mode,
-                    target.as_deref(),
-                    sketch_cache,
-                    datums,
-                    live,
-                    warnings,
-                );
+                return Err("Revolve must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::Pattern => {
                 let FeatureType::Pattern { source, kind } = &node.feature else {
