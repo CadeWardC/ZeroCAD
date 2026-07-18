@@ -31,6 +31,24 @@ fn re_extrude_after_serde_round_trip_builds_a_body() {
     );
 }
 
+#[test]
+fn serde_restore_rederives_node_map_before_the_first_evaluation() {
+    let mut g = ParametricGraph::new();
+    add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (10.0, 10.0)));
+    add_extrude(&mut g, "extrude_2", "sketch_1", 5.0, ExtrudeMode::NewBody);
+
+    let restored: ParametricGraph =
+        serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+    assert_eq!(restored.node_map.len(), restored.graph.node_count());
+    for index in restored.graph.node_indices() {
+        assert_eq!(
+            restored.node_map.get(&restored.graph[index].id),
+            Some(&index)
+        );
+    }
+    assert_eq!(body_count(&restored), 1);
+}
+
 /// GUI delete path: removing a middle node swap-moves the last node's index.
 /// `remove_feature` must leave the map consistent so a later extrude attaches
 /// to the sketch, not to whatever slid into the stale slot.

@@ -732,7 +732,7 @@ impl FeatureRecord {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ParametricGraph {
     pub graph: DiGraph<FeatureRecord, ()>,
     /// Stable body identities and ordered timelines. Feature semantics live on
@@ -795,6 +795,41 @@ pub struct ParametricGraph {
     /// and a transparent accelerator (dropping it only costs a one-time rebuild).
     #[serde(skip)]
     pub(crate) eval_cache: RefCell<std::sync::Arc<EvalCache>>,
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedParametricGraph {
+    graph: DiGraph<FeatureRecord, ()>,
+    #[serde(default)]
+    semantics: crate::document::DocumentSemantics,
+    #[serde(default)]
+    sketch_face_refs: HashMap<String, FaceRef>,
+    #[serde(default)]
+    sketch_datum_refs: HashMap<String, String>,
+    #[serde(default)]
+    sketch_face_boundaries: HashMap<String, crate::sketch::SketchCurves>,
+}
+
+impl<'de> serde::Deserialize<'de> for ParametricGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let persisted = PersistedParametricGraph::deserialize(deserializer)?;
+        let mut graph = Self {
+            graph: persisted.graph,
+            semantics: persisted.semantics,
+            sketch_face_refs: persisted.sketch_face_refs,
+            sketch_datum_refs: persisted.sketch_datum_refs,
+            sketch_face_boundaries: persisted.sketch_face_boundaries,
+            node_map: HashMap::new(),
+            region_cache: RefCell::new(HashMap::new()),
+            pending_face_reattach: RefCell::new(FaceReattach::default()),
+            eval_cache: RefCell::new(std::sync::Arc::new(EvalCache::default())),
+        };
+        graph.rebuild_node_map();
+        Ok(graph)
+    }
 }
 
 /// Refreshed sketch-on-face data queued during an evaluation — see
