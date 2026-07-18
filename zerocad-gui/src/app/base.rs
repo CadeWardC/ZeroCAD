@@ -139,6 +139,7 @@ impl ZeroCadApp {
             hidden_nodes: HashSet::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            working_sketch_undo: Vec::new(),
             dim_input: None,
             dim_anchor: None,
             last_cursor: None,

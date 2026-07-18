@@ -548,6 +548,21 @@ impl Document {
         }
     }
 
+    /// Clone only persisted, authoritative document state.
+    ///
+    /// A normal [`Clone`] intentionally shares the immutable evaluator cache so
+    /// workers can hand warm geometry between equivalent revisions cheaply.
+    /// Undo, redo, autosave, and recovery snapshots must use this method: those
+    /// snapshots are history, not evaluator checkpoints, and must stay bounded
+    /// independently of the amount of cached geometry.
+    pub fn clone_authoritative(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone_document(),
+            state: self.state.clone(),
+            revision: self.revision,
+        }
+    }
+
     pub fn is_visible(&self, id: &str) -> bool {
         self.state.visibility.get(id).copied().unwrap_or(true)
     }

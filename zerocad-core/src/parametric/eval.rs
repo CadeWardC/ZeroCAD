@@ -865,6 +865,17 @@ impl ParametricGraph {
         Ok(())
     }
 
+    /// Test seam for simulating an in-place edit over a genuinely warm cache.
+    /// Production callers must use `commit_feature_edit`, which clears derived
+    /// state after rebuilding the semantic contract.
+    #[cfg(test)]
+    pub(crate) fn refresh_feature_contract_over_warm_cache_for_test(
+        &mut self,
+        id: &str,
+    ) -> Result<(), String> {
+        self.refresh_feature_contract(id)
+    }
+
     pub fn feature_state(&self, id: &str) -> Option<crate::document::FeatureState> {
         self.graph
             .node_weights()

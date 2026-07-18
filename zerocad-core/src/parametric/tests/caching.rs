@@ -349,3 +349,395 @@ fn stale_revision_bound_writebacks_are_rejected() {
     assert!(document.apply_face_reattach_updates(current));
     assert!(document.sketch_face_boundaries.contains_key("sketch_1"));
 }
+
+#[test]
+fn authoritative_document_clone_drops_warm_evaluator_checkpoints() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let document = crate::Document::from_graph(graph, crate::Unit::Millimeter);
+    let hidden = std::collections::HashSet::new();
+    document
+        .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+        .unwrap();
+    assert!(document
+        .evaluator_graph()
+        .eval_cache
+        .borrow()
+        .checkpoints
+        .iter()
+        .any(Option::is_some));
+
+    let snapshot = document.clone_authoritative();
+    assert!(snapshot
+        .evaluator_graph()
+        .eval_cache
+        .borrow()
+        .checkpoints
+        .is_empty());
+    assert_eq!(snapshot.revision(), document.revision());
+    assert_eq!(snapshot.state.units, document.state.units);
+}
+
+#[derive(Debug, Clone)]
+enum JsonStep {
+    Key(String),
+    Index(usize),
+}
+
+fn feature_mutation_corpus() -> Vec<FeatureType> {
+    use crate::mock_kernel::EdgeCurveHint;
+    use crate::{
+        AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef, HoleKind,
+        PatternKind, PlaneBase, Variable,
+    };
+
+    let face = FaceRef {
+        centroid: [1.0, 2.0, 3.0],
+        normal: [0.0, 0.0, 1.0],
+        topology: None,
+    };
+    let direct_face = FaceRef {
+        topology: Some(TopologyFaceRef {
+            body_id: Some("missing_a".into()),
+            face_id: Some("foreign:face:1".into()),
+            producer_feature_id: Some("missing_a".into()),
+            ..TopologyFaceRef::default()
+        }),
+        ..face.clone()
+    };
+    let edge = EdgeRef {
+        p0: [0.0, 0.0, 0.0],
+        p1: [1.0, 0.0, 0.0],
+        n1: [0.0, 1.0, 0.0],
+        n2: [0.0, 0.0, 1.0],
+        curve: Some(EdgeCurveHint::Line),
+        topology: None,
+    };
+    vec![
+        FeatureType::Origin,
+        FeatureType::Box {
+            w: 2.0,
+            h: 3.0,
+            d: 4.0,
+        },
+        FeatureType::Cylinder { r: 2.0, h: 5.0 },
+        FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: Vec::new(),
+            corner_mods: Vec::new(),
+            mirrors: Vec::new(),
+            on_face: false,
+            entity_ids: Vec::new(),
+            next_entity_id: 1,
+            solver: None,
+        },
+        FeatureType::Extrude {
+            depth: 6.0,
+            region_indices: vec![0],
+            mode: ExtrudeMode::NewBody,
+            target: Some("missing_body".into()),
+            depth_expr: Some("3*2".into()),
+        },
+        FeatureType::EdgeMod {
+            target: "missing_body".into(),
+            edge,
+            dist: 0.2,
+            dist_expr: Some("0.1*2".into()),
+            kind: crate::sketch::CornerKind::Chamfer,
+        },
+        FeatureType::VariableSet {
+            variables: vec![Variable::new("width", crate::Unit::Millimeter)],
+        },
+        FeatureType::Import {
+            step_data: "ISO-10303-21;END-ISO-10303-21;".into(),
+            label: "fixture".into(),
+        },
+        FeatureType::Revolve {
+            axis: AxisBase::X,
+            angle_deg: 180.0,
+            angle_expr: Some("90*2".into()),
+            region_indices: vec![0],
+            mode: ExtrudeMode::NewBody,
+            target: Some("missing_body".into()),
+        },
+        FeatureType::Loft {
+            sections: vec![("section_a".into(), 0), ("section_b".into(), 1)],
+            mode: ExtrudeMode::NewBody,
+            target: Some("missing_body".into()),
+        },
+        FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 0,
+            path_sketch: "path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: Some("missing_body".into()),
+        },
+        FeatureType::Shell {
+            target: "missing_body".into(),
+            thickness: 0.5,
+            thickness_expr: Some("wall".into()),
+            open_faces: vec![face.clone()],
+        },
+        FeatureType::Hole {
+            target: "missing_body".into(),
+            position: [1.0, 1.0, 1.0],
+            direction: [0.0, 0.0, -1.0],
+            diameter: 2.0,
+            diameter_expr: Some("bore".into()),
+            depth: Some(4.0),
+            kind: HoleKind::Counterbore {
+                diameter: 4.0,
+                depth: 1.0,
+            },
+            standard: None,
+            manufacturing: None,
+        },
+        FeatureType::Pattern {
+            source: "missing_body".into(),
+            kind: PatternKind::Linear {
+                dir: AxisBase::Y,
+                spacing: 3.0,
+                spacing_expr: Some("step".into()),
+                count: 3,
+            },
+        },
+        FeatureType::BodyTransform {
+            source: "missing_body".into(),
+            translation: [1.0, 2.0, 3.0],
+            copy: true,
+        },
+        FeatureType::Thread {
+            target: "missing_body".into(),
+            face: face.clone(),
+            internal: true,
+            pitch: 1.0,
+            depth: 0.3,
+            angle_deg: 60.0,
+            right_handed: true,
+            starts: 2,
+            length: Some(8.0),
+            flip: true,
+            designation: "M6x1".into(),
+            standard: None,
+        },
+        FeatureType::DatumPlane {
+            def: DatumPlaneDef::Offset {
+                base: PlaneBase::XY,
+                distance: 5.0,
+                distance_expr: Some("datum_height".into()),
+            },
+        },
+        FeatureType::DatumAxis {
+            def: DatumAxisDef::TwoPoints {
+                a: [0.0, 0.0, 0.0],
+                b: [0.0, 0.0, 1.0],
+            },
+        },
+        FeatureType::DatumPoint {
+            def: DatumPointDef::Coords { p: [1.0, 2.0, 3.0] },
+        },
+        FeatureType::BodyJoin {
+            sources: vec!["missing_a".into(), "missing_b".into()],
+        },
+        FeatureType::BodyCut {
+            target: "missing_a".into(),
+            tool: "missing_b".into(),
+            keep_tool: true,
+        },
+        FeatureType::BodyIntersect {
+            target: "missing_a".into(),
+            tool: "missing_b".into(),
+            keep_tool: true,
+        },
+        FeatureType::BodySplit {
+            target: "missing_a".into(),
+            plane: PlaneBase::Datum("missing_plane".into()),
+            face: None,
+        },
+        FeatureType::BodyScale {
+            source: "missing_a".into(),
+            factor: 2.0,
+            factor_expr: Some("scale_factor".into()),
+            center: [1.0, 2.0, 3.0],
+        },
+        FeatureType::FaceOffset {
+            target: "missing_a".into(),
+            face: direct_face.clone(),
+            distance: -2.0,
+            distance_expr: Some("-wall".into()),
+        },
+        FeatureType::FaceMove {
+            target: "missing_a".into(),
+            face: direct_face.clone(),
+            translation: [0.0, 0.0, 2.0],
+        },
+        FeatureType::FaceDelete {
+            target: "missing_a".into(),
+            face: direct_face.clone(),
+        },
+        FeatureType::FaceThicken {
+            target: "missing_a".into(),
+            face: direct_face,
+            thickness: 1.5,
+            thickness_expr: Some("sheet".into()),
+            reverse: true,
+        },
+        FeatureType::ImportStl {
+            stl_data: b"solid empty\nendsolid empty\n".to_vec(),
+            label: "empty.stl".into(),
+        },
+    ]
+}
+
+fn json_leaf_paths(
+    value: &serde_json::Value,
+    path: &mut Vec<JsonStep>,
+    out: &mut Vec<Vec<JsonStep>>,
+) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                path.push(JsonStep::Key(key.clone()));
+                json_leaf_paths(value, path, out);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(values) if !values.is_empty() => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(JsonStep::Index(index));
+                json_leaf_paths(value, path, out);
+                path.pop();
+            }
+        }
+        _ => out.push(path.clone()),
+    }
+}
+
+fn value_at_mut<'a>(
+    mut value: &'a mut serde_json::Value,
+    path: &[JsonStep],
+) -> &'a mut serde_json::Value {
+    for step in path {
+        value = match step {
+            JsonStep::Key(key) => value.get_mut(key).unwrap(),
+            JsonStep::Index(index) => value.get_mut(*index).unwrap(),
+        };
+    }
+    value
+}
+
+fn mutation_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    use serde_json::{Number, Value};
+    match value {
+        Value::Bool(value) => vec![Value::Bool(!value)],
+        Value::Number(value) => vec![Value::Number(
+            Number::from_f64(value.as_f64().unwrap() + 0.375).unwrap(),
+        )],
+        Value::String(value) => vec![Value::String(format!("{value}_mutated"))],
+        Value::Null => vec![
+            Value::String("mutated".into()),
+            Value::Number(Number::from_f64(1.375).unwrap()),
+            Value::Bool(true),
+            Value::Array(Vec::new()),
+            Value::Object(Default::default()),
+        ],
+        Value::Array(values) if values.is_empty() => vec![
+            Value::Array(vec![Value::String("mutated".into())]),
+            Value::Array(vec![Value::Number(Number::from(1))]),
+            Value::Array(vec![Value::Bool(true)]),
+        ],
+        Value::Array(_) | Value::Object(_) => unreachable!("only leaves are mutated"),
+    }
+}
+
+#[test]
+fn every_mutable_persisted_feature_leaf_matches_a_cache_free_rebuild() {
+    let hidden = std::collections::HashSet::new();
+    let mut exercised = 0usize;
+    let mut variants = 0usize;
+
+    for (variant_index, original) in feature_mutation_corpus().into_iter().enumerate() {
+        let encoded = serde_json::to_value(&original).unwrap();
+        let variant_name = encoded
+            .as_object()
+            .and_then(|object| object.keys().next())
+            .cloned()
+            .unwrap_or_else(|| "Origin".into());
+        let mut paths = Vec::new();
+        json_leaf_paths(&encoded, &mut Vec::new(), &mut paths);
+        let mut variant_exercised = 0usize;
+
+        for (leaf_index, path) in paths.into_iter().enumerate() {
+            let original_leaf = path.iter().fold(&encoded, |value, step| match step {
+                JsonStep::Key(key) => &value[key],
+                JsonStep::Index(index) => &value[*index],
+            });
+            let changed = mutation_candidates(original_leaf)
+                .into_iter()
+                .find_map(|candidate| {
+                    let mut encoded = encoded.clone();
+                    *value_at_mut(&mut encoded, &path) = candidate;
+                    serde_json::from_value::<FeatureType>(encoded).ok()
+                });
+            let Some(changed) = changed else { continue };
+
+            let id = format!("mutation_{variant_index}_{leaf_index}");
+            let mut warm = ParametricGraph::new();
+            warm.add_feature(FeatureNode {
+                id: id.clone(),
+                name: variant_name.clone(),
+                feature: original.clone(),
+            });
+            warm.evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+                .unwrap();
+            let index = warm.node_map[id.as_str()];
+            warm.graph[index].feature = changed;
+            warm.refresh_feature_contract_over_warm_cache_for_test(&id)
+                .unwrap();
+            let cold = warm.clone_document();
+
+            let warm_output = warm
+                .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+                .unwrap();
+            let cold_output = cold
+                .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
+                .unwrap();
+            assert_eq!(
+                mesh_digest(&warm_output.bodies),
+                mesh_digest(&cold_output.bodies),
+                "warm/cold geometry drift for {variant_name} at {path:?}"
+            );
+            assert_eq!(
+                warm_output.warnings, cold_output.warnings,
+                "warm/cold warnings drift for {variant_name} at {path:?}"
+            );
+            assert_eq!(
+                warm_output.diagnostics, cold_output.diagnostics,
+                "warm/cold diagnostics drift for {variant_name} at {path:?}"
+            );
+            assert_eq!(
+                warm_output.statuses, cold_output.statuses,
+                "warm/cold statuses drift for {variant_name} at {path:?}"
+            );
+            variant_exercised += 1;
+            exercised += 1;
+        }
+
+        if !matches!(original, FeatureType::Origin) {
+            assert!(
+                variant_exercised > 0,
+                "the mutation corpus must exercise at least one persisted field of {variant_name}"
+            );
+            variants += 1;
+        }
+    }
+
+    assert_eq!(
+        variants, 28,
+        "all persisted feature variants must be present"
+    );
+    assert!(
+        exercised >= 150,
+        "mutation coverage unexpectedly fell to {exercised} leaves"
+    );
+}

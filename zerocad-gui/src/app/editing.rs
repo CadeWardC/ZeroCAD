@@ -720,6 +720,7 @@ impl ZeroCadApp {
                     line_endpoint = Some(s.b);
                 }
             }
+            self.push_working_sketch_undo();
             if self.sketch_solver_model.is_some() {
                 let vars = self.document.variable_map();
                 let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);

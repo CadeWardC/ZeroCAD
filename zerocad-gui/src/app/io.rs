@@ -5,7 +5,7 @@ use crate::*;
 /// sketch, so undoing the extrude must also reveal the sketch again.
 impl ZeroCadApp {
     pub(crate) fn current_document_snapshot(&self) -> Document {
-        let mut document = self.document.clone();
+        let mut document = self.document.clone_authoritative();
         document.state.units = self.current_unit;
         document.state.created_unix = self.doc_created_unix;
         document.state.visibility.clear();

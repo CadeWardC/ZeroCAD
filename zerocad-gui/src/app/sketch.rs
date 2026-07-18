@@ -1,6 +1,38 @@
 use crate::*;
 
 impl ZeroCadApp {
+    /// Begin one atomic live-sketch edit. Multi-entity operations call this
+    /// once, immediately before their first mutation.
+    pub(crate) fn push_working_sketch_undo(&mut self) {
+        if self.working_sketch_undo.len() >= 50 {
+            self.working_sketch_undo.remove(0);
+        }
+        self.working_sketch_undo.push(WorkingSketchSnapshot {
+            shapes: self.sketch_shapes.clone(),
+            corner_mods: self.sketch_corner_mods.clone(),
+            mirrors: self.sketch_mirrors.clone(),
+            solver_model: self.sketch_solver_model.clone(),
+            entity_ids: self.sketch_entity_ids.clone(),
+            next_entity_id: self.sketch_next_entity_id,
+        });
+    }
+
+    fn restore_working_sketch_snapshot(&mut self, snapshot: WorkingSketchSnapshot) {
+        self.sketch_shapes = snapshot.shapes;
+        self.sketch_corner_mods = snapshot.corner_mods;
+        self.sketch_mirrors = snapshot.mirrors;
+        self.sketch_solver_model = snapshot.solver_model;
+        self.sketch_entity_ids = snapshot.entity_ids;
+        self.sketch_next_entity_id = snapshot.next_entity_id;
+        self.pending_corners.clear();
+        self.line_chain_start = None;
+        self.sketch_selected_ids.clear();
+        self.sketch_selected_constraint = None;
+        self.sketch_conflict_constraint = None;
+        self.cancel_in_progress_shape();
+        self.rebuild_active_sketch_curves();
+    }
+
     fn ensure_active_solver_model(&mut self) {
         if self.sketch_solver_model.is_some() {
             return;
@@ -40,6 +72,7 @@ impl ZeroCadApp {
             self.status_msg = "Select one or more body edges to project.".to_string();
             return;
         }
+        self.push_working_sketch_undo();
         self.ensure_active_solver_model();
         let mut added = 0usize;
         let mut errors = Vec::new();
@@ -58,6 +91,9 @@ impl ZeroCadApp {
             }
         }
         if added == 0 {
+            if let Some(snapshot) = self.working_sketch_undo.pop() {
+                self.restore_working_sketch_snapshot(snapshot);
+            }
             self.status_msg = errors
                 .into_iter()
                 .next()
@@ -203,6 +239,12 @@ impl ZeroCadApp {
             return;
         }
 
+        if let Some(snapshot) = self.working_sketch_undo.pop() {
+            self.restore_working_sketch_snapshot(snapshot);
+            self.status_msg = "Undid the last sketch operation.".to_string();
+            return;
+        }
+
         let Some(_shape) = self.sketch_shapes.pop() else {
             if self.sketch_mirrors.pop().is_some() || self.sketch_corner_mods.pop().is_some() {
                 self.rebuild_active_sketch_curves();
@@ -319,6 +361,7 @@ impl ZeroCadApp {
             self.status_msg = "Nothing to mirror — draw geometry first.".to_string();
             return;
         }
+        self.push_working_sketch_undo();
         self.sketch_mirrors
             .push(zerocad_core::SketchMirror { a: p0, b: p1 });
         self.rebuild_active_sketch_curves();
@@ -365,6 +408,7 @@ impl ZeroCadApp {
         self.sketch_shapes.clear();
         self.sketch_corner_mods.clear();
         self.sketch_mirrors.clear();
+        self.working_sketch_undo.clear();
         self.pending_corners.clear();
         self.detected_regions.clear();
         self.selected_region_indices.clear();
@@ -491,6 +535,7 @@ impl ZeroCadApp {
         if self.pending_corners.is_empty() {
             return;
         }
+        self.push_working_sketch_undo();
         let mods = self.pending_corner_mods();
         let n = mods.len();
         self.sketch_corner_mods.extend(mods);
@@ -709,5 +754,58 @@ impl ZeroCadApp {
         if dragged && !self.pending_corners.is_empty() {
             self.rebuild_active_sketch_curves();
         }
+    }
+}
+
+#[cfg(test)]
+mod working_sketch_undo_tests {
+    use super::*;
+
+    fn rectangle(width: f32) -> SketchShape {
+        SketchShape::Rectangle {
+            origin: (0.0, 0.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: Dimension::literal(width),
+            h: Dimension::literal(5.0),
+            from_center: false,
+        }
+    }
+
+    #[test]
+    fn multi_entity_working_sketch_transaction_undoes_atomically() {
+        let mut app = ZeroCadApp::new();
+        app.sketch_shapes.push(rectangle(10.0));
+        app.rebuild_active_sketch_curves();
+        let before = app.sketch_curves.clone();
+
+        app.push_working_sketch_undo();
+        app.sketch_shapes.push(rectangle(20.0));
+        app.sketch_mirrors.push(zerocad_core::SketchMirror {
+            a: (0.0, 0.0),
+            b: (0.0, 1.0),
+        });
+        app.sketch_corner_mods.push(CornerMod {
+            at: (0.0, 0.0),
+            radius: Dimension::literal(1.0),
+            kind: CornerKind::Chamfer,
+        });
+        app.rebuild_active_sketch_curves();
+
+        app.undo_last_sketch_action();
+        assert_eq!(app.sketch_shapes.len(), 1);
+        assert!(app.sketch_mirrors.is_empty());
+        assert!(app.sketch_corner_mods.is_empty());
+        assert_eq!(app.sketch_curves, before);
+    }
+
+    #[test]
+    fn working_sketch_transactions_keep_only_fifty_snapshots() {
+        let mut app = ZeroCadApp::new();
+        for index in 0..55 {
+            app.push_working_sketch_undo();
+            app.sketch_shapes.push(rectangle(index as f32 + 1.0));
+        }
+        assert_eq!(app.working_sketch_undo.len(), 50);
     }
 }

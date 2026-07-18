@@ -554,6 +554,21 @@ struct UndoSnapshot {
     document: Document,
 }
 
+/// Authoritative state of a live sketch before one user-visible transaction.
+///
+/// This is deliberately independent of the whole-document undo stack. A
+/// future Trim, Offset, or sketch Pattern may touch many entities but still
+/// pushes exactly one of these snapshots and therefore undoes atomically.
+#[derive(Debug, Clone)]
+struct WorkingSketchSnapshot {
+    shapes: Vec<SketchShape>,
+    corner_mods: Vec<CornerMod>,
+    mirrors: Vec<zerocad_core::SketchMirror>,
+    solver_model: Option<zerocad_core::sketch::SketchSolverModel>,
+    entity_ids: Vec<zerocad_core::sketch::EntityId>,
+    next_entity_id: u32,
+}
+
 struct PendingSave {
     path: PathBuf,
     profile: zerocad_core::SaveProfile,
@@ -923,6 +938,9 @@ struct ZeroCadApp {
     /// Snapshot stack for Redo (Ctrl+Y / Ctrl+Shift+Z). Cleared whenever a new
     /// destructive change is committed.
     redo_stack: Vec<UndoSnapshot>,
+    /// Transaction snapshots for edits made before Finish Sketch. Kept
+    /// separately from document undo and capped at the same 50-entry policy.
+    working_sketch_undo: Vec<WorkingSketchSnapshot>,
 
     /// Active shape-dimension dialog (after the first click of a shape).
     dim_input: Option<DimInput>,
