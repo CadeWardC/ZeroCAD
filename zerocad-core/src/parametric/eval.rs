@@ -64,6 +64,7 @@ impl ParametricGraph {
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
             pending_face_reattach: RefCell::new(FaceReattach::default()),
+            pending_legacy_backfills: RefCell::new(LegacyReferenceBackfills::default()),
             eval_cache: RefCell::new(std::sync::Arc::new(EvalCache::default())),
         };
         pg.bootstrap_origin();
@@ -84,6 +85,7 @@ impl ParametricGraph {
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
             pending_face_reattach: RefCell::new(FaceReattach::default()),
+            pending_legacy_backfills: RefCell::new(LegacyReferenceBackfills::default()),
             eval_cache: RefCell::new(std::sync::Arc::new(EvalCache::default())),
         };
         graph.rebuild_node_map();
@@ -603,6 +605,54 @@ impl ParametricGraph {
             }
         }
         true
+    }
+
+    pub(crate) fn queue_legacy_reference_backfills(
+        &self,
+        pending: LegacyReferenceBackfills,
+    ) -> bool {
+        if pending.is_empty() {
+            return false;
+        }
+        let mut queued = self.pending_legacy_backfills.borrow_mut();
+        queued.producing_revision = pending.producing_revision;
+        queued.edge_mods.extend(pending.edge_mods);
+        queued.sketch_faces.extend(pending.sketch_faces);
+        true
+    }
+
+    /// Explicitly migrate unique legacy matches discovered during evaluation.
+    /// Merely evaluating never changes persisted reference identity.
+    pub(crate) fn apply_legacy_reference_migrations(&mut self) -> bool {
+        let pending = std::mem::take(&mut *self.pending_legacy_backfills.borrow_mut());
+        if pending.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (feature_id, resolved) in pending.edge_mods {
+            if let Some(index) = self.resolve_node(feature_id.as_str()) {
+                if let FeatureType::EdgeMod { edge, .. } = &mut self.graph[index].feature {
+                    if edge.topology.is_none() {
+                        *edge = resolved;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for (sketch_id, resolved) in pending.sketch_faces {
+            if self
+                .sketch_face_refs
+                .get(sketch_id.as_str())
+                .is_some_and(|reference| !face_ref_is_named(reference))
+            {
+                self.sketch_face_refs.insert(sketch_id, resolved);
+                changed = true;
+            }
+        }
+        if changed {
+            self.eval_cache = RefCell::new(std::sync::Arc::new(EvalCache::default()));
+        }
+        changed
     }
 
     /// Ids of `id`'s direct parents that are sketches and feed **only** `id`.
@@ -1197,12 +1247,15 @@ impl ParametricGraph {
             )?;
             let tessellation = tess_started.elapsed();
             let face_reattach = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
+            let legacy_reference_backfills =
+                std::mem::take(&mut *self.pending_legacy_backfills.borrow_mut());
             Ok(EvaluationOutput {
                 bodies,
                 warnings,
                 statuses,
                 diagnostics,
                 face_reattach,
+                legacy_reference_backfills,
                 timings: EvaluationTimings {
                     total: total_started.elapsed(),
                     build,
@@ -1327,6 +1380,8 @@ impl ParametricGraph {
     ) -> Result<(Vec<LiveBody>, Vec<String>, EvaluationTrace), String> {
         let mut trace = EvaluationTrace::default();
         *self.pending_face_reattach.borrow_mut() = FaceReattach::for_revision(document_revision);
+        *self.pending_legacy_backfills.borrow_mut() =
+            LegacyReferenceBackfills::for_revision(document_revision);
         crate::mock_kernel::reset_diagnostics();
         if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
             return Err("model evaluation was superseded".to_string());
@@ -2224,11 +2279,24 @@ impl ParametricGraph {
         idx: NodeIndex,
         context: FeatureEvalContext<'_>,
     ) -> Result<FeatureEvalResult, String> {
-        if !matches!(context.feature.feature, FeatureType::EdgeMod { .. }) {
+        let FeatureType::EdgeMod { target, edge, .. } = &context.feature.feature else {
             return Err(format!(
                 "registry evaluator EdgeMod cannot invoke feature kind '{}'",
                 context.feature.feature.kind_id()
             ));
+        };
+        if edge.topology.is_none() {
+            if let Some(resolved) = context
+                .live_bodies
+                .iter()
+                .find(|body| body.id == target.as_str())
+                .and_then(|body| resolve_legacy_edge_ref_unique(body, edge))
+            {
+                self.pending_legacy_backfills
+                    .borrow_mut()
+                    .edge_mods
+                    .insert(context.feature_id.clone(), resolved);
+            }
         }
         // `apply_edge_mod` is already the strongest family boundary: native
         // candidates pass body/topology checks, selected-edge locality, recut
@@ -3059,6 +3127,19 @@ impl ParametricGraph {
                     None
                 }
             });
+        if datum_cs.is_none()
+            && self
+                .sketch_face_refs
+                .get(sketch_id.as_str())
+                .is_some_and(|face_ref| {
+                    face_ref_is_named(face_ref) && rederive_sketch_cs(face_ref, live).is_none()
+                })
+        {
+            warnings.push(format!(
+                "Extrude '{node_id}': sketch '{sketch_id}' is attached to a named face that no longer resolves."
+            ));
+            return;
+        }
         let cs_owned = datum_cs
             .or_else(|| {
                 self.sketch_face_refs
@@ -3077,62 +3158,69 @@ impl ParametricGraph {
         // preferred). The refreshed outline + indices are queued for a
         // persistent write-back (`apply_face_reattach`) so the GUI shows the
         // moved outline and the stored indices stay in the space they were
-        // detected in. On any failure the stored snapshot is used, as before.
+        // detected in. Only genuinely unnamed legacy references may fall back
+        // to the stored snapshot.
         let mut refreshed: Option<(Vec<Region>, Vec<usize>)> = None;
-        if let (Some(stored_boundary), Some(face_ref)) = (
-            sketch.face_boundary.as_ref(),
-            self.sketch_face_refs.get(sketch_id.as_str()),
-        ) {
-            if let Some(fresh_boundary) = rederive_face_boundary(face_ref, live, cs) {
-                if hash_curves(&fresh_boundary) != hash_curves(stored_boundary) {
-                    let mut merged = sketch.curves.clone();
-                    merged.extend_curves(&fresh_boundary);
-                    let fresh_regions = self.cached_regions(&merged);
-                    let mut remapped: Vec<usize> = Vec::new();
-                    let mut lost = 0usize;
-                    for &i in region_indices {
-                        let Some(old) = sketch.regions.get(i) else {
-                            lost += 1;
-                            continue;
-                        };
-                        let p = region_material_point(old);
-                        let target = if fresh_regions.get(i).is_some_and(|r| r.contains(p)) {
-                            Some(i)
-                        } else {
-                            fresh_regions.iter().position(|r| r.contains(p))
-                        };
-                        match target {
-                            Some(j) => {
-                                if !remapped.contains(&j) {
-                                    remapped.push(j);
-                                }
+        let attached_face = self.sketch_face_refs.get(sketch_id.as_str());
+        let fresh_face_boundary =
+            attached_face.and_then(|face_ref| rederive_face_boundary(face_ref, live, cs));
+        if attached_face.is_some_and(face_ref_is_named) && fresh_face_boundary.is_none() {
+            warnings.push(format!(
+                "Extrude '{node_id}': sketch '{sketch_id}' is attached to a named face whose outline no longer resolves."
+            ));
+            return;
+        }
+        if let (Some(stored_boundary), Some(fresh_boundary)) =
+            (sketch.face_boundary.as_ref(), fresh_face_boundary)
+        {
+            if hash_curves(&fresh_boundary) != hash_curves(stored_boundary) {
+                let mut merged = sketch.curves.clone();
+                merged.extend_curves(&fresh_boundary);
+                let fresh_regions = self.cached_regions(&merged);
+                let mut remapped: Vec<usize> = Vec::new();
+                let mut lost = 0usize;
+                for &i in region_indices {
+                    let Some(old) = sketch.regions.get(i) else {
+                        lost += 1;
+                        continue;
+                    };
+                    let p = region_material_point(old);
+                    let target = if fresh_regions.get(i).is_some_and(|r| r.contains(p)) {
+                        Some(i)
+                    } else {
+                        fresh_regions.iter().position(|r| r.contains(p))
+                    };
+                    match target {
+                        Some(j) => {
+                            if !remapped.contains(&j) {
+                                remapped.push(j);
                             }
-                            None => lost += 1,
                         }
+                        None => lost += 1,
                     }
-                    if lost > 0 {
-                        warnings.push(format!(
-                            "Extrude '{node_id}': {lost} selected region(s) of sketch \
+                }
+                if lost > 0 {
+                    warnings.push(format!(
+                        "Extrude '{node_id}': {lost} selected region(s) of sketch \
                              '{sketch_id}' did not survive the face outline change."
-                        ));
-                    }
-                    // A selection that lost EVERY region would degenerate to
-                    // "all regions" (empty selector) — keep the stored snapshot
-                    // instead and fail loud above.
-                    let selection_survives = region_indices.is_empty() || !remapped.is_empty();
-                    if !fresh_regions.is_empty() && selection_survives {
-                        let mut pending = self.pending_face_reattach.borrow_mut();
+                    ));
+                }
+                // A selection that lost EVERY region would degenerate to
+                // "all regions" (empty selector) — keep the stored snapshot
+                // instead and fail loud above.
+                let selection_survives = region_indices.is_empty() || !remapped.is_empty();
+                if !fresh_regions.is_empty() && selection_survives {
+                    let mut pending = self.pending_face_reattach.borrow_mut();
+                    pending
+                        .boundaries
+                        .insert(sketch_id.as_str().into(), fresh_boundary);
+                    pending.planes.insert(sketch_id.as_str().into(), *cs);
+                    if remapped != region_indices {
                         pending
-                            .boundaries
-                            .insert(sketch_id.as_str().into(), fresh_boundary);
-                        pending.planes.insert(sketch_id.as_str().into(), *cs);
-                        if remapped != region_indices {
-                            pending
-                                .region_indices
-                                .insert(node_id.into(), remapped.clone());
-                        }
-                        refreshed = Some((fresh_regions, remapped));
+                            .region_indices
+                            .insert(node_id.into(), remapped.clone());
                     }
+                    refreshed = Some((fresh_regions, remapped));
                 }
             }
         }
@@ -3902,24 +3990,22 @@ impl ParametricGraph {
                 "Revolve '{node_id}': its sketch '{sketch_id}' {reason}."
             ));
         }
-        // Same plane priority as extrude: datum attachment, face attachment,
-        // saved plane.
-        let datum_cs = self
-            .sketch_datum_refs
-            .get(sketch_id.as_str())
-            .and_then(|datum_id| match datums.get(datum_id.as_str()) {
-                Some(DatumValue::Plane(cs)) => Some(*cs),
-                _ => None,
-            });
-        let cs_owned = datum_cs
-            .or_else(|| {
-                self.sketch_face_refs
-                    .get(sketch_id.as_str())
-                    .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
-            })
-            .unwrap_or(sketch.cs);
+        let cs_owned = match self.effective_sketch_cs(sketch_id, sketch.cs, datums, live) {
+            Ok(cs) => cs,
+            Err(reason) => {
+                warnings.push(format!("Revolve '{node_id}': {reason}."));
+                return;
+            }
+        };
         let cs = &cs_owned;
-        let regions = &sketch.regions;
+        let regions_owned = match self.effective_sketch_regions(sketch_id, sketch, live, cs) {
+            Ok(regions) => regions,
+            Err(reason) => {
+                warnings.push(format!("Revolve '{node_id}': {reason}."));
+                return;
+            }
+        };
+        let regions = &regions_owned;
         if regions.is_empty() {
             return;
         }
@@ -4058,20 +4144,70 @@ impl ParametricGraph {
         saved: CoordinateSystem,
         datums: &HashMap<String, DatumValue>,
         live: &[LiveBody],
-    ) -> CoordinateSystem {
+    ) -> Result<CoordinateSystem, String> {
         let datum_cs = self.sketch_datum_refs.get(sketch_id).and_then(|datum_id| {
             match datums.get(datum_id.as_str()) {
                 Some(DatumValue::Plane(cs)) => Some(*cs),
                 _ => None,
             }
         });
-        datum_cs
-            .or_else(|| {
-                self.sketch_face_refs
-                    .get(sketch_id)
-                    .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
-            })
-            .unwrap_or(saved)
+        if let Some(cs) = datum_cs {
+            return Ok(cs);
+        }
+        let Some(face_ref) = self.sketch_face_refs.get(sketch_id) else {
+            return Ok(saved);
+        };
+        if !face_ref_is_named(face_ref) {
+            let historical_body = self.node_map.get(sketch_id).and_then(|sketch_index| {
+                self.graph
+                    .neighbors_directed(*sketch_index, petgraph::Direction::Incoming)
+                    .find_map(|parent| {
+                        let body_id = self.graph[parent].body.as_ref()?;
+                        live.iter().find(|body| body.id == body_id.as_str())
+                    })
+            });
+            if let Some(resolved) =
+                historical_body.and_then(|body| resolve_legacy_face_ref_unique(body, face_ref))
+            {
+                self.pending_legacy_backfills
+                    .borrow_mut()
+                    .sketch_faces
+                    .insert(sketch_id.into(), resolved);
+            }
+        }
+        match rederive_sketch_cs(face_ref, live) {
+            Some(cs) => Ok(cs),
+            None if face_ref_is_named(face_ref) => Err(format!(
+                "sketch '{sketch_id}' is attached to a named face that no longer resolves"
+            )),
+            None => Ok(saved),
+        }
+    }
+
+    /// Rebuild the regions of a face-attached consumer from the current face
+    /// outline. Stored outlines are only a legacy/preview fallback; a missing
+    /// named face suspends the consumer instead of silently using stale curves.
+    fn effective_sketch_regions(
+        &self,
+        sketch_id: &str,
+        sketch: &SketchEval,
+        live: &[LiveBody],
+        cs: &CoordinateSystem,
+    ) -> Result<Vec<Region>, String> {
+        let Some(face_ref) = self.sketch_face_refs.get(sketch_id) else {
+            return Ok(sketch.regions.clone());
+        };
+        match rederive_face_boundary(face_ref, live, cs) {
+            Some(boundary) => {
+                let mut current = sketch.curves.clone();
+                current.extend_curves(&boundary);
+                Ok(self.cached_regions(&current))
+            }
+            None if face_ref_is_named(face_ref) => Err(format!(
+                "sketch '{sketch_id}' is attached to a named face that no longer resolves"
+            )),
+            None => Ok(sketch.regions.clone()),
+        }
     }
 
     /// Look up a cached sketch evaluation by its node id.
@@ -4112,13 +4248,26 @@ impl ParametricGraph {
                 ));
                 return;
             };
-            let Some(region) = sketch.regions.get(*region_index) else {
+            let cs = match self.effective_sketch_cs(sketch_id, sketch.cs, datums, live) {
+                Ok(cs) => cs,
+                Err(reason) => {
+                    warnings.push(format!("Loft '{node_id}': {reason}."));
+                    return;
+                }
+            };
+            let regions = match self.effective_sketch_regions(sketch_id, sketch, live, &cs) {
+                Ok(regions) => regions,
+                Err(reason) => {
+                    warnings.push(format!("Loft '{node_id}': {reason}."));
+                    return;
+                }
+            };
+            let Some(region) = regions.get(*region_index) else {
                 warnings.push(format!(
                     "Loft '{node_id}': sketch '{sketch_id}' has no region {region_index}."
                 ));
                 return;
             };
-            let cs = self.effective_sketch_cs(sketch_id, sketch.cs, datums, live);
             resolved.push((cs, region.boundary.clone()));
         }
         let Some(solid) = crate::mock_kernel::lofted_solid(&resolved) else {
@@ -4154,20 +4303,40 @@ impl ParametricGraph {
             ));
             return;
         };
-        let Some(region) = profile.regions.get(profile_region) else {
+        let profile_cs = match self.effective_sketch_cs(profile_sketch, profile.cs, datums, live) {
+            Ok(cs) => cs,
+            Err(reason) => {
+                warnings.push(format!("Sweep '{node_id}': {reason}."));
+                return;
+            }
+        };
+        let profile_regions =
+            match self.effective_sketch_regions(profile_sketch, profile, live, &profile_cs) {
+                Ok(regions) => regions,
+                Err(reason) => {
+                    warnings.push(format!("Sweep '{node_id}': {reason}."));
+                    return;
+                }
+            };
+        let Some(region) = profile_regions.get(profile_region) else {
             warnings.push(format!(
                 "Sweep '{node_id}': profile sketch has no region {profile_region}."
             ));
             return;
         };
-        let profile_cs = self.effective_sketch_cs(profile_sketch, profile.cs, datums, live);
         let Some(path) = self.sketch_eval_by_id(sketch_cache, path_sketch) else {
             warnings.push(format!(
                 "Sweep '{node_id}': path sketch '{path_sketch}' not found."
             ));
             return;
         };
-        let path_cs = self.effective_sketch_cs(path_sketch, path.cs, datums, live);
+        let path_cs = match self.effective_sketch_cs(path_sketch, path.cs, datums, live) {
+            Ok(cs) => cs,
+            Err(reason) => {
+                warnings.push(format!("Sweep '{node_id}': {reason}."));
+                return;
+            }
+        };
         let Some(path_2d) = path.curves.path_polyline(1e-3) else {
             warnings.push(format!(
                 "Sweep '{node_id}': the path sketch must be a single open chain of \
@@ -5117,18 +5286,15 @@ fn solid_surface_enters_other(surface: &KernelSolid, other: &KernelSolid) -> boo
         })
 }
 
-/// Display mesh for Mirror+Join. Guarded boolean fallbacks can retain coincident
-/// caps and distinct face ids at the mirror plane even though they are one logical
-/// body. Remove those internal caps and merge continuous coplanar faces before
-/// suppressing the construction edge at the interface.
+/// Whether a face reference carries an identity that must resolve exactly.
+fn face_ref_is_named(face_ref: &FaceRef) -> bool {
+    face_ref
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.face_id.as_deref())
+        .is_some()
+}
 
-/// Tessellate each assembled body: reuse the analytic mesh when the body was
-/// never touched by a boolean, else extract a mesh from its kernel solid parts.
-/// Bodies that tessellate to nothing are dropped.
-/// Re-derive a sketch-on-face coordinate system from the current geometry: find
-/// the body the captured face belongs to (already assembled into `live`), resolve
-/// the face there, and build a plane from its centroid + normal. `None` if the
-/// body or face is gone (the caller then keeps the frozen placement).
 fn rederive_sketch_cs(face_ref: &FaceRef, live: &[LiveBody]) -> Option<CoordinateSystem> {
     let body_id = face_ref.topology.as_ref()?.body_id.as_deref()?;
     let body = live.iter().find(|b| b.id == body_id)?;

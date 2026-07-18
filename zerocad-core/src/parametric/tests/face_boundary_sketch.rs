@@ -238,3 +238,37 @@ fn drawn_circle_splits_against_face_boundary() {
         .any(|v| (v[2] - 5.0).abs() < 0.11 && v[0] > 7.0 - 0.11 && (v[1] - 5.0).abs() < 3.11);
     assert!(has_floor, "expected a pocket floor near z=5 under the lens");
 }
+
+#[test]
+fn named_face_loss_suspends_extrude_instead_of_using_stored_outline() {
+    let mut g = box_with_face_sketch(SketchCurves::new());
+    g.sketch_face_refs.insert(
+        "sketch_2".into(),
+        FaceRef {
+            centroid: [5.0, 5.0, 10.0],
+            normal: [0.0, 0.0, 1.0],
+            topology: Some(TopologyFaceRef {
+                body_id: Some("box_1".into()),
+                component_id: None,
+                topology_version: Some(0),
+                face_id: Some("box_box_1:face:missing".into()),
+                surface_kind: Some("plane".into()),
+                producer_feature_id: Some("box_1".into()),
+                source_entity_id: None,
+            }),
+        },
+    );
+    add_extrude(&mut g, "extrude_3", "sketch_2", 5.0, ExtrudeMode::NewBody);
+
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(bodies.len(), 1, "the unresolved consumer must add no body");
+    assert_eq!(bodies[0].0, "box_1");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("named face") && warning.contains("no longer resolves")),
+        "missing durable face must be reported, got {warnings:?}"
+    );
+}

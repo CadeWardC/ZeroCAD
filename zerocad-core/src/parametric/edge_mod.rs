@@ -62,7 +62,21 @@ pub(crate) fn apply_edge_mod(
         crate::sketch::CornerKind::Fillet => "Fillet",
         crate::sketch::CornerKind::Chamfer => "Chamfer",
     };
-    let resolved_edge = resolve_edge_ref_by_topology(body, edge).unwrap_or_else(|| edge.clone());
+    let resolved_edge = match resolve_edge_ref_by_topology(body, edge) {
+        Some(resolved) => resolved,
+        None if edge
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.edge_id.as_deref())
+            .is_some() =>
+        {
+            warnings.push(format!(
+                "{label} '{mod_id}': its named edge no longer resolves, so the body was left unchanged."
+            ));
+            return;
+        }
+        None => edge.clone(),
+    };
     if let Err(reason) = edge_mod_preflight(body, &resolved_edge, dist) {
         warnings.push(format!(
             "{label} '{mod_id}': {reason}, so the body was left unchanged."
@@ -145,6 +159,39 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
     //    edge's own id is re-derived (a sketch id becomes a `mesh:group` id after a
     //    cut). Match on the same face-owner pair, disambiguated by geometry.
     resolve_edge_by_face_pair(body, edge, requested)
+}
+
+/// Resolve a genuinely unnamed legacy edge only when geometry identifies one
+/// and only one durable candidate at this historical body state.
+pub(crate) fn resolve_legacy_edge_ref_unique(body: &LiveBody, edge: &EdgeRef) -> Option<EdgeRef> {
+    if edge
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.edge_id.as_deref())
+        .is_some()
+    {
+        return None;
+    }
+    let reference_mesh;
+    let mesh = if let Some(pristine) = body.pristine.as_deref() {
+        pristine
+    } else {
+        reference_mesh = edge_mod_reference_mesh(body);
+        &reference_mesh
+    };
+    let mut candidates = mesh.edge_refs.iter().filter(|candidate| {
+        topology_edge_id(candidate).is_some()
+            && mesh_candidate_matches_captured_edge(candidate, edge)
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(edge_ref_from_mesh_candidate(
+        body,
+        candidate,
+        &TopologyEdgeRef::default(),
+    ))
 }
 
 fn resolve_edge_by_face_pair(
@@ -404,6 +451,51 @@ fn resolve_face_ref_by_geometry(body: &LiveBody, face: &FaceRef) -> Option<Resol
         .as_ref()
         .and_then(pick)
         .or_else(|| pick(&edge_mod_reference_mesh(body)))
+}
+
+/// Resolve a genuinely unnamed legacy face only when the historical body state
+/// contains exactly one durable geometric match.
+pub(crate) fn resolve_legacy_face_ref_unique(body: &LiveBody, face: &FaceRef) -> Option<FaceRef> {
+    if face
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.face_id.as_deref())
+        .is_some()
+    {
+        return None;
+    }
+    let reference_mesh;
+    let mesh = if let Some(pristine) = body.pristine.as_deref() {
+        pristine
+    } else {
+        reference_mesh = edge_mod_reference_mesh(body);
+        &reference_mesh
+    };
+    let mut candidates = mesh.face_refs.iter().filter(|candidate| {
+        topology_face_id(candidate).is_some()
+            && dot3(candidate.normal, face.normal) >= 0.99
+            && distance3(candidate.centroid, face.centroid) <= 1.0e-2
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let requested = candidate
+        .topology
+        .as_ref()
+        .map(|topology| TopologyFaceRef {
+            body_id: topology
+                .body_id
+                .clone()
+                .or_else(|| Some(body.id.to_string())),
+            component_id: topology.component_id.clone(),
+            topology_version: topology.topology_version,
+            face_id: topology.face_id.clone(),
+            surface_kind: topology.surface_kind.clone(),
+            producer_feature_id: topology.producer_feature_id.clone(),
+            source_entity_id: topology.source_entity_id.clone(),
+        })?;
+    resolved_face_from_mesh_face(body, candidate, &requested).map(|resolved| resolved.face)
 }
 
 fn component_index_for_face(

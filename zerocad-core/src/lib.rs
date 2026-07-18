@@ -39,10 +39,10 @@ pub use parametric::{
     EvaluationDiagnostic, EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings,
     EvaluationTrace, ExtrudeMode, FaceInspection, FeatureNode, FeatureTiming, FeatureType,
     HoleApplication, HoleFit, HoleKind, HoleManufacturingMetadata, HoleStandardPreset,
-    InterferencePair, ParametricGraph, PatternKind, PlaneBase, PristineMeshReuse,
-    ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily,
-    TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution, HOLE_STANDARD_PRESETS,
-    STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
+    InterferencePair, LegacyReferenceBackfills, ParametricGraph, PatternKind, PlaneBase,
+    PristineMeshReuse, ResolvedStandardGeometry, StandardReference, StandardsDataPack,
+    StandardsFamily, TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution,
+    HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
 };
 pub use release::{
     validate_compatibility_exception_ledger, validate_phase7_exception_ledger,

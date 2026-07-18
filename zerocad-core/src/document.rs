@@ -599,6 +599,8 @@ impl Document {
 
     pub fn mark_edited(&mut self) -> DocumentRevision {
         self.revision = self.revision.next();
+        *self.runtime.pending_legacy_backfills.borrow_mut() =
+            crate::parametric::LegacyReferenceBackfills::for_revision(self.revision);
         self.revision
     }
 
@@ -622,6 +624,40 @@ impl Document {
             return false;
         }
         if self.runtime.apply_face_reattach_updates(pending) {
+            self.revision = self.revision.next();
+            self.runtime
+                .pending_legacy_backfills
+                .borrow_mut()
+                .rebind_revision(self.revision);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Accept unique legacy matches from a background evaluation without
+    /// changing persisted state. A later explicit migration/save may commit.
+    pub fn queue_legacy_reference_backfills(
+        &self,
+        pending: crate::parametric::LegacyReferenceBackfills,
+    ) -> bool {
+        if pending.producing_revision() != self.revision {
+            return false;
+        }
+        self.runtime.queue_legacy_reference_backfills(pending)
+    }
+
+    pub fn apply_legacy_reference_migrations(&mut self) -> bool {
+        if self
+            .runtime
+            .pending_legacy_backfills
+            .borrow()
+            .producing_revision()
+            != self.revision
+        {
+            return false;
+        }
+        if self.runtime.apply_legacy_reference_migrations() {
             self.mark_edited();
             true
         } else {

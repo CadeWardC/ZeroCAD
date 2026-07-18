@@ -167,6 +167,10 @@ impl ZeroCadApp {
                     || matches!(save.profile, zerocad_core::SaveProfile::Compact))
         });
         if should_dispatch {
+            if self.document.apply_legacy_reference_migrations() {
+                self.document_revision = self.document_revision.wrapping_add(1);
+                log::info!("Committed unique legacy reference backfills during explicit save");
+            }
             let created_unix = *self.doc_created_unix.get_or_insert_with(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

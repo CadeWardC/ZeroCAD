@@ -145,6 +145,78 @@ fn edge_mod_oversized_leaves_body_unchanged_and_warns() {
 }
 
 #[test]
+fn named_edge_loss_suspends_edge_mod_without_geometric_substitution() {
+    let mut g = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let index = g.node_map["edgemod_2"];
+    if let FeatureType::EdgeMod { edge, .. } = &mut g.graph[index].feature {
+        edge.topology = Some(TopologyEdgeRef {
+            body_id: Some("box_1".into()),
+            topology_version: Some(0),
+            edge_id: Some("entity:missing:edge".into()),
+            adjacent_face_ids: Vec::new(),
+            curve_kind: Some("line".into()),
+            adjacent_surface_kinds: Vec::new(),
+            producer_feature_id: Some("box_1".into()),
+            source_entity_id: None,
+        });
+    }
+
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        bodies[0].1.indices.len(),
+        MockMesh::make_box(10.0, 10.0, 10.0).indices.len(),
+        "the missing named edge must leave the box unchanged"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("named edge") && warning.contains("no longer resolves")),
+        "missing named edge must be reported, got {warnings:?}"
+    );
+}
+
+#[test]
+fn unique_legacy_edge_match_waits_for_explicit_migration() {
+    let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
+    let mut document = crate::Document::from_graph(graph, crate::units::Unit::Millimeter);
+    let cancellation =
+        EvaluationCancellation::new(1, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)));
+    let output = document
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &cancellation,
+        )
+        .unwrap();
+    assert!(!output.legacy_reference_backfills.is_empty());
+    let index = document.node_map["edgemod_2"];
+    let topology_before = match &document.graph[index].feature {
+        FeatureType::EdgeMod { edge, .. } => edge.topology.as_ref(),
+        _ => panic!("fixture lost edge mod"),
+    };
+    assert!(
+        topology_before.is_none(),
+        "evaluation must not auto-migrate"
+    );
+
+    assert!(document.queue_legacy_reference_backfills(output.legacy_reference_backfills));
+    assert!(document.apply_legacy_reference_migrations());
+    let topology_after = match &document.graph[index].feature {
+        FeatureType::EdgeMod { edge, .. } => edge.topology.as_ref(),
+        _ => panic!("fixture lost edge mod"),
+    };
+    assert!(
+        topology_after
+            .and_then(|topology| topology.edge_id.as_deref())
+            .is_some(),
+        "explicit migration must persist the unique durable edge name"
+    );
+}
+
+#[test]
 fn edge_mod_candidate_contract_cold_warm_cancel_and_restore() {
     let graph = box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet);
     let hidden = std::collections::HashSet::new();

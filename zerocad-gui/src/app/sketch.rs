@@ -99,8 +99,12 @@ impl ZeroCadApp {
             }) {
                 return Self::edge_ref_from_mesh(&projection.source_body, mesh, group);
             }
+            // Named references are never retargeted geometrically. The caller
+            // leaves the projection unresolved until that exact edge returns.
+            return None;
         }
 
+        // Genuinely unnamed legacy projection: bounded geometric fallback.
         let groups: std::collections::BTreeSet<u32> = mesh
             .edge_refs
             .iter()

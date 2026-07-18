@@ -275,6 +275,8 @@ impl ZeroCadApp {
                     let warnings = output.rendered_warnings();
                     self.document
                         .install_evaluation_cache(output.cache_snapshot);
+                    self.document
+                        .queue_legacy_reference_backfills(output.legacy_reference_backfills);
                     let face_reattached = self
                         .document
                         .apply_face_reattach_updates(output.face_reattach);

@@ -113,8 +113,8 @@ pub struct TopologyEdgeRef {
 /// captured geometry when a persistent topology name cannot be resolved.
 ///
 /// The topology field lets an `EdgeMod` follow equivalent upstream dimension
-/// edits. If the stable identity no longer resolves, the captured world-space
-/// edge is still used as a legacy geometric fallback.
+/// edits. Captured world-space geometry is a fallback only for genuinely
+/// unnamed legacy references; a missing stable identity suspends the consumer.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeRef {
     pub p0: [f32; 3],
@@ -785,6 +785,10 @@ pub struct ParametricGraph {
     /// which dies with it.
     #[serde(skip)]
     pub(crate) pending_face_reattach: RefCell<FaceReattach>,
+    /// Unique legacy geometric matches discovered at their historical body
+    /// state. Evaluation only queues these; explicit migration/save commits.
+    #[serde(skip)]
+    pub(crate) pending_legacy_backfills: RefCell<LegacyReferenceBackfills>,
     /// Per-node geometry checkpoints from the previous evaluation, used to skip
     /// re-solving the unchanged prefix of the feature tree. Each entry holds the
     /// assembled bodies *after* one node, keyed by a cumulative content hash of
@@ -825,6 +829,7 @@ impl<'de> serde::Deserialize<'de> for ParametricGraph {
             node_map: HashMap::new(),
             region_cache: RefCell::new(HashMap::new()),
             pending_face_reattach: RefCell::new(FaceReattach::default()),
+            pending_legacy_backfills: RefCell::new(LegacyReferenceBackfills::default()),
             eval_cache: RefCell::new(std::sync::Arc::new(EvalCache::default())),
         };
         graph.rebuild_node_map();
@@ -869,6 +874,41 @@ impl FaceReattach {
 
     pub fn producing_revision(&self) -> crate::document::DocumentRevision {
         self.producing_revision
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyReferenceBackfills {
+    pub(crate) producing_revision: crate::document::DocumentRevision,
+    pub(crate) edge_mods: HashMap<crate::document::FeatureId, EdgeRef>,
+    pub(crate) sketch_faces: HashMap<crate::document::FeatureId, FaceRef>,
+}
+
+impl Default for LegacyReferenceBackfills {
+    fn default() -> Self {
+        Self::for_revision(crate::document::DocumentRevision::INITIAL)
+    }
+}
+
+impl LegacyReferenceBackfills {
+    pub(crate) fn for_revision(revision: crate::document::DocumentRevision) -> Self {
+        Self {
+            producing_revision: revision,
+            edge_mods: HashMap::new(),
+            sketch_faces: HashMap::new(),
+        }
+    }
+
+    pub fn producing_revision(&self) -> crate::document::DocumentRevision {
+        self.producing_revision
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edge_mods.is_empty() && self.sketch_faces.is_empty()
+    }
+
+    pub(crate) fn rebind_revision(&mut self, revision: crate::document::DocumentRevision) {
+        self.producing_revision = revision;
     }
 }
 
@@ -1038,6 +1078,7 @@ pub struct EvaluationOutput {
     pub statuses: Vec<FeatureStatus>,
     pub diagnostics: Vec<EvaluationDiagnostic>,
     pub face_reattach: FaceReattach,
+    pub legacy_reference_backfills: LegacyReferenceBackfills,
     pub timings: EvaluationTimings,
     pub feature_timings: Vec<FeatureTiming>,
     pub trace: EvaluationTrace,
