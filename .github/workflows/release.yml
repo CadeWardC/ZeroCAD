@@ -133,8 +133,10 @@ jobs:
         include:
           - arch: aarch64
             os: macos-latest
+          # Last Intel image GitHub offers; retires August 2027 (macos-13 was
+          # retired Dec 2025 — jobs requesting it queue forever).
           - arch: x86_64
-            os: macos-13
+            os: macos-15-intel
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
