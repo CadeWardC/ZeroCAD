@@ -255,6 +255,10 @@ primitive-only coverage does not become the robustness ceiling.
 - Add staged curve-family pairings with typed unsupported cases.
 - Do not block the A1-based usability release on general NURBS/NURBS
   arrangement.
+- **Known limitation:** parabola and hyperbola spans are not yet lifted into
+  analytic B-Rep wires. The analytic builder declines those spans and ZeroCAD
+  uses its existing sampled modeling fallback. Native analytic lifting is
+  deferred beyond Foundation 1E.
 
 ### Shared offsets and skinning
 

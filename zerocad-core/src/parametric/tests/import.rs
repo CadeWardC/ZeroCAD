@@ -92,12 +92,24 @@ fn import_step_faces_are_stamped_with_durable_names() {
 #[test]
 fn import_step_bad_data_warns_instead_of_failing() {
     let g = import_graph("garbage, not a STEP file".to_string());
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+    let cancellation =
+        EvaluationCancellation::new(1, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)));
+    let output = g
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &cancellation,
+        )
         .unwrap();
-    assert!(bodies.is_empty());
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("import_1"), "warning: {}", warnings[0]);
+    assert!(output.bodies.is_empty());
+    assert_eq!(output.diagnostics.len(), 1);
+    let diagnostic = &output.diagnostics[0];
+    assert_eq!(diagnostic.feature_id, "import_1");
+    assert_eq!(diagnostic.code.as_str(), DiagnosticCode::OPERATION_FAILED);
+    assert_eq!(
+        diagnostic.parameters.get("feature_id"),
+        Some(&DiagnosticParameterValue::Text("import_1".into()))
+    );
 }
 
 #[test]

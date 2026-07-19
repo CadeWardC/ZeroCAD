@@ -302,22 +302,39 @@ fn evaluation_trace_classifies_cold_and_warm_work_without_wall_clock_time() {
 }
 
 #[test]
-fn diagnostic_dependencies_refresh_names_without_rebuilding_geometry() {
+fn typed_diagnostics_refresh_while_geometry_checkpoint_is_reused() {
     let mut graph = ParametricGraph::new();
     graph.add_feature(FeatureNode {
-        id: "box_1".into(),
-        name: "Original name".into(),
-        feature: FeatureType::Box {
-            w: 10.0,
-            h: 10.0,
-            d: 10.0,
+        id: "import_1".into(),
+        name: "Original import".into(),
+        feature: FeatureType::Import {
+            step_data: "garbage, not a STEP file".into(),
+            label: "broken".into(),
         },
     });
     let hidden = std::collections::HashSet::new();
-    graph
+    let cold = graph
         .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
         .unwrap();
-    graph.graph[graph.node_map["box_1"]].name = "Renamed box".into();
+    assert_eq!(
+        cold.trace.evaluated_features,
+        [crate::document::FeatureId::from("import_1")]
+    );
+    let cold_diagnostic = cold
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.feature_id == "import_1")
+        .expect("failed import must emit a typed diagnostic");
+    assert_eq!(
+        cold_diagnostic.code.as_str(),
+        DiagnosticCode::OPERATION_FAILED
+    );
+    assert_eq!(
+        cold_diagnostic.parameters.get("feature_name"),
+        Some(&DiagnosticParameterValue::Text("Original import".into()))
+    );
+
+    graph.graph[graph.node_map["import_1"]].name = "Renamed import".into();
 
     let warm = graph
         .evaluate_request(&hidden, EvaluationQuality::Final, &live_cancellation())
@@ -325,9 +342,118 @@ fn diagnostic_dependencies_refresh_names_without_rebuilding_geometry() {
     assert!(warm.trace.evaluated_features.is_empty());
     assert_eq!(
         warm.trace.reused_checkpoints,
-        [crate::document::FeatureId::from("box_1")]
+        [crate::document::FeatureId::from("import_1")]
     );
-    assert_eq!(warm.statuses[0].feature_name, "Renamed box");
+    let warm_diagnostic = warm
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.feature_id == "import_1")
+        .expect("reused failure checkpoint must refresh its typed diagnostic");
+    assert_eq!(
+        warm_diagnostic.code.as_str(),
+        DiagnosticCode::OPERATION_FAILED
+    );
+    assert_eq!(
+        warm_diagnostic.parameters.get("feature_name"),
+        Some(&DiagnosticParameterValue::Text("Renamed import".into()))
+    );
+    assert_eq!(warm.statuses[0].feature_name, "Renamed import");
+}
+
+#[test]
+fn document_revision_advances_for_authoritative_modeling_mutators() {
+    let mut document = crate::Document::new();
+    let mut expected = document.revision();
+
+    document.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "add_feature");
+
+    assert!(document.set_feature_suppressed("box_1", true));
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "set_feature_suppressed");
+
+    assert!(document.set_feature_sequence("box_1", crate::document::SequenceKey(42)));
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "set_feature_sequence");
+
+    let box_index = document.node_map["box_1"];
+    document.graph[box_index].name = "Renamed box".into();
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "authoritative field edit");
+
+    document.commit_feature_edit("box_1").unwrap();
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "commit_feature_edit");
+
+    document.set_visible("box_1", false);
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "set_visible");
+    document.set_visible("box_1", false);
+    assert_eq!(
+        document.revision(),
+        expected,
+        "a visibility no-op is not an edit"
+    );
+
+    assert!(document.remove_feature("box_1"));
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "remove_feature");
+
+    document.clear();
+    expected = expected.next();
+    assert_eq!(document.revision(), expected, "clear");
+
+    let mut ordered = crate::Document::from_graph(
+        box_with_edge_mod(2.0, crate::sketch::CornerKind::Fillet),
+        crate::Unit::Millimeter,
+    );
+    let before_reorder = ordered.revision();
+    assert!(ordered.move_feature_in_timeline("edgemod_2", -1));
+    assert_eq!(
+        ordered.revision(),
+        before_reorder.next(),
+        "move_feature_in_timeline"
+    );
+}
+
+#[test]
+fn normal_document_evaluation_stamps_all_revision_bound_writebacks() {
+    let mut document = crate::Document::new();
+    document.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+
+    let output = document
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &live_cancellation(),
+        )
+        .unwrap();
+    assert_eq!(output.revision, document.revision());
+    assert_eq!(
+        output.face_reattach.producing_revision(),
+        document.revision()
+    );
+    assert_eq!(
+        output.legacy_reference_backfills.producing_revision(),
+        document.revision()
+    );
 }
 
 #[test]

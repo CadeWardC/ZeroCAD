@@ -8,10 +8,13 @@ workloads closed:
 powershell -NoProfile -ExecutionPolicy Bypass -File benchmarks/profile-modeling.ps1 -ConfirmBestPerformanceAndIdle
 ```
 
-The runner writes `target/modeling-profile.json`. It performs five unrecorded
-warmups and 31 recorded samples for each workload, then reports nearest-rank p50
-and p95 (`sorted[ceil(p * n) - 1]`). Both percentiles must remain below their
-budget:
+The runner writes `target/modeling-profile.json`. Accepted reference evidence is
+copied to `benchmarks/modeling-baseline.json` and committed separately from the
+source commit it measures. The report records that exact source commit, UTC
+capture time, Rust toolchain, effective power overlay, and environment
+qualification. It performs five unrecorded warmups and 31 recorded samples for
+each workload, then reports nearest-rank p50 and p95
+(`sorted[ceil(p * n) - 1]`). Both percentiles must remain below their budget:
 
 | Workload | Corpus | Budget |
 |---|---|---:|

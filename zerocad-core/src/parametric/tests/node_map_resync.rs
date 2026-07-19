@@ -73,9 +73,10 @@ fn re_extrude_after_remove_feature_builds_a_body() {
 }
 
 /// Full lifecycle regression for the historical serde-skip trap: capture an
-/// undo snapshot, restore it, serialize/load once more, delete the original
-/// body feature (which swap-moves the arena), and re-extrude the surviving
-/// sketch. Every restore/delete boundary must rederive or self-heal `node_map`.
+/// undo snapshot, restore it, save and load a real `.zcad` file, delete the
+/// original body feature (which swap-moves the arena), and re-extrude the
+/// surviving sketch. Every restore/delete boundary must rederive or self-heal
+/// `node_map`.
 #[test]
 fn undo_load_delete_and_re_extrude_preserves_dependency_wiring() {
     let mut original = ParametricGraph::new();
@@ -104,9 +105,32 @@ fn undo_load_delete_and_re_extrude_preserves_dependency_wiring() {
     });
     let restored: ParametricGraph = serde_json::from_str(&undo_snapshot).unwrap();
 
-    // A second round trip represents canonical document loading after undo.
-    let loaded_bytes = serde_json::to_vec(&restored).unwrap();
-    let mut loaded: ParametricGraph = serde_json::from_slice(&loaded_bytes).unwrap();
+    let document = crate::Document::from_graph(restored, crate::Unit::Millimeter);
+    static NEXT_FILE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let unique = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "zerocad_node_map_lifecycle_{}_{unique}.zcad",
+        std::process::id()
+    ));
+    crate::zcad_format::write_document_file(
+        &path,
+        &document,
+        &crate::zcad_format::SaveOptions::default(),
+        &crate::zcad_format::HydrationBundle::default(),
+    )
+    .unwrap();
+    assert!(path.is_file(), "canonical save must reach the filesystem");
+    let mut loaded =
+        crate::zcad_format::read_document_file(&path, &crate::zcad_format::LoadOptions::default())
+            .unwrap()
+            .document;
+    std::fs::remove_file(&path).unwrap();
+
+    assert_eq!(
+        loaded.node_map.len(),
+        loaded.graph.node_count(),
+        "canonical load must rederive node_map before the first edit"
+    );
     assert!(loaded.remove_feature("extrude_2"));
     add_extrude(
         &mut loaded,

@@ -19,6 +19,7 @@ $environmentQualification = if ($SkipEnvironmentChecks) {
 else {
     "reference_conditions_verified"
 }
+$effectiveOverlayValue = "not_checked"
 
 if (-not $SkipEnvironmentChecks) {
     if (-not $ConfirmBestPerformanceAndIdle) {
@@ -74,6 +75,7 @@ public static class ZeroCadPowerStatus {
             "The current overlay is $effectiveOverlay."
         )
     }
+    $effectiveOverlayValue = $effectiveOverlay.ToString()
 }
 else {
     Write-Warning (
@@ -99,6 +101,22 @@ catch {
 }
 $report | Add-Member -NotePropertyName environment_qualification -NotePropertyValue (
     $environmentQualification
+)
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $sourceCommit) {
+    throw "Could not record the source commit for the modeling profile."
+}
+$rustcVersion = (& rustc --version).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $rustcVersion) {
+    throw "Could not record the Rust toolchain for the modeling profile."
+}
+$report | Add-Member -NotePropertyName source_commit -NotePropertyValue $sourceCommit
+$report | Add-Member -NotePropertyName recorded_utc -NotePropertyValue (
+    [DateTime]::UtcNow.ToString("o")
+)
+$report | Add-Member -NotePropertyName rustc_version -NotePropertyValue $rustcVersion
+$report | Add-Member -NotePropertyName effective_power_overlay -NotePropertyValue (
+    $effectiveOverlayValue
 )
 
 $outputDirectory = Split-Path -Parent $outputFullPath

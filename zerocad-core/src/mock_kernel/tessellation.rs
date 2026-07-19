@@ -497,6 +497,10 @@ pub(crate) fn analytic_loop_to_wire<P>(
                     spline.multiplicities().to_vec(),
                 )))
             }
+            // Known Foundation 1E boundary: arrangement may carry these curve
+            // families, but ZeroCAD does not yet lift them into analytic B-Rep
+            // wires. Returning `None` deliberately selects the sampled legacy
+            // extrusion fallback in `extruded_region_solid`.
             GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => None,
         }
     }
