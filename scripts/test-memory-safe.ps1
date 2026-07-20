@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(1, 2)]
-    [int] $BuildJobs = 1,
+    [ValidateRange(1, 8)]
+    [int] $BuildJobs = 4,
 
-    [ValidateRange(1, 2)]
+    [ValidateSet(1)]
     [int] $TestThreads = 1,
 
     [ValidateRange(512, 32768)]
@@ -28,14 +28,33 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$env:CARGO_BUILD_JOBS = $BuildJobs.ToString()
 
 function Assert-FreeMemory {
     $os = Get-CimInstance Win32_OperatingSystem
-    $freeMB = [math]::Round($os.FreePhysicalMemory / 1KB)
+    [int] $freeMB = [math]::Round($os.FreePhysicalMemory / 1KB)
     if ($freeMB -lt $MinimumFreeMemoryMB) {
         throw "Only $freeMB MB of physical memory is free; refusing to start the next test slice (minimum: $MinimumFreeMemoryMB MB)."
     }
+    return $freeMB
+}
+
+function Set-AdaptiveBuildJobs {
+    [int] $freeMB = Assert-FreeMemory
+    [int] $memorySafeJobs = if ($freeMB -ge 8192) {
+        4
+    }
+    elseif ($freeMB -ge 6144) {
+        3
+    }
+    else {
+        2
+    }
+    [int] $effectiveJobs = [math]::Min($BuildJobs, $memorySafeJobs)
+    $env:CARGO_BUILD_JOBS = $effectiveJobs.ToString()
+    Write-Host (
+        "Free memory: {0:N0} MiB; compiler jobs: {1}; test threads: {2}." -f
+        $freeMB, $effectiveJobs, $TestThreads
+    ) -ForegroundColor DarkGray
 }
 
 function Invoke-CargoSlice {
@@ -47,7 +66,7 @@ function Invoke-CargoSlice {
         [string[]] $CargoArgs
     )
 
-    Assert-FreeMemory
+    Set-AdaptiveBuildJobs
     Write-Host "`n==> $Label" -ForegroundColor Cyan
     & cargo @CargoArgs
     if ($LASTEXITCODE -ne 0) {
@@ -88,8 +107,8 @@ try {
             $groups = @($UnitGroups)
         }
         else {
-            Assert-FreeMemory
-            Write-Host "Discovering zerocad-core unit-test slices (one build job, one test process at a time)..." -ForegroundColor Cyan
+            Set-AdaptiveBuildJobs
+            Write-Host "Discovering zerocad-core unit-test slices (parallel compilation, one test process at a time)..." -ForegroundColor Cyan
             $listedTests = & cargo test -p zerocad-core --lib -- --list --format terse
             if ($LASTEXITCODE -ne 0) {
                 throw "Could not enumerate zerocad-core unit tests."
@@ -125,6 +144,7 @@ try {
             $integrationTargets = @($IntegrationTargets)
         }
         else {
+            Set-AdaptiveBuildJobs
             $metadata = (& cargo metadata --no-deps --format-version 1 | ConvertFrom-Json)
             if ($LASTEXITCODE -ne 0) {
                 throw "Could not read Cargo test targets."
