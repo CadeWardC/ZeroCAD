@@ -3247,88 +3247,97 @@ impl ParametricGraph {
     /// Dependency-safe evaluator order. `SequenceKey` is deliberately only a
     /// tie-breaker among ready nodes, so timeline edits never violate the DAG.
     fn body_nodes_in_evaluation_order(&self) -> Result<Vec<NodeIndex>, String> {
-        let nodes: Vec<NodeIndex> = self
-            .graph
-            .node_indices()
-            .filter(|&i| {
-                matches!(
-                    self.graph[i].feature,
-                    FeatureType::Box { .. }
-                        | FeatureType::Cylinder { .. }
-                        | FeatureType::Extrude { .. }
-                        | FeatureType::EdgeMod { .. }
-                        | FeatureType::Import { .. }
-                        | FeatureType::ImportStl { .. }
-                        | FeatureType::Revolve { .. }
-                        | FeatureType::Pattern { .. }
-                        | FeatureType::FeaturePattern { .. }
-                        | FeatureType::BodyTransform { .. }
-                        | FeatureType::BodyJoin { .. }
-                        | FeatureType::BodyCut { .. }
-                        | FeatureType::BodyIntersect { .. }
-                        | FeatureType::BodySplit { .. }
-                        | FeatureType::BodyScale { .. }
-                        | FeatureType::FaceOffset { .. }
-                        | FeatureType::FaceMove { .. }
-                        | FeatureType::FaceDelete { .. }
-                        | FeatureType::FaceThicken { .. }
-                        | FeatureType::Hole { .. }
-                        | FeatureType::Shell { .. }
-                        | FeatureType::Loft { .. }
-                        | FeatureType::Sweep { .. }
-                        | FeatureType::Thread { .. }
-                        | FeatureType::DatumPlane { .. }
-                        | FeatureType::DatumAxis { .. }
-                        | FeatureType::DatumPoint { .. }
-                        | FeatureType::Draft { .. }
-                )
-            })
-            .collect();
-        let mut indegree: HashMap<NodeIndex, usize> = nodes
-            .iter()
-            .map(|&node| {
-                let count = nodes
-                    .iter()
-                    .copied()
-                    .filter(|parent| {
-                        *parent != node
-                            && petgraph::algo::has_path_connecting(&self.graph, *parent, node, None)
-                    })
-                    .count();
-                (node, count)
-            })
-            .collect();
+        let is_evaluation_node = |idx: NodeIndex| {
+            matches!(
+                self.graph[idx].feature,
+                FeatureType::Box { .. }
+                    | FeatureType::Cylinder { .. }
+                    | FeatureType::Extrude { .. }
+                    | FeatureType::EdgeMod { .. }
+                    | FeatureType::Import { .. }
+                    | FeatureType::ImportStl { .. }
+                    | FeatureType::Revolve { .. }
+                    | FeatureType::Pattern { .. }
+                    | FeatureType::FeaturePattern { .. }
+                    | FeatureType::BodyTransform { .. }
+                    | FeatureType::BodyJoin { .. }
+                    | FeatureType::BodyCut { .. }
+                    | FeatureType::BodyIntersect { .. }
+                    | FeatureType::BodySplit { .. }
+                    | FeatureType::BodyScale { .. }
+                    | FeatureType::FaceOffset { .. }
+                    | FeatureType::FaceMove { .. }
+                    | FeatureType::FaceDelete { .. }
+                    | FeatureType::FaceThicken { .. }
+                    | FeatureType::Hole { .. }
+                    | FeatureType::Shell { .. }
+                    | FeatureType::Loft { .. }
+                    | FeatureType::Sweep { .. }
+                    | FeatureType::Thread { .. }
+                    | FeatureType::DatumPlane { .. }
+                    | FeatureType::DatumAxis { .. }
+                    | FeatureType::DatumPoint { .. }
+                    | FeatureType::Draft { .. }
+            )
+        };
         let order_key = |idx: NodeIndex| {
             (
                 self.feature_sequence(&self.graph[idx].id)
                     .map(|key| key.0)
                     .unwrap_or_else(|| creation_key(&self.graph[idx].id)),
-                self.graph[idx].id.as_str(),
+                self.graph[idx].id.clone(),
+                idx.index(),
             )
         };
-        let mut ordered = Vec::with_capacity(nodes.len());
-        while ordered.len() < nodes.len() {
-            let next = nodes
-                .iter()
-                .copied()
-                .filter(|node| indegree.get(node) == Some(&0))
-                .min_by_key(|node| order_key(*node))
-                .ok_or_else(|| "Circular dependency detected in body timeline!".to_string())?;
-            indegree.remove(&next);
-            ordered.push(next);
-            let dependent_children: Vec<_> = nodes
-                .iter()
-                .copied()
-                .filter(|child| {
-                    indegree.contains_key(child)
-                        && petgraph::algo::has_path_connecting(&self.graph, next, *child, None)
-                })
-                .collect();
-            for child in dependent_children {
-                if let Some(value) = indegree.get_mut(&child) {
-                    *value = value.saturating_sub(1);
+
+        // The former implementation asked `has_path_connecting` for every pair
+        // of body nodes and repeated those graph walks after every emitted node.
+        // That made a simple 500-feature transform chain spend more time finding
+        // its order than evaluating it. Run Kahn's algorithm over the complete
+        // graph instead: non-body nodes still constrain dependencies, while the
+        // sequence/id key deterministically chooses among currently-ready nodes.
+        let mut indegree: HashMap<NodeIndex, usize> = self
+            .graph
+            .node_indices()
+            .map(|node| {
+                (
+                    node,
+                    self.graph
+                        .neighbors_directed(node, petgraph::Direction::Incoming)
+                        .count(),
+                )
+            })
+            .collect();
+        let mut ready = std::collections::BTreeSet::new();
+        for (&node, &degree) in &indegree {
+            if degree == 0 {
+                ready.insert(order_key(node));
+            }
+        }
+
+        let mut processed = 0usize;
+        let mut ordered = Vec::new();
+        while let Some((_, _, raw_index)) = ready.pop_first() {
+            let node = NodeIndex::new(raw_index);
+            processed += 1;
+            if is_evaluation_node(node) {
+                ordered.push(node);
+            }
+            for child in self
+                .graph
+                .neighbors_directed(node, petgraph::Direction::Outgoing)
+            {
+                let degree = indegree
+                    .get_mut(&child)
+                    .expect("topological traversal lost a graph node");
+                *degree = degree.saturating_sub(1);
+                if *degree == 0 {
+                    ready.insert(order_key(child));
                 }
             }
+        }
+        if processed != self.graph.node_count() {
+            return Err("Circular dependency detected in body timeline!".to_string());
         }
         Ok(ordered)
     }
