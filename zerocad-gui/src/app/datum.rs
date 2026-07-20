@@ -2,7 +2,9 @@
 //! hit-testing, and creating new datum nodes from the toolbar.
 
 use crate::*;
-use zerocad_core::{DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, PlaneBase};
+use zerocad_core::{
+    DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, PlaneBase, TopologyVertexRef, VertexRef,
+};
 
 /// Half-extent of a datum plane's displayed sheet (world units). Centered on
 /// the datum's origin, unlike the origin sheets' one-quadrant style, so an
@@ -10,6 +12,104 @@ use zerocad_core::{DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, Plane
 const DATUM_SHEET_HALF: f32 = 12.0;
 
 impl ZeroCadApp {
+    pub(crate) fn selected_datum_face(&self) -> Option<zerocad_core::parametric::FaceRef> {
+        let faces: Vec<_> = self
+            .selected_body
+            .iter()
+            .filter_map(|(body, pick)| match pick {
+                BodyPick::Face(face) => self.face_ref(body, *face),
+                _ => None,
+            })
+            .collect();
+        (faces.len() == 1).then(|| faces[0].clone())
+    }
+
+    pub(crate) fn selected_datum_edge(&self) -> Option<zerocad_core::parametric::EdgeRef> {
+        let edges: Vec<_> = self
+            .selected_body
+            .iter()
+            .filter_map(|(body, pick)| match pick {
+                BodyPick::Edge(edge) => self.edge_ref_from(body, *edge),
+                _ => None,
+            })
+            .collect();
+        (edges.len() == 1).then(|| edges[0].clone())
+    }
+
+    pub(crate) fn selected_datum_vertices(&self) -> Vec<VertexRef> {
+        let mut selected: Vec<_> = self
+            .selected_body
+            .iter()
+            .filter_map(|(body, pick)| match pick {
+                BodyPick::Vertex(vertex) => Some((body.clone(), *vertex)),
+                _ => None,
+            })
+            .collect();
+        selected.sort();
+        selected
+            .into_iter()
+            .filter_map(|(body, vertex)| self.vertex_ref_from_mesh(&body, vertex))
+            .collect()
+    }
+
+    fn vertex_ref_from_mesh(&self, body_id: &str, vertex: u32) -> Option<VertexRef> {
+        let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == body_id)?;
+        let offset = vertex as usize * 3;
+        let point = [
+            *mesh.edge_vertices.get(offset)?,
+            *mesh.edge_vertices.get(offset + 1)?,
+            *mesh.edge_vertices.get(offset + 2)?,
+        ];
+        let model_scale = mesh
+            .edge_vertices
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let tolerance = (model_scale * f32::EPSILON * 64.0).max(f32::MIN_POSITIVE);
+        let touches = |candidate: [f32; 3]| {
+            (candidate[0] - point[0]).abs() <= tolerance
+                && (candidate[1] - point[1]).abs() <= tolerance
+                && (candidate[2] - point[2]).abs() <= tolerance
+        };
+        let mut incident_edge_ids = Vec::new();
+        let mut incident_face_ids = Vec::new();
+        let mut topology_version = None;
+        let mut producer_feature_id = None;
+        let mut source_entity_id = None;
+        for edge in &mesh.edge_refs {
+            if !touches(edge.p0) && !touches(edge.p1) {
+                continue;
+            }
+            if let Some(topology) = &edge.topology {
+                if let Some(edge_id) = topology.edge_id.clone() {
+                    incident_edge_ids.push(edge_id);
+                }
+                incident_face_ids.extend(topology.adjacent_face_ids.iter().cloned());
+                topology_version = topology_version.or(topology.topology_version);
+                producer_feature_id =
+                    producer_feature_id.or_else(|| topology.producer_feature_id.clone());
+                source_entity_id = source_entity_id.or_else(|| topology.source_entity_id.clone());
+            }
+        }
+        incident_edge_ids.sort();
+        incident_edge_ids.dedup();
+        incident_face_ids.sort();
+        incident_face_ids.dedup();
+        let topology =
+            (!incident_edge_ids.is_empty() || !incident_face_ids.is_empty()).then(|| {
+                TopologyVertexRef {
+                    body_id: Some(body_id.to_string()),
+                    topology_version,
+                    incident_edge_ids,
+                    incident_face_ids,
+                    producer_feature_id,
+                    source_entity_id,
+                }
+            });
+        Some(VertexRef { point, topology })
+    }
+
     /// Every visible datum PLANE, resolved: `(node_id, display_name, frame)`.
     /// Sorted by id for stable draw order.
     pub(crate) fn resolved_datum_planes(&self) -> Vec<(String, String, CoordinateSystem)> {
@@ -34,10 +134,8 @@ impl ZeroCadApp {
     }
 
     fn resolved_datums(&self) -> Vec<(String, String, DatumValue)> {
-        let vars = self.document.variable_map();
-        let mut warnings = Vec::new();
-        let datums = self.document.resolve_datums(&vars, &mut warnings);
-        datums
+        self.datum_values
+            .clone()
             .into_iter()
             .filter(|(id, _)| !self.hidden_nodes.contains(id))
             .map(|(id, v)| {
@@ -130,13 +228,123 @@ impl ZeroCadApp {
                     def: DatumPointDef::Coords { p: [0.0, 0.0, 0.0] },
                 },
             ),
+            DatumKind::PlaneFromFace(face) => (
+                format!("datum_{}", self.next_id()),
+                "Face Plane".to_string(),
+                FeatureType::DatumPlane {
+                    def: DatumPlaneDef::PlanarFace { face },
+                },
+            ),
+            DatumKind::AxisFromEdge(edge) => (
+                format!("datumaxis_{}", self.next_id()),
+                "Edge Axis".to_string(),
+                FeatureType::DatumAxis {
+                    def: DatumAxisDef::Edge { edge },
+                },
+            ),
+            DatumKind::AxisFromFace(face) => (
+                format!("datumaxis_{}", self.next_id()),
+                "Surface Axis".to_string(),
+                FeatureType::DatumAxis {
+                    def: DatumAxisDef::CylindricalOrConicalFace { face },
+                },
+            ),
+            DatumKind::AxisFromVertices(a, b) => (
+                format!("datumaxis_{}", self.next_id()),
+                "Vertex Axis".to_string(),
+                FeatureType::DatumAxis {
+                    def: DatumAxisDef::TwoVertices { a, b },
+                },
+            ),
+            DatumKind::PointFromVertex(vertex) => (
+                format!("datumpt_{}", self.next_id()),
+                "Vertex Point".to_string(),
+                FeatureType::DatumPoint {
+                    def: DatumPointDef::Vertex { vertex },
+                },
+            ),
+            DatumKind::PointBetweenVertices(a, b) => (
+                format!("datumpt_{}", self.next_id()),
+                "Midpoint".to_string(),
+                FeatureType::DatumPoint {
+                    def: DatumPointDef::Midpoint { a, b },
+                },
+            ),
+            DatumKind::PointOnEdge(edge) => (
+                format!("datumpt_{}", self.next_id()),
+                "Edge Midpoint".to_string(),
+                FeatureType::DatumPoint {
+                    def: DatumPointDef::EdgeMidpoint { edge },
+                },
+            ),
+            DatumKind::PointAtCircleCenter(edge) => (
+                format!("datumpt_{}", self.next_id()),
+                "Circle Center".to_string(),
+                FeatureType::DatumPoint {
+                    def: DatumPointDef::CircleCenter { edge },
+                },
+            ),
         };
+        let mut dependencies: Vec<String> = match &feature {
+            FeatureType::DatumPlane {
+                def: DatumPlaneDef::PlanarFace { face },
+            }
+            | FeatureType::DatumAxis {
+                def: DatumAxisDef::CylindricalOrConicalFace { face },
+            } => face
+                .topology
+                .as_ref()
+                .and_then(|topology| topology.body_id.clone())
+                .into_iter()
+                .collect(),
+            FeatureType::DatumAxis {
+                def: DatumAxisDef::Edge { edge },
+            }
+            | FeatureType::DatumPoint {
+                def: DatumPointDef::EdgeMidpoint { edge } | DatumPointDef::CircleCenter { edge },
+            } => edge
+                .topology
+                .as_ref()
+                .and_then(|topology| topology.body_id.clone())
+                .into_iter()
+                .collect(),
+            FeatureType::DatumAxis {
+                def: DatumAxisDef::TwoVertices { a, b },
+            }
+            | FeatureType::DatumPoint {
+                def: DatumPointDef::Midpoint { a, b },
+            } => [a, b]
+                .into_iter()
+                .filter_map(|vertex| {
+                    vertex
+                        .topology
+                        .as_ref()
+                        .and_then(|topology| topology.body_id.clone())
+                })
+                .collect(),
+            FeatureType::DatumPoint {
+                def: DatumPointDef::Vertex { vertex },
+            } => vertex
+                .topology
+                .as_ref()
+                .and_then(|topology| topology.body_id.clone())
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        dependencies.sort();
+        dependencies.dedup();
         self.document.add_feature(FeatureNode {
             id: id.clone(),
             name: name.clone(),
             feature,
         });
+        for dependency in dependencies {
+            self.document.add_dependency(&dependency, &id);
+        }
         self.selected_node_id = Some(id);
+        self.selected_body.clear();
+        self.reevaluate_geometry();
         self.status_msg = format!("{name} created — tune it in the Properties panel.");
     }
 }

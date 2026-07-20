@@ -104,6 +104,8 @@ pub enum SketchEntity {
         start: EntityId,
         end: EntityId,
         radius: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clockwise: bool,
         #[serde(default)]
         derived_from: Option<EntityId>,
     },
@@ -352,11 +354,24 @@ pub struct SketchSolverModel {
     /// upstream rebuild.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projected_edges: Vec<ProjectedEdgeReference>,
+    /// Associative derived geometry. These operations reference stable source
+    /// entity ids and are rebuilt after solving; their results remain read-only
+    /// until explicitly dissolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offsets: Vec<crate::sketch::SketchOffsetOperation>,
+    /// Associative linear/circular copies. Generated spans are evaluated after
+    /// solving and remain outside `entities` (read-only) until Dissolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<crate::sketch::SketchPatternOperation>,
 }
 
 impl SketchSolverModel {
     pub fn is_empty(&self) -> bool {
-        self.points.is_empty() && self.entities.is_empty() && self.constraints.is_empty()
+        self.points.is_empty()
+            && self.entities.is_empty()
+            && self.constraints.is_empty()
+            && self.offsets.is_empty()
+            && self.patterns.is_empty()
     }
 
     pub fn point(&self, id: EntityId) -> Option<&SketchPoint> {
@@ -433,6 +448,7 @@ pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::Sket
                 start,
                 end,
                 radius,
+                clockwise,
                 ..
             } => {
                 if let (Some(c), Some(s), Some(e)) = (pos(*center), pos(*start), pos(*end)) {
@@ -441,6 +457,7 @@ pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::Sket
                         radius: *radius as f32,
                         start: s,
                         end: e,
+                        clockwise: *clockwise,
                     });
                 }
             }
@@ -681,6 +698,7 @@ pub fn promote_shapes_to_entities(
                 });
             }
             SketchShape::RegularPolygon { .. }
+            | SketchShape::Slot { .. }
             | SketchShape::Spline { .. }
             | SketchShape::Imported { .. }
             | SketchShape::Raw { .. } => promote_raw(&built, owner, &mut ids, &mut model),
@@ -744,6 +762,7 @@ fn promote_raw(
             start,
             end,
             radius: arc.radius as f64,
+            clockwise: arc.clockwise,
             derived_from: Some(owner),
         });
     }
@@ -832,6 +851,7 @@ mod tests {
                     start: EntityId(1),
                     end: EntityId(1),
                     radius: 4.0,
+                    clockwise: false,
                     derived_from: None,
                 },
                 SketchEntity::Spline {
@@ -986,6 +1006,24 @@ mod tests {
                 },
                 entity_ids: vec![EntityId(2)],
                 point_ids: vec![EntityId(0), EntityId(1)],
+            }],
+            offsets: vec![crate::sketch::SketchOffsetOperation {
+                id: EntityId(28),
+                sources: vec![EntityId(3)],
+                distance: Dimension {
+                    value: 1.5,
+                    expr: Some("wall".to_string()),
+                },
+                creation_side_seed: (6.0, 0.0),
+            }],
+            patterns: vec![crate::sketch::SketchPatternOperation {
+                id: EntityId(29),
+                sources: vec![EntityId(3)],
+                kind: crate::sketch::SketchPatternKind::Circular {
+                    center: [0.0, 0.0],
+                    total_angle_deg: Dimension::literal(360.0),
+                    count: 4,
+                },
             }],
         };
         let json = serde_json::to_string(&model).expect("serialize");

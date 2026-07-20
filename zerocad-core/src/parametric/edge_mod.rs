@@ -168,7 +168,7 @@ pub(crate) fn resolve_legacy_edge_ref_unique(body: &LiveBody, edge: &EdgeRef) ->
         .topology
         .as_ref()
         .and_then(|topology| topology.edge_id.as_deref())
-        .is_some()
+        .is_some_and(|id| crate::parametric::topo_name::TopoName::parse(id).is_durable())
     {
         return None;
     }
@@ -180,8 +180,7 @@ pub(crate) fn resolve_legacy_edge_ref_unique(body: &LiveBody, edge: &EdgeRef) ->
         &reference_mesh
     };
     let mut candidates = mesh.edge_refs.iter().filter(|candidate| {
-        topology_edge_id(candidate).is_some()
-            && mesh_candidate_matches_captured_edge(candidate, edge)
+        topology_edge_id(candidate).is_some() && non_durable_edge_geometry_matches(candidate, edge)
     });
     let candidate = candidates.next()?;
     if candidates.next().is_some() {
@@ -192,6 +191,51 @@ pub(crate) fn resolve_legacy_edge_ref_unique(body: &LiveBody, edge: &EdgeRef) ->
         candidate,
         &TopologyEdgeRef::default(),
     ))
+}
+
+fn non_durable_edge_geometry_matches(
+    candidate: &crate::mock_kernel::MeshEdgeRef,
+    edge: &EdgeRef,
+) -> bool {
+    match (candidate.curve.as_ref(), edge.curve.as_ref()) {
+        (
+            Some(crate::mock_kernel::EdgeCurveHint::Circle {
+                center: candidate_center,
+                axis: candidate_axis,
+                radius: candidate_radius,
+                closed: candidate_closed,
+                ..
+            }),
+            Some(crate::mock_kernel::EdgeCurveHint::Circle {
+                center: requested_center,
+                axis: requested_axis,
+                radius: requested_radius,
+                closed: requested_closed,
+                ..
+            }),
+        ) => {
+            let coordinate_scale = candidate_center
+                .iter()
+                .chain(requested_center.iter())
+                .map(|value| value.abs())
+                .chain([candidate_radius.abs(), requested_radius.abs()])
+                .fold(0.0_f32, f32::max);
+            let tolerance = (coordinate_scale * f32::EPSILON * 64.0)
+                .max(candidate_radius.abs().max(requested_radius.abs()) * 1.0e-4)
+                .max(f32::MIN_POSITIVE);
+            let candidate_axis =
+                crate::geometry::Vec3::new(candidate_axis[0], candidate_axis[1], candidate_axis[2])
+                    .normalize();
+            let requested_axis =
+                crate::geometry::Vec3::new(requested_axis[0], requested_axis[1], requested_axis[2])
+                    .normalize();
+            *candidate_closed == *requested_closed
+                && distance3(*candidate_center, *requested_center) <= tolerance
+                && (candidate_radius - requested_radius).abs() <= tolerance
+                && candidate_axis.dot(requested_axis).abs() >= 0.9999
+        }
+        _ => mesh_candidate_matches_captured_edge(candidate, edge),
+    }
 }
 
 fn resolve_edge_by_face_pair(

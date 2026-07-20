@@ -51,10 +51,13 @@ mod preview_tests {
                     regions: regions.clone(),
                     loops: Vec::new(),
                     circles: vec![circle],
+                    draft_supported: false,
                     on_face: mode != ExtrudeMode::NewBody,
                 }],
                 depth: 4.0,
                 depth_text: "4".into(),
+                draft_angle_deg: 0.0,
+                draft_angle_text: "0".into(),
                 focus_request: false,
                 mode,
                 on_face: mode != ExtrudeMode::NewBody,
@@ -96,6 +99,9 @@ pub(crate) struct ExtrudeTarget {
     /// the split regions so the orange ghost can rebuild a clean cylinder when a
     /// construction/projected line divides the circle into multiple faces.
     pub(crate) circles: Vec<zerocad_core::Circle>,
+    /// False when the selected sketch contains analytic curved boundaries that
+    /// Extrude Draft v1 deliberately leaves unresolved.
+    pub(crate) draft_supported: bool,
     /// True when the source sketch sits on an existing body face (vs an origin
     /// plane). Drives the auto-chosen extrude mode (face → Join/Cut, plane →
     /// New Body).
@@ -127,6 +133,9 @@ pub(crate) struct ExtrudeOp {
     /// Editable text buffer for the inline distance box. Kept in sync with
     /// `depth` (typing parses into `depth`; dragging reformats this).
     pub(crate) depth_text: String,
+    /// Signed far-section wall draft in degrees and its editable expression.
+    pub(crate) draft_angle_deg: f32,
+    pub(crate) draft_angle_text: String,
     /// True until the inline box has grabbed keyboard focus once.
     pub(crate) focus_request: bool,
     /// Whether this extrude makes a new body, joins existing bodies, or cuts.
@@ -162,6 +171,29 @@ impl ExtrudeOp {
             // disc as a hole — renders as a clean prism-with-hole.
             let plan = zerocad_core::boolean_region_plan(&t.loops, &t.regions, &t.indices);
             let mut mesh = MockMesh::empty();
+            if self.draft_angle_deg.abs() > f32::EPSILON {
+                if !t.draft_supported {
+                    return Vec::new();
+                }
+                for (region_index, region) in t.regions.iter().enumerate() {
+                    if !plan.process.get(region_index).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let Ok(solid) = zerocad_core::drafted_region_solid(
+                        &region.boundary,
+                        &region.holes,
+                        depth,
+                        &t.cs,
+                        self.draft_angle_deg,
+                    ) else {
+                        return Vec::new();
+                    };
+                    mesh.append(MockMesh::from_solid(&solid));
+                }
+                let axis = t.cs.u.cross(t.cs.v).normalize();
+                parts.push((t.cs.origin, axis, mesh));
+                continue;
+            }
             let complete_circles =
                 zerocad_core::complete_selected_circles(&t.circles, &t.regions, &plan.process);
             let mut collapsed_regions = HashSet::new();
@@ -281,6 +313,7 @@ impl ZeroCadApp {
         let op = self.extrude_op.as_ref()?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         ((op.depth / 0.05).round() as i64).hash(&mut h);
+        ((op.draft_angle_deg / 0.02).round() as i64).hash(&mut h);
         let mode_id: u8 = match op.mode {
             ExtrudeMode::NewBody => 0,
             ExtrudeMode::Join => 1,
@@ -356,6 +389,8 @@ impl ZeroCadApp {
                     region_indices,
                     mode: op.mode,
                     depth_expr: None,
+                    draft_angle_deg: op.draft_angle_deg,
+                    draft_angle_expr: None,
                 },
             });
             graph.add_dependency(&target.sketch_id, &extrude_id);
@@ -477,12 +512,22 @@ impl ZeroCadApp {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             base_key.hash(&mut h);
             depth.to_bits().hash(&mut h);
+            op.draft_angle_deg.to_bits().hash(&mut h);
             h.finish()
         };
         if let Some((cached_key, mesh)) = self.extrude_preview_mesh_cache.as_ref() {
             if *cached_key == full_key {
                 return Some(mesh.clone());
             }
+        }
+        if op.draft_angle_deg.abs() > f32::EPSILON {
+            let mut mesh = MockMesh::empty();
+            for (_, _, part) in op.preview_part_meshes(depth) {
+                mesh.append(part);
+            }
+            self.extrude_preview_mesh_cache = Some((full_key, mesh.clone()));
+            self.extrude_ghost_base = None;
+            return Some(mesh);
         }
         let base_hit =
             matches!(self.extrude_ghost_base.as_ref(), Some((k, _, _)) if *k == base_key);
@@ -633,6 +678,42 @@ impl ZeroCadApp {
                                 }
                             }
                         }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Draft")
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(90, 95, 102)),
+                            );
+                            if let Some(op) = self.extrude_op.as_mut() {
+                                let outcome = crate::expr::autocomplete_field(
+                                    ui,
+                                    egui::Id::new("extrude_draft_angle_field"),
+                                    &mut op.draft_angle_text,
+                                    56.0,
+                                    true,
+                                    false,
+                                    false,
+                                    &var_names,
+                                    &mut ac,
+                                );
+                                if outcome.accepted_via_key {
+                                    suppress_commit = true;
+                                }
+                                if outcome.response.changed() || outcome.response.has_focus() {
+                                    if let Ok(value) =
+                                        crate::expr::eval(&op.draft_angle_text, &varmap)
+                                    {
+                                        op.draft_angle_deg = value as f32;
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new("°")
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(110, 110, 110)),
+                                );
+                            }
+                        });
                         ui.add_space(5.0);
                         if let Some(op) = self.extrude_op.as_mut() {
                             // Until the user picks a mode, follow the sketch's
@@ -697,6 +778,8 @@ impl ZeroCadApp {
         depth: f32,
         mode: ExtrudeMode,
         depth_expr: Option<String>,
+        draft_angle_deg: f32,
+        draft_angle_expr: Option<String>,
     ) -> Option<String> {
         if region_indices.is_empty() {
             return None;
@@ -740,6 +823,8 @@ impl ZeroCadApp {
                 region_indices,
                 mode,
                 depth_expr,
+                draft_angle_deg,
+                draft_angle_expr,
             },
         };
         self.document.add_feature(extrude_node);
@@ -758,6 +843,7 @@ impl ZeroCadApp {
         bool,
         Vec<zerocad_core::ShapeLoop>,
         Vec<zerocad_core::Circle>,
+        bool,
     )> {
         let var_map = self.document.variable_map();
         self.document.graph.node_indices().find_map(|idx| {
@@ -797,7 +883,16 @@ impl ZeroCadApp {
                         Vec::new()
                     };
                     let circles = eff.circles.clone();
-                    return Some((*cs, detect_regions(&eff), *on_face, loops, circles));
+                    let draft_supported =
+                        eff.circles.is_empty() && eff.arcs.is_empty() && eff.splines.is_empty();
+                    return Some((
+                        *cs,
+                        detect_regions(&eff),
+                        *on_face,
+                        loops,
+                        circles,
+                        draft_supported,
+                    ));
                 }
             }
             None
@@ -862,7 +957,9 @@ impl ZeroCadApp {
         for (sid, mut idxs) in by_sketch {
             idxs.sort();
             idxs.dedup();
-            if let Some((cs, regions, on_face, loops, circles)) = self.lookup_sketch(&sid) {
+            if let Some((cs, regions, on_face, loops, circles, draft_supported)) =
+                self.lookup_sketch(&sid)
+            {
                 idxs.retain(|&i| i < regions.len());
                 if !idxs.is_empty() {
                     targets.push(ExtrudeTarget {
@@ -873,6 +970,7 @@ impl ZeroCadApp {
                         on_face,
                         loops,
                         circles,
+                        draft_supported,
                     });
                 }
             }
@@ -893,6 +991,8 @@ impl ZeroCadApp {
             targets,
             depth,
             depth_text: format!("{:.2}", depth),
+            draft_angle_deg: 0.0,
+            draft_angle_text: "0".to_string(),
             focus_request: true,
             mode,
             on_face,
@@ -982,9 +1082,14 @@ impl ZeroCadApp {
                 // A direct face push/pull has no drawn overlapping shapes.
                 loops: Vec::new(),
                 circles: Vec::new(),
+                draft_supported: boundary.circles.is_empty()
+                    && boundary.arcs.is_empty()
+                    && boundary.splines.is_empty(),
             }],
             depth,
             depth_text: format!("{:.2}", depth),
+            draft_angle_deg: 0.0,
+            draft_angle_text: "0".to_string(),
             focus_request: true,
             mode,
             on_face: true,
@@ -1023,7 +1128,7 @@ impl ZeroCadApp {
     pub(crate) fn begin_extrude_whole_sketch(&mut self, sketch_id: &str) {
         let regions = self
             .lookup_sketch(sketch_id)
-            .map(|(_, r, _, _, _)| r)
+            .map(|(_, r, _, _, _, _)| r)
             .unwrap_or_default();
         if regions.is_empty() {
             self.status_msg =
@@ -1051,6 +1156,15 @@ impl ZeroCadApp {
         let Some(op) = self.extrude_op.take() else {
             return;
         };
+
+        if !op.draft_angle_deg.is_finite() || op.draft_angle_deg.abs() >= 89.0 {
+            self.status_msg = format!(
+                "Extrude Draft must be finite and strictly between -89° and 89° (got {:.3}°).",
+                op.draft_angle_deg
+            );
+            self.extrude_op = Some(op);
+            return;
+        }
 
         // Capture pending visual
         self.pending_visual = Some(PendingCommitVisual {
@@ -1082,6 +1196,11 @@ impl ZeroCadApp {
         } else {
             None
         };
+        let draft_angle_expr = if zerocad_core::expr::preserves_source(&op.draft_angle_text) {
+            Some(op.draft_angle_text.trim().to_string())
+        } else {
+            None
+        };
 
         // Direct face push/pull: materialize the helper on-face sketch now
         // (inside this undo unit), so the extrude below has a real parent.
@@ -1098,6 +1217,8 @@ impl ZeroCadApp {
                 op.depth,
                 op.mode,
                 depth_expr.clone(),
+                op.draft_angle_deg,
+                draft_angle_expr.clone(),
             ) {
                 last_id = Some(id);
                 count += 1;

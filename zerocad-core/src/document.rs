@@ -4,7 +4,7 @@
 //! petgraph-backed evaluator input.  This module owns the durable meaning that
 //! must not depend on petgraph arena order or Rust enum discriminants.
 
-use crate::parametric::{ExtrudeMode, FeatureType};
+use crate::parametric::{DatumAxisDef, DatumPlaneDef, DatumPointDef, ExtrudeMode, FeatureType};
 use crate::{ParametricGraph, Unit};
 use std::collections::BTreeMap;
 
@@ -256,6 +256,7 @@ pub enum SemanticEntityKind {
     Sketch,
     SketchEntity,
     Datum,
+    Vertex,
 }
 
 /// Stable topology identity, independent of geometric fallback data.
@@ -301,6 +302,9 @@ pub enum GeometricIntent {
     },
     Datum {
         datum: FeatureId,
+    },
+    Vertex {
+        point: [f32; 3],
     },
 }
 
@@ -457,6 +461,52 @@ impl SemanticSelector {
                 p1: edge.p1,
                 adjacent_normals: [edge.n1, edge.n2],
                 curve_kind,
+            },
+        }
+    }
+
+    pub fn from_vertex(vertex: &crate::parametric::VertexRef) -> Self {
+        let topology = vertex.topology.as_ref();
+        let mut incident_edge_ids = topology
+            .map(|topology| topology.incident_edge_ids.clone())
+            .unwrap_or_default();
+        incident_edge_ids.sort();
+        incident_edge_ids.dedup();
+        let mut incident_face_ids = topology
+            .map(|topology| topology.incident_face_ids.clone())
+            .unwrap_or_default();
+        incident_face_ids.sort();
+        incident_face_ids.dedup();
+        let entity_id = if !incident_face_ids.is_empty() {
+            Some(format!("vertex:faces:{}", incident_face_ids.join("|")))
+        } else {
+            (!incident_edge_ids.is_empty())
+                .then(|| format!("vertex:edges:{}", incident_edge_ids.join("|")))
+        };
+        Self {
+            kind: SemanticEntityKind::Vertex,
+            topology: SelectionTopology {
+                body: topology
+                    .and_then(|topology| topology.body_id.as_deref())
+                    .map(BodyId::from),
+                component_id: None,
+                topology_version: topology.and_then(|topology| topology.topology_version),
+                entity_id,
+                adjacent_entity_ids: if incident_face_ids.is_empty() {
+                    incident_edge_ids
+                } else {
+                    incident_face_ids
+                },
+            },
+            provenance: SelectionProvenance {
+                feature: topology
+                    .and_then(|topology| topology.producer_feature_id.as_deref())
+                    .map(FeatureId::from),
+                source_entity_id: topology.and_then(|topology| topology.source_entity_id.clone()),
+            },
+            semantic_role: Some("vertex".to_owned()),
+            intent: GeometricIntent::Vertex {
+                point: vertex.point,
             },
         }
     }
@@ -745,6 +795,9 @@ pub(crate) fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId
         | FeatureType::Shell { target, .. }
         | FeatureType::Hole { target, .. }
         | FeatureType::Thread { target, .. } => Some(BodyId::from(target.as_str())),
+        FeatureType::FeaturePattern { target, .. } | FeatureType::Draft { target, .. } => {
+            Some(BodyId::from(target.as_str()))
+        }
         FeatureType::Origin
         | FeatureType::Sketch { .. }
         | FeatureType::VariableSet { .. }
@@ -789,6 +842,34 @@ fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
         | FeatureType::BodyScale { source, .. } => {
             vec![FeatureInput::body("source", BodyId::from(source.as_str()))]
         }
+        FeatureType::FeaturePattern {
+            target,
+            source_feature,
+            ..
+        } => vec![
+            FeatureInput::body("target", BodyId::from(target.as_str())),
+            FeatureInput::feature("source_feature", FeatureId::from(source_feature.as_str())),
+        ],
+        FeatureType::Draft {
+            target,
+            faces,
+            neutral,
+            ..
+        } => {
+            let mut inputs = vec![FeatureInput::body("target", BodyId::from(target.as_str()))];
+            inputs.extend(faces.iter().map(|face| {
+                FeatureInput::selection("draft_face", SemanticSelector::from_face(face))
+            }));
+            inputs.push(match neutral {
+                crate::parametric::DraftNeutral::Face(face) => {
+                    FeatureInput::selection("neutral_face", SemanticSelector::from_face(face))
+                }
+                crate::parametric::DraftNeutral::Datum(datum) => {
+                    FeatureInput::datum("neutral_datum", FeatureId::from(datum.as_str()))
+                }
+            });
+            inputs
+        }
         FeatureType::BodyJoin { sources } => sources
             .iter()
             .map(|source| FeatureInput::body("source", BodyId::from(source.as_str())))
@@ -827,6 +908,44 @@ fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
             FeatureInput::sketch("profile", FeatureId::from(profile_sketch.as_str())),
             FeatureInput::sketch("path", FeatureId::from(path_sketch.as_str())),
         ],
+        FeatureType::DatumPlane {
+            def: DatumPlaneDef::PlanarFace { face },
+        } => vec![FeatureInput::selection(
+            "planar_face",
+            SemanticSelector::from_face(face),
+        )],
+        FeatureType::DatumAxis { def } => match def {
+            DatumAxisDef::Edge { edge } => vec![FeatureInput::selection(
+                "axis_edge",
+                SemanticSelector::from_edge(edge),
+            )],
+            DatumAxisDef::CylindricalOrConicalFace { face } => vec![FeatureInput::selection(
+                "axis_face",
+                SemanticSelector::from_face(face),
+            )],
+            DatumAxisDef::TwoVertices { a, b } => vec![
+                FeatureInput::selection("vertex_a", SemanticSelector::from_vertex(a)),
+                FeatureInput::selection("vertex_b", SemanticSelector::from_vertex(b)),
+            ],
+            DatumAxisDef::TwoPoints { .. } | DatumAxisDef::PlaneIntersection { .. } => Vec::new(),
+        },
+        FeatureType::DatumPoint { def } => match def {
+            DatumPointDef::Vertex { vertex } => vec![FeatureInput::selection(
+                "vertex",
+                SemanticSelector::from_vertex(vertex),
+            )],
+            DatumPointDef::Midpoint { a, b } => vec![
+                FeatureInput::selection("vertex_a", SemanticSelector::from_vertex(a)),
+                FeatureInput::selection("vertex_b", SemanticSelector::from_vertex(b)),
+            ],
+            DatumPointDef::EdgeMidpoint { edge } | DatumPointDef::CircleCenter { edge } => {
+                vec![FeatureInput::selection(
+                    "edge",
+                    SemanticSelector::from_edge(edge),
+                )]
+            }
+            DatumPointDef::Coords { .. } => Vec::new(),
+        },
         _ => Vec::new(),
     };
     inputs.sort_by(|a, b| {
@@ -869,6 +988,8 @@ impl FeatureRegistration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeaturePayloadDecoder {
     NumericFieldsV1,
+    NumericFieldsV2,
+    NumericFieldsV3,
     StepAssetV1,
     StlAssetV1,
 }
@@ -884,6 +1005,30 @@ const NUMERIC_FIELDS_V1: &[FeaturePayloadDecoderRegistration] =
         schema: 1,
         decoder: FeaturePayloadDecoder::NumericFieldsV1,
     }];
+const NUMERIC_FIELDS_V1_V2: &[FeaturePayloadDecoderRegistration] = &[
+    FeaturePayloadDecoderRegistration {
+        schema: 1,
+        decoder: FeaturePayloadDecoder::NumericFieldsV1,
+    },
+    FeaturePayloadDecoderRegistration {
+        schema: 2,
+        decoder: FeaturePayloadDecoder::NumericFieldsV2,
+    },
+];
+const NUMERIC_FIELDS_V1_V2_V3: &[FeaturePayloadDecoderRegistration] = &[
+    FeaturePayloadDecoderRegistration {
+        schema: 1,
+        decoder: FeaturePayloadDecoder::NumericFieldsV1,
+    },
+    FeaturePayloadDecoderRegistration {
+        schema: 2,
+        decoder: FeaturePayloadDecoder::NumericFieldsV2,
+    },
+    FeaturePayloadDecoderRegistration {
+        schema: 3,
+        decoder: FeaturePayloadDecoder::NumericFieldsV3,
+    },
+];
 const STEP_ASSET_V1: &[FeaturePayloadDecoderRegistration] = &[FeaturePayloadDecoderRegistration {
     schema: 1,
     decoder: FeaturePayloadDecoder::StepAssetV1,
@@ -909,6 +1054,7 @@ pub enum FeatureEvaluatorKind {
     Shell,
     Hole,
     Pattern,
+    FeaturePattern,
     BodyTransform,
     Thread,
     BodyJoin,
@@ -921,6 +1067,7 @@ pub enum FeatureEvaluatorKind {
     FaceDelete,
     FaceThicken,
     ImportStl,
+    Draft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -955,14 +1102,18 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::Cylinder,
             FeatureEditorGroup::Solid,
         ),
-        registration(
+        registration_with_payload(
             "sketch.sketch",
+            3,
+            NUMERIC_FIELDS_V1_V2_V3,
             "Sketch",
             FeatureEvaluatorKind::Sketch,
             FeatureEditorGroup::Sketch,
         ),
-        registration(
+        registration_with_payload(
             "part.extrude",
+            2,
+            NUMERIC_FIELDS_V1_V2,
             "Extrude",
             FeatureEvaluatorKind::Extrude,
             FeatureEditorGroup::Solid,
@@ -999,8 +1150,10 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::Loft,
             FeatureEditorGroup::Solid,
         ),
-        registration(
+        registration_with_payload(
             "part.sweep",
+            2,
+            NUMERIC_FIELDS_V1_V2,
             "Sweep",
             FeatureEvaluatorKind::Sweep,
             FeatureEditorGroup::Solid,
@@ -1024,6 +1177,12 @@ impl FeatureRegistry {
             FeatureEditorGroup::Modify,
         ),
         registration(
+            "part.feature_pattern",
+            "Feature Pattern",
+            FeatureEvaluatorKind::FeaturePattern,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
             "part.transform",
             "Move / Copy",
             FeatureEvaluatorKind::BodyTransform,
@@ -1035,20 +1194,26 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::Thread,
             FeatureEditorGroup::Modify,
         ),
-        registration(
+        registration_with_payload(
             "datum.plane",
+            2,
+            NUMERIC_FIELDS_V1_V2,
             "Datum Plane",
             FeatureEvaluatorKind::Datum,
             FeatureEditorGroup::Construct,
         ),
-        registration(
+        registration_with_payload(
             "datum.axis",
+            2,
+            NUMERIC_FIELDS_V1_V2,
             "Datum Axis",
             FeatureEvaluatorKind::Datum,
             FeatureEditorGroup::Construct,
         ),
-        registration(
+        registration_with_payload(
             "datum.point",
+            2,
+            NUMERIC_FIELDS_V1_V2,
             "Datum Point",
             FeatureEvaluatorKind::Datum,
             FeatureEditorGroup::Construct,
@@ -1105,6 +1270,12 @@ impl FeatureRegistry {
             "direct.face_thicken",
             "Thicken Face",
             FeatureEvaluatorKind::FaceThicken,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "part.draft",
+            "Draft",
+            FeatureEvaluatorKind::Draft,
             FeatureEditorGroup::Modify,
         ),
         registration_with_payload(
@@ -1200,7 +1371,9 @@ impl FeatureType {
             FeatureType::FaceMove { .. } => "direct.face_move",
             FeatureType::FaceDelete { .. } => "direct.face_delete",
             FeatureType::FaceThicken { .. } => "direct.face_thicken",
+            FeatureType::Draft { .. } => "part.draft",
             FeatureType::ImportStl { .. } => "exchange.stl_import",
+            FeatureType::FeaturePattern { .. } => "part.feature_pattern",
         }
     }
 

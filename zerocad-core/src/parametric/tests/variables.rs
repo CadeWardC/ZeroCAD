@@ -55,6 +55,8 @@ fn sketch_dimension_follows_a_variable() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("sketch_2", "extrude_3");
@@ -228,6 +230,8 @@ fn extrude_depth_follows_a_variable() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: Some("h".to_string()),
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("sketch_2", "extrude_3");
@@ -358,6 +362,8 @@ fn rename_variable_rewrites_identifier_references_atomically() {
             mode: ExtrudeMode::NewBody,
             target: None,
             depth_expr: Some("width + width_extra".to_string()),
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.rename_variable("width", "span").unwrap();

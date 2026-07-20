@@ -111,6 +111,8 @@ fn eval_cache_key_changes_when_a_sketch_constraint_changes() {
             construction: vec![],
             driven_dimensions: vec![],
             projected_edges: vec![],
+            offsets: vec![],
+            patterns: vec![],
         });
     } else {
         panic!("test fixture should contain a Sketch");
@@ -511,6 +513,9 @@ enum JsonStep {
 
 fn feature_mutation_corpus() -> Vec<FeatureType> {
     use crate::mock_kernel::EdgeCurveHint;
+    use crate::parametric::{
+        DraftNeutral, FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
+    };
     use crate::{
         AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef, HoleKind,
         PatternKind, PlaneBase, Variable,
@@ -563,6 +568,8 @@ fn feature_mutation_corpus() -> Vec<FeatureType> {
             mode: ExtrudeMode::NewBody,
             target: Some("missing_body".into()),
             depth_expr: Some("3*2".into()),
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
         FeatureType::EdgeMod {
             target: "missing_body".into(),
@@ -597,6 +604,8 @@ fn feature_mutation_corpus() -> Vec<FeatureType> {
             path_sketch: "path".into(),
             mode: ExtrudeMode::NewBody,
             target: Some("missing_body".into()),
+            total_twist_deg: 30.0,
+            total_twist_expr: Some("twist".into()),
         },
         FeatureType::Shell {
             target: "missing_body".into(),
@@ -626,6 +635,18 @@ fn feature_mutation_corpus() -> Vec<FeatureType> {
                 spacing_expr: Some("step".into()),
                 count: 3,
             },
+        },
+        FeatureType::FeaturePattern {
+            target: "missing_body".into(),
+            source_feature: "missing_source".into(),
+            kind: FeaturePatternKind::Linear {
+                direction: AxisBase::Y,
+                spacing: 3.0,
+                spacing_expr: Some("feature_step".into()),
+                count: 3,
+            },
+            compute_mode: FeaturePatternComputeMode::Identical,
+            extent_policy: FeaturePatternExtentPolicy::SourceExtent,
         },
         FeatureType::BodyTransform {
             source: "missing_body".into(),
@@ -703,10 +724,18 @@ fn feature_mutation_corpus() -> Vec<FeatureType> {
         },
         FeatureType::FaceThicken {
             target: "missing_a".into(),
-            face: direct_face,
+            face: direct_face.clone(),
             thickness: 1.5,
             thickness_expr: Some("sheet".into()),
             reverse: true,
+        },
+        FeatureType::Draft {
+            target: "missing_a".into(),
+            faces: vec![direct_face.clone()],
+            neutral: DraftNeutral::Face(direct_face),
+            angle_deg: 3.0,
+            angle_expr: Some("draft_angle".into()),
+            flip_pull: true,
         },
         FeatureType::ImportStl {
             stl_data: b"solid empty\nendsolid empty\n".to_vec(),
@@ -759,7 +788,16 @@ fn mutation_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {
         Value::Number(value) => vec![Value::Number(
             Number::from_f64(value.as_f64().unwrap() + 0.375).unwrap(),
         )],
-        Value::String(value) => vec![Value::String(format!("{value}_mutated"))],
+        Value::String(value) => {
+            let mut candidates = match value.as_str() {
+                "SourceExtent" => vec![Value::String("ThroughAllLocalTarget".into())],
+                "ThroughAllLocalTarget" => vec![Value::String("SourceExtent".into())],
+                "Identical" => vec![Value::String("UnsupportedForTest".into())],
+                _ => Vec::new(),
+            };
+            candidates.push(Value::String(format!("{value}_mutated")));
+            candidates
+        }
         Value::Null => vec![
             Value::String("mutated".into()),
             Value::Number(Number::from_f64(1.375).unwrap()),
@@ -859,7 +897,7 @@ fn every_mutable_persisted_feature_leaf_matches_a_cache_free_rebuild() {
     }
 
     assert_eq!(
-        variants, 28,
+        variants, 30,
         "all persisted feature variants must be present"
     );
     assert!(

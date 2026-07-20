@@ -113,6 +113,50 @@ impl ZeroCadApp {
         self.mesh_stats = Self::mesh_totals(&self.body_meshes);
     }
 
+    pub(crate) fn mirror_join_outcome(
+        &self,
+        feature_id: &str,
+        source_body_id: &str,
+    ) -> MirrorJoinOutcome {
+        classify_mirror_join_outcome(
+            self.eval_pending,
+            self.unresolved_features.get(feature_id).cloned(),
+            self.body_meshes.iter().any(|(id, _)| id == feature_id),
+            self.body_meshes.iter().any(|(id, _)| id == source_body_id),
+        )
+    }
+
+    fn finish_pending_mirror_join_feedback(&mut self) {
+        let Some(pending) = self.pending_mirror_join_feedback.clone() else {
+            return;
+        };
+        let had_warnings = self.error_msg.is_some();
+        match self.mirror_join_outcome(&pending.feature_id, &pending.source_body_id) {
+            MirrorJoinOutcome::Evaluating => {}
+            MirrorJoinOutcome::Joined => {
+                self.status_msg = if had_warnings {
+                    "Mirror joined into the source body; the model also has warnings.".to_string()
+                } else {
+                    "Mirror joined into the source body.".to_string()
+                };
+                self.pending_mirror_join_feedback = None;
+            }
+            MirrorJoinOutcome::Separate => {
+                self.status_msg = if had_warnings {
+                    "Mirror created as a separate body; Join could not connect. See warning."
+                        .to_string()
+                } else {
+                    "Mirror created as a separate body; Join could not connect.".to_string()
+                };
+                self.pending_mirror_join_feedback = None;
+            }
+            MirrorJoinOutcome::Unresolved(_) => {
+                self.status_msg = "Mirror remains unresolved; see the reported issue.".to_string();
+                self.pending_mirror_join_feedback = None;
+            }
+        }
+    }
+
     /// Apply an evaluation result to the displayed model + status line.
     pub(crate) fn apply_eval_result(
         &mut self,
@@ -272,6 +316,7 @@ impl ZeroCadApp {
                                 .map(|r| (s.feature_id.to_string(), r.to_string()))
                         })
                         .collect();
+                    self.datum_values = output.datums.clone();
                     let warnings = output.rendered_warnings();
                     self.document
                         .install_evaluation_cache(output.cache_snapshot);
@@ -281,12 +326,61 @@ impl ZeroCadApp {
                         .document
                         .apply_face_reattach_updates(output.face_reattach);
                     self.apply_eval_result(output.bodies, warnings, face_reattached);
+                    self.finish_pending_mirror_join_feedback();
                 }
                 Err(err) => {
                     self.error_msg = Some(err.to_string());
-                    self.status_msg = "Error: Model evaluation failed.".to_string();
+                    self.status_msg = if self.pending_mirror_join_feedback.take().is_some() {
+                        "Error: Mirror evaluation failed.".to_string()
+                    } else {
+                        "Error: Model evaluation failed.".to_string()
+                    };
                 }
             }
         }
+    }
+}
+
+fn classify_mirror_join_outcome(
+    eval_pending: bool,
+    unresolved_reason: Option<String>,
+    has_feature_body: bool,
+    has_source_body: bool,
+) -> MirrorJoinOutcome {
+    if eval_pending {
+        MirrorJoinOutcome::Evaluating
+    } else if let Some(reason) = unresolved_reason {
+        MirrorJoinOutcome::Unresolved(reason)
+    } else if has_feature_body {
+        MirrorJoinOutcome::Separate
+    } else if has_source_body {
+        MirrorJoinOutcome::Joined
+    } else {
+        MirrorJoinOutcome::Unresolved("neither joined nor separate output is available".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_join_outcome_tracks_evaluating_joined_separate_and_unresolved() {
+        assert_eq!(
+            classify_mirror_join_outcome(true, None, true, true),
+            MirrorJoinOutcome::Evaluating
+        );
+        assert_eq!(
+            classify_mirror_join_outcome(false, None, false, true),
+            MirrorJoinOutcome::Joined
+        );
+        assert_eq!(
+            classify_mirror_join_outcome(false, None, true, true),
+            MirrorJoinOutcome::Separate
+        );
+        assert_eq!(
+            classify_mirror_join_outcome(false, Some("missing plane".to_string()), false, true),
+            MirrorJoinOutcome::Unresolved("missing plane".to_string())
+        );
     }
 }

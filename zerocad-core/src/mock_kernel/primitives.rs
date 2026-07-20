@@ -300,6 +300,13 @@ fn resample_ring_2d(pts: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
     if m < 2 || n < 3 {
         return pts.to_vec();
     }
+    // Equal vertex counts already provide one-to-one correspondence. Re-spacing
+    // a non-square polygon by perimeter quarters moves its corners (a 10x8
+    // rectangle becomes four diagonal chords), which can make an otherwise
+    // valid drafted frustum fail to sew.
+    if m == n {
+        return pts.to_vec();
+    }
     // Cumulative perimeter length at each original vertex (closed).
     let mut cum = vec![0.0f32; m + 1];
     for i in 0..m {
@@ -410,6 +417,8 @@ pub fn swept_solid(
     profile_boundary: &[(f32, f32)],
     profile_holes: &[Vec<(f32, f32)>],
     path_points: &[crate::geometry::Vec3],
+    total_twist_deg: f32,
+    closed: bool,
 ) -> Option<KernelSolid> {
     use crate::geometry::Vec3;
     // Drop consecutive duplicate path points.
@@ -423,9 +432,10 @@ pub fn swept_solid(
             path.push(p);
         }
     }
-    if path.len() < 2
+    if path.len() < if closed { 3 } else { 2 }
         || profile_boundary.len() < 3
         || profile_holes.iter().any(|hole| hole.len() < 3)
+        || !total_twist_deg.is_finite()
     {
         return None;
     }
@@ -433,8 +443,22 @@ pub fn swept_solid(
     // Tangents by central difference (forward/back at the ends).
     let m = path.len();
     let tangent = |i: usize| -> Vec3 {
-        let a = if i == 0 { path[0] } else { path[i - 1] };
-        let b = if i + 1 < m { path[i + 1] } else { path[m - 1] };
+        let a = if i == 0 {
+            if closed {
+                path[m - 1]
+            } else {
+                path[0]
+            }
+        } else {
+            path[i - 1]
+        };
+        let b = if i + 1 < m {
+            path[i + 1]
+        } else if closed {
+            path[0]
+        } else {
+            path[m - 1]
+        };
         b.sub(a).normalize()
     };
 
@@ -471,8 +495,10 @@ pub fn swept_solid(
             })
             .collect(),
     };
-    let mut sections = Vec::with_capacity(m);
-    sections.push(section_at(path[0], r, s));
+    let initial_r = r;
+    let initial_s = s;
+    let mut frames = Vec::with_capacity(m);
+    frames.push((r, s, t));
     for i in 1..m {
         // Double-reflection RMF transport of (r) from frame i-1 to i.
         let v1 = path[i].sub(path[i - 1]);
@@ -497,13 +523,83 @@ pub fn swept_solid(
         r = r_next;
         s = s_next;
         t = t_next;
-        sections.push(section_at(path[i], r, s));
+        frames.push((r, s, t));
+    }
+
+    // A closed RMF generally returns with a residual rotation (holonomy).
+    // Measure that residual after transporting the final frame over the seam,
+    // then distribute the opposite rotation by arc length. The seam therefore
+    // closes exactly instead of concentrating a visible twist at one section.
+    let transport_right = |from: Vec3, to: Vec3, tangent_from: Vec3, right: Vec3| {
+        let chord = to.sub(from);
+        let chord_len2 = chord.dot(chord);
+        let (right_line, tangent_line) = if chord_len2 > 1.0e-12 {
+            (
+                right.sub(chord.mul(2.0 / chord_len2 * chord.dot(right))),
+                tangent_from.sub(chord.mul(2.0 / chord_len2 * chord.dot(tangent_from))),
+            )
+        } else {
+            (right, tangent_from)
+        };
+        let tangent_to = tangent(0);
+        let normal_delta = tangent_to.sub(tangent_line);
+        let normal_len2 = normal_delta.dot(normal_delta);
+        if normal_len2 > 1.0e-12 {
+            right_line
+                .sub(normal_delta.mul(2.0 / normal_len2 * normal_delta.dot(right_line)))
+                .normalize()
+        } else {
+            right_line.normalize()
+        }
+    };
+    let closure_correction = if closed {
+        let closure_r = transport_right(path[m - 1], path[0], t, r);
+        let axis = tangent(0);
+        axis.dot(closure_r.cross(initial_r))
+            .atan2(closure_r.dot(initial_r))
+    } else {
+        0.0
+    };
+    let twist = (total_twist_deg as f64).to_radians() as f32;
+    let rotate_about = |vector: Vec3, axis: Vec3, angle: f32| {
+        vector
+            .mul(angle.cos())
+            .add(axis.cross(vector).mul(angle.sin()))
+            .add(axis.mul(axis.dot(vector) * (1.0 - angle.cos())))
+            .normalize()
+    };
+    let mut cumulative = vec![0.0f32; m];
+    for index in 1..m {
+        cumulative[index] = cumulative[index - 1] + path[index].sub(path[index - 1]).length();
+    }
+    let total_length = cumulative[m - 1]
+        + if closed {
+            path[0].sub(path[m - 1]).length()
+        } else {
+            0.0
+        };
+    if total_length <= f32::EPSILON {
+        return None;
+    }
+    let mut sections = Vec::with_capacity(m + usize::from(closed));
+    for (index, &(frame_r, _frame_s, frame_t)) in frames.iter().enumerate() {
+        let fraction = cumulative[index] / total_length;
+        let correction = fraction * (closure_correction + twist);
+        let right = rotate_about(frame_r, frame_t, correction);
+        let up = frame_t.cross(right).normalize();
+        sections.push(section_at(path[index], right, up));
+    }
+    if closed {
+        // Exact duplicate, not a separately recomputed frame: ordered skinning
+        // connects the last unique path section to this seam and emits no caps.
+        sections.push(section_at(path[0], initial_r, initial_s));
     }
 
     match consume_operation(
         "sweep skin",
-        openrcad::algo::skin_section_loops_operation_with_policy(
+        openrcad::algo::skin_ordered_section_loops_operation_with_policy(
             &sections,
+            closed,
             &TolerancePolicy::STANDARD,
         ),
     ) {
@@ -602,7 +698,7 @@ pub fn helical_thread_solid(
     ];
     // Profile frame: u along the (start) radial direction, v along the axis.
     let profile_cs = CoordinateSystem::new(axis_origin, e1, axis);
-    swept_solid(&profile_cs, &profile, &[], &path)
+    swept_solid(&profile_cs, &profile, &[], &path, 0.0, false)
 }
 
 /// The analytic helical thread **wall** (no caps): a handful of large

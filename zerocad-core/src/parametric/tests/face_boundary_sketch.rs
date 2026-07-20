@@ -219,6 +219,8 @@ fn drawn_circle_splits_against_face_boundary() {
             region_indices: vec![lens_idx],
             mode: ExtrudeMode::Cut,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("sketch_2", "extrude_3");

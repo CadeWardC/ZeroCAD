@@ -89,6 +89,11 @@ impl ZeroCadApp {
     }
 
     pub(crate) fn handle_3d_escape(&mut self, ctx: &egui::Context) {
+        if self.draft_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.draft_op = None;
+            self.status_msg = "Draft cancelled.".to_string();
+            return;
+        }
         if self.combine_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.combine_op = None;
             self.status_msg = "Combine cancelled.".to_string();

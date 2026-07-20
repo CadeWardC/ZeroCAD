@@ -40,6 +40,8 @@ fn add_extrude(g: &mut ParametricGraph, id: &str, sketch: &str, depth: f32, mode
             region_indices: vec![],
             mode,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency(sketch, id);

@@ -309,8 +309,13 @@ pub struct RecipeFeaturePayload(
 );
 
 impl RecipeFeaturePayload {
-    fn inline(feature: &crate::parametric::FeatureType) -> Self {
-        Self(0, crate::feature_dto::encode(feature), None, None)
+    fn inline(feature: &crate::parametric::FeatureType, payload_schema: u16) -> Self {
+        Self(
+            0,
+            crate::feature_dto::encode_for_schema(feature, payload_schema),
+            None,
+            None,
+        )
     }
 
     fn step_import(content_hash: [u8; 32], label: String) -> Self {
@@ -595,7 +600,7 @@ impl DocumentRecipeV3 {
                         assets.entry(content_hash).or_insert(bytes);
                         RecipeFeaturePayload::stl_import(content_hash, label.clone())
                     }
-                    feature => RecipeFeaturePayload::inline(feature),
+                    feature => RecipeFeaturePayload::inline(feature, node.payload_version),
                 };
                 RecipeFeature {
                     id: node.id.clone(),
@@ -757,7 +762,9 @@ impl DocumentRecipeV3 {
                 })?;
             let feature = match (decoder, payload) {
                 (
-                    crate::document::FeaturePayloadDecoder::NumericFieldsV1,
+                    crate::document::FeaturePayloadDecoder::NumericFieldsV1
+                    | crate::document::FeaturePayloadDecoder::NumericFieldsV2
+                    | crate::document::FeaturePayloadDecoder::NumericFieldsV3,
                     RecipeFeaturePayload(0, fields, None, None),
                 ) => crate::feature_dto::decode_with_decoder(
                     kind_id.as_str(),

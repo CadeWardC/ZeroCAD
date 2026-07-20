@@ -33,14 +33,29 @@ use std::collections::HashMap;
 /// keep one `crate::sketch::` namespace.
 pub mod constraints;
 pub mod linalg;
+pub mod offset;
+pub mod pattern;
 pub mod projection;
 pub mod solve;
+pub mod trim;
 pub use constraints::{
     bake_construction_curves, effective_shape_ids, Constraint, EntityId, ProjectedEdgeReference,
     SketchEntity, SketchPoint, SketchSolverModel,
 };
+pub use offset::{
+    apply_associative_offsets, evaluate_associative_offset, SketchOffsetError,
+    SketchOffsetOperation,
+};
+pub use pattern::{
+    apply_associative_patterns, dissolve_associative_pattern, evaluate_associative_pattern,
+    SketchPatternError, SketchPatternEvaluation, SketchPatternKind, SketchPatternOperation,
+    SketchPatternSpanId,
+};
 pub use projection::{append_projected_edge, rebuild_projected_edge};
 pub use solve::{solve_model, SolveOutcome, SolveReport};
+pub use trim::{
+    apply_trim_preview, preview_trim, TrimConstraintReport, TrimError, TrimOutcome, TrimPreview,
+};
 
 /// Vertex coordinate snap tolerance (in sketch plane units / mm).
 const VERTEX_TOL: f64 = 1e-3;
@@ -52,8 +67,6 @@ use crate::CIRCLE_SEGS;
 /// Facet count for an ellipse drawn via [`SketchCurves::add_ellipse`] — matches
 /// the circle discretization so the two read consistently.
 const ELLIPSE_SEGS: usize = CIRCLE_SEGS;
-/// Minimum area for a cycle to count as a real region (filters slivers).
-const MIN_REGION_AREA: f64 = 1e-2;
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LineSegment {
@@ -72,7 +85,8 @@ pub struct Circle {
 /// extrude wire builder can sweep it to an exact cylindrical wall instead of
 /// relying on [`crate::mock_kernel`]'s sample-based arc refit (which can't segment
 /// the tangent-connected arcs of a rounded rectangle). The arc runs the short way
-/// from `start` to `end` about `center`; region detection tessellates it via
+/// from `start` to `end` about `center`; `clockwise` disambiguates an exact
+/// semicircle (and other explicitly clockwise spans). Region detection tessellates it via
 /// [`SketchCurves`]'s flattening, so the DCEL still sees only line segments.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Arc {
@@ -80,6 +94,28 @@ pub struct Arc {
     pub radius: f32,
     pub start: (f32, f32),
     pub end: (f32, f32),
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clockwise: bool,
+}
+
+impl Arc {
+    fn parameter_bounds(&self) -> (f64, f64) {
+        let angle = |point: (f32, f32)| {
+            f64::from(point.1 - self.center.1).atan2(f64::from(point.0 - self.center.0))
+        };
+        let first = angle(self.start);
+        let mut last = angle(self.end);
+        while last - first > std::f64::consts::PI {
+            last -= std::f64::consts::TAU;
+        }
+        while last - first < -std::f64::consts::PI {
+            last += std::f64::consts::TAU;
+        }
+        if self.clockwise && last > first {
+            last -= std::f64::consts::TAU;
+        }
+        (first, last)
+    }
 }
 
 /// How a spline's stored points define the curve.
@@ -501,6 +537,14 @@ impl SketchCurves {
     /// branch, a closed loop with no free end, or a disjoint set). Circles are
     /// ignored (a closed path needs no free end and isn't a v1 sweep path).
     pub fn path_polyline(&self, tol: f32) -> Option<Vec<(f32, f32)>> {
+        let (points, closed) = self.sweep_path_polyline(tol)?;
+        (!closed).then_some(points)
+    }
+
+    /// Chain a Wave 3 sweep path and report whether it is closed. One circle
+    /// is accepted as a closed path; mixed circles or branched/disjoint chains
+    /// remain invalid instead of being partially consumed.
+    pub fn sweep_path_polyline(&self, tol: f32) -> Option<(Vec<(f32, f32)>, bool)> {
         #[derive(Clone)]
         enum Seg {
             Line((f32, f32), (f32, f32)),
@@ -517,6 +561,22 @@ impl SketchCurves {
             for pair in spline.sampled_points(0.01).windows(2) {
                 segs.push(Seg::Line(pair[0], pair[1]));
             }
+        }
+        if !self.circles.is_empty() {
+            if self.circles.len() != 1 || !segs.is_empty() {
+                return None;
+            }
+            let circle = self.circles[0];
+            let points = (0..48)
+                .map(|index| {
+                    let angle = std::f32::consts::TAU * index as f32 / 48.0;
+                    (
+                        circle.center.0 + circle.radius * angle.cos(),
+                        circle.center.1 + circle.radius * angle.sin(),
+                    )
+                })
+                .collect();
+            return Some((points, true));
         }
         if segs.is_empty() {
             return None;
@@ -540,13 +600,31 @@ impl SketchCurves {
         }
         let degree =
             |p: (f32, f32), eps: &[(f32, f32)]| eps.iter().filter(|&&q| near(p, q)).count();
-        let start = endpoints
+        if endpoints
+            .iter()
+            .any(|&point| !matches!(degree(point, &endpoints), 1 | 2))
+        {
+            return None;
+        }
+        let mut free: Vec<_> = endpoints
             .iter()
             .copied()
-            .find(|&p| degree(p, &endpoints) == 1);
+            .filter(|&point| degree(point, &endpoints) == 1)
+            .collect();
         // Closed loops (every endpoint degree 2) have no free end → not a v1
         // open path.
-        let start = start?;
+        if !matches!(free.len(), 0 | 2) {
+            return None;
+        }
+        let closed = free.is_empty();
+        free.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        let start = free.first().copied().unwrap_or_else(|| {
+            endpoints
+                .iter()
+                .copied()
+                .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)))
+                .expect("non-empty curve collection has endpoints")
+        });
 
         let mut used = vec![false; segs.len()];
         let mut chain_pts: Vec<(f32, f32)> = Vec::new();
@@ -567,22 +645,19 @@ impl SketchCurves {
             match &segs[next_i] {
                 Seg::Line(_, _) => chain_pts.push(to),
                 Seg::Arc(arc) => {
-                    // Sample the arc from `from` to `to` the short way.
-                    let ang = |p: (f32, f32)| (p.1 - arc.center.1).atan2(p.0 - arc.center.0);
-                    let a0 = ang(from);
-                    let mut a1 = ang(to);
-                    while a1 - a0 > std::f32::consts::PI {
-                        a1 -= std::f32::consts::TAU;
-                    }
-                    while a1 - a0 < -std::f32::consts::PI {
-                        a1 += std::f32::consts::TAU;
-                    }
+                    let (stored_first, stored_last) = arc.parameter_bounds();
+                    let forward = near(from, arc.start);
+                    let (a0, a1) = if forward {
+                        (stored_first, stored_last)
+                    } else {
+                        (stored_last, stored_first)
+                    };
                     let steps = 12;
                     for k in 1..=steps {
-                        let t = a0 + (a1 - a0) * (k as f32 / steps as f32);
+                        let t = a0 + (a1 - a0) * (k as f64 / steps as f64);
                         chain_pts.push((
-                            arc.center.0 + arc.radius * t.cos(),
-                            arc.center.1 + arc.radius * t.sin(),
+                            arc.center.0 + arc.radius * t.cos() as f32,
+                            arc.center.1 + arc.radius * t.sin() as f32,
                         ));
                     }
                 }
@@ -590,10 +665,16 @@ impl SketchCurves {
             cursor = to;
         }
         // Every curve must have been consumed (a single simple chain).
-        if used.iter().any(|&u| !u) || chain_pts.len() < 2 {
+        if used.iter().any(|&u| !u)
+            || chain_pts.len() < 2
+            || (closed && !near(*chain_pts.last().unwrap(), start))
+        {
             return None;
         }
-        Some(chain_pts)
+        if closed {
+            chain_pts.pop();
+        }
+        Some((chain_pts, closed))
     }
 
     pub fn add_circle(&mut self, center: (f32, f32), radius: f32) {
@@ -739,6 +820,14 @@ pub enum SketchShape {
         rotation_deg: f32,
         circumscribed: bool,
     },
+    /// Center-to-center slot. `start` and `end` locate the semicircle centers;
+    /// `width` is the full slot width. Coincident centers intentionally produce
+    /// a circle so the three-click tool remains well-defined at zero length.
+    Slot {
+        start: (f32, f32),
+        end: (f32, f32),
+        width: Dimension,
+    },
     /// An editable native spline. Its defining points remain available after
     /// save/load instead of being reduced to an anonymous polyline.
     Spline { spline: Spline },
@@ -824,6 +913,43 @@ impl SketchShape {
                         c.add_line(vertices[k], vertices[(k + 1) % n]);
                     }
                 }
+            }
+            SketchShape::Slot { start, end, width } => {
+                let width = width.resolve(vars);
+                if !width.is_finite() || width <= 0.0 {
+                    return c;
+                }
+                let radius = width * 0.5;
+                let dx = end.0 - start.0;
+                let dy = end.1 - start.1;
+                let centerline_length = dx.hypot(dy);
+                if centerline_length <= 1.0e-5 {
+                    c.add_circle(*start, radius);
+                    return c;
+                }
+
+                let normal = (-dy / centerline_length, dx / centerline_length);
+                let start_left = (start.0 + normal.0 * radius, start.1 + normal.1 * radius);
+                let end_left = (end.0 + normal.0 * radius, end.1 + normal.1 * radius);
+                let end_right = (end.0 - normal.0 * radius, end.1 - normal.1 * radius);
+                let start_right = (start.0 - normal.0 * radius, start.1 - normal.1 * radius);
+
+                c.add_line(start_left, end_left);
+                c.arcs.push(Arc {
+                    center: *end,
+                    radius,
+                    start: end_left,
+                    end: end_right,
+                    clockwise: true,
+                });
+                c.add_line(end_right, start_right);
+                c.arcs.push(Arc {
+                    center: *start,
+                    radius,
+                    start: start_right,
+                    end: start_left,
+                    clockwise: true,
+                });
             }
             SketchShape::Spline { spline } => c.add_spline(spline.clone()),
             SketchShape::Imported { curves, .. } => c = curves.clone(),
@@ -914,6 +1040,9 @@ pub fn reflect_curves_across(curves: &SketchCurves, a: (f32, f32), b: (f32, f32)
             radius: arc.radius,
             start: reflect_pt(arc.start, a, d),
             end: reflect_pt(arc.end, a, d),
+            // Reflection reverses orientation. Leaving the reflected arc in
+            // automatic-shortest mode preserves its geometric half/span.
+            clockwise: false,
         });
     }
     for spline in &curves.splines {
@@ -994,6 +1123,19 @@ pub fn effective_curves_solved(
     solver: Option<&SketchSolverModel>,
     vars: &HashMap<String, f64>,
 ) -> SketchCurves {
+    effective_curves_solved_checked(curves, shapes, corner_mods, mirrors, solver, vars).0
+}
+
+/// Checked sketch rebuild used by the evaluator. Compatibility/UI callers may
+/// use [`effective_curves_solved`] when only last-valid geometry is required.
+pub fn effective_curves_solved_checked(
+    curves: &SketchCurves,
+    shapes: &[SketchShape],
+    corner_mods: &[CornerMod],
+    mirrors: &[SketchMirror],
+    solver: Option<&SketchSolverModel>,
+    vars: &HashMap<String, f64>,
+) -> (SketchCurves, Vec<(EntityId, SketchOffsetError)>) {
     if let Some(model) = solver.filter(|m| !m.is_empty()) {
         let mut c = if solve::has_variable_bound_constraint(model) {
             let report = solve::solve_model(model, vars);
@@ -1011,8 +1153,15 @@ pub fn effective_curves_solved(
             let r = m.radius.resolve(vars);
             apply_corner_mod(&mut c, m.at, r, m.kind);
         }
+        let failures = apply_associative_offsets(&mut c, model, vars);
+        let mut failures = failures;
+        failures.extend(
+            apply_associative_patterns(&mut c, model, vars)
+                .into_iter()
+                .map(|(id, error)| (id, SketchOffsetError::Pattern(error))),
+        );
         apply_mirrors(&mut c, mirrors);
-        return c;
+        return (c, failures);
     }
     let mut c = if shapes.is_empty() {
         curves.clone()
@@ -1024,7 +1173,7 @@ pub fn effective_curves_solved(
         apply_corner_mod(&mut c, m.at, r, m.kind);
     }
     apply_mirrors(&mut c, mirrors);
-    c
+    (c, Vec::new())
 }
 
 fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -1142,6 +1291,7 @@ fn apply_corner_mod(curves: &mut SketchCurves, at: (f32, f32), radius: f32, kind
                 radius,
                 start: p1,
                 end: p2,
+                clockwise: false,
             });
         }
     }
@@ -1231,6 +1381,8 @@ pub enum RegionProvenanceFragment {
     },
     Slot {
         shape_id: Option<usize>,
+        #[serde(default)]
+        boundary: SlotBoundary,
     },
     RoundedRectangle {
         shape_id: Option<usize>,
@@ -1238,6 +1390,18 @@ pub enum RegionProvenanceFragment {
     RawPolyline {
         shape_id: Option<usize>,
     },
+}
+
+/// Stable identity for each native-slot boundary component.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum SlotBoundary {
+    #[default]
+    LeftSide,
+    EndCap,
+    RightSide,
+    StartCap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1333,6 +1497,21 @@ fn sketch_provenance_fragments(
                 .flatten()
         })
         .collect();
+    for (position, shape) in shapes.iter().enumerate() {
+        if matches!(shape, SketchShape::Slot { .. }) {
+            for boundary in [
+                SlotBoundary::LeftSide,
+                SlotBoundary::EndCap,
+                SlotBoundary::RightSide,
+                SlotBoundary::StartCap,
+            ] {
+                fragments.push(RegionProvenanceFragment::Slot {
+                    shape_id: id_at(position),
+                    boundary,
+                });
+            }
+        }
+    }
     if let Some((rect_min, rect_max)) = rectangle_bounds_from_segments(&curves.segments) {
         for edge_index in 0..4 {
             fragments.push(RegionProvenanceFragment::RectangleEdge {
@@ -1360,6 +1539,7 @@ fn sketch_provenance_fragments(
                     matches!(
                         shape,
                         SketchShape::RegularPolygon { .. }
+                            | SketchShape::Slot { .. }
                             | SketchShape::Spline { .. }
                             | SketchShape::Imported { .. }
                             | SketchShape::Raw { .. }
@@ -1452,6 +1632,7 @@ pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, Ana
     use openrcad::foundation::{Dir2d, Pnt2d};
     use openrcad::geom2d::{BSplineCurve2d, Circle2d, Curve2d, CurveSpan, GeomCurve2d, Line2d};
 
+    let tolerance = sketch_linear_tolerance(curves);
     let mut spans = Vec::new();
     for (index, segment) in curves.segments.iter().enumerate() {
         // Corner fillets retain their historical display/containment chords
@@ -1468,7 +1649,7 @@ pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, Ana
         let dx = f64::from(segment.b.0 - segment.a.0);
         let dy = f64::from(segment.b.1 - segment.a.1);
         let length = dx.hypot(dy);
-        if length <= VERTEX_TOL {
+        if length <= tolerance {
             continue;
         }
         let direction = Dir2d::new(dx / length, dy / length);
@@ -1506,17 +1687,7 @@ pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, Ana
         if arc.radius <= 0.0 {
             continue;
         }
-        let angle = |point: (f32, f32)| {
-            f64::from(point.1 - arc.center.1).atan2(f64::from(point.0 - arc.center.0))
-        };
-        let first = angle(arc.start);
-        let mut last = angle(arc.end);
-        while last - first > std::f64::consts::PI {
-            last -= std::f64::consts::TAU;
-        }
-        while last - first < -std::f64::consts::PI {
-            last += std::f64::consts::TAU;
-        }
+        let (first, last) = arc.parameter_bounds();
         spans.push(CurveSpan::new(
             GeomCurve2d::circle(Circle2d::from_center(
                 Pnt2d::new(f64::from(arc.center.0), f64::from(arc.center.1)),
@@ -1582,7 +1753,7 @@ pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, Ana
             // analytic arc reconstructed from those values to rejoin its
             // trimmed line endpoint without treating a real modeling gap as
             // closed.
-            tolerance: 1.0e-5,
+            tolerance,
             root_subdivisions: 256,
         },
     )
@@ -1590,7 +1761,7 @@ pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, Ana
     Ok(arrangement
         .regions
         .into_iter()
-        .filter(|region| region.area > MIN_REGION_AREA)
+        .filter(|region| region.area > tolerance * tolerance)
         .map(|analytic| Region {
             boundary: sample_analytic_loop(&analytic.outer),
             holes: analytic.holes.iter().map(sample_analytic_loop).collect(),
@@ -1621,14 +1792,7 @@ fn segment_is_arc_display_chord(segment: &LineSegment, arc: &Arc) -> bool {
     let angle = |point: (f32, f32)| {
         f64::from(point.1 - arc.center.1).atan2(f64::from(point.0 - arc.center.0))
     };
-    let first = angle(arc.start);
-    let mut last = angle(arc.end);
-    while last - first > std::f64::consts::PI {
-        last -= std::f64::consts::TAU;
-    }
-    while last - first < -std::f64::consts::PI {
-        last += std::f64::consts::TAU;
-    }
+    let (first, last) = arc.parameter_bounds();
     let within = |point: (f32, f32)| {
         let base = angle(point);
         (-1..=1).any(|turn| {
@@ -1710,6 +1874,7 @@ fn detect_regions_legacy(curves: &SketchCurves) -> Vec<Region> {
     let next = compute_next_pointers(&half_edges, &vertices);
     let cycles = walk_cycles(&half_edges, &next);
 
+    let area_tolerance = sketch_linear_tolerance(curves).powi(2);
     let mut regions: Vec<Region> = Vec::new();
     for cycle in cycles {
         let pts: Vec<(f32, f32)> = cycle
@@ -1720,7 +1885,7 @@ fn detect_regions_legacy(curves: &SketchCurves) -> Vec<Region> {
             })
             .collect();
         let area = signed_area_f64(&cycle, &half_edges, &vertices);
-        if area > MIN_REGION_AREA {
+        if area > area_tolerance {
             regions.push(Region {
                 boundary: pts,
                 holes: Vec::new(),
@@ -1730,7 +1895,7 @@ fn detect_regions_legacy(curves: &SketchCurves) -> Vec<Region> {
         }
     }
 
-    assign_holes(&mut regions);
+    assign_holes(&mut regions, area_tolerance);
     regions
 }
 
@@ -1743,7 +1908,7 @@ fn detect_regions_legacy(curves: &SketchCurves) -> Vec<Region> {
 ///
 /// Adjacent faces produced by intersecting shapes share edges, so neither
 /// contains the other's interior point — they are never turned into holes.
-fn assign_holes(regions: &mut [Region]) {
+fn assign_holes(regions: &mut [Region], area_tolerance: f64) {
     let n = regions.len();
     if n < 2 {
         return;
@@ -1765,7 +1930,7 @@ fn assign_holes(regions: &mut [Region]) {
             if i == j {
                 continue;
             }
-            if gross[i] > gross[j] + MIN_REGION_AREA
+            if gross[i] > gross[j] + area_tolerance
                 && point_in_polygon(interior_points[j], &regions[i].boundary)
             {
                 best = match best {
@@ -1791,6 +1956,18 @@ fn assign_holes(regions: &mut [Region]) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Tolerance for persisted f32 sketch coordinates without a model-unit floor.
+/// Scaling a sketch scales this tolerance and its corresponding area cutoff,
+/// so small but well-conditioned profiles are not discarded merely because
+/// their dimensions happen to be below one millimetre.
+fn sketch_linear_tolerance(curves: &SketchCurves) -> f64 {
+    let scale = flatten_curves(curves)
+        .into_iter()
+        .flat_map(|(a, b)| [a.x.abs(), a.y.abs(), b.x.abs(), b.y.abs()])
+        .fold(0.0_f64, f64::max);
+    (scale * f64::from(f32::EPSILON) * 8.0).max(f64::EPSILON * 64.0)
+}
+
 fn flatten_curves(curves: &SketchCurves) -> Vec<(P, P)> {
     let mut out: Vec<(P, P)> = Vec::new();
     for s in &curves.segments {
@@ -1813,6 +1990,27 @@ fn flatten_curves(curves: &SketchCurves) -> Vec<(P, P)> {
             };
             out.push((prev, cur));
             prev = cur;
+        }
+    }
+    for arc in &curves.arcs {
+        if curves
+            .segments
+            .iter()
+            .any(|segment| segment_is_arc_display_chord(segment, arc))
+        {
+            continue;
+        }
+        let (first, last) = arc.parameter_bounds();
+        let steps = arc_segments((last - first).abs() as f32, arc.radius);
+        let mut previous = P::from(arc.start);
+        for index in 1..=steps {
+            let parameter = first + (last - first) * index as f64 / steps as f64;
+            let current = P {
+                x: f64::from(arc.center.0) + f64::from(arc.radius) * parameter.cos(),
+                y: f64::from(arc.center.1) + f64::from(arc.radius) * parameter.sin(),
+            };
+            out.push((previous, current));
+            previous = current;
         }
     }
     for spline in &curves.splines {
@@ -2374,6 +2572,108 @@ mod tests {
             regions
         );
         assert!(approx(regions[0].area, 80.0, 0.1));
+    }
+
+    #[test]
+    fn native_slot_is_two_tangent_sides_and_two_analytic_caps() {
+        let slot = SketchShape::Slot {
+            start: (0.0, 0.0),
+            end: (20.0, 0.0),
+            width: Dimension::literal(6.0),
+        };
+        let curves = slot.build(&HashMap::new());
+        assert_eq!(curves.segments.len(), 2);
+        assert_eq!(curves.arcs.len(), 2);
+        assert!(curves.circles.is_empty());
+        assert_eq!(curves.segments[0].b, curves.arcs[0].start);
+        assert_eq!(curves.arcs[0].end, curves.segments[1].a);
+        assert_eq!(curves.segments[1].b, curves.arcs[1].start);
+        assert_eq!(curves.arcs[1].end, curves.segments[0].a);
+
+        let regions = detect_regions_analytic(&curves).expect("slot must arrange analytically");
+        assert_eq!(regions.len(), 1);
+        let expected_area = 20.0 * 6.0 + std::f32::consts::PI * 3.0 * 3.0;
+        assert!(
+            approx(regions[0].area, expected_area, 0.05),
+            "slot area was {}, expected {expected_area}",
+            regions[0].area
+        );
+    }
+
+    #[test]
+    fn zero_length_slot_becomes_circle_and_nonpositive_width_is_rejected() {
+        let circle = SketchShape::Slot {
+            start: (4.0, -3.0),
+            end: (4.0, -3.0),
+            width: Dimension::literal(8.0),
+        }
+        .build(&HashMap::new());
+        assert!(circle.segments.is_empty());
+        assert!(circle.arcs.is_empty());
+        assert_eq!(circle.circles.len(), 1);
+        assert_eq!(circle.circles[0].center, (4.0, -3.0));
+        assert_eq!(circle.circles[0].radius, 4.0);
+
+        for width in [0.0, -1.0, f32::NAN] {
+            let rejected = SketchShape::Slot {
+                start: (0.0, 0.0),
+                end: (10.0, 0.0),
+                width: Dimension::literal(width),
+            }
+            .build(&HashMap::new());
+            assert!(rejected.is_empty(), "width {width:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slot_provenance_and_shape_identity_survive_round_trip() {
+        let shape = SketchShape::Slot {
+            start: (1.0, 2.0),
+            end: (9.0, 5.0),
+            width: Dimension {
+                value: 4.0,
+                expr: Some("slot_width".to_string()),
+            },
+        };
+        let encoded = serde_json::to_vec(&shape).unwrap();
+        let decoded: SketchShape = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, shape);
+
+        let curves = shape.build(&HashMap::from([("slot_width".to_string(), 6.0)]));
+        let regions = detect_regions(&curves);
+        let provenance = build_region_provenance(&curves, &[shape], &[EntityId(42)], &regions);
+        let boundaries: Vec<SlotBoundary> = provenance[0]
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                RegionProvenanceFragment::Slot {
+                    shape_id: Some(42),
+                    boundary,
+                } => Some(*boundary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            boundaries,
+            vec![
+                SlotBoundary::LeftSide,
+                SlotBoundary::EndCap,
+                SlotBoundary::RightSide,
+                SlotBoundary::StartCap,
+            ]
+        );
+
+        let (model, _) = constraints::promote_shapes_to_entities(
+            &[decoded],
+            &[EntityId(42)],
+            &HashMap::from([("slot_width".to_string(), 6.0)]),
+            43,
+        );
+        assert_eq!(model.entities.len(), 4);
+        assert!(model
+            .entities
+            .iter()
+            .all(|entity| entity.derived_from() == Some(EntityId(42))));
     }
 
     #[test]

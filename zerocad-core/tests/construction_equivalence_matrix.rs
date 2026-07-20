@@ -145,6 +145,8 @@ fn primitive_and_sketched_prism_are_equivalent() {
             region_indices: Vec::new(),
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     sketch.add_dependency("sketch_1", "extrude_2");

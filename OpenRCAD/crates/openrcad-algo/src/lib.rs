@@ -234,8 +234,8 @@ pub use rolling_ball::{
 };
 #[allow(deprecated)]
 pub use skin::{
-    skin_polygon_rings, skin_polygon_rings_with_policy, skin_section_loops_with_policy,
-    SectionLoops, SkinError,
+    skin_ordered_section_loops_with_policy, skin_polygon_rings, skin_polygon_rings_with_policy,
+    skin_section_loops_with_policy, SectionLoops, SkinError,
 };
 
 /// Error shared by canonical unary modeling-operation entry points.
@@ -408,6 +408,16 @@ pub fn skin_section_loops_operation_with_policy(
     policy: &openrcad_foundation::TolerancePolicy,
 ) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
     let value = skin_section_loops_with_policy(sections, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_generated_operation(value, policy)
+}
+
+pub fn skin_ordered_section_loops_operation_with_policy(
+    sections: &[SectionLoops],
+    closed: bool,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = skin_ordered_section_loops_with_policy(sections, closed, policy)
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
     finish_generated_operation(value, policy)
 }

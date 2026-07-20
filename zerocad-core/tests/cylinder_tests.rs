@@ -108,6 +108,8 @@ fn construction_line_split_circle_extrudes_as_one_clean_cylinder() {
             mode: ExtrudeMode::NewBody,
             target: None,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_1", "extrude_2");
@@ -162,6 +164,8 @@ fn construction_line_split_circle_joins_as_one_clean_cylinder() {
             mode: ExtrudeMode::NewBody,
             target: None,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_1", "extrude_2");
@@ -193,6 +197,8 @@ fn construction_line_split_circle_joins_as_one_clean_cylinder() {
             mode: ExtrudeMode::Join,
             target: Some("extrude_2".into()),
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_3", "extrude_4");
@@ -258,6 +264,8 @@ fn capsule_union_hides_tangent_generator_seams() {
             mode: ExtrudeMode::NewBody,
             target: None,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_1", "extrude_2");

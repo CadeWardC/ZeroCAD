@@ -462,6 +462,8 @@ mod tests {
                 region_indices: vec![],
                 mode: ExtrudeMode::NewBody,
                 depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
             },
         });
         g.add_dependency("sketch_1", "extrude_2");

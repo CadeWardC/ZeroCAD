@@ -199,6 +199,7 @@ fn build_projection(
                     start: start_id,
                     end: end_id,
                     radius: f64::from(radius),
+                    clockwise: false,
                     derived_from: None,
                 });
                 point_ids.extend([center_id, start_id, end_id]);

@@ -599,6 +599,8 @@ fn add_extrude_targeted(
             region_indices: vec![],
             mode,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
             target: target.map(str::to_string),
         },
     });

@@ -64,6 +64,8 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             mode: ExtrudeMode::NewBody,
             target: None,
             depth_expr: Some("3*2".into()),
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
         FeatureType::EdgeMod {
             target: "missing_body".into(),
@@ -105,6 +107,8 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             path_sketch: "path".into(),
             mode: ExtrudeMode::NewBody,
             target: None,
+            total_twist_deg: -45.0,
+            total_twist_expr: Some("-twist".into()),
         },
         FeatureType::Shell {
             target: "missing_body".into(),
@@ -1016,6 +1020,8 @@ fn round_trip_overlapping_boolean_extrude() {
             region_indices: base,
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     pg.add_dependency("s", "e");
@@ -1086,6 +1092,351 @@ fn round_trip_regular_polygon_keeps_expression_and_no_circle() {
     let curves = shapes[0].build(&loaded.graph.variable_map());
     assert_eq!(curves.segments.len(), 7);
     assert!(curves.circles.is_empty());
+}
+
+#[test]
+fn wave2_payloads_survive_real_save_to_disk_and_reload() {
+    use zerocad_core::sketch::{
+        EntityId, SketchEntity, SketchOffsetOperation, SketchPoint, SketchSolverModel,
+    };
+    use zerocad_core::{CoordinateSystem, Dimension, ExtrudeMode, SketchCurves, SketchShape};
+
+    let offset = SketchOffsetOperation {
+        id: EntityId(20),
+        sources: vec![EntityId(12)],
+        distance: Dimension {
+            value: 2.5,
+            expr: Some("wall/2".to_string()),
+        },
+        creation_side_seed: (4.0, 3.0),
+    };
+    let solver = SketchSolverModel {
+        points: vec![
+            SketchPoint {
+                id: EntityId(10),
+                pos: (0.0, 0.0),
+            },
+            SketchPoint {
+                id: EntityId(11),
+                pos: (10.0, 0.0),
+            },
+        ],
+        entities: vec![SketchEntity::Line {
+            id: EntityId(12),
+            p0: EntityId(10),
+            p1: EntityId(11),
+            derived_from: None,
+        }],
+        offsets: vec![offset.clone()],
+        ..SketchSolverModel::default()
+    };
+
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "wave2_sketch".to_string(),
+        name: "Slot and Offset".to_string(),
+        feature: FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: vec![SketchShape::Slot {
+                start: (1.0, 2.0),
+                end: (8.0, 5.0),
+                width: Dimension {
+                    value: 4.0,
+                    expr: Some("slot_width".to_string()),
+                },
+            }],
+            corner_mods: Vec::new(),
+            mirrors: Vec::new(),
+            on_face: false,
+            entity_ids: vec![EntityId(1)],
+            next_entity_id: 21,
+            solver: Some(solver),
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "wave2_extrude".to_string(),
+        name: "Drafted Extrude".to_string(),
+        feature: FeatureType::Extrude {
+            depth: 12.0,
+            region_indices: vec![0],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            depth_expr: Some("height".to_string()),
+            draft_angle_deg: 3.25,
+            draft_angle_expr: Some("draft".to_string()),
+        },
+    });
+    graph.add_dependency("wave2_sketch", "wave2_extrude");
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("wave2-payloads.zcad");
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    write_document_file(
+        &path,
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .expect("save Wave 2 document to disk");
+    let loaded = read_document_file(&path, &LoadOptions::default())
+        .expect("reload Wave 2 document from disk");
+
+    let sketch = loaded
+        .document
+        .graph
+        .node_weights()
+        .find(|node| node.id == "wave2_sketch")
+        .expect("reloaded sketch");
+    // Canonical saves stamp the registry's current Sketch schema. V3 is a
+    // strict superset of the Wave 2 solver/offset payload exercised below.
+    assert_eq!(sketch.payload_version, 3);
+    let FeatureType::Sketch { shapes, solver, .. } = &sketch.feature else {
+        panic!("expected sketch feature");
+    };
+    assert!(matches!(
+        shapes.as_slice(),
+        [SketchShape::Slot { start, end, width }]
+            if *start == (1.0, 2.0)
+                && *end == (8.0, 5.0)
+                && width.expr.as_deref() == Some("slot_width")
+    ));
+    let reloaded_offset = &solver.as_ref().expect("solver model").offsets[0];
+    assert_eq!(reloaded_offset, &offset);
+
+    let extrude = loaded
+        .document
+        .graph
+        .node_weights()
+        .find(|node| node.id == "wave2_extrude")
+        .expect("reloaded extrude");
+    assert_eq!(extrude.payload_version, 2);
+    assert!(matches!(
+        &extrude.feature,
+        FeatureType::Extrude {
+            draft_angle_deg,
+            draft_angle_expr,
+            ..
+        } if (draft_angle_deg - 3.25).abs() < f32::EPSILON
+            && draft_angle_expr.as_deref() == Some("draft")
+    ));
+}
+
+#[test]
+fn wave3_payloads_survive_real_save_to_disk_and_reload() {
+    use zerocad_core::parametric::{
+        DraftNeutral, FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
+    };
+    use zerocad_core::sketch::{
+        EntityId, SketchPatternKind, SketchPatternOperation, SketchSolverModel,
+    };
+    use zerocad_core::{
+        AxisBase, CoordinateSystem, DatumPlaneDef, Dimension, ExtrudeMode, HoleKind, SketchCurves,
+    };
+
+    let selected_face = FaceRef {
+        centroid: [10.0, 0.0, 4.0],
+        normal: [1.0, 0.0, 0.0],
+        topology: Some(TopologyFaceRef {
+            body_id: Some("draft_base".into()),
+            face_id: Some("box:draft_base:face:x_max".into()),
+            producer_feature_id: Some("draft_base".into()),
+            ..TopologyFaceRef::default()
+        }),
+    };
+    let neutral_face = FaceRef {
+        centroid: [5.0, 5.0, 8.0],
+        normal: [0.0, 0.0, 1.0],
+        topology: Some(TopologyFaceRef {
+            body_id: Some("datum_base".into()),
+            face_id: Some("box:datum_base:face:z_max".into()),
+            producer_feature_id: Some("datum_base".into()),
+            ..TopologyFaceRef::default()
+        }),
+    };
+    let pattern = SketchPatternOperation {
+        id: EntityId(50),
+        sources: vec![EntityId(2)],
+        kind: SketchPatternKind::Linear {
+            direction: [1.0, 0.0],
+            spacing: Dimension {
+                value: 6.0,
+                expr: Some("pitch".into()),
+            },
+            count: 4,
+        },
+    };
+
+    let mut graph = ParametricGraph::new();
+    for id in ["datum_base", "draft_base", "pattern_base"] {
+        graph.add_feature(FeatureNode {
+            id: id.into(),
+            name: id.into(),
+            feature: FeatureType::Box {
+                w: 20.0,
+                h: 10.0,
+                d: 8.0,
+            },
+        });
+    }
+    graph.add_feature(FeatureNode {
+        id: "wave3_sketch".into(),
+        name: "Patterned Sketch".into(),
+        feature: FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: Vec::new(),
+            corner_mods: Vec::new(),
+            mirrors: Vec::new(),
+            on_face: false,
+            entity_ids: Vec::new(),
+            next_entity_id: 51,
+            solver: Some(SketchSolverModel {
+                patterns: vec![pattern.clone()],
+                ..SketchSolverModel::default()
+            }),
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "wave3_sweep".into(),
+        name: "Twisted Sweep".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "wave3_sketch".into(),
+            profile_region: 0,
+            path_sketch: "wave3_sketch".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            total_twist_deg: -90.0,
+            total_twist_expr: Some("-twist".into()),
+        },
+    });
+    graph.add_dependency("wave3_sketch", "wave3_sweep");
+    graph.add_feature(FeatureNode {
+        id: "face_plane".into(),
+        name: "Face Plane".into(),
+        feature: FeatureType::DatumPlane {
+            def: DatumPlaneDef::PlanarFace {
+                face: neutral_face.clone(),
+            },
+        },
+    });
+    graph.add_dependency("datum_base", "face_plane");
+    graph.add_feature(FeatureNode {
+        id: "hole_source".into(),
+        name: "Source Hole".into(),
+        feature: FeatureType::Hole {
+            target: "pattern_base".into(),
+            position: [5.0, 5.0, 8.0],
+            direction: [0.0, 0.0, -1.0],
+            diameter: 2.0,
+            diameter_expr: None,
+            depth: None,
+            kind: HoleKind::Simple,
+            standard: None,
+            manufacturing: None,
+        },
+    });
+    graph.add_dependency("pattern_base", "hole_source");
+    graph.add_feature(FeatureNode {
+        id: "wave3_pattern".into(),
+        name: "Feature Pattern".into(),
+        feature: FeatureType::FeaturePattern {
+            target: "pattern_base".into(),
+            source_feature: "hole_source".into(),
+            kind: FeaturePatternKind::Circular {
+                axis: AxisBase::Z,
+                total_angle_deg: 270.0,
+                total_angle_expr: Some("pattern_angle".into()),
+                count: 4,
+            },
+            compute_mode: FeaturePatternComputeMode::Identical,
+            extent_policy: FeaturePatternExtentPolicy::SourceExtent,
+        },
+    });
+    graph.add_dependency("hole_source", "wave3_pattern");
+    graph.add_feature(FeatureNode {
+        id: "wave3_draft".into(),
+        name: "Standalone Draft".into(),
+        feature: FeatureType::Draft {
+            target: "draft_base".into(),
+            faces: vec![selected_face.clone()],
+            neutral: DraftNeutral::Datum("face_plane".into()),
+            angle_deg: 3.0,
+            angle_expr: Some("draft_angle".into()),
+            flip_pull: true,
+        },
+    });
+    graph.add_dependency("draft_base", "wave3_draft");
+    graph.add_dependency("face_plane", "wave3_draft");
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("wave3-payloads.zcad");
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    write_document_file(
+        &path,
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .expect("save Wave 3 document to disk");
+    let loaded = read_document_file(&path, &LoadOptions::default())
+        .expect("reload Wave 3 document from disk");
+    let node = |id: &str| {
+        loaded
+            .document
+            .graph
+            .node_weights()
+            .find(|node| node.id == id)
+            .unwrap_or_else(|| panic!("reloaded {id}"))
+    };
+
+    assert_eq!(node("wave3_sketch").payload_version, 3);
+    assert!(matches!(
+        &node("wave3_sketch").feature,
+        FeatureType::Sketch {
+            solver: Some(SketchSolverModel { patterns, .. }),
+            ..
+        } if patterns == &vec![pattern]
+    ));
+    assert_eq!(node("wave3_sweep").payload_version, 2);
+    assert!(matches!(
+        &node("wave3_sweep").feature,
+        FeatureType::Sweep {
+            total_twist_deg,
+            total_twist_expr: Some(expression),
+            ..
+        } if *total_twist_deg == -90.0 && expression == "-twist"
+    ));
+    assert_eq!(node("face_plane").payload_version, 2);
+    assert!(matches!(
+        &node("face_plane").feature,
+        FeatureType::DatumPlane {
+            def: DatumPlaneDef::PlanarFace { face }
+        } if face == &neutral_face
+    ));
+    assert_eq!(node("wave3_pattern").payload_version, 1);
+    assert!(matches!(
+        &node("wave3_pattern").feature,
+        FeatureType::FeaturePattern {
+            kind: FeaturePatternKind::Circular { count: 4, .. },
+            ..
+        }
+    ));
+    assert_eq!(node("wave3_draft").payload_version, 1);
+    assert!(matches!(
+        &node("wave3_draft").feature,
+        FeatureType::Draft {
+            faces,
+            neutral: DraftNeutral::Datum(datum),
+            angle_deg,
+            angle_expr: Some(expression),
+            flip_pull: true,
+            ..
+        } if faces == &vec![selected_face]
+            && datum == "face_plane"
+            && *angle_deg == 3.0
+            && expression == "draft_angle"
+    ));
 }
 
 #[test]

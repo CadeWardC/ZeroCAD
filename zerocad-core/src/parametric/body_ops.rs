@@ -704,7 +704,7 @@ fn apply_body_split_by_cylinder(
     );
 }
 
-fn solid_volume(solid: &KernelSolid) -> Option<f64> {
+pub(crate) fn solid_volume(solid: &KernelSolid) -> Option<f64> {
     let mesh = openrcad::mesh::tessellate_checked(solid, 0.05, 0.25).ok()?;
     openrcad::mesh::mass_properties(&mesh).map(|properties| properties.volume)
 }

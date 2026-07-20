@@ -15,6 +15,12 @@ struct FeatureEvalContext<'a> {
     tolerance: &'a openrcad::foundation::TolerancePolicy,
     document_revision: crate::document::DocumentRevision,
     live_bodies: &'a [LiveBody],
+    /// Body-evaluation order and already-built prefix checkpoints. Feature
+    /// patterns use these read-only snapshots to recover the exact historical
+    /// target state at their source feature; they never evaluate against a
+    /// later target and guess what material the source changed.
+    history_nodes: &'a [NodeIndex],
+    history_checkpoints: &'a [Option<EvalCheckpoint>],
 }
 
 #[derive(Debug, Default)]
@@ -192,7 +198,17 @@ impl ParametricGraph {
         parent_id: &str,
         child_id: &str,
     ) -> Result<(), String> {
-        let parent_feature_id = self.dependency_parent_feature_id(parent_id, child_id);
+        // Canonical recipe dependencies already store exact feature ids. In
+        // particular, an early body producer may intentionally be the
+        // historical input of a later feature even after the body's timeline
+        // has acquired newer modifiers. Only legacy callers that supplied a
+        // body-output id need the remapping fallback.
+        let parent_feature_id = if self.resolve_node(parent_id).is_some() {
+            parent_id.to_string()
+        } else {
+            self.dependency_parent_feature_id(parent_id, child_id)
+                .to_string()
+        };
         let parent_idx = self
             .resolve_node(&parent_feature_id)
             .ok_or_else(|| format!("dependency parent '{parent_feature_id}' does not exist"))?;
@@ -1227,12 +1243,39 @@ impl ParametricGraph {
                 .next()
                 .map(|cp| cp.statuses.clone())
                 .unwrap_or_default();
+            let datums = self
+                .eval_cache
+                .borrow()
+                .checkpoints
+                .iter()
+                .rev()
+                .flatten()
+                .next()
+                .map(|checkpoint| checkpoint.datums.clone())
+                .unwrap_or_default();
+            let checkpoint_diagnostics = self
+                .eval_cache
+                .borrow()
+                .checkpoints
+                .iter()
+                .rev()
+                .flatten()
+                .next()
+                .map(|checkpoint| checkpoint.diagnostics.clone())
+                .unwrap_or_default();
             let mut diagnostics = crate::mock_kernel::take_diagnostics();
-            diagnostics.extend(
-                statuses
-                    .iter()
-                    .filter_map(super::diagnostics::diagnostic_for_status),
-            );
+            diagnostics.extend(checkpoint_diagnostics);
+            let compatibility_diagnostics: Vec<_> = statuses
+                .iter()
+                .filter_map(super::diagnostics::diagnostic_for_status)
+                .filter(|candidate| {
+                    !diagnostics.iter().any(|diagnostic| {
+                        diagnostic.feature_id == candidate.feature_id
+                            && diagnostic.rendered_message() == candidate.rendered_message()
+                    })
+                })
+                .collect();
+            diagnostics.extend(compatibility_diagnostics);
             let feature_timings = self
                 .eval_cache
                 .borrow()
@@ -1262,6 +1305,7 @@ impl ParametricGraph {
                 std::mem::take(&mut *self.pending_legacy_backfills.borrow_mut());
             Ok(EvaluationOutput {
                 bodies,
+                datums,
                 warnings,
                 statuses,
                 diagnostics,
@@ -1411,8 +1455,6 @@ impl ParametricGraph {
         // bodies). Their warnings stay OUT of the checkpointed `warnings` —
         // they are re-derived fresh each build and appended at return, so a
         // reused prefix can't double-report them.
-        let mut datum_warnings = Vec::new();
-        let datums = self.resolve_datums(&vars, &mut datum_warnings);
 
         if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
             return Err("model evaluation was superseded".to_string());
@@ -1449,7 +1491,7 @@ impl ParametricGraph {
                 })
                 .flatten()
         };
-        if let Some((live, mut warnings)) = fully_reused {
+        if let Some((live, warnings)) = fully_reused {
             trace.reused_checkpoints.extend(
                 nodes
                     .iter()
@@ -1470,14 +1512,18 @@ impl ParametricGraph {
                 self.refresh_checkpoint_diagnostics(&mut refreshed.checkpoints, &manifests);
                 *self.eval_cache.borrow_mut() = std::sync::Arc::new(refreshed);
             }
-            if !datum_warnings.is_empty() {
-                datum_warnings.extend(warnings);
-                warnings = datum_warnings;
-            }
             return Ok((live, warnings, trace));
         }
 
-        let (mut live, mut warnings, mut statuses, reuse, mut checkpoints) = {
+        let (
+            mut live,
+            mut datums,
+            mut warnings,
+            mut diagnostics,
+            mut statuses,
+            reuse,
+            mut checkpoints,
+        ) = {
             let cache = self.eval_cache.borrow();
             let cps = &cache.checkpoints;
             let matched = (0..keys.len().min(cps.len()))
@@ -1492,13 +1538,20 @@ impl ParametricGraph {
                             let mut retained_checkpoint = old.clone();
                             retained_checkpoint.manifest = manifests[i];
                             self.refresh_status_names(&mut retained_checkpoint.statuses);
+                            self.refresh_diagnostic_names(&mut retained_checkpoint.diagnostics);
                             retained[i] = Some(retained_checkpoint);
                         }
                     }
                 }
                 (
                     cp.live.clone(),
+                    cp.datums.clone(),
                     cp.warnings.clone(),
+                    {
+                        let mut diagnostics = cp.diagnostics.clone();
+                        self.refresh_diagnostic_names(&mut diagnostics);
+                        diagnostics
+                    },
                     {
                         let mut statuses = cp.statuses.clone();
                         self.refresh_status_names(&mut statuses);
@@ -1509,6 +1562,8 @@ impl ParametricGraph {
                 )
             } else {
                 (
+                    Vec::new(),
+                    HashMap::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -1552,7 +1607,9 @@ impl ParametricGraph {
                 // Shared contract: resolve registry family -> invoke into a
                 // candidate state -> validate -> record -> commit -> cache.
                 let mut candidate_live = live.clone();
+                let mut resolved_datum = None;
                 let mut feature_warnings = Vec::new();
+                let mut feature_diagnostics = Vec::new();
                 let invocation = match self.resolve_feature_evaluator(node) {
                     Ok(evaluator)
                         if !matches!(
@@ -1577,6 +1634,8 @@ impl ParametricGraph {
                             tolerance: &openrcad::foundation::TolerancePolicy::STANDARD,
                             document_revision,
                             live_bodies: &live,
+                            history_nodes: &nodes,
+                            history_checkpoints: &checkpoints,
                         };
                         let result = match evaluator {
                             crate::document::FeatureEvaluatorKind::Revolve => {
@@ -1591,6 +1650,7 @@ impl ParametricGraph {
                                 self.evaluate_shell_or_hole_candidate(evaluator, context)
                             }
                             crate::document::FeatureEvaluatorKind::Pattern
+                            | crate::document::FeatureEvaluatorKind::FeaturePattern
                             | crate::document::FeatureEvaluatorKind::BodyTransform => {
                                 self.evaluate_pattern_or_transform_candidate(evaluator, context)
                             }
@@ -1639,10 +1699,23 @@ impl ParametricGraph {
                             feature_warnings.extend(
                                 result
                                     .diagnostics
-                                    .into_iter()
+                                    .iter()
                                     .map(|diagnostic| diagnostic.rendered_message().to_string()),
                             );
+                            feature_diagnostics.extend(result.diagnostics);
                             Ok(())
+                        })
+                    }
+                    Ok(crate::document::FeatureEvaluatorKind::Datum) => {
+                        resolved_datum = self.resolve_datum_node(
+                            node,
+                            &datums,
+                            &vars,
+                            &live,
+                            &mut feature_warnings,
+                        );
+                        resolved_datum.as_ref().map(|_| ()).ok_or_else(|| {
+                            "its historical geometry or datum inputs no longer resolve".to_string()
                         })
                     }
                     Ok(evaluator) => self.invoke_registered_feature(
@@ -1654,6 +1727,7 @@ impl ParametricGraph {
                         draft,
                         &mut candidate_live,
                         &mut feature_warnings,
+                        &mut feature_diagnostics,
                     ),
                     Err(error) => Err(error),
                 };
@@ -1670,6 +1744,9 @@ impl ParametricGraph {
                             ));
                         } else {
                             live = candidate_live;
+                            if let Some(value) = resolved_datum {
+                                datums.insert(node.id.clone(), value);
+                            }
                             let mut pending = self.pending_face_reattach.borrow_mut();
                             pending.boundaries.extend(contract_writebacks.boundaries);
                             pending.planes.extend(contract_writebacks.planes);
@@ -1679,6 +1756,24 @@ impl ParametricGraph {
                         }
                     }
                 }
+                for message in &feature_warnings {
+                    if feature_diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.rendered_message() == message)
+                    {
+                        continue;
+                    }
+                    if let Some(diagnostic) =
+                        super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                            feature_id: node.id.clone().into(),
+                            feature_name: node.name.clone(),
+                            state: ResolutionState::Unresolved(message.clone()),
+                        })
+                    {
+                        feature_diagnostics.push(diagnostic);
+                    }
+                }
+                diagnostics.extend(feature_diagnostics);
                 warnings.extend(feature_warnings);
                 // Per-feature resolution status: this node is Unresolved iff it
                 // raised a warning while being applied — each warning names its own
@@ -1704,7 +1799,9 @@ impl ParametricGraph {
                 key: keys[i],
                 manifest: manifests[i],
                 live: live.clone(),
+                datums: datums.clone(),
                 warnings: warnings.clone(),
+                diagnostics: diagnostics.clone(),
                 statuses: statuses.clone(),
                 feature_duration: contract_feature_timing
                     .unwrap_or_else(|| feature_started.elapsed()),
@@ -1714,10 +1811,6 @@ impl ParametricGraph {
 
         *self.eval_cache.borrow_mut() = std::sync::Arc::new(EvalCache { checkpoints });
 
-        if !datum_warnings.is_empty() {
-            datum_warnings.extend(warnings);
-            warnings = datum_warnings;
-        }
         Ok((live, warnings, trace))
     }
 
@@ -1875,12 +1968,27 @@ impl ParametricGraph {
                     path_sketch,
                     mode,
                     target,
+                    total_twist_deg,
+                    total_twist_expr,
                 } = &context.feature.feature
                 else {
                     return Err(format!(
                         "registry evaluator Sweep cannot invoke feature kind '{}'",
                         context.feature.feature.kind_id()
                     ));
+                };
+                let total_twist_deg = match total_twist_expr {
+                    Some(expression) => match crate::expr::eval(expression, context.variables) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Sweep '{}': total-twist expression \"{}\" no longer evaluates; using last value {:.3}.",
+                                context.feature_id, expression, total_twist_deg
+                            ));
+                            *total_twist_deg
+                        }
+                    },
+                    None => *total_twist_deg,
                 };
                 self.apply_sweep(
                     context.feature_id.as_str(),
@@ -1889,6 +1997,7 @@ impl ParametricGraph {
                     path_sketch,
                     *mode,
                     target.as_deref(),
+                    total_twist_deg,
                     context.sketches,
                     context.datums,
                     &mut candidate_body_state,
@@ -2112,7 +2221,41 @@ impl ParametricGraph {
                     &mut warnings,
                 );
             }
-            _ => return Err("non Pattern/Transform family reached the contract".into()),
+            crate::document::FeatureEvaluatorKind::FeaturePattern => {
+                let FeatureType::FeaturePattern {
+                    target,
+                    source_feature,
+                    kind,
+                    compute_mode,
+                    extent_policy,
+                } = &context.feature.feature
+                else {
+                    return Err(format!(
+                        "registry evaluator FeaturePattern cannot invoke feature kind '{}'",
+                        context.feature.feature.kind_id()
+                    ));
+                };
+                apply_feature_pattern(
+                    self,
+                    context.feature_id.as_str(),
+                    target,
+                    source_feature,
+                    kind,
+                    *compute_mode,
+                    *extent_policy,
+                    context.variables,
+                    context.datums,
+                    context.history_nodes,
+                    context.history_checkpoints,
+                    &mut candidate_body_state,
+                    &mut warnings,
+                );
+            }
+            _ => {
+                return Err(
+                    "non Pattern/FeaturePattern/Transform family reached the contract".into(),
+                )
+            }
         }
         let diagnostics = warnings
             .into_iter()
@@ -2240,6 +2383,7 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
+        let mut diagnostics = Vec::new();
         let previous_writebacks = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
         let invocation = self.invoke_registered_feature(
             idx,
@@ -2250,20 +2394,18 @@ impl ParametricGraph {
             context.quality == EvaluationQuality::Interactive,
             &mut candidate_body_state,
             &mut warnings,
+            &mut diagnostics,
         );
         let face_reattach = std::mem::take(&mut *self.pending_face_reattach.borrow_mut());
         *self.pending_face_reattach.borrow_mut() = previous_writebacks;
         invocation?;
-        let diagnostics = warnings
-            .into_iter()
-            .filter_map(|message| {
-                super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.clone(),
-                    feature_name: context.feature.name.clone(),
-                    state: ResolutionState::Unresolved(message),
-                })
+        diagnostics.extend(warnings.into_iter().filter_map(|message| {
+            super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                feature_id: context.feature_id.clone(),
+                feature_name: context.feature.name.clone(),
+                state: ResolutionState::Unresolved(message),
             })
-            .collect();
+        }));
         let topology_history = Vec::new();
         let validation_evidence = FeatureValidationEvidence {
             input_body_count: context.live_bodies.len(),
@@ -2337,6 +2479,7 @@ impl ParametricGraph {
         draft: bool,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
+        diagnostics: &mut Vec<EvaluationDiagnostic>,
     ) -> Result<(), String> {
         let node = &self.graph[idx];
         let payload_mismatch = || {
@@ -2490,6 +2633,8 @@ impl ParametricGraph {
                     region_indices,
                     mode,
                     depth_expr,
+                    draft_angle_deg,
+                    draft_angle_expr,
                     target,
                 } = &node.feature
                 else {
@@ -2514,10 +2659,25 @@ impl ParametricGraph {
                     },
                     None => *depth,
                 };
+                let eff_draft_angle = match draft_angle_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, vars) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            diagnostics.push(Self::extrude_draft_expression_diagnostic(
+                                &node.id,
+                                expression,
+                                *draft_angle_deg,
+                            ));
+                            *draft_angle_deg
+                        }
+                    },
+                    None => *draft_angle_deg,
+                };
                 self.apply_extrude(
                     idx,
                     &node.id,
                     eff_depth,
+                    eff_draft_angle,
                     region_indices,
                     *mode,
                     target.as_deref(),
@@ -2526,6 +2686,7 @@ impl ParametricGraph {
                     draft,
                     live,
                     warnings,
+                    diagnostics,
                 );
             }
             crate::document::FeatureEvaluatorKind::Revolve => {
@@ -2533,6 +2694,9 @@ impl ParametricGraph {
             }
             crate::document::FeatureEvaluatorKind::Pattern => {
                 return Err("Pattern must be invoked through FeatureEvalResult".into());
+            }
+            crate::document::FeatureEvaluatorKind::FeaturePattern => {
+                return Err("FeaturePattern must be invoked through FeatureEvalResult".into());
             }
             crate::document::FeatureEvaluatorKind::BodyTransform => {
                 return Err("BodyTransform must be invoked through FeatureEvalResult".into());
@@ -2685,6 +2849,52 @@ impl ParametricGraph {
                     live,
                     warnings,
                 );
+            }
+            crate::document::FeatureEvaluatorKind::Draft => {
+                let FeatureType::Draft {
+                    target,
+                    faces,
+                    neutral,
+                    angle_deg,
+                    angle_expr,
+                    flip_pull,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                let effective_angle = match angle_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, vars) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            let diagnostic = Self::standalone_draft_expression_diagnostic(
+                                &node.id, expression, *angle_deg,
+                            );
+                            warnings.push(diagnostic.rendered_message().to_string());
+                            diagnostics.push(diagnostic);
+                            *angle_deg
+                        }
+                    },
+                    None => *angle_deg,
+                };
+                if let Err(reason) = apply_standalone_draft(
+                    &node.id,
+                    target,
+                    faces,
+                    neutral,
+                    effective_angle,
+                    *flip_pull,
+                    datums,
+                    live,
+                ) {
+                    let diagnostic = Self::standalone_draft_diagnostic(
+                        &node.id,
+                        target,
+                        effective_angle,
+                        &reason,
+                    );
+                    warnings.push(diagnostic.rendered_message().to_string());
+                    diagnostics.push(diagnostic);
+                }
             }
             crate::document::FeatureEvaluatorKind::Thread => {
                 return Err("Thread must be invoked through FeatureEvalResult".into());
@@ -2857,6 +3067,18 @@ impl ParametricGraph {
         }
     }
 
+    fn refresh_diagnostic_names(&self, diagnostics: &mut [EvaluationDiagnostic]) {
+        for diagnostic in diagnostics {
+            let Some(index) = self.node_map.get(diagnostic.feature_id.as_str()).copied() else {
+                continue;
+            };
+            let Some(feature_name) = diagnostic.parameters.get_mut("feature_name") else {
+                continue;
+            };
+            *feature_name = DiagnosticParameterValue::Text(self.graph[index].name.clone());
+        }
+    }
+
     fn refresh_checkpoint_diagnostics(
         &self,
         checkpoints: &mut [Option<EvalCheckpoint>],
@@ -2865,6 +3087,7 @@ impl ParametricGraph {
         for (checkpoint, manifest) in checkpoints.iter_mut().zip(manifests) {
             if let Some(checkpoint) = checkpoint {
                 self.refresh_status_names(&mut checkpoint.statuses);
+                self.refresh_diagnostic_names(&mut checkpoint.diagnostics);
                 checkpoint.manifest = *manifest;
             }
         }
@@ -2894,7 +3117,7 @@ impl ParametricGraph {
                 // current variables (or from its solver model when present);
                 // the region-cache key (a hash of the resolved curves) then
                 // changes whenever a variable does.
-                let effective = crate::sketch::effective_curves_solved(
+                let (effective, offset_failures) = crate::sketch::effective_curves_solved_checked(
                     curves,
                     shapes,
                     corner_mods,
@@ -2902,6 +3125,15 @@ impl ParametricGraph {
                     solver.as_ref(),
                     vars,
                 );
+                let offset_failure = (!offset_failures.is_empty()).then(|| {
+                    offset_failures
+                        .iter()
+                        .map(|(operation, error)| {
+                            format!("offset operation {} is unresolved: {error}", operation.0)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                });
                 // Sketch-on-face: region detection sees the projected face
                 // boundary (reference curves) so drawn shapes split against the
                 // face outline and the outline itself is a region. Appended
@@ -2943,20 +3175,28 @@ impl ParametricGraph {
                             }
                         }
                     });
-                let regions = match &face_boundary {
-                    Some(boundary) => {
-                        let mut merged = effective.clone();
-                        merged.extend_curves(boundary);
-                        self.cached_regions(&merged)
+                let regions = if offset_failure.is_some() {
+                    Vec::new()
+                } else {
+                    match &face_boundary {
+                        Some(boundary) => {
+                            let mut merged = effective.clone();
+                            merged.extend_curves(boundary);
+                            self.cached_regions(&merged)
+                        }
+                        None => self.cached_regions(&effective),
                     }
-                    None => self.cached_regions(&effective),
                 };
                 let provenance = build_region_provenance(&effective, shapes, entity_ids, &regions);
                 // Whole-shape outlines drive the overlapping-shapes-as-boolean
                 // path. Sketch fillets/chamfers (`corner_mods`) reshape the
                 // displayed geometry, which the raw shape outlines wouldn't
                 // reflect, so those sketches fall back to the per-region path.
-                let shape_loops = if corner_mods.is_empty() {
+                let shape_loops = if corner_mods.is_empty()
+                    && solver
+                        .as_ref()
+                        .is_none_or(|model| model.offsets.is_empty() && model.patterns.is_empty())
+                {
                     crate::sketch::shape_loops(shapes, vars)
                 } else {
                     Vec::new()
@@ -2971,6 +3211,7 @@ impl ParametricGraph {
                         face_boundary,
                         shape_loops,
                         solve_failure,
+                        offset_failure,
                     },
                 );
             }
@@ -3020,6 +3261,7 @@ impl ParametricGraph {
                         | FeatureType::ImportStl { .. }
                         | FeatureType::Revolve { .. }
                         | FeatureType::Pattern { .. }
+                        | FeatureType::FeaturePattern { .. }
                         | FeatureType::BodyTransform { .. }
                         | FeatureType::BodyJoin { .. }
                         | FeatureType::BodyCut { .. }
@@ -3035,17 +3277,23 @@ impl ParametricGraph {
                         | FeatureType::Loft { .. }
                         | FeatureType::Sweep { .. }
                         | FeatureType::Thread { .. }
+                        | FeatureType::DatumPlane { .. }
+                        | FeatureType::DatumAxis { .. }
+                        | FeatureType::DatumPoint { .. }
+                        | FeatureType::Draft { .. }
                 )
             })
             .collect();
-        let body_nodes: std::collections::HashSet<NodeIndex> = nodes.iter().copied().collect();
         let mut indegree: HashMap<NodeIndex, usize> = nodes
             .iter()
             .map(|&node| {
-                let count = self
-                    .graph
-                    .neighbors_directed(node, petgraph::Direction::Incoming)
-                    .filter(|parent| body_nodes.contains(parent))
+                let count = nodes
+                    .iter()
+                    .copied()
+                    .filter(|parent| {
+                        *parent != node
+                            && petgraph::algo::has_path_connecting(&self.graph, *parent, node, None)
+                    })
                     .count();
                 (node, count)
             })
@@ -3068,17 +3316,172 @@ impl ParametricGraph {
                 .ok_or_else(|| "Circular dependency detected in body timeline!".to_string())?;
             indegree.remove(&next);
             ordered.push(next);
-            for child in self
-                .graph
-                .neighbors_directed(next, petgraph::Direction::Outgoing)
-                .filter(|child| body_nodes.contains(child))
-            {
+            let dependent_children: Vec<_> = nodes
+                .iter()
+                .copied()
+                .filter(|child| {
+                    indegree.contains_key(child)
+                        && petgraph::algo::has_path_connecting(&self.graph, next, *child, None)
+                })
+                .collect();
+            for child in dependent_children {
                 if let Some(value) = indegree.get_mut(&child) {
                     *value = value.saturating_sub(1);
                 }
             }
         }
         Ok(ordered)
+    }
+
+    fn extrude_draft_expression_diagnostic(
+        node_id: &str,
+        expression: &str,
+        fallback_angle_deg: f32,
+    ) -> EvaluationDiagnostic {
+        let message = format!(
+            "Extrude '{node_id}': draft expression \"{expression}\" no longer evaluates; using last value {fallback_angle_deg:.3}°."
+        );
+        EvaluationDiagnostic::new(
+            node_id,
+            "extrude draft",
+            DiagnosticCode::parameter_invalid(),
+            DiagnosticSeverity::Warning,
+            message,
+        )
+        .with_parameter("parameter", "draft_angle_deg")
+        .with_parameter("expression", expression)
+        .with_parameter(
+            "fallback_angle_deg",
+            DiagnosticParameterValue::Decimal(fallback_angle_deg.to_string()),
+        )
+        .with_fallback("used the last stored draft angle")
+    }
+
+    fn standalone_draft_expression_diagnostic(
+        node_id: &str,
+        expression: &str,
+        fallback_angle_deg: f32,
+    ) -> EvaluationDiagnostic {
+        EvaluationDiagnostic::new(
+            node_id,
+            "standalone draft",
+            DiagnosticCode::parameter_invalid(),
+            DiagnosticSeverity::Warning,
+            format!(
+                "Draft '{node_id}': angle expression \"{expression}\" no longer evaluates; using last value {fallback_angle_deg:.6}°."
+            ),
+        )
+        .with_parameter("parameter", "angle_deg")
+        .with_parameter("expression", expression)
+        .with_parameter(
+            "fallback_angle_deg",
+            DiagnosticParameterValue::Decimal(fallback_angle_deg.to_string()),
+        )
+        .with_fallback("used the last stored Draft angle")
+    }
+
+    fn standalone_draft_diagnostic(
+        node_id: &str,
+        target: &str,
+        angle_deg: f32,
+        reason: &str,
+    ) -> EvaluationDiagnostic {
+        let lower = reason.to_ascii_lowercase();
+        let (code, reason_key) = if lower.contains("ambiguous") {
+            (DiagnosticCode::reference_ambiguous(), "ambiguous_reference")
+        } else if lower.contains("no longer resolves")
+            || lower.contains("no longer exists")
+            || lower.contains("does not exist")
+        {
+            (DiagnosticCode::reference_missing(), "missing_reference")
+        } else if lower.contains("angle")
+            || lower.contains("select at least one")
+            || lower.contains("must be prism side")
+            || lower.contains("not perpendicular")
+            || lower.contains("not one of the prism end")
+        {
+            (DiagnosticCode::parameter_invalid(), "invalid_parameter")
+        } else if lower.contains("cannot be displayed") {
+            (
+                DiagnosticCode::result_invalid_topology(),
+                "invalid_candidate_topology",
+            )
+        } else if lower.contains("supports only") || lower.contains("requires") {
+            (
+                DiagnosticCode::feature_unresolved(),
+                "unsupported_draft_v1_input",
+            )
+        } else {
+            (DiagnosticCode::operation_failed(), "draft_operation_failed")
+        };
+        EvaluationDiagnostic::new(
+            node_id,
+            "standalone draft",
+            code,
+            DiagnosticSeverity::Warning,
+            format!("Draft '{node_id}': {reason}; the body was left unchanged."),
+        )
+        .with_parameter("reason", reason_key)
+        .with_parameter("target", target)
+        .with_parameter(
+            "angle_deg",
+            DiagnosticParameterValue::Decimal(angle_deg.to_string()),
+        )
+        .with_fallback("kept the prior body state")
+    }
+
+    fn extrude_draft_diagnostic(
+        node_id: &str,
+        error: &ExtrudeDraftError,
+        depth: f32,
+        angle_deg: f32,
+    ) -> EvaluationDiagnostic {
+        let (code, reason) = match error {
+            ExtrudeDraftError::InvalidAngle(_) => {
+                (DiagnosticCode::parameter_invalid(), "invalid_angle")
+            }
+            ExtrudeDraftError::ProfileCollapse => {
+                (DiagnosticCode::parameter_invalid(), "profile_collapse")
+            }
+            ExtrudeDraftError::UnsupportedCurves => {
+                (DiagnosticCode::feature_unresolved(), "unsupported_curves")
+            }
+            ExtrudeDraftError::Offset(openrcad::sketch::OffsetError::Collapse { .. }) => {
+                (DiagnosticCode::parameter_invalid(), "offset_collapse")
+            }
+            ExtrudeDraftError::Offset(openrcad::sketch::OffsetError::TopologyChange { .. }) => (
+                DiagnosticCode::result_invalid_topology(),
+                "offset_topology_change",
+            ),
+            ExtrudeDraftError::ChangedEdgeCorrespondence => (
+                DiagnosticCode::result_invalid_topology(),
+                "changed_edge_correspondence",
+            ),
+            ExtrudeDraftError::KernelFailure => (
+                DiagnosticCode::kernel("draft_solid_build"),
+                "kernel_failure",
+            ),
+            ExtrudeDraftError::Offset(_) | ExtrudeDraftError::RegionCollision => {
+                (DiagnosticCode::operation_failed(), "draft_operation_failed")
+            }
+        };
+        EvaluationDiagnostic::new(
+            node_id,
+            "extrude draft",
+            code,
+            DiagnosticSeverity::Warning,
+            format!("Extrude '{node_id}': {error}."),
+        )
+        .with_parameter("reason", reason)
+        .with_parameter(
+            "draft_angle_deg",
+            DiagnosticParameterValue::Decimal(angle_deg.to_string()),
+        )
+        .with_parameter(
+            "depth",
+            DiagnosticParameterValue::Decimal(depth.to_string()),
+        )
+        .with_fallback("kept the prior body state")
     }
 
     /// Evaluate one Extrude node against the bodies assembled so far. Resolves
@@ -3091,6 +3494,7 @@ impl ParametricGraph {
         idx: NodeIndex,
         node_id: &str,
         depth: f32,
+        draft_angle_deg: f32,
         region_indices: &[usize],
         mode: ExtrudeMode,
         boolean_target: Option<&str>,
@@ -3099,6 +3503,7 @@ impl ParametricGraph {
         draft: bool,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
+        diagnostics: &mut Vec<EvaluationDiagnostic>,
     ) {
         // Resolve the parent sketch's plane + regions.
         let parent_idx = self
@@ -3122,6 +3527,12 @@ impl ParametricGraph {
             warnings.push(format!(
                 "Extrude '{node_id}': its sketch '{sketch_id}' {reason}."
             ));
+        }
+        if let Some(reason) = &sketch.offset_failure {
+            warnings.push(format!(
+                "Extrude '{node_id}': its sketch '{sketch_id}' {reason}."
+            ));
+            return;
         }
         // Plane priority: a datum attachment re-derives from the datum's current
         // resolution (editing the datum moves everything sketched on it); a face
@@ -3267,6 +3678,66 @@ impl ParametricGraph {
         let plan = crate::parametric::extrude::boolean_region_plan(loops, regions, region_indices);
         let region_is_boolean = plan.is_boolean;
         let process_region = plan.process;
+        let has_draft = draft_angle_deg.abs() > f32::EPSILON;
+        if !draft_angle_deg.is_finite() || draft_angle_deg.abs() >= 89.0 {
+            diagnostics.push(Self::extrude_draft_diagnostic(
+                node_id,
+                &ExtrudeDraftError::InvalidAngle(draft_angle_deg),
+                depth,
+                draft_angle_deg,
+            ));
+            return;
+        }
+        if has_draft
+            && (!sketch.curves.circles.is_empty()
+                || !sketch.curves.arcs.is_empty()
+                || !sketch.curves.splines.is_empty())
+        {
+            diagnostics.push(Self::extrude_draft_diagnostic(
+                node_id,
+                &ExtrudeDraftError::UnsupportedCurves,
+                depth,
+                draft_angle_deg,
+            ));
+            return;
+        }
+        let mut drafted_regions = HashMap::new();
+        if has_draft {
+            for (index, region) in regions.iter().enumerate() {
+                if !process_region[index] {
+                    continue;
+                }
+                let drafted = match drafted_region_loops(
+                    &region.boundary,
+                    &region.holes,
+                    depth,
+                    draft_angle_deg,
+                ) {
+                    Ok(drafted) => drafted,
+                    Err(error) => {
+                        diagnostics.push(Self::extrude_draft_diagnostic(
+                            node_id,
+                            &error,
+                            depth,
+                            draft_angle_deg,
+                        ));
+                        return;
+                    }
+                };
+                drafted_regions.insert(index, drafted);
+            }
+            if let Err(error) =
+                validate_drafted_region_set(&drafted_regions.values().cloned().collect::<Vec<_>>())
+            {
+                diagnostics.push(Self::extrude_draft_diagnostic(
+                    node_id,
+                    &error,
+                    depth,
+                    draft_angle_deg,
+                ));
+                return;
+            }
+        }
         // Did any boolean-cluster region get built in NewBody mode? Its adjacent
         // kept pieces are fused at the end so a unioned cluster reads as one solid.
         let mut newbody_has_boolean = false;
@@ -3285,13 +3756,34 @@ impl ParametricGraph {
             .map(|a| (a.center, a.radius))
             .collect();
         let region_solid = |r: &Region, cs: &CoordinateSystem, d: f32| {
-            crate::mock_kernel::extruded_sketch_region_solid(r, d, cs, &arc_circles)
+            if has_draft {
+                drafted_region_solid(&r.boundary, &r.holes, d, cs, draft_angle_deg).map(Some)
+            } else {
+                Ok(crate::mock_kernel::extruded_sketch_region_solid(
+                    r,
+                    d,
+                    cs,
+                    &arc_circles,
+                ))
+            }
         };
+        let loop_solid =
+            |boundary: &[(f32, f32)], holes: &[Vec<(f32, f32)>], cs: &CoordinateSystem, d: f32| {
+                if has_draft {
+                    drafted_region_solid(boundary, holes, d, cs, draft_angle_deg).map(Some)
+                } else {
+                    Ok(crate::mock_kernel::extruded_region_solid(
+                        boundary, holes, d, cs,
+                    ))
+                }
+            };
         // The smooth native-cylinder tool for a circular, hole-free region (None
         // otherwise). Tried before the faceted prism so a round boss/pocket reads
         // smooth — the kernel fuses/bores analytic cylinders watertight.
         let cyl_tool = |r: &Region, cs: &CoordinateSystem, d: f32| {
-            crate::mock_kernel::circular_cylinder_tool(&r.boundary, &r.holes, d, cs)
+            (!has_draft)
+                .then(|| crate::mock_kernel::circular_cylinder_tool(&r.boundary, &r.holes, d, cs))
+                .flatten()
         };
 
         let mut newbody_tools: Vec<KernelSolid> = Vec::new();
@@ -3430,7 +3922,7 @@ impl ParametricGraph {
                     // its corner arcs into one big circle (≈ the half-diagonal), so
                     // skip them when the sketch handed us fillet arcs and let the
                     // exact-arc `region_solid` build the rounded body.
-                    let rect_circle_exact = if arc_circles.is_empty() {
+                    let rect_circle_exact = if !has_draft && arc_circles.is_empty() {
                         provenance
                             .and_then(|provenance| {
                                 rect_circle_region_base_and_cutter_from_provenance(
@@ -3467,34 +3959,58 @@ impl ParametricGraph {
                     // Prefer the smooth analytic cylinder for a circular profile so
                     // a new-body cylinder stays round if it is later joined/cut
                     // (re-tessellated from this solid); falls back to the prism.
+                    let drafted_or_prismatic = match region_solid(region, cs, depth) {
+                        Ok(solid) => solid,
+                        Err(error) => {
+                            diagnostics.push(Self::extrude_draft_diagnostic(
+                                node_id,
+                                &error,
+                                depth,
+                                draft_angle_deg,
+                            ));
+                            return;
+                        }
+                    };
                     let body_tool = canonical_rect_circle
                         .as_ref()
                         .and_then(|canonical| canonical.body.clone())
                         .or_else(|| cyl_tool(region, cs, depth))
-                        .or_else(|| region_solid(region, cs, depth));
+                        .or(drafted_or_prismatic);
                     // Keep the part so the display mesh derives directly from it
                     // (single source of truth) instead of an independently rebuilt twin.
                     let region_part = body_tool.clone();
                     if let Some(s) = body_tool {
                         newbody_tools.push(s);
                     }
-                    let region_source = SketchExtrudeRegionSource {
-                        boundary: region.boundary.clone(),
-                        holes: region.holes.clone(),
-                        depth,
-                        cs: *cs,
-                        rect_circle: canonical_rect_circle,
-                    };
-                    sketch_source.regions.push(region_source);
-                    let mut region_mesh = match region_part.as_ref() {
-                        Some(part) => crate::mock_kernel::display_mesh_from_part(
+                    if !has_draft {
+                        let region_source = SketchExtrudeRegionSource {
+                            boundary: region.boundary.clone(),
+                            holes: region.holes.clone(),
+                            depth,
+                            cs: *cs,
+                            rect_circle: canonical_rect_circle,
+                        };
+                        sketch_source.regions.push(region_source);
+                    }
+                    let mut region_mesh = match (has_draft, region_part.as_ref()) {
+                        (true, Some(part)) => MockMesh::from_solid(part),
+                        (true, None) => {
+                            diagnostics.push(Self::extrude_draft_diagnostic(
+                                node_id,
+                                &ExtrudeDraftError::KernelFailure,
+                                depth,
+                                draft_angle_deg,
+                            ));
+                            return;
+                        }
+                        (false, Some(part)) => crate::mock_kernel::display_mesh_from_part(
                             part,
                             &region.boundary,
                             &region.holes,
                             depth,
                             cs,
                         ),
-                        None => crate::mock_kernel::extruded_region_display_mesh(
+                        (false, None) => crate::mock_kernel::extruded_region_display_mesh(
                             &region.boundary,
                             &region.holes,
                             depth,
@@ -3509,7 +4025,14 @@ impl ParametricGraph {
                         cs,
                         depth,
                     );
-                    stamp_sketch_extrude_face_refs(&mut region_mesh, node_id, i, cs, depth);
+                    stamp_sketch_extrude_face_refs(
+                        &mut region_mesh,
+                        node_id,
+                        i,
+                        has_draft.then_some(provenance).flatten(),
+                        cs,
+                        depth,
+                    );
                     crate::mock_kernel::populate_edge_adjacent_face_names(&mut region_mesh);
                     if let Some(part) = region_part.as_ref() {
                         newbody_part_meshes
@@ -3534,27 +4057,63 @@ impl ParametricGraph {
                     // `directional_cut` solves only for the end caps.
                     let (cut_cs, cut_depth) = directional_cut(cs, depth);
                     let smooth = cyl_tool(region, &cut_cs, cut_depth);
-                    let exact = region_solid(region, &cut_cs, cut_depth);
+                    let exact = match region_solid(region, &cut_cs, cut_depth) {
+                        Ok(solid) => solid,
+                        Err(error) => {
+                            diagnostics.push(Self::extrude_draft_diagnostic(
+                                node_id,
+                                &error,
+                                depth,
+                                draft_angle_deg,
+                            ));
+                            return;
+                        }
+                    };
                     let grown_boundary = grow_loop(&region.boundary, true);
                     let grown_holes: Vec<Vec<(f32, f32)>> =
                         region.holes.iter().map(|h| grow_loop(h, false)).collect();
-                    let expanded = crate::mock_kernel::extruded_region_solid(
-                        &grown_boundary,
-                        &grown_holes,
-                        cut_depth,
-                        &cut_cs,
-                    );
+                    let expanded =
+                        match loop_solid(&grown_boundary, &grown_holes, &cut_cs, cut_depth) {
+                            Ok(solid) => solid,
+                            Err(error) => {
+                                diagnostics.push(Self::extrude_draft_diagnostic(
+                                    node_id,
+                                    &error,
+                                    depth,
+                                    draft_angle_deg,
+                                ));
+                                return;
+                            }
+                        };
                     // The same tool swept the other way, for the fall-back when the
                     // drawn direction misses the body (see `CutTool`).
                     let (rev_cs, rev_depth) = directional_cut(cs, -depth);
                     let smooth_rev = cyl_tool(region, &rev_cs, rev_depth);
-                    let exact_rev = region_solid(region, &rev_cs, rev_depth);
-                    let expanded_rev = crate::mock_kernel::extruded_region_solid(
-                        &grown_boundary,
-                        &grown_holes,
-                        rev_depth,
-                        &rev_cs,
-                    );
+                    let exact_rev = match region_solid(region, &rev_cs, rev_depth) {
+                        Ok(solid) => solid,
+                        Err(error) => {
+                            diagnostics.push(Self::extrude_draft_diagnostic(
+                                node_id,
+                                &error,
+                                depth,
+                                draft_angle_deg,
+                            ));
+                            return;
+                        }
+                    };
+                    let expanded_rev =
+                        match loop_solid(&grown_boundary, &grown_holes, &rev_cs, rev_depth) {
+                            Ok(solid) => solid,
+                            Err(error) => {
+                                diagnostics.push(Self::extrude_draft_diagnostic(
+                                    node_id,
+                                    &error,
+                                    depth,
+                                    draft_angle_deg,
+                                ));
+                                return;
+                            }
+                        };
                     if smooth.is_some() || exact.is_some() || expanded.is_some() {
                         let circle = if sketch.curves.segments.is_empty()
                             && sketch.curves.circles.len() == 1
@@ -3583,12 +4142,34 @@ impl ParametricGraph {
                     // present) coplanarity with the face the sketch sits on. The
                     // dip is absorbed by the body it joins, leaving no artifact.
                     let smooth = cyl_tool(region, cs, depth);
-                    let exact = region_solid(region, cs, depth);
-                    let dipped = region_solid(
+                    let exact = match region_solid(region, cs, depth) {
+                        Ok(solid) => solid,
+                        Err(error) => {
+                            diagnostics.push(Self::extrude_draft_diagnostic(
+                                node_id,
+                                &error,
+                                depth,
+                                draft_angle_deg,
+                            ));
+                            return;
+                        }
+                    };
+                    let dipped = match region_solid(
                         region,
                         &overshoot_cs(cs, depth),
                         overshoot_depth(depth, 1.0),
-                    );
+                    ) {
+                        Ok(solid) => solid,
+                        Err(error) => {
+                            diagnostics.push(Self::extrude_draft_diagnostic(
+                                node_id,
+                                &error,
+                                depth,
+                                draft_angle_deg,
+                            ));
+                            return;
+                        }
+                    };
                     if smooth.is_some() || exact.is_some() || dipped.is_some() {
                         join_tools.push(JoinTool {
                             smooth,
@@ -3708,6 +4289,7 @@ impl ParametricGraph {
                                         &mut mesh,
                                         &output_id,
                                         output_index + part_index,
+                                        None,
                                         &mesh_cs,
                                         mesh_depth,
                                     );
@@ -3803,6 +4385,9 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
                     | crate::sketch::SketchShape::RegularPolygon { diameter, .. } => {
                         rename_dimension_expression(diameter, old, new);
                     }
+                    crate::sketch::SketchShape::Slot { width, .. } => {
+                        rename_dimension_expression(width, old, new);
+                    }
                     crate::sketch::SketchShape::Line {
                         length, angle_deg, ..
                     } => {
@@ -3839,7 +4424,14 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
                 }
             }
         }
-        FeatureType::Extrude { depth_expr, .. } => rename_expression(depth_expr, old, new),
+        FeatureType::Extrude {
+            depth_expr,
+            draft_angle_expr,
+            ..
+        } => {
+            rename_expression(depth_expr, old, new);
+            rename_expression(draft_angle_expr, old, new);
+        }
         FeatureType::EdgeMod { dist_expr, .. } => rename_expression(dist_expr, old, new),
         FeatureType::VariableSet { variables } => {
             for variable in variables {
@@ -3847,6 +4439,9 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
             }
         }
         FeatureType::Revolve { angle_expr, .. } => rename_expression(angle_expr, old, new),
+        FeatureType::Sweep {
+            total_twist_expr, ..
+        } => rename_expression(total_twist_expr, old, new),
         FeatureType::Shell { thickness_expr, .. } => rename_expression(thickness_expr, old, new),
         FeatureType::Hole { diameter_expr, .. } => rename_expression(diameter_expr, old, new),
         FeatureType::Pattern { kind, .. } => match kind {
@@ -3854,25 +4449,35 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
             PatternKind::Mirror { offset_expr, .. } => rename_expression(offset_expr, old, new),
             PatternKind::Circular { .. } => {}
         },
+        FeatureType::FeaturePattern { kind, .. } => match kind {
+            FeaturePatternKind::Linear { spacing_expr, .. } => {
+                rename_expression(spacing_expr, old, new)
+            }
+            FeaturePatternKind::Circular {
+                total_angle_expr, ..
+            } => rename_expression(total_angle_expr, old, new),
+        },
         FeatureType::DatumPlane { def } => match def {
             DatumPlaneDef::Offset { distance_expr, .. } => {
                 rename_expression(distance_expr, old, new)
             }
             DatumPlaneDef::Angle { angle_expr, .. } => rename_expression(angle_expr, old, new),
-            DatumPlaneDef::ThreePoints { .. } | DatumPlaneDef::MidPlane { .. } => {}
+            DatumPlaneDef::ThreePoints { .. }
+            | DatumPlaneDef::MidPlane { .. }
+            | DatumPlaneDef::PlanarFace { .. } => {}
         },
         FeatureType::BodyScale { factor_expr, .. } => rename_expression(factor_expr, old, new),
         FeatureType::FaceOffset { distance_expr, .. } => rename_expression(distance_expr, old, new),
         FeatureType::FaceThicken { thickness_expr, .. } => {
             rename_expression(thickness_expr, old, new)
         }
+        FeatureType::Draft { angle_expr, .. } => rename_expression(angle_expr, old, new),
         FeatureType::Origin
         | FeatureType::Box { .. }
         | FeatureType::Cylinder { .. }
         | FeatureType::Import { .. }
         | FeatureType::ImportStl { .. }
         | FeatureType::Loft { .. }
-        | FeatureType::Sweep { .. }
         | FeatureType::BodyTransform { .. }
         | FeatureType::Thread { .. }
         | FeatureType::DatumAxis { .. }
@@ -3997,6 +4602,12 @@ impl ParametricGraph {
             warnings.push(format!(
                 "Revolve '{node_id}': its sketch '{sketch_id}' {reason}."
             ));
+        }
+        if let Some(reason) = &sketch.offset_failure {
+            warnings.push(format!(
+                "Revolve '{node_id}': its sketch '{sketch_id}' {reason}."
+            ));
+            return;
         }
         let cs_owned = match self.effective_sketch_cs(sketch_id, sketch.cs, datums, live) {
             Ok(cs) => cs,
@@ -4300,6 +4911,7 @@ impl ParametricGraph {
         path_sketch: &str,
         mode: ExtrudeMode,
         boolean_target: Option<&str>,
+        total_twist_deg: f32,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         datums: &HashMap<String, DatumValue>,
         live: &mut Vec<LiveBody>,
@@ -4345,10 +4957,10 @@ impl ParametricGraph {
                 return;
             }
         };
-        let Some(path_2d) = path.curves.path_polyline(1e-3) else {
+        let Some((path_2d, closed)) = path.curves.sweep_path_polyline(1e-3) else {
             warnings.push(format!(
-                "Sweep '{node_id}': the path sketch must be a single open chain of \
-                 lines/arcs (no branches, loops, or gaps)."
+                "Sweep '{node_id}': the path sketch must be one simple open or closed \
+                 line/arc/circle chain (no branches or gaps)."
             ));
             return;
         };
@@ -4356,9 +4968,24 @@ impl ParametricGraph {
             .iter()
             .map(|&(u, v)| path_cs.unproject(u, v))
             .collect();
-        let Some(solid) =
-            crate::mock_kernel::swept_solid(&profile_cs, &region.boundary, &region.holes, &path_3d)
-        else {
+        let twist_turn_remainder = (total_twist_deg as f64)
+            .to_radians()
+            .rem_euclid(std::f64::consts::TAU);
+        if closed && twist_turn_remainder.min(std::f64::consts::TAU - twist_turn_remainder) > 1.0e-6
+        {
+            warnings.push(format!(
+                "Sweep '{node_id}': a closed path needs total twist to be a whole number of turns so its seam closes."
+            ));
+            return;
+        }
+        let Some(solid) = crate::mock_kernel::swept_solid(
+            &profile_cs,
+            &region.boundary,
+            &region.holes,
+            &path_3d,
+            total_twist_deg,
+            closed,
+        ) else {
             warnings.push(format!(
                 "Sweep '{node_id}': the profile could not be swept along the path \
                  (it may self-intersect on a tight bend)."
@@ -4868,6 +5495,601 @@ pub(crate) fn refresh_thread_pristine(body: &mut LiveBody) {
         mesh.append(MockMesh::from_solid(part));
     }
     body.pristine = (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh));
+}
+
+fn feature_pattern_transforms(
+    node_id: &str,
+    kind: &FeaturePatternKind,
+    vars: &HashMap<String, f64>,
+    datums: &HashMap<String, DatumValue>,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<openrcad::foundation::Trsf>> {
+    use openrcad::foundation::{Ax1, Dir, Pnt, Trsf, Vec as GeomVec};
+    let transforms = match kind {
+        FeaturePatternKind::Linear {
+            direction,
+            spacing,
+            spacing_expr,
+            count,
+        } => {
+            if *count == 0 {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': count includes the source and must be at least 1."
+                ));
+                return None;
+            }
+            if *count == 1 {
+                return Some(Vec::new());
+            }
+            let Some((_, direction)) = super::datum::resolve_axis_base_world(direction, datums)
+            else {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': its linear direction could not be resolved."
+                ));
+                return None;
+            };
+            let spacing = match spacing_expr {
+                Some(expression) => match crate::expr::eval(expression, vars) {
+                    Ok(value) => value as f32,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "Feature pattern '{node_id}': spacing expression \"{expression}\" no longer evaluates; using last value {spacing:.3}."
+                        ));
+                        *spacing
+                    }
+                },
+                None => *spacing,
+            };
+            if !spacing.is_finite() || spacing.abs() <= f32::EPSILON {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': linear spacing must be finite and non-zero."
+                ));
+                return None;
+            }
+            (1..*count)
+                .map(|instance| {
+                    Trsf::translation(GeomVec::new(
+                        direction.x as f64 * spacing as f64 * instance as f64,
+                        direction.y as f64 * spacing as f64 * instance as f64,
+                        direction.z as f64 * spacing as f64 * instance as f64,
+                    ))
+                })
+                .collect()
+        }
+        FeaturePatternKind::Circular {
+            axis,
+            total_angle_deg,
+            total_angle_expr,
+            count,
+        } => {
+            if *count == 0 {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': count includes the source and must be at least 1."
+                ));
+                return None;
+            }
+            if *count == 1 {
+                return Some(Vec::new());
+            }
+            let Some((origin, direction)) = super::datum::resolve_axis_base_world(axis, datums)
+            else {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': its circular axis could not be resolved."
+                ));
+                return None;
+            };
+            let angle = match total_angle_expr {
+                Some(expression) => match crate::expr::eval(expression, vars) {
+                    Ok(value) => value as f32,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "Feature pattern '{node_id}': angle expression \"{expression}\" no longer evaluates; using last value {total_angle_deg:.3}."
+                        ));
+                        *total_angle_deg
+                    }
+                },
+                None => *total_angle_deg,
+            };
+            if !angle.is_finite() || angle.abs() <= f32::EPSILON {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': total angle must be finite and non-zero."
+                ));
+                return None;
+            }
+            let full = (angle.abs() - 360.0).abs() < 1.0e-3;
+            let step = if full {
+                angle.to_radians() as f64 / *count as f64
+            } else {
+                angle.to_radians() as f64 / (*count - 1) as f64
+            };
+            let axis = Ax1::new(
+                Pnt::new(origin.x as f64, origin.y as f64, origin.z as f64),
+                Dir::new(direction.x as f64, direction.y as f64, direction.z as f64),
+            );
+            (1..*count)
+                .map(|instance| Trsf::rotation(&axis, step * instance as f64))
+                .collect()
+        }
+    };
+    Some(transforms)
+}
+
+fn feature_pattern_body_signature(body: &LiveBody) -> blake3::Hash {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&body.parts, &mut bytes)
+        .expect("kernel bodies in an evaluation checkpoint must serialize");
+    blake3::hash(&bytes)
+}
+
+fn feature_pattern_material_delta(
+    before: &LiveBody,
+    after: &LiveBody,
+    joined_material: bool,
+) -> Result<Vec<KernelSolid>, String> {
+    let (base, subtractor) = if joined_material {
+        (after, before)
+    } else {
+        (before, after)
+    };
+    let before_volume: f64 = before.parts.iter().filter_map(solid_volume).sum();
+    let after_volume: f64 = after.parts.iter().filter_map(solid_volume).sum();
+    let expected = if joined_material {
+        after_volume - before_volume
+    } else {
+        before_volume - after_volume
+    };
+    if !expected.is_finite() || expected <= f64::EPSILON * before_volume.abs().max(1.0) {
+        return Err("the source feature did not produce a measurable material change".into());
+    }
+
+    let mut delta = base.parts.clone();
+    for subtractor_part in &subtractor.parts {
+        let mut next = Vec::new();
+        for part in delta {
+            let overlaps = crate::mock_kernel::solid_aabb(&part)
+                .zip(crate::mock_kernel::solid_aabb(subtractor_part))
+                .is_some_and(|(a, b)| crate::mock_kernel::aabbs_overlap(&a, &b, 0.0));
+            if !overlaps {
+                next.push(part);
+                continue;
+            }
+            let Some(remainders) = crate::mock_kernel::difference_bodies(&part, subtractor_part)
+            else {
+                return Err("the source material delta could not be recovered atomically".into());
+            };
+            next.extend(remainders);
+        }
+        delta = next;
+    }
+    let actual: f64 = delta.iter().filter_map(solid_volume).sum();
+    let relative_error = (actual - expected).abs() / expected.abs();
+    if delta.is_empty() || !actual.is_finite() || relative_error > 0.1 {
+        return Err(format!(
+            "the source material delta was ambiguous (expected volume {expected:.6}, recovered {actual:.6})"
+        ));
+    }
+    Ok(delta)
+}
+
+#[derive(Clone)]
+struct FeaturePatternFaceName {
+    centroid: [f32; 3],
+    normal: [f32; 3],
+    surface_kind: Option<String>,
+    topology: crate::mock_kernel::MeshTopologyFaceRef,
+}
+
+fn collect_feature_pattern_face_names(
+    body: &LiveBody,
+    operation_id: &str,
+    node_id: &str,
+    source_feature: &str,
+    instance: usize,
+    names: &mut Vec<FeaturePatternFaceName>,
+) {
+    let Some(mesh) = body.pristine.as_deref() else {
+        return;
+    };
+    for face in &mesh.face_refs {
+        let Some(topology) = face.topology.as_ref() else {
+            continue;
+        };
+        let Some(generated_name) = topology
+            .face_id
+            .as_deref()
+            .filter(|name| name.contains(operation_id))
+        else {
+            continue;
+        };
+        let Some(operation_start) = generated_name.find(operation_id) else {
+            continue;
+        };
+        let prefix = &generated_name[..operation_start];
+        let suffix = &generated_name[operation_start + operation_id.len()..];
+        let source_topology_name = format!("{prefix}{source_feature}{suffix}");
+        let mut durable = topology.clone();
+        durable.face_id = Some(format!(
+            "pattern:{node_id}:instance:{instance}:source:{source_topology_name}"
+        ));
+        durable.producer_feature_id = Some(node_id.to_string());
+        durable.source_entity_id = Some(source_topology_name);
+        names.push(FeaturePatternFaceName {
+            centroid: face.centroid,
+            normal: face.normal,
+            surface_kind: topology.surface_kind.clone(),
+            topology: durable,
+        });
+    }
+}
+
+fn restore_feature_pattern_face_names(body: &mut LiveBody, names: &[FeaturePatternFaceName]) {
+    if names.is_empty() {
+        return;
+    }
+    let mut mesh = body.pristine.as_deref().cloned().unwrap_or_else(|| {
+        let mut mesh = MockMesh::empty();
+        for part in &body.parts {
+            mesh.append(MockMesh::from_solid(part));
+        }
+        mesh
+    });
+    let coordinate_scale = mesh
+        .face_refs
+        .iter()
+        .flat_map(|face| face.centroid)
+        .map(f32::abs)
+        .fold(f32::MIN_POSITIVE, f32::max);
+    let tolerance = coordinate_scale * f32::EPSILON * 256.0;
+    for named in names {
+        let candidates: Vec<_> = mesh
+            .face_refs
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                let delta = (0..3)
+                    .map(|axis| (candidate.centroid[axis] - named.centroid[axis]).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                let normal_dot = (0..3)
+                    .map(|axis| candidate.normal[axis] * named.normal[axis])
+                    .sum::<f32>();
+                let candidate_normal = candidate
+                    .normal
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>();
+                let named_normal = named.normal.iter().map(|value| value * value).sum::<f32>();
+                let normal_compatible =
+                    if candidate_normal <= f32::EPSILON || named_normal <= f32::EPSILON {
+                        candidate_normal <= f32::EPSILON && named_normal <= f32::EPSILON
+                    } else {
+                        normal_dot.abs() / (candidate_normal * named_normal).sqrt() > 0.95
+                    };
+                let candidate_surface = candidate
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.surface_kind.as_ref());
+                (candidate_surface.is_none() || candidate_surface == named.surface_kind.as_ref())
+                    && delta <= tolerance
+                    && normal_compatible
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if let [index] = candidates.as_slice() {
+            mesh.face_refs[*index].topology = Some(named.topology.clone());
+        }
+    }
+    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+    body.pristine = Some(std::sync::Arc::new(mesh));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_feature_pattern(
+    graph: &ParametricGraph,
+    node_id: &str,
+    target: &str,
+    source_feature: &str,
+    kind: &FeaturePatternKind,
+    compute_mode: FeaturePatternComputeMode,
+    extent_policy: FeaturePatternExtentPolicy,
+    vars: &HashMap<String, f64>,
+    datums: &HashMap<String, DatumValue>,
+    history_nodes: &[NodeIndex],
+    history_checkpoints: &[Option<EvalCheckpoint>],
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    if compute_mode != FeaturePatternComputeMode::Identical {
+        warnings.push(format!(
+            "Feature pattern '{node_id}': only Identical computation is supported in payload v1."
+        ));
+        return;
+    }
+    let Some(source_index) = graph
+        .graph
+        .node_indices()
+        .find(|index| graph.graph[*index].id == source_feature)
+    else {
+        warnings.push(format!(
+            "Feature pattern '{node_id}': source feature '{source_feature}' no longer exists."
+        ));
+        return;
+    };
+    let Some(source_position) = history_nodes
+        .iter()
+        .position(|candidate| *candidate == source_index)
+    else {
+        warnings.push(format!(
+            "Feature pattern '{node_id}': source '{source_feature}' is not a material feature."
+        ));
+        return;
+    };
+    let Some(source_checkpoint) = history_checkpoints
+        .get(source_position)
+        .and_then(Option::as_ref)
+    else {
+        warnings.push(format!(
+            "Feature pattern '{node_id}': source '{source_feature}' is not earlier in the evaluated history."
+        ));
+        return;
+    };
+    let source_status = source_checkpoint
+        .statuses
+        .iter()
+        .find(|status| status.feature_id.as_str() == source_feature);
+    if !source_status.is_some_and(|status| matches!(status.state, ResolutionState::Resolved)) {
+        warnings.push(format!(
+            "Feature pattern '{node_id}': source '{source_feature}' is suppressed or unresolved."
+        ));
+        return;
+    }
+    let Some(_) = live.iter().find(|body| body.id == target) else {
+        warnings.push(format!(
+            "Feature pattern '{node_id}': target body '{target}' no longer exists."
+        ));
+        return;
+    };
+
+    let Some(transforms) = feature_pattern_transforms(node_id, kind, vars, datums, warnings) else {
+        return;
+    };
+    if transforms.is_empty() {
+        return;
+    }
+
+    let source = &graph.graph[source_index].feature;
+    let historical_before = source_position
+        .checked_sub(1)
+        .and_then(|position| history_checkpoints.get(position))
+        .and_then(Option::as_ref)
+        .map(|checkpoint| checkpoint.live.as_slice())
+        .unwrap_or(&[]);
+    let historical_after = source_checkpoint.live.as_slice();
+    let original = live.clone();
+    let mut durable_pattern_faces = Vec::new();
+
+    enum SourceRecipe<'a> {
+        Hole {
+            position: [f32; 3],
+            direction: [f32; 3],
+            diameter: f32,
+            depth: Option<f32>,
+            kind: &'a HoleKind,
+            drill_point_angle_deg: Option<f32>,
+        },
+        MaterialDelta {
+            joined: bool,
+            parts: Vec<KernelSolid>,
+        },
+    }
+
+    let recipe = match source {
+        FeatureType::Hole {
+            target: source_target,
+            position,
+            direction,
+            diameter,
+            diameter_expr,
+            depth,
+            kind,
+            manufacturing,
+            ..
+        } if source_target == target => {
+            if depth.is_none() && extent_policy != FeaturePatternExtentPolicy::ThroughAllLocalTarget
+            {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': a through-all Hole requires ThroughAllLocalTarget extent."
+                ));
+                return;
+            }
+            if depth.is_some() && extent_policy != FeaturePatternExtentPolicy::SourceExtent {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': a blind Hole requires SourceExtent."
+                ));
+                return;
+            }
+            let diameter = diameter_expr
+                .as_ref()
+                .and_then(|expression| crate::expr::eval(expression, vars).ok())
+                .map_or(*diameter, |value| value as f32);
+            SourceRecipe::Hole {
+                position: *position,
+                direction: *direction,
+                diameter,
+                depth: *depth,
+                kind,
+                drill_point_angle_deg: manufacturing
+                    .as_ref()
+                    .and_then(|metadata| metadata.drill_point_angle_deg),
+            }
+        }
+        FeatureType::Extrude {
+            mode,
+            target: Some(source_target),
+            ..
+        }
+        | FeatureType::Revolve {
+            mode,
+            target: Some(source_target),
+            ..
+        } if source_target == target && matches!(mode, ExtrudeMode::Join | ExtrudeMode::Cut) => {
+            if extent_policy != FeaturePatternExtentPolicy::SourceExtent {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': Extrude/Revolve sources require SourceExtent."
+                ));
+                return;
+            }
+            let Some(before) = historical_before.iter().find(|body| body.id == target) else {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': target '{target}' was missing immediately before source '{source_feature}'."
+                ));
+                return;
+            };
+            let Some(after) = historical_after.iter().find(|body| body.id == target) else {
+                warnings.push(format!(
+                    "Feature pattern '{node_id}': target '{target}' was missing immediately after source '{source_feature}'."
+                ));
+                return;
+            };
+            let joined = *mode == ExtrudeMode::Join;
+            let parts = match feature_pattern_material_delta(before, after, joined) {
+                Ok(parts) => parts,
+                Err(reason) => {
+                    warnings.push(format!(
+                        "Feature pattern '{node_id}': could not recover source '{source_feature}' at its historical target state: {reason}."
+                    ));
+                    return;
+                }
+            };
+            SourceRecipe::MaterialDelta { joined, parts }
+        }
+        _ => {
+            warnings.push(format!(
+                "Feature pattern '{node_id}': v1 sources must be a Hole or a targeted Join/Cut Extrude or Revolve on '{target}'."
+            ));
+            return;
+        }
+    };
+
+    use openrcad::foundation::{Dir, Pnt};
+    for (offset, transform) in transforms.iter().enumerate() {
+        let instance = offset + 1;
+        let operation_id = format!("{node_id}:instance:{instance}:source:{source_feature}");
+        let Some(before_target) = live.iter().find(|body| body.id == target).cloned() else {
+            *live = original;
+            warnings.push(format!(
+                "Feature pattern '{node_id}': target '{target}' disappeared before instance {instance}; the entire pattern was rolled back."
+            ));
+            return;
+        };
+        let mut instance_warnings = Vec::new();
+        match &recipe {
+            SourceRecipe::Hole {
+                position,
+                direction,
+                diameter,
+                depth,
+                kind,
+                drill_point_angle_deg,
+            } => {
+                let point = transform.transform_point(&Pnt::new(
+                    position[0] as f64,
+                    position[1] as f64,
+                    position[2] as f64,
+                ));
+                let direction = transform.transform_dir(&Dir::new(
+                    direction[0] as f64,
+                    direction[1] as f64,
+                    direction[2] as f64,
+                ));
+                apply_hole(
+                    &operation_id,
+                    target,
+                    [point.x() as f32, point.y() as f32, point.z() as f32],
+                    [
+                        direction.x() as f32,
+                        direction.y() as f32,
+                        direction.z() as f32,
+                    ],
+                    *diameter,
+                    *depth,
+                    kind,
+                    *drill_point_angle_deg,
+                    live,
+                    &mut instance_warnings,
+                );
+            }
+            SourceRecipe::MaterialDelta { joined, parts } => {
+                let transformed: Vec<_> = parts
+                    .iter()
+                    .map(|part| crate::mock_kernel::transformed_solid(part, transform, false))
+                    .collect();
+                if *joined {
+                    let tools = transformed
+                        .into_iter()
+                        .map(|part| JoinTool {
+                            smooth: None,
+                            exact: Some(part),
+                            dipped: None,
+                        })
+                        .collect();
+                    apply_join(
+                        live,
+                        &operation_id,
+                        tools,
+                        Some(target),
+                        false,
+                        &mut instance_warnings,
+                    );
+                } else {
+                    let tools = transformed
+                        .into_iter()
+                        .map(|part| CutTool::single_direction(None, Some(part), None, None))
+                        .collect();
+                    apply_cut(
+                        live,
+                        &operation_id,
+                        tools,
+                        Some(target),
+                        false,
+                        &mut instance_warnings,
+                    );
+                }
+            }
+        }
+        let changed = live
+            .iter()
+            .find(|body| body.id == target)
+            .is_some_and(|after| {
+                feature_pattern_body_signature(after)
+                    != feature_pattern_body_signature(&before_target)
+            });
+        if !instance_warnings.is_empty() || !changed {
+            *live = original;
+            let reason = if instance_warnings.is_empty() {
+                "the instance missed the target or made no material change".to_string()
+            } else {
+                instance_warnings.join(" ")
+            };
+            warnings.push(format!(
+                "Feature pattern '{node_id}': instance {instance} failed ({reason}); the entire pattern was rolled back."
+            ));
+            return;
+        }
+        if let Some(after) = live.iter().find(|body| body.id == target) {
+            collect_feature_pattern_face_names(
+                after,
+                &operation_id,
+                node_id,
+                source_feature,
+                instance,
+                &mut durable_pattern_faces,
+            );
+        }
+    }
+    if let Some(target_body) = live.iter_mut().find(|body| body.id == target) {
+        restore_feature_pattern_face_names(target_body, &durable_pattern_faces);
+    }
 }
 
 /// Evaluate one Pattern node: replicate the source BODY's solids by the

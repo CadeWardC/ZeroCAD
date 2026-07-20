@@ -68,6 +68,18 @@ pub enum TopoName {
         instance: usize,
         face: usize,
     },
+    /// `pattern:{node}:instance:{i}:source:{source topology name}`
+    FeaturePatternFace {
+        node: String,
+        instance: usize,
+        source: String,
+    },
+    /// `draft:{node}:region:{i}:face:{k}`
+    DraftFace {
+        node: String,
+        region: usize,
+        face: usize,
+    },
     /// `entity:{id}:{role}` — solver-created sketch entity provenance.
     Entity { id: u32, role: String },
     /// `mesh:{group}` — reconstructed (non-durable) identity.
@@ -116,7 +128,9 @@ impl TopoName {
             | TopoName::GeneratedFace { node, .. }
             | TopoName::IndexedFace { node, .. }
             | TopoName::RevolveFace { node, .. }
-            | TopoName::PatternFace { node, .. } => Some(node),
+            | TopoName::PatternFace { node, .. }
+            | TopoName::FeaturePatternFace { node, .. }
+            | TopoName::DraftFace { node, .. } => Some(node),
             _ => None,
         }
     }
@@ -182,6 +196,14 @@ impl std::fmt::Display for TopoName {
                 instance,
                 face,
             } => write!(f, "pattern:{node}:inst:{instance}:face:{face}"),
+            TopoName::FeaturePatternFace {
+                node,
+                instance,
+                source,
+            } => write!(f, "pattern:{node}:instance:{instance}:source:{source}"),
+            TopoName::DraftFace { node, region, face } => {
+                write!(f, "draft:{node}:region:{region}:face:{face}")
+            }
             TopoName::Entity { id, role } => write!(f, "entity:{id}:{role}"),
             TopoName::MeshGroup(g) => write!(f, "mesh:{g}"),
             TopoName::Unrecognized(s) => f.write_str(s),
@@ -305,7 +327,37 @@ fn parse_name(s: &str) -> Option<TopoName> {
             });
         }
     }
+    if let Some(rest) = s.strip_prefix("draft:") {
+        let region_idx = rest.find(":region:")?;
+        let node = &rest[..region_idx];
+        let after_region = &rest[region_idx + 8..];
+        let face_idx = after_region.find(":face:")?;
+        let region = after_region[..face_idx].parse().ok()?;
+        let face = after_region[face_idx + 6..].parse().ok()?;
+        if !node.is_empty() {
+            return Some(TopoName::DraftFace {
+                node: node.to_string(),
+                region,
+                face,
+            });
+        }
+    }
     if let Some(rest) = s.strip_prefix("pattern:") {
+        if let Some(instance_idx) = rest.find(":instance:") {
+            let node = &rest[..instance_idx];
+            let after_instance = &rest[instance_idx + 10..];
+            let source_idx = after_instance.find(":source:")?;
+            let instance = after_instance[..source_idx].parse().ok()?;
+            let source = &after_instance[source_idx + 8..];
+            if !node.is_empty() && !source.is_empty() && TopoName::parse(source).is_durable() {
+                return Some(TopoName::FeaturePatternFace {
+                    node: node.to_string(),
+                    instance,
+                    source: source.to_string(),
+                });
+            }
+            return None;
+        }
         let instance_idx = rest.find(":inst:")?;
         let node = &rest[..instance_idx];
         let after_instance = &rest[instance_idx + 6..];
@@ -367,6 +419,8 @@ mod tests {
             "sweep:sweep_6:face:3",
             "stl:import_7:face:11",
             "revolve:revolve_8:region:2:face:4",
+            "draft:draft_9:region:1:face:5",
+            "pattern:feature_pattern_10:instance:2:source:cut:hole_3:tool-face:0",
             "pattern:pattern_9:inst:3:face:6",
             "entity:12:line",
             "mesh:4",
@@ -411,6 +465,15 @@ mod tests {
         assert_eq!(
             TopoName::parse("box_box_1:face:+x").owner_node(),
             Some("box_1")
+        );
+        assert_eq!(
+            TopoName::parse("draft:draft_9:region:1:face:5").owner_node(),
+            Some("draft_9")
+        );
+        assert_eq!(
+            TopoName::parse("pattern:feature_pattern_10:instance:2:source:cut:hole_3:tool-face:0")
+                .owner_node(),
+            Some("feature_pattern_10")
         );
     }
 }

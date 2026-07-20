@@ -165,6 +165,7 @@ fn evaluator_family_dependency_matrix_is_explicit() {
         Family::Shell,
         Family::Hole,
         Family::Pattern,
+        Family::FeaturePattern,
         Family::BodyTransform,
         Family::Thread,
         Family::BodyJoin,
@@ -177,6 +178,7 @@ fn evaluator_family_dependency_matrix_is_explicit() {
         Family::FaceDelete,
         Family::FaceThicken,
         Family::ImportStl,
+        Family::Draft,
     ];
     let registered: Vec<_> = crate::document::FeatureRegistry::BUILTINS
         .iter()

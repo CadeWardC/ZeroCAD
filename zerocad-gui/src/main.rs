@@ -19,6 +19,7 @@ mod bug_report;
 mod combine_ui;
 mod direct_edit_ui;
 mod document_worker;
+mod draft_ui;
 mod dxf_ui;
 mod edgemod;
 mod evaluation_worker;
@@ -46,6 +47,7 @@ mod thumbnail;
 use body_ops_ui::{ScaleBodyOp, SplitBodyOp};
 use combine_ui::CombineOp;
 use direct_edit_ui::DirectFaceCommand;
+use draft_ui::DraftOp;
 use edgemod::EdgeModOp;
 use expr::Autocomplete;
 use extrude::ExtrudeOp;
@@ -176,6 +178,15 @@ pub enum SketchTool {
     /// Regular N-gon with its edge midpoints on the drag circle (center → flat
     /// sets the apothem and the rotation). Side count comes from the toolbar.
     PolygonCircumscribed,
+    /// Center-to-center slot: click both end centers, then a third point to set
+    /// the full width. Coincident centers produce a circle.
+    Slot,
+    /// Associative offset of selected line/arc/circle entities. Click sources,
+    /// then click the creation side/distance.
+    Offset,
+    /// Remove the exact line/arc/circle span under the cursor. The hover result
+    /// is the immutable replacement plan committed by the click.
+    Trim,
     /// Reflect the whole sketch across a 2-point axis (center line). Not a draw
     /// tool in the shape sense — its two clicks define the mirror line.
     Mirror,
@@ -232,6 +243,9 @@ pub enum ToolFamily {
     Circle,
     /// The regular-polygon button, holding the inscribed and circumscribed modes.
     Polygon,
+    Slot,
+    Offset,
+    Trim,
     /// The sketch mirror button (single mode, no flyout).
     Mirror,
     /// The corner-modifier button, holding both Fillet and Chamfer (its flyout
@@ -253,6 +267,9 @@ impl SketchTool {
             | SketchTool::Ellipse
             | SketchTool::ThreePointEllipse => ToolFamily::Circle,
             SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => ToolFamily::Polygon,
+            SketchTool::Slot => ToolFamily::Slot,
+            SketchTool::Offset => ToolFamily::Offset,
+            SketchTool::Trim => ToolFamily::Trim,
             SketchTool::Mirror => ToolFamily::Mirror,
             SketchTool::Fillet => ToolFamily::Corner,
             SketchTool::Chamfer => ToolFamily::Corner,
@@ -276,7 +293,8 @@ impl SketchTool {
             | SketchTool::ThreePointCircle
             | SketchTool::Ellipse
             | SketchTool::ThreePointEllipse => 3,
-            SketchTool::Fillet | SketchTool::Chamfer => 1,
+            SketchTool::Slot => 3,
+            SketchTool::Offset | SketchTool::Trim | SketchTool::Fillet | SketchTool::Chamfer => 1,
         }
     }
 
@@ -290,6 +308,9 @@ impl SketchTool {
                 | SketchTool::ThreePointCircle
                 | SketchTool::Ellipse
                 | SketchTool::ThreePointEllipse
+                | SketchTool::Slot
+                | SketchTool::Offset
+                | SketchTool::Trim
                 | SketchTool::Mirror
         )
     }
@@ -323,6 +344,9 @@ impl SketchTool {
             SketchTool::Ellipse => icons::Icon::Ellipse,
             SketchTool::ThreePointEllipse => icons::Icon::ThreePointEllipse,
             SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => icons::Icon::Polygon,
+            SketchTool::Slot => icons::Icon::Slot,
+            SketchTool::Offset => icons::Icon::Offset,
+            SketchTool::Trim => icons::Icon::Trim,
             SketchTool::Mirror => icons::Icon::Mirror,
             SketchTool::Fillet => icons::Icon::Fillet,
             SketchTool::Chamfer => icons::Icon::Chamfer,
@@ -344,6 +368,9 @@ impl SketchTool {
             SketchTool::ThreePointEllipse => "3-Point Ellipse",
             SketchTool::PolygonInscribed => "Inscribed Polygon",
             SketchTool::PolygonCircumscribed => "Circumscribed Polygon",
+            SketchTool::Slot => "Center-to-Center Slot",
+            SketchTool::Offset => "Offset",
+            SketchTool::Trim => "Trim",
             SketchTool::Mirror => "Mirror",
             SketchTool::Fillet => "Fillet",
             SketchTool::Chamfer => "Chamfer",
@@ -360,6 +387,9 @@ impl ToolFamily {
             ToolFamily::Rectangle => SketchTool::Rectangle,
             ToolFamily::Circle => SketchTool::Circle,
             ToolFamily::Polygon => SketchTool::PolygonInscribed,
+            ToolFamily::Slot => SketchTool::Slot,
+            ToolFamily::Offset => SketchTool::Offset,
+            ToolFamily::Trim => SketchTool::Trim,
             ToolFamily::Mirror => SketchTool::Mirror,
             ToolFamily::Corner => SketchTool::Fillet,
         }
@@ -385,6 +415,9 @@ impl ToolFamily {
                 SketchTool::PolygonInscribed,
                 SketchTool::PolygonCircumscribed,
             ],
+            ToolFamily::Slot => &[SketchTool::Slot],
+            ToolFamily::Offset => &[SketchTool::Offset],
+            ToolFamily::Trim => &[SketchTool::Trim],
             ToolFamily::Mirror => &[SketchTool::Mirror],
             ToolFamily::Corner => &[SketchTool::Fillet, SketchTool::Chamfer],
         }
@@ -403,6 +436,7 @@ fn sketch_variable_dims(shapes: &[SketchShape]) -> Vec<String> {
                 length, angle_deg, ..
             } => vec![length, angle_deg],
             SketchShape::RegularPolygon { diameter, .. } => vec![diameter],
+            SketchShape::Slot { width, .. } => vec![width],
             SketchShape::Spline { .. } | SketchShape::Imported { .. } | SketchShape::Raw { .. } => {
                 vec![]
             }
@@ -465,6 +499,20 @@ pub enum DatumKind {
     ThreePointPlane,
     Axis,
     Point,
+    PlaneFromFace(zerocad_core::parametric::FaceRef),
+    AxisFromEdge(zerocad_core::parametric::EdgeRef),
+    AxisFromFace(zerocad_core::parametric::FaceRef),
+    AxisFromVertices(
+        zerocad_core::parametric::VertexRef,
+        zerocad_core::parametric::VertexRef,
+    ),
+    PointFromVertex(zerocad_core::parametric::VertexRef),
+    PointBetweenVertices(
+        zerocad_core::parametric::VertexRef,
+        zerocad_core::parametric::VertexRef,
+    ),
+    PointOnEdge(zerocad_core::parametric::EdgeRef),
+    PointAtCircleCenter(zerocad_core::parametric::EdgeRef),
 }
 
 /// What the user did on a feature-tree row this frame.
@@ -597,8 +645,25 @@ pub(crate) struct PendingCommitVisual {
     pub(crate) exact_bodies: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingMirrorJoinFeedback {
+    feature_id: String,
+    source_body_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MirrorJoinOutcome {
+    Evaluating,
+    Joined,
+    Separate,
+    Unresolved(String),
+}
+
 struct ZeroCadApp {
     pending_visual: Option<PendingCommitVisual>,
+    /// A just-created Mirror+Join whose actual joined/separate outcome is
+    /// waiting on the committed evaluator. This is UI-only derived state.
+    pending_mirror_join_feedback: Option<PendingMirrorJoinFeedback>,
     /// Authoritative editable project. The runtime graph is an evaluator
     /// projection owned by this document rather than the application root.
     document: Document,
@@ -606,6 +671,9 @@ struct ZeroCadApp {
     /// One mesh per solid body (node id + mesh), so faces/edges/points can be
     /// picked per body. Replaces the old single combined `current_mesh`.
     body_meshes: SharedBodyMeshes,
+    /// Construction geometry resolved alongside `body_meshes` at the same
+    /// document revision. This includes face/edge/vertex-derived datums.
+    datum_values: std::collections::HashMap<String, zerocad_core::DatumValue>,
     /// Cached `(vertices, triangles)` totals across `body_meshes`, refreshed
     /// only when the meshes change so the status bar doesn't re-sum every
     /// vertex/index of the whole model on every frame.
@@ -730,6 +798,19 @@ struct ZeroCadApp {
     /// Editable radius/setback for the Fillet/Chamfer tools (a number or a
     /// variable expression).
     corner_radius_text: String,
+    /// Optional expression for the Offset distance. Empty means the placement
+    /// click supplies the exact signed distance.
+    offset_distance_text: String,
+    /// Associative sketch-pattern inputs. X/Y are a direction for Linear and a
+    /// center for Circular; source expressions are persisted where supported.
+    sketch_pattern_x_text: String,
+    sketch_pattern_y_text: String,
+    sketch_pattern_spacing_text: String,
+    sketch_pattern_count_text: String,
+    sketch_pattern_angle_text: String,
+    /// Immutable exact trim plan currently under the cursor. A successful
+    /// click consumes this same plan so hover and commit cannot diverge.
+    sketch_trim_preview: Option<zerocad_core::sketch::TrimPreview>,
     /// Side count for the regular-polygon tools (inscribed/circumscribed),
     /// editable in the sketch toolbar. Clamped to a sane 3..=64 range.
     polygon_sides: u32,
@@ -850,6 +931,8 @@ struct ZeroCadApp {
     thread_op: Option<ThreadOp>,
     /// The in-progress Sweep tool dialog (profile chosen, picking path).
     sweep_op: Option<SweepOp>,
+    /// The in-progress standalone planar-face Draft command.
+    draft_op: Option<DraftOp>,
     /// Memoized live Cut/Join preview: `(input hash, evaluated bodies)`. The
     /// preview re-runs the whole parametric model (truck booleans), which is far
     /// too slow to redo every frame, so it's cached and only recomputed when the

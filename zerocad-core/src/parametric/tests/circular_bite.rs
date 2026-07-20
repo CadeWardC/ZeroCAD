@@ -41,6 +41,8 @@ fn rect_with_circular_hole_newbody_renders() {
                 region_indices: sel.clone(),
                 mode: ExtrudeMode::NewBody,
                 depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
             },
         });
         g2.add_dependency("s", "e");

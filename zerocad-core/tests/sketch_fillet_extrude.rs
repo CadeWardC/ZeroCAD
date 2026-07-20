@@ -60,6 +60,8 @@ fn filleted_rect(radius: f64, corners: &[(f32, f32)]) -> (usize, Vec<f64>, bool,
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("sketch_1", "extrude_2");
@@ -167,6 +169,8 @@ fn rounded_rectangle_display_mesh_is_the_analytic_part() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("sketch_1", "extrude_2");

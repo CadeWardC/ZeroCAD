@@ -38,17 +38,18 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    body_output_id, boolean_region_plan, complete_selected_circles, edge_wedge_is_concave_mesh,
-    AxisBase, BodyInspection, BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef,
-    DatumValue, DiagnosticCode, DiagnosticParameterValue, DiagnosticSeverity, EdgeInspection,
-    EdgePairInspection, EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation,
-    EvaluationDiagnostic, EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings,
-    EvaluationTrace, ExtrudeMode, FaceInspection, FeatureNode, FeatureTiming, FeatureType,
-    HoleApplication, HoleFit, HoleKind, HoleManufacturingMetadata, HoleStandardPreset,
-    InterferencePair, LegacyReferenceBackfills, ParametricGraph, PatternKind, PlaneBase,
-    PristineMeshReuse, ResolvedStandardGeometry, StandardReference, StandardsDataPack,
-    StandardsFamily, TopologyEdgeRef, Variable, VariableDiagnostic, VariableResolution,
-    HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
+    body_output_id, boolean_region_plan, complete_selected_circles, drafted_region_solid,
+    edge_wedge_is_concave_mesh, AxisBase, BodyInspection, BooleanRegionPlan, DatumAxisDef,
+    DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticCode, DiagnosticParameterValue,
+    DiagnosticSeverity, EdgeInspection, EdgePairInspection, EdgeRef, EvaluationCacheSnapshot,
+    EvaluationCancellation, EvaluationDiagnostic, EvaluationError, EvaluationOutput,
+    EvaluationQuality, EvaluationTimings, EvaluationTrace, ExtrudeMode, FaceInspection,
+    FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
+    HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, LegacyReferenceBackfills,
+    ParametricGraph, PatternKind, PlaneBase, PristineMeshReuse, ResolvedStandardGeometry,
+    StandardReference, StandardsDataPack, StandardsFamily, TopologyEdgeRef, TopologyVertexRef,
+    Variable, VariableDiagnostic, VariableResolution, VertexRef, HOLE_STANDARD_PRESETS,
+    STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
 };
 pub use release::{
     validate_compatibility_exception_ledger, validate_phase7_exception_ledger,
@@ -61,8 +62,9 @@ pub use sketch::{
     effective_curves_solved, overlap_clusters, reflect_curves_across, shape_loops, shapes_cross,
     shapes_overlap, Circle, CornerKind, CornerMod, Dimension, ImportedSketchMetadata, LineSegment,
     Region, RegionProvenance, RegionProvenanceFragment, RegionWithProvenance, ShapeLoop,
-    SketchCurves, SketchImportFormat, SketchMirror, SketchShape, Spline, SplineContinuity,
-    SplineKind,
+    SketchCurves, SketchImportFormat, SketchMirror, SketchPatternError, SketchPatternEvaluation,
+    SketchPatternKind, SketchPatternOperation, SketchPatternSpanId, SketchShape, Spline,
+    SplineContinuity, SplineKind,
 };
 pub use stl::{
     meshes_to_3mf, meshes_to_binary_stl, read_stl_mesh, write_binary_stl, StlImportError,

@@ -22,6 +22,7 @@ pub(crate) struct SweepOp {
     pub(crate) profile_region: usize,
     pub(crate) path_sketch: Option<String>,
     pub(crate) mode: ExtrudeMode,
+    pub(crate) total_twist_text: String,
 }
 
 impl ZeroCadApp {
@@ -89,6 +90,7 @@ impl ZeroCadApp {
             profile_region,
             path_sketch: None,
             mode: ExtrudeMode::NewBody,
+            total_twist_text: "0".to_string(),
         });
         self.status_msg = "Sweep: choose the path sketch, then OK.".to_string();
     }
@@ -113,6 +115,7 @@ impl ZeroCadApp {
         let mut commit = false;
         let mut cancel = false;
         let mut op_new = op.clone();
+        let variables = self.visible_variable_map();
         egui::Area::new(egui::Id::new("sweep_dialog"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
@@ -154,6 +157,16 @@ impl ZeroCadApp {
                     }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        ui.label("Total twist");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut op_new.total_twist_text)
+                                .desired_width(70.0),
+                        );
+                        ui.label("°");
+                        crate::expr::evaluation_hint(ui, &op_new.total_twist_text, &variables, "°");
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
                         for (m, label) in [
                             (ExtrudeMode::NewBody, "New Body"),
                             (ExtrudeMode::Join, "Join"),
@@ -192,6 +205,14 @@ impl ZeroCadApp {
         let Some(path_sketch) = op.path_sketch.clone() else {
             return;
         };
+        let Some(total_twist_deg) = self.eval_dim(&op.total_twist_text) else {
+            self.status_msg = "Sweep twist must be a number or valid expression.".to_string();
+            return;
+        };
+        if !total_twist_deg.is_finite() {
+            self.status_msg = "Sweep twist must be finite.".to_string();
+            return;
+        }
         // Cut/Join from a face-attached profile targets that body.
         let target = if matches!(op.mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
             self.document
@@ -214,6 +235,9 @@ impl ZeroCadApp {
                 path_sketch: path_sketch.clone(),
                 mode: op.mode,
                 target,
+                total_twist_deg,
+                total_twist_expr: zerocad_core::expr::preserves_source(&op.total_twist_text)
+                    .then(|| op.total_twist_text.trim().to_string()),
             },
         });
         self.document.add_dependency(&op.profile_sketch, &id);

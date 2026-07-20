@@ -37,6 +37,8 @@ fn add_targeted_extrude(
             region_indices,
             mode,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency(sketch, id);

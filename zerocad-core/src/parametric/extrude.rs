@@ -1,5 +1,503 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtrudeDraftError {
+    InvalidAngle(f32),
+    UnsupportedCurves,
+    Offset(openrcad::sketch::OffsetError),
+    ProfileCollapse,
+    ChangedEdgeCorrespondence,
+    RegionCollision,
+    KernelFailure,
+}
+
+impl std::fmt::Display for ExtrudeDraftError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAngle(angle) => write!(
+                formatter,
+                "draft angle {angle:.3}° is invalid; it must be finite and strictly between -89° and 89°"
+            ),
+            Self::UnsupportedCurves => formatter.write_str(
+                "draft v1 supports only planar straight-edged regions; circular, arc, ellipse, and spline boundaries remain unresolved",
+            ),
+            Self::Offset(error) => write!(formatter, "draft profile offset failed: {error}"),
+            Self::ProfileCollapse => formatter.write_str(
+                "draft collapses or inverts a material boundary before the far section",
+            ),
+            Self::ChangedEdgeCorrespondence => formatter.write_str(
+                "draft changed edge correspondence between the base and far sections",
+            ),
+            Self::RegionCollision => formatter.write_str(
+                "drafted far sections collide or touch; the multi-region result is ambiguous",
+            ),
+            Self::KernelFailure => {
+                formatter.write_str("the kernel could not build a closed drafted solid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExtrudeDraftError {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DraftedRegionLoops {
+    pub(crate) top_boundary: Vec<(f32, f32)>,
+    pub(crate) top_holes: Vec<Vec<(f32, f32)>>,
+}
+
+fn signed_area(points: &[(f32, f32)]) -> f64 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(&(ax, ay), &(bx, by))| f64::from(ax) * f64::from(by) - f64::from(bx) * f64::from(ay))
+        .sum::<f64>()
+        * 0.5
+}
+
+fn line_loop(
+    points: &[(f32, f32)],
+    loop_index: usize,
+) -> Result<openrcad::sketch::ArrangementLoop<(usize, usize)>, ExtrudeDraftError> {
+    use openrcad::foundation::{Dir2d, Pnt2d};
+    use openrcad::geom2d::{CurveSpan, GeomCurve2d, Line2d};
+
+    if points.len() < 3 || !signed_area(points).is_finite() {
+        return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+    }
+    let mut spans = Vec::with_capacity(points.len());
+    for (edge_index, (&start, &end)) in points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .enumerate()
+    {
+        let dx = f64::from(end.0 - start.0);
+        let dy = f64::from(end.1 - start.1);
+        let length = dx.hypot(dy);
+        if !length.is_finite() || length <= 1.0e-7 {
+            return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+        }
+        spans.push(CurveSpan::new(
+            GeomCurve2d::line(Line2d::from_point_dir(
+                Pnt2d::new(f64::from(start.0), f64::from(start.1)),
+                Dir2d::new(dx / length, dy / length),
+            )),
+            0.0,
+            length,
+            (loop_index, edge_index),
+        ));
+    }
+    Ok(openrcad::sketch::ArrangementLoop {
+        spans,
+        signed_area: signed_area(points),
+    })
+}
+
+fn span_loop_points<P>(loop_: &openrcad::sketch::ArrangementLoop<P>) -> Vec<(f32, f32)> {
+    loop_
+        .spans
+        .iter()
+        .map(|span| {
+            let point = span.start();
+            (point.x() as f32, point.y() as f32)
+        })
+        .collect()
+}
+
+fn correspondence_is_unchanged(
+    input: &openrcad::sketch::ArrangementRegion<(usize, usize)>,
+    output: &openrcad::sketch::ArrangementRegion<(usize, usize)>,
+) -> bool {
+    let provenance = |loop_: &openrcad::sketch::ArrangementLoop<(usize, usize)>| {
+        let mut ids: Vec<_> = loop_.spans.iter().map(|span| span.provenance).collect();
+        ids.sort_unstable();
+        ids
+    };
+    if provenance(&input.outer) != provenance(&output.outer)
+        || input.holes.len() != output.holes.len()
+    {
+        return false;
+    }
+    let mut input_holes: Vec<_> = input.holes.iter().map(provenance).collect();
+    let mut output_holes: Vec<_> = output.holes.iter().map(provenance).collect();
+    input_holes.sort();
+    output_holes.sort();
+    input_holes == output_holes
+}
+
+pub(crate) fn drafted_region_loops(
+    boundary: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    angle_deg: f32,
+) -> Result<DraftedRegionLoops, ExtrudeDraftError> {
+    if !angle_deg.is_finite() || angle_deg.abs() >= 89.0 {
+        return Err(ExtrudeDraftError::InvalidAngle(angle_deg));
+    }
+    if angle_deg.abs() <= f32::EPSILON {
+        return Ok(DraftedRegionLoops {
+            top_boundary: boundary.to_vec(),
+            top_holes: holes.to_vec(),
+        });
+    }
+    let outer = line_loop(boundary, 0)?;
+    let hole_loops = holes
+        .iter()
+        .enumerate()
+        .map(|(index, hole)| line_loop(hole, index + 1))
+        .collect::<Result<Vec<_>, _>>()?;
+    let area = outer.area() - hole_loops.iter().map(|hole| hole.area()).sum::<f64>();
+    let input = openrcad::sketch::ArrangementRegion {
+        outer,
+        holes: hole_loops,
+        area,
+    };
+    // Product convention: positive draft removes material away from the sketch
+    // plane (far section contracts); negative draft adds material (expands).
+    let distance = -f64::from(depth.abs()) * f64::from(angle_deg).to_radians().tan();
+    let output = openrcad::sketch::offset_material_region(
+        &input,
+        distance,
+        openrcad::sketch::OffsetOptions { tolerance: 1.0e-6 },
+    )
+    .map_err(ExtrudeDraftError::Offset)?;
+    if !correspondence_is_unchanged(&input, &output) {
+        return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+    }
+    let area_tolerance = 1.0e-8;
+    let outer_moved_correctly = if distance > 0.0 {
+        output.outer.area() > input.outer.area() + area_tolerance
+    } else {
+        output.outer.area() + area_tolerance < input.outer.area()
+    };
+    let holes_moved_correctly = input.holes.iter().all(|input_hole| {
+        output
+            .holes
+            .iter()
+            .find(|output_hole| {
+                let mut input_ids: Vec<_> = input_hole
+                    .spans
+                    .iter()
+                    .map(|span| span.provenance)
+                    .collect();
+                let mut output_ids: Vec<_> = output_hole
+                    .spans
+                    .iter()
+                    .map(|span| span.provenance)
+                    .collect();
+                input_ids.sort_unstable();
+                output_ids.sort_unstable();
+                input_ids == output_ids
+            })
+            .is_some_and(|output_hole| {
+                if distance > 0.0 {
+                    output_hole.area() + area_tolerance < input_hole.area()
+                } else {
+                    output_hole.area() > input_hole.area() + area_tolerance
+                }
+            })
+    });
+    if !outer_moved_correctly || !holes_moved_correctly || output.area <= area_tolerance {
+        return Err(ExtrudeDraftError::ProfileCollapse);
+    }
+    Ok(DraftedRegionLoops {
+        top_boundary: span_loop_points(&output.outer),
+        top_holes: output.holes.iter().map(span_loop_points).collect(),
+    })
+}
+
+fn orientation(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f64 {
+    f64::from(b.0 - a.0) * f64::from(c.1 - a.1) - f64::from(b.1 - a.1) * f64::from(c.0 - a.0)
+}
+
+fn segments_touch(a: (f32, f32), b: (f32, f32), c: (f32, f32), d: (f32, f32)) -> bool {
+    let (ab_c, ab_d) = (orientation(a, b, c), orientation(a, b, d));
+    let (cd_a, cd_b) = (orientation(c, d, a), orientation(c, d, b));
+    let tolerance = 1.0e-8;
+    if ab_c.abs() <= tolerance
+        || ab_d.abs() <= tolerance
+        || cd_a.abs() <= tolerance
+        || cd_b.abs() <= tolerance
+    {
+        let overlaps = |a: f32, b: f32, c: f32| c >= a.min(b) - 1.0e-6 && c <= a.max(b) + 1.0e-6;
+        return (ab_c.abs() <= tolerance && overlaps(a.0, b.0, c.0) && overlaps(a.1, b.1, c.1))
+            || (ab_d.abs() <= tolerance && overlaps(a.0, b.0, d.0) && overlaps(a.1, b.1, d.1))
+            || (cd_a.abs() <= tolerance && overlaps(c.0, d.0, a.0) && overlaps(c.1, d.1, a.1))
+            || (cd_b.abs() <= tolerance && overlaps(c.0, d.0, b.0) && overlaps(c.1, d.1, b.1));
+    }
+    (ab_c > 0.0) != (ab_d > 0.0) && (cd_a > 0.0) != (cd_b > 0.0)
+}
+
+fn loop_edges(points: &[(f32, f32)]) -> impl Iterator<Item = ((f32, f32), (f32, f32))> + '_ {
+    points
+        .iter()
+        .copied()
+        .zip(points.iter().copied().cycle().skip(1))
+        .take(points.len())
+}
+
+fn point_in_loop(point: (f32, f32), polygon: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    for (a, b) in loop_edges(polygon) {
+        if (a.1 > point.1) != (b.1 > point.1)
+            && point.0 < (b.0 - a.0) * (point.1 - a.1) / (b.1 - a.1) + a.0
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn point_in_material(point: (f32, f32), region: &DraftedRegionLoops) -> bool {
+    point_in_loop(point, &region.top_boundary)
+        && !region
+            .top_holes
+            .iter()
+            .any(|hole| point_in_loop(point, hole))
+}
+
+pub(crate) fn validate_drafted_region_set(
+    regions: &[DraftedRegionLoops],
+) -> Result<(), ExtrudeDraftError> {
+    for first in 0..regions.len() {
+        for second in first + 1..regions.len() {
+            let first_loops = std::iter::once(&regions[first].top_boundary)
+                .chain(regions[first].top_holes.iter());
+            let second_loops: Vec<_> = std::iter::once(&regions[second].top_boundary)
+                .chain(regions[second].top_holes.iter())
+                .collect();
+            for first_loop in first_loops {
+                for second_loop in &second_loops {
+                    if loop_edges(first_loop).any(|(a, b)| {
+                        loop_edges(second_loop).any(|(c, d)| segments_touch(a, b, c, d))
+                    }) {
+                        return Err(ExtrudeDraftError::RegionCollision);
+                    }
+                }
+            }
+            if regions[first]
+                .top_boundary
+                .first()
+                .is_some_and(|point| point_in_material(*point, &regions[second]))
+                || regions[second]
+                    .top_boundary
+                    .first()
+                    .is_some_and(|point| point_in_material(*point, &regions[first]))
+            {
+                return Err(ExtrudeDraftError::RegionCollision);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn drafted_region_solid(
+    boundary: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &CoordinateSystem,
+    angle_deg: f32,
+) -> Result<KernelSolid, ExtrudeDraftError> {
+    let drafted = drafted_region_loops(boundary, holes, depth, angle_deg)?;
+    let top_cs = cs.with_origin(cs.origin.add(cs.n.mul(depth)));
+    let solid = crate::mock_kernel::lofted_solid(&[
+        (*cs, boundary.to_vec(), holes.to_vec()),
+        (top_cs, drafted.top_boundary, drafted.top_holes),
+    ])
+    .ok_or(ExtrudeDraftError::KernelFailure)?;
+    let expected_faces = 2 + boundary.len() + holes.iter().map(Vec::len).sum::<usize>();
+    if solid.shell().faces().len() != expected_faces {
+        return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+    }
+    Ok(solid)
+}
+
+fn shifted_loop_with_selected_edges(
+    points: &[(f32, f32)],
+    selected: &[bool],
+    shift_into_material: f32,
+    outer: bool,
+) -> Result<Vec<(f32, f32)>, ExtrudeDraftError> {
+    if points.len() < 3 || selected.len() != points.len() {
+        return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+    }
+    let orientation_sign = if signed_area(points) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let material_sign = if outer {
+        orientation_sign
+    } else {
+        -orientation_sign
+    };
+    let mut lines = Vec::with_capacity(points.len());
+    for (index, (&start, &end)) in points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .enumerate()
+    {
+        let direction = (end.0 - start.0, end.1 - start.1);
+        let length = direction.0.hypot(direction.1);
+        if !length.is_finite() || length <= 1.0e-7 {
+            return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+        }
+        let amount = if selected[index] {
+            shift_into_material
+        } else {
+            0.0
+        };
+        let offset = (
+            -direction.1 / length * material_sign * amount,
+            direction.0 / length * material_sign * amount,
+        );
+        lines.push((
+            (start.0 + offset.0, start.1 + offset.1),
+            (end.0 + offset.0, end.1 + offset.1),
+        ));
+    }
+    let mut output = Vec::with_capacity(points.len());
+    for index in 0..points.len() {
+        let previous = lines[(index + points.len() - 1) % points.len()];
+        let current = lines[index];
+        let a = (previous.1 .0 - previous.0 .0, previous.1 .1 - previous.0 .1);
+        let b = (current.1 .0 - current.0 .0, current.1 .1 - current.0 .1);
+        let denominator = a.0 * b.1 - a.1 * b.0;
+        if denominator.abs() <= 1.0e-8 {
+            return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+        }
+        let delta = (current.0 .0 - previous.0 .0, current.0 .1 - previous.0 .1);
+        let t = (delta.0 * b.1 - delta.1 * b.0) / denominator;
+        let point = (previous.0 .0 + a.0 * t, previous.0 .1 + a.1 * t);
+        if !point.0.is_finite() || !point.1.is_finite() {
+            return Err(ExtrudeDraftError::ProfileCollapse);
+        }
+        output.push(point);
+    }
+    if signed_area(&output).signum() != signed_area(points).signum()
+        || signed_area(&output).abs() <= 1.0e-8
+    {
+        return Err(ExtrudeDraftError::ProfileCollapse);
+    }
+    Ok(output)
+}
+
+pub(crate) fn drafted_region_solid_selected(
+    boundary: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+    depth: f32,
+    cs: &CoordinateSystem,
+    angle_deg: f32,
+    selected_outer: &[bool],
+    selected_holes: &[Vec<bool>],
+) -> Result<KernelSolid, ExtrudeDraftError> {
+    if !angle_deg.is_finite() || angle_deg.abs() >= 89.0 {
+        return Err(ExtrudeDraftError::InvalidAngle(angle_deg));
+    }
+    if selected_outer.len() != boundary.len()
+        || selected_holes.len() != holes.len()
+        || holes
+            .iter()
+            .zip(selected_holes)
+            .any(|(hole, selected)| hole.len() != selected.len())
+    {
+        return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+    }
+    let shift = depth.abs() * angle_deg.to_radians().tan();
+    let top_boundary = shifted_loop_with_selected_edges(boundary, selected_outer, shift, true)?;
+    let top_holes = holes
+        .iter()
+        .zip(selected_holes)
+        .map(|(hole, selected)| shifted_loop_with_selected_edges(hole, selected, shift, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let drafted = DraftedRegionLoops {
+        top_boundary: top_boundary.clone(),
+        top_holes: top_holes.clone(),
+    };
+    validate_drafted_region_set(std::slice::from_ref(&drafted))?;
+    let top_cs = cs.with_origin(cs.origin.add(cs.n.mul(depth)));
+    let solid = crate::mock_kernel::lofted_solid(&[
+        (*cs, boundary.to_vec(), holes.to_vec()),
+        (top_cs, top_boundary, top_holes),
+    ])
+    .ok_or(ExtrudeDraftError::KernelFailure)?;
+    let expected_faces = 2 + boundary.len() + holes.iter().map(Vec::len).sum::<usize>();
+    if solid.shell().faces().len() != expected_faces {
+        return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
+    }
+    Ok(solid)
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    fn rectangle(min: f32, max: f32) -> Vec<(f32, f32)> {
+        vec![(min, min), (max, min), (max, max), (min, max)]
+    }
+
+    #[test]
+    fn signed_draft_offsets_the_far_section_analytically() {
+        let boundary = rectangle(0.0, 10.0);
+        let contracted = drafted_region_loops(&boundary, &[], 10.0, 5.0).unwrap();
+        let expanded = drafted_region_loops(&boundary, &[], 10.0, -5.0).unwrap();
+        let offset = 10.0 * 5.0_f32.to_radians().tan();
+        let expanded_min = expanded
+            .top_boundary
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::INFINITY, f32::min);
+        let contracted_min = contracted
+            .top_boundary
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::INFINITY, f32::min);
+        assert!((contracted_min - offset).abs() < 1.0e-4);
+        assert!((expanded_min + offset).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn draft_preserves_holes_and_edge_correspondence() {
+        let boundary = rectangle(0.0, 20.0);
+        let hole = rectangle(7.0, 13.0);
+        let drafted = drafted_region_loops(&boundary, std::slice::from_ref(&hole), 5.0, 3.0)
+            .expect("straight holed region should draft");
+        assert_eq!(drafted.top_boundary.len(), boundary.len());
+        assert_eq!(drafted.top_holes.len(), 1);
+        assert_eq!(drafted.top_holes[0].len(), hole.len());
+        let solid = drafted_region_solid(&boundary, &[hole], 5.0, &CoordinateSystem::XY, 3.0)
+            .expect("drafted holed solid");
+        assert_eq!(solid.shell().faces().len(), 10);
+    }
+
+    #[test]
+    fn invalid_and_collapsing_drafts_reject_atomically() {
+        let boundary = rectangle(0.0, 2.0);
+        assert!(matches!(
+            drafted_region_loops(&boundary, &[], 2.0, 89.0),
+            Err(ExtrudeDraftError::InvalidAngle(_))
+        ));
+        assert!(matches!(
+            drafted_region_loops(&boundary, &[], 10.0, 45.0),
+            Err(ExtrudeDraftError::Offset(_) | ExtrudeDraftError::ProfileCollapse)
+        ));
+    }
+
+    #[test]
+    fn expanding_far_sections_reject_region_collisions() {
+        let first = drafted_region_loops(&rectangle(0.0, 4.0), &[], 5.0, -10.0).unwrap();
+        let second_boundary = vec![(5.0, 0.0), (9.0, 0.0), (9.0, 4.0), (5.0, 4.0)];
+        let second = drafted_region_loops(&second_boundary, &[], 5.0, -10.0).unwrap();
+        assert_eq!(
+            validate_drafted_region_set(&[first, second]),
+            Err(ExtrudeDraftError::RegionCollision)
+        );
+    }
+}
+
 pub(crate) fn stamp_sketch_extrude_edge_refs(
     mesh: &mut MockMesh,
     body_id: &str,
@@ -75,14 +573,16 @@ pub(crate) fn stamp_sketch_extrude_edge_refs(
 
 /// Stamp durable names onto an extruded region's **faces**, the face analogue of
 /// [`stamp_sketch_extrude_edge_refs`]. Each cap becomes
-/// `sketch:{body}:region:{i}:face:{top|bottom}` and each wall
-/// `sketch:{body}:region:{i}:face:side[:occ:n]`. Faces are the primary named
+/// `sketch:{body}:region:{i}:face:{top|bottom}`. Drafted walls supplied with
+/// provenance are owned by the source curve fragment; compatibility calls
+/// retain `sketch:{body}:region:{i}:face:side[:occ:n]`. Faces are the primary named
 /// entity — an edge's identity derives from the pair of faces it separates — so
 /// this is what a sketch-on-face placement or a cut/join target pins to.
 pub(crate) fn stamp_sketch_extrude_face_refs(
     mesh: &mut MockMesh,
     body_id: &str,
     region_index: usize,
+    provenance: Option<&RegionProvenance>,
     cs: &CoordinateSystem,
     depth: f32,
 ) {
@@ -93,7 +593,20 @@ pub(crate) fn stamp_sketch_extrude_face_refs(
     let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, face_ref) in mesh.face_refs.iter().enumerate() {
         let role = sketch_extrude_face_role(face_ref.normal, cs, depth);
-        let base_id = format!("sketch:{body_id}:region:{region_index}:face:{role}");
+        let fragment = if role == "side" {
+            provenance.and_then(|provenance| {
+                drafted_face_base_edge(mesh, face_ref.face_id, cs, depth)
+                    .and_then(|edge| sketch_extrude_edge_fragment_id(&edge, provenance, cs))
+            })
+        } else {
+            None
+        };
+        let base_id = fragment.map_or_else(
+            || format!("sketch:{body_id}:region:{region_index}:face:{role}"),
+            |fragment| {
+                format!("sketch:{body_id}:region:{region_index}:face:wall:fragment:{fragment}")
+            },
+        );
         by_base.entry(base_id).or_default().push(i);
     }
     let mut assigned: Vec<Option<String>> = vec![None; mesh.face_refs.len()];
@@ -121,6 +634,67 @@ pub(crate) fn stamp_sketch_extrude_face_refs(
             source_entity_id: None,
         });
     }
+}
+
+pub(crate) fn drafted_face_base_edge(
+    mesh: &MockMesh,
+    face_id: u32,
+    cs: &CoordinateSystem,
+    depth: f32,
+) -> Option<crate::mock_kernel::MeshEdgeRef> {
+    let axis = cs.n.normalize();
+    let tolerance = (depth.abs() * 1.0e-5).max(1.0e-6);
+    let mut base_vertices: Vec<[f32; 3]> = Vec::new();
+    for (triangle, triangle_face_id) in mesh
+        .indices
+        .chunks_exact(3)
+        .zip(mesh.face_ids.iter().copied())
+    {
+        if triangle_face_id != face_id {
+            continue;
+        }
+        for index in triangle {
+            let offset = *index as usize * 6;
+            let vertex = mesh.vertices.get(offset..offset + 3)?;
+            let position = [vertex[0], vertex[1], vertex[2]];
+            let plane_offset = Vec3::new(position[0], position[1], position[2])
+                .sub(cs.origin)
+                .dot(axis);
+            if plane_offset.abs() <= tolerance
+                && !base_vertices.iter().any(|candidate| {
+                    (candidate[0] - position[0]).powi(2)
+                        + (candidate[1] - position[1]).powi(2)
+                        + (candidate[2] - position[2]).powi(2)
+                        <= tolerance * tolerance
+                })
+            {
+                base_vertices.push(position);
+            }
+        }
+    }
+    let mut pair = None;
+    let mut greatest_distance = 0.0_f32;
+    for first in 0..base_vertices.len() {
+        for second in first + 1..base_vertices.len() {
+            let distance = (base_vertices[first][0] - base_vertices[second][0]).powi(2)
+                + (base_vertices[first][1] - base_vertices[second][1]).powi(2)
+                + (base_vertices[first][2] - base_vertices[second][2]).powi(2);
+            if distance > greatest_distance {
+                greatest_distance = distance;
+                pair = Some((base_vertices[first], base_vertices[second]));
+            }
+        }
+    }
+    let (p0, p1) = pair?;
+    Some(crate::mock_kernel::MeshEdgeRef {
+        group: 0,
+        p0,
+        p1,
+        n1: [0.0; 3],
+        n2: [0.0; 3],
+        curve: Some(EdgeCurveHint::Line),
+        topology: None,
+    })
 }
 
 /// Stamp durable PRIMITIVE names onto a box body's faces:
@@ -384,7 +958,7 @@ pub(crate) fn sketch_extrude_linear_fragment_id(
             RegionProvenanceFragment::RawPolyline { shape_id }
             | RegionProvenanceFragment::SketchFilletArc { shape_id }
             | RegionProvenanceFragment::SketchChamferEdge { shape_id }
-            | RegionProvenanceFragment::Slot { shape_id }
+            | RegionProvenanceFragment::Slot { shape_id, .. }
             | RegionProvenanceFragment::RoundedRectangle { shape_id } => {
                 raw.get_or_insert_with(|| provenance_fragment_stable_id(i, fragment, *shape_id));
             }
@@ -445,7 +1019,15 @@ pub(crate) fn provenance_fragment_stable_id(
         RegionProvenanceFragment::CircleArc { .. } => format!("{owner}:circle"),
         RegionProvenanceFragment::SketchFilletArc { .. } => format!("{owner}:sketch-fillet"),
         RegionProvenanceFragment::SketchChamferEdge { .. } => format!("{owner}:sketch-chamfer"),
-        RegionProvenanceFragment::Slot { .. } => format!("{owner}:slot"),
+        RegionProvenanceFragment::Slot { boundary, .. } => {
+            let boundary = match boundary {
+                crate::sketch::SlotBoundary::LeftSide => "side-left",
+                crate::sketch::SlotBoundary::EndCap => "end",
+                crate::sketch::SlotBoundary::RightSide => "side-right",
+                crate::sketch::SlotBoundary::StartCap => "start",
+            };
+            format!("{owner}:slot:{boundary}")
+        }
         RegionProvenanceFragment::RoundedRectangle { .. } => {
             format!("{owner}:rounded-rectangle")
         }

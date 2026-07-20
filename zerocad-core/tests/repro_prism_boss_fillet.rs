@@ -59,6 +59,8 @@ fn prism_boss_graph() -> ParametricGraph {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_1", "extrude_2");
@@ -89,6 +91,8 @@ fn prism_boss_graph() -> ParametricGraph {
             region_indices: vec![],
             mode: ExtrudeMode::Join,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_3", "extrude_4");
@@ -290,6 +294,8 @@ fn prism_only_graph() -> ParametricGraph {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_1", "extrude_2");
@@ -330,6 +336,8 @@ fn fillet_really_sharp_prism_corner_edge_gui_path() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_1", "extrude_2");

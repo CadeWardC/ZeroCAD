@@ -90,6 +90,22 @@ pub struct Arrangement<P> {
     pub edge_count: usize,
 }
 
+/// One analytic intersection between two bounded curve spans.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CurveSpanIntersection {
+    pub first_parameter: f64,
+    pub second_parameter: f64,
+}
+
+/// Pairwise intersection result shared by arrangement construction and editing
+/// operations such as Trim. `coincident` distinguishes an overlapping locus
+/// from a finite set of crossing points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurveSpanIntersections {
+    pub points: Vec<CurveSpanIntersection>,
+    pub coincident: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Intersection {
     first: f64,
@@ -236,6 +252,51 @@ pub fn arrange_curve_spans<P: Clone>(
     })
 }
 
+/// Intersect two bounded analytic spans using the same tolerance and root
+/// isolation policy as [`arrange_curve_spans`].
+pub fn intersect_curve_spans<A, B>(
+    first: &CurveSpan<A>,
+    second: &CurveSpan<B>,
+    options: ArrangementOptions,
+) -> Result<CurveSpanIntersections, ArrangementError> {
+    if !options.tolerance.is_finite() || options.tolerance <= 0.0 {
+        return Err(ArrangementError::InvalidTolerance);
+    }
+    let first_invalid = !first.is_finite()
+        || first.parameter_length() <= options.tolerance
+        || first.start().distance(&first.end()) <= options.tolerance
+            && !is_complete_period(first, options.tolerance);
+    if first_invalid {
+        return Err(ArrangementError::InvalidSpan { index: 0 });
+    }
+    let second_invalid = !second.is_finite()
+        || second.parameter_length() <= options.tolerance
+        || second.start().distance(&second.end()) <= options.tolerance
+            && !is_complete_period(second, options.tolerance);
+    if second_invalid {
+        return Err(ArrangementError::InvalidSpan { index: 1 });
+    }
+    let intersections = span_intersections(first, second, options).map_err(|()| {
+        ArrangementError::UnsupportedPair {
+            first: 0,
+            second: 1,
+            first_kind: first.kind(),
+            second_kind: second.kind(),
+        }
+    })?;
+    let coincident = spans_are_coincident(first, second, &intersections, options.tolerance);
+    Ok(CurveSpanIntersections {
+        points: intersections
+            .into_iter()
+            .map(|intersection| CurveSpanIntersection {
+                first_parameter: intersection.first,
+                second_parameter: intersection.second,
+            })
+            .collect(),
+        coincident,
+    })
+}
+
 fn is_complete_period<P>(span: &CurveSpan<P>, tolerance: f64) -> bool {
     span.curve.is_periodic()
         && (span.parameter_length() - span.curve.period()).abs()
@@ -287,6 +348,42 @@ fn span_intersections<A, B>(
         _ => return Err(()),
     };
     Ok(deduplicate_intersections(raw, options.tolerance))
+}
+
+fn spans_are_coincident<A, B>(
+    first: &CurveSpan<A>,
+    second: &CurveSpan<B>,
+    intersections: &[Intersection],
+    tolerance: f64,
+) -> bool {
+    match (&first.curve, &second.curve) {
+        (GeomCurve2d::Line(a), GeomCurve2d::Line(b)) => {
+            let p = a.location();
+            let q = b.location();
+            let r = a.direction();
+            let s = b.direction();
+            if cross(r.x(), r.y(), s.x(), s.y()).abs() > tolerance
+                || cross(q.x() - p.x(), q.y() - p.y(), r.x(), r.y()).abs() > tolerance
+            {
+                return false;
+            }
+            intersections.iter().enumerate().any(|(index, first_hit)| {
+                intersections[index + 1..].iter().any(|second_hit| {
+                    first
+                        .curve
+                        .point(first_hit.first)
+                        .distance(&first.curve.point(second_hit.first))
+                        > tolerance
+                })
+            })
+        }
+        (GeomCurve2d::Circle(a), GeomCurve2d::Circle(b)) => {
+            a.center().distance(&b.center()) <= tolerance
+                && (a.radius() - b.radius()).abs() <= tolerance
+                && !intersections.is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn line_line<A, B>(
@@ -1093,6 +1190,27 @@ mod tests {
             .regions
             .iter()
             .all(|region| (region.area - 4.0 * PI).abs() < 1.0e-7));
+    }
+
+    #[test]
+    fn pairwise_curve_span_intersections_use_arrangement_parameters() {
+        let horizontal = line(1, (-2.0, 0.0), (2.0, 0.0));
+        let vertical = line(2, (0.0, -2.0), (0.0, 2.0));
+        let result =
+            intersect_curve_spans(&horizontal, &vertical, ArrangementOptions::default()).unwrap();
+        assert!(!result.coincident);
+        assert_eq!(result.points.len(), 1);
+        assert!((result.points[0].first_parameter - 2.0).abs() < 1.0e-9);
+        assert!((result.points[0].second_parameter - 2.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn pairwise_curve_span_intersections_report_overlap() {
+        let first = line(1, (0.0, 0.0), (4.0, 0.0));
+        let second = line(2, (2.0, 0.0), (6.0, 0.0));
+        let result = intersect_curve_spans(&first, &second, ArrangementOptions::default()).unwrap();
+        assert!(result.coincident);
+        assert!(result.points.len() >= 2);
     }
 
     #[test]

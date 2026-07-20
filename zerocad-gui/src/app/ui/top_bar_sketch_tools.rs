@@ -112,6 +112,74 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Native center-to-center slot. Two clicks set the cap
+                        // centers; the third sets the full width.
+                        {
+                            let is_active = self.active_tool == Some(SketchTool::Slot);
+                            let btn = draw_tool_btn(ui, is_active, "Slot", Some(icons::Icon::Slot));
+                            if btn
+                                .on_hover_text(
+                                    "Center-to-center slot — click both end centers, then set the width",
+                                )
+                                .clicked()
+                            {
+                                self.active_tool = Some(SketchTool::Slot);
+                                self.cancel_in_progress_shape();
+                                self.line_chain_start = None;
+                                self.clear_pending_corners();
+                                log::info!("Switched to Slot tool");
+                            }
+                        }
+
+                        // Associative analytic offset. Source selection happens
+                        // in the viewport; a click away from the selected chain
+                        // supplies the creation-side seed and distance.
+                        {
+                            let is_active = self.active_tool == Some(SketchTool::Offset);
+                            let btn =
+                                draw_tool_btn(ui, is_active, "Offset", Some(icons::Icon::Offset));
+                            if btn
+                                .on_hover_text(
+                                    "Offset connected lines/arcs or a circle — select sources, then click the desired side",
+                                )
+                                .clicked()
+                            {
+                                self.ensure_active_solver_model();
+                                self.active_tool = Some(SketchTool::Offset);
+                                self.cancel_in_progress_shape();
+                                self.line_chain_start = None;
+                                self.clear_pending_corners();
+                                self.status_msg =
+                                    "Click an offset source. Shift-click to extend the chain, then click the desired side."
+                                        .to_string();
+                                log::info!("Switched to Offset tool");
+                            }
+                        }
+
+                        // Parametric curve Trim. Hover computes an immutable
+                        // removable-span plan and the click commits that same plan.
+                        {
+                            let is_active = self.active_tool == Some(SketchTool::Trim);
+                            let btn =
+                                draw_tool_btn(ui, is_active, "Trim", Some(icons::Icon::Trim));
+                            if btn
+                                .on_hover_text(
+                                    "Trim a line, arc, circle, ellipse, or spline — hover the removable span, then click",
+                                )
+                                .clicked()
+                            {
+                                self.ensure_active_solver_model();
+                                self.active_tool = Some(SketchTool::Trim);
+                                self.cancel_in_progress_shape();
+                                self.line_chain_start = None;
+                                self.clear_pending_corners();
+                                self.status_msg =
+                                    "Hover a curve to preview the exact removable span."
+                                        .to_string();
+                                log::info!("Switched to Trim tool");
+                            }
+                        }
+
                         let has_projectable_edge = self
                             .selected_body
                             .iter()
@@ -238,6 +306,119 @@ impl ZeroCadApp {
                                     .range(3..=64)
                                     .speed(0.1),
                             );
+                        }
+
+                        if self.active_tool == Some(SketchTool::Offset) {
+                            ui.label(
+                                egui::RichText::new("D:")
+                                    .size(12.0)
+                                    .color(self.pal().text_body),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.offset_distance_text)
+                                    .desired_width(58.0)
+                                    .hint_text("click"),
+                            )
+                            .on_hover_text(
+                                "Optional distance or expression; leave empty to use the placement click",
+                            );
+                            let can_dissolve = self
+                                .sketch_solver_model
+                                .as_ref()
+                                .is_some_and(|model| !model.offsets.is_empty());
+                            if ui
+                                .add_enabled(can_dissolve, egui::Button::new("Dissolve Offset"))
+                                .on_hover_text(
+                                    "Convert the most recent associative offset into editable entities",
+                                )
+                                .clicked()
+                            {
+                                self.dissolve_last_sketch_offset();
+                            }
+                        }
+
+                        let can_pattern = self.sketch_solver_model.is_some()
+                            && !self.sketch_selected_ids.is_empty();
+                        let mut create_linear_pattern = false;
+                        let mut create_circular_pattern = false;
+                        if can_pattern {
+                            ui.menu_button("Sketch Pattern", |ui| {
+                                ui.set_min_width(245.0);
+                                ui.label("X/Y: direction (Linear) or center (Circular)");
+                                ui.horizontal(|ui| {
+                                    ui.label("X");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.sketch_pattern_x_text,
+                                        )
+                                        .desired_width(65.0),
+                                    );
+                                    ui.label("Y");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.sketch_pattern_y_text,
+                                        )
+                                        .desired_width(65.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Spacing");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.sketch_pattern_spacing_text,
+                                        )
+                                        .desired_width(65.0),
+                                    );
+                                    ui.label("Count");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.sketch_pattern_count_text,
+                                        )
+                                        .desired_width(45.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Total angle");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.sketch_pattern_angle_text,
+                                        )
+                                        .desired_width(65.0),
+                                    );
+                                    ui.label("°");
+                                });
+                                ui.separator();
+                                if ui.button("Create Linear Pattern").clicked() {
+                                    create_linear_pattern = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Create Circular Pattern").clicked() {
+                                    create_circular_pattern = true;
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                        let can_dissolve_pattern = self
+                            .sketch_solver_model
+                            .as_ref()
+                            .is_some_and(|model| !model.patterns.is_empty());
+                        if ui
+                            .add_enabled(
+                                can_dissolve_pattern,
+                                egui::Button::new("Dissolve Pattern"),
+                            )
+                            .on_hover_text(
+                                "Convert the most recent associative pattern into editable entities",
+                            )
+                            .clicked()
+                        {
+                            self.dissolve_last_sketch_pattern();
+                        }
+                        if create_linear_pattern {
+                            self.create_sketch_pattern(false);
+                        }
+                        if create_circular_pattern {
+                            self.create_sketch_pattern(true);
                         }
 
                         // Radius/distance input for the active corner tool, with

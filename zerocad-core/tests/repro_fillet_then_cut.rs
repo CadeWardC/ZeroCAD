@@ -81,6 +81,8 @@ fn add_circle_cut(g: &mut ParametricGraph, depth: f32) {
             region_indices: vec![],
             mode: ExtrudeMode::Cut,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("sketch_3", "extrude_4");

@@ -52,6 +52,8 @@ fn extrude_node(id: &str, region_indices: Vec<usize>) -> FeatureNode {
             region_indices,
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     }
 }

@@ -2105,6 +2105,125 @@ impl ZeroCadApp {
                 }
             }
 
+            if self.active_tool == Some(crate::SketchTool::Trim) {
+                if let Some(preview) = &self.sketch_trim_preview {
+                    let removable_stroke =
+                        egui::Stroke::new(3.2, egui::Color32::from_rgb(255, 82, 82));
+                    for segment in &preview.removable.segments {
+                        painter.line_segment(
+                            [to_screen(segment.a), to_screen(segment.b)],
+                            removable_stroke,
+                        );
+                    }
+                    for circle in &preview.removable.circles {
+                        let mut previous = None;
+                        for index in 0..=64 {
+                            let angle = index as f32 / 64.0 * std::f32::consts::TAU;
+                            let point = to_screen((
+                                circle.center.0 + circle.radius * angle.cos(),
+                                circle.center.1 + circle.radius * angle.sin(),
+                            ));
+                            if let Some(previous) = previous {
+                                painter.line_segment([previous, point], removable_stroke);
+                            }
+                            previous = Some(point);
+                        }
+                    }
+                    for arc in &preview.removable.arcs {
+                        let first = (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
+                        let mut last = (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
+                        if arc.clockwise {
+                            while last >= first {
+                                last -= std::f32::consts::TAU;
+                            }
+                        } else {
+                            while last <= first {
+                                last += std::f32::consts::TAU;
+                            }
+                        }
+                        let steps = (((last - first).abs() / std::f32::consts::TAU) * 64.0)
+                            .ceil()
+                            .max(8.0) as usize;
+                        let mut previous = None;
+                        for index in 0..=steps {
+                            let angle = first + (last - first) * index as f32 / steps as f32;
+                            let point = to_screen((
+                                arc.center.0 + arc.radius * angle.cos(),
+                                arc.center.1 + arc.radius * angle.sin(),
+                            ));
+                            if let Some(previous) = previous {
+                                painter.line_segment([previous, point], removable_stroke);
+                            }
+                            previous = Some(point);
+                        }
+                    }
+                    for spline in &preview.removable.splines {
+                        for segment in spline.sampled_points(0.01).windows(2) {
+                            painter.line_segment(
+                                [to_screen(segment[0]), to_screen(segment[1])],
+                                removable_stroke,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if self.active_tool == Some(crate::SketchTool::Offset) {
+                if let Some(cursor) = current_cursor_snap {
+                    if let Some(preview) = self.preview_sketch_offset(cursor) {
+                        let preview_stroke =
+                            egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 140, 0));
+                        for segment in &preview.segments {
+                            painter.line_segment(
+                                [to_screen(segment.a), to_screen(segment.b)],
+                                preview_stroke,
+                            );
+                        }
+                        for circle in &preview.circles {
+                            let mut previous = None;
+                            for index in 0..=48 {
+                                let angle = index as f32 / 48.0 * std::f32::consts::TAU;
+                                let point = to_screen((
+                                    circle.center.0 + circle.radius * angle.cos(),
+                                    circle.center.1 + circle.radius * angle.sin(),
+                                ));
+                                if let Some(previous) = previous {
+                                    painter.line_segment([previous, point], preview_stroke);
+                                }
+                                previous = Some(point);
+                            }
+                        }
+                        for arc in &preview.arcs {
+                            let first =
+                                (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
+                            let mut last =
+                                (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
+                            while last - first > std::f32::consts::PI {
+                                last -= std::f32::consts::TAU;
+                            }
+                            while last - first < -std::f32::consts::PI {
+                                last += std::f32::consts::TAU;
+                            }
+                            if arc.clockwise && last > first {
+                                last -= std::f32::consts::TAU;
+                            }
+                            let mut previous = None;
+                            for index in 0..=24 {
+                                let angle = first + (last - first) * index as f32 / 24.0;
+                                let point = to_screen((
+                                    arc.center.0 + arc.radius * angle.cos(),
+                                    arc.center.1 + arc.radius * angle.sin(),
+                                ));
+                                if let Some(previous) = previous {
+                                    painter.line_segment([previous, point], preview_stroke);
+                                }
+                                previous = Some(point);
+                            }
+                        }
+                    }
+                }
+            }
+
             // 6e. Live preview of the in-progress shape. It is built with the
             // exact same `shape_from_points` used to commit, so the preview can
             // never diverge from the result — and it folds in typed dimensions

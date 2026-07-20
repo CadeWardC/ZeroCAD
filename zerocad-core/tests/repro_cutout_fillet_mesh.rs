@@ -179,6 +179,8 @@ fn cutout_fillet_repro_graph() -> ParametricGraph {
             region_indices: vec![],
             mode: ExtrudeMode::Cut,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_2", "extrude_3");

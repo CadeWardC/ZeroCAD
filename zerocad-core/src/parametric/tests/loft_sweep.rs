@@ -181,6 +181,8 @@ fn sweep_square_along_straight_path_is_a_prism() {
             path_sketch: "path".to_string(),
             mode: ExtrudeMode::NewBody,
             target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
         },
     });
     g.add_dependency("profile", "sweep_1");
@@ -193,6 +195,130 @@ fn sweep_square_along_straight_path_is_a_prism() {
     let v = volume(&bodies[0].1);
     // 2×2 profile × length 10 = 40.
     assert!((v - 40.0).abs() / 40.0 < 0.02, "sweep volume {v} vs 40");
+}
+
+#[test]
+fn sweep_v2_distributes_signed_total_twist_without_realigning_profile_indices() {
+    let mut graph = ParametricGraph::new();
+    add_sketch_cs(
+        &mut graph,
+        "profile",
+        CoordinateSystem::XY,
+        rect_sketch((-1.0, -0.5), (1.0, 0.5)),
+    );
+    straight_path_sketch(
+        &mut graph,
+        "path",
+        CoordinateSystem::XZ,
+        (0.0, 0.0),
+        (0.0, 10.0),
+    );
+    graph.add_feature(FeatureNode {
+        id: "twisted_sweep".into(),
+        name: "Twisted sweep".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 0,
+            path_sketch: "path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            total_twist_deg: 90.0,
+            total_twist_expr: None,
+        },
+    });
+    graph.add_dependency("profile", "twisted_sweep");
+    graph.add_dependency("path", "twisted_sweep");
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    let mesh = &bodies[0].1;
+    let top: Vec<_> = mesh
+        .vertices
+        .chunks_exact(6)
+        .filter(|vertex| (vertex[2] - 10.0).abs() < 1.0e-3)
+        .collect();
+    let max_x = top.iter().map(|vertex| vertex[0].abs()).fold(0.0, f32::max);
+    let max_y = top.iter().map(|vertex| vertex[1].abs()).fold(0.0, f32::max);
+    assert!(
+        max_x < 0.55 && max_y > 0.95,
+        "twisted top extents x={max_x}, y={max_y}"
+    );
+}
+
+#[test]
+fn closed_circle_sweep_closes_seam_without_end_caps() {
+    let mut graph = ParametricGraph::new();
+    add_sketch_cs(
+        &mut graph,
+        "profile",
+        CoordinateSystem::XY,
+        rect_sketch((-0.4, -0.4), (0.4, 0.4)),
+    );
+    let mut path = SketchCurves::new();
+    path.add_circle((0.0, 0.0), 5.0);
+    add_sketch_cs(&mut graph, "closed_path", CoordinateSystem::XZ, path);
+    graph.add_feature(FeatureNode {
+        id: "closed_sweep".into(),
+        name: "Closed sweep".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 0,
+            path_sketch: "closed_path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
+        },
+    });
+    graph.add_dependency("profile", "closed_sweep");
+    graph.add_dependency("closed_path", "closed_sweep");
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    let actual = volume(&bodies[0].1);
+    let expected = 0.8 * 0.8 * std::f64::consts::TAU * 5.0;
+    assert!(
+        (actual - expected).abs() / expected < 0.08,
+        "closed sweep {actual} vs {expected}"
+    );
+}
+
+#[test]
+fn closed_sweep_rejects_non_integral_seam_twist_atomically() {
+    let mut graph = ParametricGraph::new();
+    add_sketch_cs(
+        &mut graph,
+        "profile",
+        CoordinateSystem::XY,
+        rect_sketch((-0.4, -0.4), (0.4, 0.4)),
+    );
+    let mut path = SketchCurves::new();
+    path.add_circle((0.0, 0.0), 5.0);
+    add_sketch_cs(&mut graph, "closed_path", CoordinateSystem::XZ, path);
+    graph.add_feature(FeatureNode {
+        id: "bad_closed_sweep".into(),
+        name: "Bad closed sweep".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 0,
+            path_sketch: "closed_path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            total_twist_deg: 45.0,
+            total_twist_expr: None,
+        },
+    });
+    graph.add_dependency("profile", "bad_closed_sweep");
+    graph.add_dependency("closed_path", "bad_closed_sweep");
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(bodies.is_empty());
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("whole number of turns")));
 }
 
 #[test]
@@ -217,6 +343,8 @@ fn sweep_preserves_profile_hole() {
             path_sketch: "path".into(),
             mode: ExtrudeMode::NewBody,
             target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
         },
     });
     graph.add_dependency("profile", "holed_sweep");
@@ -257,6 +385,8 @@ fn sweep_along_bent_path_is_watertight() {
             path_sketch: "path".to_string(),
             mode: ExtrudeMode::NewBody,
             target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
         },
     });
     g.add_dependency("profile", "sweep_1");
@@ -299,6 +429,8 @@ fn sweep_rejects_branching_path() {
             path_sketch: "path".to_string(),
             mode: ExtrudeMode::NewBody,
             target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
         },
     });
     g.add_dependency("profile", "sweep_1");
@@ -415,6 +547,8 @@ fn loft_and_sweep_candidate_contract_gates() {
             path_sketch: "sweep_path".into(),
             mode: ExtrudeMode::NewBody,
             target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
         },
     });
     sweep.add_dependency("sweep_profile", "sweep_contract");

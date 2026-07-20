@@ -29,11 +29,12 @@ impl ZeroCadApp {
         self.sketch_selected_ids.clear();
         self.sketch_selected_constraint = None;
         self.sketch_conflict_constraint = None;
+        self.sketch_trim_preview = None;
         self.cancel_in_progress_shape();
         self.rebuild_active_sketch_curves();
     }
 
-    fn ensure_active_solver_model(&mut self) {
+    pub(crate) fn ensure_active_solver_model(&mut self) {
         if self.sketch_solver_model.is_some() {
             return;
         }
@@ -55,6 +56,480 @@ impl ZeroCadApp {
         self.sketch_entity_ids = ids;
         self.sketch_next_entity_id = next;
         self.sketch_solver_model = Some(model);
+    }
+
+    fn selected_offset_sources(&self) -> Result<Vec<zerocad_core::sketch::EntityId>, String> {
+        let model = self
+            .sketch_solver_model
+            .as_ref()
+            .ok_or_else(|| "Offset requires editable sketch geometry.".to_string())?;
+        let mut sources = Vec::new();
+        for selected in &self.sketch_selected_ids {
+            let Some(entity) = model
+                .entities
+                .iter()
+                .find(|entity| entity.id() == *selected)
+            else {
+                continue;
+            };
+            match entity {
+                zerocad_core::sketch::SketchEntity::Line { .. }
+                | zerocad_core::sketch::SketchEntity::Circle { .. }
+                | zerocad_core::sketch::SketchEntity::Arc { .. } => sources.push(*selected),
+                zerocad_core::sketch::SketchEntity::Ellipse { .. } => {
+                    return Err("Ellipse offsets are not supported in Offset v1.".to_string());
+                }
+                zerocad_core::sketch::SketchEntity::Spline { .. } => {
+                    return Err("Spline offsets are not supported in Offset v1.".to_string());
+                }
+            }
+        }
+        sources.sort();
+        sources.dedup();
+        if sources.is_empty() {
+            Err("Select one or more connected lines/arcs, or one circle.".to_string())
+        } else {
+            Ok(sources)
+        }
+    }
+
+    fn offset_signed_distance(
+        &self,
+        sources: &[zerocad_core::sketch::EntityId],
+        seed: (f32, f32),
+    ) -> Result<f32, String> {
+        use zerocad_core::sketch::SketchEntity;
+        let model = self
+            .sketch_solver_model
+            .as_ref()
+            .ok_or_else(|| "Offset requires editable sketch geometry.".to_string())?;
+        let point = |id| {
+            model
+                .point(id)
+                .map(|point| (point.pos.0 as f32, point.pos.1 as f32))
+        };
+        let mut candidates = Vec::new();
+        for source in sources {
+            let Some(entity) = model.entities.iter().find(|entity| entity.id() == *source) else {
+                continue;
+            };
+            let signed = match entity {
+                SketchEntity::Line { p0, p1, .. } => {
+                    let (start, end) = (point(*p0).unwrap(), point(*p1).unwrap());
+                    let dx = end.0 - start.0;
+                    let dy = end.1 - start.1;
+                    let length = dx.hypot(dy);
+                    if length <= 1.0e-6 {
+                        continue;
+                    }
+                    (seed.0 - start.0) * (-dy / length) + (seed.1 - start.1) * (dx / length)
+                }
+                SketchEntity::Circle { center, radius, .. } => {
+                    let center = point(*center).unwrap();
+                    *radius as f32 - (seed.0 - center.0).hypot(seed.1 - center.1)
+                }
+                SketchEntity::Arc {
+                    center,
+                    start,
+                    end,
+                    radius,
+                    clockwise,
+                    ..
+                } => {
+                    let center = point(*center).unwrap();
+                    let start = point(*start).unwrap();
+                    let end = point(*end).unwrap();
+                    let traversal = if *clockwise {
+                        -1.0
+                    } else {
+                        let first = (start.1 - center.1).atan2(start.0 - center.0);
+                        let mut last = (end.1 - center.1).atan2(end.0 - center.0);
+                        while last - first > std::f32::consts::PI {
+                            last -= std::f32::consts::TAU;
+                        }
+                        while last - first < -std::f32::consts::PI {
+                            last += std::f32::consts::TAU;
+                        }
+                        (last - first).signum()
+                    };
+                    (*radius as f32 - (seed.0 - center.0).hypot(seed.1 - center.1)) / traversal
+                }
+                SketchEntity::Ellipse { .. } | SketchEntity::Spline { .. } => continue,
+            };
+            candidates.push((signed.abs(), signed));
+        }
+        let signed = candidates
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, signed)| signed)
+            .ok_or_else(|| "The selected offset sources are unavailable.".to_string())?;
+        if !signed.is_finite() || signed.abs() <= 1.0e-5 {
+            Err("Click away from the source to set a nonzero offset.".to_string())
+        } else {
+            Ok(signed)
+        }
+    }
+
+    fn offset_operation_from_seed(
+        &self,
+        seed: (f32, f32),
+    ) -> Result<zerocad_core::sketch::SketchOffsetOperation, String> {
+        let sources = self.selected_offset_sources()?;
+        let placement_distance = self.offset_signed_distance(&sources, seed)?;
+        let text = self.offset_distance_text.trim();
+        let distance = if text.is_empty() {
+            Dimension::literal(placement_distance)
+        } else {
+            let magnitude = self
+                .eval_dim(text)
+                .ok_or_else(|| format!("Invalid offset expression '{text}'."))?
+                .abs();
+            if !magnitude.is_finite() || magnitude <= 1.0e-5 {
+                return Err("Offset distance must be greater than zero.".to_string());
+            }
+            let value = placement_distance.signum() * magnitude;
+            let expr = zerocad_core::expr::preserves_source(text).then(|| {
+                if placement_distance.is_sign_negative() {
+                    format!("-({text})")
+                } else {
+                    text.to_string()
+                }
+            });
+            Dimension { value, expr }
+        };
+        Ok(zerocad_core::sketch::SketchOffsetOperation {
+            id: zerocad_core::sketch::EntityId(self.sketch_next_entity_id),
+            sources,
+            distance,
+            creation_side_seed: seed,
+        })
+    }
+
+    fn nearest_offset_entity(
+        &self,
+        position: (f32, f32),
+        tolerance: f32,
+    ) -> Option<zerocad_core::sketch::EntityId> {
+        use zerocad_core::sketch::SketchEntity;
+        let model = self.sketch_solver_model.as_ref()?;
+        let point = |id| {
+            model
+                .point(id)
+                .map(|point| (point.pos.0 as f32, point.pos.1 as f32))
+        };
+        let segment_distance = |a: (f32, f32), b: (f32, f32)| {
+            let ab = (b.0 - a.0, b.1 - a.1);
+            let length_squared = ab.0 * ab.0 + ab.1 * ab.1;
+            if length_squared <= f32::EPSILON {
+                return (position.0 - a.0).hypot(position.1 - a.1);
+            }
+            let t = (((position.0 - a.0) * ab.0 + (position.1 - a.1) * ab.1) / length_squared)
+                .clamp(0.0, 1.0);
+            (position.0 - (a.0 + ab.0 * t)).hypot(position.1 - (a.1 + ab.1 * t))
+        };
+        model
+            .entities
+            .iter()
+            .filter(|entity| !model.construction.contains(&entity.id()))
+            .filter_map(|entity| {
+                let distance = match entity {
+                    SketchEntity::Line { p0, p1, .. } => segment_distance(point(*p0)?, point(*p1)?),
+                    SketchEntity::Circle { center, radius, .. }
+                    | SketchEntity::Arc { center, radius, .. } => {
+                        let center = point(*center)?;
+                        ((position.0 - center.0).hypot(position.1 - center.1) - *radius as f32)
+                            .abs()
+                    }
+                    SketchEntity::Ellipse { .. } | SketchEntity::Spline { .. } => return None,
+                };
+                (distance <= tolerance).then_some((entity.id(), distance))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    }
+
+    pub(crate) fn handle_offset_click(
+        &mut self,
+        position: (f32, f32),
+        tolerance: f32,
+        extend_selection: bool,
+    ) {
+        self.ensure_active_solver_model();
+        if let Some(entity) = self.nearest_offset_entity(position, tolerance) {
+            if !extend_selection {
+                self.sketch_selected_ids.clear();
+            }
+            if let Some(index) = self
+                .sketch_selected_ids
+                .iter()
+                .position(|selected| *selected == entity)
+            {
+                self.sketch_selected_ids.remove(index);
+            } else {
+                self.sketch_selected_ids.push(entity);
+            }
+            self.status_msg = format!(
+                "{} offset source(s) selected — Shift-click more, then click on the desired side.",
+                self.sketch_selected_ids.len()
+            );
+            return;
+        }
+
+        let operation = match self.offset_operation_from_seed(position) {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.status_msg = error;
+                return;
+            }
+        };
+        self.push_working_sketch_undo();
+        self.sketch_next_entity_id += 1;
+        let vars = self.document.variable_map();
+        let outcome = if let Some(model) = &mut self.sketch_solver_model {
+            model.offsets.push(operation.clone());
+            zerocad_core::sketch::evaluate_associative_offset(model, &operation, &vars)
+        } else {
+            return;
+        };
+        self.sketch_selected_ids.clear();
+        self.rebuild_active_sketch_curves();
+        self.status_msg = match outcome {
+            Ok(_) => "Associative offset created. Its derived curves are read-only until Dissolve."
+                .to_string(),
+            Err(error) => format!("Offset {} is unresolved: {error}.", operation.id.0),
+        };
+    }
+
+    pub(crate) fn preview_sketch_offset(&self, seed: (f32, f32)) -> Option<SketchCurves> {
+        let operation = self.offset_operation_from_seed(seed).ok()?;
+        let model = self.sketch_solver_model.as_ref()?;
+        zerocad_core::sketch::evaluate_associative_offset(
+            model,
+            &operation,
+            &self.document.variable_map(),
+        )
+        .ok()
+    }
+
+    pub(crate) fn dissolve_last_sketch_offset(&mut self) {
+        let vars = self.document.variable_map();
+        let (operation, derived) = {
+            let Some(model) = self.sketch_solver_model.as_ref() else {
+                self.status_msg = "This sketch has no associative offsets.".to_string();
+                return;
+            };
+            let Some(operation) = model.offsets.last().cloned() else {
+                self.status_msg = "This sketch has no associative offsets.".to_string();
+                return;
+            };
+            let derived =
+                match zerocad_core::sketch::evaluate_associative_offset(model, &operation, &vars) {
+                    Ok(derived) => derived,
+                    Err(error) => {
+                        self.status_msg =
+                            format!("Offset {} cannot dissolve: {error}.", operation.id.0);
+                        return;
+                    }
+                };
+            (operation, derived)
+        };
+
+        self.push_working_sketch_undo();
+        let (addition, next) = zerocad_core::sketch::constraints::promote_shapes_to_entities(
+            &[SketchShape::Raw { curves: derived }],
+            &[operation.id],
+            &vars,
+            self.sketch_next_entity_id,
+        );
+        if let Some(model) = &mut self.sketch_solver_model {
+            model.offsets.retain(|offset| offset.id != operation.id);
+            model.points.extend(addition.points);
+            model.entities.extend(addition.entities);
+            model.constraints.extend(addition.constraints);
+        }
+        self.sketch_next_entity_id = next;
+        self.rebuild_active_sketch_curves();
+        self.status_msg = format!(
+            "Offset {} dissolved into editable sketch entities.",
+            operation.id.0
+        );
+    }
+
+    pub(crate) fn create_sketch_pattern(&mut self, circular: bool) {
+        self.ensure_active_solver_model();
+        let vars = self.document.variable_map();
+        let Some(model) = self.sketch_solver_model.as_ref() else {
+            return;
+        };
+        let mut sources: Vec<_> = self
+            .sketch_selected_ids
+            .iter()
+            .copied()
+            .filter(|selected| model.entities.iter().any(|entity| entity.id() == *selected))
+            .collect();
+        sources.sort();
+        sources.dedup();
+        if sources.is_empty() {
+            self.status_msg = "Select one or more sketch curves to pattern.".to_string();
+            return;
+        }
+        let count_value = self
+            .eval_dim(&self.sketch_pattern_count_text)
+            .unwrap_or(-1.0);
+        let count = count_value.round() as u32;
+        if count_value < 1.0 || (count_value - count as f32).abs() > 1.0e-5 {
+            self.status_msg = "Sketch Pattern count must be a positive whole number.".to_string();
+            return;
+        }
+        let parse = |text: &str| self.eval_dim(text);
+        let kind = if circular {
+            let (Some(center_x), Some(center_y), Some(angle)) = (
+                parse(&self.sketch_pattern_x_text),
+                parse(&self.sketch_pattern_y_text),
+                parse(&self.sketch_pattern_angle_text),
+            ) else {
+                self.status_msg = "Circular pattern center and angle must evaluate.".to_string();
+                return;
+            };
+            zerocad_core::sketch::SketchPatternKind::Circular {
+                center: [f64::from(center_x), f64::from(center_y)],
+                total_angle_deg: Dimension {
+                    value: angle,
+                    expr: zerocad_core::expr::preserves_source(&self.sketch_pattern_angle_text)
+                        .then(|| self.sketch_pattern_angle_text.trim().to_string()),
+                },
+                count,
+            }
+        } else {
+            let (Some(direction_x), Some(direction_y), Some(spacing)) = (
+                parse(&self.sketch_pattern_x_text),
+                parse(&self.sketch_pattern_y_text),
+                parse(&self.sketch_pattern_spacing_text),
+            ) else {
+                self.status_msg = "Linear pattern direction and spacing must evaluate.".to_string();
+                return;
+            };
+            zerocad_core::sketch::SketchPatternKind::Linear {
+                direction: [f64::from(direction_x), f64::from(direction_y)],
+                spacing: Dimension {
+                    value: spacing,
+                    expr: zerocad_core::expr::preserves_source(&self.sketch_pattern_spacing_text)
+                        .then(|| self.sketch_pattern_spacing_text.trim().to_string()),
+                },
+                count,
+            }
+        };
+        let operation = zerocad_core::sketch::SketchPatternOperation {
+            id: zerocad_core::sketch::EntityId(self.sketch_next_entity_id),
+            sources,
+            kind,
+        };
+        if let Err(error) =
+            zerocad_core::sketch::evaluate_associative_pattern(model, &operation, &vars)
+        {
+            self.status_msg = format!("Sketch Pattern is unresolved: {error}.");
+            return;
+        }
+        self.push_working_sketch_undo();
+        self.sketch_next_entity_id += 1;
+        if let Some(model) = &mut self.sketch_solver_model {
+            model.patterns.push(operation);
+        }
+        self.sketch_selected_ids.clear();
+        self.rebuild_active_sketch_curves();
+        self.status_msg =
+            "Associative Sketch Pattern created. Generated curves are read-only until Dissolve."
+                .to_string();
+    }
+
+    pub(crate) fn dissolve_last_sketch_pattern(&mut self) {
+        let vars = self.document.variable_map();
+        let (operation, derived) = {
+            let Some(model) = self.sketch_solver_model.as_ref() else {
+                self.status_msg = "This sketch has no associative patterns.".to_string();
+                return;
+            };
+            let Some(operation) = model.patterns.last().cloned() else {
+                self.status_msg = "This sketch has no associative patterns.".to_string();
+                return;
+            };
+            let derived = match zerocad_core::sketch::dissolve_associative_pattern(
+                model, &operation, &vars,
+            ) {
+                Ok(evaluation) => evaluation.curves,
+                Err(error) => {
+                    self.status_msg = format!(
+                        "Sketch Pattern {} cannot dissolve: {error}.",
+                        operation.id.0
+                    );
+                    return;
+                }
+            };
+            (operation, derived)
+        };
+        self.push_working_sketch_undo();
+        let (addition, next) = zerocad_core::sketch::constraints::promote_shapes_to_entities(
+            &[SketchShape::Raw { curves: derived }],
+            &[operation.id],
+            &vars,
+            self.sketch_next_entity_id,
+        );
+        if let Some(model) = &mut self.sketch_solver_model {
+            model.patterns.retain(|pattern| pattern.id != operation.id);
+            model.points.extend(addition.points);
+            model.entities.extend(addition.entities);
+            model.constraints.extend(addition.constraints);
+        }
+        self.sketch_next_entity_id = next;
+        self.rebuild_active_sketch_curves();
+        self.status_msg = format!(
+            "Sketch Pattern {} dissolved into editable sketch entities.",
+            operation.id.0
+        );
+    }
+
+    /// Replace the live Trim hover plan. The plan contains both the exact
+    /// removable span and the private replacement entities used by commit.
+    pub(crate) fn update_trim_preview(&mut self, cursor: (f32, f32), tolerance: f32) {
+        self.ensure_active_solver_model();
+        self.sketch_trim_preview = self
+            .sketch_solver_model
+            .as_ref()
+            .and_then(|model| zerocad_core::sketch::preview_trim(model, cursor, tolerance).ok());
+    }
+
+    /// Commit the immutable plan most recently produced for the cursor. One
+    /// successful click creates exactly one working-sketch transaction.
+    pub(crate) fn commit_trim_preview(&mut self) {
+        let Some(preview) = self.sketch_trim_preview.take() else {
+            self.status_msg = "Trim unresolved: hover a removable curve span.".to_string();
+            return;
+        };
+        let target = preview.target;
+        self.push_working_sketch_undo();
+        let Some(model) = self.sketch_solver_model.as_mut() else {
+            let _ = self.working_sketch_undo.pop();
+            self.status_msg = "Trim requires editable sketch geometry.".to_string();
+            return;
+        };
+        let outcome = zerocad_core::sketch::apply_trim_preview(
+            model,
+            preview,
+            &mut self.sketch_next_entity_id,
+        );
+        self.sketch_selected_ids.clear();
+        self.sketch_selected_constraint = None;
+        self.rebuild_active_sketch_curves();
+        let removed = outcome.constraints.removed.len();
+        let ambiguous = outcome.constraints.ambiguous.len();
+        self.status_msg = if removed == 0 && ambiguous == 0 {
+            format!("Trimmed entity {}.", target.0)
+        } else {
+            format!(
+                "Trimmed entity {}. Removed {} invalid constraint(s) and {} ambiguous constraint(s).",
+                target.0, removed, ambiguous
+            )
+        };
     }
 
     pub(crate) fn project_selected_edges_to_sketch(&mut self) {
@@ -421,6 +896,7 @@ impl ZeroCadApp {
         self.sketch_selected_ids.clear();
         self.sketch_selected_constraint = None;
         self.sketch_conflict_constraint = None;
+        self.sketch_trim_preview = None;
         self.cancel_in_progress_shape();
     }
 

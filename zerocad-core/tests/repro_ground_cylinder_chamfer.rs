@@ -56,6 +56,8 @@ fn ground_cylinder_edge_mod(
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("s", "e");

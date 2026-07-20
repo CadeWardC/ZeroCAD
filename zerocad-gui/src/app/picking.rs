@@ -488,6 +488,7 @@ impl ZeroCadApp {
     pub(crate) fn cancel_in_progress_shape(&mut self) {
         self.sketch_temp_start = None;
         self.sketch_points.clear();
+        self.sketch_trim_preview = None;
         self.dim_input = None;
         self.dim_screen_positions.clear();
         self.snap_guides.clear();

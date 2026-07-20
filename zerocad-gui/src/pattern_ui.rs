@@ -127,6 +127,9 @@ pub(crate) enum PatternKindChoice {
 #[derive(Debug, Clone)]
 pub(crate) struct PatternOp {
     pub(crate) source: String,
+    /// Target body for a Wave 3 feature-operation pattern. `None` keeps the
+    /// legacy whole-body Pattern workflow.
+    pub(crate) feature_target: Option<String>,
     pub(crate) kind: PatternKindChoice,
     pub(crate) axis: RevolveAxisChoice,
     pub(crate) plane: Option<MirrorPlaneChoice>,
@@ -141,6 +144,31 @@ pub(crate) struct PatternOp {
 }
 
 impl ZeroCadApp {
+    pub(crate) fn feature_pattern_source_candidate(&self) -> Option<(String, String)> {
+        let selected = self.selected_node_id.as_deref()?;
+        let node = self
+            .document
+            .graph
+            .node_indices()
+            .find(|index| self.document.graph[*index].id == selected)
+            .map(|index| &self.document.graph[index])?;
+        let target = match &node.feature {
+            FeatureType::Hole { target, .. } => Some(target.clone()),
+            FeatureType::Extrude {
+                mode: ExtrudeMode::Join | ExtrudeMode::Cut,
+                target: Some(target),
+                ..
+            }
+            | FeatureType::Revolve {
+                mode: ExtrudeMode::Join | ExtrudeMode::Cut,
+                target: Some(target),
+                ..
+            } => Some(target.clone()),
+            _ => None,
+        }?;
+        Some((node.id.clone(), target))
+    }
+
     /// Lightweight live body ghost for a Mirror op whose reflection plane has
     /// been picked. Returns `None` while the picker is still waiting for input.
     pub(crate) fn mirror_preview_mesh(&self) -> Option<MockMesh> {
@@ -227,6 +255,7 @@ impl ZeroCadApp {
         }
         self.pattern_op = Some(PatternOp {
             source,
+            feature_target: None,
             kind: PatternKindChoice::Linear,
             axis: RevolveAxisChoice::X,
             plane: None,
@@ -241,6 +270,28 @@ impl ZeroCadApp {
         self.status_msg = "Pattern: choose the kind and parameters, then OK.".to_string();
     }
 
+    pub(crate) fn begin_feature_pattern(&mut self, source: String, target: String) {
+        if self.pattern_op.is_some() {
+            return;
+        }
+        self.pattern_op = Some(PatternOp {
+            source,
+            feature_target: Some(target),
+            kind: PatternKindChoice::Linear,
+            axis: RevolveAxisChoice::X,
+            plane: None,
+            pick_plane: false,
+            mirror_offset_enabled: false,
+            mirror_offset_text: "0".to_string(),
+            mirror_join: false,
+            spacing_text: "20".to_string(),
+            count_text: "3".to_string(),
+            angle_text: "360".to_string(),
+        });
+        self.status_msg =
+            "Feature Pattern: choose linear or circular parameters, then OK.".to_string();
+    }
+
     /// Start the standalone 3D Mirror command directly in viewport plane-pick
     /// mode. It deliberately does not share Pattern's kind selector.
     pub(crate) fn begin_mirror(&mut self, source: String) {
@@ -249,6 +300,7 @@ impl ZeroCadApp {
         }
         self.pattern_op = Some(PatternOp {
             source,
+            feature_target: None,
             kind: PatternKindChoice::Mirror,
             axis: RevolveAxisChoice::X,
             plane: None,
@@ -295,7 +347,9 @@ impl ZeroCadApp {
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.style()).show(ui, |ui| {
                     ui.set_min_width(250.0);
-                    let title = if op_new.kind == PatternKindChoice::Mirror {
+                    let title = if op_new.feature_target.is_some() {
+                        format!("Feature pattern of {}", op_new.source)
+                    } else if op_new.kind == PatternKindChoice::Mirror {
                         format!("Mirror {}", op_new.source)
                     } else {
                         format!("Pattern of {}", op_new.source)
@@ -451,6 +505,10 @@ impl ZeroCadApp {
     }
 
     fn commit_pattern_op(&mut self, op: PatternOp) {
+        if op.feature_target.is_some() {
+            self.commit_feature_pattern_op(op);
+            return;
+        }
         let count_value = self.eval_dim(&op.count_text).unwrap_or(0.0);
         let count = count_value.round() as u32;
         if (count_value - count as f32).abs() > 1.0e-5 {
@@ -546,16 +604,113 @@ impl ZeroCadApp {
                 self.document.add_dependency(body_id, &id);
             }
         }
-        self.selected_node_id = Some(id);
+        self.selected_node_id = Some(id.clone());
         self.pattern_op = None;
+        if mirror_joins {
+            self.pending_mirror_join_feedback = Some(PendingMirrorJoinFeedback {
+                feature_id: id,
+                source_body_id: op.source.clone(),
+            });
+        }
         self.reevaluate_geometry();
         self.status_msg = if mirror_joins {
-            "Mirrored copy joined into the source body.".to_string()
+            "Mirror created; evaluating join.".to_string()
         } else if op.kind == PatternKindChoice::Mirror {
             "Mirrored body created.".to_string()
         } else {
             "Pattern created.".to_string()
         };
+    }
+
+    fn commit_feature_pattern_op(&mut self, op: PatternOp) {
+        use zerocad_core::parametric::{
+            FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
+        };
+        let Some(target) = op.feature_target.clone() else {
+            return;
+        };
+        let count_value = self.eval_dim(&op.count_text).unwrap_or(-1.0);
+        let count = count_value.round() as u32;
+        if count_value < 0.0 || (count_value - count as f32).abs() > 1.0e-5 {
+            self.status_msg =
+                "Feature Pattern count must be a non-negative whole number.".to_string();
+            return;
+        }
+        let kind = match op.kind {
+            PatternKindChoice::Linear => {
+                let Some(spacing) = self.eval_dim(&op.spacing_text) else {
+                    self.status_msg =
+                        "Feature Pattern spacing must be a number or valid expression.".to_string();
+                    return;
+                };
+                if count > 1 && spacing.abs() <= f32::EPSILON {
+                    self.status_msg =
+                        "A multi-instance Feature Pattern needs non-zero spacing.".to_string();
+                    return;
+                }
+                FeaturePatternKind::Linear {
+                    direction: op.axis.to_axis_base(),
+                    spacing,
+                    spacing_expr: zerocad_core::expr::preserves_source(&op.spacing_text)
+                        .then(|| op.spacing_text.trim().to_string()),
+                    count,
+                }
+            }
+            PatternKindChoice::Circular => {
+                let Some(total_angle_deg) = self.eval_dim(&op.angle_text) else {
+                    self.status_msg =
+                        "Feature Pattern angle must be a number or valid expression.".to_string();
+                    return;
+                };
+                if !total_angle_deg.is_finite() || total_angle_deg.abs() <= f32::EPSILON {
+                    self.status_msg =
+                        "Feature Pattern angle must be finite and non-zero.".to_string();
+                    return;
+                }
+                FeaturePatternKind::Circular {
+                    axis: op.axis.to_axis_base(),
+                    total_angle_deg,
+                    total_angle_expr: zerocad_core::expr::preserves_source(&op.angle_text)
+                        .then(|| op.angle_text.trim().to_string()),
+                    count,
+                }
+            }
+            PatternKindChoice::Mirror => return,
+        };
+        let extent_policy = self
+            .document
+            .graph
+            .node_indices()
+            .find(|index| self.document.graph[*index].id == op.source)
+            .and_then(|index| match &self.document.graph[index].feature {
+                FeatureType::Hole { depth: None, .. } => {
+                    Some(FeaturePatternExtentPolicy::ThroughAllLocalTarget)
+                }
+                _ => None,
+            })
+            .unwrap_or(FeaturePatternExtentPolicy::SourceExtent);
+        self.push_undo();
+        let number = self.next_id();
+        let id = format!("feature_pattern_{number}");
+        self.document.add_feature(FeatureNode {
+            id: id.clone(),
+            name: format!("Feature Pattern {number}"),
+            feature: FeatureType::FeaturePattern {
+                target,
+                source_feature: op.source.clone(),
+                kind,
+                compute_mode: FeaturePatternComputeMode::Identical,
+                extent_policy,
+            },
+        });
+        self.document.add_dependency(&op.source, &id);
+        if let RevolveAxisChoice::Datum(datum, _) = &op.axis {
+            self.document.add_dependency(datum, &id);
+        }
+        self.selected_node_id = Some(id);
+        self.pattern_op = None;
+        self.reevaluate_geometry();
+        self.status_msg = "Feature Pattern created.".to_string();
     }
 }
 

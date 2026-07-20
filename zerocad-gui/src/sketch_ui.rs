@@ -110,6 +110,9 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
         | SketchTool::ThreePointCircle
         | SketchTool::Ellipse
         | SketchTool::ThreePointEllipse
+        | SketchTool::Slot
+        | SketchTool::Offset
+        | SketchTool::Trim
         | SketchTool::ControlPointSpline
         | SketchTool::FitPointSpline
         | SketchTool::Mirror

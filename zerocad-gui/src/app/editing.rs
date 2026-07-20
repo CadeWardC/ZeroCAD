@@ -633,6 +633,21 @@ impl ZeroCadApp {
                     circumscribed: tool == SketchTool::PolygonCircumscribed,
                 }
             }
+            SketchTool::Slot => {
+                let (axis_x, axis_y) = (p1.0 - p0.0, p1.1 - p0.1);
+                let axis_length = axis_x.hypot(axis_y);
+                let half_width = if axis_length <= 1.0e-5 {
+                    (last.0 - p0.0).hypot(last.1 - p0.1)
+                } else {
+                    let normal = (-axis_y / axis_length, axis_x / axis_length);
+                    ((last.0 - p1.0) * normal.0 + (last.1 - p1.1) * normal.1).abs()
+                };
+                SketchShape::Slot {
+                    start: p0,
+                    end: p1,
+                    width: Dimension::literal(half_width * 2.0),
+                }
+            }
             SketchTool::RectangleThreePoint
             | SketchTool::ThreePointCircle
             | SketchTool::Ellipse
@@ -642,7 +657,11 @@ impl ZeroCadApp {
             // Mirror reflects existing geometry across its 2-click axis; it's
             // committed via `commit_sketch_mirror`, not the shape pipeline.
             // Fillet/Chamfer modify existing corners; they don't create shapes.
-            SketchTool::Mirror | SketchTool::Fillet | SketchTool::Chamfer => return None,
+            SketchTool::Mirror
+            | SketchTool::Offset
+            | SketchTool::Trim
+            | SketchTool::Fillet
+            | SketchTool::Chamfer => return None,
         };
         Some(shape)
     }
@@ -707,6 +726,13 @@ impl ZeroCadApp {
         let mut line_endpoint: Option<(f32, f32)> = None;
         let mut inferred_total = 0usize;
         if let Some(shape) = self.shape_record_from_points(last) {
+            if is_line == false
+                && matches!(self.active_tool, Some(SketchTool::Slot))
+                && shape.build(&self.document.variable_map()).is_empty()
+            {
+                self.status_msg = "Slot width must be greater than zero.".to_string();
+                return;
+            }
             // Continuous-Line: resolve the committed segment — reject a
             // degenerate (zero-length) one so a stray/duplicate click can't
             // inject a zero-length line or a false loop close, and capture the

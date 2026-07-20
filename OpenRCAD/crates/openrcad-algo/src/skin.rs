@@ -248,6 +248,28 @@ pub fn skin_section_loops_with_policy(
     sections: &[SectionLoops],
     policy: &TolerancePolicy,
 ) -> Result<Solid, SkinError> {
+    skin_section_loops_impl(sections, policy, true, false)
+}
+
+/// Skin sections whose point and hole ordering is already authoritative, as it
+/// is for one profile transported by a sweep frame. Geometric ring alignment is
+/// deliberately disabled so it cannot erase an explicit total twist. A closed
+/// skin expects the caller to append an exact copy of its first section after
+/// the final path section; that seam is connected without planar end caps.
+pub fn skin_ordered_section_loops_with_policy(
+    sections: &[SectionLoops],
+    closed: bool,
+    policy: &TolerancePolicy,
+) -> Result<Solid, SkinError> {
+    skin_section_loops_impl(sections, policy, false, closed)
+}
+
+fn skin_section_loops_impl(
+    sections: &[SectionLoops],
+    policy: &TolerancePolicy,
+    align_geometrically: bool,
+    closed: bool,
+) -> Result<Solid, SkinError> {
     policy
         .validate()
         .map_err(|error| SkinError::InvalidTolerancePolicy(error.to_string()))?;
@@ -288,6 +310,19 @@ pub fn skin_section_loops_with_policy(
     });
 
     for (section_index, section) in sections.iter().enumerate().skip(1) {
+        if !align_geometrically {
+            let outer_normal = ring_normal(&section.outer).ok_or(SkinError::DegenerateRing)?;
+            let holes = section
+                .holes
+                .iter()
+                .map(|hole| orient_hole(hole, outer_normal))
+                .collect::<Result<Vec<_>, _>>()?;
+            aligned.push(SectionLoops {
+                outer: section.outer.clone(),
+                holes,
+            });
+            continue;
+        }
         let previous = aligned.last().expect("first section was inserted");
         let outer = align_ring(&previous.outer, &section.outer).ok_or(SkinError::RingMismatch)?;
         let outer_normal = ring_normal(&outer).ok_or(SkinError::DegenerateRing)?;
@@ -336,21 +371,23 @@ pub fn skin_section_loops_with_policy(
         append_lateral_faces(&hole_rings, &mut faces)?;
     }
 
-    for section in [&aligned[0], aligned.last().unwrap()] {
-        let normal = ring_normal(&section.outer).ok_or(SkinError::DegenerateRing)?;
-        let surface = GeomSurface::plane(Plane::from_point_normal(section.outer[0], normal));
-        let outer = ring_wire(&section.outer)?;
-        let inners = section
-            .holes
-            .iter()
-            .map(|hole| ring_wire(hole))
-            .collect::<Result<Vec<_>, _>>()?;
-        faces.push(Face::with_wires(
-            Some(surface),
-            Some(outer),
-            inners,
-            Orientation::Forward,
-        ));
+    if !closed {
+        for section in [&aligned[0], aligned.last().unwrap()] {
+            let normal = ring_normal(&section.outer).ok_or(SkinError::DegenerateRing)?;
+            let surface = GeomSurface::plane(Plane::from_point_normal(section.outer[0], normal));
+            let outer = ring_wire(&section.outer)?;
+            let inners = section
+                .holes
+                .iter()
+                .map(|hole| ring_wire(hole))
+                .collect::<Result<Vec<_>, _>>()?;
+            faces.push(Face::with_wires(
+                Some(surface),
+                Some(outer),
+                inners,
+                Orientation::Forward,
+            ));
+        }
     }
 
     let solid = Solid::new(

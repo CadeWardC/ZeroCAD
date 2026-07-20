@@ -38,6 +38,8 @@ fn ex(g: &mut ParametricGraph, id: &str, s: &str, d: f32, m: ExtrudeMode) {
             region_indices: vec![],
             mode: m,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency(s, id);

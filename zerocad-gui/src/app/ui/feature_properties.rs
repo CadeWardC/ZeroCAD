@@ -76,6 +76,13 @@ impl ZeroCadApp {
                 let pal = self.pal();
                 let current_unit = self.current_unit;
                 let var_map = self.document.variable_map();
+                let mirror_join_outcome = match &self.document.graph[idx].feature {
+                    FeatureType::Pattern {
+                        source,
+                        kind: zerocad_core::PatternKind::Mirror { join: true, .. },
+                    } => Some(self.mirror_join_outcome(&selected_feature_id, source)),
+                    _ => None,
+                };
                 let current_body_center = self
                     .body_meshes
                     .iter()
@@ -259,6 +266,15 @@ impl ZeroCadApp {
                                             egui::RichText::new("Mid-plane between two planes.")
                                                 .size(11.5)
                                                 .color(pal.text_muted),
+                                            );
+                                    }
+                                    DatumPlaneDef::PlanarFace { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative plane from a named planar face.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
                                         );
                                     }
                                 },
@@ -283,6 +299,33 @@ impl ZeroCadApp {
                                             egui::RichText::new("Intersection line of two planes.")
                                                 .size(11.5)
                                                 .color(pal.text_muted),
+                                            );
+                                    }
+                                    DatumAxisDef::Edge { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative axis from a named edge.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                    }
+                                    DatumAxisDef::CylindricalOrConicalFace { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative axis from an analytic cylindrical or conical face.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                    }
+                                    DatumAxisDef::TwoVertices { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative axis through two named vertices.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
                                         );
                                     }
                                 },
@@ -299,6 +342,42 @@ impl ZeroCadApp {
                                                 }
                                             }
                                         });
+                                    }
+                                    DatumPointDef::Vertex { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative point from a named vertex.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                    }
+                                    DatumPointDef::Midpoint { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative midpoint between two named vertices.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                    }
+                                    DatumPointDef::EdgeMidpoint { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative midpoint of a named edge.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                    }
+                                    DatumPointDef::CircleCenter { .. } => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Associative center of a named circular edge.",
+                                            )
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
                                     }
                                 },
                                 FeatureType::Revolve {
@@ -625,6 +704,7 @@ impl ZeroCadApp {
                                         zerocad_core::PatternKind::Mirror {
                                             offset,
                                             offset_expr,
+                                            join,
                                             ..
                                         } => {
                                             ui.label(
@@ -632,6 +712,36 @@ impl ZeroCadApp {
                                                     .size(11.5)
                                                     .color(pal.text_muted),
                                             );
+                                            if *join {
+                                                let (text, color) = match mirror_join_outcome
+                                                    .as_ref()
+                                                    .expect("Mirror+Join outcome is precomputed")
+                                                {
+                                                    MirrorJoinOutcome::Evaluating => (
+                                                        "Outcome: Evaluating join".to_string(),
+                                                        pal.text_muted,
+                                                    ),
+                                                    MirrorJoinOutcome::Joined => (
+                                                        "Outcome: Joined into source body".to_string(),
+                                                        egui::Color32::from_rgb(22, 101, 52),
+                                                    ),
+                                                    MirrorJoinOutcome::Separate => (
+                                                        "Outcome: Separate body (Join could not connect)"
+                                                            .to_string(),
+                                                        egui::Color32::from_rgb(180, 83, 9),
+                                                    ),
+                                                    MirrorJoinOutcome::Unresolved(reason) => (
+                                                        format!("Outcome: Unresolved — {reason}"),
+                                                        egui::Color32::from_rgb(185, 28, 28),
+                                                    ),
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(text)
+                                                        .strong()
+                                                        .size(11.5)
+                                                        .color(color),
+                                                );
+                                            }
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("Offset").size(12.0));
                                                 if ui
@@ -656,6 +766,192 @@ impl ZeroCadApp {
                                             );
                                         }
                                     }
+                                }
+                                FeatureType::FeaturePattern {
+                                    target,
+                                    source_feature,
+                                    kind,
+                                    compute_mode,
+                                    extent_policy,
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Source feature: {source_feature}  •  Target: {target}"
+                                        ))
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Compute: {compute_mode:?}  •  Extent: {extent_policy:?}"
+                                        ))
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.add_space(4.0);
+                                    match kind {
+                                        zerocad_core::parametric::FeaturePatternKind::Linear {
+                                            spacing,
+                                            spacing_expr,
+                                            count,
+                                            ..
+                                        } => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Spacing").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(spacing)
+                                                            .speed(0.5)
+                                                            .suffix(current_unit.suffix()),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    *spacing_expr = None;
+                                                    modified = true;
+                                                }
+                                            });
+                                            expression_editor(
+                                                ui,
+                                                spacing_expr,
+                                                &var_map,
+                                                "expression, e.g. pitch*2",
+                                                current_unit.suffix(),
+                                                &mut modified,
+                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Count").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(count)
+                                                            .speed(0.1)
+                                                            .range(0..=200),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                        zerocad_core::parametric::FeaturePatternKind::Circular {
+                                            total_angle_deg,
+                                            total_angle_expr,
+                                            count,
+                                            ..
+                                        } => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Total angle").size(12.0),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(total_angle_deg)
+                                                            .speed(1.0)
+                                                            .suffix("°"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    *total_angle_expr = None;
+                                                    modified = true;
+                                                }
+                                            });
+                                            expression_editor(
+                                                ui,
+                                                total_angle_expr,
+                                                &var_map,
+                                                "expression, e.g. full_angle",
+                                                "°",
+                                                &mut modified,
+                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Count").size(12.0));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(count)
+                                                            .speed(0.1)
+                                                            .range(0..=200),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                FeatureType::Draft {
+                                    target,
+                                    faces,
+                                    neutral,
+                                    angle_deg,
+                                    angle_expr,
+                                    flip_pull,
+                                } => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Target: {target}  •  Selected side faces: {}",
+                                            faces.len()
+                                        ))
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
+                                    let neutral_label = match neutral {
+                                        zerocad_core::parametric::DraftNeutral::Face(face) => face
+                                            .topology
+                                            .as_ref()
+                                            .and_then(|topology| topology.face_id.as_deref())
+                                            .map_or_else(
+                                                || "legacy face reference".to_string(),
+                                                ToString::to_string,
+                                            ),
+                                        zerocad_core::parametric::DraftNeutral::Datum(id) => {
+                                            format!("datum {id}")
+                                        }
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Neutral reference: {neutral_label}"
+                                        ))
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Draft angle").size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(angle_deg)
+                                                    .speed(0.25)
+                                                    .range(-88.9..=88.9)
+                                                    .suffix("°"),
+                                            )
+                                            .changed()
+                                        {
+                                            *angle_expr = None;
+                                            modified = true;
+                                        }
+                                    });
+                                    expression_editor(
+                                        ui,
+                                        angle_expr,
+                                        &var_map,
+                                        "expression, e.g. taper_angle",
+                                        "°",
+                                        &mut modified,
+                                    );
+                                    if ui
+                                        .checkbox(flip_pull, "Reverse pull direction")
+                                        .changed()
+                                    {
+                                        modified = true;
+                                    }
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Draft v1 supports straight planar side faces on retained prismatic bodies.",
+                                        )
+                                        .size(10.5)
+                                        .color(pal.text_muted),
+                                    );
                                 }
                                 FeatureType::Cylinder { r, h } => {
                                     ui.label(
@@ -841,6 +1137,8 @@ impl ZeroCadApp {
                                     region_indices,
                                     mode,
                                     depth_expr,
+                                    draft_angle_deg,
+                                    draft_angle_expr,
                                     ..
                                 } => {
                                     ui.horizontal(|ui| {
@@ -892,6 +1190,58 @@ impl ZeroCadApp {
                                             }
                                         };
                                         ui.label(egui::RichText::new(txt).size(11.0).weak());
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Draft Angle:").size(12.0));
+                                        let response = ui.add(
+                                            egui::Slider::new(draft_angle_deg, -88.9..=88.9)
+                                                .suffix("°"),
+                                        );
+                                        if response.changed() {
+                                            *draft_angle_expr = None;
+                                            modified = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("=")
+                                                .size(13.0)
+                                                .color(pal.text_muted),
+                                        );
+                                        let mut buffer =
+                                            draft_angle_expr.clone().unwrap_or_default();
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut buffer)
+                                                .hint_text("angle expression")
+                                                .desired_width(150.0),
+                                        );
+                                        if response.changed() {
+                                            let value = buffer.trim();
+                                            *draft_angle_expr = if value.is_empty() {
+                                                None
+                                            } else {
+                                                Some(value.to_string())
+                                            };
+                                            modified = true;
+                                        }
+                                    });
+                                    if let Some(expression) = draft_angle_expr.as_ref() {
+                                        let text = match zerocad_core::expr::eval(
+                                            expression,
+                                            &var_map,
+                                        ) {
+                                            Ok(value) if value.abs() < 89.0 => {
+                                                format!("→ {value:.3}°")
+                                            }
+                                            Ok(value) => format!(
+                                                "→ {value:.3}° (invalid: must be between -89° and 89°)"
+                                            ),
+                                            Err(_) => {
+                                                "→ unresolved (check variable names)".to_string()
+                                            }
+                                        };
+                                        ui.label(egui::RichText::new(text).size(11.0).weak());
                                     }
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {

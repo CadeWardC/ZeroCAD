@@ -189,6 +189,8 @@ fn test_parametric_graph_sketch_extrude() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     };
 
@@ -237,6 +239,8 @@ fn test_overlapping_rectangles_fuse_into_one_extruded_body() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     pg.add_dependency("s", "e");
@@ -270,6 +274,8 @@ fn test_overlapping_rectangles_fuse_into_one_extruded_body() {
             region_indices: vec![],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     pg2.add_dependency("s2", "e2");

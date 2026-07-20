@@ -23,6 +23,7 @@ mod cut;
 mod datum;
 mod diagnostics;
 mod direct_edit;
+mod draft;
 mod edge_mod;
 mod eval;
 mod extrude;
@@ -40,6 +41,7 @@ pub(crate) use body_ops::*;
 #[allow(unused_imports)]
 pub(crate) use cut::*;
 pub(crate) use direct_edit::*;
+pub(crate) use draft::*;
 pub use edge_mod::edge_wedge_is_concave_mesh;
 #[allow(unused_imports)]
 pub(crate) use edge_mod::*;
@@ -47,7 +49,10 @@ pub(crate) use edge_mod::*;
 pub(crate) use eval::*;
 #[allow(unused_imports)]
 pub(crate) use extrude::*;
-pub use extrude::{boolean_region_plan, complete_selected_circles, BooleanRegionPlan};
+pub use extrude::{
+    boolean_region_plan, complete_selected_circles, drafted_region_solid, BooleanRegionPlan,
+    ExtrudeDraftError,
+};
 pub use inspection::{
     BodyInspection, EdgeInspection, EdgePairInspection, FaceInspection, InterferencePair,
 };

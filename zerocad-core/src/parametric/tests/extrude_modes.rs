@@ -124,6 +124,8 @@ fn multi_region_join_rolls_back_when_any_region_cannot_fuse() {
             region_indices: Vec::new(),
             mode: ExtrudeMode::Join,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     graph.add_dependency("sketch_2", "extrude_3");

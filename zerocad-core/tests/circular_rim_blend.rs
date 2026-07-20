@@ -539,6 +539,8 @@ fn bite_arc_edge_mod_commits(kind: zerocad_core::CornerKind, label: &str) {
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("s", "e");
@@ -655,6 +657,8 @@ fn sketch_extrude_edge_mod(
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("s", "e");
@@ -898,6 +902,8 @@ fn corner_flow_edge_mods_commit(arc_first: bool) {
             region_indices: vec![region],
             mode: ExtrudeMode::NewBody,
             depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
     });
     g.add_dependency("s", "e");

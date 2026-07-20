@@ -168,6 +168,36 @@ pub struct FaceRef {
     pub topology: Option<TopologyFaceRef>,
 }
 
+/// Durable identity for a selected B-Rep vertex.
+///
+/// Vertices are named by the durable edges that meet at them. This survives
+/// ordinary dimension edits without relying on kernel arena indices, while the
+/// captured point remains available only as the fallback for genuinely unnamed
+/// legacy references.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyVertexRef {
+    #[serde(default)]
+    pub body_id: Option<String>,
+    #[serde(default)]
+    pub topology_version: Option<u64>,
+    #[serde(default)]
+    pub incident_edge_ids: Vec<String>,
+    #[serde(default)]
+    pub incident_face_ids: Vec<String>,
+    #[serde(default)]
+    pub producer_feature_id: Option<String>,
+    #[serde(default)]
+    pub source_entity_id: Option<String>,
+}
+
+/// A world-space vertex capture with optional durable incident-edge identity.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VertexRef {
+    pub point: [f32; 3],
+    #[serde(default)]
+    pub topology: Option<TopologyVertexRef>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum FeatureType {
     Origin,
@@ -256,6 +286,13 @@ pub enum FeatureType {
         /// holds the last resolved value (a fallback when a variable is missing).
         #[serde(default)]
         depth_expr: Option<String>,
+        /// Signed wall draft in degrees. Positive contracts the far section;
+        /// negative expands it. Schema-v1 payloads decode this as zero.
+        #[serde(default)]
+        draft_angle_deg: f32,
+        /// Optional expression driving `draft_angle_deg`.
+        #[serde(default)]
+        draft_angle_expr: Option<String>,
     },
     /// Round (fillet) or bevel (chamfer) one edge of an existing solid body by
     /// `dist`. Applied as a guarded boolean subtraction of an edge-aligned cutter
@@ -335,6 +372,12 @@ pub enum FeatureType {
         mode: ExtrudeMode,
         #[serde(default)]
         target: Option<String>,
+        /// Signed twist distributed over the complete path. Schema-v1 payloads
+        /// decode this as zero.
+        #[serde(default)]
+        total_twist_deg: f32,
+        #[serde(default)]
+        total_twist_expr: Option<String>,
     },
     /// Hollow out an existing body to a constant wall `thickness`, removing
     /// `open_faces` (at least one). Kernel support: boxes, cylinders, and any
@@ -542,6 +585,35 @@ pub enum FeatureType {
         stl_data: Vec<u8>,
         label: String,
     },
+    /// Replicate the material operation produced by an earlier feature while
+    /// preserving one target body. Unlike [`Self::Pattern`], this does not copy
+    /// a finished body: instance zero is the source feature itself and this
+    /// node applies only instances `1..count` to the target's historical state.
+    /// Appended to preserve every pre-existing binary enum tag.
+    FeaturePattern {
+        /// Body modified by the source feature and every additional instance.
+        target: String,
+        /// Earlier Hole or Join/Cut Extrude/Revolve feature to replicate.
+        source_feature: String,
+        kind: FeaturePatternKind,
+        #[serde(default)]
+        compute_mode: FeaturePatternComputeMode,
+        #[serde(default)]
+        extent_policy: FeaturePatternExtentPolicy,
+    },
+    /// Standalone tapered-face edit for planar prismatic bodies. The selected
+    /// side faces are drafted relative to one neutral face or datum plane; the
+    /// original body remains unchanged when any reference or candidate fails.
+    Draft {
+        target: String,
+        faces: Vec<FaceRef>,
+        neutral: DraftNeutral,
+        angle_deg: f32,
+        #[serde(default)]
+        angle_expr: Option<String>,
+        #[serde(default)]
+        flip_pull: bool,
+    },
 }
 
 /// A plane input to a datum definition: one of the three base planes or a
@@ -570,9 +642,7 @@ pub enum AxisBase {
     },
 }
 
-/// How a [`FeatureType::DatumPlane`] is constructed. All inputs are resolvable
-/// without live body geometry (base planes, other datums, explicit points), so
-/// datums evaluate in a pure pre-pass before the body loop.
+/// How a [`FeatureType::DatumPlane`] is constructed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DatumPlaneDef {
     /// `base` translated `distance` along its stored normal (handedness kept:
@@ -602,6 +672,8 @@ pub enum DatumPlaneDef {
     /// Halfway between two (parallel) planes: `a`'s axes at the midpoint of
     /// the two origins projected along `a`'s normal.
     MidPlane { a: PlaneBase, b: PlaneBase },
+    /// The exact historical location of a selected planar body face.
+    PlanarFace { face: FaceRef },
 }
 
 /// How a [`FeatureType::DatumAxis`] is constructed.
@@ -616,12 +688,36 @@ pub enum DatumAxisDef {
         a: PlaneBase,
         b: PlaneBase,
     },
+    /// A straight selected edge, or the axis of a selected circular edge.
+    Edge {
+        edge: EdgeRef,
+    },
+    /// The analytic axis of a selected cylindrical or conical face.
+    CylindricalOrConicalFace {
+        face: FaceRef,
+    },
+    /// The line through two durable body vertices.
+    TwoVertices {
+        a: VertexRef,
+        b: VertexRef,
+    },
 }
 
 /// How a [`FeatureType::DatumPoint`] is constructed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DatumPointDef {
     Coords { p: [f32; 3] },
+    Vertex { vertex: VertexRef },
+    Midpoint { a: VertexRef, b: VertexRef },
+    EdgeMidpoint { edge: EdgeRef },
+    CircleCenter { edge: EdgeRef },
+}
+
+/// Neutral reference for a standalone Draft feature.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DraftNeutral {
+    Face(FaceRef),
+    Datum(String),
 }
 
 /// The head style of a [`FeatureType::Hole`].
@@ -674,9 +770,52 @@ pub enum PatternKind {
     },
 }
 
+/// Placement of instances for a feature-level pattern. `count` is always the
+/// total occurrence count, including the already-evaluated source feature.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum FeaturePatternKind {
+    Linear {
+        direction: AxisBase,
+        spacing: f32,
+        #[serde(default)]
+        spacing_expr: Option<String>,
+        count: u32,
+    },
+    Circular {
+        axis: AxisBase,
+        total_angle_deg: f32,
+        #[serde(default)]
+        total_angle_expr: Option<String>,
+        count: u32,
+    },
+}
+
+/// Feature-pattern computation strategy. Wave 3 v1 intentionally exposes only
+/// rigid copies of the source operation recipe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FeaturePatternComputeMode {
+    #[default]
+    Identical,
+    /// Unit tests use this value to prove that the v1 evaluator rejects an
+    /// unsupported computation mode and that changing this persisted field
+    /// invalidates a warm checkpoint. It is never part of production builds or
+    /// the published payload schema.
+    #[cfg(test)]
+    UnsupportedForTest,
+}
+
+/// Whether an instance keeps the source feature's finite extent or recomputes
+/// a through-all Hole against the target at that placement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FeaturePatternExtentPolicy {
+    #[default]
+    SourceExtent,
+    ThroughAllLocalTarget,
+}
+
 /// A resolved datum: what a datum feature node evaluates to. Never serialized —
 /// recomputed from the graph on every build.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DatumValue {
     Plane(crate::geometry::CoordinateSystem),
     Axis {
@@ -934,7 +1073,13 @@ pub(crate) struct EvalCheckpoint {
     #[serde(skip)]
     pub(crate) manifest: DependencyManifest,
     pub(crate) live: Vec<LiveBody>,
+    #[serde(default)]
+    pub(crate) datums: HashMap<String, DatumValue>,
     pub(crate) warnings: Vec<String>,
+    /// Authoritative typed diagnostics accumulated through this checkpoint.
+    /// `warnings` remains only as the rendered compatibility surface.
+    #[serde(default)]
+    pub(crate) diagnostics: Vec<EvaluationDiagnostic>,
     /// Per-feature resolution status accumulated up to and including this node,
     /// in creation order. Cached alongside `warnings` so a reused prefix restores
     /// its statuses too — see [`FeatureStatus`].
@@ -1074,6 +1219,10 @@ pub struct EvaluationTrace {
 #[derive(Debug)]
 pub struct EvaluationOutput {
     pub bodies: Vec<(String, MockMesh)>,
+    /// Resolved construction geometry from the same revision/checkpoint as
+    /// `bodies`. UI overlays must consume this map instead of independently
+    /// re-resolving definitions without the historical live-body state.
+    pub datums: HashMap<String, DatumValue>,
     pub warnings: Vec<String>,
     pub statuses: Vec<FeatureStatus>,
     pub diagnostics: Vec<EvaluationDiagnostic>,
@@ -1360,4 +1509,7 @@ pub(crate) struct SketchEval {
     /// geometry baked is the last-valid stored positions; the extrude that
     /// consumes this sketch surfaces the reason as a fail-loud warning.
     pub(crate) solve_failure: Option<String>,
+    /// Associative offset failures suspend consumers rather than allowing them
+    /// to build from only the surviving base curves.
+    pub(crate) offset_failure: Option<String>,
 }

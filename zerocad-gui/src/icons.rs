@@ -35,6 +35,9 @@ pub(crate) const FILLET: &str = include_str!("../../icons/sketch/fillet3d.svg");
 pub(crate) const CHAMFER: &str = include_str!("../../icons/sketch/chamfer3d.svg");
 pub(crate) const POLYGON: &str = include_str!("../../icons/sketch/polygon.svg");
 pub(crate) const MIRROR: &str = include_str!("../../icons/sketch/mirror.svg");
+pub(crate) const SLOT: &str = include_str!("../../icons/sketch/slot.svg");
+pub(crate) const OFFSET: &str = include_str!("../../icons/sketch/offset.svg");
+pub(crate) const TRIM: &str = include_str!("../../icons/sketch/trim.svg");
 pub(crate) const SKETCH: &str = include_str!("../../icons/sketch/sketch.svg");
 pub(crate) const EXTRUDE: &str = include_str!("../../icons/3d/extrude.svg");
 pub(crate) const CHECK: &str = include_str!("../../icons/general/check.svg");
@@ -64,6 +67,9 @@ pub(crate) enum Icon {
     Chamfer,
     Polygon,
     Mirror,
+    Slot,
+    Offset,
+    Trim,
     Extrude,
     Check,
     EyeOpen,
@@ -94,6 +100,9 @@ impl Icon {
             Icon::Chamfer => CHAMFER,
             Icon::Polygon => POLYGON,
             Icon::Mirror => MIRROR,
+            Icon::Slot => SLOT,
+            Icon::Offset => OFFSET,
+            Icon::Trim => TRIM,
             Icon::Extrude => EXTRUDE,
             Icon::Check => CHECK,
             Icon::EyeOpen => EYE_OPEN,

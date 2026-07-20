@@ -15,8 +15,8 @@ pub mod arrangement;
 pub mod offset;
 
 pub use arrangement::{
-    arrange_curve_spans, Arrangement, ArrangementError, ArrangementLoop, ArrangementOptions,
-    ArrangementRegion,
+    arrange_curve_spans, intersect_curve_spans, Arrangement, ArrangementError, ArrangementLoop,
+    ArrangementOptions, ArrangementRegion, CurveSpanIntersection, CurveSpanIntersections,
 };
 pub use offset::{
     offset_curve_chain, offset_material_region, OffsetChain, OffsetError, OffsetOptions,

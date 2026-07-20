@@ -537,6 +537,31 @@ impl ZeroCadApp {
             }
         }
 
+        // DRAFT: taper one or more selected planar side faces relative to an
+        // end face or datum plane chosen in the command dialog.
+        if !active_sketching
+            && self.extrude_op.is_none()
+            && self.edge_mod_op.is_none()
+            && self.draft_op.is_none()
+        {
+            if let Some((target, faces)) = self.draft_candidate() {
+                let draft_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Draft",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if draft_btn
+                    .on_hover_text("Taper the selected planar side face(s)")
+                    .clicked()
+                {
+                    self.begin_draft(target, faces);
+                }
+            }
+        }
+
         // Imported-part direct modeling: one selected B-Rep face enables the
         // exact Phase 5 operations. Numeric values are editable immediately in
         // the feature Properties panel after creation.
@@ -656,7 +681,23 @@ impl ZeroCadApp {
             && self.edge_mod_op.is_none()
             && self.pattern_op.is_none()
         {
-            if let Some(source) = self.pattern_source_candidate() {
+            if let Some((source, target)) = self.feature_pattern_source_candidate() {
+                ui.separator();
+                let pattern_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    "Feature Pattern",
+                    egui::Color32::from_rgb(241, 245, 249),
+                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                );
+                if pattern_btn
+                    .on_hover_text("Repeat the selected Hole or Join/Cut operation")
+                    .clicked()
+                {
+                    self.begin_feature_pattern(source, target);
+                }
+            } else if let Some(source) = self.pattern_source_candidate() {
                 ui.separator();
                 let pattern_btn = icons::Icon::Extrude.labeled_button(
                     ui,
@@ -694,6 +735,9 @@ impl ZeroCadApp {
         // plane becomes a sketchable target in the plane picker.
         if !active_sketching && self.extrude_op.is_none() && self.edge_mod_op.is_none() {
             ui.separator();
+            let selected_datum_face = self.selected_datum_face();
+            let selected_datum_edge = self.selected_datum_edge();
+            let selected_datum_vertices = self.selected_datum_vertices();
             let datum_btn_id = ui.make_persistent_id("datum_menu_dropdown");
             let datum_btn = icons::Icon::Sketch.labeled_button(
                 ui,
@@ -739,9 +783,75 @@ impl ZeroCadApp {
                         ui.memory_mut(|mem| mem.close_popup());
                         self.create_datum(DatumKind::ThreePointPlane);
                     }
+                    if let Some(face) = selected_datum_face.clone() {
+                        let surface_kind = face
+                            .topology
+                            .as_ref()
+                            .and_then(|topology| topology.surface_kind.as_deref())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        if (surface_kind.is_empty() || surface_kind.contains("plane"))
+                            && ui.button("Plane from selected face").clicked()
+                        {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(DatumKind::PlaneFromFace(face.clone()));
+                        }
+                        if (surface_kind.contains("cylinder") || surface_kind.contains("cone"))
+                            && ui.button("Axis from selected surface").clicked()
+                        {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(DatumKind::AxisFromFace(face));
+                        }
+                    }
                     if ui.button("Axis (2 points)").clicked() {
                         ui.memory_mut(|mem| mem.close_popup());
                         self.create_datum(DatumKind::Axis);
+                    }
+                    if let Some(edge) = selected_datum_edge.clone() {
+                        if ui.button("Axis from selected edge").clicked() {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(DatumKind::AxisFromEdge(edge.clone()));
+                        }
+                        let circular = matches!(
+                            edge.curve,
+                            Some(zerocad_core::mock_kernel::EdgeCurveHint::Circle { .. })
+                        );
+                        let label = if circular {
+                            "Center of selected circle"
+                        } else {
+                            "Midpoint of selected edge"
+                        };
+                        if ui.button(label).clicked() {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(if circular {
+                                DatumKind::PointAtCircleCenter(edge)
+                            } else {
+                                DatumKind::PointOnEdge(edge)
+                            });
+                        }
+                    }
+                    if selected_datum_vertices.len() == 2 {
+                        if ui.button("Axis through selected vertices").clicked() {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(DatumKind::AxisFromVertices(
+                                selected_datum_vertices[0].clone(),
+                                selected_datum_vertices[1].clone(),
+                            ));
+                        }
+                        if ui.button("Point between selected vertices").clicked() {
+                            ui.memory_mut(|mem| mem.close_popup());
+                            self.create_datum(DatumKind::PointBetweenVertices(
+                                selected_datum_vertices[0].clone(),
+                                selected_datum_vertices[1].clone(),
+                            ));
+                        }
+                    } else if selected_datum_vertices.len() == 1
+                        && ui.button("Point from selected vertex").clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.create_datum(DatumKind::PointFromVertex(
+                            selected_datum_vertices[0].clone(),
+                        ));
                     }
                     if ui.button("Point").clicked() {
                         ui.memory_mut(|mem| mem.close_popup());

@@ -443,7 +443,37 @@ impl ZeroCadApp {
                         // finalized on the next click — never on the drag itself.
                         let begin_draw = response.drag_started_by(egui::PointerButton::Primary);
                         if self.is_sketch_mode
+                            && self.active_tool == Some(SketchTool::Offset)
+                            && response.clicked()
+                            && !self.camera_anim_active
+                        {
+                            if let Some(position) = response.interact_pointer_pos() {
+                                let scale =
+                                    rect.width().min(rect.height()) / (self.camera_zoom * 5.0);
+                                let raw =
+                                    self.screen_to_sketch(position, rect, &self.active_sketch_cs);
+                                let seed = self.snap_sketch_point(raw, scale, ctrl);
+                                self.handle_offset_click(seed, 9.0 / scale.max(1.0e-4), shift);
+                            }
+                        }
+                        if self.is_sketch_mode
+                            && self.active_tool == Some(SketchTool::Trim)
+                            && response.clicked()
+                            && !self.camera_anim_active
+                        {
+                            if let Some(position) = response.interact_pointer_pos() {
+                                let scale =
+                                    rect.width().min(rect.height()) / (self.camera_zoom * 5.0);
+                                let raw =
+                                    self.screen_to_sketch(position, rect, &self.active_sketch_cs);
+                                self.update_trim_preview(raw, 9.0 / scale.max(1.0e-4));
+                                self.commit_trim_preview();
+                            }
+                        }
+                        if self.is_sketch_mode
                             && self.active_tool.is_some()
+                            && self.active_tool != Some(SketchTool::Offset)
+                            && self.active_tool != Some(SketchTool::Trim)
                             && (response.clicked() || begin_draw)
                             && !self.camera_anim_active
                         {
@@ -998,6 +1028,9 @@ impl ZeroCadApp {
                                 let tol = 9.0 / scale.max(1e-4);
                                 self.update_snap_guides(&res, raw, tol);
                             }
+                            if self.active_tool == Some(SketchTool::Trim) {
+                                self.update_trim_preview(raw, 9.0 / scale.max(1.0e-4));
+                            }
                             Some(if angle_snapping {
                                 snap_line_angle(self.sketch_temp_start.unwrap(), res.pos)
                             } else {
@@ -1007,8 +1040,13 @@ impl ZeroCadApp {
                             self.cursor_snap_kind = None;
                             self.snap_guides.clear();
                             self.cursor_snap_guides.clear();
+                            self.sketch_trim_preview = None;
                             None
                         };
+
+                        if self.active_tool != Some(SketchTool::Trim) {
+                            self.sketch_trim_preview = None;
+                        }
 
                         // Track cursor and refresh live dimension fields.
                         self.last_cursor = current_cursor_snap;
@@ -1155,6 +1193,7 @@ impl ZeroCadApp {
         self.show_thread_dialog(ctx);
         self.show_shell_dialog(ctx);
         self.show_sweep_dialog(ctx);
+        self.show_draft_dialog(ctx);
 
         // 3D fillet/chamfer: the drag manipulator on the edge, the inline size
         // box, and the inline 2D corner-radius box (anchored on the staged

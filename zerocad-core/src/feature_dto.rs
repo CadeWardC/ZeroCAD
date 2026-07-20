@@ -5,7 +5,8 @@
 //! feature kind's payload version and adds an explicit decoder.
 
 use crate::parametric::{
-    AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeRef, ExtrudeMode, FaceRef,
+    AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DraftNeutral, EdgeRef, ExtrudeMode,
+    FaceRef, FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
     FeatureType, HoleKind, HoleManufacturingMetadata, PatternKind, PlaneBase, StandardReference,
     Variable,
 };
@@ -98,7 +99,11 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             put(&mut fields, 5, on_face);
             put(&mut fields, 6, entity_ids);
             put(&mut fields, 7, next_entity_id);
-            put(&mut fields, 8, solver);
+            let mut legacy_solver = solver.clone();
+            if let Some(model) = legacy_solver.as_mut() {
+                model.patterns.clear();
+            }
+            put(&mut fields, 8, &legacy_solver);
         }
         FeatureType::Extrude {
             depth,
@@ -106,6 +111,7 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             mode,
             target,
             depth_expr,
+            ..
         } => {
             put(&mut fields, 0, depth);
             put(&mut fields, 1, region_indices);
@@ -161,6 +167,7 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             path_sketch,
             mode,
             target,
+            ..
         } => {
             put(&mut fields, 0, profile_sketch);
             put(&mut fields, 1, profile_region);
@@ -322,6 +329,75 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             put(&mut fields, 4, reverse);
         }
         FeatureType::ImportStl { .. } => {}
+        FeatureType::FeaturePattern {
+            target,
+            source_feature,
+            kind,
+            compute_mode,
+            extent_policy,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, source_feature);
+            put(&mut fields, 2, kind);
+            put(&mut fields, 3, compute_mode);
+            put(&mut fields, 4, extent_policy);
+        }
+        FeatureType::Draft {
+            target,
+            faces,
+            neutral,
+            angle_deg,
+            angle_expr,
+            flip_pull,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, faces);
+            put(&mut fields, 2, neutral);
+            put(&mut fields, 3, angle_deg);
+            put(&mut fields, 4, angle_expr);
+            put(&mut fields, 5, flip_pull);
+        }
+    }
+    fields
+}
+
+/// Encode one feature using the numeric layout registered for `payload_schema`.
+/// Schema 1 remains byte-for-byte stable; Extrude v2 appends only new slots.
+pub(crate) fn encode_for_schema(
+    feature: &FeatureType,
+    payload_schema: u16,
+) -> NumericFeatureFields {
+    let mut fields = encode(feature);
+    if let FeatureType::Extrude {
+        draft_angle_deg,
+        draft_angle_expr,
+        ..
+    } = feature
+    {
+        if payload_schema >= 2 {
+            put(&mut fields, 5, draft_angle_deg);
+            put(&mut fields, 6, draft_angle_expr);
+        }
+    }
+    if let FeatureType::Sweep {
+        total_twist_deg,
+        total_twist_expr,
+        ..
+    } = feature
+    {
+        if payload_schema >= 2 {
+            put(&mut fields, 5, total_twist_deg);
+            put(&mut fields, 6, total_twist_expr);
+        }
+    }
+    if let FeatureType::Sketch { solver, .. } = feature {
+        if payload_schema >= 3 {
+            let patterns = solver
+                .as_ref()
+                .map(|model| model.patterns.as_slice())
+                .unwrap_or(&[]);
+            put(&mut fields, 9, &patterns);
+        }
     }
     fields
 }
@@ -334,11 +410,75 @@ pub(crate) fn decode_with_decoder(
 ) -> Result<FeatureType, String> {
     match decoder {
         crate::document::FeaturePayloadDecoder::NumericFieldsV1 => decode_v1(kind, fields),
+        crate::document::FeaturePayloadDecoder::NumericFieldsV2 => decode_v2(kind, fields),
+        crate::document::FeaturePayloadDecoder::NumericFieldsV3 => decode_v3(kind, fields),
         crate::document::FeaturePayloadDecoder::StepAssetV1
         | crate::document::FeaturePayloadDecoder::StlAssetV1 => Err(format!(
             "feature kind '{kind}' schema {payload_schema} requires a content-addressed asset payload"
         )),
     }
+}
+
+fn decode_v3(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType, String> {
+    if kind != "sketch.sketch" {
+        return decode_v2(kind, fields);
+    }
+    let mut solver = take::<Option<SketchSolverModel>>(&mut fields, 8, "solver")?;
+    let patterns =
+        take::<Vec<crate::sketch::SketchPatternOperation>>(&mut fields, 9, "associative patterns")?;
+    if !patterns.is_empty() {
+        solver
+            .get_or_insert_with(SketchSolverModel::default)
+            .patterns = patterns;
+    }
+    let feature = FeatureType::Sketch {
+        cs: take::<CoordinateSystem>(&mut fields, 0, "coordinate system")?,
+        curves: take::<SketchCurves>(&mut fields, 1, "curves")?,
+        shapes: take::<Vec<SketchShape>>(&mut fields, 2, "shapes")?,
+        corner_mods: take::<Vec<CornerMod>>(&mut fields, 3, "corner modifiers")?,
+        mirrors: take::<Vec<SketchMirror>>(&mut fields, 4, "mirrors")?,
+        on_face: take(&mut fields, 5, "on face")?,
+        entity_ids: take::<Vec<EntityId>>(&mut fields, 6, "entity ids")?,
+        next_entity_id: take(&mut fields, 7, "next entity id")?,
+        solver,
+    };
+    finish(kind, fields)?;
+    Ok(feature)
+}
+
+fn decode_v2(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType, String> {
+    let feature = match kind {
+        "part.extrude" => FeatureType::Extrude {
+            depth: take(&mut fields, 0, "depth")?,
+            region_indices: take(&mut fields, 1, "regions")?,
+            mode: take::<ExtrudeMode>(&mut fields, 2, "mode")?,
+            target: take(&mut fields, 3, "target")?,
+            depth_expr: take(&mut fields, 4, "depth expression")?,
+            draft_angle_deg: take(&mut fields, 5, "draft angle")?,
+            draft_angle_expr: take(&mut fields, 6, "draft angle expression")?,
+        },
+        "part.sweep" => FeatureType::Sweep {
+            profile_sketch: take(&mut fields, 0, "profile sketch")?,
+            profile_region: take(&mut fields, 1, "profile region")?,
+            path_sketch: take(&mut fields, 2, "path sketch")?,
+            mode: take::<ExtrudeMode>(&mut fields, 3, "mode")?,
+            target: take(&mut fields, 4, "target")?,
+            total_twist_deg: take(&mut fields, 5, "total twist")?,
+            total_twist_expr: take(&mut fields, 6, "total twist expression")?,
+        },
+        "datum.plane" => FeatureType::DatumPlane {
+            def: take::<DatumPlaneDef>(&mut fields, 0, "definition")?,
+        },
+        "datum.axis" => FeatureType::DatumAxis {
+            def: take::<DatumAxisDef>(&mut fields, 0, "definition")?,
+        },
+        "datum.point" => FeatureType::DatumPoint {
+            def: take::<DatumPointDef>(&mut fields, 0, "definition")?,
+        },
+        _ => return decode_v1(kind, fields),
+    };
+    finish(kind, fields)?;
+    Ok(feature)
 }
 
 #[cfg(test)]
@@ -399,6 +539,8 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
             mode: take::<ExtrudeMode>(&mut fields, 2, "mode")?,
             target: take(&mut fields, 3, "target")?,
             depth_expr: take(&mut fields, 4, "depth expression")?,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
         },
         "part.edge_mod" => FeatureType::EdgeMod {
             target: take(&mut fields, 0, "target")?,
@@ -436,6 +578,8 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
             path_sketch: take(&mut fields, 2, "path sketch")?,
             mode: take::<ExtrudeMode>(&mut fields, 3, "mode")?,
             target: take(&mut fields, 4, "target")?,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
         },
         "part.shell" => FeatureType::Shell {
             target: take(&mut fields, 0, "target")?,
@@ -467,6 +611,21 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
         "part.pattern" => FeatureType::Pattern {
             source: take(&mut fields, 0, "source")?,
             kind: take::<PatternKind>(&mut fields, 1, "kind")?,
+        },
+        "part.feature_pattern" => FeatureType::FeaturePattern {
+            target: take(&mut fields, 0, "target")?,
+            source_feature: take(&mut fields, 1, "source feature")?,
+            kind: take::<FeaturePatternKind>(&mut fields, 2, "pattern kind")?,
+            compute_mode: take::<FeaturePatternComputeMode>(&mut fields, 3, "compute mode")?,
+            extent_policy: take::<FeaturePatternExtentPolicy>(&mut fields, 4, "extent policy")?,
+        },
+        "part.draft" => FeatureType::Draft {
+            target: take(&mut fields, 0, "target")?,
+            faces: take::<Vec<FaceRef>>(&mut fields, 1, "faces")?,
+            neutral: take::<DraftNeutral>(&mut fields, 2, "neutral")?,
+            angle_deg: take(&mut fields, 3, "angle")?,
+            angle_expr: take(&mut fields, 4, "angle expression")?,
+            flip_pull: take(&mut fields, 5, "flip pull")?,
         },
         "part.transform" => FeatureType::BodyTransform {
             source: take(&mut fields, 0, "source")?,
@@ -555,6 +714,29 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
         }
         _ => return Err(format!("unknown feature kind '{kind}'")),
     };
+    match &feature {
+        FeatureType::DatumPlane {
+            def: DatumPlaneDef::PlanarFace { .. },
+        }
+        | FeatureType::DatumAxis {
+            def:
+                DatumAxisDef::Edge { .. }
+                | DatumAxisDef::CylindricalOrConicalFace { .. }
+                | DatumAxisDef::TwoVertices { .. },
+        }
+        | FeatureType::DatumPoint {
+            def:
+                DatumPointDef::Vertex { .. }
+                | DatumPointDef::Midpoint { .. }
+                | DatumPointDef::EdgeMidpoint { .. }
+                | DatumPointDef::CircleCenter { .. },
+        } => {
+            return Err(format!(
+                "feature kind '{kind}' uses a geometry-derived datum definition that requires payload schema 2"
+            ));
+        }
+        _ => {}
+    }
     finish(kind, fields)?;
     Ok(feature)
 }
@@ -562,6 +744,155 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extrude_v1_decodes_zero_draft_and_v2_round_trips_expression() {
+        let feature = FeatureType::Extrude {
+            depth: 12.0,
+            region_indices: vec![2],
+            mode: ExtrudeMode::Join,
+            target: Some("body".into()),
+            depth_expr: Some("height".into()),
+            draft_angle_deg: -3.5,
+            draft_angle_expr: Some("-draft".into()),
+        };
+
+        let v1 = decode_with_decoder(
+            "part.extrude",
+            1,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV1,
+            encode_for_schema(&feature, 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            v1,
+            FeatureType::Extrude {
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+                ..
+            }
+        ));
+
+        let v2 = decode_with_decoder(
+            "part.extrude",
+            2,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV2,
+            encode_for_schema(&feature, 2),
+        )
+        .unwrap();
+        assert!(matches!(
+            v2,
+            FeatureType::Extrude {
+                draft_angle_deg,
+                draft_angle_expr: Some(expression),
+                ..
+            } if draft_angle_deg == -3.5 && expression == "-draft"
+        ));
+    }
+
+    #[test]
+    fn sweep_v1_decodes_zero_twist_and_v2_round_trips_signed_expression() {
+        let feature = FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 2,
+            path_sketch: "path".into(),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            total_twist_deg: -135.0,
+            total_twist_expr: Some("-3*twist".into()),
+        };
+        let v1 = decode_with_decoder(
+            "part.sweep",
+            1,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV1,
+            encode_for_schema(&feature, 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            v1,
+            FeatureType::Sweep {
+                total_twist_deg: 0.0,
+                total_twist_expr: None,
+                ..
+            }
+        ));
+
+        let v2 = decode_with_decoder(
+            "part.sweep",
+            2,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV2,
+            encode_for_schema(&feature, 2),
+        )
+        .unwrap();
+        assert!(matches!(
+            v2,
+            FeatureType::Sweep {
+                total_twist_deg,
+                total_twist_expr: Some(expression),
+                ..
+            } if total_twist_deg == -135.0 && expression == "-3*twist"
+        ));
+    }
+
+    #[test]
+    fn sketch_v3_adds_associative_patterns_without_changing_v2_solver_payload() {
+        let pattern = crate::sketch::SketchPatternOperation {
+            id: EntityId(20),
+            sources: vec![EntityId(5)],
+            kind: crate::sketch::SketchPatternKind::Linear {
+                direction: [1.0, 0.0],
+                spacing: crate::sketch::Dimension {
+                    value: 4.0,
+                    expr: Some("pitch".into()),
+                },
+                count: 3,
+            },
+        };
+        let feature = FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: Vec::new(),
+            corner_mods: Vec::new(),
+            mirrors: Vec::new(),
+            on_face: false,
+            entity_ids: Vec::new(),
+            next_entity_id: 21,
+            solver: Some(SketchSolverModel {
+                patterns: vec![pattern.clone()],
+                ..SketchSolverModel::default()
+            }),
+        };
+
+        let v2 = decode_with_decoder(
+            "sketch.sketch",
+            2,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV2,
+            encode_for_schema(&feature, 2),
+        )
+        .unwrap();
+        assert!(matches!(
+            v2,
+            FeatureType::Sketch {
+                solver: Some(SketchSolverModel { patterns, .. }),
+                ..
+            } if patterns.is_empty()
+        ));
+
+        let v3 = decode_with_decoder(
+            "sketch.sketch",
+            3,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV3,
+            encode_for_schema(&feature, 3),
+        )
+        .unwrap();
+        assert!(matches!(
+            v3,
+            FeatureType::Sketch {
+                solver: Some(SketchSolverModel { patterns, .. }),
+                ..
+            } if patterns == vec![pattern]
+        ));
+    }
 
     #[test]
     fn body_ops_payloads_have_stable_v1_round_trips() {
@@ -610,6 +941,119 @@ mod tests {
                 && factor == 2.5
                 && expression == "scale_factor"
                 && center == [1.0, 2.0, 3.0]
+        ));
+    }
+
+    #[test]
+    fn feature_pattern_has_an_independent_stable_v1_payload() {
+        let feature = FeatureType::FeaturePattern {
+            target: "plate".into(),
+            source_feature: "hole_2".into(),
+            kind: FeaturePatternKind::Circular {
+                axis: AxisBase::Datum("pattern_axis".into()),
+                total_angle_deg: 270.0,
+                total_angle_expr: Some("pattern_angle".into()),
+                count: 4,
+            },
+            compute_mode: FeaturePatternComputeMode::Identical,
+            extent_policy: FeaturePatternExtentPolicy::ThroughAllLocalTarget,
+        };
+        let decoded = decode("part.feature_pattern", 1, encode(&feature)).unwrap();
+        assert!(matches!(
+            decoded,
+            FeatureType::FeaturePattern {
+                target,
+                source_feature,
+                kind: FeaturePatternKind::Circular {
+                    axis: AxisBase::Datum(axis),
+                    total_angle_deg,
+                    total_angle_expr: Some(expression),
+                    count: 4,
+                },
+                compute_mode: FeaturePatternComputeMode::Identical,
+                extent_policy: FeaturePatternExtentPolicy::ThroughAllLocalTarget,
+            } if target == "plate"
+                && source_feature == "hole_2"
+                && axis == "pattern_axis"
+                && total_angle_deg == 270.0
+                && expression == "pattern_angle"
+        ));
+    }
+
+    #[test]
+    fn draft_has_an_independent_stable_v1_payload() {
+        let neutral = FaceRef {
+            centroid: [0.0, 0.0, 12.0],
+            normal: [0.0, 0.0, 1.0],
+            topology: None,
+        };
+        let selected = FaceRef {
+            centroid: [5.0, 0.0, 6.0],
+            normal: [1.0, 0.0, 0.0],
+            topology: None,
+        };
+        let feature = FeatureType::Draft {
+            target: "body".into(),
+            faces: vec![selected.clone()],
+            neutral: DraftNeutral::Face(neutral.clone()),
+            angle_deg: -4.5,
+            angle_expr: Some("-taper".into()),
+            flip_pull: true,
+        };
+        let decoded = decode("part.draft", 1, encode(&feature)).unwrap();
+        assert!(matches!(
+            decoded,
+            FeatureType::Draft {
+                target,
+                faces,
+                neutral: DraftNeutral::Face(decoded_neutral),
+                angle_deg,
+                angle_expr: Some(expression),
+                flip_pull: true,
+            } if target == "body"
+                && faces == vec![selected]
+                && decoded_neutral == neutral
+                && angle_deg == -4.5
+                && expression == "-taper"
+        ));
+    }
+
+    #[test]
+    fn geometry_datums_require_v2_while_legacy_datums_remain_v1() {
+        let legacy = FeatureType::DatumPoint {
+            def: DatumPointDef::Coords { p: [1.0, 2.0, 3.0] },
+        };
+        assert!(matches!(
+            decode("datum.point", 1, encode(&legacy)).unwrap(),
+            FeatureType::DatumPoint {
+                def: DatumPointDef::Coords { p: [1.0, 2.0, 3.0] }
+            }
+        ));
+
+        let geometry = FeatureType::DatumPlane {
+            def: DatumPlaneDef::PlanarFace {
+                face: FaceRef {
+                    centroid: [4.0, 5.0, 6.0],
+                    normal: [0.0, 1.0, 0.0],
+                    topology: None,
+                },
+            },
+        };
+        let v1_error = decode("datum.plane", 1, encode(&geometry))
+            .expect_err("geometry datum must not decode as schema v1");
+        assert!(v1_error.contains("requires payload schema 2"));
+        assert!(matches!(
+            decode_with_decoder(
+                "datum.plane",
+                2,
+                crate::document::FeaturePayloadDecoder::NumericFieldsV2,
+                encode_for_schema(&geometry, 2),
+            )
+            .unwrap(),
+            FeatureType::DatumPlane {
+                def: DatumPlaneDef::PlanarFace { face }
+            } if face.centroid == [4.0, 5.0, 6.0]
+                && face.normal == [0.0, 1.0, 0.0]
         ));
     }
 
