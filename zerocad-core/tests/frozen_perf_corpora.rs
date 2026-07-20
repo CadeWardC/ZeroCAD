@@ -138,3 +138,46 @@ fn committed_baseline_json_matches_the_frozen_corpus_manifest() {
         );
     }
 }
+
+#[test]
+fn committed_modeling_baseline_is_qualified_and_reproducible() {
+    let report: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../benchmarks/modeling-baseline.json"
+    )))
+    .expect("committed modeling baseline must be valid JSON");
+    assert_eq!(report["schema"], 1);
+    assert_eq!(report["environment_qualification"], "reference_conditions_verified");
+    assert_eq!(report["passed"], true);
+    assert_eq!(
+        report["source_commit"]
+            .as_str()
+            .expect("baseline source commit"),
+        "3994a35f7e33744ab0e10a4735fe1b61fb7ab1ab"
+    );
+
+    let workloads = report["workloads"]
+        .as_array()
+        .expect("modeling workloads must be an array");
+    assert_eq!(workloads.len(), 2);
+    for workload in workloads {
+        assert_eq!(workload["warmups"], 5);
+        assert_eq!(workload["samples"], 31);
+        assert_eq!(
+            workload["samples_ms"]
+                .as_array()
+                .expect("recorded samples")
+                .len(),
+            31
+        );
+        assert_eq!(workload["passed"], true);
+        assert!(
+            workload["p50_ms"].as_f64().expect("p50")
+                < workload["budget_ms"].as_f64().expect("budget")
+        );
+        assert!(
+            workload["p95_ms"].as_f64().expect("p95")
+                < workload["budget_ms"].as_f64().expect("budget")
+        );
+    }
+}
