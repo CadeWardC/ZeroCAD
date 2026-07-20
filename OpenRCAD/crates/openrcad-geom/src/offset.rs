@@ -21,6 +21,17 @@ impl OffsetSurface {
 
 impl Surface for OffsetSurface {
     fn point(&self, u: f64, v: f64) -> Pnt {
+        // Spherical parameterizations are singular at the poles: `du` tends
+        // to zero there, so normalizing `du × dv` can select the wrong side
+        // after a numerical perturbation. The radial normal is analytic and
+        // remains well-defined at both poles.
+        if let GeomSurface::Sphere(sphere) = self.base.as_ref() {
+            let pt = sphere.point(u, v);
+            let normal = (pt - sphere.center())
+                .normalized()
+                .unwrap_or(sphere.position().direction());
+            return pt + Vec::from_dir(normal) * self.distance;
+        }
         let (pt, du, dv) = self.base.d1(u, v);
         let normal = du.cross(&dv);
         let normal_dir = normal.normalized().unwrap_or_else(|| {

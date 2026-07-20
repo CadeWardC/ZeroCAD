@@ -416,7 +416,8 @@ impl Surface for GeomSurface {
             Self::Sphere(s) => s.is_uclosed(),
             Self::Torus(t) => t.is_uclosed(),
             Self::BSpline(b) => b.is_uclosed(),
-            Self::Gregory(_) | Self::Offset(_) | Self::Ruled(_) => false,
+            Self::Offset(offset) => offset.base.is_uclosed(),
+            Self::Gregory(_) | Self::Ruled(_) => false,
         }
     }
 
@@ -428,7 +429,8 @@ impl Surface for GeomSurface {
             Self::Sphere(s) => s.is_vclosed(),
             Self::Torus(t) => t.is_vclosed(),
             Self::BSpline(b) => b.is_vclosed(),
-            Self::Gregory(_) | Self::Offset(_) | Self::Ruled(_) => false,
+            Self::Offset(offset) => offset.base.is_vclosed(),
+            Self::Gregory(_) | Self::Ruled(_) => false,
         }
     }
 

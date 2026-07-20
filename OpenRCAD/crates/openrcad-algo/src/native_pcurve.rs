@@ -38,6 +38,7 @@ pub(crate) fn surface_periodicity(surface: &GeomSurface) -> SurfacePeriodicity {
             u_period: Some(TAU),
             v_period: Some(TAU),
         },
+        GeomSurface::Offset(offset) => surface_periodicity(&offset.base),
         _ => SurfacePeriodicity::NONE,
     }
 }

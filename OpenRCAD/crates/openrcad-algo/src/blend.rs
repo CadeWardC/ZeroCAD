@@ -11,7 +11,7 @@
 
 use core::f64::consts::{FRAC_PI_2, TAU};
 
-use openrcad_foundation::{tolerance, Ax3, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
+use openrcad_foundation::{Ax3, Dir, Pnt, ToleranceContext, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, GeomCurve, GeomSurface, OffsetSurface,
     Plane, ToroidalSurface,
@@ -82,6 +82,15 @@ pub struct CylinderInfo {
 /// Recognise the cylinder produced by `make_cylinder`: two planar caps plus a
 /// lateral wall of coaxial, equal-radius cylindrical faces.
 pub fn detect_cylinder(solid: &Solid) -> Option<CylinderInfo> {
+    detect_cylinder_with_policy(solid, &TolerancePolicy::STANDARD)
+}
+
+pub fn detect_cylinder_with_policy(
+    solid: &Solid,
+    policy: &TolerancePolicy,
+) -> Option<CylinderInfo> {
+    let context = ToleranceContext::derive(policy, &[solid.bounding_box()], None, 1.0).ok()?;
+    let policy = &context.policy;
     let faces = solid.shell().faces();
     let mut planes: Vec<Plane> = Vec::new();
     let mut cyl: Option<CylindricalSurface> = None;
@@ -91,11 +100,11 @@ pub fn detect_cylinder(solid: &Solid) -> Option<CylinderInfo> {
             Some(GeomSurface::Cylinder(c)) => {
                 if let Some(prev) = &cyl {
                     // All lateral faces must share one axis and radius.
-                    if (prev.radius() - c.radius()).abs() > 1e-6
+                    if (prev.radius() - c.radius()).abs() > policy.classification
                         || !prev
                             .position()
                             .direction()
-                            .is_parallel(&c.position().direction(), 1e-6)
+                            .is_parallel(&c.position().direction(), policy.angular)
                     {
                         return None;
                     }
@@ -128,7 +137,7 @@ pub fn detect_cylinder(solid: &Solid) -> Option<CylinderInfo> {
     };
     let _ = top;
 
-    if height <= tolerance::CONFUSION || cyl.radius() <= tolerance::CONFUSION {
+    if height <= policy.linear || cyl.radius() <= policy.linear {
         return None;
     }
 
@@ -407,14 +416,30 @@ pub fn shell_cylinder_with_policy(
         radius: cr,
         height,
     } = *info;
+    let mut bounds = openrcad_foundation::BndBox::new();
+    let axis_vec = GeomVec::from_dir(axis);
+    let x_vec = GeomVec::from_dir(xref) * cr;
+    let y_vec = axis_vec.cross(&GeomVec::from_dir(xref)) * cr;
+    let top = base + axis_vec * height;
+    for center in [base, top] {
+        for radial in [x_vec, -x_vec, y_vec, -y_vec] {
+            bounds.add(&(center + radial));
+        }
+    }
+    let context = ToleranceContext::derive(
+        policy,
+        &[bounds],
+        Some(thickness.abs().min(cr).min(height.abs())),
+        1.0,
+    )
+    .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    let policy = &context.policy;
     if thickness >= cr || thickness * 2.0 >= height {
         return Err(BlendError::ParameterTooLarge {
             requested: thickness,
             max: cr.min(height / 2.0),
         });
     }
-    let axis_vec = GeomVec::from_dir(axis);
-    let top = base + axis_vec * height;
     let inner_r = cr - thickness;
 
     // Which caps are removed?
@@ -423,9 +448,9 @@ pub fn shell_cylinder_with_policy(
     for f in open_faces {
         if let Some(GeomSurface::Plane(pl)) = f.surface() {
             let a = (pl.position().location() - base).dot(&axis_vec);
-            if a.abs() < 1e-4 {
+            if a.abs() <= policy.classification {
                 bottom_open = true;
-            } else if (a - height).abs() < 1e-4 {
+            } else if (a - height).abs() <= policy.classification {
                 top_open = true;
             }
         }

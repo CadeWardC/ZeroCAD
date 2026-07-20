@@ -1917,7 +1917,7 @@ fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
     }
 }
 
-fn point_on_face(face: &Face) -> Pnt {
+pub(crate) fn point_on_face(face: &Face) -> Pnt {
     // Surface-backed faces already carry authoritative, unwrapped pcurves.
     // Averaging boundary samples in UV gives a true interior point for periodic
     // bands (notably a cylinder split by a full-circle counterbore). A 3D chord
@@ -2282,7 +2282,7 @@ fn surfaces_are_coplanar(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> bool {
 /// Whether two analytic parameterizations describe the same infinite support
 /// surface. Parameter origins and seam directions may differ; boolean trimming
 /// cares about the geometric domain, not those coordinates.
-fn surfaces_are_same_domain(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> bool {
+pub(crate) fn surfaces_are_same_domain(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> bool {
     if surfaces_are_coplanar(s1, s2, tol) {
         return true;
     }

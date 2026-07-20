@@ -5122,9 +5122,46 @@ fn apply_shell(
         return;
     }
     let body = &live[body_idx];
+    let input_mesh = body.pristine.as_deref().cloned().unwrap_or_else(|| {
+        let mut mesh = MockMesh::empty();
+        for part in &body.parts {
+            mesh.append(MockMesh::from_solid(part));
+        }
+        mesh
+    });
+    let mut resolved_open_faces = Vec::with_capacity(open_faces.len());
+    for face in open_faces {
+        let durable_name = face
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.face_id.as_deref());
+        if let Some(durable_name) = durable_name {
+            let Some(current) = input_mesh.face_refs.iter().find(|candidate| {
+                candidate
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.face_id.as_deref())
+                    == Some(durable_name)
+            }) else {
+                warnings.push(format!(
+                    "Shell '{node_id}': named face '{durable_name}' no longer resolves."
+                ));
+                return;
+            };
+            resolved_open_faces.push(FaceRef {
+                centroid: current.centroid,
+                normal: current.normal,
+                topology: face.topology.clone(),
+            });
+        } else {
+            resolved_open_faces.push(face.clone());
+        }
+    }
+
     let mut new_parts: Vec<KernelSolid> = Vec::new();
+    let mut named_result = MockMesh::empty();
     for part in &body.parts {
-        let kernel_open: Vec<_> = open_faces
+        let kernel_open: Vec<_> = resolved_open_faces
             .iter()
             .flat_map(|fref| {
                 crate::mock_kernel::kernel_faces_matching(part, fref.centroid, fref.normal)
@@ -5134,6 +5171,11 @@ fn apply_shell(
             // This part doesn't own any of the removed faces (multi-part body)
             // — shell doesn't apply to it; keep it unchanged.
             new_parts.push(part.clone());
+            named_result.append(crate::mock_kernel::propagate_face_names(
+                &input_mesh,
+                part,
+                target,
+            ));
             continue;
         }
         match crate::mock_kernel::consume_operation(
@@ -5145,7 +5187,14 @@ fn apply_shell(
                 &openrcad::foundation::TolerancePolicy::STANDARD,
             ),
         ) {
-            Ok(outcome) => new_parts.push(outcome.solid),
+            Ok(outcome) => {
+                named_result.append(crate::mock_kernel::propagate_face_names(
+                    &input_mesh,
+                    &outcome.solid,
+                    target,
+                ));
+                new_parts.push(outcome.solid);
+            }
             Err(e) => {
                 warnings.push(format!(
                     "Shell '{node_id}': the kernel couldn't hollow this body ({e:?}). \
@@ -5155,10 +5204,19 @@ fn apply_shell(
             }
         }
     }
+    stamp_generated_face_refs(&mut named_result, node_id, "shell");
+    for face in &mut named_result.face_refs {
+        if let Some(topology) = face.topology.as_mut() {
+            if topology.producer_feature_id.as_deref() == Some(node_id) {
+                topology.body_id = Some(target.to_string());
+            }
+        }
+    }
+    crate::mock_kernel::populate_edge_adjacent_face_names(&mut named_result);
+    crate::mock_kernel::stamp_body_face_components(&mut named_result, target, &new_parts);
     let body = &mut live[body_idx];
     body.parts = new_parts;
-    // The analytic mesh no longer matches; re-derive display from the parts.
-    body.pristine = None;
+    body.pristine = (!named_result.indices.is_empty()).then(|| std::sync::Arc::new(named_result));
 }
 
 /// Evaluate one Hole node: compose the drill from analytic cylinder/cone

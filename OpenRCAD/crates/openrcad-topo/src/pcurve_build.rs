@@ -297,11 +297,19 @@ fn exact_ruled_boundary_pcurve(surface: &GeomSurface, edge: &EdgeData) -> Option
 }
 
 fn exact_planar_pcurve(brep: &BRep, surface: &GeomSurface, edge: &EdgeData) -> Option<PcurveData> {
-    let GeomSurface::Plane(plane) = surface else {
-        return None;
+    let plane = match surface {
+        GeomSurface::Plane(plane) => *plane,
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Plane(base) => Plane::from_point_normal(
+                base.location() + GeomVec::from_dir(base.normal()) * offset.distance,
+                base.normal(),
+            ),
+            _ => return None,
+        },
+        _ => return None,
     };
     let curve = edge.curve.as_ref()?;
-    let project = |point: Pnt| plane_uv(plane, point);
+    let project = |point: Pnt| plane_uv(&plane, point);
     let direction = |dir: openrcad_foundation::Dir| {
         Dir2d::new(
             dir.dot(&plane.position().x_direction()),
@@ -403,7 +411,9 @@ fn project_samples(
     // At a spherical pole longitude is undefined. Seed projection from the
     // first interior edge sample so a pole endpoint inherits the longitude of
     // the great-circle boundary instead of arbitrarily starting at zero.
-    let mut hint = if matches!(surface, GeomSurface::Sphere(_)) && count > 2 {
+    let spherical = matches!(surface, GeomSurface::Sphere(_))
+        || matches!(surface, GeomSurface::Offset(offset) if matches!(offset.base.as_ref(), GeomSurface::Sphere(_)));
+    let mut hint = if spherical && count > 2 {
         edge_point(brep, edge, 1.0 / (count - 1) as f64)
             .and_then(|point| project_point(surface, point, None))
     } else {
@@ -426,6 +436,18 @@ fn project_samples(
 }
 
 fn edge_point(brep: &BRep, edge: &EdgeData, fraction: f64) -> Option<Pnt> {
+    // Topology owns the endpoints. Analytic intersection curves are allowed to
+    // differ from their vertices within edge tolerance, and evaluating those
+    // curves at very large translations can lose enough low bits for adjacent
+    // coedges to project to different UV endpoints. Always seed pcurves from
+    // the shared vertex positions so UV loops remain contiguous by
+    // construction; use the curve only for interior samples.
+    if fraction <= 0.0 {
+        return Some(brep.vertices.get(edge.start)?.point);
+    }
+    if fraction >= 1.0 {
+        return Some(brep.vertices.get(edge.end)?.point);
+    }
     if let Some(curve) = &edge.curve {
         return Some(curve.point(edge.first + (edge.last - edge.first) * fraction));
     }
@@ -502,24 +524,7 @@ fn project_point(surface: &GeomSurface, point: Pnt, hint: Option<Pnt2d>) -> Opti
         GeomSurface::Plane(plane) => plane_uv(plane, point),
         GeomSurface::Cylinder(cylinder) => axial_uv(cylinder.position(), point, hint),
         GeomSurface::Cone(cone) => axial_uv(cone.position(), point, hint),
-        GeomSurface::Sphere(sphere) => {
-            let frame = sphere.position();
-            let offset = point - frame.location();
-            let radius = sphere.radius();
-            if radius <= 0.0 {
-                return None;
-            }
-            let z = offset.dot(&GeomVec::from_dir(frame.direction()));
-            let x = offset.dot(&GeomVec::from_dir(frame.x_direction()));
-            let y = offset.dot(&GeomVec::from_dir(frame.y_direction()));
-            let latitude = (z / radius).clamp(-1.0, 1.0).asin();
-            let longitude = if x.hypot(y) <= openrcad_foundation::tolerance::CONFUSION {
-                hint.map_or(0.0, |point| point.x())
-            } else {
-                y.atan2(x).rem_euclid(core::f64::consts::TAU)
-            };
-            Pnt2d::new(longitude, latitude)
-        }
+        GeomSurface::Sphere(sphere) => spherical_uv(sphere.position(), point, hint)?,
         GeomSurface::Torus(torus) => {
             let frame = torus.position();
             let offset = point - frame.location();
@@ -539,9 +544,17 @@ fn project_point(surface: &GeomSurface, point: Pnt, hint: Option<Pnt2d>) -> Opti
                 newton_uv(surface, point, hint)?
             }
         }
-        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) | GeomSurface::Offset(_) => {
-            newton_uv(surface, point, hint)?
-        }
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Plane(plane) => plane_uv(plane, point),
+            GeomSurface::Cylinder(cylinder) => axial_uv(cylinder.position(), point, hint),
+            GeomSurface::Cone(cone) => {
+                let uv = axial_uv(cone.position(), point, hint);
+                Pnt2d::new(uv.x(), uv.y() + offset.distance * cone.semi_angle().sin())
+            }
+            GeomSurface::Sphere(sphere) => spherical_uv(sphere.position(), point, hint)?,
+            _ => newton_uv(surface, point, hint)?,
+        },
+        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) => newton_uv(surface, point, hint)?,
     };
     (uv.x().is_finite() && uv.y().is_finite()).then_some(uv)
 }
@@ -557,6 +570,24 @@ fn axial_uv(frame: openrcad_foundation::Ax3, point: Pnt, hint: Option<Pnt2d>) ->
         y.atan2(x).rem_euclid(core::f64::consts::TAU)
     };
     Pnt2d::new(u, v)
+}
+
+fn spherical_uv(frame: openrcad_foundation::Ax3, point: Pnt, hint: Option<Pnt2d>) -> Option<Pnt2d> {
+    let offset = point - frame.location();
+    let magnitude = offset.magnitude();
+    if magnitude <= 0.0 {
+        return None;
+    }
+    let z = offset.dot(&GeomVec::from_dir(frame.direction()));
+    let x = offset.dot(&GeomVec::from_dir(frame.x_direction()));
+    let y = offset.dot(&GeomVec::from_dir(frame.y_direction()));
+    let latitude = (z / magnitude).clamp(-1.0, 1.0).asin();
+    let longitude = if x.hypot(y) <= openrcad_foundation::tolerance::CONFUSION {
+        hint.map_or(0.0, |point| point.x())
+    } else {
+        y.atan2(x).rem_euclid(core::f64::consts::TAU)
+    };
+    Some(Pnt2d::new(longitude, latitude))
 }
 
 fn newton_uv(surface: &GeomSurface, point: Pnt, hint: Option<Pnt2d>) -> Option<Pnt2d> {

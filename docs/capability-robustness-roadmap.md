@@ -53,9 +53,11 @@ they are not active vNext release gates.
 - The release-mode modeling percentile gate is implemented for the existing
   Lenovo 82XU (Ryzen 7 7840HS, 16 GiB, Windows 11, Rust 1.94). It enforces five
   warmups, 31 samples, nearest-rank p50/p95, AC power, and the effective **Best
-  performance** overlay. Smoke output is marked non-evidence. A valid reference
-  run remains pending because this machine currently reports the **Better
-  battery** overlay; the runner refuses to mislabel that result.
+  performance** overlay. Smoke output is marked non-evidence. Decision
+  2026-07-20: no committed reference baseline will be captured for this
+  tranche; the profiler and its thresholds remain available for on-demand
+  runs, and any future performance evidence claim must first record a
+  reference run under the documented conditions.
 
 ## Delivery principles
 
@@ -350,7 +352,16 @@ history coverage, and provisional self-intersection strategy. Stage 4C remains
 a research milestone with an explicit go/no-go review, not a routine enum
 addition.
 
+For 4A/4B, strict validation and watertightness are atomic acceptance gates for
+the supported convex/analytic boundary, not a comprehensive self-intersection
+certificate. Wave 5 owns explicit concave intersection and resolution.
+
+The executable Wave 4 entry contract and current readiness matrix are published
+in [`wave4-shell-feasibility.md`](wave4-shell-feasibility.md).
+
 ### Stage 4A - Plane and cylinder networks
+
+**Implemented and verified.**
 
 Offset mixed planar/cylindrical face networks, trim adjacent supports, rebuild
 pcurves and inner faces, and bridge removed-face rims. Cover drilled blocks,
@@ -359,9 +370,14 @@ paths.
 
 ### Stage 4B - Cone, then sphere
 
+**Implemented and verified within the published feasibility boundary.**
+
 Add cone offsets and plane/cylinder/cone intersections before sphere support.
 Reject disappearing radii, apex collapse, unsupported intersections, and branch
 ambiguity atomically.
+
+Development stops here for this tranche. Stage 4C and Wave 5 remain out of
+scope until a separate go/no-go decision.
 
 ### Stage 4C - Torus and fillet bands
 

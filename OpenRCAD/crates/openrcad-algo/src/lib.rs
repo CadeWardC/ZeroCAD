@@ -16,6 +16,7 @@ pub mod merge;
 mod native_pcurve;
 pub mod operation;
 pub mod plane_split;
+pub mod shell_feasibility;
 
 pub use blend::BlendError;
 pub use facade::SolidExt;
@@ -29,6 +30,12 @@ pub use plane_split::{
     PlaneSplitError,
 };
 pub use sew::SewError;
+pub use shell_feasibility::{
+    ShellArtifact, ShellCapabilityState, ShellHistoryDisposition, ShellMilestone,
+    ShellOwnershipRule, ShellPcurveRule, ShellPrerequisiteState, ShellPrerequisiteStatus,
+    ShellSelfIntersectionStep, ShellStage4CPrerequisite, ShellStageEntryDecision, ShellSupportKind,
+    SHELL_FEASIBILITY_V1,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -381,7 +388,9 @@ pub fn shell_solid_operation_with_policy(
 ) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
     let value = shell_solid_with_policy(solid, thickness, open_faces, policy)
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
-    finish_unary_operation(solid, value, policy)
+    let mut result = finish_unary_operation(solid, value, policy)?;
+    result.history = offset::shell_topology_history(solid, &result.value, open_faces, policy);
+    Ok(result)
 }
 
 pub fn blend_contour_operation_with_policy(

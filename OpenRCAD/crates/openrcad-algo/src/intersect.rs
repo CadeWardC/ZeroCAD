@@ -103,7 +103,27 @@ pub fn uv_of(s: &GeomSurface, p: &Pnt) -> (f64, f64) {
             Some(uv) => uv,
             None => search_nearest_parameter_newton(s, p, (0.0, 0.0)),
         },
-        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) | GeomSurface::Offset(_) => {
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Plane(_) | GeomSurface::Cylinder(_) => uv_of(&offset.base, p),
+            GeomSurface::Cone(cone) => {
+                let (u, axial, _) = axial_uv(&cone.position(), p);
+                (u, axial + offset.distance * cone.semi_angle().sin())
+            }
+            GeomSurface::Sphere(sphere) => {
+                let pos = sphere.position();
+                let d = *p - sphere.center();
+                let magnitude = d.magnitude().max(f64::MIN_POSITIVE);
+                let w = GeomVec::from_dir(pos.direction());
+                let x = GeomVec::from_dir(pos.x_direction());
+                let y = GeomVec::from_dir(pos.y_direction());
+                (
+                    norm_angle(d.dot(&y).atan2(d.dot(&x))),
+                    (d.dot(&w) / magnitude).clamp(-1.0, 1.0).asin(),
+                )
+            }
+            _ => search_nearest_parameter_newton(s, p, (0.0, 0.0)),
+        },
+        GeomSurface::BSpline(_) | GeomSurface::Gregory(_) => {
             search_nearest_parameter_newton(s, p, (0.0, 0.0))
         }
     }
@@ -1005,8 +1025,28 @@ fn analytic_surface_surface(s1: &GeomSurface, s2: &GeomSurface) -> Option<Vec<Ge
         }
         (GeomSurface::Plane(plane), GeomSurface::Cone(cone))
         | (GeomSurface::Cone(cone), GeomSurface::Plane(plane)) => plane_cone_curves(plane, cone),
+        (GeomSurface::Plane(plane), GeomSurface::Sphere(sphere))
+        | (GeomSurface::Sphere(sphere), GeomSurface::Plane(plane)) => {
+            Some(plane_sphere_curves(plane, sphere))
+        }
         _ => None,
     }
+}
+
+fn plane_sphere_curves(plane: &Plane, sphere: &openrcad_geom::SphericalSurface) -> Vec<GeomCurve> {
+    let normal = GeomVec::from_dir(plane.normal());
+    let signed_distance = (sphere.center() - plane.location()).dot(&normal);
+    if signed_distance.abs() > sphere.radius() {
+        return Vec::new();
+    }
+    let radius_squared =
+        (sphere.radius() * sphere.radius() - signed_distance * signed_distance).max(0.0);
+    if radius_squared <= f64::EPSILON * sphere.radius().powi(2) {
+        return Vec::new();
+    }
+    let center = sphere.center() - normal * signed_distance;
+    let frame = Ax3::new_axes(center, plane.normal(), plane.position().x_direction());
+    vec![GeomCurve::Circle(Circle::new(frame, radius_squared.sqrt()))]
 }
 
 /// Exact circles where a cone meets a coaxial cylinder. Countersinks rely on

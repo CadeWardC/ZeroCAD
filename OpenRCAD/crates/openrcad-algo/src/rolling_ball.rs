@@ -7,8 +7,8 @@
 use core::fmt;
 
 use openrcad_foundation::{
-    tolerance, Ax2, Ax3, Dir, NeverCancelled, Pnt, TolerancePolicy, TolerancePolicyError,
-    Vec as GeomVec,
+    tolerance, Ax2, Ax3, Dir, NeverCancelled, Pnt, ToleranceContext, TolerancePolicy,
+    TolerancePolicyError, Vec as GeomVec,
 };
 use openrcad_geom::{
     Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface,
@@ -7544,6 +7544,14 @@ pub(crate) fn planar_outward_normal_checked(
     solid: &Solid,
     face: &Face,
 ) -> Result<Dir, RollingBallError> {
+    planar_outward_normal_checked_with_policy(solid, face, &TolerancePolicy::STANDARD)
+}
+
+pub(crate) fn planar_outward_normal_checked_with_policy(
+    solid: &Solid,
+    face: &Face,
+    policy: &TolerancePolicy,
+) -> Result<Dir, RollingBallError> {
     let n = planar_outward_normal(face)?;
     let Some(wire) = face.outer_wire() else {
         return Ok(n);
@@ -7569,7 +7577,19 @@ pub(crate) fn planar_outward_normal_checked(
         + (bb_hi[1] - bb_lo[1]).powi(2)
         + (bb_hi[2] - bb_lo[2]).powi(2))
     .sqrt();
-    let eps = (diag * 1.0e-3).clamp(1.0e-5, 0.05);
+    let context = ToleranceContext::derive(
+        policy,
+        &[solid.bounding_box()],
+        (diag.is_finite() && diag > 0.0).then_some(diag),
+        1.0,
+    )
+    .map_err(RollingBallError::InvalidTolerancePolicy)?;
+    let maximum_probe = (context.local_feature_size * 0.05).max(context.arithmetic_floor);
+    let eps = context
+        .convergence
+        .max(context.policy.classification * 4.0)
+        .max(context.arithmetic_floor)
+        .min(maximum_probe);
     let outward_probe = centroid + GeomVec::from_dir(n) * eps;
     let inward_probe = centroid - GeomVec::from_dir(n) * eps;
     let outward_material = crate::boolean::point_in_solid(&outward_probe, solid);

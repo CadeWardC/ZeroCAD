@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::TriangleMesh;
-use openrcad_foundation::{tolerance::CONFUSION, Pnt, Pnt2d, Vec as GeomVec};
+use openrcad_foundation::{tolerance::CONFUSION, Pnt, Pnt2d, TolerancePolicy, Vec as GeomVec};
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Surface};
-use openrcad_topo::{orientation::Orientation, Face, PcurveData};
+use openrcad_topo::{orientation::Orientation, EdgeId, Face, PcurveData};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tri {
@@ -2000,7 +2000,11 @@ pub fn discretize_edge_curve_budget(
 /// which arena edge — the boolean can leave coincident-but-distinct edges) is
 /// looking at it: sorted quantized endpoints plus the curve midpoint. The
 /// midpoint distinguishes the two arcs that can join one vertex pair.
-pub type SharedEdgeKey = ((i64, i64, i64), (i64, i64, i64), (i64, i64, i64));
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SharedEdgeKey {
+    Topological(EdgeId),
+    Geometric(((i64, i64, i64), (i64, i64, i64), (i64, i64, i64))),
+}
 
 /// One canonical sample of a solid-wide shared edge polyline.
 #[derive(Clone, Copy, Debug)]
@@ -2009,6 +2013,15 @@ pub struct SharedEdgeSample {
     pub point: Pnt,
     /// Normalized progress from the canonical first endpoint to the last.
     pub canonical_fraction: f64,
+}
+
+/// Scale-bound shared boundary cache. Keeping the derived quantum with the
+/// samples guarantees that per-face lookup derives exactly the same
+/// scale-aware key as the solid-wide edge-first pass.
+pub struct SharedEdgeMap {
+    samples: HashMap<SharedEdgeKey, Vec<SharedEdgeSample>>,
+    topological_occurrences: HashMap<EdgeId, usize>,
+    quantum: f64,
 }
 
 /// Recover the local edge fraction for a sample supplied by another,
@@ -2062,27 +2075,79 @@ fn closest_curve_fraction(curve: &GeomCurve, first: f64, last: f64, point: Pnt) 
     0.5 * (low + high)
 }
 
-fn shared_key_point(p: Pnt) -> (i64, i64, i64) {
+fn shared_key_point(p: Pnt, quantum: f64) -> (i64, i64, i64) {
     (
-        (p.x() * 1e6).round() as i64,
-        (p.y() * 1e6).round() as i64,
-        (p.z() * 1e6).round() as i64,
+        (p.x() / quantum).round() as i64,
+        (p.y() / quantum).round() as i64,
+        (p.z() / quantum).round() as i64,
     )
 }
 
-fn shared_edge_key(edge: &openrcad_topo::Edge) -> Option<SharedEdgeKey> {
+fn shared_map_quantum(faces: &[Face], policy: &TolerancePolicy) -> f64 {
+    let mut minimum = [f64::INFINITY; 3];
+    let mut maximum = [f64::NEG_INFINITY; 3];
+    for face in faces {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                let mut points = vec![edge.start().point(), edge.end().point()];
+                if let Some(curve) = edge.curve() {
+                    points.push(curve.point(0.5 * (edge.first() + edge.last())));
+                }
+                for point in points {
+                    for (axis, coordinate) in
+                        [point.x(), point.y(), point.z()].into_iter().enumerate()
+                    {
+                        minimum[axis] = minimum[axis].min(coordinate);
+                        maximum[axis] = maximum[axis].max(coordinate);
+                    }
+                }
+            }
+        }
+    }
+    let model_scale = ((maximum[0] - minimum[0]).powi(2)
+        + (maximum[1] - minimum[1]).powi(2)
+        + (maximum[2] - minimum[2]).powi(2))
+    .sqrt();
+    let coordinate_scale = minimum
+        .into_iter()
+        .chain(maximum)
+        .map(f64::abs)
+        .fold(0.0, f64::max);
+    let arithmetic_floor = coordinate_scale.max(model_scale) * f64::EPSILON * 64.0;
+    let requested = policy
+        .snap_tolerance(model_scale)
+        .max(arithmetic_floor)
+        .max(policy.resolution);
+    2.0_f64.powf(requested.log2().ceil())
+}
+
+fn shared_edge_key(
+    edge: &openrcad_topo::Edge,
+    quantum: f64,
+    topological_occurrences: &HashMap<EdgeId, usize>,
+) -> Option<SharedEdgeKey> {
     let curve = edge.curve()?;
     let p0 = edge.start().point();
     let p1 = edge.end().point();
+    let pm = curve.point(0.5 * (edge.first() + edge.last()));
     // Collapsed/closed edges take the pole path in the face tessellator, not
     // the curve-discretization path, so they are never shared.
-    if p0.distance(&p1) <= 1e-5 {
+    if p0.distance(&p1) <= edge.tolerance() {
         return None;
     }
-    let pm = curve.point(0.5 * (edge.first() + edge.last()));
-    let (k0, k1) = (shared_key_point(p0), shared_key_point(p1));
-    let km = shared_key_point(pm);
-    Some(if k0 <= k1 { (k0, k1, km) } else { (k1, k0, km) })
+    if topological_occurrences
+        .get(&edge.id())
+        .is_some_and(|count| *count >= 2)
+    {
+        return Some(SharedEdgeKey::Topological(edge.id()));
+    }
+    let (k0, k1) = (shared_key_point(p0, quantum), shared_key_point(p1, quantum));
+    let km = shared_key_point(pm, quantum);
+    Some(SharedEdgeKey::Geometric(if k0 <= k1 {
+        (k0, k1, km)
+    } else {
+        (k1, k0, km)
+    }))
 }
 
 /// Discretize every boundary edge of the shell ONCE, at the maximum density any
@@ -2094,11 +2159,16 @@ fn shared_edge_key(edge: &openrcad_topo::Edge) -> Option<SharedEdgeKey> {
 /// the combined mesh is crack-free by construction instead of relying on
 /// post-hoc lens stitching (which fans, and whose fans the cylinder refinement
 /// pass used to amplify into non-manifold soup on tangent seams).
-pub fn shared_edge_polylines(
+pub fn shared_edge_polylines(faces: &[Face], chord_err: f64, angle_err: f64) -> SharedEdgeMap {
+    shared_edge_polylines_with_policy(faces, chord_err, angle_err, &TolerancePolicy::STANDARD)
+}
+
+pub fn shared_edge_polylines_with_policy(
     faces: &[Face],
     chord_err: f64,
     angle_err: f64,
-) -> HashMap<SharedEdgeKey, Vec<SharedEdgeSample>> {
+    policy: &TolerancePolicy,
+) -> SharedEdgeMap {
     // The native cylinder primitive is exactly two planar caps plus three
     // cylindrical 120° wall patches. Its binary arc subdivision sits on a
     // numerical cliff at common round budgets (0.13 rad is intended as 48
@@ -2116,7 +2186,19 @@ pub fn shared_edge_polylines(
             .filter(|face| matches!(face.surface(), Some(GeomSurface::Plane(_))))
             .count()
             == 2;
-    let mut map: HashMap<SharedEdgeKey, Vec<SharedEdgeSample>> = HashMap::new();
+    let mut topological_occurrences = HashMap::new();
+    for face in faces {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                *topological_occurrences.entry(edge.id()).or_default() += 1;
+            }
+        }
+    }
+    let mut map = SharedEdgeMap {
+        samples: HashMap::new(),
+        topological_occurrences,
+        quantum: shared_map_quantum(faces, policy),
+    };
     for face in faces {
         let surface = match face.surface() {
             Some(s) => s,
@@ -2124,7 +2206,10 @@ pub fn shared_edge_polylines(
         };
         for wire in &face.wires() {
             for edge in wire.edges().iter() {
-                let (key, curve) = match (shared_edge_key(edge), edge.curve()) {
+                let (key, curve) = match (
+                    shared_edge_key(edge, map.quantum, &map.topological_occurrences),
+                    edge.curve(),
+                ) {
                     (Some(k), Some(c)) => (k, c),
                     _ => continue,
                 };
@@ -2171,8 +2256,8 @@ pub fn shared_edge_polylines(
                     pts[0].0 = ve;
                     pts[n - 1].0 = vs;
                 }
-                let k_first = shared_key_point(pts[0].0);
-                let k_last = shared_key_point(pts.last().unwrap().0);
+                let k_first = shared_key_point(pts[0].0, map.quantum);
+                let k_last = shared_key_point(pts.last().unwrap().0, map.quantum);
                 let reversed = k_first > k_last;
                 if reversed {
                     pts.reverse();
@@ -2188,7 +2273,7 @@ pub fn shared_edge_polylines(
                         },
                     })
                     .collect();
-                match map.entry(key) {
+                match map.samples.entry(key) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         if pts.len() > e.get().len() {
                             e.insert(pts);
@@ -2223,7 +2308,7 @@ pub fn tessellate_face_budget(
     chord_err: f64,
     angle_err: f64,
     face_index: u32,
-    shared: Option<&HashMap<SharedEdgeKey, Vec<SharedEdgeSample>>>,
+    shared: Option<&SharedEdgeMap>,
 ) -> TriangleMesh {
     tessellate_face_budget_configured(face, chord_err, angle_err, face_index, shared, false)
 }
@@ -2233,7 +2318,7 @@ pub(crate) fn tessellate_face_budget_configured(
     chord_err: f64,
     angle_err: f64,
     face_index: u32,
-    shared: Option<&HashMap<SharedEdgeKey, Vec<SharedEdgeSample>>>,
+    shared: Option<&SharedEdgeMap>,
     bound_cylinder_diagonals: bool,
 ) -> TriangleMesh {
     let surface = match face.surface() {
@@ -2289,7 +2374,7 @@ pub(crate) fn tessellate_face_budget_configured(
                 .expect("strict tessellation requires a pcurve on every surface coedge");
             let p_start = edge.start().point();
             let p_end = edge.end().point();
-            let is_collapsed = p_start.distance(&p_end) <= 1e-5;
+            let is_collapsed = p_start.distance(&p_end) <= edge.tolerance();
 
             if is_collapsed {
                 let reversed = !edge.orientation().is_forward();
@@ -2346,7 +2431,10 @@ pub(crate) fn tessellate_face_budget_configured(
             // Shared solid-wide polyline for this edge when available (both
             // adjacent faces then sample identical boundary points); otherwise
             // discretize locally as before.
-            let shared_pts = shared.and_then(|m| shared_edge_key(edge).and_then(|k| m.get(&k)));
+            let shared_pts = shared.and_then(|map| {
+                shared_edge_key(edge, map.quantum, &map.topological_occurrences)
+                    .and_then(|key| map.samples.get(&key))
+            });
             let samples_directed: Vec<(Pnt, f64)> = if let Some(sp) = shared_pts {
                 let t_start = if is_reversed {
                     edge.last()
@@ -2695,6 +2783,13 @@ pub(crate) fn tessellate_face_budget_configured(
 
 /// Combine multiple TriangleMeshes into a single watertight TriangleMesh by welding coincident vertices.
 pub fn combine(meshes: &[TriangleMesh]) -> TriangleMesh {
+    combine_with_tolerance(meshes, TolerancePolicy::STANDARD.linear)
+}
+
+/// Policy/context-aware mesh combination. The caller supplies the operation's
+/// scale-derived weld quantum so large or far-translated models do not fall
+/// back to a hidden model-unit floor.
+pub fn combine_with_tolerance(meshes: &[TriangleMesh], tolerance: f64) -> TriangleMesh {
     let mut all_vertices = Vec::new();
     let mut all_triangles = Vec::new();
     let mut all_face_ids = Vec::new();
@@ -2703,11 +2798,12 @@ pub fn combine(meshes: &[TriangleMesh]) -> TriangleMesh {
     for mesh in meshes {
         let mut index_map = Vec::with_capacity(mesh.vertices.len());
         for &p in &mesh.vertices {
-            // Weld vertices that are within 1e-9 of each other
+            // All per-face boundary points were generated under the same
+            // operation context, so quantize them on that context's grid.
             let key = (
-                (p.x() * 1e9).round() as i64,
-                (p.y() * 1e9).round() as i64,
-                (p.z() * 1e9).round() as i64,
+                (p.x() / tolerance).round() as i64,
+                (p.y() / tolerance).round() as i64,
+                (p.z() / tolerance).round() as i64,
             );
             let idx = *vertex_map.entry(key).or_insert_with(|| {
                 let id = all_vertices.len();

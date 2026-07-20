@@ -105,6 +105,7 @@ pub enum IndexedFaceKind {
     Import,
     Loft,
     Sweep,
+    Shell,
     Stl,
 }
 
@@ -184,6 +185,7 @@ impl std::fmt::Display for TopoName {
                     IndexedFaceKind::Import => "import",
                     IndexedFaceKind::Loft => "loft",
                     IndexedFaceKind::Sweep => "sweep",
+                    IndexedFaceKind::Shell => "shell",
                     IndexedFaceKind::Stl => "stl",
                 };
                 write!(f, "{kind}:{node}:face:{face}")
@@ -297,6 +299,7 @@ fn parse_name(s: &str) -> Option<TopoName> {
         ("import:", IndexedFaceKind::Import),
         ("loft:", IndexedFaceKind::Loft),
         ("sweep:", IndexedFaceKind::Sweep),
+        ("shell:", IndexedFaceKind::Shell),
         ("stl:", IndexedFaceKind::Stl),
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
@@ -417,6 +420,7 @@ mod tests {
             "import:import_4:face:2",
             "loft:loft_5:face:7",
             "sweep:sweep_6:face:3",
+            "shell:shell_7:face:8",
             "stl:import_7:face:11",
             "revolve:revolve_8:region:2:face:4",
             "draft:draft_9:region:1:face:5",

@@ -15,7 +15,7 @@ pub mod triangulate;
 pub use properties::{mass_properties, MassProperties};
 
 use openrcad_foundation::{
-    BndBox, CancellationProbe, Cancelled, NeverCancelled, Pnt, TolerancePolicy,
+    BndBox, CancellationProbe, Cancelled, NeverCancelled, Pnt, ToleranceContext, TolerancePolicy,
     TolerancePolicyError, Trsf,
 };
 use openrcad_topo::{HealthReport, ValidationError};
@@ -308,7 +308,8 @@ pub fn tessellate_checked_with_policy_and_cancel(
     cancel: &dyn CancellationProbe,
 ) -> Result<TriangleMesh, TessellationError> {
     validate_tessellation_input(solid, chord_err, angle_err, policy)?;
-    let mesh = tessellate_with_cancel_configured(solid, chord_err, angle_err, cancel, false)?;
+    let mesh =
+        tessellate_with_cancel_configured(solid, chord_err, angle_err, policy, cancel, false)?;
     validate_mesh(mesh, policy)
 }
 
@@ -323,7 +324,8 @@ pub fn tessellate_checked_for_display_with_policy_and_cancel(
     cancel: &dyn CancellationProbe,
 ) -> Result<TriangleMesh, TessellationError> {
     validate_tessellation_input(solid, chord_err, angle_err, policy)?;
-    let mesh = tessellate_with_cancel_configured(solid, chord_err, angle_err, cancel, true)?;
+    let mesh =
+        tessellate_with_cancel_configured(solid, chord_err, angle_err, policy, cancel, true)?;
     validate_mesh(mesh, policy)
 }
 
@@ -460,12 +462,14 @@ fn tessellate_with_cancel_configured(
     solid: &openrcad_topo::Solid,
     chord_err: f64,
     angle_err: f64,
+    policy: &TolerancePolicy,
     cancel: &dyn openrcad_foundation::CancellationProbe,
     bound_cylinder_diagonals: bool,
 ) -> Result<TriangleMesh, openrcad_foundation::Cancelled> {
     cancel.check_cancelled()?;
     let faces = solid.faces();
-    let shared = triangulate::shared_edge_polylines(&faces, chord_err, angle_err);
+    let shared =
+        triangulate::shared_edge_polylines_with_policy(&faces, chord_err, angle_err, policy);
     cancel.check_cancelled()?;
 
     // Faces tessellate independently, so this parallelises cleanly across the
@@ -527,7 +531,13 @@ fn tessellate_with_cancel_configured(
 
     let meshes = meshes?;
     cancel.check_cancelled()?;
-    let mut combined = triangulate::combine(&meshes);
+    let context = ToleranceContext::derive(policy, &[solid.bounding_box()], Some(chord_err), 1.0)
+        .expect("validated tessellation tolerance context");
+    let weld_quantum = context
+        .quantization
+        .max(context.arithmetic_floor)
+        .max(context.policy.linear);
+    let mut combined = triangulate::combine_with_tolerance(&meshes, weld_quantum);
     // Safety net for boundaries the shared-edge pass could not cover (edges
     // whose geometric keys did not match across faces): stitch lens cracks
     // where two faces sampled a shared boundary differently.
