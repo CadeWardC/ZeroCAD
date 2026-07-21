@@ -7,8 +7,8 @@ use openrcad_foundation::{
 };
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Plane, Surface};
 use openrcad_geom2d::{
-    BSplineCurve2d, Circle2d, Ellipse2d, GeomCurve2d, Line2d, PlaneTorusSection2d,
-    TorusPlaneSection2d,
+    BSplineCurve2d, Circle2d, CylinderPlaneSection2d, Ellipse2d, GeomCurve2d, Line2d,
+    PlaneTorusSection2d, TorusPlaneSection2d,
 };
 
 use crate::arena::{BRep, EdgeData, EdgeId, FaceId, LoopId};
@@ -201,9 +201,15 @@ impl Solid {
                             Some(GeomCurve::TorusSurfaceCurve(_)) => "torus-surface",
                             None => "none",
                         };
+                        let start = brep.vertices.get(edge.start).map(|vertex| vertex.point);
+                        let end = brep.vertices.get(edge.end).map(|vertex| vertex.point);
+                        let curve_endpoints = edge
+                            .curve
+                            .as_ref()
+                            .map(|curve| (curve.point(edge.first), curve.point(edge.last)));
                         eprintln!(
-                            "pcurve projection failed face={face_id:?} surface={surface_kind} edge={edge_id:?} curve={curve_kind} range=({}, {}) surface_data={surface:?} curve_data={:?}",
-                            edge.first, edge.last, edge.curve
+                            "pcurve projection failed face={face_id:?} surface={surface_kind} edge={edge_id:?} curve={curve_kind} range=({}, {}) start={start:?} end={end:?} curve_endpoints={curve_endpoints:?} surface_data={surface:?} curve_data={:?}",
+                            edge.first, edge.last, edge.curve,
                         );
                     }
                     PcurveBuildError::ProjectionFailed {
@@ -215,9 +221,11 @@ impl Solid {
             let deviation = max_deviation(&brep, surface, &edge, &pcurve, 96);
             if !deviation.is_finite() || deviation > allowed_tolerance {
                 if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                    let start = brep.vertices.get(edge.start).map(|vertex| vertex.point);
+                    let end = brep.vertices.get(edge.end).map(|vertex| vertex.point);
                     eprintln!(
-                        "pcurve inconsistent face={face_id:?} edge={edge_id:?} surface={surface:?} curve={:?} range=({}, {}) deviation={deviation} tolerance={allowed_tolerance}",
-                        edge.curve, edge.first, edge.last
+                        "pcurve inconsistent face={face_id:?} edge={edge_id:?} surface={surface:?} curve={:?} range=({}, {}) start={start:?} end={end:?} pcurve={pcurve:?} deviation={deviation} tolerance={allowed_tolerance}",
+                        edge.curve, edge.first, edge.last,
                     );
                 }
                 return Err(PcurveBuildError::Inconsistent {
@@ -258,7 +266,8 @@ pub fn exact_pcurve_for_edge(
     let edge_data = edge.brep.edges.get(edge.id)?;
     exact_planar_pcurve(&edge.brep, surface, edge_data)
         .or_else(|| exact_ruled_boundary_pcurve(surface, edge_data))
-        .or_else(|| exact_cylinder_curve_pcurve(surface, edge_data, policy))
+        .or_else(|| exact_cylinder_curve_pcurve(&edge.brep, surface, edge_data, policy))
+        .or_else(|| exact_sphere_great_circle_pcurve(&edge.brep, surface, edge_data, policy))
         .or_else(|| exact_torus_surface_curve_pcurve(surface, edge_data))
         .or_else(|| exact_torus_plane_section_pcurve(surface, edge_data))
         .or_else(|| exact_torus_circle_pcurve(surface, edge_data, policy))
@@ -275,6 +284,12 @@ fn build_pcurve(
         return Some(exact);
     }
     if let Some(exact) = exact_ruled_boundary_pcurve(surface, edge) {
+        return Some(exact);
+    }
+    if let Some(exact) = exact_cylinder_curve_pcurve(brep, surface, edge, policy) {
+        return Some(exact);
+    }
+    if let Some(exact) = exact_sphere_great_circle_pcurve(brep, surface, edge, policy) {
         return Some(exact);
     }
     if let Some(exact) = exact_torus_surface_curve_pcurve(surface, edge) {
@@ -347,6 +362,7 @@ type TorusUvEndpoints = ((f64, f64), (f64, f64));
 /// analytic frames avoids subtracting tiny radii from far-origin world
 /// coordinates, which can lose enough angular precision to break UV closure.
 fn exact_cylinder_curve_pcurve(
+    brep: &BRep,
     surface: &GeomSurface,
     edge: &EdgeData,
     policy: &TolerancePolicy,
@@ -376,10 +392,31 @@ fn exact_cylinder_curve_pcurve(
     let (curve, first, last) = curve_data(edge.curve.as_ref()?, edge.first, edge.last)?;
     let frame = cylinder.position();
     let axis = GeomVec::from_dir(frame.direction());
-    let frame_x = GeomVec::from_dir(frame.x_direction());
-    let frame_y = GeomVec::from_dir(frame.y_direction());
     let scale = cylinder.radius().abs().max(f64::MIN_POSITIVE);
     let tolerance = policy.classification + scale * f64::EPSILON * 64.0;
+    let topology_start = brep.vertices.get(edge.start)?.point;
+    let topology_end = brep.vertices.get(edge.end)?.point;
+    let start_uv = axial_uv(frame, topology_start, None);
+    let end_uv = axial_uv(frame, topology_end, Some(start_uv));
+    // Exact support classification is insufficient on its own: operation code
+    // can preserve an analytic curve while replacing one of the topology
+    // vertices incorrectly. Only attach an exact pcurve when the oriented
+    // topology endpoints are also carried by the curve. This keeps pcurve
+    // construction a validator rather than a way to legitimize malformed
+    // topology.
+    let curve_first = curve.point(first);
+    let curve_last = curve.point(last);
+    let direct = topology_start.distance(&curve_first) <= tolerance
+        && topology_end.distance(&curve_last) <= tolerance;
+    let reversed = topology_start.distance(&curve_last) <= tolerance
+        && topology_end.distance(&curve_first) <= tolerance;
+    let (topology_first, topology_last) = if direct {
+        (first, last)
+    } else if reversed {
+        (last, first)
+    } else {
+        return None;
+    };
 
     let endpoints = match curve {
         GeomCurve::Circle(circle) => {
@@ -395,13 +432,14 @@ fn exact_cylinder_curve_pcurve(
             if (center_offset - axis * v).magnitude() > tolerance {
                 return None;
             }
-            let circle_x = GeomVec::from_dir(circle.position().x_direction());
-            let u_offset = circle_x.dot(&frame_y).atan2(circle_x.dot(&frame_x));
-            let sign = alignment.signum();
-            [
-                Pnt2d::new(u_offset + sign * first, v),
-                Pnt2d::new(u_offset + sign * last, v),
-            ]
+            // Topology owns edge orientation. Anchor at its shared start vertex,
+            // then use the analytic circle span only to choose the periodic end
+            // branch; deriving both ends from the curve frame reverses some
+            // coedges after transforms and can select the opposite cylinder arc.
+            let predicted_end =
+                start_uv.x() + alignment.signum() * (topology_last - topology_first);
+            let end_u = unwrap_near(end_uv.x(), predicted_end, Some(core::f64::consts::TAU));
+            [Pnt2d::new(start_uv.x(), v), Pnt2d::new(end_u, v)]
         }
         GeomCurve::Line(line) => {
             let direction = GeomVec::from_dir(line.direction());
@@ -415,15 +453,149 @@ fn exact_cylinder_curve_pcurve(
             if (radial.magnitude() - cylinder.radius()).abs() > tolerance {
                 return None;
             }
-            let u = radial.dot(&frame_y).atan2(radial.dot(&frame_x));
+            let end_u = unwrap_near(end_uv.x(), start_uv.x(), Some(core::f64::consts::TAU));
+            if (end_u - start_uv.x()).abs() > policy.angular {
+                return None;
+            }
             [
-                Pnt2d::new(u, axial + alignment * first),
-                Pnt2d::new(u, axial + alignment * last),
+                Pnt2d::new(start_uv.x(), axial + alignment * topology_first),
+                Pnt2d::new(start_uv.x(), axial + alignment * topology_last),
             ]
+        }
+        GeomCurve::Ellipse(ellipse) => {
+            let center_offset = ellipse.center() - frame.location();
+            let v_offset = center_offset.dot(&axis);
+            let radial_center = center_offset - axis * v_offset;
+            if radial_center.magnitude() > tolerance {
+                return None;
+            }
+
+            let major =
+                GeomVec::from_dir(ellipse.position().x_direction()) * ellipse.major_radius();
+            let minor =
+                GeomVec::from_dir(ellipse.position().y_direction()) * ellipse.minor_radius();
+            let v_cosine = major.dot(&axis);
+            let v_sine = minor.dot(&axis);
+            let radial_major = major - axis * v_cosine;
+            let radial_minor = minor - axis * v_sine;
+            let major_radius = radial_major.magnitude();
+            let minor_radius = radial_minor.magnitude();
+            if (major_radius - cylinder.radius()).abs() > tolerance
+                || (minor_radius - cylinder.radius()).abs() > tolerance
+                || radial_major.dot(&radial_minor).abs() > tolerance * scale
+            {
+                return None;
+            }
+
+            let frame_x = GeomVec::from_dir(frame.x_direction());
+            let frame_y = GeomVec::from_dir(frame.y_direction());
+            let major_x = radial_major.dot(&frame_x);
+            let major_y = radial_major.dot(&frame_y);
+            let minor_x = radial_minor.dot(&frame_x);
+            let minor_y = radial_minor.dot(&frame_y);
+            let determinant = major_x * minor_y - major_y * minor_x;
+            if (determinant.abs() - cylinder.radius() * cylinder.radius()).abs()
+                > 2.0 * tolerance * scale
+            {
+                return None;
+            }
+            let section = CylinderPlaneSection2d::new(
+                major_y.atan2(major_x),
+                determinant.is_sign_negative(),
+                v_offset,
+                v_cosine,
+                v_sine,
+            )?;
+            return Some(
+                PcurveData::new(
+                    GeomCurve2d::cylinder_plane_section(section),
+                    topology_first,
+                    topology_last,
+                )
+                .with_periodicity(surface_periodicity(surface)),
+            );
         }
         _ => return None,
     };
     line_pcurve(&endpoints, surface_periodicity(surface))
+}
+
+/// Exact UV line for the coordinate great circles used to bound native sphere
+/// patches. The classification and samples are evaluated only from the two
+/// analytic frames; far-origin world-coordinate subtraction is limited to the
+/// support and endpoint certificates.
+fn exact_sphere_great_circle_pcurve(
+    brep: &BRep,
+    surface: &GeomSurface,
+    edge: &EdgeData,
+    policy: &TolerancePolicy,
+) -> Option<PcurveData> {
+    let sphere = match surface {
+        GeomSurface::Sphere(sphere) => *sphere,
+        _ => return None,
+    };
+    let GeomCurve::Circle(circle) = edge.curve.as_ref()? else {
+        return None;
+    };
+    let scale = sphere.radius().max(circle.radius());
+    let tolerance = policy.classification + scale * f64::EPSILON * 64.0;
+    if circle.center().distance(&sphere.position().location()) > tolerance
+        || (circle.radius() - sphere.radius()).abs() > tolerance
+    {
+        return None;
+    }
+    let topology_start = brep.vertices.get(edge.start)?.point;
+    let topology_end = brep.vertices.get(edge.end)?.point;
+    if topology_start.distance(&circle.point(edge.first)) > tolerance
+        || topology_end.distance(&circle.point(edge.last)) > tolerance
+    {
+        return None;
+    }
+
+    let sphere_frame = sphere.position();
+    let sphere_x = GeomVec::from_dir(sphere_frame.x_direction());
+    let sphere_y = GeomVec::from_dir(sphere_frame.y_direction());
+    let sphere_z = GeomVec::from_dir(sphere_frame.direction());
+    let circle_x = GeomVec::from_dir(circle.position().x_direction());
+    let circle_y = GeomVec::from_dir(circle.position().y_direction());
+    let local = |parameter: f64| {
+        let (sine, cosine) = parameter.sin_cos();
+        let radial = circle_x * cosine + circle_y * sine;
+        (
+            radial.dot(&sphere_x),
+            radial.dot(&sphere_y),
+            radial.dot(&sphere_z).clamp(-1.0, 1.0),
+        )
+    };
+    let parameters = [0.0, 0.25, 0.5, 0.75, 1.0]
+        .map(|fraction| edge.first + (edge.last - edge.first) * fraction);
+    let reference = parameters
+        .iter()
+        .map(|parameter| local(*parameter))
+        .find(|(x, y, _)| x.hypot(*y) > policy.angular)?;
+    let reference_u = reference.1.atan2(reference.0);
+    let periodicity = surface_periodicity(surface);
+    let mut previous_u = reference_u;
+    let mut samples = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        let (x, y, z) = local(parameter);
+        let raw_u = if x.hypot(y) <= policy.angular {
+            previous_u
+        } else {
+            y.atan2(x)
+        };
+        let u = unwrap_near(raw_u, previous_u, periodicity.u_period);
+        previous_u = u;
+        samples.push(Pnt2d::new(u, z.asin()));
+    }
+    let candidate = line_pcurve(&[samples[0], samples[4]], periodicity)?;
+    if samples.iter().enumerate().any(|(index, sample)| {
+        let expected = candidate.point_at_fraction(index as f64 / 4.0);
+        sample.distance(&expected) > policy.angular
+    }) {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// A [`GeomCurve::TorusSurfaceCurve`] owns its exact affine `(u, v)` map.

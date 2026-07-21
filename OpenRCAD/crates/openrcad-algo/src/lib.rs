@@ -72,6 +72,10 @@ pub use contour::{
     apply_blend_contour, apply_blend_contour_with_policy, BlendContour, BlendContourError,
     BlendCurveHint, BlendKind, BlendLaw,
 };
+pub mod corner_network;
+pub use corner_network::{
+    CornerIncidentBand, CornerNetworkCertificate, CornerNetworkError, CornerNetworkPlan,
+};
 
 /// Apply `op` between `object` and `tool` (OCCT `BRepAlgoAPI_Fuse/Cut/Common`).
 ///

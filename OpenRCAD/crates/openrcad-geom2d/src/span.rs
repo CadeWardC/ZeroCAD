@@ -16,6 +16,7 @@ pub enum CurveKind2d {
     BSpline,
     TorusPlaneSection,
     PlaneTorusSection,
+    CylinderPlaneSection,
 }
 
 impl From<&GeomCurve2d> for CurveKind2d {
@@ -29,6 +30,7 @@ impl From<&GeomCurve2d> for CurveKind2d {
             GeomCurve2d::BSpline(_) => Self::BSpline,
             GeomCurve2d::TorusPlaneSection(_) => Self::TorusPlaneSection,
             GeomCurve2d::PlaneTorusSection(_) => Self::PlaneTorusSection,
+            GeomCurve2d::CylinderPlaneSection(_) => Self::CylinderPlaneSection,
         }
     }
 }

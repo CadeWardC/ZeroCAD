@@ -254,14 +254,17 @@ impl StepWriter {
             GeomCurve2d::Parabola(_)
             | GeomCurve2d::Hyperbola(_)
             | GeomCurve2d::TorusPlaneSection(_)
-            | GeomCurve2d::PlaneTorusSection(_) => {
-                // The two torus-section pcurves are exact inside OpenRCAD but
-                // have no portable AP242 analytic entity. Export a denser,
+            | GeomCurve2d::PlaneTorusSection(_)
+            | GeomCurve2d::CylinderPlaneSection(_) => {
+                // These section pcurves are exact inside OpenRCAD but have no
+                // portable AP242 analytic entity. Export a denser,
                 // deterministic representation without changing the durable
                 // in-memory B-Rep curve.
                 let count = if matches!(
                     curve,
-                    GeomCurve2d::TorusPlaneSection(_) | GeomCurve2d::PlaneTorusSection(_)
+                    GeomCurve2d::TorusPlaneSection(_)
+                        | GeomCurve2d::PlaneTorusSection(_)
+                        | GeomCurve2d::CylinderPlaneSection(_)
                 ) {
                     257
                 } else {

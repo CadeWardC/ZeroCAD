@@ -19,6 +19,7 @@ use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
 
 use crate::native_pcurve::analytic_face_with_pcurves;
 use crate::sew::sew_shell_with_policy as sew_with_policy;
+use crate::{BandSupportKind, CornerIncidentBand, CornerNetworkPlan};
 
 fn native_blend_face(surface: GeomSurface, wire: Wire) -> Result<Face, RollingBallError> {
     analytic_face_with_pcurves(surface, wire, Orientation::Forward)
@@ -409,6 +410,7 @@ fn fillet_planar_edge_inner(
                 start,
                 &start_caps,
                 radius,
+                policy,
                 &mut faces,
                 &mut skipped_faces,
             ) || try_corner_miter(
@@ -489,6 +491,7 @@ fn fillet_planar_edge_inner(
                 end,
                 &end_caps,
                 radius,
+                policy,
                 &mut faces,
                 &mut skipped_faces,
             ) || try_corner_miter(
@@ -3793,12 +3796,11 @@ fn try_corner_sphere_two_caps(
     corner: Pnt,
     caps: &[Face],
     radius: f64,
+    policy: &TolerancePolicy,
     faces: &mut Vec<Face>,
     skipped: &mut std::collections::HashSet<FaceId>,
 ) -> bool {
-    let _ = solid;
     let r = radius;
-    let near = |p: Pnt, q: Pnt| p.distance(&q) <= 10.0 * tolerance::CONFUSION;
 
     if caps.len() != 2 {
         return false;
@@ -3809,6 +3811,12 @@ fn try_corner_sphere_two_caps(
     {
         return false;
     }
+    let Ok(tolerance) =
+        ToleranceContext::derive(policy, &[solid.bounding_box()], Some(radius), 1.0)
+    else {
+        return false;
+    };
+    let near = |p: Pnt, q: Pnt| p.distance(&q) <= tolerance.welding;
 
     // Sphere center: the new blend's rolling-ball center at this corner.
     let c0 = blend.centerline.start().point();
@@ -3855,6 +3863,21 @@ fn try_corner_sphere_two_caps(
         return false;
     }
 
+    // Route the established three-valent specialization through the same
+    // traversal-independent planner used by the general corner network. No
+    // topology is touched until the planner certifies the envelope and
+    // orthogonal equal-radius trihedron.
+    let incidents = [t, side_a, side_b].map(|contact| CornerIncidentBand {
+        contact,
+        radius,
+        support: BandSupportKind::Cylinder,
+    });
+    let Ok(plan) = CornerNetworkPlan::new(center, incidents, &tolerance) else {
+        return false;
+    };
+    if !plan.is_orthogonal_three_valent(&tolerance) {
+        return false;
+    }
     // Map each cap to the side tangent it must retract to (the side it borders).
     let side_pt_for = |cap: &Face| -> Option<Pnt> {
         if faces_share_edge(cap, &blend.face_a) {
@@ -3869,7 +3892,7 @@ fn try_corner_sphere_two_caps(
         return false;
     };
     // The two caps must border different sides.
-    if side0.distance(&side1) < 1e-6 {
+    if side0.distance(&side1) <= tolerance.welding {
         return false;
     }
 
@@ -4009,7 +4032,8 @@ pub fn fillet_edges_with_policy(
         // endpoint drift an earlier blend leaves when two requested edges share a
         // corner (the shared vertex is consumed, shortening the survivor) — an
         // exact endpoint match alone would fail there with `SpineNotOnFace`.
-        let target = relocate_edge(&current, edge).ok_or(RollingBallError::SpineNotOnFace)?;
+        let target = relocate_edge_with_policy(&current, edge, policy)
+            .ok_or(RollingBallError::SpineNotOnFace)?;
         current = fillet_planar_edge_with_policy(&current, &target, radius, policy)?;
     }
     Ok(current)
@@ -6314,7 +6338,6 @@ fn planar_blend(
     let centerline = Edge::between_points(c0, c1);
     let arc_start = contact_arc(c0, spine_dir, n_b, radius, b0, a0)?;
     let arc_end = contact_arc(c1, spine_dir, n_a, radius, a1, b1)?;
-
     let wire = Wire::from_edges([
         contact_a.clone(),
         arc_end.clone(),
@@ -6580,6 +6603,14 @@ fn point_line_distance(p: Pnt, origin: Pnt, dir: Dir) -> f64 {
 /// already rounded by the earlier fillet). Without this, multi-edge fillets that
 /// share a corner fail with [`RollingBallError::SpineNotOnFace`].
 pub(crate) fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
+    relocate_edge_with_policy(solid, requested, &TolerancePolicy::STANDARD)
+}
+
+fn relocate_edge_with_policy(
+    solid: &Solid,
+    requested: &Edge,
+    policy: &TolerancePolicy,
+) -> Option<Edge> {
     let current = solid.edges();
     if let Some(e) = current.iter().find(|c| same_undirected_edge(c, requested)) {
         return Some(e.clone());
@@ -6599,7 +6630,9 @@ pub(crate) fn relocate_edge(solid: &Solid, requested: &Edge) -> Option<Edge> {
     }
     let dir = (r1 - r0).normalized()?;
     let dir_vec = GeomVec::from_dir(dir);
-    let tol = 10.0 * tolerance::CONFUSION;
+    let tolerance =
+        ToleranceContext::derive(policy, &[solid.bounding_box()], Some(len), 1.0).ok()?;
+    let tol = tolerance.welding;
 
     let mut best: Option<(f64, Edge)> = None;
     for c in &current {

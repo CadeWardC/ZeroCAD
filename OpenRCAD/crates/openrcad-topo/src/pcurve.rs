@@ -225,6 +225,10 @@ impl PcurveData {
             // its exact 3D section instead.
             GeomCurve2d::TorusPlaneSection(_) => return None,
             GeomCurve2d::PlaneTorusSection(_) => return None,
+            GeomCurve2d::CylinderPlaneSection(curve) if u_scale == 1.0 => (
+                GeomCurve2d::cylinder_plane_section((*curve).scaled_v(v_scale)?),
+                1.0,
+            ),
             _ => return None,
         };
 
@@ -284,7 +288,7 @@ fn crosses_periodic_seam(first: f64, last: f64, period: Option<f64>) -> bool {
 mod tests {
     use super::*;
     use openrcad_foundation::{Dir2d, Pnt2d};
-    use openrcad_geom2d::Line2d;
+    use openrcad_geom2d::{CylinderPlaneSection2d, Line2d};
 
     fn u_line(origin: f64) -> PcurveData {
         PcurveData::new(
@@ -334,6 +338,30 @@ mod tests {
             let after = scaled.point_at_fraction(fraction);
             assert!((after.x() - before.x() * 4.0).abs() < 1e-12);
             assert!((after.y() - before.y() * 2.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn cylinder_section_scale_preserves_angle_and_scales_axial_distance() {
+        let source = PcurveData::new(
+            GeomCurve2d::cylinder_plane_section(
+                CylinderPlaneSection2d::new(0.4, false, 3.0, 2.0, -1.0).unwrap(),
+            ),
+            0.2,
+            1.4,
+        )
+        .with_periodicity(SurfacePeriodicity::u_periodic(core::f64::consts::TAU));
+        let scaled = source
+            .scaled_surface_coordinates(1.0, 1.0e3)
+            .expect("cylinder section mapping is exact");
+        for fraction in [0.0, 0.25, 0.5, 1.0] {
+            let before = source.point_at_fraction(fraction);
+            let after = scaled.point_at_fraction(fraction);
+            assert_eq!(after.x(), before.x());
+            assert!(
+                (after.y() - before.y() * 1.0e3).abs()
+                    <= 8.0 * f64::EPSILON * after.y().abs().max(f64::MIN_POSITIVE)
+            );
         }
     }
 }

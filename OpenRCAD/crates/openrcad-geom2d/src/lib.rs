@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub mod bspline;
 pub mod circle;
 pub mod curve;
+pub mod cylinder_plane_section;
 pub mod ellipse;
 pub mod hyperbola;
 pub mod line;
@@ -29,6 +30,7 @@ pub mod torus_plane_section;
 pub use bspline::BSplineCurve2d;
 pub use circle::Circle2d;
 pub use curve::Curve2d;
+pub use cylinder_plane_section::CylinderPlaneSection2d;
 pub use ellipse::Ellipse2d;
 pub use hyperbola::Hyperbola2d;
 pub use line::Line2d;
@@ -57,6 +59,9 @@ pub enum GeomCurve2d {
     TorusPlaneSection(TorusPlaneSection2d),
     /// Exact regular-torus section in the cutting plane's parameter space.
     PlaneTorusSection(PlaneTorusSection2d),
+    /// Exact oblique planar section in a cylinder's parameter space. Appended
+    /// to preserve every existing serialized discriminant.
+    CylinderPlaneSection(CylinderPlaneSection2d),
 }
 
 impl GeomCurve2d {
@@ -107,6 +112,12 @@ impl GeomCurve2d {
     pub fn plane_torus_section(section: PlaneTorusSection2d) -> Self {
         Self::PlaneTorusSection(section)
     }
+
+    /// Construct an exact oblique cylinder/plane-section pcurve.
+    #[inline]
+    pub fn cylinder_plane_section(section: CylinderPlaneSection2d) -> Self {
+        Self::CylinderPlaneSection(section)
+    }
 }
 
 impl Curve2d for GeomCurve2d {
@@ -120,6 +131,7 @@ impl Curve2d for GeomCurve2d {
             Self::BSpline(b) => b.point(u),
             Self::TorusPlaneSection(section) => section.point(u),
             Self::PlaneTorusSection(section) => section.point(u),
+            Self::CylinderPlaneSection(section) => section.point(u),
         }
     }
 
@@ -133,6 +145,7 @@ impl Curve2d for GeomCurve2d {
             Self::BSpline(b) => b.d1(u),
             Self::TorusPlaneSection(section) => section.d1(u),
             Self::PlaneTorusSection(section) => section.d1(u),
+            Self::CylinderPlaneSection(section) => section.d1(u),
         }
     }
 
@@ -146,6 +159,7 @@ impl Curve2d for GeomCurve2d {
             Self::BSpline(b) => b.bounds(),
             Self::TorusPlaneSection(section) => section.bounds(),
             Self::PlaneTorusSection(section) => section.bounds(),
+            Self::CylinderPlaneSection(section) => section.bounds(),
         }
     }
 
@@ -159,6 +173,7 @@ impl Curve2d for GeomCurve2d {
             Self::BSpline(b) => b.is_closed(),
             Self::TorusPlaneSection(section) => section.is_closed(),
             Self::PlaneTorusSection(section) => section.is_closed(),
+            Self::CylinderPlaneSection(section) => section.is_closed(),
         }
     }
 
@@ -172,6 +187,7 @@ impl Curve2d for GeomCurve2d {
             Self::BSpline(b) => b.is_periodic(),
             Self::TorusPlaneSection(section) => section.is_periodic(),
             Self::PlaneTorusSection(section) => section.is_periodic(),
+            Self::CylinderPlaneSection(section) => section.is_periodic(),
         }
     }
 
@@ -185,6 +201,7 @@ impl Curve2d for GeomCurve2d {
             Self::BSpline(b) => b.period(),
             Self::TorusPlaneSection(section) => section.period(),
             Self::PlaneTorusSection(section) => section.period(),
+            Self::CylinderPlaneSection(section) => section.period(),
         }
     }
 }

@@ -504,7 +504,8 @@ pub(crate) fn analytic_loop_to_wire<P>(
             GeomCurve2d::Parabola(_)
             | GeomCurve2d::Hyperbola(_)
             | GeomCurve2d::TorusPlaneSection(_)
-            | GeomCurve2d::PlaneTorusSection(_) => None,
+            | GeomCurve2d::PlaneTorusSection(_)
+            | GeomCurve2d::CylinderPlaneSection(_) => None,
         }
     }
 

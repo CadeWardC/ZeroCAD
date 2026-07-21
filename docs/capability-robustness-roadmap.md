@@ -417,6 +417,17 @@ The regression matrix covers repeated and endpoint knots, non-unit weights,
 rational conics, finite-difference agreement, scales `1e-3..1e3`, and far-origin
 coordinates.
 
+Wave 5B's planning and three-valent migration slice is implemented. A typed,
+immutable corner-network planner validates and canonically orders three-through-
+six incident bands before topology changes. The established equal-radius,
+orthogonal three-valent sphere now routes through that planner and retains its
+locked topology, radius, ownership, selection-order independence, and strict
+validation across `1e-3..1e3`, arbitrary rotation, and far-origin placement.
+Exact cylinder/plane-section and coordinate great-circle pcurves prevent this
+path from falling back to world-coordinate projection. Four-through-six-valent
+patch construction and imprinting remain pending; the planner alone is not
+reported as higher-valence geometry support.
+
 ## Persistence schedule
 
 | Capability | Contract |

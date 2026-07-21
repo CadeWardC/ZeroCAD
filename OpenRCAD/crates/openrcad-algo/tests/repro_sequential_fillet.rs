@@ -5,7 +5,7 @@
 //! (shared top-face) pairs.
 
 use openrcad_algo::{fillet_edges, fillet_planar_edge, rolling_ball_fillet_edge};
-use openrcad_foundation::{Pnt, TolerancePolicy, Vec as GeomVec};
+use openrcad_foundation::{Ax1, Dir, Pnt, ToleranceContext, TolerancePolicy, Trsf, Vec as GeomVec};
 use openrcad_geom::{GeomCurve, GeomSurface};
 use openrcad_mesh::tessellate;
 use openrcad_primitives::make_box;
@@ -507,6 +507,74 @@ fn three_edge_corner_is_selection_order_independent() {
         assert_eq!(miter_seams(&solid), 0, "order {order:?}");
         assert_eq!(cracks(&solid), 0, "order {order:?}");
         assert_eq!(nonmanifold(&solid), 0, "order {order:?}");
+    }
+}
+
+#[test]
+fn three_edge_corner_planner_holds_across_scale_rotation_and_far_origin() {
+    let cases = [
+        (1.0e-3, Trsf::IDENTITY, GeomVec::ZERO),
+        (
+            1.0,
+            Trsf::rotation(
+                &Ax1::new(Pnt::ORIGIN, Dir::new(1.0, 2.0, 3.0)),
+                37.0_f64.to_radians(),
+            ),
+            GeomVec::ZERO,
+        ),
+        (
+            1.0e3,
+            Trsf::rotation(
+                &Ax1::new(Pnt::ORIGIN, Dir::new(1.0, 2.0, 3.0)),
+                37.0_f64.to_radians(),
+            ),
+            GeomVec::new(1.0e9, -1.0e9, 5.0e8),
+        ),
+    ];
+
+    for (scale, rotation, translation) in cases {
+        let (w, h, d, radius) = (40.0 * scale, 30.0 * scale, 20.0 * scale, 4.0 * scale);
+        let source = make_box(&Pnt::ORIGIN, w, h, d)
+            .transformed(&rotation)
+            .transformed(&Trsf::translation(translation));
+        let transform = |point: Pnt| {
+            Trsf::translation(translation).transform_point(&rotation.transform_point(&point))
+        };
+        let edges = [
+            Edge::between_points(
+                transform(Pnt::new(0.0, 0.0, d)),
+                transform(Pnt::new(w, 0.0, d)),
+            ),
+            Edge::between_points(transform(Pnt::new(w, 0.0, d)), transform(Pnt::new(w, h, d))),
+            Edge::between_points(
+                transform(Pnt::new(w, 0.0, 0.0)),
+                transform(Pnt::new(w, 0.0, d)),
+            ),
+        ];
+        let selected = [edges[2].clone(), edges[0].clone(), edges[1].clone()];
+        let result = fillet_edges(&source, &selected, radius).unwrap_or_else(|error| {
+            panic!("three-edge scale {scale} transformation failed: {error}")
+        });
+        result
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .unwrap_or_else(|error| panic!("three-edge scale {scale} invalid: {error:?}"));
+        let sphere = result
+            .shell()
+            .faces()
+            .into_iter()
+            .find_map(|face| match face.surface() {
+                Some(GeomSurface::Sphere(sphere)) => Some(*sphere),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("three-edge scale {scale} lost its sphere"));
+        let tolerance = ToleranceContext::derive(
+            &TolerancePolicy::STANDARD,
+            &[result.bounding_box()],
+            Some(radius),
+            1.0,
+        )
+        .expect("three-edge tolerance context");
+        assert!((sphere.radius() - radius).abs() <= tolerance.policy.intersection);
     }
 }
 
