@@ -116,8 +116,8 @@ impl Wire {
         let edges = self.edges();
         match (edges.first(), edges.last()) {
             (Some(a), Some(b)) => a
-                .start()
-                .is_equal(&b.end(), openrcad_foundation::tolerance::CONFUSION),
+                .source()
+                .is_equal(&b.target(), openrcad_foundation::tolerance::CONFUSION),
             _ => false,
         }
     }
@@ -195,5 +195,21 @@ mod tests {
             Edge::between_points(Pnt::new(1.0, 0.0, 0.0), Pnt::new(2.0, 0.0, 0.0)),
         ]);
         assert!(!w.is_closed());
+    }
+
+    #[test]
+    fn reversed_boundary_coedges_use_oriented_endpoints_for_closure() {
+        let a = Pnt::origin();
+        let b = Pnt::new(1.0, 0.0, 0.0);
+        let c = Pnt::new(0.0, 1.0, 0.0);
+        let w = Wire::from_edges([
+            Edge::between_points(b, a).reversed(),
+            Edge::between_points(b, c),
+            Edge::between_points(a, c).reversed(),
+        ]);
+        let edges = w.edges();
+        assert_eq!(edges.first().unwrap().source().point(), a);
+        assert_eq!(edges.last().unwrap().target().point(), a);
+        assert!(w.is_closed());
     }
 }

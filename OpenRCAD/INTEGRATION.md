@@ -328,8 +328,11 @@ Know these before you wire OpenRCAD into a production path:
   radius rather than emitting a degenerate solid. Equal-radius convex planar
   corner networks are verified for complete selections of valence three through
   six. Partial, higher-valence, mixed-radius, and non-planar networks reject
-  explicitly. General face overflow and concave-offset self-intersection
-  resolution are not implemented yet.
+  explicitly. Contact-curve overflow is exact for convex straight all-planar
+  prisms and may cross multiple successive planar faces. Curved successor
+  supports, non-prismatic sources, concave corners, and profile-consuming radii
+  reject explicitly. General curved-support overflow and concave-offset
+  self-intersection resolution are not implemented yet.
 - **Booleans: severed cuts stay one body.** Watertight and health-validated on
   through-cuts, face-flush and corner-overlap unions, blind pockets, enclosed
   voids, partial and rotated cuts, and cylinder cuts and bosses (the former

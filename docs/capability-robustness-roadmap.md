@@ -431,6 +431,18 @@ projection loss. Partial selections and valence above six reject atomically
 with typed corner-network errors. Mixed-radius or non-planar N-valent networks
 remain outside the verified release subset.
 
+Wave 5C is implemented for the verified convex straight-prism matrix. When a
+rolling-ball contact leaves the selected finite planar face, the operation now
+continues the exact circular contact boundary across one or more successive
+planar faces, imprints the resulting band with analytic pcurves, and rebuilds
+the prism atomically. Radius, analytic volume, topology history, pcurve
+consistency, real disk reload, durable names, and pairwise scale/aspect/
+rotation/far-origin cases are locked by regressions. Curved successor supports,
+non-prismatic sources, concave corners, and a radius that consumes the profile
+reject with typed errors before mutation. Cylinder, cone, and torus successor
+matrices remain future expansions; the implementation never substitutes a
+vertex-motion clamp or approximate trim for those unsupported cases.
+
 ## Persistence schedule
 
 | Capability | Contract |

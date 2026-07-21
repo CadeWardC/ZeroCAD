@@ -2287,31 +2287,40 @@ fn align_u(u: f64, poly: &[(f64, f64)]) -> f64 {
     x
 }
 
+fn is_inside_wire_uv(u: f64, v: f64, surface: &GeomSurface, wire: &openrcad_topo::Wire) -> bool {
+    let periodic = !matches!(surface, GeomSurface::Plane(_) | GeomSurface::BSpline(_));
+    let polygon = loop_uv_polygon(surface, wire);
+    let aligned_u = if periodic { align_u(u, &polygon) } else { u };
+    point_in_polygon_2d((aligned_u, v), &polygon)
+}
+
+/// Checks if a parametric point `(u, v)` lies inside the face's outer trimming
+/// loop, without treating inner holes as support overflow.
+///
+/// This distinction matters to local operations: crossing a hole can be handled
+/// by the existing imprint/trim topology, while leaving the finite outer support
+/// requires contact-curve continuation onto a successor face.
+pub fn is_inside_outer_trimming_loop(u: f64, v: f64, face: &Face) -> bool {
+    let (Some(surface), Some(outer_wire)) = (face.surface(), face.outer_wire()) else {
+        return false;
+    };
+    is_inside_wire_uv(u, v, surface, &outer_wire)
+}
+
 /// Checks if a parametric point `(u, v)` lies topologically inside the face's
 /// trimming loops (inside the outer loop and outside every hole). Works for both
 /// planar and analytic curved faces by testing in `(u, v)` parameter space.
 pub fn is_inside_trimming_loops(u: f64, v: f64, face: &Face) -> bool {
-    let surface = match face.surface() {
-        Some(s) => s,
-        None => return false,
+    let Some(surface) = face.surface() else {
+        return false;
     };
-    let periodic = !matches!(surface, GeomSurface::Plane(_) | GeomSurface::BSpline(_));
 
-    let outer_wire = match face.outer_wire() {
-        Some(w) => w,
-        None => return false,
-    };
-    let outer_poly = loop_uv_polygon(surface, &outer_wire);
-    let tu = if periodic { align_u(u, &outer_poly) } else { u };
-    if !point_in_polygon_2d((tu, v), &outer_poly) {
+    if !is_inside_outer_trimming_loop(u, v, face) {
         return false;
     }
 
     for hole in face.inner_wires() {
-        let hole_poly = loop_uv_polygon(surface, &hole);
-        let hu = if periodic { align_u(u, &hole_poly) } else { u };
-        let res = point_in_polygon_2d((hu, v), &hole_poly);
-        if res {
+        if is_inside_wire_uv(u, v, surface, &hole) {
             return false;
         }
     }
@@ -3014,6 +3023,37 @@ mod tests {
             !point_in_polygon_2d((1500.0, 0.3), &sliver),
             "point well to the right is outside"
         );
+    }
+
+    #[test]
+    fn outer_support_membership_does_not_misclassify_an_inner_hole() {
+        use openrcad_topo::{Edge, Face, Wire};
+
+        let square = |min: f64, max: f64| {
+            let points = [
+                Pnt::new(min, min, 0.0),
+                Pnt::new(max, min, 0.0),
+                Pnt::new(max, max, 0.0),
+                Pnt::new(min, max, 0.0),
+            ];
+            Wire::from_edges((0..4).map(|index| {
+                Edge::between_points(points[index], points[(index + 1) % points.len()])
+            }))
+        };
+        let face = Face::with_wires(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                Dir::dz(),
+            ))),
+            Some(square(0.0, 4.0)),
+            vec![square(1.0, 3.0)],
+            Orientation::Forward,
+        );
+        let surface = face.surface().expect("planar test face");
+        let (u, v) = uv_of(surface, &Pnt::new(2.0, 2.0, 0.0));
+
+        assert!(is_inside_outer_trimming_loop(u, v, &face));
+        assert!(!is_inside_trimming_loops(u, v, &face));
     }
 
     #[test]

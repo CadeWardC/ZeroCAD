@@ -7,7 +7,7 @@
 use core::fmt;
 
 use openrcad_foundation::{
-    tolerance, Ax2, Ax3, Dir, NeverCancelled, Pnt, ToleranceContext, TolerancePolicy,
+    tolerance, Ax2, Ax3, Dir, NeverCancelled, Pnt, Pnt2d, ToleranceContext, TolerancePolicy,
     TolerancePolicyError, Vec as GeomVec,
 };
 use openrcad_geom::{
@@ -15,12 +15,13 @@ use openrcad_geom::{
     RuledSurface, SphericalSurface, Surface, ToroidalSurface,
 };
 use openrcad_mesh::tessellate_checked_with_policy_and_cancel;
-use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
+use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, SurfacePeriodicity, Vertex, Wire};
 
-use crate::native_pcurve::analytic_face_with_pcurves;
+use crate::native_pcurve::{analytic_face_with_pcurves, uv_line};
 use crate::sew::sew_shell_with_policy as sew_with_policy;
 use crate::{
-    BandSupportKind, CornerIncidentBand, CornerNetworkError, CornerNetworkPlan, CornerTangentSphere,
+    BandSupportKind, BandTopologyError, CornerIncidentBand, CornerNetworkError, CornerNetworkPlan,
+    CornerTangentSphere, GeometryWorkBudget, GeometryWorkStage,
 };
 
 fn native_blend_face(surface: GeomSurface, wire: Wire) -> Result<Face, RollingBallError> {
@@ -41,6 +42,64 @@ pub enum AdjacencyReason {
     RadiusTooLarge,
     /// The pair of surface types has no supported solver path.
     UnsupportedSurfacePair,
+}
+
+/// Typed failure details for contact-curve continuation beyond a finite face.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilletOverflowError {
+    /// The selected support pair does not yet have an exact overflow tool.
+    UnsupportedSelectedSupports {
+        first: BandSupportKind,
+        second: BandSupportKind,
+    },
+    /// Additive/concave continuation requires a different material envelope.
+    ConcaveUnsupported,
+    /// The exact reconstruction path requires a straight planar prism.
+    NonPrismaticSource,
+    /// Shared deterministic geometry-budget or band-topology failure.
+    Topology(BandTopologyError),
+    /// The exact rolling-ball crescent profile was degenerate.
+    DegenerateProfile,
+    /// The rolling-ball arc could not be clipped uniquely against the profile.
+    ProfileTrim { reason: String },
+    /// The clipped analytic profile could not be rebuilt into a strict solid.
+    RebuildFailed { reason: String },
+    /// The reconstruction completed but did not produce a strict body.
+    InvalidCandidate { reason: String },
+}
+
+impl fmt::Display for FilletOverflowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSelectedSupports { first, second } => write!(
+                f,
+                "fillet overflow does not support selected {first:?}/{second:?} surfaces"
+            ),
+            Self::ConcaveUnsupported => f.write_str("concave fillet overflow is not supported"),
+            Self::NonPrismaticSource => {
+                f.write_str("fillet overflow source is not a straight planar prism")
+            }
+            Self::Topology(error) => write!(f, "fillet overflow topology failed: {error}"),
+            Self::DegenerateProfile => f.write_str("fillet overflow profile is degenerate"),
+            Self::ProfileTrim { reason } => {
+                write!(f, "fillet overflow profile clipping failed: {reason}")
+            }
+            Self::RebuildFailed { reason } => {
+                write!(f, "fillet overflow reconstruction failed: {reason}")
+            }
+            Self::InvalidCandidate { reason } => {
+                write!(f, "fillet overflow produced an invalid candidate: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FilletOverflowError {}
+
+impl From<BandTopologyError> for FilletOverflowError {
+    fn from(error: BandTopologyError) -> Self {
+        Self::Topology(error)
+    }
 }
 
 /// Errors reported by the rolling-ball solver.
@@ -73,6 +132,8 @@ pub enum RollingBallError {
     CandidateValidation { stage: &'static str, reason: String },
     /// Multi-band corner planning rejected the requested network before commit.
     CornerNetwork(CornerNetworkError),
+    /// A contact curve left its finite support and continuation failed.
+    Overflow(FilletOverflowError),
 }
 
 impl fmt::Display for RollingBallError {
@@ -121,6 +182,7 @@ impl fmt::Display for RollingBallError {
                 )
             }
             Self::CornerNetwork(error) => write!(f, "rolling ball: {error}"),
+            Self::Overflow(error) => write!(f, "rolling ball: {error}"),
         }
     }
 }
@@ -130,6 +192,12 @@ impl std::error::Error for RollingBallError {}
 impl From<CornerNetworkError> for RollingBallError {
     fn from(error: CornerNetworkError) -> Self {
         Self::CornerNetwork(error)
+    }
+}
+
+impl From<FilletOverflowError> for RollingBallError {
+    fn from(error: FilletOverflowError) -> Self {
+        Self::Overflow(error)
     }
 }
 
@@ -319,10 +387,509 @@ pub fn fillet_planar_edge_with_policy(
     policy
         .validate()
         .map_err(RollingBallError::InvalidTolerancePolicy)?;
+    let overflow_probe = rolling_ball_fillet_edge_with_policy(solid, edge, radius, policy)?;
+    if blend_contact_overflows(&overflow_probe) {
+        return fillet_planar_overflow_with_policy(solid, &overflow_probe, policy);
+    }
     match fillet_planar_edge_inner(solid, edge, radius, true, policy) {
         Ok(solid) => Ok(solid),
         Err(_) => fillet_planar_edge_inner(solid, edge, radius, false, policy),
     }
+}
+
+fn contact_point_inside_outer_support(face: &Face, contact: &Edge, fraction: f64) -> bool {
+    let (Some(surface), Some(curve)) = (face.surface(), contact.curve()) else {
+        return false;
+    };
+    let parameter = contact.first() + (contact.last() - contact.first()) * fraction;
+    let point = curve.point(parameter);
+    let (u, v) = crate::intersect::uv_of(surface, &point);
+    crate::intersect::is_inside_outer_trimming_loop(u, v, face)
+}
+
+fn blend_contact_overflows(blend: &RollingBallBlend) -> bool {
+    [
+        (&blend.face_a, &blend.contact_a),
+        (&blend.face_b, &blend.contact_b),
+    ]
+    .into_iter()
+    .any(|(face, contact)| {
+        // The verified 5C case is cross-sectional overflow on a straight
+        // prism: one translated contact lies outside the same finite side
+        // support for its full interior. A contact that leaves support only
+        // near an endpoint is a local runout/corner interaction already owned
+        // by the established trim path (for example, a top edge ending at a
+        // joined boss). Routing that case through prism reconstruction would
+        // reject previously supported topology as NonPrismaticSource.
+        [0.125, 0.5, 0.875]
+            .into_iter()
+            .all(|fraction| !contact_point_inside_outer_support(face, contact, fraction))
+    })
+}
+
+/// Exact convex planar overflow recut.
+///
+/// The removed corner is the analytic crescent bounded by the sharp spine,
+/// both tangent points, and the rolling-ball arc. Sweeping that profile beyond
+/// both spine endpoints creates one strict solid. The profile walk carries the
+/// arc across every successive planar face it truly intersects; no
+/// vertex-motion clamp or sampled topology participates in the result.
+fn fillet_planar_overflow_with_policy(
+    solid: &Solid,
+    blend: &RollingBallBlend,
+    policy: &TolerancePolicy,
+) -> Result<Solid, RollingBallError> {
+    let support_kinds = (
+        blend
+            .face_a
+            .surface()
+            .map(BandSupportKind::of)
+            .unwrap_or(BandSupportKind::Other),
+        blend
+            .face_b
+            .surface()
+            .map(BandSupportKind::of)
+            .unwrap_or(BandSupportKind::Other),
+    );
+    if support_kinds != (BandSupportKind::Plane, BandSupportKind::Plane) {
+        return Err(FilletOverflowError::UnsupportedSelectedSupports {
+            first: support_kinds.0,
+            second: support_kinds.1,
+        }
+        .into());
+    }
+    if blend.concave {
+        return Err(FilletOverflowError::ConcaveUnsupported.into());
+    }
+
+    let start = blend.spine.source().point();
+    let end = blend.spine.target().point();
+    let spine_vector = end - start;
+    spine_vector
+        .normalized()
+        .ok_or(FilletOverflowError::DegenerateProfile)?;
+    let tolerance =
+        ToleranceContext::derive(policy, &[solid.bounding_box()], Some(blend.radius), 1.0)
+            .map_err(RollingBallError::InvalidTolerancePolicy)?;
+    let profile = prismatic_overflow_profile(solid, blend, &tolerance)?;
+    let profile_wire = profile
+        .outer_wire()
+        .ok_or(FilletOverflowError::NonPrismaticSource)?;
+    if !profile_wire.is_closed() {
+        let edges = profile_wire.edges();
+        let gaps = edges
+            .iter()
+            .enumerate()
+            .map(|(index, edge)| {
+                let next = &edges[(index + 1) % edges.len()];
+                edge.target().point().distance(&next.source().point())
+            })
+            .collect::<Vec<_>>();
+        return Err(FilletOverflowError::ProfileTrim {
+            reason: format!("reconstructed profile is open; coedge gaps={gaps:?}"),
+        }
+        .into());
+    }
+    let candidate =
+        crate::prism::prism_operation_with_policy(&profile, spine_vector, &tolerance.policy)
+            .map_err(|error| FilletOverflowError::RebuildFailed {
+                reason: error.to_string(),
+            })?
+            .value;
+    // The ordinary prism path assumes that a circular profile keeps the circle
+    // interior. Overflow clipping keeps the opposite side of its analytic arc,
+    // so the requested cylinder's material orientation is the inverse. Its
+    // exact coedges and pcurves remain unchanged.
+    let (candidate, reversed_band) =
+        orient_overflow_band_outward(&candidate, blend.radius, tolerance.policy.linear);
+    let has_requested_band = candidate.faces().into_iter().any(|face| {
+        matches!(face.surface(), Some(GeomSurface::Cylinder(cylinder)) if
+            (cylinder.radius() - blend.radius).abs() <= tolerance.policy.linear)
+    });
+    let health = candidate.health_report_with_policy(&tolerance.policy);
+    let strict = candidate.validate_strict_with_policy(&tolerance.policy);
+    if !reversed_band
+        || !has_requested_band
+        || !candidate.is_watertight_with_policy(&tolerance.policy)
+        || !health.is_healthy()
+        || strict.is_err()
+    {
+        return Err(FilletOverflowError::InvalidCandidate {
+            reason: format!(
+                "reversed_band={reversed_band}, requested_band={has_requested_band}, watertight={}, health={health:?}, strict={strict:?}",
+                candidate.is_watertight_with_policy(&tolerance.policy)
+            ),
+        }
+        .into());
+    }
+    Ok(candidate)
+}
+
+fn orient_overflow_band_outward(
+    candidate: &Solid,
+    radius: f64,
+    linear_tolerance: f64,
+) -> (Solid, bool) {
+    let solid_id = candidate.id();
+    let mut brep = (**candidate.brep()).clone();
+    let band_faces = candidate
+        .faces()
+        .into_iter()
+        .filter(|face| {
+            matches!(face.surface(), Some(GeomSurface::Cylinder(cylinder)) if
+                (cylinder.radius() - radius).abs() <= linear_tolerance)
+        })
+        .map(|face| face.id())
+        .collect::<Vec<_>>();
+    for face_id in &band_faces {
+        let loop_ids = {
+            let face = &mut brep.faces[*face_id];
+            face.orientation = face.orientation.reversed();
+            face.outer_wire
+                .into_iter()
+                .chain(face.inner_wires.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        for loop_id in loop_ids {
+            let coedges = &mut brep.loops[loop_id].edges;
+            coedges.reverse();
+            for coedge in coedges {
+                coedge.orientation = coedge.orientation.reversed();
+            }
+        }
+        bind_exact_overflow_band_pcurves(&mut brep, *face_id);
+    }
+    (
+        Solid::from_id(std::sync::Arc::new(brep), solid_id),
+        !band_faces.is_empty(),
+    )
+}
+
+fn bind_exact_overflow_band_pcurves(brep: &mut openrcad_topo::BRep, face_id: FaceId) {
+    let (cylinder, Some(loop_id)) = (
+        match brep.faces[face_id].surface {
+            Some(GeomSurface::Cylinder(cylinder)) => cylinder,
+            _ => return,
+        },
+        brep.faces[face_id].outer_wire,
+    ) else {
+        return;
+    };
+    let coedges = brep.loops[loop_id].edges.clone();
+    let Some((u_first, u_last)) = coedges.iter().find_map(|coedge| {
+        let edge = &brep.edges[coedge.id];
+        matches!(edge.curve, Some(GeomCurve::Circle(_))).then_some((edge.first, edge.last))
+    }) else {
+        return;
+    };
+    let axis_origin = cylinder.position().location();
+    let axis = GeomVec::from_dir(cylinder.position().direction());
+    let uv_for_point = |point: Pnt| {
+        let offset = point - axis_origin;
+        let v = offset.dot(&axis);
+        let first_point = cylinder.point(u_first, v);
+        let last_point = cylinder.point(u_last, v);
+        let u = if point.distance(&first_point) <= point.distance(&last_point) {
+            u_first
+        } else {
+            u_last
+        };
+        Pnt2d::new(u, v)
+    };
+    let periodicity = SurfacePeriodicity::u_periodic(core::f64::consts::TAU);
+    let pcurves = coedges
+        .iter()
+        .map(|coedge| {
+            let edge = &brep.edges[coedge.id];
+            let start = brep.vertices[edge.start].point;
+            let end = brep.vertices[edge.end].point;
+            let (start_uv, end_uv) = if matches!(edge.curve, Some(GeomCurve::Circle(_))) {
+                let start_v = (start - axis_origin).dot(&axis);
+                let end_v = (end - axis_origin).dot(&axis);
+                (
+                    Pnt2d::new(edge.first, start_v),
+                    Pnt2d::new(edge.last, end_v),
+                )
+            } else {
+                (uv_for_point(start), uv_for_point(end))
+            };
+            uv_line(start_uv, end_uv, periodicity)
+        })
+        .collect::<Vec<_>>();
+    for (coedge, pcurve) in brep.loops[loop_id].edges.iter_mut().zip(pcurves) {
+        coedge.pcurve = Some(brep.pcurves.insert(pcurve));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OverflowProfileHit {
+    edge_index: usize,
+    point: Pnt,
+}
+
+fn prismatic_overflow_profile(
+    solid: &Solid,
+    blend: &RollingBallBlend,
+    tolerance: &ToleranceContext,
+) -> Result<Face, RollingBallError> {
+    let start = blend.spine.source().point();
+    let end = blend.spine.target().point();
+    let caps_start = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
+    let caps_end = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+    if caps_start.len() != 1 || caps_end.len() != 1 {
+        return Err(FilletOverflowError::NonPrismaticSource.into());
+    }
+    let profile = &caps_start[0];
+    let opposite = &caps_end[0];
+    let Some(profile_wire) = profile.outer_wire() else {
+        return Err(FilletOverflowError::NonPrismaticSource.into());
+    };
+    let Some(opposite_wire) = opposite.outer_wire() else {
+        return Err(FilletOverflowError::NonPrismaticSource.into());
+    };
+    let profile_edges = profile_wire.edges();
+    let opposite_edges = opposite_wire.edges();
+    let all_planar = solid
+        .faces()
+        .into_iter()
+        .all(|face| matches!(face.surface(), Some(GeomSurface::Plane(_))));
+    let straight_profile = profile_edges
+        .iter()
+        .all(|edge| matches!(edge.curve(), Some(GeomCurve::Line(_)) | None));
+    if !all_planar
+        || !straight_profile
+        || !profile.inner_wires().is_empty()
+        || !opposite.inner_wires().is_empty()
+        || profile_edges.len() < 3
+        || profile_edges.len() != opposite_edges.len()
+        || solid.face_count() != profile_edges.len() + 2
+    {
+        return Err(FilletOverflowError::NonPrismaticSource.into());
+    }
+
+    let translation = end - start;
+    let endpoint_tolerance = tolerance.policy.sewing * 4.0;
+    let opposite_vertices: Vec<Pnt> = opposite_edges
+        .iter()
+        .map(|edge| edge.source().point())
+        .collect();
+    if profile_edges.iter().any(|edge| {
+        let translated = edge.source().point() + translation;
+        !opposite_vertices
+            .iter()
+            .any(|point| point.distance(&translated) <= endpoint_tolerance)
+    }) {
+        return Err(FilletOverflowError::NonPrismaticSource.into());
+    }
+
+    let mut budget = GeometryWorkBudget::intersection_default();
+    trim_overflow_profile_at_corner(
+        profile,
+        start,
+        &blend.start_arc,
+        tolerance.policy.intersection,
+        &mut budget,
+    )
+}
+
+fn trim_overflow_profile_at_corner(
+    profile: &Face,
+    corner: Pnt,
+    arc: &Edge,
+    intersection_tolerance: f64,
+    budget: &mut GeometryWorkBudget,
+) -> Result<Face, RollingBallError> {
+    let wire = profile
+        .outer_wire()
+        .ok_or(FilletOverflowError::NonPrismaticSource)?;
+    let edges = wire.edges();
+    let count = edges.len();
+    let next_index = edges
+        .iter()
+        .position(|edge| edge.source().point().distance(&corner) <= intersection_tolerance * 4.0)
+        .ok_or_else(|| FilletOverflowError::ProfileTrim {
+            reason: "selected spine endpoint is absent from the profile".to_string(),
+        })?;
+    let previous_index = (next_index + count - 1) % count;
+    if edges[previous_index].target().point().distance(&corner) > intersection_tolerance * 4.0 {
+        return Err(FilletOverflowError::ProfileTrim {
+            reason: "profile corner is not orientation-contiguous".to_string(),
+        }
+        .into());
+    }
+
+    let forward =
+        first_profile_arc_hit(&edges, arc, next_index, 1, intersection_tolerance, budget)?;
+    let backward = first_profile_arc_hit(
+        &edges,
+        arc,
+        previous_index,
+        -1,
+        intersection_tolerance,
+        budget,
+    )?;
+    if forward.edge_index == backward.edge_index {
+        return Err(FilletOverflowError::ProfileTrim {
+            reason: "both continuation branches reached the same profile edge".to_string(),
+        }
+        .into());
+    }
+
+    budget
+        .charge(GeometryWorkStage::Recut, count as u64)
+        .map_err(FilletOverflowError::from)?;
+    let clipped_arc = clipped_circle_edge(arc, backward.point, forward.point)?;
+    let mut rebuilt = Vec::with_capacity(count + 1);
+    rebuilt.push(clipped_arc);
+    push_nonzero_edge(
+        &mut rebuilt,
+        shorten_edge_keep_curve(
+            &edges[forward.edge_index],
+            edges[forward.edge_index].target().point(),
+            forward.point,
+        ),
+    );
+    let mut index = (forward.edge_index + 1) % count;
+    while index != backward.edge_index {
+        if index == next_index || index == previous_index {
+            return Err(FilletOverflowError::ProfileTrim {
+                reason: "continuation did not remove the selected corner chain".to_string(),
+            }
+            .into());
+        }
+        rebuilt.push(edges[index].clone());
+        index = (index + 1) % count;
+    }
+    push_nonzero_edge(
+        &mut rebuilt,
+        shorten_edge_keep_curve(
+            &edges[backward.edge_index],
+            edges[backward.edge_index].source().point(),
+            backward.point,
+        ),
+    );
+    rebuild_face(profile, Wire::from_edges(rebuilt))
+}
+
+fn first_profile_arc_hit(
+    edges: &[Edge],
+    arc: &Edge,
+    start_index: usize,
+    direction: isize,
+    intersection_tolerance: f64,
+    budget: &mut GeometryWorkBudget,
+) -> Result<OverflowProfileHit, RollingBallError> {
+    let Some(GeomCurve::Circle(circle)) = arc.curve() else {
+        return Err(FilletOverflowError::DegenerateProfile.into());
+    };
+    let arc_low = arc.first().min(arc.last());
+    let arc_high = arc.first().max(arc.last());
+    let angular_tolerance = intersection_tolerance / circle.radius().max(intersection_tolerance);
+    let count = edges.len();
+    for offset in 0..count {
+        budget
+            .charge(GeometryWorkStage::Intersection, 1)
+            .map_err(FilletOverflowError::from)?;
+        let index = (start_index as isize + direction * offset as isize).rem_euclid(count as isize)
+            as usize;
+        let mut hits: Vec<Pnt> = segment_circle_hits(&edges[index], circle, intersection_tolerance)
+            .into_iter()
+            .filter(|point| {
+                let parameter = circle_parameter_for_point(circle, *point, arc.first(), arc.last());
+                parameter >= arc_low - angular_tolerance
+                    && parameter <= arc_high + angular_tolerance
+            })
+            .collect();
+        hits.sort_by(|left, right| {
+            let anchor = if direction > 0 {
+                edges[index].source().point()
+            } else {
+                edges[index].target().point()
+            };
+            left.distance(&anchor).total_cmp(&right.distance(&anchor))
+        });
+        if let Some(point) = hits.first().copied() {
+            let parameter = circle_parameter_for_point(circle, point, arc.first(), arc.last());
+            return Ok(OverflowProfileHit {
+                edge_index: index,
+                point: circle.point(parameter),
+            });
+        }
+    }
+    Err(FilletOverflowError::ProfileTrim {
+        reason: "rolling-ball arc did not cross both profile branches".to_string(),
+    }
+    .into())
+}
+
+fn clipped_circle_edge(arc: &Edge, start: Pnt, end: Pnt) -> Result<Edge, RollingBallError> {
+    let Some(GeomCurve::Circle(circle)) = arc.curve() else {
+        return Err(FilletOverflowError::DegenerateProfile.into());
+    };
+    let start_parameter = circle_parameter_for_point(circle, start, arc.first(), arc.last());
+    let end_parameter = circle_parameter_for_point(circle, end, arc.first(), arc.last());
+    let (first, last, first_point, last_point) = if start_parameter <= end_parameter {
+        (start_parameter, end_parameter, start, end)
+    } else {
+        (end_parameter, start_parameter, end, start)
+    };
+    let canonical = Edge::new(
+        Some(GeomCurve::circle(*circle)),
+        first,
+        last,
+        Vertex::new(first_point),
+        Vertex::new(last_point),
+    );
+    Ok(orient_edge_between(&canonical, start, end))
+}
+
+/// Intersect a finite straight profile edge with a circle in circle-local
+/// coordinates. Rebasing before the quadratic is essential for small parts at
+/// a large world translation; subtracting two billion-unit squared terms would
+/// otherwise erase the millimetre-scale discriminant.
+fn segment_circle_hits(edge: &Edge, circle: &Circle, linear_tolerance: f64) -> Vec<Pnt> {
+    let start = edge.source().point();
+    let end = edge.target().point();
+    let center = circle.center();
+    let axis = GeomVec::from_dir(circle.axis());
+    let start_local = start - center;
+    let end_local = end - center;
+    if start_local.dot(&axis).abs() > linear_tolerance * 4.0
+        || end_local.dot(&axis).abs() > linear_tolerance * 4.0
+    {
+        return Vec::new();
+    }
+    let direction = end - start;
+    let a = direction.dot(&direction);
+    if a <= linear_tolerance * linear_tolerance {
+        return Vec::new();
+    }
+    let b = 2.0 * start_local.dot(&direction);
+    let c = start_local.dot(&start_local) - circle.radius() * circle.radius();
+    let discriminant = b * b - 4.0 * a * c;
+    let characteristic = direction.magnitude().max(circle.radius());
+    let discriminant_tolerance = linear_tolerance * characteristic.powi(3) * 16.0;
+    if discriminant < -discriminant_tolerance {
+        return Vec::new();
+    }
+    let root = discriminant.max(0.0).sqrt();
+    let parameter_tolerance = linear_tolerance / direction.magnitude();
+    let mut hits = Vec::new();
+    for parameter in [(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)] {
+        if parameter < -parameter_tolerance || parameter > 1.0 + parameter_tolerance {
+            continue;
+        }
+        let point = start + direction * parameter.clamp(0.0, 1.0);
+        let radial_error = ((point - center).magnitude() - circle.radius()).abs();
+        if radial_error <= linear_tolerance * 4.0
+            && !hits
+                .iter()
+                .any(|existing: &Pnt| existing.distance(&point) <= linear_tolerance)
+        {
+            hits.push(point);
+        }
+    }
+    hits
 }
 
 fn fillet_planar_edge_inner(
@@ -8414,6 +8981,7 @@ mod tests {
                 RollingBallError::NewtonDiverged { .. } => "n",
                 RollingBallError::BlendSurfaceBuild(_) => "b",
                 RollingBallError::CornerNetwork(_) => "c",
+                RollingBallError::Overflow(_) => "o",
                 RollingBallError::InvalidTopology => "h",
                 RollingBallError::CandidateValidation { .. } => "v",
             }
@@ -8562,8 +9130,8 @@ mod tests {
     }
 
     #[test]
-    fn handles_blend_overflow_clamping() {
-        let solid = make_box(&Pnt::origin(), 1.0, 1.0, 1.0);
+    fn continues_single_face_overflow_without_vertex_clamping() {
+        let solid = make_box(&Pnt::origin(), 1.0, 4.0, 1.0);
         let edge = solid
             .edges()
             .into_iter()
@@ -8579,8 +9147,67 @@ mod tests {
             .unwrap();
 
         let filleted = fillet_planar_edge(&solid, &edge, 1.5);
-        assert!(filleted.is_ok());
-        assert!(filleted.unwrap().is_watertight());
+        assert!(filleted.is_ok(), "overflow fillet failed: {filleted:?}");
+        let filleted = filleted.unwrap();
+        assert!(filleted.is_watertight());
+        assert!(filleted.health_report().is_healthy());
+        assert!(filleted.faces().into_iter().any(|face| {
+            matches!(face.surface(), Some(GeomSurface::Cylinder(cylinder)) if
+                (cylinder.radius() - 1.5).abs() <= TolerancePolicy::STANDARD.intersection)
+        }));
+        solid
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .expect("overflow candidate construction must not mutate its source");
+    }
+
+    #[test]
+    fn rejects_overflow_that_consumes_the_entire_profile() {
+        let solid = make_box(&Pnt::origin(), 1.0, 1.0, 1.0);
+        let edge = Edge::between_points(Pnt::origin(), Pnt::new(0.0, 0.0, 1.0));
+        assert!(matches!(
+            fillet_planar_edge(&solid, &edge, 4.0),
+            Err(RollingBallError::Overflow(
+                FilletOverflowError::ProfileTrim { .. }
+            ))
+        ));
+        solid
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .expect("a rejected overflow must leave the source unchanged");
+    }
+
+    #[test]
+    fn overflow_intersection_budget_exhausts_deterministically() {
+        let solid = make_box(&Pnt::origin(), 1.0, 4.0, 1.0);
+        let edge = Edge::between_points(Pnt::origin(), Pnt::new(0.0, 0.0, 1.0));
+        let blend = rolling_ball_fillet_edge(&solid, &edge, 1.5).unwrap();
+        let corner = blend.spine.source().point();
+        let cap = endpoint_cap_faces(&solid, corner, &blend.face_a, &blend.face_b)
+            .into_iter()
+            .next()
+            .expect("overflow end profile");
+        let edges = cap.outer_wire().expect("profile wire").edges();
+        let start_index = edges
+            .iter()
+            .position(|edge| edge.source().point().distance(&corner) <= 1.0e-6)
+            .expect("selected profile corner");
+        let mut budget = GeometryWorkBudget::new(0);
+        assert!(matches!(
+            first_profile_arc_hit(
+                &edges,
+                &blend.start_arc,
+                start_index,
+                1,
+                TolerancePolicy::STANDARD.intersection,
+                &mut budget,
+            ),
+            Err(RollingBallError::Overflow(FilletOverflowError::Topology(
+                BandTopologyError::OperationBudgetExhausted {
+                    stage: GeometryWorkStage::Intersection,
+                    limit: 0,
+                    consumed: 0,
+                }
+            )))
+        ));
     }
 
     #[test]

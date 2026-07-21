@@ -247,7 +247,7 @@ pub use rolling_ball::{
     fillet_tangent_edge_chain_with_policy, rolling_ball_between_curved_faces,
     rolling_ball_between_curved_faces_with_policy, rolling_ball_between_planar_faces,
     rolling_ball_between_planar_faces_with_policy, rolling_ball_fillet_edge,
-    rolling_ball_fillet_edge_with_policy, RollingBallBlend, RollingBallError,
+    rolling_ball_fillet_edge_with_policy, FilletOverflowError, RollingBallBlend, RollingBallError,
 };
 #[allow(deprecated)]
 pub use skin::{

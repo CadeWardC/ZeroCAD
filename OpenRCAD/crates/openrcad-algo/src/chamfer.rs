@@ -107,7 +107,8 @@ impl From<RollingBallError> for ChamferError {
             RollingBallError::UnsolvableAdjacency { .. }
             | RollingBallError::NewtonDiverged { .. }
             | RollingBallError::BlendSurfaceBuild(_)
-            | RollingBallError::CornerNetwork(_) => ChamferError::UnsupportedTrimTopology,
+            | RollingBallError::CornerNetwork(_)
+            | RollingBallError::Overflow(_) => ChamferError::UnsupportedTrimTopology,
             RollingBallError::InvalidTopology => ChamferError::InvalidTopology,
             RollingBallError::CandidateValidation { stage, reason } => {
                 ChamferError::CandidateValidation { stage, reason }

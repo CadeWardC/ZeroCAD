@@ -16,6 +16,21 @@
         "opening_count": 2,
         "wall_thickness_mm": 0.5
       }
+    },
+    {
+      "file": "fillet-overflow.zcad",
+      "sha256": "bc5926c0b27d0ff2019cd17e646966f269e3b849cf91504832047221cca32331",
+      "expected_resolution": "resolved",
+      "body_count": 1,
+      "required_features": [
+        "sketch",
+        "extrude",
+        "fillet"
+      ],
+      "measurements": {
+        "fillet_radius_mm": 1.5,
+        "successive_planar_faces": 1
+      }
     }
   ]
 }
