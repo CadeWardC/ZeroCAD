@@ -28,6 +28,11 @@ pub(crate) type LoftSectionProfile = (
     Vec<Vec<(f32, f32)>>,
 );
 
+pub(crate) type SmoothLoftSectionProfile = (
+    crate::geometry::CoordinateSystem,
+    crate::sketch::AnalyticSketchRegion,
+);
+
 mod arc_display;
 mod blend;
 mod boolean;

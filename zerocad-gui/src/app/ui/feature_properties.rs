@@ -1,5 +1,5 @@
 use crate::*;
-use zerocad_core::{DatumAxisDef, DatumPlaneDef, DatumPointDef};
+use zerocad_core::{DatumAxisDef, DatumPlaneDef, DatumPointDef, LoftSurfaceMode};
 
 /// Edit the persisted source of an expression-backed numeric property and show
 /// its current evaluated value without replacing the source text.
@@ -416,7 +416,12 @@ impl ZeroCadApp {
                                         &mut modified,
                                     );
                                 }
-                                FeatureType::Loft { sections, mode, .. } => {
+                                FeatureType::Loft {
+                                    sections,
+                                    surface_mode,
+                                    mode,
+                                    ..
+                                } => {
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "Loft through {} sections ({:?}).",
@@ -426,6 +431,25 @@ impl ZeroCadApp {
                                         .size(11.5)
                                         .color(pal.text_muted),
                                     );
+                                    let previous = *surface_mode;
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Surface").size(12.0));
+                                        egui::ComboBox::from_id_salt("loft_surface_mode")
+                                            .selected_text(format!("{surface_mode:?}"))
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    surface_mode,
+                                                    LoftSurfaceMode::Ruled,
+                                                    "Ruled",
+                                                );
+                                                ui.selectable_value(
+                                                    surface_mode,
+                                                    LoftSurfaceMode::Smooth,
+                                                    "Smooth",
+                                                );
+                                            });
+                                    });
+                                    modified |= *surface_mode != previous;
                                 }
                                 FeatureType::Sweep {
                                     path_sketch, mode, ..

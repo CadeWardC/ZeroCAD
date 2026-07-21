@@ -1937,10 +1937,12 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
+        let mut diagnostics = Vec::new();
         match family {
             crate::document::FeatureEvaluatorKind::Loft => {
                 let FeatureType::Loft {
                     sections,
+                    surface_mode,
                     mode,
                     target,
                 } = &context.feature.feature
@@ -1953,12 +1955,14 @@ impl ParametricGraph {
                 self.apply_loft(
                     context.feature_id.as_str(),
                     sections,
+                    *surface_mode,
                     *mode,
                     target.as_deref(),
                     context.sketches,
                     context.datums,
                     &mut candidate_body_state,
                     &mut warnings,
+                    &mut diagnostics,
                 );
             }
             crate::document::FeatureEvaluatorKind::Sweep => {
@@ -2006,16 +2010,13 @@ impl ParametricGraph {
             }
             _ => return Err("non-skinning family reached the Loft/Sweep contract".into()),
         }
-        let diagnostics = warnings
-            .into_iter()
-            .filter_map(|message| {
-                super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.clone(),
-                    feature_name: context.feature.name.clone(),
-                    state: ResolutionState::Unresolved(message),
-                })
+        diagnostics.extend(warnings.into_iter().filter_map(|message| {
+            super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                feature_id: context.feature_id.clone(),
+                feature_name: context.feature.name.clone(),
+                state: ResolutionState::Unresolved(message),
             })
-            .collect();
+        }));
         let topology_history = Vec::new();
         let validation_evidence = FeatureValidationEvidence {
             input_body_count: context.live_bodies.len(),
@@ -4854,12 +4855,14 @@ impl ParametricGraph {
         &self,
         node_id: &str,
         sections: &[(String, usize)],
+        surface_mode: LoftSurfaceMode,
         mode: ExtrudeMode,
         boolean_target: Option<&str>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         datums: &HashMap<String, DatumValue>,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
+        diagnostics: &mut Vec<EvaluationDiagnostic>,
     ) {
         if sections.len() < 2 {
             warnings.push(format!(
@@ -4868,7 +4871,52 @@ impl ParametricGraph {
             return;
         }
         let mut resolved: Vec<crate::mock_kernel::LoftSectionProfile> = Vec::new();
+        let mut analytic_resolved: Vec<crate::mock_kernel::SmoothLoftSectionProfile> = Vec::new();
         for (sketch_id, region_index) in sections {
+            if surface_mode == LoftSurfaceMode::Smooth {
+                let sampled_only_kind = self.node_map.get(sketch_id.as_str()).and_then(|index| {
+                    match &self.graph[*index].feature {
+                        FeatureType::Sketch { solver, .. }
+                            if solver.as_ref().is_some_and(|model| {
+                                model.entities.iter().any(|entity| {
+                                    matches!(entity, crate::sketch::SketchEntity::Ellipse { .. })
+                                })
+                            }) =>
+                        {
+                            Some("ellipse")
+                        }
+                        FeatureType::Sketch { shapes, .. }
+                            if shapes.iter().any(|shape| {
+                                matches!(shape, crate::sketch::SketchShape::Raw { .. })
+                            }) =>
+                        {
+                            Some("raw_sampled_curve")
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(curve_kind) = sampled_only_kind {
+                    diagnostics.push(
+                        EvaluationDiagnostic::new(
+                            node_id,
+                            "smooth loft",
+                            DiagnosticCode::new("loft.unsupported_span")
+                                .expect("Smooth Loft diagnostic code is a compile-time constant"),
+                            DiagnosticSeverity::Warning,
+                            format!(
+                                "Smooth Loft '{node_id}' rejected section sketch '{sketch_id}': \
+                                 {curve_kind} currently reaches the region pipeline only as sampled \
+                                 display geometry."
+                            ),
+                        )
+                        .with_parameter("section_sketch", sketch_id.clone())
+                        .with_parameter("curve_kind", curve_kind)
+                        .with_parameter("failed_stage", "analytic_section_resolution")
+                        .with_fallback("kept last valid body"),
+                    );
+                    return;
+                }
+            }
             let Some(sketch) = self.sketch_eval_by_id(sketch_cache, sketch_id) else {
                 warnings.push(format!(
                     "Loft '{node_id}': section sketch '{sketch_id}' not found."
@@ -4896,13 +4944,173 @@ impl ParametricGraph {
                 return;
             };
             resolved.push((cs, region.boundary.clone(), region.holes.clone()));
+            if surface_mode == LoftSurfaceMode::Smooth {
+                let Some(analytic) = region.analytic.clone() else {
+                    diagnostics.push(
+                        EvaluationDiagnostic::new(
+                            node_id,
+                            "smooth loft",
+                            DiagnosticCode::new("loft.unsupported_span")
+                                .expect("Smooth Loft diagnostic code is a compile-time constant"),
+                            DiagnosticSeverity::Warning,
+                            format!(
+                                "Smooth Loft '{node_id}' requires analytic section spans; sketch \
+                                 '{sketch_id}' region {region_index} only has a sampled legacy outline."
+                            ),
+                        )
+                        .with_parameter("section_sketch", sketch_id.clone())
+                        .with_parameter("region", *region_index)
+                        .with_parameter("failed_stage", "analytic_section_resolution")
+                        .with_fallback("kept last valid body"),
+                    );
+                    return;
+                };
+                analytic_resolved.push((cs, analytic));
+            }
         }
-        let Some(solid) = crate::mock_kernel::lofted_solid(&resolved) else {
-            warnings.push(format!(
-                "Loft '{node_id}': the sections could not be skinned into a solid \
-                 (check they're ordered and similarly shaped)."
-            ));
-            return;
+        let solid = match surface_mode {
+            LoftSurfaceMode::Ruled => {
+                let Some(solid) = crate::mock_kernel::lofted_solid(&resolved) else {
+                    warnings.push(format!(
+                        "Loft '{node_id}': the sections could not be skinned into a solid \
+                         (check they're ordered and similarly shaped)."
+                    ));
+                    return;
+                };
+                solid
+            }
+            LoftSurfaceMode::Smooth => {
+                match crate::mock_kernel::smooth_lofted_solid(&analytic_resolved) {
+                    Ok(solid) => solid,
+                    Err(error) => {
+                        let mut diagnostic = EvaluationDiagnostic::new(
+                            node_id,
+                            "smooth loft",
+                            DiagnosticCode::new(error.diagnostic_code()).expect(
+                                "kernel Smooth Loft diagnostic codes are compile-time constants",
+                            ),
+                            DiagnosticSeverity::Warning,
+                            format!("Smooth Loft '{node_id}' was rejected atomically: {error}."),
+                        )
+                        .with_parameter("section_count", sections.len())
+                        .with_parameter("failed_stage", "analytic_skinning")
+                        .with_parameter("reason", error.to_string())
+                        .with_fallback("kept last valid body");
+                        if let crate::mock_kernel::SmoothLoftBuildError::Kernel(
+                            openrcad::algo::ModelingOperationError::SmoothLoft(kernel_error),
+                        ) = &error
+                        {
+                            use openrcad::algo::SmoothLoftError;
+                            match kernel_error {
+                                SmoothLoftError::EmptyLoop {
+                                    section,
+                                    loop_index,
+                                }
+                                | SmoothLoftError::OpenLoop {
+                                    section,
+                                    loop_index,
+                                    ..
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("section", *section)
+                                        .with_parameter("loop", *loop_index);
+                                }
+                                SmoothLoftError::HoleCountMismatch {
+                                    section,
+                                    expected,
+                                    actual,
+                                }
+                                | SmoothLoftError::SpanCountMismatch {
+                                    section,
+                                    expected,
+                                    actual,
+                                    ..
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("section", *section)
+                                        .with_parameter("expected", *expected)
+                                        .with_parameter("actual", *actual);
+                                }
+                                SmoothLoftError::AmbiguousHoleCorrespondence { section }
+                                | SmoothLoftError::CoincidentSections { section }
+                                | SmoothLoftError::NonParallelSections { section }
+                                | SmoothLoftError::ReversedSectionOrder { section } => {
+                                    diagnostic = diagnostic.with_parameter("section", *section);
+                                }
+                                SmoothLoftError::AmbiguousSeam {
+                                    section,
+                                    loop_index,
+                                    provenance,
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("section", *section)
+                                        .with_parameter("loop", *loop_index)
+                                        .with_parameter("provenance", *provenance);
+                                }
+                                SmoothLoftError::SpanKindMismatch {
+                                    section,
+                                    loop_index,
+                                    span,
+                                    expected,
+                                    actual,
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("section", *section)
+                                        .with_parameter("loop", *loop_index)
+                                        .with_parameter("span", *span)
+                                        .with_parameter("expected_kind", format!("{expected:?}"))
+                                        .with_parameter("actual_kind", format!("{actual:?}"));
+                                }
+                                SmoothLoftError::InvalidCurve {
+                                    section,
+                                    loop_index,
+                                    span,
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("section", *section)
+                                        .with_parameter("loop", *loop_index)
+                                        .with_parameter("span", *span);
+                                }
+                                SmoothLoftError::NonPositiveWeight {
+                                    span,
+                                    control,
+                                    weight,
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("span", *span)
+                                        .with_parameter("control", *control)
+                                        .with_parameter(
+                                            "weight",
+                                            DiagnosticParameterValue::Decimal(weight.to_string()),
+                                        );
+                                }
+                                SmoothLoftError::SelfIntersection { section_interval } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("section_interval", *section_interval);
+                                }
+                                SmoothLoftError::WorkBudgetExhausted {
+                                    stage,
+                                    limit,
+                                    consumed,
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("work_stage", format!("{stage:?}"))
+                                        .with_parameter("work_limit", *limit)
+                                        .with_parameter("work_consumed", *consumed);
+                                }
+                                SmoothLoftError::InvalidTolerancePolicy(_)
+                                | SmoothLoftError::TooFewSections
+                                | SmoothLoftError::SingularInterpolation
+                                | SmoothLoftError::FaceBuild(_)
+                                | SmoothLoftError::Sew(_)
+                                | SmoothLoftError::InvalidTopology => {}
+                            }
+                        }
+                        diagnostics.push(diagnostic);
+                        return;
+                    }
+                }
+            }
         };
         self.assemble_generated_body(node_id, solid, mode, boolean_target, live, warnings, |m| {
             stamp_generated_face_refs(m, node_id, "loft")

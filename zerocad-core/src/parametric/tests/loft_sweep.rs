@@ -11,6 +11,10 @@ fn shifted_xy(z: f32) -> CoordinateSystem {
     CoordinateSystem::XY.with_origin(Vec3::new(0.0, 0.0, z))
 }
 
+fn loft_cancellation() -> EvaluationCancellation {
+    EvaluationCancellation::new(1, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)))
+}
+
 fn holed_rectangle(
     outer_min: (f32, f32),
     outer_max: (f32, f32),
@@ -49,6 +53,7 @@ fn loft_two_squares_is_a_frustum() {
         name: "Loft".to_string(),
         feature: FeatureType::Loft {
             sections: vec![("sketch_1".to_string(), 0), ("sketch_2".to_string(), 0)],
+            surface_mode: LoftSurfaceMode::Ruled,
             mode: ExtrudeMode::NewBody,
             target: None,
         },
@@ -82,6 +87,7 @@ fn loft_preserves_section_holes() {
         name: "Holed loft".into(),
         feature: FeatureType::Loft {
             sections: vec![("bottom".into(), bottom_region), ("top".into(), top_region)],
+            surface_mode: LoftSurfaceMode::Ruled,
             mode: ExtrudeMode::NewBody,
             target: None,
         },
@@ -115,6 +121,7 @@ fn loft_needs_two_sections() {
         name: "Loft".to_string(),
         feature: FeatureType::Loft {
             sections: vec![("sketch_1".to_string(), 0)],
+            surface_mode: LoftSurfaceMode::Ruled,
             mode: ExtrudeMode::NewBody,
             target: None,
         },
@@ -136,6 +143,225 @@ fn loft_needs_two_sections() {
         }),
         "diagnostics: {:?}",
         output.diagnostics
+    );
+}
+
+fn smooth_rectangle_loft(section_count: usize) -> ParametricGraph {
+    let mut graph = ParametricGraph::new();
+    let mut sections = Vec::new();
+    for section in 0..section_count {
+        let fraction = section as f32 / (section_count - 1) as f32;
+        let id = format!("smooth_section_{section}");
+        let half_width = 2.0 + fraction;
+        let half_height = 1.5 + fraction * 0.25;
+        add_sketch_cs(
+            &mut graph,
+            &id,
+            CoordinateSystem::XY.with_origin(Vec3::new(fraction * 0.35, 0.0, fraction * 8.0)),
+            rect_sketch((-half_width, -half_height), (half_width, half_height)),
+        );
+        sections.push((id, 0));
+    }
+    graph.add_feature(FeatureNode {
+        id: "smooth_loft".into(),
+        name: "Smooth Loft".into(),
+        feature: FeatureType::Loft {
+            sections: sections.clone(),
+            surface_mode: LoftSurfaceMode::Smooth,
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    for (section, _) in sections {
+        graph.add_dependency(&section, "smooth_loft");
+    }
+    graph
+}
+
+#[test]
+fn smooth_loft_two_through_five_sections_is_resolved_and_cache_equivalent() {
+    for section_count in 2..=5 {
+        let graph = smooth_rectangle_loft(section_count);
+        let hidden = std::collections::HashSet::new();
+        let cold = graph
+            .evaluate_request(&hidden, EvaluationQuality::Final, &loft_cancellation())
+            .unwrap();
+        let warm = graph
+            .evaluate_request(&hidden, EvaluationQuality::Final, &loft_cancellation())
+            .unwrap();
+        assert!(
+            cold.warnings.is_empty(),
+            "cold warnings: {:?}",
+            cold.warnings
+        );
+        assert!(
+            cold.diagnostics.is_empty(),
+            "cold diagnostics: {:?}",
+            cold.diagnostics
+        );
+        assert_eq!(cold.bodies.len(), 1);
+        assert_eq!(cold.bodies[0].1.indices, warm.bodies[0].1.indices);
+        assert_eq!(cold.bodies[0].1.face_ids, warm.bodies[0].1.face_ids);
+        assert!(cold.bodies[0].1.mass_properties().unwrap().volume > 0.0);
+        if section_count == 4 {
+            let cancelled_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+            assert!(matches!(
+                graph.evaluate_request(
+                    &hidden,
+                    EvaluationQuality::Interactive,
+                    &EvaluationCancellation::new(1, cancelled_generation),
+                ),
+                Err(EvaluationError::Cancelled)
+            ));
+        }
+    }
+}
+
+#[test]
+fn smooth_loft_section_family_mismatch_is_typed_and_atomic() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "existing".into(),
+        name: "Existing body".into(),
+        feature: FeatureType::Box {
+            w: 2.0,
+            h: 3.0,
+            d: 4.0,
+        },
+    });
+    add_sketch_cs(
+        &mut graph,
+        "rectangle",
+        shifted_xy(0.0),
+        rect_sketch((-2.0, -1.0), (2.0, 1.0)),
+    );
+    let mut circle = SketchCurves::new();
+    circle.add_circle((0.0, 0.0), 1.5);
+    add_sketch_cs(&mut graph, "circle", shifted_xy(5.0), circle);
+    graph.add_feature(FeatureNode {
+        id: "invalid_smooth_loft".into(),
+        name: "Invalid Smooth Loft".into(),
+        feature: FeatureType::Loft {
+            sections: vec![("rectangle".into(), 0), ("circle".into(), 0)],
+            surface_mode: LoftSurfaceMode::Smooth,
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    graph.add_dependency("rectangle", "invalid_smooth_loft");
+    graph.add_dependency("circle", "invalid_smooth_loft");
+
+    let output = graph
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &loft_cancellation(),
+        )
+        .unwrap();
+    assert_eq!(output.bodies.len(), 1, "the existing body must survive");
+    assert_eq!(output.bodies[0].0, "existing");
+    let diagnostic = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.feature_id == "invalid_smooth_loft")
+        .expect("typed Smooth Loft rejection");
+    assert_eq!(diagnostic.code.as_str(), "loft.section_mismatch");
+    assert_eq!(
+        diagnostic.parameters.get("failed_stage"),
+        Some(&DiagnosticParameterValue::Text("analytic_skinning".into()))
+    );
+}
+
+#[test]
+fn smooth_loft_preserves_periodic_circle_sections_exactly() {
+    let mut graph = ParametricGraph::new();
+    for (id, z, radius) in [("circle_0", 0.0, 2.0), ("circle_1", 6.0, 3.0)] {
+        let mut curves = SketchCurves::new();
+        curves.add_circle((0.0, 0.0), radius);
+        add_sketch_cs(&mut graph, id, shifted_xy(z), curves);
+    }
+    graph.add_feature(FeatureNode {
+        id: "smooth_circle_loft".into(),
+        name: "Smooth circular Loft".into(),
+        feature: FeatureType::Loft {
+            sections: vec![("circle_0".into(), 0), ("circle_1".into(), 0)],
+            surface_mode: LoftSurfaceMode::Smooth,
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    graph.add_dependency("circle_0", "smooth_circle_loft");
+    graph.add_dependency("circle_1", "smooth_circle_loft");
+
+    let output = graph
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &loft_cancellation(),
+        )
+        .unwrap();
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    assert_eq!(output.bodies.len(), 1);
+    let actual = output.bodies[0].1.mass_properties().unwrap().volume;
+    let expected = std::f64::consts::PI * 6.0 / 3.0 * (4.0 + 6.0 + 9.0);
+    assert!(
+        (actual - expected).abs() / expected < 0.02,
+        "circular Smooth Loft volume {actual} vs {expected}"
+    );
+}
+
+#[test]
+fn smooth_loft_rejects_sampled_ellipse_instead_of_persisting_approximate_topology() {
+    let mut graph = ParametricGraph::new();
+    for (id, z) in [("ellipse_0", 0.0), ("ellipse_1", 5.0)] {
+        let mut curves = SketchCurves::new();
+        curves.add_ellipse((0.0, 0.0), (3.0, 0.0), 1.5);
+        graph.add_feature(FeatureNode {
+            id: id.into(),
+            name: id.into(),
+            feature: FeatureType::Sketch {
+                cs: shifted_xy(z),
+                curves: curves.clone(),
+                shapes: vec![crate::sketch::SketchShape::Raw { curves }],
+                corner_mods: vec![],
+                mirrors: vec![],
+                on_face: false,
+                entity_ids: vec![],
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+    }
+    graph.add_feature(FeatureNode {
+        id: "ellipse_smooth_loft".into(),
+        name: "Unsupported approximate ellipse Loft".into(),
+        feature: FeatureType::Loft {
+            sections: vec![("ellipse_0".into(), 0), ("ellipse_1".into(), 0)],
+            surface_mode: LoftSurfaceMode::Smooth,
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        },
+    });
+    graph.add_dependency("ellipse_0", "ellipse_smooth_loft");
+    graph.add_dependency("ellipse_1", "ellipse_smooth_loft");
+
+    let output = graph
+        .evaluate_request(
+            &std::collections::HashSet::new(),
+            EvaluationQuality::Final,
+            &loft_cancellation(),
+        )
+        .unwrap();
+    assert!(output.bodies.is_empty());
+    let diagnostic = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.feature_id == "ellipse_smooth_loft")
+        .expect("sampled ellipse must reject with a typed diagnostic");
+    assert_eq!(diagnostic.code.as_str(), "loft.unsupported_span");
+    assert_eq!(
+        diagnostic.parameters.get("curve_kind"),
+        Some(&DiagnosticParameterValue::Text("raw_sampled_curve".into()))
     );
 }
 
@@ -516,6 +742,7 @@ fn loft_and_sweep_candidate_contract_gates() {
         name: "Loft contract".into(),
         feature: FeatureType::Loft {
             sections: vec![("loft_profile_1".into(), 0), ("loft_profile_2".into(), 0)],
+            surface_mode: LoftSurfaceMode::Ruled,
             mode: ExtrudeMode::NewBody,
             target: None,
         },

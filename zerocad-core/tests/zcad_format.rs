@@ -98,6 +98,7 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
         },
         FeatureType::Loft {
             sections: vec![("section_a".into(), 0), ("section_b".into(), 1)],
+            surface_mode: zerocad_core::LoftSurfaceMode::Smooth,
             mode: ExtrudeMode::NewBody,
             target: None,
         },

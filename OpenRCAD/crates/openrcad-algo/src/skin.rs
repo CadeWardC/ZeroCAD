@@ -466,7 +466,7 @@ fn hole_cost(first: &[Pnt], second: &[Pnt]) -> f64 {
     centroid_cost + scale_cost
 }
 
-fn match_holes(
+pub(crate) fn match_holes(
     previous: &[Vec<Pnt>],
     current: &[Vec<Pnt>],
     section: usize,

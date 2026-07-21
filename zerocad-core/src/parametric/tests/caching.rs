@@ -595,6 +595,7 @@ fn feature_mutation_corpus() -> Vec<FeatureType> {
         },
         FeatureType::Loft {
             sections: vec![("section_a".into(), 0), ("section_b".into(), 1)],
+            surface_mode: LoftSurfaceMode::Smooth,
             mode: ExtrudeMode::NewBody,
             target: Some("missing_body".into()),
         },
@@ -792,6 +793,8 @@ fn mutation_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {
             let mut candidates = match value.as_str() {
                 "SourceExtent" => vec![Value::String("ThroughAllLocalTarget".into())],
                 "ThroughAllLocalTarget" => vec![Value::String("SourceExtent".into())],
+                "Ruled" => vec![Value::String("Smooth".into())],
+                "Smooth" => vec![Value::String("Ruled".into())],
                 "Identical" => vec![Value::String("UnsupportedForTest".into())],
                 _ => Vec::new(),
             };

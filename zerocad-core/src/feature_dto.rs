@@ -7,8 +7,8 @@
 use crate::parametric::{
     AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DraftNeutral, EdgeRef, ExtrudeMode,
     FaceRef, FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
-    FeatureType, HoleKind, HoleManufacturingMetadata, PatternKind, PlaneBase, StandardReference,
-    Variable,
+    FeatureType, HoleKind, HoleManufacturingMetadata, LoftSurfaceMode, PatternKind, PlaneBase,
+    StandardReference, Variable,
 };
 use crate::sketch::{
     CornerKind, CornerMod, EntityId, SketchMirror, SketchShape, SketchSolverModel,
@@ -156,6 +156,7 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             sections,
             mode,
             target,
+            ..
         } => {
             put(&mut fields, 0, sections);
             put(&mut fields, 1, mode);
@@ -390,6 +391,11 @@ pub(crate) fn encode_for_schema(
             put(&mut fields, 6, total_twist_expr);
         }
     }
+    if let FeatureType::Loft { surface_mode, .. } = feature {
+        if payload_schema >= 2 {
+            put(&mut fields, 3, surface_mode);
+        }
+    }
     if let FeatureType::Sketch { solver, .. } = feature {
         if payload_schema >= 3 {
             let patterns = solver
@@ -465,6 +471,12 @@ fn decode_v2(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
             target: take(&mut fields, 4, "target")?,
             total_twist_deg: take(&mut fields, 5, "total twist")?,
             total_twist_expr: take(&mut fields, 6, "total twist expression")?,
+        },
+        "part.loft" => FeatureType::Loft {
+            sections: take::<Vec<(String, usize)>>(&mut fields, 0, "sections")?,
+            mode: take::<ExtrudeMode>(&mut fields, 1, "mode")?,
+            target: take(&mut fields, 2, "target")?,
+            surface_mode: take::<LoftSurfaceMode>(&mut fields, 3, "surface mode")?,
         },
         "datum.plane" => FeatureType::DatumPlane {
             def: take::<DatumPlaneDef>(&mut fields, 0, "definition")?,
@@ -571,6 +583,7 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
             sections: take::<Vec<(String, usize)>>(&mut fields, 0, "sections")?,
             mode: take::<ExtrudeMode>(&mut fields, 1, "mode")?,
             target: take(&mut fields, 2, "target")?,
+            surface_mode: LoftSurfaceMode::Ruled,
         },
         "part.sweep" => FeatureType::Sweep {
             profile_sketch: take(&mut fields, 0, "profile sketch")?,
@@ -832,6 +845,50 @@ mod tests {
                 ..
             } if total_twist_deg == -135.0 && expression == "-3*twist"
         ));
+    }
+
+    #[test]
+    fn loft_v1_remains_ruled_and_v2_round_trips_smooth_mode() {
+        let feature = FeatureType::Loft {
+            sections: vec![("bottom".into(), 0), ("top".into(), 2)],
+            surface_mode: LoftSurfaceMode::Smooth,
+            mode: ExtrudeMode::NewBody,
+            target: None,
+        };
+        let v1 = decode_with_decoder(
+            "part.loft",
+            1,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV1,
+            encode_for_schema(&feature, 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            v1,
+            FeatureType::Loft {
+                surface_mode: LoftSurfaceMode::Ruled,
+                ..
+            }
+        ));
+
+        let v2 = decode_with_decoder(
+            "part.loft",
+            2,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV2,
+            encode_for_schema(&feature, 2),
+        )
+        .unwrap();
+        assert!(matches!(
+            v2,
+            FeatureType::Loft {
+                surface_mode: LoftSurfaceMode::Smooth,
+                sections,
+                ..
+            } if sections == vec![("bottom".into(), 0), ("top".into(), 2)]
+        ));
+        let newer = decode("part.loft", 3, encode_for_schema(&feature, 2))
+            .expect_err("an unknown future Loft schema must reject");
+        assert!(newer.contains("unsupported payload schema 3"));
+        assert!(newer.contains("supported schemas: [1, 2]"));
     }
 
     #[test]

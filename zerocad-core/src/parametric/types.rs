@@ -17,6 +17,17 @@ impl Default for ExtrudeMode {
     }
 }
 
+/// Surface construction used between Loft sections.
+///
+/// `Ruled` is the historical, schema-v1 behavior. `Smooth` uses exact
+/// rational section spans and interpolates every input section analytically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LoftSurfaceMode {
+    #[default]
+    Ruled,
+    Smooth,
+}
+
 /// Separator used for additional solid-body outputs owned by one feature.
 /// The first output keeps the feature id for backward compatibility; later
 /// outputs use `feature_id::body:N` with a one-based display number.
@@ -697,6 +708,9 @@ pub enum FeatureType {
     Loft {
         /// Ordered `(sketch_id, region_index)` sections.
         sections: Vec<(String, usize)>,
+        /// Schema-v1 payloads decode as [`LoftSurfaceMode::Ruled`].
+        #[serde(default)]
+        surface_mode: LoftSurfaceMode,
         #[serde(default)]
         mode: ExtrudeMode,
         #[serde(default)]

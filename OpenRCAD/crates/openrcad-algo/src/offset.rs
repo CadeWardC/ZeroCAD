@@ -348,7 +348,12 @@ fn point_segment_distance(point: Pnt, first: Pnt, second: Pnt) -> f64 {
     point.distance(&(first + direction * parameter))
 }
 
-fn segment_distance(first_start: Pnt, first_end: Pnt, second_start: Pnt, second_end: Pnt) -> f64 {
+pub(crate) fn segment_distance_for_certificate(
+    first_start: Pnt,
+    first_end: Pnt,
+    second_start: Pnt,
+    second_end: Pnt,
+) -> f64 {
     // The endpoint probes cover parallel and degenerate segments. The
     // interior/interior solve covers the skew case without a unit-scale
     // epsilon: the operation-local angular policy decides parallelism.
@@ -494,7 +499,12 @@ fn preflight_concave_shell_with_policy(
                 }) {
                     continue;
                 }
-                let distance = segment_distance(first_start, first_end, second_start, second_end);
+                let distance = segment_distance_for_certificate(
+                    first_start,
+                    first_end,
+                    second_start,
+                    second_end,
+                );
                 if distance > context.policy.linear {
                     minimum_clearance = minimum_clearance.min(distance);
                 }

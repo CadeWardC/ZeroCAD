@@ -406,6 +406,299 @@ pub fn lofted_solid(sections: &[super::LoftSectionProfile]) -> Option<KernelSoli
     }
 }
 
+/// Typed application-boundary failure for exact analytic Smooth Loft.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SmoothLoftBuildError {
+    Kernel(openrcad::algo::ModelingOperationError),
+    Outcome(String),
+}
+
+impl SmoothLoftBuildError {
+    pub(crate) fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Kernel(openrcad::algo::ModelingOperationError::SmoothLoft(error)) => {
+                error.diagnostic_code()
+            }
+            Self::Kernel(openrcad::algo::ModelingOperationError::InvalidOutput(_)) => {
+                "result.invalid_topology"
+            }
+            Self::Kernel(_) | Self::Outcome(_) => "operation.failed",
+        }
+    }
+}
+
+impl std::fmt::Display for SmoothLoftBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kernel(error) => error.fmt(formatter),
+            Self::Outcome(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for SmoothLoftBuildError {}
+
+fn smooth_world_point(
+    cs: &crate::geometry::CoordinateSystem,
+    point: openrcad::foundation::Pnt2d,
+) -> Pnt {
+    Pnt::new(
+        f64::from(cs.origin.x) + f64::from(cs.u.x) * point.x() + f64::from(cs.v.x) * point.y(),
+        f64::from(cs.origin.y) + f64::from(cs.u.y) * point.x() + f64::from(cs.v.y) * point.y(),
+        f64::from(cs.origin.z) + f64::from(cs.u.z) * point.x() + f64::from(cs.v.z) * point.y(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SmoothConicSpanSpec {
+    center: openrcad::foundation::Pnt2d,
+    x_axis: openrcad::foundation::Dir2d,
+    y_axis: openrcad::foundation::Dir2d,
+    x_radius: f64,
+    y_radius: f64,
+    first: f64,
+    last: f64,
+}
+
+fn smooth_conic_span(
+    cs: &crate::geometry::CoordinateSystem,
+    spec: SmoothConicSpanSpec,
+) -> Option<BSplineCurve> {
+    use core::f64::consts::FRAC_PI_2;
+
+    let delta = spec.last - spec.first;
+    if !delta.is_finite() || delta.abs() <= TolerancePolicy::STANDARD.resolution {
+        return None;
+    }
+    let segments = (delta.abs() / FRAC_PI_2).ceil() as usize;
+    let segment_delta = delta / segments as f64;
+    let point = |angle: f64, radial_scale: f64| {
+        let local = openrcad::foundation::Pnt2d::new(
+            spec.center.x()
+                + radial_scale
+                    * (spec.x_radius * angle.cos() * spec.x_axis.x()
+                        + spec.y_radius * angle.sin() * spec.y_axis.x()),
+            spec.center.y()
+                + radial_scale
+                    * (spec.x_radius * angle.cos() * spec.x_axis.y()
+                        + spec.y_radius * angle.sin() * spec.y_axis.y()),
+        );
+        smooth_world_point(cs, local)
+    };
+    let mut poles = Vec::with_capacity(segments * 2 + 1);
+    let mut weights = Vec::with_capacity(segments * 2 + 1);
+    for segment in 0..segments {
+        let start = spec.first + segment_delta * segment as f64;
+        let end = start + segment_delta;
+        let middle = (start + end) * 0.5;
+        let middle_weight = (segment_delta * 0.5).cos();
+        if !middle_weight.is_finite() || middle_weight <= TolerancePolicy::STANDARD.resolution {
+            return None;
+        }
+        if segment == 0 {
+            poles.push(point(start, 1.0));
+            weights.push(1.0);
+        }
+        poles.push(point(middle, 1.0 / middle_weight));
+        weights.push(middle_weight);
+        poles.push(point(end, 1.0));
+        weights.push(1.0);
+    }
+    let knots = (0..=segments)
+        .map(|index| index as f64 / segments as f64)
+        .collect::<Vec<_>>();
+    let multiplicities = (0..=segments)
+        .map(|index| {
+            if index == 0 || index == segments {
+                3
+            } else {
+                2
+            }
+        })
+        .collect();
+    Some(BSplineCurve::new(
+        2,
+        poles,
+        Some(weights),
+        knots,
+        multiplicities,
+    ))
+}
+
+fn smooth_provenance_family(family: crate::sketch::SketchCurveFamily) -> u8 {
+    match family {
+        crate::sketch::SketchCurveFamily::Line => 0,
+        crate::sketch::SketchCurveFamily::Circle => 1,
+        crate::sketch::SketchCurveFamily::Arc => 2,
+        crate::sketch::SketchCurveFamily::Spline => 3,
+    }
+}
+
+fn smooth_loop_spans(
+    cs: &crate::geometry::CoordinateSystem,
+    source: &[openrcad::geom2d::CurveSpan<crate::sketch::SketchCurveProvenance>],
+    section: usize,
+    loop_index: usize,
+) -> Result<Vec<openrcad::algo::SmoothCurveSpan>, openrcad::algo::SmoothLoftError> {
+    use openrcad::geom2d::GeomCurve2d;
+
+    // One sketch entity can be split into several arrangement spans. Rank the
+    // spans by durable entity provenance and exact parameter bounds so every
+    // span receives a unique, traversal-independent seam key.
+    let mut canonical = source
+        .iter()
+        .enumerate()
+        .map(|(index, span)| {
+            (
+                smooth_provenance_family(span.provenance.family),
+                span.provenance.index,
+                span.first.min(span.last),
+                span.first.max(span.last),
+                index,
+            )
+        })
+        .collect::<Vec<_>>();
+    canonical.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.total_cmp(&right.2))
+            .then(left.3.total_cmp(&right.3))
+    });
+    let mut ranks = vec![0_u64; source.len()];
+    for (rank, entry) in canonical.into_iter().enumerate() {
+        ranks[entry.4] = rank as u64;
+    }
+
+    source
+        .iter()
+        .enumerate()
+        .map(|(span_index, span)| {
+            let invalid = || openrcad::algo::SmoothLoftError::InvalidCurve {
+                section,
+                loop_index,
+                span: span_index,
+            };
+            let (curve, first, last, kind) = match &span.curve {
+                GeomCurve2d::Line(line) => (
+                    BSplineCurve::new(
+                        1,
+                        vec![
+                            smooth_world_point(
+                                cs,
+                                openrcad::geom2d::Curve2d::point(line, span.first),
+                            ),
+                            smooth_world_point(
+                                cs,
+                                openrcad::geom2d::Curve2d::point(line, span.last),
+                            ),
+                        ],
+                        None,
+                        vec![0.0, 1.0],
+                        vec![2, 2],
+                    ),
+                    0.0,
+                    1.0,
+                    openrcad::algo::SmoothSpanKind::Line,
+                ),
+                GeomCurve2d::Circle(circle) => (
+                    smooth_conic_span(
+                        cs,
+                        SmoothConicSpanSpec {
+                            center: circle.center(),
+                            x_axis: circle.x_axis(),
+                            y_axis: circle.position().y_direction(),
+                            x_radius: circle.radius(),
+                            y_radius: circle.radius(),
+                            first: span.first,
+                            last: span.last,
+                        },
+                    )
+                    .ok_or_else(invalid)?,
+                    0.0,
+                    1.0,
+                    openrcad::algo::SmoothSpanKind::Circle,
+                ),
+                GeomCurve2d::Ellipse(ellipse) => (
+                    smooth_conic_span(
+                        cs,
+                        SmoothConicSpanSpec {
+                            center: ellipse.center(),
+                            x_axis: ellipse.position().x_direction(),
+                            y_axis: ellipse.position().y_direction(),
+                            x_radius: ellipse.major_radius(),
+                            y_radius: ellipse.minor_radius(),
+                            first: span.first,
+                            last: span.last,
+                        },
+                    )
+                    .ok_or_else(invalid)?,
+                    0.0,
+                    1.0,
+                    openrcad::algo::SmoothSpanKind::Ellipse,
+                ),
+                GeomCurve2d::BSpline(spline) => (
+                    BSplineCurve::new(
+                        spline.degree(),
+                        spline
+                            .poles()
+                            .iter()
+                            .map(|point| smooth_world_point(cs, *point))
+                            .collect(),
+                        spline.weights().map(ToOwned::to_owned),
+                        spline.knots().to_vec(),
+                        spline.multiplicities().to_vec(),
+                    ),
+                    span.first,
+                    span.last,
+                    openrcad::algo::SmoothSpanKind::BSpline,
+                ),
+                _ => return Err(invalid()),
+            };
+            Ok(openrcad::algo::SmoothCurveSpan::new(
+                curve,
+                first,
+                last,
+                ranks[span_index],
+                kind,
+            ))
+        })
+        .collect()
+}
+
+/// Build a Smooth Loft from exact arrangement spans. Sampled region outlines
+/// are deliberately not accepted here: a section without analytic provenance
+/// receives a typed rejection in the evaluator and Ruled remains available.
+pub(crate) fn smooth_lofted_solid(
+    sections: &[super::SmoothLoftSectionProfile],
+) -> Result<KernelSolid, SmoothLoftBuildError> {
+    let kernel_sections = sections
+        .iter()
+        .enumerate()
+        .map(|(section, (cs, region))| {
+            let outer = smooth_loop_spans(cs, &region.outer.spans, section, 0)?;
+            let holes = region
+                .holes
+                .iter()
+                .enumerate()
+                .map(|(hole, loop_)| smooth_loop_spans(cs, &loop_.spans, section, hole + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(openrcad::algo::SmoothSectionLoops { outer, holes })
+        })
+        .collect::<Result<Vec<_>, openrcad::algo::SmoothLoftError>>()
+        .map_err(|error| {
+            SmoothLoftBuildError::Kernel(openrcad::algo::ModelingOperationError::SmoothLoft(error))
+        })?;
+    let operation = openrcad::algo::skin_smooth_section_loops_operation_with_policy(
+        &kernel_sections,
+        &TolerancePolicy::STANDARD,
+    )
+    .map_err(SmoothLoftBuildError::Kernel)?;
+    consume_operation::<String>("smooth loft skin", Ok(operation))
+        .map(|outcome| outcome.solid)
+        .map_err(SmoothLoftBuildError::Outcome)
+}
+
 /// Sweep a complete material profile (outer boundary plus holes) along
 /// `path_points` (an ordered 3D polyline) using rotation-minimizing frames
 /// (double-reflection method), so the profile is transported without twist.

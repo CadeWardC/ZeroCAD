@@ -1144,8 +1144,10 @@ impl FeatureRegistry {
             FeatureEvaluatorKind::Revolve,
             FeatureEditorGroup::Solid,
         ),
-        registration(
+        registration_with_payload(
             "part.loft",
+            2,
+            NUMERIC_FIELDS_V1_V2,
             "Loft",
             FeatureEvaluatorKind::Loft,
             FeatureEditorGroup::Solid,

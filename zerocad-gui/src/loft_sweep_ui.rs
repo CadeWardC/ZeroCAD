@@ -5,6 +5,7 @@
 //! face, then pick the path sketch from a dropdown.
 
 use crate::*;
+use zerocad_core::LoftSurfaceMode;
 
 /// Creation order key from a node id like `sketch_12` (the trailing number).
 /// Ids without a trailing number sort first.
@@ -60,6 +61,7 @@ impl ZeroCadApp {
             name: format!("Loft {n}"),
             feature: FeatureType::Loft {
                 sections: sections.clone(),
+                surface_mode: LoftSurfaceMode::Ruled,
                 mode: ExtrudeMode::NewBody,
                 target: None,
             },

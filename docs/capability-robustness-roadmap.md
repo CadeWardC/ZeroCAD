@@ -480,6 +480,25 @@ branching non-adjacent offset intersection: it rejects that branch explicitly.
 Arbitrary NURBS Shell, including Shell on future Smooth Loft output, remains
 unsupported.
 
+Wave 5F is implemented as an explicit Loft surface mode. `Ruled` remains the
+default and preserves schema-v1 behavior exactly; Loft payload v2 adds
+`Smooth`. The Smooth path consumes provenance-bearing analytic arrangement
+spans, resolves hole order uniquely, canonicalizes seams deterministically,
+unifies rational B-spline degree and knots exactly in homogeneous space, and
+interpolates ordered parallel sections with degree
+`min(3, section_count - 1)`. The acceptance suite locks two through five input
+sections. Input sections are retained exactly rather than being reconstructed
+from tessellated rings. Topology changes, ambiguous hole
+or seam correspondence, coincident/reversed sections, unsupported spans,
+non-positive weights, detected self-intersection, and invalid output reject
+atomically with typed `loft.*` diagnostics. The release matrix covers lines,
+circles/arcs, and supported rational B-spline arrangement spans, including
+reordered holes, `1e-3..1e3` scales, and far-origin placement. Public sketch
+ellipses still reach region detection as sampled display chords and therefore
+reject in Smooth mode instead of becoming approximate durable topology.
+Arbitrary section orientation changes and Shell on Smooth Loft output remain
+explicitly unsupported; users can retain Ruled mode for those cases.
+
 ## Persistence schedule
 
 | Capability | Contract |

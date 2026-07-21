@@ -12,7 +12,7 @@
 
 use openrcad_algo::{boolean, fillet_edges, BooleanOp};
 use openrcad_foundation::{Ax2, Dir, Pnt, ToleranceContext, TolerancePolicy};
-use openrcad_geom::{Curve as _, GeomSurface, Surface as _};
+use openrcad_geom::{BSplineCurve, Curve as _, GeomSurface, Surface as _};
 use openrcad_primitives::{make_box, make_box_operation_with_policy, make_cylinder};
 use openrcad_topo::{Edge, Face, Orientation, Solid};
 
@@ -78,6 +78,45 @@ fn shell_rebuilt_coedges_preserve_raw_and_oriented_parameters() {
         .value;
 
     assert_coedges_param_and_pcurve_consistent(&shelled, "primitive Shell");
+}
+
+#[test]
+fn smooth_loft_generated_coedges_preserve_raw_oriented_and_pcurve_parameters() {
+    let section = |z: f64, half_width: f64| {
+        let points = [
+            Pnt::new(-half_width, -1.0, z),
+            Pnt::new(half_width, -1.0, z),
+            Pnt::new(half_width, 1.0, z),
+            Pnt::new(-half_width, 1.0, z),
+        ];
+        openrcad_algo::SmoothSectionLoops {
+            outer: (0..4)
+                .map(|index| {
+                    openrcad_algo::SmoothCurveSpan::new(
+                        BSplineCurve::new(
+                            1,
+                            vec![points[index], points[(index + 1) % 4]],
+                            None,
+                            vec![0.0, 1.0],
+                            vec![2, 2],
+                        ),
+                        0.0,
+                        1.0,
+                        index as u64,
+                        openrcad_algo::SmoothSpanKind::Line,
+                    )
+                })
+                .collect(),
+            holes: vec![],
+        }
+    };
+    let operation = openrcad_algo::skin_smooth_section_loops_operation_with_policy(
+        &[section(0.0, 2.0), section(3.0, 2.5), section(7.0, 1.75)],
+        &TolerancePolicy::STANDARD,
+    )
+    .expect("exact Smooth Loft operation");
+
+    assert_coedges_param_and_pcurve_consistent(&operation.value, "Smooth Loft");
 }
 
 fn assert_coedges_param_and_pcurve_consistent(solid: &Solid, label: &str) {

@@ -46,6 +46,23 @@
         "wall_thickness_mm": 0.5,
         "concave_edges": 1
       }
+    },
+    {
+      "file": "smooth-loft-analytic.zcad",
+      "sha256": "b2c3fda34b54a8fd3dd8ebe78e4b21f26c2df30a60233492fc23b0e0782ddd67",
+      "expected_resolution": "resolved",
+      "body_count": 1,
+      "required_features": [
+        "section_0",
+        "section_1",
+        "section_2",
+        "section_3",
+        "smooth_loft"
+      ],
+      "measurements": {
+        "section_count": 4,
+        "analytic_span_count": 16
+      }
     }
   ]
 }

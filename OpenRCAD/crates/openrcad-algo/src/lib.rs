@@ -138,6 +138,7 @@ pub mod fillet;
 pub mod offset;
 pub mod prism;
 pub mod rolling_ball;
+pub mod smooth_skin;
 pub use all_edges::{
     chamfer_all_edges_strict, chamfer_all_edges_strict_operation_with_policy,
     chamfer_all_edges_strict_with_policy, fillet_all_edges_strict,
@@ -149,6 +150,10 @@ pub use chamfer::{chamfer_edges, chamfer_edges_with_policy, ChamferError};
 pub use offset::{
     certify_concave_shell_with_policy, ConcaveShellCertificate, ConcaveShellError,
     ShellWallThicknessError, ShellWallThicknessEvidence,
+};
+pub use smooth_skin::{
+    skin_smooth_section_loops_with_policy, SmoothCurveSpan, SmoothLoftError, SmoothSectionLoops,
+    SmoothSpanKind,
 };
 
 /// Roll a constant-`radius` fillet along every edge of `solid`
@@ -272,6 +277,7 @@ pub use skin::{
 pub enum ModelingOperationError {
     Build(String),
     Shell(BlendError),
+    SmoothLoft(SmoothLoftError),
     PcurveBuild(String),
     InvalidOutput(openrcad_topo::ValidationReport),
 }
@@ -281,6 +287,7 @@ impl core::fmt::Display for ModelingOperationError {
         match self {
             Self::Build(reason) => write!(f, "operation construction failed: {reason}"),
             Self::Shell(error) => write!(f, "Shell construction failed: {error}"),
+            Self::SmoothLoft(error) => write!(f, "Smooth Loft construction failed: {error}"),
             Self::PcurveBuild(reason) => {
                 write!(f, "operation pcurve construction failed: {reason}")
             }
@@ -474,6 +481,15 @@ pub fn skin_section_loops_operation_with_policy(
 ) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
     let value = skin_section_loops_with_policy(sections, policy)
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_generated_operation(value, policy)
+}
+
+pub fn skin_smooth_section_loops_operation_with_policy(
+    sections: &[SmoothSectionLoops],
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = skin_smooth_section_loops_with_policy(sections, policy)
+        .map_err(ModelingOperationError::SmoothLoft)?;
     finish_generated_operation(value, policy)
 }
 
