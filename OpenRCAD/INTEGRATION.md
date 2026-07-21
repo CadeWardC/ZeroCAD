@@ -325,9 +325,11 @@ Know these before you wire OpenRCAD into a production path:
   result directly; any other *whole solid* yields `BlendError::UnsupportedShape`.
   The **per-edge** `fillet_edges` (rolling ball) does handle arbitrary
   planar/analytic edges, including boolean results — and rejects an over-large
-  radius rather than emitting a degenerate solid. N-valent Gregory corner blends,
-  face overflow, and concave-offset self-intersection resolution are not
-  implemented yet.
+  radius rather than emitting a degenerate solid. Equal-radius convex planar
+  corner networks are verified for complete selections of valence three through
+  six. Partial, higher-valence, mixed-radius, and non-planar networks reject
+  explicitly. General face overflow and concave-offset self-intersection
+  resolution are not implemented yet.
 - **Booleans: severed cuts stay one body.** Watertight and health-validated on
   through-cuts, face-flush and corner-overlap unions, blind pockets, enclosed
   voids, partial and rotated cuts, and cylinder cuts and bosses (the former

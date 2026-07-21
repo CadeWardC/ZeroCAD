@@ -417,16 +417,19 @@ The regression matrix covers repeated and endpoint knots, non-unit weights,
 rational conics, finite-difference agreement, scales `1e-3..1e3`, and far-origin
 coordinates.
 
-Wave 5B's planning and three-valent migration slice is implemented. A typed,
-immutable corner-network planner validates and canonically orders three-through-
-six incident bands before topology changes. The established equal-radius,
-orthogonal three-valent sphere now routes through that planner and retains its
-locked topology, radius, ownership, selection-order independence, and strict
-validation across `1e-3..1e3`, arbitrary rotation, and far-origin placement.
-Exact cylinder/plane-section and coordinate great-circle pcurves prevent this
-path from falling back to world-coordinate projection. Four-through-six-valent
-patch construction and imprinting remain pending; the planner alone is not
-reported as higher-valence geometry support.
+Wave 5B is implemented for the verified equal-radius, convex planar matrix. A
+typed, immutable corner-network planner validates and canonically orders three-
+through-six incident bands before topology changes. The operation solves the
+common rolling-ball center from all support planes, truncates every selected
+band simultaneously, and closes the network with one exact spherical patch.
+The established three-valent behavior and new four-through-six-valent fixtures
+retain strict topology, radius, ownership, selection-order independence,
+crack-free shared-edge tessellation, and complete conservative history across
+`1e-3..1e3`, arbitrary rotation, and far-origin placement. Exact oblique
+great-circle and endpoint-corrected cylinder pcurves avoid world-coordinate
+projection loss. Partial selections and valence above six reject atomically
+with typed corner-network errors. Mixed-radius or non-planar N-valent networks
+remain outside the verified release subset.
 
 ## Persistence schedule
 
