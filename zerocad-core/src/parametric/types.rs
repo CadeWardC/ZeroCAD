@@ -127,6 +127,349 @@ pub struct EdgeRef {
     pub topology: Option<TopologyEdgeRef>,
 }
 
+/// Reserved string encoding for a strict whole-solid edge selection.
+///
+/// `EdgeMod` deliberately remains a single-edge-shaped persisted feature for
+/// `.zcad` compatibility. The all-edge convenience command stores the exact
+/// durable identities captured at creation time in `TopologyEdgeRef::edge_id`, then
+/// the evaluator resolves the complete set and commits one atomic kernel
+/// candidate. Length prefixes make arbitrary UTF-8 topology names lossless;
+/// canonical sorting makes the same selection byte-identical regardless of
+/// display or traversal order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllEdgeSelector {
+    pub edge_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllEdgeSelectorError {
+    EmptySelection,
+    EmptyName,
+    TooManyNames,
+    EncodingTooLarge,
+    InvalidLength,
+    NonCanonicalLength,
+    TruncatedName,
+    InvalidUtf8Boundary,
+    NonDurableName(String),
+    DuplicateName(String),
+    NamesNotSorted,
+}
+
+impl std::fmt::Display for AllEdgeSelectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySelection => formatter.write_str("the all-edge selection is empty"),
+            Self::EmptyName => formatter.write_str("an all-edge topology name is empty"),
+            Self::TooManyNames => {
+                formatter.write_str("the all-edge selection exceeds its name budget")
+            }
+            Self::EncodingTooLarge => {
+                formatter.write_str("the all-edge selection exceeds its byte budget")
+            }
+            Self::InvalidLength => {
+                formatter.write_str("an all-edge topology-name length is invalid")
+            }
+            Self::NonCanonicalLength => {
+                formatter.write_str("an all-edge topology-name length is not canonical")
+            }
+            Self::TruncatedName => formatter.write_str("an all-edge topology name is truncated"),
+            Self::InvalidUtf8Boundary => {
+                formatter.write_str("an all-edge topology-name length splits UTF-8")
+            }
+            Self::NonDurableName(name) => {
+                write!(formatter, "all-edge topology name '{name}' is not durable")
+            }
+            Self::DuplicateName(name) => {
+                write!(formatter, "all-edge topology name '{name}' is duplicated")
+            }
+            Self::NamesNotSorted => {
+                formatter.write_str("all-edge topology names are not canonically sorted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AllEdgeSelectorError {}
+
+impl AllEdgeSelector {
+    /// This prefix is outside the durable `TopoName` grammar on purpose: the
+    /// encoded value identifies a selection, not a generated topology entity.
+    pub const PREFIX: &'static str = "zerocad.selection.all-edges.v1:";
+    const FACE_PAIR_PREFIX: &'static str = "zerocad.selection.edge-by-faces.v1:";
+    pub const MAX_NAMES: usize = 65_536;
+    pub const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
+
+    pub fn new<I, S>(edge_names: I) -> Result<Self, AllEdgeSelectorError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut edge_names = edge_names.into_iter().map(Into::into).collect::<Vec<_>>();
+        if edge_names.is_empty() {
+            return Err(AllEdgeSelectorError::EmptySelection);
+        }
+        if edge_names.len() > Self::MAX_NAMES {
+            return Err(AllEdgeSelectorError::TooManyNames);
+        }
+        if edge_names.iter().any(String::is_empty) {
+            return Err(AllEdgeSelectorError::EmptyName);
+        }
+        if let Some(name) = edge_names
+            .iter()
+            .find(|name| !Self::is_durable_edge_key(name))
+        {
+            return Err(AllEdgeSelectorError::NonDurableName(name.clone()));
+        }
+        edge_names.sort();
+        if let Some(pair) = edge_names.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(AllEdgeSelectorError::DuplicateName(pair[0].clone()));
+        }
+        Ok(Self { edge_names })
+    }
+
+    pub fn encode(&self) -> Result<String, AllEdgeSelectorError> {
+        let canonical = Self::new(self.edge_names.clone())?;
+        if canonical.edge_names != self.edge_names {
+            return Err(AllEdgeSelectorError::NamesNotSorted);
+        }
+        let mut encoded = String::from(Self::PREFIX);
+        for name in &self.edge_names {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{}:{name}", name.len()).expect("writing to a String cannot fail");
+            if encoded.len() > Self::MAX_ENCODED_BYTES {
+                return Err(AllEdgeSelectorError::EncodingTooLarge);
+            }
+        }
+        Ok(encoded)
+    }
+
+    /// Returns `None` for a normal topology edge id and `Some` only for the
+    /// reserved selector prefix. Malformed selectors never fall back to legacy
+    /// geometric matching.
+    pub fn decode(edge_id: &str) -> Option<Result<Self, AllEdgeSelectorError>> {
+        let encoded = edge_id.strip_prefix(Self::PREFIX)?;
+        Some(Self::decode_payload(encoded))
+    }
+
+    fn decode_payload(encoded: &str) -> Result<Self, AllEdgeSelectorError> {
+        if edge_id_total_len(encoded) > Self::MAX_ENCODED_BYTES {
+            return Err(AllEdgeSelectorError::EncodingTooLarge);
+        }
+        let names = decode_length_prefixed_names(encoded, Self::MAX_NAMES)?;
+        let selector = Self { edge_names: names };
+        if selector.edge_names.is_empty() {
+            return Err(AllEdgeSelectorError::EmptySelection);
+        }
+        if let Some(pair) = selector
+            .edge_names
+            .windows(2)
+            .find(|pair| pair[0] >= pair[1])
+        {
+            return Err(if pair[0] == pair[1] {
+                AllEdgeSelectorError::DuplicateName(pair[0].clone())
+            } else {
+                AllEdgeSelectorError::NamesNotSorted
+            });
+        }
+        if let Some(name) = selector
+            .edge_names
+            .iter()
+            .find(|name| !Self::is_durable_edge_key(name))
+        {
+            return Err(AllEdgeSelectorError::NonDurableName(name.clone()));
+        }
+        Ok(selector)
+    }
+
+    /// Derive one stable selector key. A producer-owned durable edge name wins;
+    /// primitive and reconstructed edges may instead use their two durable face
+    /// owners, which is the established reattachment identity for those edges.
+    pub fn durable_edge_key(edge_id: Option<&str>, adjacent_face_ids: &[String]) -> Option<String> {
+        if let Some(edge_id) =
+            edge_id.filter(|edge_id| super::topo_name::TopoName::parse(edge_id).is_durable())
+        {
+            return Some(edge_id.to_string());
+        }
+        if adjacent_face_ids.len() != 2
+            || adjacent_face_ids
+                .iter()
+                .any(|face| !super::topo_name::TopoName::parse(face).is_durable())
+        {
+            return None;
+        }
+        let mut faces = adjacent_face_ids.to_vec();
+        faces.sort();
+        if faces[0] == faces[1] {
+            return None;
+        }
+        let mut key = String::from(Self::FACE_PAIR_PREFIX);
+        for face in faces {
+            use std::fmt::Write as _;
+            write!(&mut key, "{}:{face}", face.len()).expect("writing to a String cannot fail");
+        }
+        (key.len() <= Self::MAX_ENCODED_BYTES).then_some(key)
+    }
+
+    fn is_durable_edge_key(key: &str) -> bool {
+        if super::topo_name::TopoName::parse(key).is_durable() {
+            return true;
+        }
+        let Some(payload) = key.strip_prefix(Self::FACE_PAIR_PREFIX) else {
+            return false;
+        };
+        let Ok(faces) = decode_length_prefixed_names(payload, 2) else {
+            return false;
+        };
+        faces.len() == 2
+            && faces[0] < faces[1]
+            && faces
+                .iter()
+                .all(|face| super::topo_name::TopoName::parse(face).is_durable())
+    }
+}
+
+fn edge_id_total_len(payload: &str) -> usize {
+    AllEdgeSelector::PREFIX.len().saturating_add(payload.len())
+}
+
+fn decode_length_prefixed_names(
+    encoded: &str,
+    maximum_names: usize,
+) -> Result<Vec<String>, AllEdgeSelectorError> {
+    let mut names = Vec::new();
+    let mut cursor = 0;
+    while cursor < encoded.len() {
+        if names.len() == maximum_names {
+            return Err(AllEdgeSelectorError::TooManyNames);
+        }
+        let remainder = encoded
+            .get(cursor..)
+            .ok_or(AllEdgeSelectorError::InvalidUtf8Boundary)?;
+        let colon = remainder
+            .find(':')
+            .ok_or(AllEdgeSelectorError::InvalidLength)?;
+        let digits = &remainder[..colon];
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(AllEdgeSelectorError::InvalidLength);
+        }
+        if digits.len() > 1 && digits.starts_with('0') {
+            return Err(AllEdgeSelectorError::NonCanonicalLength);
+        }
+        let length = digits
+            .parse::<usize>()
+            .map_err(|_| AllEdgeSelectorError::InvalidLength)?;
+        if length == 0 {
+            return Err(AllEdgeSelectorError::EmptyName);
+        }
+        let start = cursor + colon + 1;
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= encoded.len())
+            .ok_or(AllEdgeSelectorError::TruncatedName)?;
+        let name = encoded
+            .get(start..end)
+            .ok_or(AllEdgeSelectorError::InvalidUtf8Boundary)?;
+        names.push(name.to_string());
+        cursor = end;
+    }
+    Ok(names)
+}
+
+#[cfg(test)]
+mod all_edge_selector_tests {
+    use super::*;
+
+    #[test]
+    fn selector_is_canonical_lossless_and_distinct_from_normal_edge_ids() {
+        let selector = AllEdgeSelector::new([
+            "sketch:body:region:0:fragment:shape:7:circle:role:top",
+            "sketch:body:region:0:fragment:shape:1:rectangle-edge:2:role:side",
+            "entity:12:edge-µ",
+        ])
+        .expect("valid selector");
+        let encoded = selector.encode().expect("encode selector");
+        assert_eq!(
+            AllEdgeSelector::decode(&encoded),
+            Some(Ok(selector.clone()))
+        );
+        assert_eq!(AllEdgeSelector::decode("entity:12:line"), None);
+        assert_eq!(
+            selector.edge_names,
+            [
+                "entity:12:edge-µ",
+                "sketch:body:region:0:fragment:shape:1:rectangle-edge:2:role:side",
+                "sketch:body:region:0:fragment:shape:7:circle:role:top",
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_selectors_fail_closed() {
+        assert_eq!(
+            AllEdgeSelector::decode(AllEdgeSelector::PREFIX),
+            Some(Err(AllEdgeSelectorError::EmptySelection))
+        );
+        assert_eq!(
+            AllEdgeSelector::decode(&format!("{}01:a", AllEdgeSelector::PREFIX)),
+            Some(Err(AllEdgeSelectorError::NonCanonicalLength))
+        );
+        assert_eq!(
+            AllEdgeSelector::decode(&format!("{}1:b1:a", AllEdgeSelector::PREFIX)),
+            Some(Err(AllEdgeSelectorError::NamesNotSorted))
+        );
+        assert_eq!(
+            AllEdgeSelector::decode(&format!("{}1:a1:a", AllEdgeSelector::PREFIX)),
+            Some(Err(AllEdgeSelectorError::DuplicateName("a".to_string())))
+        );
+        assert_eq!(
+            AllEdgeSelector::decode(&format!("{}1:a", AllEdgeSelector::PREFIX)),
+            Some(Err(AllEdgeSelectorError::NonDurableName("a".to_string())))
+        );
+        let utf8_name = "entity:1:µ";
+        assert_eq!(
+            AllEdgeSelector::decode(&format!(
+                "{}{}:{utf8_name}",
+                AllEdgeSelector::PREFIX,
+                utf8_name.len()
+            )),
+            Some(Ok(AllEdgeSelector {
+                edge_names: vec![utf8_name.to_string()]
+            }))
+        );
+        assert_eq!(
+            AllEdgeSelector::decode(&format!(
+                "{}{}:{utf8_name}",
+                AllEdgeSelector::PREFIX,
+                utf8_name.len() - 1
+            )),
+            Some(Err(AllEdgeSelectorError::InvalidUtf8Boundary))
+        );
+    }
+
+    #[test]
+    fn durable_face_pair_is_canonical_and_non_durable_fallback_id_is_ignored() {
+        let faces = vec![
+            "box_box_1:face:+y".to_string(),
+            "box_box_1:face:+x".to_string(),
+        ];
+        let key = AllEdgeSelector::durable_edge_key(Some("mesh:9"), &faces)
+            .expect("durable face-pair key");
+        let reversed = AllEdgeSelector::durable_edge_key(
+            Some("mesh:2"),
+            &[faces[1].clone(), faces[0].clone()],
+        )
+        .expect("same reversed face-pair key");
+        assert_eq!(key, reversed);
+        let selector = AllEdgeSelector::new([key]).expect("face-pair selector");
+        assert_eq!(
+            AllEdgeSelector::decode(&selector.encode().expect("encode pair selector")),
+            Some(Ok(selector))
+        );
+        assert!(AllEdgeSelector::durable_edge_key(Some("mesh:9"), &[]).is_none());
+    }
+}
+
 /// Optional stable topology identity for a selected/attached face — the face
 /// analogue of [`TopologyEdgeRef`]. Faces are the primary named entity in
 /// persistent topological naming (an edge is identified by the pair of faces it

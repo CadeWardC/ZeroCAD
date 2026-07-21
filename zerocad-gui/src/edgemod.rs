@@ -8,7 +8,7 @@
 
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
-use zerocad_core::{CornerKind, EdgeRef, FeatureNode, FeatureType, MockMesh};
+use zerocad_core::{AllEdgeSelector, CornerKind, EdgeRef, FeatureNode, FeatureType, MockMesh};
 
 use crate::{PendingCommitVisual, PendingVisualMode, SharedBodyMeshes, ZeroCadApp};
 
@@ -357,9 +357,9 @@ fn edge_mod_circular_edge_preview_mesh(
 /// and the editable size; the viewport shows the resulting body in real time.
 ///
 /// One op can round/bevel **several** selected edges at once (Fusion's multi-edge
-/// fillet): they are applied as a chain of single-edge `EdgeMod` features, each
-/// re-locating its edge on the evolving body, so edges that share a corner blend
-/// correctly. The inline size box and drag handle anchor on the first edge.
+/// fillet). Explicit selections remain a chain of single-edge `EdgeMod`
+/// features; whole-body commands use one exact selector and one atomic kernel
+/// operation. The inline size box and drag handle anchor on the first edge.
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeModOp {
     /// Node id of the body being modified.
@@ -384,12 +384,104 @@ pub(crate) struct EdgeModOp {
     pub(crate) dist_text: String,
     /// True until the inline box has grabbed keyboard focus once.
     pub(crate) focus_request: bool,
+    /// Whole-body convenience command: commit only after the complete exact
+    /// preview resolves without a single blocker.
+    pub(crate) strict_all_edges: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AllEdgeSelectionError {
+    NoEligibleEdges,
+    MissingDurableNames { count: usize },
+    AmbiguousGroup { group: u32 },
+    AmbiguousDurableName { name: String },
+}
+
+fn durable_all_edge_refs(
+    node_id: &str,
+    mesh: &MockMesh,
+) -> Result<Vec<EdgeRef>, AllEdgeSelectionError> {
+    let mut eligible_groups = mesh.edge_groups.clone();
+    eligible_groups.extend(mesh.edge_refs.iter().map(|edge| edge.group));
+    eligible_groups.sort_unstable();
+    eligible_groups.dedup();
+    if eligible_groups.is_empty() {
+        return Err(AllEdgeSelectionError::NoEligibleEdges);
+    }
+    if let Some(group) = eligible_groups.iter().copied().find(|group| {
+        mesh.edge_refs
+            .iter()
+            .filter(|edge| edge.group == *group)
+            .count()
+            > 1
+    }) {
+        return Err(AllEdgeSelectionError::AmbiguousGroup { group });
+    }
+
+    let mut missing = eligible_groups
+        .iter()
+        .filter(|group| !mesh.edge_refs.iter().any(|edge| edge.group == **group))
+        .count();
+    let mut named = Vec::with_capacity(mesh.edge_refs.len());
+    for edge in &mesh.edge_refs {
+        let Some(topology) = edge.topology.as_ref() else {
+            missing += 1;
+            continue;
+        };
+        let Some(key) = AllEdgeSelector::durable_edge_key(
+            topology.edge_id.as_deref(),
+            &topology.adjacent_face_ids,
+        ) else {
+            missing += 1;
+            continue;
+        };
+        named.push((key, edge.group));
+    }
+    if missing > 0 {
+        return Err(AllEdgeSelectionError::MissingDurableNames { count: missing });
+    }
+    named.sort();
+    if let Some(pair) = named.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(AllEdgeSelectionError::AmbiguousDurableName {
+            name: pair[0].0.clone(),
+        });
+    }
+    named
+        .into_iter()
+        .map(|(_, group)| {
+            ZeroCadApp::edge_ref_from_mesh(node_id, mesh, group)
+                .ok_or(AllEdgeSelectionError::MissingDurableNames { count: 1 })
+        })
+        .collect()
 }
 
 impl EdgeModOp {
     /// The primary (first) edge — the anchor for the inline box and drag handle.
     pub(crate) fn primary(&self) -> &EdgeRef {
         &self.edges[0]
+    }
+
+    /// Produce the existing `EdgeMod` payload shape used for persistence.
+    /// Strict whole-body mode records its exact durable-name set in one
+    /// selector-backed edge, so replay remains an atomic operation.
+    fn persisted_edges(&self) -> Option<Vec<EdgeRef>> {
+        if !self.strict_all_edges {
+            return Some(self.edges.clone());
+        }
+        let names = self.edges.iter().map(|edge| {
+            let topology = edge.topology.as_ref()?;
+            AllEdgeSelector::durable_edge_key(
+                topology.edge_id.as_deref(),
+                &topology.adjacent_face_ids,
+            )
+        });
+        let selector = AllEdgeSelector::new(names.collect::<Option<Vec<_>>>()?)
+            .ok()?
+            .encode()
+            .ok()?;
+        let mut edge = self.primary().clone();
+        edge.topology.as_mut()?.edge_id = Some(selector);
+        Some(vec![edge])
     }
 
     /// World-space midpoint of the primary edge — the anchor for the inline box.
@@ -638,7 +730,176 @@ mod tests {
             dist,
             dist_text: format!("{dist:.2}"),
             focus_request: false,
+            strict_all_edges: false,
         }
+    }
+
+    fn named_mesh_edge(group: u32, name: Option<&str>) -> zerocad_core::mock_kernel::MeshEdgeRef {
+        zerocad_core::mock_kernel::MeshEdgeRef {
+            group,
+            p0: [group as f32, 0.0, 0.0],
+            p1: [group as f32, 0.0, 1.0],
+            n1: [1.0, 0.0, 0.0],
+            n2: [0.0, 1.0, 0.0],
+            curve: None,
+            topology: name.map(|name| zerocad_core::mock_kernel::MeshTopologyEdgeRef {
+                body_id: Some("body".to_string()),
+                edge_id: Some(name.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn all_edge_materialization_is_durable_unique_and_name_ordered() {
+        let mut mesh = MockMesh::empty();
+        mesh.edge_groups = vec![9, 2, 9, 2];
+        mesh.edge_refs = vec![
+            named_mesh_edge(9, Some("entity:9:edge")),
+            named_mesh_edge(2, Some("entity:2:edge")),
+        ];
+        let edges = durable_all_edge_refs("body", &mesh).expect("durable all-edge selection");
+        assert_eq!(edges.len(), 2);
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| edge
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.edge_id.as_deref())
+                    .expect("durable edge name"))
+                .collect::<Vec<_>>(),
+            ["entity:2:edge", "entity:9:edge"]
+        );
+    }
+
+    #[test]
+    fn all_edge_materialization_rejects_missing_or_ambiguous_names() {
+        let mut missing = MockMesh::empty();
+        missing.edge_groups = vec![1, 2];
+        missing.edge_refs = vec![
+            named_mesh_edge(1, Some("entity:1:edge")),
+            named_mesh_edge(2, None),
+        ];
+        assert_eq!(
+            durable_all_edge_refs("body", &missing),
+            Err(AllEdgeSelectionError::MissingDurableNames { count: 1 })
+        );
+
+        let mut ambiguous = MockMesh::empty();
+        ambiguous.edge_groups = vec![1, 2];
+        ambiguous.edge_refs = vec![
+            named_mesh_edge(1, Some("entity:1:edge")),
+            named_mesh_edge(2, Some("entity:1:edge")),
+        ];
+        assert_eq!(
+            durable_all_edge_refs("body", &ambiguous),
+            Err(AllEdgeSelectionError::AmbiguousDurableName {
+                name: "entity:1:edge".to_string()
+            })
+        );
+
+        let mut duplicate_group = MockMesh::empty();
+        duplicate_group.edge_groups = vec![1];
+        duplicate_group.edge_refs = vec![
+            named_mesh_edge(1, Some("entity:1:edge")),
+            named_mesh_edge(1, Some("entity:2:edge")),
+        ];
+        assert_eq!(
+            durable_all_edge_refs("body", &duplicate_group),
+            Err(AllEdgeSelectionError::AmbiguousGroup { group: 1 })
+        );
+    }
+
+    #[test]
+    fn all_edge_materialization_accepts_primitive_durable_face_pairs() {
+        let mut first = named_mesh_edge(1, Some("mesh:1"));
+        first
+            .topology
+            .as_mut()
+            .expect("first topology")
+            .adjacent_face_ids = vec![
+            "box_box_1:face:+x".to_string(),
+            "box_box_1:face:+y".to_string(),
+        ];
+        let mut second = named_mesh_edge(2, Some("mesh:2"));
+        second
+            .topology
+            .as_mut()
+            .expect("second topology")
+            .adjacent_face_ids = vec![
+            "box_box_1:face:+x".to_string(),
+            "box_box_1:face:+z".to_string(),
+        ];
+        let mut mesh = MockMesh::empty();
+        mesh.edge_groups = vec![1, 2];
+        mesh.edge_refs = vec![first, second];
+        let edges = durable_all_edge_refs("box_1", &mesh)
+            .expect("primitive face pairs are durable edge identities");
+        assert_eq!(edges.len(), 2);
+        let op = EdgeModOp {
+            target: "box_1".to_string(),
+            display_edges: edges.clone(),
+            edges,
+            concave: vec![false, false],
+            kind: CornerKind::Chamfer,
+            dist: 0.4,
+            dist_text: "0.4".to_string(),
+            focus_request: false,
+            strict_all_edges: true,
+        };
+        let persisted = op.persisted_edges().expect("face-pair selector");
+        let selector = AllEdgeSelector::decode(
+            persisted[0]
+                .topology
+                .as_ref()
+                .and_then(|topology| topology.edge_id.as_deref())
+                .expect("selector edge id"),
+        )
+        .expect("selector prefix")
+        .expect("selector payload");
+        assert_eq!(selector.edge_names.len(), 2);
+    }
+
+    #[test]
+    fn strict_all_edge_op_persists_one_exact_selector_feature() {
+        let mut first = straight_box_edge();
+        first.topology = Some(zerocad_core::TopologyEdgeRef {
+            body_id: Some("body".to_string()),
+            edge_id: Some("entity:9:edge".to_string()),
+            ..Default::default()
+        });
+        let mut second = straight_box_edge();
+        second.p0[0] = 1.0;
+        second.p1[0] = 1.0;
+        second.topology = Some(zerocad_core::TopologyEdgeRef {
+            body_id: Some("body".to_string()),
+            edge_id: Some("entity:2:edge".to_string()),
+            ..Default::default()
+        });
+        let op = EdgeModOp {
+            target: "body".to_string(),
+            edges: vec![first, second],
+            display_edges: Vec::new(),
+            concave: Vec::new(),
+            kind: CornerKind::Fillet,
+            dist: 0.4,
+            dist_text: "0.4".to_string(),
+            focus_request: false,
+            strict_all_edges: true,
+        };
+
+        let persisted = op.persisted_edges().expect("selector payload");
+        assert_eq!(persisted.len(), 1);
+        let edge_id = persisted[0]
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.edge_id.as_deref())
+            .expect("selector id");
+        let selector = AllEdgeSelector::decode(edge_id)
+            .expect("reserved selector")
+            .expect("valid selector");
+        assert_eq!(selector.edge_names, ["entity:2:edge", "entity:9:edge"]);
     }
 
     /// A concave bite arc on a body's top face (z = 10): rim circle about +Z,
@@ -1018,6 +1279,7 @@ impl ZeroCadApp {
             dist,
             dist_text: text,
             focus_request: true,
+            strict_all_edges: false,
         });
         // Start each edit with a clean speculative edge-mod slate so a stale
         // precompute from a previous edit can't be mistaken for this one.
@@ -1031,6 +1293,74 @@ impl ZeroCadApp {
         } else {
             "Set the size, then Enter / OK to apply (Esc cancels).".to_string()
         };
+    }
+
+    /// Begin a strict whole-body Fillet/Chamfer by materializing every eligible
+    /// selectable edge as a uniquely named durable [`EdgeRef`]. No history is
+    /// changed unless the exact full-chain preview succeeds without warnings.
+    pub(crate) fn begin_all_edge_mod(&mut self, kind: CornerKind) {
+        let Some(node_id) = self.selected_whole_body() else {
+            self.status_msg = "Fully select one body first.".to_string();
+            return;
+        };
+        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| *id == node_id) else {
+            self.status_msg = "The selected body has no evaluated geometry.".to_string();
+            return;
+        };
+        let edges = match durable_all_edge_refs(&node_id, mesh) {
+            Ok(edges) => edges,
+            Err(AllEdgeSelectionError::NoEligibleEdges) => {
+                self.status_msg = "The selected body has no eligible edges.".to_string();
+                return;
+            }
+            Err(AllEdgeSelectionError::MissingDurableNames { count }) => {
+                self.status_msg = format!(
+                    "All-edge operation refused: {count} eligible edge(s) lack durable identities."
+                );
+                return;
+            }
+            Err(AllEdgeSelectionError::AmbiguousGroup { group }) => {
+                self.status_msg = format!(
+                    "All-edge operation refused: selectable edge group {group} resolves more than once."
+                );
+                return;
+            }
+            Err(AllEdgeSelectionError::AmbiguousDurableName { name }) => {
+                self.status_msg = format!(
+                    "All-edge operation refused: durable edge identity '{name}' is ambiguous."
+                );
+                return;
+            }
+        };
+        let concave = edges
+            .iter()
+            .map(|edge| {
+                zerocad_core::edge_wedge_is_concave_mesh(mesh, edge.p0, edge.p1, edge.n1, edge.n2)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let text = self.edge_mod_dist_text.clone();
+        let dist = self.eval_dim(&text).unwrap_or(3.0).max(0.2);
+        self.edge_mod_op = Some(EdgeModOp {
+            target: node_id,
+            display_edges: edges.clone(),
+            edges,
+            concave,
+            kind,
+            dist,
+            dist_text: text,
+            focus_request: true,
+            strict_all_edges: true,
+        });
+        self.clear_edge_mod_speculation();
+        let count = self
+            .edge_mod_op
+            .as_ref()
+            .map(|operation| operation.edges.len())
+            .unwrap_or(0);
+        self.status_msg = format!(
+            "Checking all {count} durable edge(s) atomically. Commit is enabled after the exact preview passes."
+        );
     }
 
     /// Reset all speculative edge-mod precompute state (cache and in-flight job).
@@ -1124,6 +1454,7 @@ impl ZeroCadApp {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         ((op.dist.max(0.2) / 0.01).round() as i64).hash(&mut h);
         (op.kind as u8).hash(&mut h);
+        op.strict_all_edges.hash(&mut h);
         op.target.hash(&mut h);
         for edge in &op.display_edges {
             Self::hash_edge_ref(&mut h, edge);
@@ -1136,28 +1467,28 @@ impl ZeroCadApp {
         h.finish()
     }
 
-    /// Append the op's edges as a chain of single-edge `EdgeMod` nodes onto a
-    /// cloned graph — each depending on the previous so they apply in order, each
-    /// at size `dist`. Temp ids are suffixed `id_counter + i` so `creation_key`
-    /// orders them after every committed node and in edge order. The kernel
-    /// re-locates each edge on the evolving body, so edges sharing a corner blend
-    /// correctly. Used by both the speculative and live-preview graphs.
+    /// Append the operation to a cloned graph. Explicit multi-selection keeps
+    /// its dependency-ordered chain, while strict whole-body mode writes one
+    /// selector-backed node so preview and commit share the atomic kernel path.
     fn append_edge_mod_chain(
         &self,
         graph: &mut zerocad_core::ParametricGraph,
         op: &EdgeModOp,
         dist: f32,
         tag: &str,
-    ) {
+    ) -> bool {
+        let Some(edges) = op.persisted_edges() else {
+            return false;
+        };
         let mut prev = op.target.clone();
-        for (i, edge) in op.edges.iter().enumerate() {
+        for (i, edge) in edges.into_iter().enumerate() {
             let id = format!("edgemod_{tag}_{}", self.id_counter + i);
             graph.add_feature(FeatureNode {
                 id: id.clone(),
                 name: format!("{tag} edge mod {i}"),
                 feature: FeatureType::EdgeMod {
                     target: op.target.clone(),
-                    edge: edge.clone(),
+                    edge,
                     dist,
                     dist_expr: None,
                     kind: op.kind,
@@ -1166,6 +1497,7 @@ impl ZeroCadApp {
             graph.add_dependency(&prev, &id);
             prev = id;
         }
+        true
     }
 
     /// Build the graph the speculative precompute evaluates: the current model
@@ -1176,7 +1508,9 @@ impl ZeroCadApp {
     fn build_edge_mod_arc_document(&self) -> Option<zerocad_core::Document> {
         let op = self.edge_mod_op.as_ref()?;
         let mut graph = self.document.clone();
-        self.append_edge_mod_chain(&mut graph, op, op.dist.max(0.2), "spec");
+        if !self.append_edge_mod_chain(&mut graph, op, op.dist.max(0.2), "spec") {
+            return None;
+        }
         Some(graph)
     }
 
@@ -1351,6 +1685,46 @@ impl ZeroCadApp {
     /// Commit the live edge mod into history as a real `EdgeMod` feature, binding
     /// the size to a variable expression when the text references one.
     pub(crate) fn commit_edge_mod(&mut self) {
+        if let Some(operation) = self
+            .edge_mod_op
+            .as_ref()
+            .filter(|operation| operation.strict_all_edges)
+        {
+            let key = Self::edge_mod_arc_key(operation, &self.hidden_nodes);
+            let exact = self
+                .edge_mod_arc_cache
+                .as_ref()
+                .filter(|(cached_key, _, _)| *cached_key == key)
+                .or_else(|| {
+                    self.edge_mod_arc_lru
+                        .iter()
+                        .find(|(cached_key, _, _)| *cached_key == key)
+                });
+            let Some((_, _, warnings)) = exact else {
+                self.status_msg =
+                    "Still checking every edge; wait for the exact preview before committing."
+                        .to_string();
+                return;
+            };
+            if !warnings.is_empty() {
+                let noun = match operation.kind {
+                    CornerKind::Fillet => "Fillet",
+                    CornerKind::Chamfer => "Chamfer",
+                };
+                self.status_msg = format!("All-edge {noun} rejected atomically. {}", warnings[0]);
+                return;
+            }
+        }
+        let Some(persisted_edges) = self
+            .edge_mod_op
+            .as_ref()
+            .and_then(EdgeModOp::persisted_edges)
+        else {
+            self.status_msg =
+                "The durable edge selection could not be encoded; the model was not changed."
+                    .to_string();
+            return;
+        };
         // Resolve preview state first to avoid borrow-check conflicts
         let cached_bodies = self.cached_preview_edge_mod_bodies();
         let exact_bodies = cached_bodies.is_some();
@@ -1378,14 +1752,13 @@ impl ZeroCadApp {
         } else {
             None
         };
-        // One single-edge `EdgeMod` feature per selected edge, chained so they
-        // apply in order. The kernel re-locates each edge on the evolving body, so
-        // edges sharing a corner blend correctly (the earlier blend shortens the
-        // survivor, which `fillet_edges` tracks).
+        // Explicit selection keeps one feature per edge. Strict whole-body mode
+        // contributes exactly one selector-backed feature, preventing partial
+        // history on rebuild or reload.
         let dist = op.dist.max(0.2);
         let edge_count = op.display_edges.len();
         let mut prev = op.target.clone();
-        for edge in op.edges {
+        for edge in persisted_edges {
             let id = format!("edgemod_{}", self.next_id());
             let name = self.next_edge_mod_name(op.kind);
             self.document.add_feature(FeatureNode {

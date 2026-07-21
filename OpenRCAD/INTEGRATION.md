@@ -9,10 +9,12 @@ exchange. It is written to be copy-paste practical; for the conceptual *why*, se
 > primitives, intersection engine + BVH, booleans, tessellation, sewing, and
 > STEP/STL layers are real and tested, plus an interactive viewer
 > (`openrcad-render`) and a parametric document layer (`openrcad-document`). The
-> whole-solid fillet/chamfer/shell builders handle a single **box** or
-> **cylinder** primitive at **any orientation** and return a typed error for
-> anything else; the per-edge rolling-ball fillet (`fillet_edges`) works on
-> arbitrary edges including boolean results. Booleans are watertight **and**
+> primitive fillet/chamfer/shell builders handle a single **box** or
+> **cylinder** primitive at **any orientation**. Strict all-edge Fillet/Chamfer
+> adapters preserve those fast paths and extend to arbitrary solids whenever
+> every edge passes the selected-edge machinery; otherwise they return the
+> complete typed blocker set atomically. The per-edge rolling-ball fillet
+> (`fillet_edges`) works on arbitrary edges including boolean results. Booleans are watertight **and**
 > health-validated across the everyday cases (partial-imprint, coplanar joins,
 > cylinder cuts and bosses). See [Limitations](#limitations).
 
@@ -184,9 +186,9 @@ the result satisfies the Euler characteristic `V − E + F = 2`.
 
 ### Per-edge blends (any solid, including boolean results)
 
-The whole-solid builders above recognise only a box or cylinder. To blend an
-**arbitrary** solid — including a boolean result — select the edges and use the
-per-edge rolling-ball API. It handles planar–planar, planar–cylindrical, and
+The primitive whole-solid builders above recognise only a box or cylinder. To
+blend selected edges of an **arbitrary** solid — including a boolean result —
+use the per-edge rolling-ball API. It handles planar–planar, planar–cylindrical, and
 planar–analytic edge adjacency, and rejects an over-large radius with a typed
 error rather than emitting a degenerate solid.
 
@@ -218,6 +220,27 @@ let blended = apply_blend_contour(&solid, &contour)?; // -> Result<Solid, BlendC
 
 `BlendContourError` distinguishes an empty contour, an unsupported variable law,
 and an underlying fillet/chamfer failure.
+
+### Strict all-edge convenience
+
+Use the strict adapters when skipping an unsupported edge would be incorrect:
+
+```rust
+use openrcad::algo::{
+    fillet_all_edges_strict,
+    chamfer_all_edges_strict,
+    AllEdgeBlendError,
+};
+
+let rounded = fillet_all_edges_strict(&solid, 2.0)?;
+let beveled = chamfer_all_edges_strict(&solid, 2.0)?;
+```
+
+Edges are ordered canonically. Box/cylinder inputs use their simultaneous
+primitive solution; other solids use the grouped selected-edge engines. On
+failure, `AllEdgeBlendError::BlockingEdges` carries the deterministic source
+edges and typed reasons found by diagnostic replay. The input solid is immutable
+and no partly blended candidate is returned.
 
 ### Sweep a profile into a solid (`prism`)
 

@@ -458,6 +458,41 @@ impl ZeroCadApp {
             );
         }
 
+        // Strict whole-body convenience: a fully selected body resolves every
+        // selectable durable edge, previews the complete atomic operation, and
+        // refuses to commit if even one edge blocks. Persistence remains one
+        // existing EdgeMod payload with an exact materialized-name selector.
+        let all_edge_body =
+            (!active_sketching && self.extrude_op.is_none() && self.edge_mod_op.is_none())
+                .then(|| self.selected_whole_body())
+                .flatten();
+        if all_edge_body.is_some() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Modify All Edges")
+                    .strong()
+                    .size(12.0)
+                    .color(self.pal().text_strong),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if icons::Icon::Fillet
+                    .menu_button(ui, "Fillet All")
+                    .on_hover_text("Round every durable edge atomically; report all blockers")
+                    .clicked()
+                {
+                    self.begin_all_edge_mod(CornerKind::Fillet);
+                }
+                if icons::Icon::Chamfer
+                    .menu_button(ui, "Chamfer All")
+                    .on_hover_text("Bevel every durable edge atomically; report all blockers")
+                    .clicked()
+                {
+                    self.begin_all_edge_mod(CornerKind::Chamfer);
+                }
+            });
+        }
+
         // HOLE: drill into the selected body face.
         if !active_sketching
             && self.extrude_op.is_none()

@@ -370,6 +370,18 @@ pub(crate) fn take_diagnostics() -> Vec<EvaluationDiagnostic> {
     PENDING_DIAGNOSTICS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
 }
 
+/// Mark the current kernel-diagnostic boundary for an outer atomic operation.
+/// A multi-part candidate may validate several scratch solids before a later
+/// part fails; callers restore this boundary so recovery metadata from discarded
+/// scratch results cannot leak into the committed evaluation output.
+pub(crate) fn diagnostic_checkpoint() -> usize {
+    PENDING_DIAGNOSTICS.with(|pending| pending.borrow().len())
+}
+
+pub(crate) fn restore_diagnostic_checkpoint(checkpoint: usize) {
+    PENDING_DIAGNOSTICS.with(|pending| pending.borrow_mut().truncate(checkpoint));
+}
+
 fn active_feature() -> String {
     ACTIVE_FEATURE.with(|active| active.borrow().clone().unwrap_or_default())
 }

@@ -132,11 +132,19 @@ pub fn boolean_checked_bodies(
     boolean::boolean_checked_bodies(object, tool, op)
 }
 
+mod all_edges;
 pub mod chamfer;
 pub mod fillet;
 pub mod offset;
 pub mod prism;
 pub mod rolling_ball;
+pub use all_edges::{
+    chamfer_all_edges_strict, chamfer_all_edges_strict_operation_with_policy,
+    chamfer_all_edges_strict_with_policy, fillet_all_edges_strict,
+    fillet_all_edges_strict_operation_with_policy, fillet_all_edges_strict_with_policy,
+    AllEdgeBlendError, AllEdgeBlendFailure, AllEdgeBlendKind, AllEdgeBlendOperationError,
+    AllEdgeBlocker,
+};
 pub use chamfer::{chamfer_edges, chamfer_edges_with_policy, ChamferError};
 
 /// Roll a constant-`radius` fillet along every edge of `solid`

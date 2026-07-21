@@ -62,6 +62,22 @@ pub(crate) fn apply_edge_mod(
         crate::sketch::CornerKind::Fillet => "Fillet",
         crate::sketch::CornerKind::Chamfer => "Chamfer",
     };
+    if let Some(selector) = edge
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.edge_id.as_deref())
+        .and_then(AllEdgeSelector::decode)
+    {
+        match selector {
+            Ok(selector) => {
+                apply_strict_all_edge_mod(mod_id, &selector, dist, kind, body, warnings)
+            }
+            Err(error) => warnings.push(format!(
+                "{label} '{mod_id}': its persisted all-edge selector is invalid ({error}), so the body was left unchanged."
+            )),
+        }
+        return;
+    }
     let resolved_edge = match resolve_edge_ref_by_topology(body, edge) {
         Some(resolved) => resolved,
         None if edge
@@ -91,6 +107,173 @@ pub(crate) fn apply_edge_mod(
             apply_chamfer(mod_id, &selection, dist, body, warnings)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AllEdgeResolutionError {
+    NoEligibleEdges,
+    MissingDurableName { group: u32 },
+    AmbiguousGroup { group: u32 },
+    AmbiguousName { name: String },
+}
+
+impl std::fmt::Display for AllEdgeResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEligibleEdges => formatter.write_str("the target has no eligible edges"),
+            Self::MissingDurableName { group } => {
+                write!(
+                    formatter,
+                    "eligible edge group {group} is missing a durable name"
+                )
+            }
+            Self::AmbiguousGroup { group } => {
+                write!(
+                    formatter,
+                    "eligible edge group {group} resolves more than once"
+                )
+            }
+            Self::AmbiguousName { name } => {
+                write!(formatter, "durable edge name '{name}' is ambiguous")
+            }
+        }
+    }
+}
+
+fn current_durable_all_edge_names(mesh: &MockMesh) -> Result<Vec<String>, AllEdgeResolutionError> {
+    let mut groups = mesh.edge_groups.clone();
+    groups.extend(mesh.edge_refs.iter().map(|edge| edge.group));
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.is_empty() {
+        return Err(AllEdgeResolutionError::NoEligibleEdges);
+    }
+
+    let mut names = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut candidates = mesh.edge_refs.iter().filter(|edge| edge.group == group);
+        let candidate = candidates
+            .next()
+            .ok_or(AllEdgeResolutionError::MissingDurableName { group })?;
+        if candidates.next().is_some() {
+            return Err(AllEdgeResolutionError::AmbiguousGroup { group });
+        }
+        let topology = candidate
+            .topology
+            .as_ref()
+            .ok_or(AllEdgeResolutionError::MissingDurableName { group })?;
+        let key = AllEdgeSelector::durable_edge_key(
+            topology.edge_id.as_deref(),
+            &topology.adjacent_face_ids,
+        )
+        .ok_or(AllEdgeResolutionError::MissingDurableName { group })?;
+        names.push(key);
+    }
+    names.sort();
+    if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(AllEdgeResolutionError::AmbiguousName {
+            name: pair[0].clone(),
+        });
+    }
+    Ok(names)
+}
+
+/// Resolve and apply a materialized all-edge selector in one transaction. The
+/// requested and current name sets must be identical: upstream topology may
+/// move, but adding, deleting, splitting, or ambiguously renaming an edge never
+/// expands this feature into a wildcard operation.
+fn apply_strict_all_edge_mod(
+    mod_id: &str,
+    selector: &AllEdgeSelector,
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+    body: &mut LiveBody,
+    warnings: &mut Vec<String>,
+) {
+    let label = match kind {
+        crate::sketch::CornerKind::Fillet => "Fillet",
+        crate::sketch::CornerKind::Chamfer => "Chamfer",
+    };
+    if !dist.is_finite() || dist <= 0.0 {
+        warnings.push(format!(
+            "{label} '{mod_id}': distance must be positive, so the body was left unchanged."
+        ));
+        return;
+    }
+
+    let reference_mesh = body
+        .pristine
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| edge_mod_reference_mesh(body));
+    let current_names = match current_durable_all_edge_names(&reference_mesh) {
+        Ok(names) => names,
+        Err(error) => {
+            warnings.push(format!(
+                "{label} '{mod_id}': its all-edge references are ambiguous or missing ({error}), so the body was left unchanged."
+            ));
+            return;
+        }
+    };
+    if current_names != selector.edge_names {
+        let missing = selector
+            .edge_names
+            .iter()
+            .filter(|name| current_names.binary_search(name).is_err())
+            .cloned()
+            .collect::<Vec<_>>();
+        let added = current_names
+            .iter()
+            .filter(|name| selector.edge_names.binary_search(name).is_err())
+            .cloned()
+            .collect::<Vec<_>>();
+        warnings.push(format!(
+            "{label} '{mod_id}': its named all-edge selection no longer matches the target ({} missing, {} new), so the body was left unchanged.",
+            missing.len(),
+            added.len()
+        ));
+        return;
+    }
+
+    let mut candidate_parts = Vec::with_capacity(body.parts.len());
+    let mut failures = Vec::new();
+    let diagnostic_checkpoint = crate::mock_kernel::diagnostic_checkpoint();
+    for (part_index, part) in body.parts.iter().enumerate() {
+        let outcome = match kind {
+            crate::sketch::CornerKind::Fillet => {
+                crate::mock_kernel::fillet_all_edges_strict(part, dist)
+            }
+            crate::sketch::CornerKind::Chamfer => {
+                crate::mock_kernel::chamfer_all_edges_strict(part, dist)
+            }
+        };
+        match outcome {
+            Ok(outcome) => candidate_parts.push(outcome.solid),
+            Err(error) => failures.push(format!("part {part_index}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        crate::mock_kernel::restore_diagnostic_checkpoint(diagnostic_checkpoint);
+        warnings.push(format!(
+            "{label} '{mod_id}': the strict all-edge operation failed atomically on {} body part(s) ({}), so the body was left unchanged.",
+            failures.len(),
+            failures.join("; ")
+        ));
+        return;
+    }
+
+    body.parts = candidate_parts;
+    body.pristine = Some(std::sync::Arc::new(named_edge_mod_result_mesh(
+        &reference_mesh,
+        &body.parts,
+        &body.id,
+        mod_id,
+        match kind {
+            crate::sketch::CornerKind::Fillet => "fillet",
+            crate::sketch::CornerKind::Chamfer => "chamfer",
+        },
+    )));
+    body.sketch_source = None;
 }
 
 pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> Option<EdgeRef> {

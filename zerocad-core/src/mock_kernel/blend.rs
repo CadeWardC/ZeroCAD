@@ -1,5 +1,63 @@
 use super::*;
 
+/// Fillet every topological edge of one connected solid as a single validated
+/// kernel operation. The returned value does not escape the canonical outcome
+/// boundary unless representation validation and topology-history coverage are
+/// both complete.
+pub(crate) fn fillet_all_edges_strict(
+    solid: &KernelSolid,
+    radius: f32,
+) -> Result<KernelOutcome, String> {
+    consume_operation(
+        "all-edge fillet",
+        openrcad::algo::fillet_all_edges_strict_operation_with_policy(
+            solid,
+            radius as f64,
+            &TolerancePolicy::STANDARD,
+        )
+        .map_err(format_all_edge_operation_error),
+    )
+}
+
+/// Chamfer every topological edge of one connected solid atomically.
+pub(crate) fn chamfer_all_edges_strict(
+    solid: &KernelSolid,
+    distance: f32,
+) -> Result<KernelOutcome, String> {
+    consume_operation(
+        "all-edge chamfer",
+        openrcad::algo::chamfer_all_edges_strict_operation_with_policy(
+            solid,
+            distance as f64,
+            &TolerancePolicy::STANDARD,
+        )
+        .map_err(format_all_edge_operation_error),
+    )
+}
+
+fn format_all_edge_operation_error(error: openrcad::algo::AllEdgeBlendOperationError) -> String {
+    use openrcad::algo::{AllEdgeBlendError, AllEdgeBlendOperationError};
+
+    match error {
+        AllEdgeBlendOperationError::Blend(AllEdgeBlendError::BlockingEdges {
+            kind,
+            value,
+            blockers,
+        }) => {
+            let details = blockers
+                .iter()
+                .map(|blocker| format!("#{} ({})", blocker.ordinal, blocker.failure))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "all-edge {kind} at {value} was rejected by {} edge(s): {details}",
+                blockers.len()
+            )
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Round the edge running from `p0` to `p1` of `solid` by `radius`, using the
 /// native rolling-ball blend (no booleans). The edge is located in the solid's
 /// topology by matching its endpoints, so `p0`/`p1` are the world-space edge

@@ -443,6 +443,25 @@ reject with typed errors before mutation. Cylinder, cone, and torus successor
 matrices remain future expansions; the implementation never substitutes a
 vertex-motion clamp or approximate trim for those unsupported cases.
 
+Wave 5D is implemented as a strict whole-solid Fillet/Chamfer convenience
+layer. OpenRCAD canonically orders the complete source-edge set, preserves the
+proven box/cylinder simultaneous fast paths, and otherwise evaluates the
+completed grouped edge solvers as one immutable candidate. A failed operation
+returns every blocker found by the deterministic diagnostic pass; no successful
+subset escapes. ZeroCAD exposes Fillet All and Chamfer All for a fully selected
+body. The command materializes the exact sorted durable edge-identity set into
+one existing `EdgeMod` payload using a bounded length-prefixed selector; a
+producer edge name is preferred, with its two durable face owners as the
+established fallback. Thus `.zcad`
+framing and the EdgeMod schema do not change. Rebuild rejects missing,
+ambiguous, added, or removed names before geometry, and multi-part results commit
+only after every part succeeds. Cold/warm evaluation, both operation kinds,
+real disk reload, complete-blocker reporting, typed diagnostics, primitive
+history, and scale/aspect/rotation/far-origin behavior are regression-locked.
+Extreme aspect cases may reject when strict pcurve validation cannot certify the
+candidate; that rejection is deterministic, typed, and atomic. No edge is ever
+silently skipped.
+
 ## Persistence schedule
 
 | Capability | Contract |

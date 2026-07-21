@@ -39,12 +39,12 @@ pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
     body_output_id, boolean_region_plan, complete_selected_circles, drafted_region_solid,
-    edge_wedge_is_concave_mesh, AxisBase, BodyInspection, BooleanRegionPlan, DatumAxisDef,
-    DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticCode, DiagnosticParameterValue,
-    DiagnosticSeverity, EdgeInspection, EdgePairInspection, EdgeRef, EvaluationCacheSnapshot,
-    EvaluationCancellation, EvaluationDiagnostic, EvaluationError, EvaluationOutput,
-    EvaluationQuality, EvaluationTimings, EvaluationTrace, ExtrudeMode, FaceInspection,
-    FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
+    edge_wedge_is_concave_mesh, AllEdgeSelector, AllEdgeSelectorError, AxisBase, BodyInspection,
+    BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticCode,
+    DiagnosticParameterValue, DiagnosticSeverity, EdgeInspection, EdgePairInspection, EdgeRef,
+    EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic, EvaluationError,
+    EvaluationOutput, EvaluationQuality, EvaluationTimings, EvaluationTrace, ExtrudeMode,
+    FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
     HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, LegacyReferenceBackfills,
     ParametricGraph, PatternKind, PlaneBase, PristineMeshReuse, ResolvedStandardGeometry,
     StandardReference, StandardsDataPack, StandardsFamily, TopologyEdgeRef, TopologyVertexRef,
