@@ -147,7 +147,10 @@ fn committed_modeling_baseline_is_qualified_and_reproducible() {
     )))
     .expect("committed modeling baseline must be valid JSON");
     assert_eq!(report["schema"], 1);
-    assert_eq!(report["environment_qualification"], "reference_conditions_verified");
+    assert_eq!(
+        report["environment_qualification"],
+        "reference_conditions_verified"
+    );
     assert_eq!(report["passed"], true);
     assert_eq!(
         report["source_commit"]
