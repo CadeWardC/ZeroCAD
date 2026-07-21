@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "file": "shell-on-fillet-band.zcad",
+      "sha256": "ebba41d491dd38639d082a4fcbf9f21a7686148c4ea4cd334ec3d0985059f01c",
+      "expected_resolution": "resolved",
+      "body_count": 1,
+      "required_features": [
+        "extrude",
+        "fillet",
+        "shell",
+        "downstream_datum"
+      ],
+      "measurements": {
+        "opening_count": 2,
+        "wall_thickness_mm": 0.5
+      }
+    }
+  ]
+}

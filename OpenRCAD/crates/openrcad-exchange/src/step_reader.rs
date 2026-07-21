@@ -1501,14 +1501,17 @@ fn project_on_curve(curve: &GeomCurve, p: Pnt) -> f64 {
             let val = dy / h.minor_radius();
             val.asinh()
         }
-        GeomCurve::BSpline(b) => {
-            let (first, last) = b.bounds();
+        curve @ (GeomCurve::BSpline(_)
+        | GeomCurve::TorusPlaneSection(_)
+        | GeomCurve::Reparametrized(_)
+        | GeomCurve::TorusSurfaceCurve(_)) => {
+            let (first, last) = curve.bounds();
             let mut best_u = first;
             let mut best_dist_sq = f64::INFINITY;
             let n = 100;
             for i in 0..=n {
                 let u = first + (last - first) * (i as f64) / (n as f64);
-                let pt = b.point(u);
+                let pt = curve.point(u);
                 let dist_sq = pt.distance_squared(&p);
                 if dist_sq < best_dist_sq {
                     best_dist_sq = dist_sq;
@@ -1517,7 +1520,7 @@ fn project_on_curve(curve: &GeomCurve, p: Pnt) -> f64 {
             }
             let mut u = best_u;
             for _ in 0..5 {
-                let (pt, tangent): (Pnt, openrcad_foundation::Vec) = b.d1(u);
+                let (pt, tangent): (Pnt, openrcad_foundation::Vec) = curve.d1(u);
                 let diff =
                     openrcad_foundation::Vec::new(pt.x() - p.x(), pt.y() - p.y(), pt.z() - p.z());
                 let f_val = diff.dot(&tangent);

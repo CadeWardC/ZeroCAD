@@ -21,9 +21,10 @@ kernel whose entire stack you own and can fix.
 > parametric document layer (`.zcad`) are implemented and tested. Booleans are
 > watertight **and** health-validated across the everyday cases — thin plates,
 > off-axis bodies, coplanar joins, through/blind cylinder cuts and bosses — with
-> coplanar faces merged back to clean topology. The whole-solid fillet/chamfer/
-> shell handle a single box or cylinder at **any orientation**, and the per-edge
-> rolling-ball fillet works on arbitrary edges, including boolean results. This
+> coplanar faces merged back to clean topology. Whole-solid Shell retains its
+> box/cylinder fast paths and also handles verified plane/cylinder/cone/sphere
+> networks plus regular torus fillet bands; per-edge rolling-ball fillets work
+> on arbitrary edges, including boolean results. This
 > README is the architectural map; for the browsable version see [`index.html`](index.html).
 > For the current status and verification notes, see [`status.html`](status.html).
 
@@ -64,7 +65,7 @@ OpenRCAD contains **no OCCT or truck source**. Both are design references only
 | Modeling Data — 3D geometry (`TKG3d`, `TKGeomBase`) | [`openrcad-geom`](crates/openrcad-geom) | ✅ plane/cyl/cone/sphere/torus, NURBS, Gregory/offset/ruled + tested |
 | Modeling Data — topology / B-Rep (`TKBRep`) | [`openrcad-topo`](crates/openrcad-topo) | ✅ arena B-Rep, per-entity tolerance, validate/manifold/watertight checks + tested |
 | Modeling Algorithms — primitives (`TKPrim`) | [`openrcad-primitives`](crates/openrcad-primitives) | ✅ box, cylinder, cone, sphere, wedge + tested |
-| Modeling Algorithms (`TKBool`, `TKGeomAlgo`, `TKFillet`, …) | [`openrcad-algo`](crates/openrcad-algo) | ✅ intersection engine, SAH BVH, Euler ops, booleans (coplanar/collinear merge → clean topology), sew, `prism`/sweep, per-edge rolling-ball fillet/chamfer on arbitrary edges + a `apply_blend_contour` façade; 🟡 whole-solid blends for box/cylinder (any orientation) + tested |
+| Modeling Algorithms (`TKBool`, `TKGeomAlgo`, `TKFillet`, …) | [`openrcad-algo`](crates/openrcad-algo) | ✅ intersection engine, SAH BVH, Euler ops, booleans (coplanar/collinear merge → clean topology), sew, `prism`/sweep, per-edge rolling-ball fillet/chamfer on arbitrary edges + an `apply_blend_contour` façade; 🟡 verified analytic Shell matrix through regular torus fillet bands |
 | Meshing / tessellation (`TKMesh`) | [`openrcad-mesh`](crates/openrcad-mesh) | ✅ adaptive parallel tessellation, GPU buffers + tested |
 | Data Exchange (`TKSTEP`, `TKSTL`, …) | [`openrcad-exchange`](crates/openrcad-exchange) | ✅ STEP read/write, STL write + tested |
 | Visualization (`TKV3d`, `TKOpenGl`) | [`openrcad-render`](crates/openrcad-render) | 🟡 interactive wgpu viewer: orbit/pan/zoom, MSAA, edge wireframe, click-select (not in facade) |
@@ -202,7 +203,7 @@ and composition is `scale = s1·s2`, `matrix = M1·M2`, `loc = s1·(M1·l2) + l1
 ### Honest scope limits
 The higher layers are real but not yet fully general.
 
-- **Whole-solid blends** (`fillet`/`chamfer`/`shell_solid`) detect a single **box or cylinder primitive at any position/orientation** (`detect_box()`/`detect_cylinder()` recover the local frame from geometry) and construct the result directly; any other *whole solid* returns `BlendError::UnsupportedShape`. The **per-edge** rolling-ball fillet (`fillet_edges`) does work on arbitrary planar/analytic edges, including boolean results. N-valent Gregory corner blends, fillet face overflow, and concave-offset self-intersection resolution are not yet implemented.
+- **Whole-solid blends** retain optimized box/cylinder builders at any position/orientation. General Shell additionally supports the published plane/cylinder/cone/sphere matrix and regular torus fillet bands bounded by planes/cylinders; unsupported cone/torus, torus/torus, sphere/torus, concave, or ambiguous networks reject with `BlendError`. The **per-edge** rolling-ball fillet (`fillet_edges`) works on arbitrary planar/analytic edges, including boolean results. N-valent Gregory corner blends, general fillet face overflow, and concave-offset self-intersection resolution are not yet implemented.
 - **Booleans** are watertight and **health-validated** (`is_healthy()` — contiguous loops, no degenerate edges, manifold) across through-cuts, face-flush and corner-overlap unions, blind pockets, enclosed voids, partial and rotated cuts, and through/blind cylinder cuts and bosses — all locked in by [`robustness.rs`](crates/openrcad-algo/tests/robustness.rs) and the `repro_*` suites (no `#[ignore]`d boolean goal-tests remain). Coplanar adjacent faces are merged back to clean topology (a 2-box union is a 6-face box). The remaining edge case: a cut that *severs* a body is returned as one solid (Euler=4) rather than split into separate bodies — `boolean_bodies` (or `Solid::split_disconnected`) recovers one `Solid` per connected component.
 
 Where a path is not yet implemented the code returns an explicit error rather than silently producing garbage, and modeling results can be self-checked with `Solid::is_watertight()` / `Solid::validate()`.
@@ -224,7 +225,7 @@ Where a path is not yet implemented the code returns an explicit error rather th
 2. **Phase 2: Intersection Engine & BVH** — *Status: **Complete***. Curve-curve, curve-surface, and surface-surface intersection via adaptive interval subdivision, with closed-form fast paths for line/circle pairs; SAH BVH with dual-tree overlap traversal. (The analytic `curve_curve` path cut box∩box booleans ~10×, from ~13.8 ms to ~1.3 ms.)
 3. **Phase 3: Booleans, Euler Operators & Primitives** — *Status: **Complete***. Euler operators (`MEV`, `MEF`, `KEV`, `KEF`); fuse/cut/common with BVH-pruned classification; box, cylinder, cone, sphere, wedge. Results verified watertight *and* healthy (loop re-threading in `sew`), with coplanar/collinear merge for clean topology and a coplanar circular-hole imprint that closes cylinder boss unions. Partial-imprint cases are resolved; the only open item is splitting a severed cut into separate bodies.
 4. **Phase 4: Tessellation, Sewing & Data Exchange** — *Status: **Complete***. Parallel meshing (`tessellate`) with chord/angular tolerances, topology sewing (`sew`), STEP read/write and STL write. Plus an interactive wgpu viewer (`openrcad-render`).
-5. **Phase 5: Advanced Blending & Offset** — *Status: **In Progress***. `RuledSurface`, `GregorySurface`, `OffsetSurface`, and `ToroidalSurface` landed in `openrcad-geom`. Fillet, chamfer, and shelling cover a box or cylinder at **any orientation** (cylinder fillets use rolling-ball **tori**, chamfers use 45° conical frustums), each watertight via `sew` and returning `Result<Solid, BlendError>`. The per-edge rolling-ball blends (`fillet_edges` / `chamfer_edges`, plus the thin `apply_blend_contour` façade that treats a co-circular run of edges as one logical contour) handle arbitrary planar/analytic edges, including boolean results, and reject an over-large radius rather than emitting a degenerate solid. Still to do: N-valent Gregory corner blends, face overflow, and self-intersection resolution for concave offsets.
+5. **Phase 5: Advanced Blending & Offset** — *Status: **In Progress***. `RuledSurface`, `GregorySurface`, `OffsetSurface`, and `ToroidalSurface` landed in `openrcad-geom`. Fillet and chamfer retain their box/cylinder fast paths; Shell also covers verified mixed plane/cylinder/cone/sphere networks and regular torus fillet bands with complete pcurves/history. The per-edge rolling-ball blends (`fillet_edges` / `chamfer_edges`, plus the thin `apply_blend_contour` façade that treats a co-circular run of edges as one logical contour) handle arbitrary planar/analytic edges, including boolean results, and reject an over-large radius rather than emitting a degenerate solid. Still to do: N-valent Gregory corner blends, general face overflow, and self-intersection resolution for concave offsets.
 
 Beyond the kernel: `openrcad-sketch` (2D profiles) and `openrcad-document` (parametric history + the `.zcad` document format) provide a Fusion/FreeCAD-style modeling spine on top of the kernel.
 

@@ -162,6 +162,7 @@ into small pieces — extend the matching piece, don't grow one function:
 | `apply_extrude` | One Extrude node → tool solids → dispatch to a mode. |
 | `apply_join` / `apply_cut` | The boolean assemblers (free functions in `join.rs` / `cut.rs`). |
 | `apply_edge_mod` | One EdgeMod node → native rolling-ball fillet/chamfer, reattaching its edge. |
+| `apply_shell` | One Shell node → atomic analytic offset, trim/pcurve validation, and named-face propagation. |
 | `tessellate_bodies` | `LiveBody` list → `(id, MockMesh)` list. |
 
 `evaluate_bodies()` is a thin wrapper that drops the warnings; tests and the

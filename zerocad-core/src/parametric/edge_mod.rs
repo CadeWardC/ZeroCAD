@@ -694,15 +694,11 @@ pub(crate) struct CircularBiteLocality<'a> {
 
 pub(crate) struct EdgeModResult {
     pub(crate) parts: Vec<KernelSolid>,
-    pub(crate) pristine: Option<MockMesh>,
 }
 
 impl EdgeModResult {
     fn single(part: KernelSolid) -> Self {
-        Self {
-            parts: vec![part],
-            pristine: None,
-        }
+        Self { parts: vec![part] }
     }
 }
 
@@ -745,8 +741,6 @@ pub(crate) fn edge_mod_native_only(selection: &EdgeModSelection) -> bool {
 /// The result of a per-part native edge modification over a body's parts.
 struct NativeEdgeModOutcome {
     parts: Vec<KernelSolid>,
-    /// Present only when every applied part contributed a pristine display mesh.
-    pristine: Option<MockMesh>,
     /// At least one part was successfully modified.
     applied: bool,
     /// Combined failure reason of the last part that could not be modified.
@@ -767,8 +761,6 @@ fn edge_mod_native_fillet_all_parts(
     let mut applied = false;
     let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(parts.len());
-    let mut next_pristine = MockMesh::empty();
-    let mut can_use_pristine = true;
     let native_only = edge_mod_native_only(selection);
     for (part_index, part) in parts.into_iter().enumerate() {
         let mut part_failures = Vec::new();
@@ -842,24 +834,16 @@ fn edge_mod_native_fillet_all_parts(
 
         if let Some(result) = accepted {
             applied = true;
-            if let Some(mesh) = result.pristine {
-                next_pristine.append(mesh);
-            } else {
-                can_use_pristine = false;
-            }
             next.extend(result.parts);
         } else {
-            can_use_pristine = false;
             if !part_failures.is_empty() {
                 last_err = Some(part_failures.join("; "));
             }
             next.push(part);
         }
     }
-    let pristine = (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
     NativeEdgeModOutcome {
         parts: next,
-        pristine,
         applied,
         last_err,
     }
@@ -878,8 +862,6 @@ fn edge_mod_native_chamfer_all_parts(
     let mut applied = false;
     let mut last_err: Option<String> = None;
     let mut next: Vec<KernelSolid> = Vec::with_capacity(parts.len());
-    let mut next_pristine = MockMesh::empty();
-    let mut can_use_pristine = true;
     let native_only = edge_mod_native_only(selection);
     for (part_index, part) in parts.into_iter().enumerate() {
         let sketch_region = sketch_source
@@ -958,27 +940,50 @@ fn edge_mod_native_chamfer_all_parts(
 
         if let Some(result) = accepted {
             applied = true;
-            if let Some(mesh) = result.pristine {
-                next_pristine.append(mesh);
-            } else {
-                can_use_pristine = false;
-            }
             next.extend(result.parts);
         } else {
-            can_use_pristine = false;
             if !part_failures.is_empty() {
                 last_err = Some(part_failures.join("; "));
             }
             next.push(part);
         }
     }
-    let pristine = (can_use_pristine && !next_pristine.indices.is_empty()).then_some(next_pristine);
     NativeEdgeModOutcome {
         parts: next,
-        pristine,
         applied,
         last_err,
     }
+}
+
+/// Rebuild the accepted modifier's display mesh at the atomic commit boundary
+/// and carry every durable input-face owner onto its continued result face.
+/// Newly generated blend/bevel faces receive operation-owned names. Previously
+/// `EdgeModResult::single` left `pristine` empty, so the next evaluation
+/// tessellated bare topology and silently discarded all face identities.
+fn named_edge_mod_result_mesh(
+    reference_mesh: &MockMesh,
+    parts: &[KernelSolid],
+    target: &str,
+    mod_id: &str,
+    kind: &str,
+) -> MockMesh {
+    let mut named = MockMesh::empty();
+    for part in parts {
+        named.append(crate::mock_kernel::propagate_face_names(
+            reference_mesh,
+            part,
+            target,
+        ));
+    }
+    super::stamp_generated_face_refs(&mut named, mod_id, kind);
+    for face in &mut named.face_refs {
+        if let Some(topology) = face.topology.as_mut() {
+            topology.body_id = Some(target.to_string());
+        }
+    }
+    crate::mock_kernel::populate_edge_adjacent_face_names(&mut named);
+    crate::mock_kernel::stamp_body_face_components(&mut named, target, parts);
+    named
 }
 
 /// Native rolling-ball fillet of the captured edge on every part of `body`.
@@ -990,6 +995,11 @@ pub(crate) fn apply_fillet(
     warnings: &mut Vec<String>,
 ) {
     let reference_mesh = edge_mod_reference_mesh(body);
+    let naming_reference_mesh = body
+        .pristine
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| reference_mesh.clone());
     let sketch_source = body.sketch_source.clone();
     let original_parts = body.parts.clone();
     let outcome = edge_mod_native_fillet_all_parts(
@@ -1002,7 +1012,13 @@ pub(crate) fn apply_fillet(
     );
     if outcome.applied && outcome.last_err.is_none() {
         body.parts = outcome.parts;
-        body.pristine = outcome.pristine.map(std::sync::Arc::new);
+        body.pristine = Some(std::sync::Arc::new(named_edge_mod_result_mesh(
+            &naming_reference_mesh,
+            &body.parts,
+            &body.id,
+            mod_id,
+            "fillet",
+        )));
         body.sketch_source = None;
     } else {
         body.parts = original_parts;
@@ -1067,6 +1083,11 @@ pub(crate) fn apply_chamfer(
     warnings: &mut Vec<String>,
 ) {
     let reference_mesh = edge_mod_reference_mesh(body);
+    let naming_reference_mesh = body
+        .pristine
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| reference_mesh.clone());
     let sketch_source = body.sketch_source.clone();
     let original_parts = body.parts.clone();
     let outcome = edge_mod_native_chamfer_all_parts(
@@ -1078,7 +1099,13 @@ pub(crate) fn apply_chamfer(
     );
     if outcome.applied && outcome.last_err.is_none() {
         body.parts = outcome.parts;
-        body.pristine = outcome.pristine.map(std::sync::Arc::new);
+        body.pristine = Some(std::sync::Arc::new(named_edge_mod_result_mesh(
+            &naming_reference_mesh,
+            &body.parts,
+            &body.id,
+            mod_id,
+            "chamfer",
+        )));
         body.sketch_source = None;
     } else {
         body.parts = original_parts;

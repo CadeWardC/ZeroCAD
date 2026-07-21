@@ -14,6 +14,8 @@ pub enum CurveKind2d {
     Parabola,
     Hyperbola,
     BSpline,
+    TorusPlaneSection,
+    PlaneTorusSection,
 }
 
 impl From<&GeomCurve2d> for CurveKind2d {
@@ -25,6 +27,8 @@ impl From<&GeomCurve2d> for CurveKind2d {
             GeomCurve2d::Parabola(_) => Self::Parabola,
             GeomCurve2d::Hyperbola(_) => Self::Hyperbola,
             GeomCurve2d::BSpline(_) => Self::BSpline,
+            GeomCurve2d::TorusPlaneSection(_) => Self::TorusPlaneSection,
+            GeomCurve2d::PlaneTorusSection(_) => Self::PlaneTorusSection,
         }
     }
 }

@@ -122,8 +122,57 @@ impl GeomCurve {
             GeomCurve::Hyperbola(h) => hyperbola_box(h, t0, t1),
             GeomCurve::BSpline(b) => b.interval_bbox(t0, t1),
             GeomCurve::Helix(h) => helix_box(h, t0, t1),
+            GeomCurve::TorusPlaneSection(section) => torus_plane_section_box(section),
+            GeomCurve::Reparametrized(curve) => curve
+                .curve()
+                .interval_point(curve.target_parameter(t0), curve.target_parameter(t1)),
+            GeomCurve::TorusSurfaceCurve(curve) => torus_surface_curve_box(curve),
         }
     }
+}
+
+/// Guaranteed bound for a curve on a torus. Every torus point lies inside the
+/// sphere of radius `R + r` about its frame origin, so this remains valid for
+/// arbitrary orientation and any trimmed parameter interval.
+fn torus_surface_curve_box(curve: &crate::TorusSurfaceCurve) -> Interval3 {
+    let center = curve.torus().position().location();
+    let extent = curve.torus().major_radius() + curve.torus().minor_radius();
+    Interval3::new(
+        Interval::new(center.x() - extent, center.x() + extent),
+        Interval::new(center.y() - extent, center.y() + extent),
+        Interval::new(center.z() - extent, center.z() + extent),
+    )
+}
+
+/// Conservative exact-family bound for a regular torus/axis-parallel-plane
+/// section. The actual lateral distance is non-negative and at most `R + r`;
+/// the axial component stays in `[-r, r]`. This deliberately bounds the whole
+/// closed branch even for a trimmed interval so recursive pruning can never
+/// discard a real intersection.
+fn torus_plane_section_box(section: &crate::TorusPlaneSection) -> Interval3 {
+    let frame = section.position();
+    let normal = section.plane_normal();
+    let axis = frame.direction();
+    let lateral = axis.cross(&normal);
+    let branch = if section.positive_branch() { 1.0 } else { -1.0 };
+    let base =
+        frame.location() + openrcad_foundation::Vec::from_dir(normal) * section.signed_offset();
+    let maximum_lateral = section.major_radius() + section.minor_radius();
+    let component = |base: f64, lateral_component: f64, axis_component: f64| {
+        let lateral_end = branch * lateral_component * maximum_lateral;
+        let lateral_interval = Interval::new(lateral_end.min(0.0), lateral_end.max(0.0));
+        let axial_extent = axis_component.abs() * section.minor_radius();
+        sum2(
+            base,
+            lateral_interval,
+            Interval::new(-axial_extent, axial_extent),
+        )
+    };
+    Interval3::new(
+        component(base.x(), lateral.x(), axis.x()),
+        component(base.y(), lateral.y(), axis.y()),
+        component(base.z(), lateral.z(), axis.z()),
+    )
 }
 
 /// Box of a helix `loc + r(u)·(cos u·X + sin u·Y) + (lead·u/2π)·Z` with

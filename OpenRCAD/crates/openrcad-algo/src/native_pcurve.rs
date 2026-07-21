@@ -187,15 +187,27 @@ pub(crate) fn analytic_line_pcurve(surface: &GeomSurface, edge: &Edge) -> Pcurve
     };
     let periodicity = surface_periodicity(surface);
     let start = crate::intersect::uv_of(surface, &edge_point(0.0));
+    let quarter = crate::intersect::uv_of(surface, &edge_point(0.25));
     let middle = crate::intersect::uv_of(surface, &edge_point(0.5));
     let end = crate::intersect::uv_of(surface, &edge_point(1.0));
-    let middle = (
-        unwrap_near(middle.0, start.0, periodicity.u_period),
-        unwrap_near(middle.1, start.1, periodicity.v_period),
+    let quarter = (
+        unwrap_near(quarter.0, start.0, periodicity.u_period),
+        unwrap_near(quarter.1, start.1, periodicity.v_period),
     );
+    let predicted_middle = (2.0 * quarter.0 - start.0, 2.0 * quarter.1 - start.1);
+    let middle = (
+        unwrap_near(middle.0, predicted_middle.0, periodicity.u_period),
+        unwrap_near(middle.1, predicted_middle.1, periodicity.v_period),
+    );
+    // For a full periodic edge the raw end parameter equals the start.  Using
+    // only the nearest branch to the midpoint is ambiguous at exactly half a
+    // period and can reverse a seam depending on floating-point sign.  The
+    // midpoint supplies a deterministic secant prediction for the intended
+    // traversal branch.
+    let predicted_end = (2.0 * middle.0 - start.0, 2.0 * middle.1 - start.1);
     let end = (
-        unwrap_near(end.0, middle.0, periodicity.u_period),
-        unwrap_near(end.1, middle.1, periodicity.v_period),
+        unwrap_near(end.0, predicted_end.0, periodicity.u_period),
+        unwrap_near(end.1, predicted_end.1, periodicity.v_period),
     );
     uv_line(
         Pnt2d::new(start.0, start.1),

@@ -30,10 +30,13 @@ pub mod line;
 pub mod offset;
 pub mod parabola;
 pub mod plane;
+pub mod reparametrized_curve;
 pub mod ruled;
 pub mod sphere;
 pub mod surface;
 pub mod torus;
+pub mod torus_plane_section;
+pub mod torus_surface_curve;
 
 pub use bspline_curve::BSplineCurve;
 pub use bspline_surface::BSplineSurface;
@@ -49,10 +52,13 @@ pub use line::Line;
 pub use offset::OffsetSurface;
 pub use parabola::Parabola;
 pub use plane::Plane;
+pub use reparametrized_curve::ReparametrizedCurve;
 pub use ruled::RuledSurface;
 pub use sphere::SphericalSurface;
 pub use surface::Surface;
 pub use torus::ToroidalSurface;
+pub use torus_plane_section::TorusPlaneSection;
+pub use torus_surface_curve::TorusSurfaceCurve;
 
 /// An owned 3D curve: one of the concrete [`Curve`]s, storable by value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -71,6 +77,15 @@ pub enum GeomCurve {
     BSpline(BSplineCurve),
     /// A helix (or tapered conical spiral).
     Helix(Helix),
+    /// Exact regular-torus section by an axis-parallel plane. Appended to keep
+    /// every existing serialized `GeomCurve` discriminant stable.
+    TorusPlaneSection(TorusPlaneSection),
+    /// Exact affine reparameterization of another curve. Appended to keep
+    /// every existing serialized `GeomCurve` discriminant stable.
+    Reparametrized(Box<ReparametrizedCurve>),
+    /// Exact affine curve in a torus' parameter space. Appended to keep every
+    /// existing serialized `GeomCurve` discriminant stable.
+    TorusSurfaceCurve(TorusSurfaceCurve),
 }
 
 impl GeomCurve {
@@ -116,6 +131,24 @@ impl GeomCurve {
         Self::Helix(h)
     }
 
+    /// Wrap an exact torus/plane section branch.
+    #[inline]
+    pub fn torus_plane_section(section: TorusPlaneSection) -> Self {
+        Self::TorusPlaneSection(section)
+    }
+
+    /// Wrap an exact affine curve reparameterization.
+    #[inline]
+    pub fn reparametrized(curve: ReparametrizedCurve) -> Self {
+        Self::Reparametrized(Box::new(curve))
+    }
+
+    /// Wrap an exact curve in a torus' parameter space.
+    #[inline]
+    pub fn torus_surface_curve(curve: TorusSurfaceCurve) -> Self {
+        Self::TorusSurfaceCurve(curve)
+    }
+
     /// Convert/approximate this curve to a B-Spline curve.
     pub fn to_bspline(&self) -> BSplineCurve {
         match self {
@@ -152,6 +185,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => h.point(u),
             Self::BSpline(b) => b.point(u),
             Self::Helix(h) => h.point(u),
+            Self::TorusPlaneSection(section) => section.point(u),
+            Self::Reparametrized(curve) => curve.point(u),
+            Self::TorusSurfaceCurve(curve) => curve.point(u),
         }
     }
 
@@ -164,6 +200,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => h.d1(u),
             Self::BSpline(b) => b.d1(u),
             Self::Helix(h) => h.d1(u),
+            Self::TorusPlaneSection(section) => section.d1(u),
+            Self::Reparametrized(curve) => curve.d1(u),
+            Self::TorusSurfaceCurve(curve) => curve.d1(u),
         }
     }
 
@@ -176,6 +215,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => h.bounds(),
             Self::BSpline(b) => b.bounds(),
             Self::Helix(h) => h.bounds(),
+            Self::TorusPlaneSection(section) => section.bounds(),
+            Self::Reparametrized(curve) => curve.bounds(),
+            Self::TorusSurfaceCurve(curve) => curve.bounds(),
         }
     }
 
@@ -188,6 +230,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => h.is_closed(),
             Self::BSpline(b) => b.is_closed(),
             Self::Helix(h) => h.is_closed(),
+            Self::TorusPlaneSection(section) => section.is_closed(),
+            Self::Reparametrized(curve) => curve.is_closed(),
+            Self::TorusSurfaceCurve(curve) => curve.is_closed(),
         }
     }
 
@@ -200,6 +245,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => h.is_periodic(),
             Self::BSpline(b) => b.is_periodic(),
             Self::Helix(h) => h.is_periodic(),
+            Self::TorusPlaneSection(section) => section.is_periodic(),
+            Self::Reparametrized(curve) => curve.is_periodic(),
+            Self::TorusSurfaceCurve(curve) => curve.is_periodic(),
         }
     }
 
@@ -212,6 +260,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => h.period(),
             Self::BSpline(b) => b.period(),
             Self::Helix(h) => h.period(),
+            Self::TorusPlaneSection(section) => section.period(),
+            Self::Reparametrized(curve) => curve.period(),
+            Self::TorusSurfaceCurve(curve) => curve.period(),
         }
     }
 
@@ -224,6 +275,9 @@ impl Curve for GeomCurve {
             Self::Hyperbola(h) => Self::Hyperbola(h.transformed(t)),
             Self::BSpline(b) => Self::BSpline(b.transformed(t)),
             Self::Helix(h) => Self::Helix(h.transformed(t)),
+            Self::TorusPlaneSection(section) => Self::TorusPlaneSection(section.transformed(t)),
+            Self::Reparametrized(curve) => Self::Reparametrized(Box::new(curve.transformed(t))),
+            Self::TorusSurfaceCurve(curve) => Self::TorusSurfaceCurve(curve.transformed(t)),
         }
     }
 }

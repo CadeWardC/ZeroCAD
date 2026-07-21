@@ -17,7 +17,7 @@ const SUPPORTS: [ShellSupportKind; 6] = [
 ];
 
 #[test]
-fn wave4_support_matrices_are_complete_and_do_not_overclaim_readiness() {
+fn wave4_support_matrices_are_complete_and_record_the_verified_4c_subset() {
     assert_eq!(SHELL_FEASIBILITY_V1.version, 1);
     assert_eq!(SHELL_FEASIBILITY_V1.offsets.len(), SUPPORTS.len());
 
@@ -51,7 +51,11 @@ fn wave4_support_matrices_are_complete_and_do_not_overclaim_readiness() {
         .find(|entry| entry.support == ShellSupportKind::Cylinder)
         .unwrap();
     assert_eq!(cylinder.state, ShellCapabilityState::VerifiedInShell);
-    for support in [ShellSupportKind::Cone, ShellSupportKind::Sphere] {
+    for support in [
+        ShellSupportKind::Cone,
+        ShellSupportKind::Sphere,
+        ShellSupportKind::Torus,
+    ] {
         assert_eq!(
             SHELL_FEASIBILITY_V1
                 .offsets
@@ -62,11 +66,34 @@ fn wave4_support_matrices_are_complete_and_do_not_overclaim_readiness() {
             ShellCapabilityState::VerifiedInShell
         );
     }
-    assert!(SHELL_FEASIBILITY_V1
-        .intersections
-        .iter()
-        .filter(|entry| entry.required_by == ShellMilestone::Stage4C)
-        .all(|entry| entry.state != ShellCapabilityState::VerifiedInShell));
+    let state = |first, second| {
+        SHELL_FEASIBILITY_V1
+            .intersections
+            .iter()
+            .find(|entry| entry.first == first && entry.second == second)
+            .unwrap()
+            .state
+    };
+    assert_eq!(
+        state(ShellSupportKind::Plane, ShellSupportKind::Torus),
+        ShellCapabilityState::VerifiedInShell
+    );
+    assert_eq!(
+        state(ShellSupportKind::Cylinder, ShellSupportKind::Torus),
+        ShellCapabilityState::VerifiedInShell
+    );
+    assert_eq!(
+        state(ShellSupportKind::Cone, ShellSupportKind::Torus),
+        ShellCapabilityState::AnalyticKernelOnly
+    );
+    assert_eq!(
+        state(ShellSupportKind::Sphere, ShellSupportKind::Torus),
+        ShellCapabilityState::GenericFallbackOnly
+    );
+    assert_eq!(
+        state(ShellSupportKind::Torus, ShellSupportKind::Torus),
+        ShellCapabilityState::AnalyticKernelOnly
+    );
 }
 
 #[test]
@@ -123,7 +150,7 @@ fn wave4_topology_pcurve_and_self_intersection_contracts_are_explicit() {
 }
 
 #[test]
-fn stage4c_cannot_become_a_routine_surface_addition() {
+fn stage4c_retains_its_explicit_review_and_all_prerequisites_are_green() {
     assert_eq!(
         shell_stage_entry_decision(ShellMilestone::Stage4A),
         ShellStageEntryDecision::EnterImplementation
@@ -137,31 +164,20 @@ fn stage4c_cannot_become_a_routine_surface_addition() {
         ShellStageEntryDecision::ResearchReviewRequired
     );
     assert!(SHELL_FEASIBILITY_V1.stage4c_review_required);
-    assert!(!stage4c_prerequisites_are_verified());
+    assert!(stage4c_prerequisites_are_verified());
 
     let statuses: HashSet<_> = SHELL_FEASIBILITY_V1
         .stage4c_prerequisites
         .iter()
         .map(|entry| (entry.prerequisite, entry.state))
         .collect();
-    assert!(statuses.contains(&(
+    for prerequisite in [
         ShellStage4CPrerequisite::ConeBandRecutCompletes,
-        ShellPrerequisiteState::Investigating,
-    )));
-    assert!(statuses.contains(&(
         ShellStage4CPrerequisite::TorusBandRecutCompletes,
-        ShellPrerequisiteState::Blocked,
-    )));
-    assert!(statuses.contains(&(
         ShellStage4CPrerequisite::CylinderSeamImprinting,
-        ShellPrerequisiteState::Verified,
-    )));
-    assert!(statuses.contains(&(
         ShellStage4CPrerequisite::FilletBandOverflow,
-        ShellPrerequisiteState::Blocked,
-    )));
-    assert!(statuses.contains(&(
         ShellStage4CPrerequisite::DeterministicBandOwnership,
-        ShellPrerequisiteState::Blocked,
-    )));
+    ] {
+        assert!(statuses.contains(&(prerequisite, ShellPrerequisiteState::Verified)));
+    }
 }

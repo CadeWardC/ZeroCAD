@@ -3,13 +3,16 @@
 use std::{collections::HashSet, sync::Arc};
 
 use openrcad_foundation::{
-    Ax22d, Dir2d, Pnt, Pnt2d, TolerancePolicy, TolerancePolicyError, Vec as GeomVec,
+    Ax22d, Ax3, Dir2d, Pnt, Pnt2d, TolerancePolicy, TolerancePolicyError, Vec as GeomVec, Vec2d,
 };
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Plane, Surface};
-use openrcad_geom2d::{BSplineCurve2d, Circle2d, Ellipse2d, GeomCurve2d, Line2d};
+use openrcad_geom2d::{
+    BSplineCurve2d, Circle2d, Ellipse2d, GeomCurve2d, Line2d, PlaneTorusSection2d,
+    TorusPlaneSection2d,
+};
 
 use crate::arena::{BRep, EdgeData, EdgeId, FaceId, LoopId};
-use crate::{PcurveData, Solid, SurfacePeriodicity};
+use crate::{Edge, PcurveData, Solid, SurfacePeriodicity};
 
 /// Failure while constructing a missing pcurve.
 #[derive(Clone, Debug, PartialEq)]
@@ -172,13 +175,51 @@ impl Solid {
             let allowed_tolerance =
                 recovery_tolerance_cap.map_or(tolerance, |cap| tolerance.max(cap));
             let pcurve = build_pcurve(&brep, surface, &edge, policy, allowed_tolerance)
-                .ok_or_else(|| PcurveBuildError::ProjectionFailed {
-                    face: *face_id,
-                    loop_id: *loop_id,
-                    edge: *edge_id,
+                .ok_or_else(|| {
+                    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                        let surface_kind = match surface {
+                            GeomSurface::Plane(_) => "plane",
+                            GeomSurface::Cylinder(_) => "cylinder",
+                            GeomSurface::Cone(_) => "cone",
+                            GeomSurface::Sphere(_) => "sphere",
+                            GeomSurface::Torus(_) => "torus",
+                            GeomSurface::BSpline(_) => "bspline",
+                            GeomSurface::Gregory(_) => "gregory",
+                            GeomSurface::Offset(_) => "offset",
+                            GeomSurface::Ruled(_) => "ruled",
+                        };
+                        let curve_kind = match &edge.curve {
+                            Some(GeomCurve::Line(_)) => "line",
+                            Some(GeomCurve::Circle(_)) => "circle",
+                            Some(GeomCurve::Ellipse(_)) => "ellipse",
+                            Some(GeomCurve::Parabola(_)) => "parabola",
+                            Some(GeomCurve::Hyperbola(_)) => "hyperbola",
+                            Some(GeomCurve::BSpline(_)) => "bspline",
+                            Some(GeomCurve::Helix(_)) => "helix",
+                            Some(GeomCurve::TorusPlaneSection(_)) => "torus-plane",
+                            Some(GeomCurve::Reparametrized(_)) => "reparametrized",
+                            Some(GeomCurve::TorusSurfaceCurve(_)) => "torus-surface",
+                            None => "none",
+                        };
+                        eprintln!(
+                            "pcurve projection failed face={face_id:?} surface={surface_kind} edge={edge_id:?} curve={curve_kind} range=({}, {}) surface_data={surface:?} curve_data={:?}",
+                            edge.first, edge.last, edge.curve
+                        );
+                    }
+                    PcurveBuildError::ProjectionFailed {
+                        face: *face_id,
+                        loop_id: *loop_id,
+                        edge: *edge_id,
+                    }
                 })?;
             let deviation = max_deviation(&brep, surface, &edge, &pcurve, 96);
             if !deviation.is_finite() || deviation > allowed_tolerance {
+                if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                    eprintln!(
+                        "pcurve inconsistent face={face_id:?} edge={edge_id:?} surface={surface:?} curve={:?} range=({}, {}) deviation={deviation} tolerance={allowed_tolerance}",
+                        edge.curve, edge.first, edge.last
+                    );
+                }
                 return Err(PcurveBuildError::Inconsistent {
                     face: *face_id,
                     loop_id: *loop_id,
@@ -206,6 +247,23 @@ impl Solid {
     }
 }
 
+/// Construct a pcurve only when the edge/surface pair has an exact supported
+/// representation. Operation code uses this before committing a generated
+/// coedge so an analytic boundary never silently becomes sampled topology.
+pub fn exact_pcurve_for_edge(
+    surface: &GeomSurface,
+    edge: &Edge,
+    policy: &TolerancePolicy,
+) -> Option<PcurveData> {
+    let edge_data = edge.brep.edges.get(edge.id)?;
+    exact_planar_pcurve(&edge.brep, surface, edge_data)
+        .or_else(|| exact_ruled_boundary_pcurve(surface, edge_data))
+        .or_else(|| exact_cylinder_curve_pcurve(surface, edge_data, policy))
+        .or_else(|| exact_torus_surface_curve_pcurve(surface, edge_data))
+        .or_else(|| exact_torus_plane_section_pcurve(surface, edge_data))
+        .or_else(|| exact_torus_circle_pcurve(surface, edge_data, policy))
+}
+
 fn build_pcurve(
     brep: &BRep,
     surface: &GeomSurface,
@@ -217,6 +275,15 @@ fn build_pcurve(
         return Some(exact);
     }
     if let Some(exact) = exact_ruled_boundary_pcurve(surface, edge) {
+        return Some(exact);
+    }
+    if let Some(exact) = exact_torus_surface_curve_pcurve(surface, edge) {
+        return Some(exact);
+    }
+    if let Some(exact) = exact_torus_plane_section_pcurve(surface, edge) {
+        return Some(exact);
+    }
+    if let Some(exact) = exact_torus_circle_pcurve(surface, edge, policy) {
         return Some(exact);
     }
     let periodicity = surface_periodicity(surface);
@@ -274,6 +341,272 @@ fn build_pcurve(
     None
 }
 
+type TorusUvEndpoints = ((f64, f64), (f64, f64));
+
+/// Exact circle and generator pcurves on a cylinder. Deriving these from the
+/// analytic frames avoids subtracting tiny radii from far-origin world
+/// coordinates, which can lose enough angular precision to break UV closure.
+fn exact_cylinder_curve_pcurve(
+    surface: &GeomSurface,
+    edge: &EdgeData,
+    policy: &TolerancePolicy,
+) -> Option<PcurveData> {
+    fn curve_data(curve: &GeomCurve, first: f64, last: f64) -> Option<(&GeomCurve, f64, f64)> {
+        match curve {
+            GeomCurve::Reparametrized(curve) => curve_data(
+                curve.curve(),
+                curve.target_parameter(first),
+                curve.target_parameter(last),
+            ),
+            _ => Some((curve, first, last)),
+        }
+    }
+
+    let cylinder = match surface {
+        GeomSurface::Cylinder(cylinder) => *cylinder,
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Cylinder(base) => openrcad_geom::CylindricalSurface::new(
+                base.position(),
+                base.radius() + offset.distance,
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (curve, first, last) = curve_data(edge.curve.as_ref()?, edge.first, edge.last)?;
+    let frame = cylinder.position();
+    let axis = GeomVec::from_dir(frame.direction());
+    let frame_x = GeomVec::from_dir(frame.x_direction());
+    let frame_y = GeomVec::from_dir(frame.y_direction());
+    let scale = cylinder.radius().abs().max(f64::MIN_POSITIVE);
+    let tolerance = policy.classification + scale * f64::EPSILON * 64.0;
+
+    let endpoints = match curve {
+        GeomCurve::Circle(circle) => {
+            let curve_axis = GeomVec::from_dir(circle.position().direction());
+            let alignment = axis.dot(&curve_axis);
+            if (alignment.abs() - 1.0).abs() > policy.angular
+                || (circle.radius() - cylinder.radius()).abs() > tolerance
+            {
+                return None;
+            }
+            let center_offset = circle.center() - frame.location();
+            let v = center_offset.dot(&axis);
+            if (center_offset - axis * v).magnitude() > tolerance {
+                return None;
+            }
+            let circle_x = GeomVec::from_dir(circle.position().x_direction());
+            let u_offset = circle_x.dot(&frame_y).atan2(circle_x.dot(&frame_x));
+            let sign = alignment.signum();
+            [
+                Pnt2d::new(u_offset + sign * first, v),
+                Pnt2d::new(u_offset + sign * last, v),
+            ]
+        }
+        GeomCurve::Line(line) => {
+            let direction = GeomVec::from_dir(line.direction());
+            let alignment = axis.dot(&direction);
+            if (alignment.abs() - 1.0).abs() > policy.angular {
+                return None;
+            }
+            let location_offset = line.location() - frame.location();
+            let axial = location_offset.dot(&axis);
+            let radial = location_offset - axis * axial;
+            if (radial.magnitude() - cylinder.radius()).abs() > tolerance {
+                return None;
+            }
+            let u = radial.dot(&frame_y).atan2(radial.dot(&frame_x));
+            [
+                Pnt2d::new(u, axial + alignment * first),
+                Pnt2d::new(u, axial + alignment * last),
+            ]
+        }
+        _ => return None,
+    };
+    line_pcurve(&endpoints, surface_periodicity(surface))
+}
+
+/// A [`GeomCurve::TorusSurfaceCurve`] owns its exact affine `(u, v)` map.
+/// Validation below still proves that the carrying face has the same support,
+/// so attaching this pcurve cannot silently cross onto an unrelated torus.
+fn exact_torus_surface_curve_pcurve(surface: &GeomSurface, edge: &EdgeData) -> Option<PcurveData> {
+    fn curve_data(
+        curve: &GeomCurve,
+        first: f64,
+        last: f64,
+    ) -> Option<(openrcad_geom::ToroidalSurface, TorusUvEndpoints)> {
+        match curve {
+            GeomCurve::TorusSurfaceCurve(curve) => {
+                Some((curve.torus(), (curve.uv(first), curve.uv(last))))
+            }
+            GeomCurve::Reparametrized(curve) => curve_data(
+                curve.curve(),
+                curve.target_parameter(first),
+                curve.target_parameter(last),
+            ),
+            _ => None,
+        }
+    }
+
+    let (curve_torus, (first, last)) = curve_data(edge.curve.as_ref()?, edge.first, edge.last)?;
+    let carrying_torus = match surface {
+        GeomSurface::Torus(torus) => *torus,
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Torus(base) => openrcad_geom::ToroidalSurface::new(
+                base.position(),
+                base.major_radius(),
+                base.minor_radius() + offset.distance,
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if carrying_torus != curve_torus {
+        return None;
+    }
+    line_pcurve(
+        &[Pnt2d::new(first.0, first.1), Pnt2d::new(last.0, last.1)],
+        surface_periodicity(surface),
+    )
+}
+
+/// Preserve the analytic torus coordinates carried by an axis-parallel plane
+/// section. Generic point projection loses too many low bits when the same
+/// small section is translated far from the origin, while this representation
+/// evaluates the exact section directly in the carrying torus' parameter
+/// space.
+fn exact_torus_plane_section_pcurve(surface: &GeomSurface, edge: &EdgeData) -> Option<PcurveData> {
+    fn curve_data(
+        curve: &GeomCurve,
+        first: f64,
+        last: f64,
+    ) -> Option<(openrcad_geom::TorusPlaneSection, f64, f64)> {
+        match curve {
+            GeomCurve::TorusPlaneSection(section) => Some((*section, first, last)),
+            GeomCurve::Reparametrized(curve) => curve_data(
+                curve.curve(),
+                curve.target_parameter(first),
+                curve.target_parameter(last),
+            ),
+            _ => None,
+        }
+    }
+
+    let (section, first, last) = curve_data(edge.curve.as_ref()?, edge.first, edge.last)?;
+    let carrying_torus = match surface {
+        GeomSurface::Torus(torus) => *torus,
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Torus(base) => openrcad_geom::ToroidalSurface::new(
+                base.position(),
+                base.major_radius(),
+                base.minor_radius() + offset.distance,
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let section_torus = openrcad_geom::ToroidalSurface::new(
+        section.position(),
+        section.major_radius(),
+        section.minor_radius(),
+    );
+    if carrying_torus != section_torus {
+        return None;
+    }
+
+    let frame = section.position();
+    let normal = GeomVec::from_dir(section.plane_normal());
+    let normal_angle = normal
+        .dot(&GeomVec::from_dir(frame.y_direction()))
+        .atan2(normal.dot(&GeomVec::from_dir(frame.x_direction())));
+    let curve = TorusPlaneSection2d::new(
+        normal_angle,
+        section.major_radius(),
+        section.minor_radius(),
+        section.signed_offset(),
+        section.positive_branch(),
+    )?;
+    Some(
+        PcurveData::new(GeomCurve2d::torus_plane_section(curve), first, last)
+            .with_periodicity(surface_periodicity(surface)),
+    )
+}
+
+/// A coaxial circle on a torus is a constant-v parameter line. Preserve the
+/// circle's unwrapped parameter (including ranges beyond one turn) instead of
+/// asking sampled projection to infer the periodic branch.
+fn exact_torus_circle_pcurve(
+    surface: &GeomSurface,
+    edge: &EdgeData,
+    policy: &TolerancePolicy,
+) -> Option<PcurveData> {
+    fn curve_data(
+        curve: &GeomCurve,
+        first: f64,
+        last: f64,
+    ) -> Option<(openrcad_geom::Circle, f64, f64)> {
+        match curve {
+            GeomCurve::Circle(circle) => Some((*circle, first, last)),
+            GeomCurve::Reparametrized(curve) => curve_data(
+                curve.curve(),
+                curve.target_parameter(first),
+                curve.target_parameter(last),
+            ),
+            _ => None,
+        }
+    }
+
+    let (circle, first, last) = curve_data(edge.curve.as_ref()?, edge.first, edge.last)?;
+    let torus = match surface {
+        GeomSurface::Torus(torus) => *torus,
+        GeomSurface::Offset(offset) => match offset.base.as_ref() {
+            GeomSurface::Torus(base) => openrcad_geom::ToroidalSurface::new(
+                base.position(),
+                base.major_radius(),
+                base.minor_radius() + offset.distance,
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let frame = torus.position();
+    let axis = GeomVec::from_dir(frame.direction());
+    let circle_axis = GeomVec::from_dir(circle.position().direction());
+    let alignment = axis.dot(&circle_axis);
+    let scale = torus
+        .major_radius()
+        .max(torus.minor_radius())
+        .max(circle.radius());
+    let tolerance = policy.classification + scale * f64::EPSILON * 64.0;
+    if (alignment.abs() - 1.0).abs() > tolerance / scale.max(f64::MIN_POSITIVE) {
+        return None;
+    }
+    let center_offset = circle.center() - frame.location();
+    let axial = center_offset.dot(&axis);
+    let radial_center = center_offset - axis * axial;
+    if radial_center.magnitude() > tolerance {
+        return None;
+    }
+    let radial_offset = circle.radius() - torus.major_radius();
+    if (radial_offset.hypot(axial) - torus.minor_radius()).abs() > tolerance {
+        return None;
+    }
+
+    let circle_x = GeomVec::from_dir(circle.position().x_direction());
+    let offset = circle_x
+        .dot(&GeomVec::from_dir(frame.y_direction()))
+        .atan2(circle_x.dot(&GeomVec::from_dir(frame.x_direction())));
+    let sign = alignment.signum();
+    let v = axial.atan2(radial_offset);
+    line_pcurve(
+        &[
+            Pnt2d::new(offset + sign * first, v),
+            Pnt2d::new(offset + sign * last, v),
+        ],
+        surface_periodicity(surface),
+    )
+}
+
 /// A ruled surface's two rail curves are exact constant-v boundaries. Handling
 /// them before projection is important for tapered, zero-lead helices: adding a
 /// whole turn changes their radius, so angle-only projection cannot recover the
@@ -300,22 +633,70 @@ fn exact_planar_pcurve(brep: &BRep, surface: &GeomSurface, edge: &EdgeData) -> O
     let plane = match surface {
         GeomSurface::Plane(plane) => *plane,
         GeomSurface::Offset(offset) => match offset.base.as_ref() {
-            GeomSurface::Plane(base) => Plane::from_point_normal(
+            GeomSurface::Plane(base) => Plane::new(Ax3::new_axes(
                 base.location() + GeomVec::from_dir(base.normal()) * offset.distance,
                 base.normal(),
-            ),
+                base.position().x_direction(),
+            )),
             _ => return None,
         },
         _ => return None,
     };
     let curve = edge.curve.as_ref()?;
     let project = |point: Pnt| plane_uv(&plane, point);
+    let project_vector = |vector: GeomVec| {
+        Vec2d::new(
+            vector.dot(&GeomVec::from_dir(plane.position().x_direction())),
+            vector.dot(&GeomVec::from_dir(plane.position().y_direction())),
+        )
+    };
     let direction = |dir: openrcad_foundation::Dir| {
         Dir2d::new(
             dir.dot(&plane.position().x_direction()),
             dir.dot(&plane.position().y_direction()),
         )
     };
+
+    fn torus_section_data(
+        curve: &GeomCurve,
+        first: f64,
+        last: f64,
+    ) -> Option<(openrcad_geom::TorusPlaneSection, f64, f64)> {
+        match curve {
+            GeomCurve::TorusPlaneSection(section) => Some((*section, first, last)),
+            GeomCurve::Reparametrized(curve) => torus_section_data(
+                curve.curve(),
+                curve.target_parameter(first),
+                curve.target_parameter(last),
+            ),
+            _ => None,
+        }
+    }
+    if let Some((section, first, last)) = torus_section_data(curve, edge.first, edge.last) {
+        let normal = GeomVec::from_dir(section.plane_normal());
+        let center = section.position().location() + normal * section.signed_offset();
+        let lateral = GeomVec::from_dir(
+            section
+                .position()
+                .direction()
+                .cross(&section.plane_normal()),
+        );
+        let axis = GeomVec::from_dir(section.position().direction());
+        let section_2d = PlaneTorusSection2d::new(
+            project(center),
+            project_vector(lateral),
+            project_vector(axis),
+            section.major_radius(),
+            section.minor_radius(),
+            section.signed_offset(),
+            section.positive_branch(),
+        )?;
+        return Some(PcurveData::new(
+            GeomCurve2d::plane_torus_section(section_2d),
+            first,
+            last,
+        ));
+    }
     match curve {
         GeomCurve::Circle(circle) => Some(PcurveData::new(
             GeomCurve2d::circle(Circle2d::new(

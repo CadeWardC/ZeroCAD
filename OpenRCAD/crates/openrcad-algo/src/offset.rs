@@ -1,7 +1,10 @@
-use openrcad_foundation::{Dir, Pnt, ToleranceContext, TolerancePolicy, Trsf, Vec as GeomVec};
+use openrcad_foundation::{
+    Dir, Pnt, Pnt2d, ToleranceContext, TolerancePolicy, Trsf, Vec as GeomVec,
+};
 use openrcad_geom::{
     ConicalSurface, Curve, CylindricalSurface, GeomCurve, GeomSurface, OffsetSurface, Plane,
-    SphericalSurface, Surface,
+    ReparametrizedCurve, RuledSurface, SphericalSurface, Surface, ToroidalSurface,
+    TorusSurfaceCurve,
 };
 use openrcad_topo::{
     Edge, Face, InputTopologyRef, Solid, TopologyChange, TopologyHistory, TopologyKind,
@@ -316,6 +319,13 @@ struct AnalyticShellSupport {
     base_normal: Dir,
 }
 
+fn trace_shell_failure(stage: &'static str, error: BlendError) -> BlendError {
+    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+        eprintln!("shell stage {stage} rejected: {error}");
+    }
+    error
+}
+
 fn checked_face_normal(
     solid: &Solid,
     face: &Face,
@@ -455,6 +465,26 @@ fn analytic_offset_support(
             }
             GeomSurface::sphere(SphericalSurface::new(sphere.position(), radius))
         }
+        GeomSurface::Torus(torus) => {
+            let minor_radius = torus.minor_radius() + signed_distance;
+            let regular_limit = torus.major_radius() - context.policy.linear;
+            if minor_radius <= context.policy.linear || minor_radius >= regular_limit {
+                let max = if signed_distance < 0.0 {
+                    torus.minor_radius()
+                } else {
+                    (torus.major_radius() - torus.minor_radius()).max(0.0)
+                };
+                return Err(BlendError::ParameterTooLarge {
+                    requested: thickness,
+                    max,
+                });
+            }
+            GeomSurface::torus(ToroidalSurface::new(
+                torus.position(),
+                torus.major_radius(),
+                minor_radius,
+            ))
+        }
         _ => return Err(BlendError::UnsupportedShape),
     };
     Ok(AnalyticShellSupport {
@@ -500,6 +530,23 @@ fn support_residual_gradient(surface: &GeomSurface, point: Pnt) -> Option<(f64, 
             let gradient = radial.normalized().map(GeomVec::from_dir)?;
             Some((magnitude - sphere.radius(), gradient))
         }
+        GeomSurface::Torus(torus) => {
+            let frame = torus.position();
+            let axis = GeomVec::from_dir(frame.direction());
+            let delta = point - frame.location();
+            let axial = delta.dot(&axis);
+            let radial = delta - axis * axial;
+            let radial_magnitude = radial.magnitude();
+            let radial_direction = radial.normalized().map(GeomVec::from_dir)?;
+            let meridian_radial = radial_magnitude - torus.major_radius();
+            let tube_distance = meridian_radial.hypot(axial);
+            if tube_distance <= f64::MIN_POSITIVE {
+                return None;
+            }
+            let gradient = radial_direction * (meridian_radial / tube_distance)
+                + axis * (axial / tube_distance);
+            Some((tube_distance - torus.minor_radius(), gradient))
+        }
         _ => None,
     }
 }
@@ -529,7 +576,7 @@ fn independent_support_rows(
                         vec_row(evaluated[third].1),
                     ];
                     let determinant = det3(&rows).abs();
-                    if best.is_none_or(|(current, _)| determinant > current) {
+                    if best.map_or(true, |(current, _)| determinant > current) {
                         best = Some((determinant, [first, second, third]));
                     }
                 }
@@ -577,14 +624,94 @@ fn remap_analytic_vertex(
     context: &ToleranceContext,
 ) -> Result<Pnt, BlendError> {
     let mut point = original;
+    // Leave accuracy headroom for the independent pcurve certificate. The
+    // looser classification tolerance is suitable for containment, but not
+    // for committing a shared analytic endpoint.
+    let target_residual = context.policy.pcurve_consistency * 0.25;
     if supports.len() == 1 {
         for _ in 0..8 {
             let (residual, gradient) = support_residual_gradient(supports[0], point)
                 .ok_or(BlendError::UnsupportedShape)?;
             point = point - gradient * residual;
-            if residual.abs() <= context.convergence {
+            if support_residual_gradient(supports[0], point)
+                .is_some_and(|(residual, _)| residual.abs() <= target_residual)
+            {
                 break;
             }
+        }
+        if original.distance(&point) > thickness.abs() * MAX_VERTEX_TRAVEL_THICKNESSES {
+            return Err(BlendError::ParameterTooLarge {
+                requested: thickness,
+                max: original.distance(&point) / MAX_VERTEX_TRAVEL_THICKNESSES,
+            });
+        }
+        return Ok(point);
+    }
+    let initial = supports
+        .iter()
+        .map(|support| support_residual_gradient(support, point))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(BlendError::UnsupportedShape)?;
+    let reference_gradient = initial[0].1;
+    let tangent_network = initial.iter().skip(1).all(|(_, gradient)| {
+        reference_gradient.cross(gradient).magnitude() <= context.policy.angular * 8.0
+    });
+    if tangent_network {
+        // G1 support transitions (notably cylinder/torus fillet contact) have
+        // dependent normals by construction. Their offset intersection is a
+        // curve, so preserve the source parameter along that curve and solve
+        // only the shared normal displacement. Reversing an implicit gradient
+        // also reverses its residual before the consistency comparison.
+        for _ in 0..12 {
+            let evaluated = supports
+                .iter()
+                .map(|support| support_residual_gradient(support, point))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(BlendError::UnsupportedShape)?;
+            let base_gradient = evaluated[0].1;
+            let aligned: Vec<f64> = evaluated
+                .iter()
+                .map(|(residual, gradient)| {
+                    if base_gradient.dot(gradient) >= 0.0 {
+                        *residual
+                    } else {
+                        -*residual
+                    }
+                })
+                .collect();
+            let minimum = aligned.iter().copied().fold(f64::INFINITY, f64::min);
+            let maximum = aligned.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if maximum - minimum > context.policy.classification * 8.0 {
+                if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                    eprintln!(
+                        "shell tangent support residual disagreement at source={original:?} result={point:?}: {aligned:?}"
+                    );
+                }
+                return Err(BlendError::UnsupportedShape);
+            }
+            let residual = aligned.iter().sum::<f64>() / aligned.len() as f64;
+            point = point - base_gradient * residual;
+            let maximum_residual = supports
+                .iter()
+                .filter_map(|support| support_residual_gradient(support, point))
+                .map(|(residual, _)| residual.abs())
+                .fold(0.0, f64::max);
+            if maximum_residual <= target_residual {
+                break;
+            }
+        }
+        let residual = supports
+            .iter()
+            .filter_map(|support| support_residual_gradient(support, point))
+            .map(|(residual, _)| residual.abs())
+            .fold(0.0, f64::max);
+        if residual > context.policy.classification * 8.0 {
+            if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                eprintln!(
+                    "shell tangent remap residual {residual} at source={original:?} result={point:?}"
+                );
+            }
+            return Err(BlendError::UnsupportedShape);
         }
         if original.distance(&point) > thickness.abs() * MAX_VERTEX_TRAVEL_THICKNESSES {
             return Err(BlendError::ParameterTooLarge {
@@ -598,16 +725,27 @@ fn remap_analytic_vertex(
         let Some((rows, rhs)) =
             independent_support_rows(supports, point, original, context.policy.angular)
         else {
+            if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                eprintln!("shell remap could not select independent support rows at {point:?}");
+            }
             return Err(BlendError::UnsupportedShape);
         };
         let determinant = det3(&rows);
         if determinant.abs() <= context.policy.angular {
+            if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                eprintln!("shell remap determinant {determinant} at {point:?}");
+            }
             return Err(BlendError::UnsupportedShape);
         }
         let delta = solve3(&rows, &rhs, determinant);
         let step = GeomVec::new(delta[0], delta[1], delta[2]);
         point = point + step;
-        if step.magnitude() <= context.convergence {
+        let maximum_residual = supports
+            .iter()
+            .filter_map(|support| support_residual_gradient(support, point))
+            .map(|(residual, _)| residual.abs())
+            .fold(0.0, f64::max);
+        if maximum_residual <= target_residual {
             break;
         }
     }
@@ -617,6 +755,15 @@ fn remap_analytic_vertex(
         .map(|(residual, _)| residual.abs())
         .fold(0.0, f64::max);
     if residual > context.policy.classification * 8.0 {
+        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+            let residuals = supports
+                .iter()
+                .filter_map(|support| support_residual_gradient(support, point))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "shell remap residual {residual} at source={original:?} result={point:?}: {residuals:?}"
+            );
+        }
         return Err(BlendError::UnsupportedShape);
     }
     if original.distance(&point) > thickness.abs() * MAX_VERTEX_TRAVEL_THICKNESSES {
@@ -646,6 +793,163 @@ fn distinct_support_indices(
         }
     }
     distinct
+}
+
+/// Exact image of a circular isocurve when a regular torus changes only its
+/// minor radius.  Fillet bands are commonly split into several faces on one
+/// support, so their shared seam has only one distinct support and cannot be
+/// recovered through a two-surface intersection.
+fn remap_torus_isocurve(
+    edge: &Edge,
+    curve: &GeomCurve,
+    base: &ToroidalSurface,
+    offset: &ToroidalSurface,
+    offset_start: Pnt,
+    offset_end: Pnt,
+    context: &ToleranceContext,
+) -> Option<GeomCurve> {
+    if !matches!(curve, GeomCurve::Circle(_)) {
+        return None;
+    }
+    let (domain_first, domain_last) = if edge.orientation() == openrcad_topo::Orientation::Reversed
+    {
+        (edge.last(), edge.first())
+    } else {
+        (edge.first(), edge.last())
+    };
+    let point = |fraction: f64| curve.point(domain_first + (domain_last - domain_first) * fraction);
+    let start = crate::intersect::uv_of(&GeomSurface::torus(*base), &point(0.0));
+    let middle = crate::intersect::uv_of(&GeomSurface::torus(*base), &point(0.5));
+    let end = crate::intersect::uv_of(&GeomSurface::torus(*base), &point(1.0));
+    let unwrap = |value: f64, reference: f64| {
+        crate::native_pcurve::unwrap_near(value, reference, Some(core::f64::consts::TAU))
+    };
+    let middle = (unwrap(middle.0, start.0), unwrap(middle.1, start.1));
+    let predicted_end = (2.0 * middle.0 - start.0, 2.0 * middle.1 - start.1);
+    let end = (
+        unwrap(end.0, predicted_end.0),
+        unwrap(end.1, predicted_end.1),
+    );
+    let u_span = (start.0 - middle.0).abs().max((middle.0 - end.0).abs());
+    let v_span = (start.1 - middle.1).abs().max((middle.1 - end.1).abs());
+    if u_span > context.policy.angular * 8.0 && v_span > context.policy.angular * 8.0 {
+        return None;
+    }
+
+    // Neighboring offset faces can move the two endpoints by different
+    // amounts along the torus. The shared split seam then ceases to be a
+    // circle, even though any exact curve on the common torus is a valid seam.
+    // Preserve the source winding and connect those constraints with an exact
+    // affine curve in torus parameter space.
+    let target_start = crate::intersect::uv_of(&GeomSurface::torus(*offset), &offset_start);
+    let target_end = crate::intersect::uv_of(&GeomSurface::torus(*offset), &offset_end);
+    let target_start = (
+        unwrap(target_start.0, start.0),
+        unwrap(target_start.1, start.1),
+    );
+    let predicted_target_end = (
+        target_start.0 + (end.0 - start.0),
+        target_start.1 + (end.1 - start.1),
+    );
+    let target_end = (
+        unwrap(target_end.0, predicted_target_end.0),
+        unwrap(target_end.1, predicted_target_end.1),
+    );
+    TorusSurfaceCurve::new(
+        *offset,
+        (domain_first, domain_last),
+        (target_start.0, target_end.0),
+        (target_start.1, target_end.1),
+    )
+    .map(GeomCurve::torus_surface_curve)
+}
+
+/// Make an all-linear cylinder loop share one exact UV vertex per topological
+/// vertex. At extreme translation/scale ratios, deriving a generator angle
+/// from its world-space location loses more bits than deriving an adjacent
+/// circular boundary from its analytic frame. Selecting the candidate that
+/// lifts closest to the shared 3D vertex preserves the stronger construction
+/// without introducing a tessellated or approximate B-Rep curve.
+fn canonicalize_cylinder_wire_pcurves(
+    surface: &GeomSurface,
+    edges: &[Edge],
+    pcurves: &mut [openrcad_topo::PcurveData],
+) {
+    let is_cylinder = matches!(surface, GeomSurface::Cylinder(_))
+        || matches!(
+            surface,
+            GeomSurface::Offset(offset)
+                if matches!(offset.base.as_ref(), GeomSurface::Cylinder(_))
+        );
+    if !is_cylinder
+        || edges.len() < 2
+        || edges.len() != pcurves.len()
+        || pcurves
+            .iter()
+            .any(|pcurve| !matches!(&pcurve.curve, openrcad_geom2d::GeomCurve2d::Line(_)))
+    {
+        return;
+    }
+
+    let periodicity = pcurves[0].periodicity;
+    let align = |point: Pnt2d, reference: Pnt2d| {
+        Pnt2d::new(
+            crate::native_pcurve::unwrap_near(point.x(), reference.x(), periodicity.u_period),
+            crate::native_pcurve::unwrap_near(point.y(), reference.y(), periodicity.v_period),
+        )
+    };
+    let mut starts = Vec::with_capacity(edges.len());
+    let mut ends = Vec::with_capacity(edges.len());
+    for (edge, pcurve) in edges.iter().zip(pcurves.iter()) {
+        let (start, end) = if edge.orientation() == openrcad_topo::Orientation::Reversed {
+            (pcurve.point_at_fraction(1.0), pcurve.point_at_fraction(0.0))
+        } else {
+            (pcurve.point_at_fraction(0.0), pcurve.point_at_fraction(1.0))
+        };
+        if let Some(previous) = ends.last().copied() {
+            let aligned = align(start, previous);
+            let shift = aligned - start;
+            starts.push(aligned);
+            ends.push(end + shift);
+        } else {
+            starts.push(start);
+            ends.push(end);
+        }
+    }
+
+    let mut vertices = Vec::with_capacity(edges.len());
+    for index in 0..edges.len() {
+        let current = starts[index];
+        let previous = if index == 0 {
+            align(ends[edges.len() - 1], current)
+        } else {
+            ends[index - 1]
+        };
+        let point = edges[index].source().point();
+        let previous_error = surface.point(previous.x(), previous.y()).distance(&point);
+        let current_error = surface.point(current.x(), current.y()).distance(&point);
+        vertices.push(if previous_error < current_error {
+            previous
+        } else {
+            current
+        });
+    }
+
+    for index in 0..edges.len() {
+        let traversal_start = vertices[index];
+        let traversal_end = if index + 1 == edges.len() {
+            align(vertices[0], traversal_start)
+        } else {
+            vertices[index + 1]
+        };
+        let (natural_start, natural_end) =
+            if edges[index].orientation() == openrcad_topo::Orientation::Reversed {
+                (traversal_end, traversal_start)
+            } else {
+                (traversal_start, traversal_end)
+            };
+        pcurves[index] = crate::native_pcurve::uv_line(natural_start, natural_end, periodicity);
+    }
 }
 
 /// Stages 4A/4B mixed analytic shell. It preserves the input face graph,
@@ -688,9 +992,9 @@ fn shell_analytic_general(
         .enumerate()
         .map(|(index, face)| {
             analytic_offset_support(solid, face, thickness, is_open[index], &context)
+                .map_err(|error| trace_shell_failure("offset-support", error))
         })
         .collect::<Result<_, _>>()?;
-
     let mut vertex_faces: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     let mut vertex_points: HashMap<(i64, i64, i64), Pnt> = HashMap::new();
     let mut edge_faces: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
@@ -724,18 +1028,84 @@ fn shell_analytic_general(
 
     let mut offset_points = HashMap::new();
     for (key, adjacent) in &vertex_faces {
-        let distinct = distinct_support_indices(adjacent, &supports, &context.policy);
-        let analytic: Vec<_> = distinct
+        // A removed opening is not an inner-shell constraint. Ordinary planar
+        // walls happen to remain in the opening plane after offset, but a
+        // tangent fillet band moves away from it and needs a ruled rim between
+        // the original and offset boundaries.
+        let closed_adjacent: Vec<_> = adjacent
             .iter()
-            .map(|index| &supports[*index].analytic)
+            .copied()
+            .filter(|index| !is_open[*index])
+            .collect();
+        let distinct = distinct_support_indices(&closed_adjacent, &supports, &context.policy);
+        if distinct.is_empty() {
+            return Err(BlendError::UnsupportedShape);
+        }
+        let mut analytic_owned: Vec<_> = distinct
+            .iter()
+            .map(|index| supports[*index].analytic.clone())
             .collect();
         let original = vertex_points[key];
+        let opening_indices: Vec<_> = adjacent
+            .iter()
+            .copied()
+            .filter(|index| is_open[*index])
+            .collect();
+        if let Some(&opening_index) = opening_indices.first() {
+            let opening_plane = match &supports[opening_index].analytic {
+                GeomSurface::Plane(plane) => plane,
+                _ => return Err(BlendError::UnsupportedShape),
+            };
+            if opening_indices.iter().skip(1).any(|index| {
+                !crate::boolean::surfaces_are_same_domain(
+                    &supports[*index].analytic,
+                    &supports[opening_index].analytic,
+                    context
+                        .policy
+                        .classification
+                        .max(context.policy.intersection),
+                )
+            }) {
+                return Err(BlendError::UnsupportedShape);
+            }
+            let boundary_support = analytic_owned
+                .iter()
+                .find(|support| !matches!(support, GeomSurface::Plane(_)))
+                .or_else(|| analytic_owned.first())
+                .ok_or(BlendError::UnsupportedShape)?;
+            let projected =
+                remap_analytic_vertex(original, &[boundary_support], thickness, &context)?;
+            let derived_opening_constraint =
+                GeomSurface::plane(Plane::from_point_normal(projected, opening_plane.normal()));
+            if analytic_owned.iter().all(|support| {
+                !crate::boolean::surfaces_are_same_domain(
+                    support,
+                    &derived_opening_constraint,
+                    context
+                        .policy
+                        .classification
+                        .max(context.policy.intersection),
+                )
+            }) {
+                analytic_owned.push(derived_opening_constraint);
+            }
+        }
+        let analytic: Vec<_> = analytic_owned.iter().collect();
+        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+            eprintln!(
+                "shell remap vertex {original:?} supports={:?}",
+                analytic
+                    .iter()
+                    .map(|support| crate::band_topology::BandSupportKind::of(support))
+                    .collect::<Vec<_>>()
+            );
+        }
         offset_points.insert(
             *key,
-            remap_analytic_vertex(original, &analytic, thickness, &context)?,
+            remap_analytic_vertex(original, &analytic, thickness, &context)
+                .map_err(|error| trace_shell_failure("remap-vertex", error))?,
         );
     }
-
     let rebuild_edge = |edge: &Edge| -> Result<Edge, BlendError> {
         let start = offset_points[&quant(&edge.source().point())];
         let end = offset_points[&quant(&edge.target().point())];
@@ -745,7 +1115,31 @@ fn shell_analytic_general(
         let adjacent = edge_faces
             .get(&edge_key(edge))
             .ok_or(BlendError::UnsupportedShape)?;
-        let distinct = distinct_support_indices(adjacent, &supports, &context.policy);
+        let closed_adjacent: Vec<_> = adjacent
+            .iter()
+            .copied()
+            .filter(|index| !is_open[*index])
+            .collect();
+        let distinct = distinct_support_indices(&closed_adjacent, &supports, &context.policy);
+        // Opening boundaries need the retained support plus a plane parallel
+        // to the removed face through the remapped edge. For ordinary
+        // plane/cylinder and plane/cone rims this is the original plane; for a
+        // shifted fillet band it is the exact parallel plane containing the
+        // inner boundary. Keeping this constraint local to the edge avoids
+        // incorrectly pinning every opening vertex to the removed face.
+        let derived_opening_index = adjacent.iter().copied().find(|index| is_open[*index]);
+        let derived_opening_constraint = derived_opening_index
+            .and_then(|index| match &supports[index].analytic {
+                GeomSurface::Plane(opening_plane) => Some(GeomSurface::plane(
+                    Plane::from_point_normal(start, opening_plane.normal()),
+                )),
+                _ => None,
+            })
+            .filter(|plane| {
+                support_residual_gradient(plane, end).is_some_and(|(residual, _)| {
+                    residual.abs() <= context.policy.classification * 8.0
+                })
+            });
         if distinct.len() == 1 {
             let support = &supports[distinct[0]];
             if let (
@@ -815,22 +1209,110 @@ fn shell_analytic_general(
                     ));
                 }
             }
-            return Err(BlendError::UnsupportedShape);
+            if let (
+                GeomSurface::Offset(offset_surface),
+                GeomSurface::Torus(offset_torus),
+                Some(curve),
+            ) = (&support.display, &support.analytic, edge.curve())
+            {
+                if let GeomSurface::Torus(base_torus) = offset_surface.base.as_ref() {
+                    let transformed = remap_torus_isocurve(
+                        edge,
+                        curve,
+                        base_torus,
+                        offset_torus,
+                        start,
+                        end,
+                        &context,
+                    )
+                    .ok_or_else(|| {
+                        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                            eprintln!("shell torus edge is not a supported exact isocurve");
+                        }
+                        BlendError::UnsupportedShape
+                    })?;
+                    let (start_parameter, end_parameter) = transformed.bounds();
+                    if transformed.point(start_parameter).distance(&start)
+                        > context.policy.classification * 8.0
+                        || transformed.point(end_parameter).distance(&end)
+                            > context.policy.classification * 8.0
+                    {
+                        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                            let start_uv =
+                                crate::intersect::uv_of(&GeomSurface::torus(*offset_torus), &start);
+                            let end_uv =
+                                crate::intersect::uv_of(&GeomSurface::torus(*offset_torus), &end);
+                            eprintln!(
+                                "shell torus edge projection mismatch start={} end={} parameters=({start_parameter}, {end_parameter}) uv=({start_uv:?}, {end_uv:?})",
+                                transformed.point(start_parameter).distance(&start),
+                                transformed.point(end_parameter).distance(&end)
+                            );
+                        }
+                        return Err(BlendError::UnsupportedShape);
+                    }
+                    return Ok(Edge::new_with_tolerance(
+                        Some(transformed),
+                        start_parameter,
+                        end_parameter,
+                        Vertex::new(start),
+                        Vertex::new(end),
+                        context.policy.linear,
+                    ));
+                }
+            }
         }
-        if distinct.len() < 2 {
-            return Err(BlendError::UnsupportedShape);
-        }
-        let candidates = crate::intersect::surface_surface(
-            &supports[distinct[0]].analytic,
-            &supports[distinct[1]].analytic,
-            context.policy.intersection,
-        );
+        let (first_support, second_support, first_source_index, second_source_index) =
+            if distinct.len() >= 2 {
+                (
+                    &supports[distinct[0]].analytic,
+                    &supports[distinct[1]].analytic,
+                    distinct[0],
+                    distinct[1],
+                )
+            } else if distinct.len() == 1 {
+                (
+                    &supports[distinct[0]].analytic,
+                    derived_opening_constraint
+                        .as_ref()
+                        .ok_or(BlendError::UnsupportedShape)?,
+                    distinct[0],
+                    derived_opening_index.ok_or(BlendError::UnsupportedShape)?,
+                )
+            } else {
+                return Err(BlendError::UnsupportedShape);
+            };
+        let contains_torus = matches!(first_support, GeomSurface::Torus(_))
+            || matches!(second_support, GeomSurface::Torus(_));
+        let mut boundary_budget = crate::band_topology::GeometryWorkBudget::intersection_default();
+        let candidates = if contains_torus {
+            boundary_budget.charge(crate::band_topology::GeometryWorkStage::Intersection, 1)?;
+            crate::intersect::analytic_surface_surface(
+                first_support,
+                second_support,
+                context.policy.intersection,
+            )
+            .ok_or_else(|| {
+                BlendError::BandTopology(
+                    crate::band_topology::BandTopologyError::UnsupportedTransition {
+                        left: crate::band_topology::BandSupportKind::of(first_support),
+                        right: crate::band_topology::BandSupportKind::of(second_support),
+                    },
+                )
+            })?
+        } else {
+            crate::intersect::surface_surface_with_budget(
+                first_support,
+                second_support,
+                context.policy.intersection,
+                &mut boundary_budget,
+            )?
+        };
         let original_midpoint = edge
             .curve()
             .map(|curve| curve.point((edge.first() + edge.last()) * 0.5))
             .unwrap_or_else(|| edge.source().point().midpoint(&edge.target().point()));
-        let mut best: Option<(f64, GeomCurve, f64, f64)> = None;
-        for curve in candidates {
+        let mut best: Option<(f64, u32, GeomCurve, f64, f64)> = None;
+        for (branch, curve) in candidates.into_iter().enumerate() {
             let (curve_min, curve_max) = curve.bounds();
             let extent = context.model_scale.max(context.local_feature_size) * 2.0;
             let (search_min, search_max) = if curve.is_periodic() {
@@ -843,55 +1325,89 @@ fn shell_analytic_general(
             };
             let start_parameter =
                 crate::boolean::project_point_on_curve(&start, &curve, search_min, search_max);
-            let mut end_parameter =
+            let end_parameter =
                 crate::boolean::project_point_on_curve(&end, &curve, search_min, search_max);
-            if curve.is_periodic() {
+            let end_parameters: Vec<_> = if curve.is_periodic() {
                 let period = curve.period();
-                let direction = if edge.orientation() == openrcad_topo::Orientation::Reversed {
-                    edge.first() - edge.last()
-                } else {
-                    edge.last() - edge.first()
-                };
-                let target_span = direction.abs();
-                end_parameter +=
-                    ((start_parameter + direction - end_parameter) / period).round() * period;
-                if (end_parameter - start_parameter).abs() <= context.policy.angular {
-                    end_parameter += period.copysign(direction);
+                let central_branch = ((start_parameter - end_parameter) / period).round();
+                [-1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(|delta| end_parameter + (central_branch + delta) * period)
+                    .collect()
+            } else {
+                vec![end_parameter]
+            };
+            for end_parameter in end_parameters {
+                let start_error = curve.point(start_parameter).distance(&start);
+                let end_error = curve.point(end_parameter).distance(&end);
+                if start_error > context.policy.classification * 8.0
+                    || end_error > context.policy.classification * 8.0
+                {
+                    continue;
                 }
-                if target_span < period && (end_parameter - start_parameter).abs() > period * 0.75 {
-                    end_parameter -= period.copysign(end_parameter - start_parameter);
+                // The source midpoint disambiguates the two complementary arcs
+                // without relying on raw first/last ordering. Reversed coedges
+                // therefore select the same geometric arc in opposite senses.
+                let midpoint = curve.point((start_parameter + end_parameter) * 0.5);
+                let score = midpoint.distance(&original_midpoint) + start_error + end_error;
+                if best.as_ref().map_or(true, |(current, ..)| score < *current) {
+                    best = Some((
+                        score,
+                        branch as u32,
+                        curve.clone(),
+                        start_parameter,
+                        end_parameter,
+                    ));
                 }
-            }
-            let start_error = curve.point(start_parameter).distance(&start);
-            let end_error = curve.point(end_parameter).distance(&end);
-            if start_error > context.policy.classification * 8.0
-                || end_error > context.policy.classification * 8.0
-            {
-                continue;
-            }
-            let midpoint = curve.point((start_parameter + end_parameter) * 0.5);
-            let score = midpoint.distance(&original_midpoint) + start_error + end_error;
-            if best.as_ref().is_none_or(|(current, ..)| score < *current) {
-                best = Some((score, curve, start_parameter, end_parameter));
             }
         }
-        let (_, curve, first, last) = best.ok_or(BlendError::UnsupportedShape)?;
-        Ok(Edge::new_with_tolerance(
-            Some(curve),
+        let (_, branch, curve, first, last) = best.ok_or(BlendError::UnsupportedShape)?;
+        let boundary = crate::band_topology::build_two_sided_boundary(
+            curve,
             first,
             last,
-            Vertex::new(start),
-            Vertex::new(end),
-            context.policy.linear,
-        ))
+            start,
+            end,
+            first_support,
+            second_support,
+            InputTopologyRef::face(0, first_source_index).into(),
+            InputTopologyRef::face(0, second_source_index).into(),
+            branch,
+            &context,
+            &mut boundary_budget,
+        )?;
+        Ok(boundary.edge)
     };
 
-    let rebuild_wire = |wire: &Wire| -> Result<Wire, BlendError> {
-        wire.edges()
+    let rebuild_wire = |wire: &Wire,
+                        surface: &GeomSurface|
+     -> Result<(Wire, Vec<openrcad_topo::PcurveData>), BlendError> {
+        let edges = wire
+            .edges()
             .iter()
-            .map(&rebuild_edge)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Wire::from_edges)
+            .map(|edge| {
+                rebuild_edge(edge).map_err(|error| {
+                    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                        eprintln!(
+                            "shell edge rebuild failed curve={:?} source={:?} target={:?}",
+                            edge.curve(),
+                            edge.source().point(),
+                            edge.target().point()
+                        );
+                    }
+                    error
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pcurves: Vec<openrcad_topo::PcurveData> = edges
+            .iter()
+            .map(|edge| {
+                openrcad_topo::pcurve_build::exact_pcurve_for_edge(surface, edge, &context.policy)
+                    .unwrap_or_else(|| crate::native_pcurve::analytic_line_pcurve(surface, edge))
+            })
+            .collect();
+        canonicalize_cylinder_wire_pcurves(surface, &edges, &mut pcurves);
+        Ok((Wire::from_edges(edges), pcurves))
     };
 
     let mut result = Vec::new();
@@ -903,34 +1419,144 @@ fn shell_analytic_general(
                 .ok_or(BlendError::UnsupportedShape)?;
             for wire in face.wires() {
                 for edge in wire.edges() {
-                    let inner = rebuild_edge(&edge)?;
+                    let inner = rebuild_edge(&edge)
+                        .map_err(|error| trace_shell_failure("opening-rim-edge", error))?;
                     let outer_start = edge.source().point();
                     let outer_end = edge.target().point();
                     let inner_start = inner.source().point();
                     let inner_end = inner.target().point();
-                    result.push(Face::new(
-                        Some(rim_surface.clone()),
-                        Wire::from_edges([
-                            edge.clone(),
-                            Edge::between_points(outer_end, inner_end),
-                            inner.reversed(),
-                            Edge::between_points(inner_start, outer_start),
-                        ]),
-                    ));
+                    let inner_is_coplanar = [inner_start, inner_end].into_iter().all(|point| {
+                        support_residual_gradient(&rim_surface, point).is_some_and(
+                            |(residual, _)| residual.abs() <= context.policy.classification * 8.0,
+                        )
+                    });
+                    let (wall_surface, inner_boundary) = if inner_is_coplanar {
+                        (rim_surface.clone(), inner.reversed())
+                    } else {
+                        let outer_curve =
+                            edge.curve().cloned().ok_or(BlendError::UnsupportedShape)?;
+                        let inner_curve =
+                            inner.curve().cloned().ok_or(BlendError::UnsupportedShape)?;
+                        // A ruled surface requires both rails to describe the
+                        // corresponding points at the same `u`. Offset
+                        // intersections can move an endpoint along the inner
+                        // rail, so its native interval is generally different.
+                        // Align it exactly with an affine parameter map instead
+                        // of approximating the rail or weakening pcurve checks.
+                        let reversed = edge.orientation() == openrcad_topo::Orientation::Reversed;
+                        let (target_first, target_last, aligned_start, aligned_end) = if reversed {
+                            (inner.last(), inner.first(), inner.end(), inner.start())
+                        } else {
+                            (inner.first(), inner.last(), inner.start(), inner.end())
+                        };
+                        let aligned_curve = GeomCurve::reparametrized(
+                            ReparametrizedCurve::new(
+                                inner_curve,
+                                edge.first(),
+                                edge.last(),
+                                target_first,
+                                target_last,
+                            )
+                            .ok_or(BlendError::UnsupportedShape)?,
+                        );
+                        let aligned_inner = Edge::new_with_tolerance(
+                            Some(aligned_curve.clone()),
+                            edge.first(),
+                            edge.last(),
+                            aligned_start,
+                            aligned_end,
+                            context.policy.linear,
+                        );
+                        let inner_boundary = if reversed {
+                            aligned_inner
+                        } else {
+                            aligned_inner.reversed()
+                        };
+                        (
+                            GeomSurface::ruled(RuledSurface::new(outer_curve, aligned_curve)),
+                            inner_boundary,
+                        )
+                    };
+                    let end_connector =
+                        Edge::between_points(outer_end, inner_boundary.source().point());
+                    let start_connector =
+                        Edge::between_points(inner_boundary.target().point(), outer_start);
+                    let rim_wire = Wire::from_edges([
+                        edge.clone(),
+                        end_connector,
+                        inner_boundary,
+                        start_connector,
+                    ]);
+                    if matches!(wall_surface, GeomSurface::Ruled(_)) {
+                        let source_parameter =
+                            if edge.orientation() == openrcad_topo::Orientation::Reversed {
+                                edge.last()
+                            } else {
+                                edge.first()
+                            };
+                        let target_parameter =
+                            if edge.orientation() == openrcad_topo::Orientation::Reversed {
+                                edge.first()
+                            } else {
+                                edge.last()
+                            };
+                        let pcurves = vec![
+                            crate::native_pcurve::uv_line(
+                                Pnt2d::new(edge.first(), 0.0),
+                                Pnt2d::new(edge.last(), 0.0),
+                                openrcad_topo::SurfacePeriodicity::NONE,
+                            ),
+                            crate::native_pcurve::uv_line(
+                                Pnt2d::new(target_parameter, 0.0),
+                                Pnt2d::new(target_parameter, 1.0),
+                                openrcad_topo::SurfacePeriodicity::NONE,
+                            ),
+                            crate::native_pcurve::uv_line(
+                                Pnt2d::new(edge.first(), 1.0),
+                                Pnt2d::new(edge.last(), 1.0),
+                                openrcad_topo::SurfacePeriodicity::NONE,
+                            ),
+                            crate::native_pcurve::uv_line(
+                                Pnt2d::new(source_parameter, 1.0),
+                                Pnt2d::new(source_parameter, 0.0),
+                                openrcad_topo::SurfacePeriodicity::NONE,
+                            ),
+                        ];
+                        result.push(Face::with_pcurves(wall_surface, rim_wire, pcurves).map_err(
+                            |error| BlendError::InvalidTolerancePolicy(error.to_string()),
+                        )?);
+                    } else {
+                        result.push(
+                            crate::native_pcurve::analytic_face_with_pcurves(
+                                wall_surface,
+                                rim_wire,
+                                openrcad_topo::Orientation::Forward,
+                            )
+                            .map_err(|error| {
+                                BlendError::InvalidTolerancePolicy(error.to_string())
+                            })?,
+                        );
+                    }
                 }
             }
             continue;
         }
         result.push(face.clone());
-        let outer = face
+        let (outer, outer_pcurves) = face
             .outer_wire()
-            .map(|wire| rebuild_wire(&wire))
+            .map(|wire| {
+                rebuild_wire(&wire, &supports[face_index].display)
+                    .map_err(|error| trace_shell_failure("offset-outer-wire", error))
+            })
             .transpose()?
             .ok_or(BlendError::UnsupportedShape)?;
         let inners = face
             .inner_wires()
             .iter()
-            .map(&rebuild_wire)
+            .map(|wire| {
+                rebuild_wire(wire, &supports[face_index].display)
+                    .map_err(|error| trace_shell_failure("offset-inner-wire", error))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let desired = supports[face_index].checked_outward.reversed();
         let orientation = if desired.dot(&supports[face_index].base_normal) >= 0.0 {
@@ -938,19 +1564,109 @@ fn shell_analytic_general(
         } else {
             openrcad_topo::Orientation::Reversed
         };
-        result.push(Face::with_wires(
-            Some(supports[face_index].display.clone()),
-            Some(outer),
-            inners,
-            orientation,
-        ));
+        result.push(
+            Face::with_wires_and_pcurves(
+                Some(supports[face_index].display.clone()),
+                Some((outer, outer_pcurves)),
+                inners,
+                orientation,
+            )
+            .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?,
+        );
     }
 
-    let shell = sew_with_policy(&result, &context.policy)
-        .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+        eprintln!("shell sewing {} candidate faces", result.len());
+    }
+    let shell = sew_with_policy(&result, &context.policy).map_err(|error| {
+        trace_shell_failure(
+            "sewing",
+            BlendError::InvalidTolerancePolicy(error.to_string()),
+        )
+    })?;
     let candidate = Solid::new(shell);
     if !candidate.is_watertight_with_policy(&context.policy) {
+        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+            eprintln!(
+                "shell candidate is not watertight: health={:?} manifold={:?} counts=({}, {}, {})",
+                candidate.health_report_with_policy(&context.policy),
+                candidate.manifold_report_with_policy(&context.policy),
+                candidate.vertex_count(),
+                candidate.edge_count(),
+                candidate.face_count()
+            );
+            let grid = 1.0 / context.policy.approximation;
+            let quant = |point: Pnt| {
+                (
+                    (point.x() * grid).round() as i64,
+                    (point.y() * grid).round() as i64,
+                    (point.z() * grid).round() as i64,
+                )
+            };
+            let mut uses = std::collections::HashMap::new();
+            for (face_index, face) in candidate.faces().iter().enumerate() {
+                for edge in face.wires().into_iter().flat_map(|wire| wire.edges()) {
+                    let start = edge.start().point();
+                    let end = edge.end().point();
+                    let middle = edge.curve().map_or_else(
+                        || start.midpoint(&end),
+                        |curve| curve.point((edge.first() + edge.last()) * 0.5),
+                    );
+                    let (first, second) = (quant(start), quant(end));
+                    let key = if first <= second {
+                        (first, second, quant(middle))
+                    } else {
+                        (second, first, quant(middle))
+                    };
+                    let kind = match edge.curve() {
+                        Some(GeomCurve::Line(_)) => "line",
+                        Some(GeomCurve::Circle(_)) => "circle",
+                        Some(GeomCurve::Ellipse(_)) => "ellipse",
+                        Some(GeomCurve::Parabola(_)) => "parabola",
+                        Some(GeomCurve::Hyperbola(_)) => "hyperbola",
+                        Some(GeomCurve::BSpline(_)) => "bspline",
+                        Some(GeomCurve::Helix(_)) => "helix",
+                        Some(GeomCurve::TorusPlaneSection(_)) => "torus-plane",
+                        Some(GeomCurve::Reparametrized(_)) => "reparametrized",
+                        Some(GeomCurve::TorusSurfaceCurve(_)) => "torus-surface",
+                        None => "none",
+                    };
+                    uses.entry(key)
+                        .or_insert_with(Vec::new)
+                        .push((face_index, kind, start, end, middle));
+                }
+            }
+            for entries in uses.values().filter(|entries| entries.len() == 1) {
+                eprintln!("shell free edge: {:?}", entries[0]);
+            }
+        }
         return Err(BlendError::UnsupportedShape);
+    }
+    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+        for (face_index, face) in candidate.faces().iter().enumerate() {
+            let surface = match face.surface() {
+                Some(GeomSurface::Plane(_)) => "plane",
+                Some(GeomSurface::Cylinder(_)) => "cylinder",
+                Some(GeomSurface::Cone(_)) => "cone",
+                Some(GeomSurface::Sphere(_)) => "sphere",
+                Some(GeomSurface::Torus(_)) => "torus",
+                Some(GeomSurface::BSpline(_)) => "bspline",
+                Some(GeomSurface::Gregory(_)) => "gregory",
+                Some(GeomSurface::Offset(_)) => "offset",
+                Some(GeomSurface::Ruled(_)) => "ruled",
+                None => "none",
+            };
+            for (wire_index, wire) in face.wires().iter().enumerate() {
+                for edge_index in 0..wire.len() {
+                    if wire.pcurve(edge_index).is_none() {
+                        eprintln!(
+                            "shell missing pcurve face_index={face_index} face_id={:?} surface={surface} wire={wire_index} edge={edge_index}",
+                            face.id()
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(candidate)
 }

@@ -12,7 +12,7 @@ explains the staged boundary frozen before the Wave 4 geometry work began.
 | Cylinder | 4A | Verified in mixed plane/cylinder networks; primitive fast paths remain reachable. |
 | Cone | 4B | Verified for truncated cones and plane/cone/cylinder countersink networks. |
 | Sphere | 4B | Verified for spherical domes joined to planar bodies. |
-| Torus | 4C | Missing; requires a separate research review. |
+| Torus | 4C | Verified for regular ring-torus offsets in plane/torus and cylinder/torus Shell networks. |
 | NURBS | Deferred | Explicitly unsupported in Wave 4. |
 
 ## Intersection readiness
@@ -31,7 +31,9 @@ or complete history for the result.
 | Cone / Cone | 4B | Generic controlled fallback only. |
 | Plane / Sphere | 4B | Exact circle construction and Shell ownership verified. |
 | Cylinder or Cone / Sphere; Sphere / Sphere | 4B | Generic controlled fallback only. |
-| Any supported analytic surface / Torus; Torus / Torus | 4C | Generic controlled fallback only. |
+| Plane / Torus; Cylinder / Torus | 4C | Verified in Shell, including exact construction-time pcurves. |
+| Cone / Torus; uniquely classifiable Torus / Torus | 4C | Exact kernel intersection verified; Shell does not expose these pairs yet. |
+| Sphere / Torus | 4C | Generic controlled fallback only; rejected by the verified 4C Shell subset. |
 | Any pair containing NURBS | Deferred | Unsupported. |
 
 Generic subdivision/refinement is research evidence, not completion evidence for
@@ -59,18 +61,19 @@ every possible self-intersection is absent. Any ambiguous or unresolved case is
 rejected atomically. Wave 5 owns explicit concave intersection, imprinting,
 classification, and resewing; Wave 4 does not silently heal those cases.
 
-Stages 4A and 4B are implemented and verified. Stage 4C remains stopped and
-always requires an explicit go/no-go research review after the band-transition
-prerequisites are green.
+Stages 4A, 4B, and the bounded 4C subset are implemented and verified. The 4C
+research review remains recorded explicitly; its prerequisites are now green
+rather than being inferred from adding a Torus surface variant.
 
-The verified 4A/4B boundary is deliberate: removed opening faces remain planar,
-distinct cylinder/cylinder, cone/cone, and sphere-pair intersections are not
-claimed, and torus/fillet-band shelling is not enabled. Scale sweeps cover
-`1e-3..1e3` plus far-origin cone and sphere fixtures. The compound countersink
-fixture is topology-verified across the scale sweep and display-verified at the
-reference scale; extreme-scale cone/cylinder lens stitching and a microscopic
-countersink translated to `1e9` remain recorded limitations rather than being
-hidden behind a tolerance increase.
+The verified boundary is deliberate: removed opening faces remain planar;
+distinct cylinder/cylinder, cone/cone, sphere-pair, cone/torus, and torus/torus
+Shell networks are not claimed. Regular fillet bands bounded by planar and
+cylindrical supports are enabled. Scale sweeps cover `1e-3..1e3`, arbitrary
+rotation, and far-origin torus, cone, and sphere fixtures. The compound
+countersink fixture is topology-verified across the scale sweep and
+display-verified at the reference scale; extreme-scale cone/cylinder lens
+stitching and a microscopic countersink translated to `1e9` remain recorded
+limitations rather than being hidden behind a tolerance increase.
 
 The conical collapse guard samples the supported face's boundary vertices. That
 is sufficient for the current analytic solid trims, whose relevant radial
@@ -78,10 +81,13 @@ extrema occur at those vertices. A future degenerate or nonstandard trim with a
 smaller interior radius must add an analytic interior-extrema query before it
 can enter the supported boundary.
 
-The current 4C review is mechanically blocked. Cone- and torus-banded recuts
-must complete deterministically rather than merely return through the guarded
-failure path; fillet overflow plus deterministic transition ownership are still
-missing. Cylinder-seam imprinting is now verified by the mixed-network Shell
-regression that crosses a rotated primitive-cylinder seam.
-These prerequisites are tracked in `SHELL_FEASIBILITY_V1` during 4A and 4B so
-they cannot first appear as surprises at the 4C review.
+The 4C prerequisite review is green. Cone- and torus-banded recuts now complete
+or reject under deterministic work budgets; the public Extrude ->
+constant-radius Fillet -> Shell fixture exercises the minimal band-end imprint
+needed by Shell; transition owners are canonical and traversal-independent;
+and cylinder-seam imprinting remains pinned by the rotated mixed-network
+regression. The torus/Boolean stall was removed with an analytic line/torus
+quartic path, and exact two-sided pcurves cover torus-plane sections, coaxial
+torus circles, and generated torus-surface curves. The primary fixture removes
+multiple openings, measures wall thickness, writes to real `.zcad` storage,
+reloads, and resolves a downstream retained-face datum.

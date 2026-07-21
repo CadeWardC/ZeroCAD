@@ -5,6 +5,7 @@
 #![allow(clippy::needless_range_loop)]
 //! Modeling algorithms for OpenRCAD (OCCT `TKBool` / `TKGeomAlgo` / `TKFillet`).
 
+pub mod band_topology;
 pub mod blend;
 pub mod bvh;
 pub mod euler;
@@ -18,6 +19,10 @@ pub mod operation;
 pub mod plane_split;
 pub mod shell_feasibility;
 
+pub use band_topology::{
+    BandBoundary, BandOwnerKey, BandSource, BandSupportKind, BandTopologyError, GeometryWorkBudget,
+    GeometryWorkStage,
+};
 pub use blend::BlendError;
 pub use facade::SolidExt;
 pub use heal::{heal_solid_operation, heal_solid_operation_with_policy, HealingError};

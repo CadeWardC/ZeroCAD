@@ -251,8 +251,22 @@ impl StepWriter {
             // STEP readers in the supported subset do not agree on analytic
             // 2D conics beyond circles/ellipses. Preserve the stored interval
             // as a deterministic degree-1 curve instead.
-            GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => {
-                let count = 65;
+            GeomCurve2d::Parabola(_)
+            | GeomCurve2d::Hyperbola(_)
+            | GeomCurve2d::TorusPlaneSection(_)
+            | GeomCurve2d::PlaneTorusSection(_) => {
+                // The two torus-section pcurves are exact inside OpenRCAD but
+                // have no portable AP242 analytic entity. Export a denser,
+                // deterministic representation without changing the durable
+                // in-memory B-Rep curve.
+                let count = if matches!(
+                    curve,
+                    GeomCurve2d::TorusPlaneSection(_) | GeomCurve2d::PlaneTorusSection(_)
+                ) {
+                    257
+                } else {
+                    65
+                };
                 let poles = (0..count)
                     .map(|index| {
                         let fraction = index as f64 / (count - 1) as f64;
@@ -460,6 +474,41 @@ impl StepWriter {
                 }
                 let b = openrcad_geom::BSplineCurve::new(1, poles, None, knots, mults);
                 self.write_curve_ranged(&GeomCurve::BSpline(b), None)
+            }
+            GeomCurve::Reparametrized(curve) => {
+                let (first, last) = range.unwrap_or_else(|| curve.bounds());
+                self.write_curve_ranged(
+                    curve.curve(),
+                    Some((curve.target_parameter(first), curve.target_parameter(last))),
+                )
+            }
+            // AP242 has no portable analytic entities for these exact torus
+            // boundary families. Approximate only the exchange representation;
+            // the operation-owned OpenRCAD B-Rep remains exact.
+            GeomCurve::TorusPlaneSection(_) | GeomCurve::TorusSurfaceCurve(_) => {
+                let (t0, t1) = range.unwrap_or_else(|| curve.bounds());
+                let count = 257;
+                let poles = (0..count)
+                    .map(|index| {
+                        let parameter = t0 + (t1 - t0) * index as f64 / (count - 1) as f64;
+                        curve.point(parameter)
+                    })
+                    .collect::<Vec<_>>();
+                let knots = (0..count)
+                    .map(|index| t0 + (t1 - t0) * index as f64 / (count - 1) as f64)
+                    .collect::<Vec<_>>();
+                let multiplicities = (0..count)
+                    .map(|index| {
+                        if index == 0 || index == count - 1 {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let approximation =
+                    openrcad_geom::BSplineCurve::new(1, poles, None, knots, multiplicities);
+                self.write_curve_ranged(&GeomCurve::BSpline(approximation), None)
             }
         }
     }
@@ -1010,4 +1059,78 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     writeln!(file, "END-ISO-10303-21;")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openrcad_foundation::{Ax3, Vec2d};
+    use openrcad_geom::TorusPlaneSection;
+    use openrcad_geom2d::{PlaneTorusSection2d, TorusPlaneSection2d};
+
+    fn torus_section() -> GeomCurve {
+        GeomCurve::torus_plane_section(TorusPlaneSection::new(
+            Ax3::new(Pnt::new(3.0, -2.0, 7.0), Dir::dz()),
+            8.0,
+            2.0,
+            Dir::dx(),
+            1.0,
+            true,
+        ))
+    }
+
+    #[test]
+    fn exact_torus_boundaries_have_deterministic_step_exchange_approximations() {
+        let curve = torus_section();
+        let torus_pcurve = GeomCurve2d::torus_plane_section(
+            TorusPlaneSection2d::new(0.0, 8.0, 2.0, 1.0, true).unwrap(),
+        );
+        let plane_pcurve = GeomCurve2d::plane_torus_section(
+            PlaneTorusSection2d::new(
+                Pnt2d::new(3.0, -2.0),
+                Vec2d::new(1.0, 0.0),
+                Vec2d::new(0.0, 1.0),
+                8.0,
+                2.0,
+                1.0,
+                true,
+            )
+            .unwrap(),
+        );
+        let range = (0.0, 2.0 * std::f64::consts::PI);
+
+        let serialize = || {
+            let mut writer = StepWriter::new();
+            writer.write_curve_ranged(&curve, Some(range));
+            writer.write_curve2d(&torus_pcurve, range);
+            writer.write_curve2d(&plane_pcurve, range);
+            writer.lines
+        };
+
+        let first = serialize();
+        let second = serialize();
+        assert_eq!(
+            first, second,
+            "STEP approximation must be byte deterministic"
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|line| line.contains("B_SPLINE_CURVE_WITH_KNOTS"))
+                .count(),
+            3,
+            "the exact 3D boundary and both exact pcurves need exchange curves"
+        );
+        assert!(
+            first
+                .iter()
+                .filter(|line| line.contains("CARTESIAN_POINT"))
+                .count()
+                >= 3 * 250,
+            "torus exchange curves retain their deterministic dense sampling"
+        );
+        assert!(matches!(curve, GeomCurve::TorusPlaneSection(_)));
+        assert!(matches!(torus_pcurve, GeomCurve2d::TorusPlaneSection(_)));
+        assert!(matches!(plane_pcurve, GeomCurve2d::PlaneTorusSection(_)));
+    }
 }

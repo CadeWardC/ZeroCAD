@@ -376,16 +376,27 @@ Add cone offsets and plane/cylinder/cone intersections before sphere support.
 Reject disappearing radii, apex collapse, unsupported intersections, and branch
 ambiguity atomically.
 
-Development stops here for this tranche. Stage 4C and Wave 5 remain out of
-scope until a separate go/no-go decision.
+The original tranche stopped here. The separate 4C go/no-go review is now green
+for the bounded regular-torus subset described below.
 
 ### Stage 4C - Torus and fillet bands
+
+**Implemented and verified for regular fillet bands bounded by planar and
+cylindrical supports.**
 
 Complete torus/cone/cylinder band transition, imprinting, and overflow
 prerequisites first. The primary gate is extrusion to constant-radius Fillet to
 Shell across rotation, multiple openings, and the scale matrix. Measure wall
 thickness and require complete history, stable pcurves, and downstream
 reattachment.
+
+The accepted matrix is deliberately narrower than every mathematically
+possible torus network: cone/torus and uniquely classifiable torus/torus have
+exact kernel intersections but remain typed Shell rejections until they gain
+full trim/history acceptance fixtures; sphere/torus remains outside the 4C
+subset. The primary public-document fixture covers two openings, complete
+pcurves/history, measured thickness, real disk reload, and a downstream named
+face consumer across `1e-3..1e3`, rotation, and far-origin kernel sweeps.
 
 Arbitrary freeform NURBS surfaces remain unsupported.
 

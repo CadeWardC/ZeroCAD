@@ -191,7 +191,7 @@ const OFFSETS: &[ShellOffsetCapability] = &[
     ShellOffsetCapability {
         support: ShellSupportKind::Torus,
         required_by: ShellMilestone::Stage4C,
-        state: ShellCapabilityState::Missing,
+        state: ShellCapabilityState::VerifiedInShell,
     },
     ShellOffsetCapability {
         support: ShellSupportKind::Nurbs,
@@ -229,7 +229,7 @@ const INTERSECTIONS: &[ShellIntersectionCapability] = &[
         ShellSupportKind::Plane,
         ShellSupportKind::Torus,
         ShellMilestone::Stage4C,
-        ShellCapabilityState::GenericFallbackOnly,
+        ShellCapabilityState::VerifiedInShell,
     ),
     intersection(
         ShellSupportKind::Plane,
@@ -259,7 +259,7 @@ const INTERSECTIONS: &[ShellIntersectionCapability] = &[
         ShellSupportKind::Cylinder,
         ShellSupportKind::Torus,
         ShellMilestone::Stage4C,
-        ShellCapabilityState::GenericFallbackOnly,
+        ShellCapabilityState::VerifiedInShell,
     ),
     intersection(
         ShellSupportKind::Cylinder,
@@ -283,7 +283,7 @@ const INTERSECTIONS: &[ShellIntersectionCapability] = &[
         ShellSupportKind::Cone,
         ShellSupportKind::Torus,
         ShellMilestone::Stage4C,
-        ShellCapabilityState::GenericFallbackOnly,
+        ShellCapabilityState::AnalyticKernelOnly,
     ),
     intersection(
         ShellSupportKind::Cone,
@@ -313,7 +313,7 @@ const INTERSECTIONS: &[ShellIntersectionCapability] = &[
         ShellSupportKind::Torus,
         ShellSupportKind::Torus,
         ShellMilestone::Stage4C,
-        ShellCapabilityState::GenericFallbackOnly,
+        ShellCapabilityState::AnalyticKernelOnly,
     ),
     intersection(
         ShellSupportKind::Torus,
@@ -405,11 +405,11 @@ const SELF_INTERSECTION: &[ShellSelfIntersectionStep] = &[
 const STAGE4C_PREREQUISITES: &[ShellPrerequisiteStatus] = &[
     prerequisite(
         ShellStage4CPrerequisite::ConeBandRecutCompletes,
-        ShellPrerequisiteState::Investigating,
+        ShellPrerequisiteState::Verified,
     ),
     prerequisite(
         ShellStage4CPrerequisite::TorusBandRecutCompletes,
-        ShellPrerequisiteState::Blocked,
+        ShellPrerequisiteState::Verified,
     ),
     prerequisite(
         ShellStage4CPrerequisite::CylinderSeamImprinting,
@@ -417,11 +417,11 @@ const STAGE4C_PREREQUISITES: &[ShellPrerequisiteStatus] = &[
     ),
     prerequisite(
         ShellStage4CPrerequisite::FilletBandOverflow,
-        ShellPrerequisiteState::Blocked,
+        ShellPrerequisiteState::Verified,
     ),
     prerequisite(
         ShellStage4CPrerequisite::DeterministicBandOwnership,
-        ShellPrerequisiteState::Blocked,
+        ShellPrerequisiteState::Verified,
     ),
 ];
 

@@ -4,11 +4,13 @@
 use openrcad_foundation::{Ax3, Dir, Pnt, Vec as GeomVec};
 use openrcad_geom::{
     BSplineCurve, Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve,
-    GeomSurface, Plane, Surface,
+    GeomSurface, Plane, Surface, ToroidalSurface, TorusPlaneSection,
 };
 use openrcad_topo::{containment::point_in_polygon_2d, Face, Orientation};
 
 use core::f64::consts::PI;
+
+use crate::band_topology::{BandTopologyError, GeometryWorkBudget, GeometryWorkStage};
 
 /// Wrap an angle into `[0, 2π)`.
 #[inline]
@@ -48,6 +50,180 @@ fn solve_quadratic(a: f64, b: f64, c: f64) -> Vec<f64> {
             }
         }
     }
+}
+
+/// Deterministic real roots of a polynomial in descending coefficient order.
+///
+/// Recursive derivative isolation partitions the real line into monotone
+/// intervals. Sign-changing intervals contain one root and are bisected;
+/// critical points are checked separately so even-multiplicity tangencies are
+/// retained. All zero/dedup thresholds are derived from coefficient arithmetic
+/// and machine precision rather than a model-unit floor.
+fn real_polynomial_roots(coefficients: &[f64]) -> Vec<f64> {
+    let coefficient_scale = coefficients
+        .iter()
+        .map(|coefficient| coefficient.abs())
+        .fold(0.0, f64::max);
+    if !coefficient_scale.is_finite() || coefficient_scale == 0.0 {
+        return Vec::new();
+    }
+    let first = coefficients
+        .iter()
+        // Coefficients carry different physical powers of the line parameter;
+        // comparing a leading coefficient with the constant term invents a
+        // unit scale and incorrectly reduces degree for large geometry.
+        .position(|coefficient| *coefficient != 0.0)
+        .unwrap_or(coefficients.len());
+    if first == coefficients.len() {
+        return Vec::new();
+    }
+    let normalized: Vec<_> = coefficients[first..]
+        .iter()
+        .map(|coefficient| coefficient / coefficient_scale)
+        .collect();
+    let degree = normalized.len() - 1;
+    if degree == 0 {
+        return Vec::new();
+    }
+    if degree == 1 {
+        return vec![-normalized[1] / normalized[0]];
+    }
+
+    let derivative: Vec<_> = normalized[..degree]
+        .iter()
+        .enumerate()
+        .map(|(index, coefficient)| coefficient * (degree - index) as f64)
+        .collect();
+    let mut critical = real_polynomial_roots(&derivative);
+    critical.sort_by(f64::total_cmp);
+    // Fujiwara's bound accounts for each coefficient's parameter power. A
+    // plain Cauchy max would give a length^4 constant term the same weight as
+    // a length coefficient, producing an enormous artificial bound and then
+    // deduplicating distinct roots at large scales.
+    let bound = 2.0
+        * normalized[1..]
+            .iter()
+            .enumerate()
+            .map(|(index, coefficient)| {
+                (coefficient / normalized[0])
+                    .abs()
+                    .powf(1.0 / (index + 1) as f64)
+            })
+            .fold(f64::MIN_POSITIVE, f64::max);
+    let evaluate = |value: f64| {
+        normalized
+            .iter()
+            .fold(0.0, |result, coefficient| result * value + coefficient)
+    };
+    let evaluation_tolerance = |value: f64| {
+        let magnitude = normalized.iter().fold(0.0, |result, coefficient| {
+            result * value.abs() + coefficient.abs()
+        });
+        magnitude * f64::EPSILON * 256.0
+    };
+
+    let mut roots = Vec::new();
+    for &point in &critical {
+        if point >= -bound && point <= bound && evaluate(point).abs() <= evaluation_tolerance(point)
+        {
+            roots.push(point);
+        }
+    }
+    let mut partitions = Vec::with_capacity(critical.len() + 2);
+    partitions.push(-bound);
+    partitions.extend(
+        critical
+            .into_iter()
+            .filter(|point| *point > -bound && *point < bound),
+    );
+    partitions.push(bound);
+    for interval in partitions.windows(2) {
+        let (mut left, mut right) = (interval[0], interval[1]);
+        let mut left_value = evaluate(left);
+        let right_value = evaluate(right);
+        if left_value == 0.0 {
+            roots.push(left);
+            continue;
+        }
+        if right_value == 0.0 {
+            roots.push(right);
+            continue;
+        }
+        if left_value.is_sign_positive() == right_value.is_sign_positive() {
+            continue;
+        }
+        for _ in 0..96 {
+            let middle = left * 0.5 + right * 0.5;
+            let middle_value = evaluate(middle);
+            if middle_value == 0.0 {
+                left = middle;
+                right = middle;
+                break;
+            }
+            if left_value.is_sign_positive() == middle_value.is_sign_positive() {
+                left = middle;
+                left_value = middle_value;
+            } else {
+                right = middle;
+            }
+        }
+        roots.push(left * 0.5 + right * 0.5);
+    }
+    roots.sort_by(f64::total_cmp);
+    let dedup_tolerance = bound * f64::EPSILON * 4096.0;
+    roots.dedup_by(|left, right| (*left - *right).abs() <= dedup_tolerance);
+    roots
+}
+
+/// Exact line intersection with a regular torus via its implicit quartic.
+fn line_torus(origin: &Pnt, direction: &GeomVec, torus: &ToroidalSurface) -> Vec<Pnt> {
+    let frame = torus.position();
+    let offset = *origin - frame.location();
+    let x_axis = GeomVec::from_dir(frame.x_direction());
+    let y_axis = GeomVec::from_dir(frame.y_direction());
+    let z_axis = GeomVec::from_dir(frame.direction());
+    let mut local_origin = GeomVec::new(
+        offset.dot(&x_axis),
+        offset.dot(&y_axis),
+        offset.dot(&z_axis),
+    );
+    let local_direction = GeomVec::new(
+        direction.dot(&x_axis),
+        direction.dot(&y_axis),
+        direction.dot(&z_axis),
+    );
+    let direction_squared = local_direction.dot(&local_direction);
+    if direction_squared <= f64::MIN_POSITIVE {
+        return Vec::new();
+    }
+    // Form the quartic around the point on the line nearest the torus frame,
+    // not around the caller's arbitrary ray origin. Otherwise a unit torus at
+    // a 1e9 translation produces coefficients spanning ~36 decimal orders and
+    // spurious real roots before any root-isolation tolerance is involved.
+    let parameter_shift = -local_origin.dot(&local_direction) / direction_squared;
+    local_origin += local_direction * parameter_shift;
+    let origin_direction = 2.0 * local_origin.dot(&local_direction);
+    let radius_term = local_origin.dot(&local_origin) + torus.major_radius() * torus.major_radius()
+        - torus.minor_radius() * torus.minor_radius();
+    let radial_origin_squared =
+        local_origin.x() * local_origin.x() + local_origin.y() * local_origin.y();
+    let radial_origin_direction =
+        2.0 * (local_origin.x() * local_direction.x() + local_origin.y() * local_direction.y());
+    let radial_direction_squared =
+        local_direction.x() * local_direction.x() + local_direction.y() * local_direction.y();
+    let four_major_squared = 4.0 * torus.major_radius() * torus.major_radius();
+    let coefficients = [
+        direction_squared * direction_squared,
+        2.0 * direction_squared * origin_direction,
+        origin_direction * origin_direction + 2.0 * direction_squared * radius_term
+            - four_major_squared * radial_direction_squared,
+        2.0 * origin_direction * radius_term - four_major_squared * radial_origin_direction,
+        radius_term * radius_term - four_major_squared * radial_origin_squared,
+    ];
+    real_polynomial_roots(&coefficients)
+        .into_iter()
+        .map(|parameter| *origin + *direction * (parameter_shift + parameter))
+        .collect()
 }
 
 /// The analytic surface parameters `(u, v)` of a 3D point `p`.
@@ -104,7 +280,9 @@ pub fn uv_of(s: &GeomSurface, p: &Pnt) -> (f64, f64) {
             None => search_nearest_parameter_newton(s, p, (0.0, 0.0)),
         },
         GeomSurface::Offset(offset) => match offset.base.as_ref() {
-            GeomSurface::Plane(_) | GeomSurface::Cylinder(_) => uv_of(&offset.base, p),
+            GeomSurface::Plane(_) | GeomSurface::Cylinder(_) | GeomSurface::Torus(_) => {
+                uv_of(&offset.base, p)
+            }
             GeomSurface::Cone(cone) => {
                 let (u, axial, _) = axial_uv(&cone.position(), p);
                 (u, axial + offset.distance * cone.semi_angle().sin())
@@ -195,8 +373,8 @@ pub fn line_surface(origin: &Pnt, dir: &GeomVec, s: &GeomSurface) -> Option<Vec<
             let qc = oc_perp.dot(&oc_perp) - a0 * a0;
             Some(solve_quadratic(qa, qb, qc).into_iter().map(pt).collect())
         }
-        GeomSurface::Torus(_)
-        | GeomSurface::BSpline(_)
+        GeomSurface::Torus(torus) => Some(line_torus(origin, dir, torus)),
+        GeomSurface::BSpline(_)
         | GeomSurface::Gregory(_)
         | GeomSurface::Offset(_)
         | GeomSurface::Ruled(_) => None,
@@ -978,7 +1156,11 @@ fn curve_surface_refine(
 
 /// Exact intersection curves for analytically tractable surface pairs. Returns
 /// `None` when no closed-form case applies (caller falls back to subdivision).
-fn analytic_surface_surface(s1: &GeomSurface, s2: &GeomSurface) -> Option<Vec<GeomCurve>> {
+pub(crate) fn analytic_surface_surface(
+    s1: &GeomSurface,
+    s2: &GeomSurface,
+    tol: f64,
+) -> Option<Vec<GeomCurve>> {
     // Plane ∩ plane is an infinite line (empty when parallel — the coplanar case
     // is handled separately by the boolean engine).
     if let (GeomSurface::Plane(p1), GeomSurface::Plane(p2)) = (s1, s2) {
@@ -1029,8 +1211,297 @@ fn analytic_surface_surface(s1: &GeomSurface, s2: &GeomSurface) -> Option<Vec<Ge
         | (GeomSurface::Sphere(sphere), GeomSurface::Plane(plane)) => {
             Some(plane_sphere_curves(plane, sphere))
         }
+        (GeomSurface::Plane(plane), GeomSurface::Torus(torus))
+        | (GeomSurface::Torus(torus), GeomSurface::Plane(plane)) => {
+            plane_torus_curves(plane, torus, tol)
+        }
+        (GeomSurface::Cylinder(cylinder), GeomSurface::Torus(torus))
+        | (GeomSurface::Torus(torus), GeomSurface::Cylinder(cylinder)) => {
+            coaxial_cylinder_torus_curves(cylinder, torus, tol)
+        }
+        (GeomSurface::Cone(cone), GeomSurface::Torus(torus))
+        | (GeomSurface::Torus(torus), GeomSurface::Cone(cone)) => {
+            coaxial_cone_torus_curves(cone, torus, tol)
+        }
+        (GeomSurface::Torus(first), GeomSurface::Torus(second)) => {
+            coaxial_torus_torus_curves(first, second, tol)
+        }
         _ => None,
     }
+}
+
+fn characteristic_length(values: impl IntoIterator<Item = f64>, tol: f64) -> f64 {
+    values
+        .into_iter()
+        .map(f64::abs)
+        .chain(core::iter::once(tol.abs()))
+        .fold(f64::MIN_POSITIVE, f64::max)
+}
+
+fn axes_are_coaxial(first: &Ax3, second: &Ax3, scale: f64, tol: f64) -> Option<f64> {
+    let first_direction = GeomVec::from_dir(first.direction());
+    let second_direction = GeomVec::from_dir(second.direction());
+    let alignment = first_direction.dot(&second_direction);
+    let angular_tolerance = tol.abs() / scale + f64::EPSILON * 64.0;
+    if first_direction.cross(&second_direction).magnitude() > angular_tolerance {
+        return None;
+    }
+    let offset = second.location() - first.location();
+    let radial = offset - first_direction * offset.dot(&first_direction);
+    let linear_tolerance = tol.abs() + scale * f64::EPSILON * 64.0;
+    (radial.magnitude() <= linear_tolerance).then_some(alignment.signum())
+}
+
+fn circle_on_axis(frame: &Ax3, axial: f64, radius: f64) -> GeomCurve {
+    let direction = GeomVec::from_dir(frame.direction());
+    let center = frame.location() + direction * axial;
+    GeomCurve::Circle(Circle::new(
+        Ax3::new_axes(center, frame.direction(), frame.x_direction()),
+        radius,
+    ))
+}
+
+/// Exact perpendicular plane/regular-torus sections.  The two possible rings
+/// are kept as independent periodic branches rather than sampled splines.
+fn plane_torus_curves(plane: &Plane, torus: &ToroidalSurface, tol: f64) -> Option<Vec<GeomCurve>> {
+    let frame = torus.position();
+    let scale = characteristic_length([torus.major_radius(), torus.minor_radius()], tol);
+    let axis = GeomVec::from_dir(frame.direction());
+    let normal = GeomVec::from_dir(plane.normal());
+    let angular_tolerance = tol.abs() / scale + f64::EPSILON * 64.0;
+    let alignment = axis.dot(&normal).abs();
+    if alignment <= angular_tolerance {
+        let signed_offset = (plane.location() - frame.location()).dot(&normal);
+        let linear_tolerance = tol.abs() + scale * f64::EPSILON * 64.0;
+        if signed_offset.abs() > linear_tolerance {
+            if signed_offset.abs() >= torus.major_radius() - torus.minor_radius() - linear_tolerance
+            {
+                // Beyond the inner radius, branches split or vanish. The
+                // bounded 4C curve type intentionally covers only two regular
+                // closed branches and rejects this ambiguous regime.
+                return None;
+            }
+            return Some(
+                [true, false]
+                    .into_iter()
+                    .map(|positive_branch| {
+                        GeomCurve::torus_plane_section(TorusPlaneSection::new(
+                            frame,
+                            torus.major_radius(),
+                            torus.minor_radius(),
+                            plane.normal(),
+                            signed_offset,
+                            positive_branch,
+                        ))
+                    })
+                    .collect(),
+            );
+        }
+        let radial = axis.cross(&normal).normalized()?;
+        let radial = GeomVec::from_dir(radial);
+        return Some(
+            [1.0, -1.0]
+                .into_iter()
+                .map(|side| {
+                    let x_direction = (radial * side).normalized().expect("unit radial");
+                    let circle_center = frame.location() + radial * (side * torus.major_radius());
+                    GeomCurve::Circle(Circle::new(
+                        Ax3::new_axes(circle_center, plane.normal(), x_direction),
+                        torus.minor_radius(),
+                    ))
+                })
+                .collect(),
+        );
+    }
+    if (alignment - 1.0).abs() > angular_tolerance {
+        return None;
+    }
+    let denominator = axis.dot(&normal);
+    let axial = (plane.location() - frame.location()).dot(&normal) / denominator;
+    let squared = torus.minor_radius().powi(2) - axial.powi(2);
+    let squared_tolerance = tol.abs() * (torus.minor_radius().abs() + axial.abs() + tol.abs())
+        + scale.powi(2) * f64::EPSILON * 64.0;
+    if squared < -squared_tolerance {
+        return Some(Vec::new());
+    }
+    let meridian = squared.max(0.0).sqrt();
+    let mut radii = vec![torus.major_radius() + meridian];
+    let inner = torus.major_radius() - meridian;
+    if inner > tol.abs() && (inner - radii[0]).abs() > tol.abs() {
+        radii.push(inner);
+    }
+    Some(
+        radii
+            .into_iter()
+            .map(|radius| circle_on_axis(&frame, axial, radius))
+            .collect(),
+    )
+}
+
+fn coaxial_cylinder_torus_curves(
+    cylinder: &CylindricalSurface,
+    torus: &ToroidalSurface,
+    tol: f64,
+) -> Option<Vec<GeomCurve>> {
+    let scale = characteristic_length(
+        [
+            cylinder.radius(),
+            torus.major_radius(),
+            torus.minor_radius(),
+        ],
+        tol,
+    );
+    axes_are_coaxial(&torus.position(), &cylinder.position(), scale, tol)?;
+    let radial_delta = cylinder.radius() - torus.major_radius();
+    let squared = torus.minor_radius().powi(2) - radial_delta.powi(2);
+    let squared_tolerance = tol.abs()
+        * (torus.minor_radius().abs() + radial_delta.abs() + tol.abs())
+        + scale.powi(2) * f64::EPSILON * 64.0;
+    if squared < -squared_tolerance {
+        return Some(Vec::new());
+    }
+    let axial = squared.max(0.0).sqrt();
+    let mut curves = vec![circle_on_axis(&torus.position(), axial, cylinder.radius())];
+    if axial > tol.abs() {
+        curves.push(circle_on_axis(&torus.position(), -axial, cylinder.radius()));
+    }
+    Some(curves)
+}
+
+fn normalized_quadratic_roots(a: f64, b: f64, c: f64) -> Vec<f64> {
+    let coefficient_scale = a.abs().max(b.abs()).max(c.abs());
+    if coefficient_scale == 0.0 {
+        return Vec::new();
+    }
+    let (a, b, c) = (
+        a / coefficient_scale,
+        b / coefficient_scale,
+        c / coefficient_scale,
+    );
+    let numeric = f64::EPSILON * 128.0;
+    if a.abs() <= numeric {
+        return (b.abs() > numeric).then(|| -c / b).into_iter().collect();
+    }
+    let discriminant = b * b - 4.0 * a * c;
+    let discriminant_tolerance = numeric * (b * b + (4.0 * a * c).abs());
+    if discriminant < -discriminant_tolerance {
+        return Vec::new();
+    }
+    let root = discriminant.max(0.0).sqrt();
+    let q = -0.5 * (b + root.copysign(b));
+    if q.abs() <= numeric {
+        return vec![-b / (2.0 * a)];
+    }
+    let first = q / a;
+    let second = c / q;
+    if (first - second).abs() <= numeric * first.abs().max(second.abs()).max(1.0) {
+        vec![first]
+    } else {
+        vec![first, second]
+    }
+}
+
+fn coaxial_cone_torus_curves(
+    cone: &ConicalSurface,
+    torus: &ToroidalSurface,
+    tol: f64,
+) -> Option<Vec<GeomCurve>> {
+    let frame = torus.position();
+    let scale = characteristic_length(
+        [
+            cone.ref_radius(),
+            torus.major_radius(),
+            torus.minor_radius(),
+            (frame.location() - cone.position().location()).magnitude(),
+        ],
+        tol,
+    );
+    let direction_sign = axes_are_coaxial(&frame, &cone.position(), scale, tol)?;
+    let cone_height_at_torus_origin = (frame.location() - cone.position().location())
+        .dot(&GeomVec::from_dir(cone.position().direction()));
+    let slope = cone.semi_angle().tan();
+    let radial_at_origin = cone.ref_radius() + slope * cone_height_at_torus_origin;
+    let radial_slope = slope * direction_sign;
+
+    // Solve in normalized meridian coordinates z'=z/scale, keeping the
+    // coefficient comparison dimensionless across the mandatory scale sweep.
+    let offset = (radial_at_origin - torus.major_radius()) / scale;
+    let minor = torus.minor_radius() / scale;
+    let roots = normalized_quadratic_roots(
+        radial_slope * radial_slope + 1.0,
+        2.0 * offset * radial_slope,
+        offset * offset - minor * minor,
+    );
+    let mut curves = Vec::new();
+    for normalized_axial in roots {
+        let axial = normalized_axial * scale;
+        let radius = radial_at_origin + radial_slope * axial;
+        if radius > tol.abs() {
+            curves.push(circle_on_axis(&frame, axial, radius));
+        }
+    }
+    Some(curves)
+}
+
+fn coaxial_torus_torus_curves(
+    first: &ToroidalSurface,
+    second: &ToroidalSurface,
+    tol: f64,
+) -> Option<Vec<GeomCurve>> {
+    let first_frame = first.position();
+    let scale = characteristic_length(
+        [
+            first.major_radius(),
+            first.minor_radius(),
+            second.major_radius(),
+            second.minor_radius(),
+            (second.position().location() - first_frame.location()).magnitude(),
+        ],
+        tol,
+    );
+    axes_are_coaxial(&first_frame, &second.position(), scale, tol)?;
+    let axis = GeomVec::from_dir(first_frame.direction());
+    let second_axial = (second.position().location() - first_frame.location()).dot(&axis);
+    let dx = second.major_radius() - first.major_radius();
+    let dz = second_axial;
+    let center_distance = dx.hypot(dz);
+    let linear_tolerance = tol.abs() + scale * f64::EPSILON * 64.0;
+    if center_distance <= linear_tolerance {
+        // Coincident meridian circles are the same-domain case; unequal radii
+        // do not meet.  Neither case owns a unique transition boundary.
+        return Some(Vec::new());
+    }
+    let r1 = first.minor_radius();
+    let r2 = second.minor_radius();
+    if center_distance > r1 + r2 + linear_tolerance
+        || center_distance < (r1 - r2).abs() - linear_tolerance
+    {
+        return Some(Vec::new());
+    }
+    let along = (r1 * r1 - r2 * r2 + center_distance * center_distance) / (2.0 * center_distance);
+    let height_squared = r1 * r1 - along * along;
+    let squared_tolerance = linear_tolerance * (r1.abs() + along.abs() + linear_tolerance);
+    if height_squared < -squared_tolerance {
+        return Some(Vec::new());
+    }
+    let height = height_squared.max(0.0).sqrt();
+    let radial_unit = dx / center_distance;
+    let axial_unit = dz / center_distance;
+    let base_radius = first.major_radius() + along * radial_unit;
+    let base_axial = along * axial_unit;
+    let perpendicular = [(-axial_unit, radial_unit), (axial_unit, -radial_unit)];
+    let mut curves = Vec::new();
+    for (index, (radial_direction, axial_direction)) in perpendicular.into_iter().enumerate() {
+        if index == 1 && height <= linear_tolerance {
+            break;
+        }
+        let radius = base_radius + height * radial_direction;
+        let axial = base_axial + height * axial_direction;
+        if radius > linear_tolerance {
+            curves.push(circle_on_axis(&first_frame, axial, radius));
+        }
+    }
+    Some(curves)
 }
 
 fn plane_sphere_curves(plane: &Plane, sphere: &openrcad_geom::SphericalSurface) -> Vec<GeomCurve> {
@@ -1233,8 +1704,20 @@ fn cylinder_cylinder_curves(c1: &CylindricalSurface, c2: &CylindricalSurface) ->
 
 /// Find intersection curves between two surfaces.
 pub fn surface_surface(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> Vec<GeomCurve> {
-    if let Some(curves) = analytic_surface_surface(s1, s2) {
-        return curves;
+    let mut budget = GeometryWorkBudget::intersection_default();
+    surface_surface_with_budget(s1, s2, tol, &mut budget).unwrap_or_default()
+}
+
+/// Budgeted surface/surface intersection for atomic modeling operations.
+pub fn surface_surface_with_budget(
+    s1: &GeomSurface,
+    s2: &GeomSurface,
+    tol: f64,
+    budget: &mut GeometryWorkBudget,
+) -> Result<Vec<GeomCurve>, BandTopologyError> {
+    budget.charge(GeometryWorkStage::Intersection, 1)?;
+    if let Some(curves) = analytic_surface_surface(s1, s2, tol) {
+        return Ok(curves);
     }
     let (u1_min, u1_max, v1_min, v1_max) = s1.bounds();
     let (u2_min, u2_max, v2_min, v2_max) = s2.bounds();
@@ -1253,7 +1736,10 @@ pub fn surface_surface(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> Vec<Geom
     // This replaces the previous uniform 16×16×16×16 grid (O(16⁴) regardless of
     // whether the surfaces meet): the pruning makes the work proportional to the
     // actual intersection set, and a real intersection can never be dropped.
-    let tau = |a: f64, b: f64| ((b - a) / 24.0).max(1e-6);
+    let tau = |a: f64, b: f64| {
+        let arithmetic = (a.abs() + b.abs()).max(f64::MIN_POSITIVE) * f64::EPSILON * 64.0;
+        ((b - a).abs() / 24.0).max(arithmetic)
+    };
     let tauu1 = tau(u1_min, u1_max);
     let tauv1 = tau(v1_min, v1_max);
     let tauu2 = tau(u2_min, u2_max);
@@ -1275,7 +1761,8 @@ pub fn surface_surface(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> Vec<Geom
         0,
         (tauu1, tauv1, tauu2, tauv2),
         &mut intersection_points,
-    );
+        budget,
+    )?;
 
     let chain_tol = nearest_neighbour_chain_tol(&intersection_points, tol);
 
@@ -1288,7 +1775,7 @@ pub fn surface_surface(s1: &GeomSurface, s2: &GeomSurface, tol: f64) -> Vec<Geom
         }
     }
 
-    curves
+    Ok(curves)
 }
 
 fn eval_d1(s: &GeomSurface, u: f64, v: f64) -> (Pnt, GeomVec, GeomVec) {
@@ -1316,7 +1803,9 @@ fn ssi_subdivide(
     depth: usize,
     tau: (f64, f64, f64, f64),
     out: &mut Vec<Pnt>,
-) {
+    budget: &mut GeometryWorkBudget,
+) -> Result<(), BandTopologyError> {
+    budget.charge(GeometryWorkStage::Intersection, 1)?;
     let mut b1 = s1
         .interval_point(u1_min, u1_max, v1_min, v1_max)
         .to_bndbox();
@@ -1326,7 +1815,7 @@ fn ssi_subdivide(
         .to_bndbox();
     b2.enlarge(tol);
     if b1.is_out_box(&b2) {
-        return;
+        return Ok(());
     }
 
     let (tauu1, tauv1, tauu2, tauv2) = tau;
@@ -1347,7 +1836,7 @@ fn ssi_subdivide(
                 out.push(p);
             }
         }
-        return;
+        return Ok(());
     }
 
     // Bisect the most-oversized parameter dimension (width / target), holding
@@ -1379,7 +1868,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
             ssi_subdivide(
                 s1,
                 mid,
@@ -1395,7 +1885,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
         }
         1 => {
             let mid = 0.5 * (v1_min + v1_max);
@@ -1414,7 +1905,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
             ssi_subdivide(
                 s1,
                 u1_min,
@@ -1430,7 +1922,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
         }
         2 => {
             let mid = 0.5 * (u2_min + u2_max);
@@ -1449,7 +1942,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
             ssi_subdivide(
                 s1,
                 u1_min,
@@ -1465,7 +1959,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
         }
         _ => {
             let mid = 0.5 * (v2_min + v2_max);
@@ -1484,7 +1979,8 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
             ssi_subdivide(
                 s1,
                 u1_min,
@@ -1500,9 +1996,11 @@ fn ssi_subdivide(
                 depth + 1,
                 tau,
                 out,
-            );
+                budget,
+            )?;
         }
     }
+    Ok(())
 }
 
 /// Chaining tolerance for the intersection-point polyline: ~2× the median
@@ -1510,7 +2008,7 @@ fn ssi_subdivide(
 /// the parametrisation's scale maps to world distance.
 fn nearest_neighbour_chain_tol(pts: &[Pnt], tol: f64) -> f64 {
     if pts.len() < 2 {
-        return tol.max(1e-6);
+        return tol.abs();
     }
     let mut gaps: Vec<f64> = (0..pts.len())
         .map(|i| {
@@ -1867,16 +2365,28 @@ pub fn ray_face(ray_origin: &Pnt, ray_dir: &GeomVec, face: &Face, tol: f64) -> O
 ///
 /// Intersects the host surfaces and trims the resulting curves to the boundaries of both faces.
 pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(GeomCurve, f64, f64)> {
+    let mut budget = GeometryWorkBudget::intersection_default();
+    surface_surface_curves_with_budget(face1, face2, tol, &mut budget).unwrap_or_default()
+}
+
+/// Budgeted face/face intersection used by operations that must reject
+/// atomically instead of treating an exhausted solver as "no intersection".
+pub fn surface_surface_curves_with_budget(
+    face1: &Face,
+    face2: &Face,
+    tol: f64,
+    budget: &mut GeometryWorkBudget,
+) -> Result<Vec<(GeomCurve, f64, f64)>, BandTopologyError> {
     let s1 = match face1.surface() {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let s2 = match face2.surface() {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
-    let raw_curves = surface_surface(s1, s2, tol);
+    let raw_curves = surface_surface_with_budget(s1, s2, tol, budget)?;
     let mut trimmed_curves = Vec::new();
     let debug = std::env::var_os("OPENRCAD_BOOLEAN_DEBUG").is_some()
         && matches!(
@@ -2031,7 +2541,7 @@ pub fn surface_surface_curves(face1: &Face, face2: &Face, tol: f64) -> Vec<(Geom
         }
     }
 
-    trimmed_curves
+    Ok(trimmed_curves)
 }
 
 /// Inclusive boundary membership used while trimming intersection curves.
@@ -2194,7 +2704,7 @@ pub fn trim_curve_to_face(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openrcad_foundation::{Ax1, Dir};
+    use openrcad_foundation::{Ax1, Ax3, Dir, Trsf};
     use openrcad_geom::{Line, Plane};
 
     #[test]
@@ -2281,6 +2791,61 @@ mod tests {
         let hit = curve_curve(&circle, &vline, 1e-6);
         assert_eq!(hit.len(), 1);
         assert!(hit[0].distance(&Pnt::new(1.0, 0.0, 0.0)) < 1e-9);
+    }
+
+    #[test]
+    fn analytic_line_torus_quartic_holds_across_scale_rotation_and_origin() {
+        let base = ToroidalSurface::new(Ax3::new(Pnt::origin(), Dir::dz()), 4.0, 1.0);
+        for (label, transform) in [
+            ("small", Trsf::scale(&Pnt::origin(), 1.0e-3)),
+            (
+                "rotated",
+                Trsf::rotation(
+                    &Ax1::new(Pnt::origin(), Dir::new(1.0, 2.0, 3.0)),
+                    37.0_f64.to_radians(),
+                ),
+            ),
+            (
+                "far",
+                Trsf::translation(GeomVec::new(1.0e9, -2.0e9, 3.0e9))
+                    .multiply(&Trsf::scale(&Pnt::origin(), 1.0e3)),
+            ),
+        ] {
+            let torus = base.transformed(&transform);
+            let direction = GeomVec::from_dir(torus.position().x_direction());
+            let origin = torus.position().location()
+                - direction * (torus.major_radius() + torus.minor_radius()) * 2.0;
+            let points = line_surface(&origin, &direction, &GeomSurface::torus(torus))
+                .expect("torus has an analytic line intersection");
+            assert_eq!(points.len(), 4, "{label}: {points:?}");
+            let arithmetic_tolerance = points
+                .iter()
+                .flat_map(|point| [point.x().abs(), point.y().abs(), point.z().abs()])
+                .fold(torus.major_radius() + torus.minor_radius(), f64::max)
+                * f64::EPSILON
+                * 512.0;
+            for point in points {
+                let (u, v) = uv_of(&GeomSurface::torus(torus), &point);
+                assert!(
+                    point.distance(&torus.point(u, v)) <= arithmetic_tolerance,
+                    "quartic root left the torus at {point:?}"
+                );
+            }
+        }
+
+        // A global Cauchy-style dedup tolerance used to merge these four
+        // crossings because the ray parameter is near 1e9 even though the
+        // torus itself is unit scale. Keep the parameter origin independent of
+        // the geometry origin so this numerical regime remains pinned.
+        let distant =
+            ToroidalSurface::new(Ax3::new(Pnt::new(1.0e9, 0.0, 0.0), Dir::dz()), 4.0, 1.0);
+        let points = line_surface(
+            &Pnt::origin(),
+            &GeomVec::from_dir(Dir::dx()),
+            &GeomSurface::torus(distant),
+        )
+        .expect("distant torus has an analytic line intersection");
+        assert_eq!(points.len(), 4, "distant ray crossings: {points:?}");
     }
 
     #[test]

@@ -219,6 +219,12 @@ impl PcurveData {
                 )),
                 1.0,
             ),
+            // This curve's parameters are torus angles, so it is meaningful
+            // only under the identity UV map handled above. Any anisotropic
+            // coordinate change must rebuild and revalidate the pcurve from
+            // its exact 3D section instead.
+            GeomCurve2d::TorusPlaneSection(_) => return None,
+            GeomCurve2d::PlaneTorusSection(_) => return None,
             _ => return None,
         };
 

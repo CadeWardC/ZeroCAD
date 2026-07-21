@@ -22,7 +22,9 @@ pub mod ellipse;
 pub mod hyperbola;
 pub mod line;
 pub mod parabola;
+pub mod plane_torus_section;
 pub mod span;
+pub mod torus_plane_section;
 
 pub use bspline::BSplineCurve2d;
 pub use circle::Circle2d;
@@ -31,7 +33,9 @@ pub use ellipse::Ellipse2d;
 pub use hyperbola::Hyperbola2d;
 pub use line::Line2d;
 pub use parabola::Parabola2d;
+pub use plane_torus_section::PlaneTorusSection2d;
 pub use span::{CurveKind2d, CurveSpan};
+pub use torus_plane_section::TorusPlaneSection2d;
 
 /// An owned 2D curve: one of the concrete [`Curve2d`]s, storable by value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +52,11 @@ pub enum GeomCurve2d {
     Hyperbola(Hyperbola2d),
     /// A B-spline or NURBS curve.
     BSpline(BSplineCurve2d),
+    /// Exact pcurve of an axis-parallel plane section on a torus. Appended to
+    /// preserve every existing serialized discriminant.
+    TorusPlaneSection(TorusPlaneSection2d),
+    /// Exact regular-torus section in the cutting plane's parameter space.
+    PlaneTorusSection(PlaneTorusSection2d),
 }
 
 impl GeomCurve2d {
@@ -86,6 +95,18 @@ impl GeomCurve2d {
     pub fn bspline(b: BSplineCurve2d) -> Self {
         Self::BSpline(b)
     }
+
+    /// Construct an exact torus/plane-section pcurve.
+    #[inline]
+    pub fn torus_plane_section(section: TorusPlaneSection2d) -> Self {
+        Self::TorusPlaneSection(section)
+    }
+
+    /// Construct an exact torus section in its cutting plane's coordinates.
+    #[inline]
+    pub fn plane_torus_section(section: PlaneTorusSection2d) -> Self {
+        Self::PlaneTorusSection(section)
+    }
 }
 
 impl Curve2d for GeomCurve2d {
@@ -97,6 +118,8 @@ impl Curve2d for GeomCurve2d {
             Self::Parabola(p) => p.point(u),
             Self::Hyperbola(h) => h.point(u),
             Self::BSpline(b) => b.point(u),
+            Self::TorusPlaneSection(section) => section.point(u),
+            Self::PlaneTorusSection(section) => section.point(u),
         }
     }
 
@@ -108,6 +131,8 @@ impl Curve2d for GeomCurve2d {
             Self::Parabola(p) => p.d1(u),
             Self::Hyperbola(h) => h.d1(u),
             Self::BSpline(b) => b.d1(u),
+            Self::TorusPlaneSection(section) => section.d1(u),
+            Self::PlaneTorusSection(section) => section.d1(u),
         }
     }
 
@@ -119,6 +144,8 @@ impl Curve2d for GeomCurve2d {
             Self::Parabola(p) => p.bounds(),
             Self::Hyperbola(h) => h.bounds(),
             Self::BSpline(b) => b.bounds(),
+            Self::TorusPlaneSection(section) => section.bounds(),
+            Self::PlaneTorusSection(section) => section.bounds(),
         }
     }
 
@@ -130,6 +157,8 @@ impl Curve2d for GeomCurve2d {
             Self::Parabola(p) => p.is_closed(),
             Self::Hyperbola(h) => h.is_closed(),
             Self::BSpline(b) => b.is_closed(),
+            Self::TorusPlaneSection(section) => section.is_closed(),
+            Self::PlaneTorusSection(section) => section.is_closed(),
         }
     }
 
@@ -141,6 +170,8 @@ impl Curve2d for GeomCurve2d {
             Self::Parabola(p) => p.is_periodic(),
             Self::Hyperbola(h) => h.is_periodic(),
             Self::BSpline(b) => b.is_periodic(),
+            Self::TorusPlaneSection(section) => section.is_periodic(),
+            Self::PlaneTorusSection(section) => section.is_periodic(),
         }
     }
 
@@ -152,6 +183,8 @@ impl Curve2d for GeomCurve2d {
             Self::Parabola(p) => p.period(),
             Self::Hyperbola(h) => h.period(),
             Self::BSpline(b) => b.period(),
+            Self::TorusPlaneSection(section) => section.period(),
+            Self::PlaneTorusSection(section) => section.period(),
         }
     }
 }

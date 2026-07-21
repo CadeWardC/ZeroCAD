@@ -493,7 +493,10 @@ fn curve_parameter_scale(curve: &GeomCurve, scale: f64) -> f64 {
         | GeomCurve::Ellipse(_)
         | GeomCurve::Hyperbola(_)
         | GeomCurve::BSpline(_)
-        | GeomCurve::Helix(_) => 1.0,
+        | GeomCurve::Helix(_)
+        | GeomCurve::TorusPlaneSection(_)
+        | GeomCurve::Reparametrized(_)
+        | GeomCurve::TorusSurfaceCurve(_) => 1.0,
     }
 }
 

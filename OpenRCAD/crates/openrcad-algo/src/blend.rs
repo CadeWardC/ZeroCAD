@@ -40,6 +40,8 @@ pub enum BlendError {
     },
     /// The supplied document tolerance policy is internally inconsistent.
     InvalidTolerancePolicy(String),
+    /// Shared analytic band construction rejected before any topology commit.
+    BandTopology(crate::band_topology::BandTopologyError),
 }
 
 impl core::fmt::Display for BlendError {
@@ -59,11 +61,18 @@ impl core::fmt::Display for BlendError {
             BlendError::InvalidTolerancePolicy(reason) => {
                 write!(f, "blend: invalid tolerance policy: {reason}")
             }
+            BlendError::BandTopology(error) => write!(f, "blend: {error}"),
         }
     }
 }
 
 impl std::error::Error for BlendError {}
+
+impl From<crate::band_topology::BandTopologyError> for BlendError {
+    fn from(value: crate::band_topology::BandTopologyError) -> Self {
+        Self::BandTopology(value)
+    }
+}
 
 /// A cylinder recovered from a [`Solid`], in its own (arbitrary) frame.
 pub struct CylinderInfo {

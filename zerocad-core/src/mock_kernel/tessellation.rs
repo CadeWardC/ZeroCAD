@@ -501,7 +501,10 @@ pub(crate) fn analytic_loop_to_wire<P>(
             // families, but ZeroCAD does not yet lift them into analytic B-Rep
             // wires. Returning `None` deliberately selects the sampled legacy
             // extrusion fallback in `extruded_region_solid`.
-            GeomCurve2d::Parabola(_) | GeomCurve2d::Hyperbola(_) => None,
+            GeomCurve2d::Parabola(_)
+            | GeomCurve2d::Hyperbola(_)
+            | GeomCurve2d::TorusPlaneSection(_)
+            | GeomCurve2d::PlaneTorusSection(_) => None,
         }
     }
 
