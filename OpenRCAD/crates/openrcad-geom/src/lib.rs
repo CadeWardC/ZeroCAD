@@ -16,6 +16,7 @@ use openrcad_foundation::{Pnt, Trsf, Vec};
 use serde::{Deserialize, Serialize};
 
 pub mod bspline_curve;
+mod bspline_derivatives;
 pub mod bspline_surface;
 pub mod circle;
 pub mod cone;
@@ -38,8 +39,8 @@ pub mod torus;
 pub mod torus_plane_section;
 pub mod torus_surface_curve;
 
-pub use bspline_curve::BSplineCurve;
-pub use bspline_surface::BSplineSurface;
+pub use bspline_curve::{BSplineCurve, BSplineCurveDerivatives};
+pub use bspline_surface::{BSplineSurface, BSplineSurfaceDerivatives};
 pub use circle::Circle;
 pub use cone::ConicalSurface;
 pub use curve::Curve;

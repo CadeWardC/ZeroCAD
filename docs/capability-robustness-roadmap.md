@@ -410,6 +410,13 @@ Arbitrary freeform NURBS surfaces remain unsupported.
 - Whole-solid Fillet/Chamfer convenience APIs after corner completion.
 - Exact rational spline `point/d1/d2` evaluation.
 
+Wave 5A is implemented: curve and surface NURBS evaluation now shares a
+local-frame homogeneous derivative engine. Curves expose `point/d1/d2`; surfaces
+expose `point/du/dv/duu/duv/dvv` without widening the common geometry traits.
+The regression matrix covers repeated and endpoint knots, non-unit weights,
+rational conics, finite-difference agreement, scales `1e-3..1e3`, and far-origin
+coordinates.
+
 ## Persistence schedule
 
 | Capability | Contract |

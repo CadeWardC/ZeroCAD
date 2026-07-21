@@ -62,7 +62,7 @@ OpenRCAD contains **no OCCT or truck source**. Both are design references only
 |---|---|---|
 | Foundation — `TKernel`, `TKMath`, `gp`, `Precision`, `Bnd` | [`openrcad-foundation`](crates/openrcad-foundation) | ✅ math, transforms, bnd boxes, interval arithmetic, exact predicates + tested |
 | Modeling Data — 2D geometry (`TKG2d`) | [`openrcad-geom2d`](crates/openrcad-geom2d) | ✅ lines, conics, NURBS + tested |
-| Modeling Data — 3D geometry (`TKG3d`, `TKGeomBase`) | [`openrcad-geom`](crates/openrcad-geom) | ✅ plane/cyl/cone/sphere/torus, NURBS, Gregory/offset/ruled + tested |
+| Modeling Data — 3D geometry (`TKG3d`, `TKGeomBase`) | [`openrcad-geom`](crates/openrcad-geom) | ✅ plane/cyl/cone/sphere/torus, NURBS with exact rational second derivatives, Gregory/offset/ruled + tested |
 | Modeling Data — topology / B-Rep (`TKBRep`) | [`openrcad-topo`](crates/openrcad-topo) | ✅ arena B-Rep, per-entity tolerance, validate/manifold/watertight checks + tested |
 | Modeling Algorithms — primitives (`TKPrim`) | [`openrcad-primitives`](crates/openrcad-primitives) | ✅ box, cylinder, cone, sphere, wedge + tested |
 | Modeling Algorithms (`TKBool`, `TKGeomAlgo`, `TKFillet`, …) | [`openrcad-algo`](crates/openrcad-algo) | ✅ intersection engine, SAH BVH, Euler ops, booleans (coplanar/collinear merge → clean topology), sew, `prism`/sweep, per-edge rolling-ball fillet/chamfer on arbitrary edges + an `apply_blend_contour` façade; 🟡 verified analytic Shell matrix through regular torus fillet bands |
