@@ -10,7 +10,7 @@ use openrcad_topo::{
     Edge, Face, InputTopologyRef, Solid, TopologyChange, TopologyHistory, TopologyKind,
     TopologyRef, Vertex, Wire,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::blend::{detect_cylinder_with_policy, shell_cylinder_with_policy, BlendError};
 use crate::sew::sew_shell_with_policy as sew_with_policy;
@@ -67,6 +67,139 @@ pub struct ShellWallThicknessEvidence {
     pub measured_max: f64,
     pub samples: usize,
     pub tolerance: f64,
+}
+
+/// Deterministic evidence that a concave Shell candidate represents one
+/// unambiguous material envelope. The topology-preserving analytic sheller
+/// has already imprinted adjacent offset supports; this certificate broad-
+/// phases every non-adjacent cell pair, runs exact trimmed intersections for
+/// the survivors, and refuses to commit an unresolved branch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConcaveShellCertificate {
+    pub concave_edges: usize,
+    pub candidate_pairs: usize,
+    pub intersection_curves: usize,
+    pub imprinted_cells: usize,
+    pub kept_cells: usize,
+    pub discarded_cells: usize,
+    pub minimum_thickness: f64,
+    pub maximum_thickness: f64,
+    pub unresolved_branches: usize,
+    pub work_units: u64,
+}
+
+impl ConcaveShellCertificate {
+    pub fn summary(&self) -> String {
+        format!(
+            "concave_edges={} candidate_pairs={} intersection_curves={} cells={} kept={} discarded={} thickness=[{}, {}] unresolved={} work_units={}",
+            self.concave_edges,
+            self.candidate_pairs,
+            self.intersection_curves,
+            self.imprinted_cells,
+            self.kept_cells,
+            self.discarded_cells,
+            self.minimum_thickness,
+            self.maximum_thickness,
+            self.unresolved_branches,
+            self.work_units,
+        )
+    }
+}
+
+/// Typed, fail-closed reasons a concave Shell envelope cannot be certified.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConcaveShellError {
+    InvalidTolerancePolicy(String),
+    UnsupportedSupport {
+        source_face: usize,
+        support: crate::band_topology::BandSupportKind,
+    },
+    MissingOffsetCell {
+        source_face: usize,
+    },
+    AmbiguousOffsetCell {
+        source_face: usize,
+        matches: usize,
+    },
+    OffsetCollapse {
+        requested: f64,
+        max: f64,
+    },
+    AmbiguousMaterialClassification {
+        cell: usize,
+    },
+    AmbiguousSelfIntersection {
+        candidate_pairs: usize,
+        intersection_curves: usize,
+    },
+    BandTopology(crate::band_topology::BandTopologyError),
+}
+
+impl ConcaveShellError {
+    pub const fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::InvalidTolerancePolicy(_) => "parameter.invalid",
+            Self::UnsupportedSupport { .. } => "shell.unsupported_support",
+            Self::MissingOffsetCell { .. }
+            | Self::AmbiguousOffsetCell { .. }
+            | Self::OffsetCollapse { .. } => "shell.offset_collapse",
+            Self::AmbiguousMaterialClassification { .. }
+            | Self::AmbiguousSelfIntersection { .. } => "shell.ambiguous_self_intersection",
+            Self::BandTopology(error) => error.diagnostic_code(),
+        }
+    }
+}
+
+impl core::fmt::Display for ConcaveShellError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidTolerancePolicy(reason) => {
+                write!(formatter, "invalid Shell tolerance policy: {reason}")
+            }
+            Self::UnsupportedSupport {
+                source_face,
+                support,
+            } => write!(
+                formatter,
+                "concave Shell source face {source_face} has unsupported {support:?} support"
+            ),
+            Self::MissingOffsetCell { source_face } => write!(
+                formatter,
+                "concave Shell source face {source_face} has no unique offset cell"
+            ),
+            Self::AmbiguousOffsetCell {
+                source_face,
+                matches,
+            } => write!(
+                formatter,
+                "concave Shell source face {source_face} resolves to {matches} offset cells"
+            ),
+            Self::OffsetCollapse { requested, max } => write!(
+                formatter,
+                "concave Shell thickness {requested} reaches the conservative local-clearance limit {max}"
+            ),
+            Self::AmbiguousMaterialClassification { cell } => write!(
+                formatter,
+                "concave Shell cell {cell} has ambiguous material-side classification"
+            ),
+            Self::AmbiguousSelfIntersection {
+                candidate_pairs,
+                intersection_curves,
+            } => write!(
+                formatter,
+                "concave Shell has {intersection_curves} unresolved intersection curves across {candidate_pairs} candidate pairs"
+            ),
+            Self::BandTopology(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ConcaveShellError {}
+
+impl From<crate::band_topology::BandTopologyError> for ConcaveShellError {
+    fn from(value: crate::band_topology::BandTopologyError) -> Self {
+        Self::BandTopology(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -154,6 +287,422 @@ pub fn measure_shell_wall_thickness(
     Ok(evidence)
 }
 
+fn planar_support_separation(
+    source: &GeomSurface,
+    candidate: &GeomSurface,
+    policy: &TolerancePolicy,
+) -> Option<f64> {
+    let (GeomSurface::Plane(source), GeomSurface::Plane(candidate)) = (source, candidate) else {
+        return None;
+    };
+    if source.normal().dot(&candidate.normal()).abs() < 1.0 - policy.angular * 8.0 {
+        return None;
+    }
+    Some(
+        (candidate.location() - source.location())
+            .dot(&GeomVec::from_dir(source.normal()))
+            .abs(),
+    )
+}
+
+fn source_offset_separation(
+    source: &GeomSurface,
+    candidate: &GeomSurface,
+    policy: &TolerancePolicy,
+) -> Option<f64> {
+    match candidate {
+        GeomSurface::Offset(offset)
+            if crate::boolean::surfaces_are_same_domain(
+                source,
+                &offset.base,
+                policy.classification.max(policy.intersection),
+            ) =>
+        {
+            Some(offset.distance.abs())
+        }
+        _ => planar_support_separation(source, candidate, policy),
+    }
+}
+
+fn faces_share_edge(first: &Face, second: &Face) -> bool {
+    let first_edges: HashSet<_> = first
+        .wires()
+        .into_iter()
+        .flat_map(|wire| wire.edges())
+        .map(|edge| edge.id())
+        .collect();
+    second
+        .wires()
+        .into_iter()
+        .flat_map(|wire| wire.edges())
+        .any(|edge| first_edges.contains(&edge.id()))
+}
+
+fn point_segment_distance(point: Pnt, first: Pnt, second: Pnt) -> f64 {
+    let direction = second - first;
+    let denominator = direction.dot(&direction);
+    if denominator <= f64::MIN_POSITIVE {
+        return point.distance(&first);
+    }
+    let parameter = ((point - first).dot(&direction) / denominator).clamp(0.0, 1.0);
+    point.distance(&(first + direction * parameter))
+}
+
+fn segment_distance(first_start: Pnt, first_end: Pnt, second_start: Pnt, second_end: Pnt) -> f64 {
+    // The endpoint probes cover parallel and degenerate segments. The
+    // interior/interior solve covers the skew case without a unit-scale
+    // epsilon: the operation-local angular policy decides parallelism.
+    let first_direction = first_end - first_start;
+    let second_direction = second_end - second_start;
+    let cross = first_direction.cross(&second_direction);
+    let cross_squared = cross.dot(&cross);
+    let mut distance = [
+        point_segment_distance(first_start, second_start, second_end),
+        point_segment_distance(first_end, second_start, second_end),
+        point_segment_distance(second_start, first_start, first_end),
+        point_segment_distance(second_end, first_start, first_end),
+    ]
+    .into_iter()
+    .fold(f64::INFINITY, f64::min);
+    if cross_squared > f64::MIN_POSITIVE {
+        let between = second_start - first_start;
+        let first_parameter = between.cross(&second_direction).dot(&cross) / cross_squared;
+        let second_parameter = between.cross(&first_direction).dot(&cross) / cross_squared;
+        if (0.0..=1.0).contains(&first_parameter) && (0.0..=1.0).contains(&second_parameter) {
+            let first_point = first_start + first_direction * first_parameter;
+            let second_point = second_start + second_direction * second_parameter;
+            distance = distance.min(first_point.distance(&second_point));
+        }
+    }
+    distance
+}
+
+fn planar_reflex_vertex_count(source: &Solid, policy: &TolerancePolicy) -> usize {
+    let mut reflex_vertices = 0usize;
+    for face in source.shell().faces() {
+        let Some(GeomSurface::Plane(plane)) = face.surface() else {
+            continue;
+        };
+        let Some(wire) = face.outer_wire() else {
+            continue;
+        };
+        let points = wire
+            .edges()
+            .iter()
+            .map(|edge| {
+                let point = edge.source().point();
+                let (u, v) = crate::intersect::uv_of(&GeomSurface::plane(*plane), &point);
+                (u, v)
+            })
+            .collect::<Vec<_>>();
+        if points.len() < 4 {
+            continue;
+        }
+        let signed_twice_area = (0..points.len())
+            .map(|index| {
+                let first = points[index];
+                let second = points[(index + 1) % points.len()];
+                first.0 * second.1 - second.0 * first.1
+            })
+            .sum::<f64>();
+        if signed_twice_area.abs() <= policy.resolution * policy.resolution {
+            continue;
+        }
+        let winding = signed_twice_area.signum();
+        for index in 0..points.len() {
+            let previous = points[(index + points.len() - 1) % points.len()];
+            let current = points[index];
+            let next = points[(index + 1) % points.len()];
+            let incoming = (current.0 - previous.0, current.1 - previous.1);
+            let outgoing = (next.0 - current.0, next.1 - current.1);
+            let cross = incoming.0 * outgoing.1 - incoming.1 * outgoing.0;
+            let scale = incoming.0.hypot(incoming.1) * outgoing.0.hypot(outgoing.1);
+            if cross * winding < -policy.angular * scale {
+                reflex_vertices += 1;
+            }
+        }
+    }
+    reflex_vertices
+}
+
+fn preflight_concave_shell_with_policy(
+    source: &Solid,
+    requested_thickness: f64,
+    policy: &TolerancePolicy,
+) -> Result<usize, ConcaveShellError> {
+    let context = ToleranceContext::derive(
+        policy,
+        &[source.bounding_box()],
+        Some(requested_thickness.abs()),
+        1.0,
+    )
+    .map_err(|error| ConcaveShellError::InvalidTolerancePolicy(error.to_string()))?;
+    let probed_concave_edges = source
+        .edges()
+        .iter()
+        .filter(|edge| {
+            crate::rolling_ball::edge_material_wedge_is_concave(source, edge) == Some(true)
+        })
+        .count();
+    // Extremely high aspect ratios can make the containment probe too local
+    // to distinguish a reflex wedge. A planar loop's signed turns are exact
+    // under rigid transforms and provide an independent analytic classifier.
+    let analytic_concave_edges = planar_reflex_vertex_count(source, &context.policy).div_ceil(2);
+    let concave_edges = probed_concave_edges.max(analytic_concave_edges);
+    if concave_edges == 0 {
+        return Ok(0);
+    }
+    for (source_face, face) in source.shell().faces().iter().enumerate() {
+        let support = face
+            .surface()
+            .map(crate::band_topology::BandSupportKind::of)
+            .unwrap_or(crate::band_topology::BandSupportKind::Other);
+        if support == crate::band_topology::BandSupportKind::Other {
+            return Err(ConcaveShellError::UnsupportedSupport {
+                source_face,
+                support,
+            });
+        }
+    }
+
+    // The straight-edge clearance certificate is exact for the planar 5E
+    // subset. Mixed analytic networks retain their surface-specific collapse
+    // checks (notably the established torus minor-radius rejection), so this
+    // conservative planar bound cannot mask a more precise legacy diagnostic.
+    if source
+        .shell()
+        .faces()
+        .iter()
+        .all(|face| matches!(face.surface(), Some(GeomSurface::Plane(_))))
+    {
+        let straight_edges = source
+            .edges()
+            .into_iter()
+            .filter(|edge| matches!(edge.curve(), None | Some(GeomCurve::Line(_))))
+            .collect::<Vec<_>>();
+        let mut minimum_clearance = f64::INFINITY;
+        for first in 0..straight_edges.len() {
+            for second in first + 1..straight_edges.len() {
+                let first_start = straight_edges[first].source().point();
+                let first_end = straight_edges[first].target().point();
+                let second_start = straight_edges[second].source().point();
+                let second_end = straight_edges[second].target().point();
+                if [first_start, first_end].into_iter().any(|first_point| {
+                    [second_start, second_end].into_iter().any(|second_point| {
+                        first_point.distance(&second_point) <= context.policy.linear
+                    })
+                }) {
+                    continue;
+                }
+                let distance = segment_distance(first_start, first_end, second_start, second_end);
+                if distance > context.policy.linear {
+                    minimum_clearance = minimum_clearance.min(distance);
+                }
+            }
+        }
+        if minimum_clearance.is_finite() {
+            let maximum = minimum_clearance * 0.5;
+            if requested_thickness.abs() >= maximum - context.policy.classification {
+                return Err(ConcaveShellError::OffsetCollapse {
+                    requested: requested_thickness,
+                    max: maximum,
+                });
+            }
+        }
+    }
+    Ok(concave_edges)
+}
+
+/// Certify the supported concave Shell envelope without mutating either
+/// operand. `Ok(None)` means the source has no material-concave analytic edge
+/// and therefore does not require the Wave 5E certificate.
+///
+/// The current accepted matrix is analytic topology whose inward offset keeps
+/// one cell per retained source face. Adjacent cells are already imprinted by
+/// the Shell builder. If non-adjacent cells intersect, exact face/face curves
+/// are recorded and the candidate is rejected atomically; approximation is
+/// never substituted for unresolved cell partitioning.
+pub fn certify_concave_shell_with_policy(
+    source: &Solid,
+    candidate: &Solid,
+    expected_thickness: f64,
+    open_faces: &[Face],
+    policy: &TolerancePolicy,
+) -> Result<Option<ConcaveShellCertificate>, ConcaveShellError> {
+    policy
+        .validate()
+        .map_err(|error| ConcaveShellError::InvalidTolerancePolicy(error.to_string()))?;
+    let context = ToleranceContext::derive(
+        policy,
+        &[source.bounding_box(), candidate.bounding_box()],
+        Some(expected_thickness.abs()),
+        1.0,
+    )
+    .map_err(|error| ConcaveShellError::InvalidTolerancePolicy(error.to_string()))?;
+    let concave_edges =
+        preflight_concave_shell_with_policy(source, expected_thickness, &context.policy)?;
+    if concave_edges == 0 {
+        return Ok(None);
+    }
+
+    let source_faces = source.shell().faces();
+    let result_faces = candidate.shell().faces();
+    let domain_tolerance = context
+        .policy
+        .classification
+        .max(context.policy.intersection);
+    let thickness_tolerance = (context.policy.linear * 10.0)
+        .max(expected_thickness.abs() * 0.005)
+        .max(context.arithmetic_floor * 8.0);
+    let mut inner_cells: HashMap<usize, f64> = HashMap::new();
+
+    for (source_index, source_face) in source_faces.iter().enumerate() {
+        if open_faces.iter().any(|open| open == source_face) {
+            continue;
+        }
+        let Some(source_surface) = source_face.surface() else {
+            return Err(ConcaveShellError::UnsupportedSupport {
+                source_face: source_index,
+                support: crate::band_topology::BandSupportKind::Other,
+            });
+        };
+        let support = crate::band_topology::BandSupportKind::of(source_surface);
+        if support == crate::band_topology::BandSupportKind::Other {
+            return Err(ConcaveShellError::UnsupportedSupport {
+                source_face: source_index,
+                support,
+            });
+        }
+
+        // Removed opening faces have no retained same-domain outer face and no
+        // corresponding inner cap. Every retained source face must have one
+        // uniquely measurable inward cell.
+        let retained = result_faces.iter().any(|face| {
+            face.surface().is_some_and(|surface| {
+                crate::boolean::surfaces_are_same_domain(source_surface, surface, domain_tolerance)
+            })
+        });
+        if !retained {
+            continue;
+        }
+
+        let mut matches = result_faces
+            .iter()
+            .enumerate()
+            .filter_map(|(result_index, result_face)| {
+                let separation = source_offset_separation(
+                    source_surface,
+                    result_face.surface()?,
+                    &context.policy,
+                )?;
+                (separation > thickness_tolerance
+                    && (separation - expected_thickness.abs()).abs() <= thickness_tolerance)
+                    .then_some((result_index, separation))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            (left.1 - expected_thickness.abs())
+                .abs()
+                .total_cmp(&(right.1 - expected_thickness.abs()).abs())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let Some(_) = matches.first() else {
+            return Err(ConcaveShellError::MissingOffsetCell {
+                source_face: source_index,
+            });
+        };
+        // Periodic/imprinted supports may be split on either side: one source
+        // face can own several result cells, and coplanar or co-toroidal source
+        // partitions can share one exact offset cell. Uniqueness is therefore
+        // geometric (result-cell identity plus requested separation), not a
+        // one-to-one face-index mapping. The 4C torus-band fixture exercises
+        // both forms of partitioning.
+        for (result_index, separation) in matches {
+            inner_cells.entry(result_index).or_insert(separation);
+        }
+    }
+    if inner_cells.is_empty() {
+        return Err(ConcaveShellError::MissingOffsetCell { source_face: 0 });
+    }
+
+    let mut kept_cells = 0usize;
+    let mut ordered_cells = inner_cells.keys().copied().collect::<Vec<_>>();
+    ordered_cells.sort_unstable();
+    let mut budget = crate::band_topology::GeometryWorkBudget::intersection_default();
+    for &cell in &ordered_cells {
+        budget.charge(crate::band_topology::GeometryWorkStage::Classification, 1)?;
+        let sample = crate::boolean::point_on_face(&result_faces[cell]);
+        if !crate::boolean::point_in_solid(&sample, source) {
+            return Err(ConcaveShellError::AmbiguousMaterialClassification { cell });
+        }
+        kept_cells += 1;
+    }
+
+    let mut edge_uses = HashMap::new();
+    for &cell in &ordered_cells {
+        for edge in result_faces[cell]
+            .wires()
+            .into_iter()
+            .flat_map(|wire| wire.edges())
+        {
+            *edge_uses.entry(edge.id()).or_insert(0usize) += 1;
+        }
+    }
+    let imprinted_boundaries = edge_uses.values().filter(|uses| **uses > 1).count();
+
+    let mut candidate_pairs = 0usize;
+    let mut intersection_curves = 0usize;
+    for first_position in 0..ordered_cells.len() {
+        for second_position in first_position + 1..ordered_cells.len() {
+            let first = &result_faces[ordered_cells[first_position]];
+            let second = &result_faces[ordered_cells[second_position]];
+            if faces_share_edge(first, second) {
+                continue;
+            }
+            let mut first_bounds = crate::bvh::compute_face_bounds(first);
+            let mut second_bounds = crate::bvh::compute_face_bounds(second);
+            first_bounds.enlarge(context.policy.classification);
+            second_bounds.enlarge(context.policy.classification);
+            if first_bounds.is_out_box(&second_bounds) {
+                continue;
+            }
+            candidate_pairs += 1;
+            budget.charge(crate::band_topology::GeometryWorkStage::Intersection, 1)?;
+            intersection_curves += crate::intersect::surface_surface_curves_with_budget(
+                first,
+                second,
+                context.policy.intersection,
+                &mut budget,
+            )?
+            .len();
+        }
+    }
+    if intersection_curves > 0 {
+        return Err(ConcaveShellError::AmbiguousSelfIntersection {
+            candidate_pairs,
+            intersection_curves,
+        });
+    }
+
+    let minimum_thickness = inner_cells.values().copied().fold(f64::INFINITY, f64::min);
+    let maximum_thickness = inner_cells
+        .values()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    Ok(Some(ConcaveShellCertificate {
+        concave_edges,
+        candidate_pairs,
+        intersection_curves,
+        imprinted_cells: kept_cells + imprinted_boundaries,
+        kept_cells,
+        discarded_cells: 0,
+        minimum_thickness,
+        maximum_thickness,
+        unresolved_branches: 0,
+        work_units: budget.consumed(),
+    }))
+}
+
 /// Shell a solid by `thickness`, removing `open_faces`.
 #[deprecated(note = "use shell_solid_with_policy")]
 pub fn shell_solid(
@@ -180,25 +729,30 @@ pub fn shell_solid_with_policy(
     if thickness.abs() <= policy.linear {
         return Ok(solid.clone());
     }
-    match shell_build_path_with_policy(solid, policy) {
+    preflight_concave_shell_with_policy(solid, thickness, policy)?;
+    let candidate = match shell_build_path_with_policy(solid, policy) {
         ShellBuildPath::BoxPrimitive => {
             let (p0, ex, ey, ez, dx, dy, dz) =
                 detect_box(solid, policy).expect("box path was classified by the same detector");
-            return Ok(shell_box(
-                p0, ex, ey, ez, dx, dy, dz, thickness, open_faces, policy,
-            ));
+            shell_box(p0, ex, ey, ez, dx, dy, dz, thickness, open_faces, policy)
         }
         ShellBuildPath::CylinderPrimitive => {
             let cylinder = detect_cylinder_with_policy(solid, policy)
                 .expect("cylinder path was classified by the same detector");
-            return shell_cylinder_with_policy(&cylinder, thickness, open_faces, policy);
+            shell_cylinder_with_policy(&cylinder, thickness, open_faces, policy)?
         }
-        ShellBuildPath::PlanarNetwork => {}
+        ShellBuildPath::PlanarNetwork => {
+            shell_planar_general(solid, thickness, open_faces, policy)?
+        }
         ShellBuildPath::MixedAnalyticNetwork => {
-            return shell_analytic_general(solid, thickness, open_faces, policy);
+            shell_analytic_general(solid, thickness, open_faces, policy)?
         }
-    }
-    shell_planar_general(solid, thickness, open_faces, policy)
+    };
+    // The candidate remains immutable until its material envelope is proven.
+    // Convex and primitive sources return `None` cheaply; concave analytic
+    // sources must pass the exact broad-phase/intersection certificate.
+    certify_concave_shell_with_policy(solid, &candidate, thickness, open_faces, policy)?;
+    Ok(candidate)
 }
 
 /// Build complete Shell-specific history rather than accepting conservative

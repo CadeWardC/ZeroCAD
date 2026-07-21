@@ -462,6 +462,24 @@ Extreme aspect cases may reject when strict pcurve validation cannot certify the
 candidate; that rejection is deterministic, typed, and atomic. No edge is ever
 silently skipped.
 
+Wave 5E is implemented for the verified analytic, topology-preserving concave
+matrix. Concavity is classified independently by material-wedge probes and
+orientation-independent planar reflex turns. Every retained source support
+must map to one or more exact measurable inward cells. The certificate records reflex edges,
+broad-phase candidate pairs, exact trimmed intersection curves, imprinted and
+classified cells, kept/discarded counts, thickness extrema, work units, and
+unresolved branches. Non-adjacent cells are intersected exactly under the
+deterministic geometry budget; any unresolved intersection, material-side
+ambiguity, unsupported support, or local-clearance collapse rejects before the
+candidate can enter document state. The complete `1e-3..1e3` scale/aspect,
+0/37/90-degree rotation, and local/far-origin Cartesian sweep is locked in the
+same stage as the clearance guard. A canonical L-prism `.zcad` v5 fixture
+covers cold/warm equivalence, durable names, typed atomic collapse, and real
+disk reload. This release matrix does not approximate or resolve a genuinely
+branching non-adjacent offset intersection: it rejects that branch explicitly.
+Arbitrary NURBS Shell, including Shell on future Smooth Loft output, remains
+unsupported.
+
 ## Persistence schedule
 
 | Capability | Contract |

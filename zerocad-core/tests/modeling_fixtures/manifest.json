@@ -31,6 +31,21 @@
         "fillet_radius_mm": 1.5,
         "successive_planar_faces": 1
       }
+    },
+    {
+      "file": "shell-concave-l-prism.zcad",
+      "sha256": "b4fc39081a6e4b39bd32f5681ac19543cc21573ffa58c92f5681ea0e7e02fe0a",
+      "expected_resolution": "resolved",
+      "body_count": 1,
+      "required_features": [
+        "sketch",
+        "extrude",
+        "shell"
+      ],
+      "measurements": {
+        "wall_thickness_mm": 0.5,
+        "concave_edges": 1
+      }
     }
   ]
 }

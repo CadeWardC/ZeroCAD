@@ -9,8 +9,10 @@ exchange. It is written to be copy-paste practical; for the conceptual *why*, se
 > primitives, intersection engine + BVH, booleans, tessellation, sewing, and
 > STEP/STL layers are real and tested, plus an interactive viewer
 > (`openrcad-render`) and a parametric document layer (`openrcad-document`). The
-> primitive fillet/chamfer/shell builders handle a single **box** or
-> **cylinder** primitive at **any orientation**. Strict all-edge Fillet/Chamfer
+> primitive fillet/chamfer fast paths handle a single **box** or
+> **cylinder** primitive at **any orientation**. Shell additionally handles the
+> verified planar/cylinder/cone/sphere/regular-torus analytic network and
+> topology-preserving concave subset. Strict all-edge Fillet/Chamfer
 > adapters preserve those fast paths and extend to arbitrary solids whenever
 > every edge passes the selected-edge machinery; otherwise they return the
 > complete typed blocker set atomically. The per-edge rolling-ball fillet
@@ -184,6 +186,19 @@ the result satisfies the Euler characteristic `V − E + F = 2`.
 | `chamfer` | ruled bevel faces + triangular corners | 45° conical frustums |
 | `shell_solid` | offset-surface cavity + planar rims | offset-surface cavity + planar rims |
 
+General Shell candidates use checked material-outward normals, exact analytic
+support intersections, construction-time pcurves, and shared-edge
+discretization. Concave sources receive an additional immutable envelope
+certificate through `certify_concave_shell_with_policy`: it measures every
+retained inward cell (with the opening set supplied explicitly), broad-phases
+non-adjacent cells, intersects surviving pairs exactly, and verifies
+material-side classification. A true unresolved
+self-intersection or local-clearance collapse returns
+`BlendError::ConcaveShell(ConcaveShellError::...)` without modifying the input.
+The verified concave release subset preserves one or more exact cells per
+retained analytic source support. Branching non-adjacent intersections and
+arbitrary NURBS Shell are explicit rejections, not approximate topology.
+
 ### Per-edge blends (any solid, including boolean results)
 
 The primitive whole-solid builders above recognise only a box or cylinder. To
@@ -342,10 +357,13 @@ the result back as a serde blob with zero pointer fix-ups.
 
 Know these before you wire OpenRCAD into a production path:
 
-- **Whole-solid blends are box/cylinder-only.** `fillet`, `chamfer`, and
-  `shell_solid` detect a single box or cylinder primitive (at **any
+- **Whole-solid Fillet/Chamfer fast paths are box/cylinder-only.** `fillet` and
+  `chamfer` detect a single box or cylinder primitive (at **any
   position/orientation** — the frame is recovered from geometry) and construct the
-  result directly; any other *whole solid* yields `BlendError::UnsupportedShape`.
+  result directly. The strict all-edge adapters extend beyond those primitives
+  only when every edge passes. `shell_solid` has a wider verified analytic
+  network, including topology-preserving concave planar sources with exact
+  envelope evidence.
   The **per-edge** `fillet_edges` (rolling ball) does handle arbitrary
   planar/analytic edges, including boolean results — and rejects an over-large
   radius rather than emitting a degenerate solid. Equal-radius convex planar
@@ -354,8 +372,11 @@ Know these before you wire OpenRCAD into a production path:
   explicitly. Contact-curve overflow is exact for convex straight all-planar
   prisms and may cross multiple successive planar faces. Curved successor
   supports, non-prismatic sources, concave corners, and profile-consuming radii
-  reject explicitly. General curved-support overflow and concave-offset
-  self-intersection resolution are not implemented yet.
+  reject explicitly. General curved-support overflow remains unsupported.
+  Concave Shell accepts only a uniquely classifiable topology-preserving
+  envelope; periodic or imprinted supports may own multiple exact cells.
+  Genuinely branching non-adjacent offset intersections and arbitrary NURBS
+  supports reject atomically with typed errors.
 - **Booleans: severed cuts stay one body.** Watertight and health-validated on
   through-cuts, face-flush and corner-overlap unions, blind pockets, enclosed
   voids, partial and rotated cuts, and cylinder cuts and bosses (the former

@@ -2052,6 +2052,7 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
+        let mut diagnostics = Vec::new();
         match family {
             crate::document::FeatureEvaluatorKind::Shell => {
                 let FeatureType::Shell {
@@ -2086,6 +2087,7 @@ impl ParametricGraph {
                     open_faces,
                     &mut candidate_body_state,
                     &mut warnings,
+                    &mut diagnostics,
                 );
             }
             crate::document::FeatureEvaluatorKind::Hole => {
@@ -2136,16 +2138,13 @@ impl ParametricGraph {
             }
             _ => return Err("non Shell/Hole family reached the contract".into()),
         }
-        let diagnostics = warnings
-            .into_iter()
-            .filter_map(|message| {
-                super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.clone(),
-                    feature_name: context.feature.name.clone(),
-                    state: ResolutionState::Unresolved(message),
-                })
+        diagnostics.extend(warnings.into_iter().filter_map(|message| {
+            super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                feature_id: context.feature_id.clone(),
+                feature_name: context.feature.name.clone(),
+                state: ResolutionState::Unresolved(message),
             })
-            .collect();
+        }));
         let topology_history = Vec::new();
         let validation_evidence = FeatureValidationEvidence {
             input_body_count: context.live_bodies.len(),
@@ -5113,6 +5112,7 @@ fn apply_shell(
     open_faces: &[FaceRef],
     live: &mut Vec<LiveBody>,
     warnings: &mut Vec<String>,
+    diagnostics: &mut Vec<EvaluationDiagnostic>,
 ) {
     let Some(body_idx) = live.iter().position(|b| b.id == target) else {
         warnings.push(format!(
@@ -5187,15 +5187,81 @@ fn apply_shell(
             ));
             continue;
         }
-        match crate::mock_kernel::consume_operation(
-            "shell",
-            openrcad::algo::shell_solid_operation_with_policy(
-                part,
-                thickness as f64,
-                &kernel_open,
-                &openrcad::foundation::TolerancePolicy::STANDARD,
-            ),
-        ) {
+        let operation = openrcad::algo::shell_solid_operation_with_policy(
+            part,
+            thickness as f64,
+            &kernel_open,
+            &openrcad::foundation::TolerancePolicy::STANDARD,
+        );
+        if let Err(openrcad::algo::ModelingOperationError::Shell(
+            openrcad::algo::BlendError::ConcaveShell(error),
+        )) = &operation
+        {
+            let mut diagnostic = EvaluationDiagnostic::new(
+                node_id,
+                "shell",
+                DiagnosticCode::new(error.diagnostic_code())
+                    .expect("kernel Shell diagnostic codes are compile-time constants"),
+                DiagnosticSeverity::Warning,
+                format!("Shell '{node_id}' was rejected atomically: {error}."),
+            )
+            .with_parameter("target", target)
+            .with_parameter(
+                "thickness",
+                DiagnosticParameterValue::Decimal(thickness.to_string()),
+            )
+            .with_fallback("kept last valid body");
+            match error {
+                openrcad::algo::offset::ConcaveShellError::UnsupportedSupport {
+                    source_face,
+                    support,
+                } => {
+                    diagnostic = diagnostic
+                        .with_parameter("source_face", *source_face)
+                        .with_parameter("support", format!("{support:?}"));
+                }
+                openrcad::algo::offset::ConcaveShellError::MissingOffsetCell { source_face } => {
+                    diagnostic = diagnostic.with_parameter("source_face", *source_face);
+                }
+                openrcad::algo::offset::ConcaveShellError::AmbiguousOffsetCell {
+                    source_face,
+                    matches,
+                } => {
+                    diagnostic = diagnostic
+                        .with_parameter("source_face", *source_face)
+                        .with_parameter("matches", *matches);
+                }
+                openrcad::algo::offset::ConcaveShellError::OffsetCollapse { requested, max } => {
+                    diagnostic = diagnostic
+                        .with_parameter(
+                            "requested",
+                            DiagnosticParameterValue::Decimal(requested.to_string()),
+                        )
+                        .with_parameter(
+                            "maximum",
+                            DiagnosticParameterValue::Decimal(max.to_string()),
+                        );
+                }
+                openrcad::algo::offset::ConcaveShellError::AmbiguousMaterialClassification {
+                    cell,
+                } => {
+                    diagnostic = diagnostic.with_parameter("cell", *cell);
+                }
+                openrcad::algo::offset::ConcaveShellError::AmbiguousSelfIntersection {
+                    candidate_pairs,
+                    intersection_curves,
+                } => {
+                    diagnostic = diagnostic
+                        .with_parameter("candidate_pairs", *candidate_pairs)
+                        .with_parameter("intersection_curves", *intersection_curves);
+                }
+                openrcad::algo::offset::ConcaveShellError::BandTopology(_) => {}
+                openrcad::algo::offset::ConcaveShellError::InvalidTolerancePolicy(_) => {}
+            }
+            diagnostics.push(diagnostic);
+            return;
+        }
+        match crate::mock_kernel::consume_operation("shell", operation) {
             Ok(outcome) => {
                 named_result.append(crate::mock_kernel::propagate_face_names(
                     &input_mesh,

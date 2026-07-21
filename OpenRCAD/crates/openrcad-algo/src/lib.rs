@@ -146,6 +146,10 @@ pub use all_edges::{
     AllEdgeBlocker,
 };
 pub use chamfer::{chamfer_edges, chamfer_edges_with_policy, ChamferError};
+pub use offset::{
+    certify_concave_shell_with_policy, ConcaveShellCertificate, ConcaveShellError,
+    ShellWallThicknessError, ShellWallThicknessEvidence,
+};
 
 /// Roll a constant-`radius` fillet along every edge of `solid`
 /// (OCCT `BRepFilletAPI_MakeFillet`).
@@ -267,6 +271,7 @@ pub use skin::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelingOperationError {
     Build(String),
+    Shell(BlendError),
     PcurveBuild(String),
     InvalidOutput(openrcad_topo::ValidationReport),
 }
@@ -275,6 +280,7 @@ impl core::fmt::Display for ModelingOperationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Build(reason) => write!(f, "operation construction failed: {reason}"),
+            Self::Shell(error) => write!(f, "Shell construction failed: {error}"),
             Self::PcurveBuild(reason) => {
                 write!(f, "operation pcurve construction failed: {reason}")
             }
@@ -422,9 +428,24 @@ pub fn shell_solid_operation_with_policy(
     policy: &openrcad_foundation::TolerancePolicy,
 ) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
     let value = shell_solid_with_policy(solid, thickness, open_faces, policy)
-        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+        .map_err(ModelingOperationError::Shell)?;
     let mut result = finish_unary_operation(solid, value, policy)?;
     result.history = offset::shell_topology_history(solid, &result.value, open_faces, policy);
+    if let Some(certificate) = offset::certify_concave_shell_with_policy(
+        solid,
+        &result.value,
+        thickness,
+        open_faces,
+        policy,
+    )
+    .map_err(|error| ModelingOperationError::Shell(BlendError::ConcaveShell(error)))?
+    {
+        result.diagnostics.push(openrcad_topo::Diagnostic::info(
+            "shell.concave_certificate",
+            certificate.summary(),
+            None,
+        ));
+    }
     Ok(result)
 }
 

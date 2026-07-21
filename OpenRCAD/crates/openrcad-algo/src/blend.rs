@@ -42,6 +42,8 @@ pub enum BlendError {
     InvalidTolerancePolicy(String),
     /// Shared analytic band construction rejected before any topology commit.
     BandTopology(crate::band_topology::BandTopologyError),
+    /// Concave Shell envelope evidence was incomplete or ambiguous.
+    ConcaveShell(crate::offset::ConcaveShellError),
 }
 
 impl core::fmt::Display for BlendError {
@@ -62,6 +64,7 @@ impl core::fmt::Display for BlendError {
                 write!(f, "blend: invalid tolerance policy: {reason}")
             }
             BlendError::BandTopology(error) => write!(f, "blend: {error}"),
+            BlendError::ConcaveShell(error) => write!(f, "shell: {error}"),
         }
     }
 }
@@ -71,6 +74,12 @@ impl std::error::Error for BlendError {}
 impl From<crate::band_topology::BandTopologyError> for BlendError {
     fn from(value: crate::band_topology::BandTopologyError) -> Self {
         Self::BandTopology(value)
+    }
+}
+
+impl From<crate::offset::ConcaveShellError> for BlendError {
+    fn from(value: crate::offset::ConcaveShellError) -> Self {
+        Self::ConcaveShell(value)
     }
 }
 
