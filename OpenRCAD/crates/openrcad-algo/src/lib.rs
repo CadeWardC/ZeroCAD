@@ -44,7 +44,7 @@ pub use shell_feasibility::{
 
 use serde::{Deserialize, Serialize};
 
-use openrcad_topo::{Face, Shell, Solid};
+use openrcad_topo::{Edge, Face, Shell, Solid};
 
 /// A boolean operation between two solids (OCCT `BRepAlgoAPI_BooleanOperation`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,7 @@ pub use contour::{
 pub mod corner_network;
 pub use corner_network::{
     CornerIncidentBand, CornerNetworkCertificate, CornerNetworkError, CornerNetworkPlan,
+    CornerTangentSphere,
 };
 
 /// Apply `op` between `object` and `tool` (OCCT `BRepAlgoAPI_Fuse/Cut/Common`).
@@ -375,6 +376,23 @@ pub fn fillet_operation_with_policy(
     policy: &openrcad_foundation::TolerancePolicy,
 ) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
     let value = fillet_with_policy(solid, radius, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_unary_operation(solid, value, policy)
+}
+
+/// Canonical operation result for a selected-edge rolling-ball fillet.
+///
+/// The builder remains atomic and returns typed [`RollingBallError`] values at
+/// its direct API boundary. This operation adapter adds strict validation,
+/// recovery evidence, and complete conservative topology lineage for evaluator
+/// consumers that need an immutable candidate rather than a bare solid.
+pub fn fillet_edges_operation_with_policy(
+    solid: &Solid,
+    edges: &[Edge],
+    radius: f64,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = rolling_ball::fillet_edges_with_policy(solid, edges, radius, policy)
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
     finish_unary_operation(solid, value, policy)
 }

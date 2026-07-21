@@ -17,6 +17,8 @@ pub enum CurveKind2d {
     TorusPlaneSection,
     PlaneTorusSection,
     CylinderPlaneSection,
+    SphereGreatCircle,
+    EndpointCorrected,
 }
 
 impl From<&GeomCurve2d> for CurveKind2d {
@@ -31,6 +33,8 @@ impl From<&GeomCurve2d> for CurveKind2d {
             GeomCurve2d::TorusPlaneSection(_) => Self::TorusPlaneSection,
             GeomCurve2d::PlaneTorusSection(_) => Self::PlaneTorusSection,
             GeomCurve2d::CylinderPlaneSection(_) => Self::CylinderPlaneSection,
+            GeomCurve2d::SphereGreatCircle(_) => Self::SphereGreatCircle,
+            GeomCurve2d::EndpointCorrected(_) => Self::EndpointCorrected,
         }
     }
 }

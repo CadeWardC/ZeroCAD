@@ -132,7 +132,7 @@ fn circular_bite_newbody_hides_internal_wall_segments() {
 }
 
 #[test]
-fn edge_mod_on_circular_bite_body_clears_pristine_mesh() {
+fn edge_mod_on_circular_bite_body_replaces_the_sketch_display_cache() {
     let kind = crate::sketch::CornerKind::Chamfer;
     let g = circular_bite_graph(Some(kind));
     let (live, warnings) = g
@@ -143,10 +143,7 @@ fn edge_mod_on_circular_bite_body_clears_pristine_mesh() {
         "{kind:?} on circular-bite body should not warn, got {warnings:?}"
     );
     assert_eq!(live.len(), 1, "{kind:?} keeps one live body");
-    assert!(
-        live[0].pristine.is_none(),
-        "{kind:?} must clear the pristine sketch display mesh after modifying the B-Rep"
-    );
+    assert_named_edge_mod_cache(&live[0], kind, "circular-bite body");
 
     let bodies = tessellate_bodies(live);
     assert_eq!(bodies.len(), 1, "{kind:?} keeps one rendered body");
@@ -192,10 +189,7 @@ fn edge_mod_on_circular_bite_cutoff_edge_succeeds() {
             .all(|solid| { solid.is_watertight() && solid.health_report().is_healthy() }));
         return;
     }
-    assert!(
-        live[0].pristine.is_none(),
-        "{kind:?} must clear pristine after modifying the B-Rep"
-    );
+    assert_named_edge_mod_cache(&live[0], kind, "circular-bite cutoff edge");
 
     let bodies = tessellate_bodies(live);
     assert_eq!(bodies.len(), 1, "{kind:?} keeps one rendered body");
@@ -262,10 +256,7 @@ fn assert_circular_bite_fillet_3mm_committed(
         "{label}: {kind:?} on edge ending at circular bite should not warn, got {warnings:?}"
     );
     assert_eq!(live.len(), 1, "{label}: {kind:?} keeps one live body");
-    assert!(
-        live[0].pristine.is_none(),
-        "{label}: {kind:?} must clear pristine after modifying the B-Rep"
-    );
+    assert_named_edge_mod_cache(&live[0], kind, label);
 
     let has_cut_cylinder = live[0].parts.iter().any(|solid| {
         solid.shell().faces().iter().any(|f| {
@@ -631,6 +622,25 @@ fn live_has_cylinder_radius(live: &[LiveBody], radius: f64) -> bool {
             })
         })
     })
+}
+
+fn assert_named_edge_mod_cache(body: &LiveBody, kind: crate::sketch::CornerKind, label: &str) {
+    assert!(
+        body.sketch_source.is_none(),
+        "{label}: {kind:?} must discard the pre-operation sketch provenance"
+    );
+    let cache = body
+        .pristine
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: {kind:?} must install its named result mesh"));
+    assert!(
+        cache.face_refs.iter().any(|face| {
+            face.topology
+                .as_ref()
+                .is_some_and(|topology| topology.producer_feature_id.as_deref() == Some("em"))
+        }),
+        "{label}: {kind:?} result mesh must contain faces owned by the edge-mod feature"
+    );
 }
 
 fn mesh_sample_count_in_box(mesh: &MockMesh, lo: [f32; 3], hi: [f32; 3]) -> usize {

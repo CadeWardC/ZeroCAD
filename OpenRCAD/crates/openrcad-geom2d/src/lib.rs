@@ -20,11 +20,13 @@ pub mod circle;
 pub mod curve;
 pub mod cylinder_plane_section;
 pub mod ellipse;
+pub mod endpoint_corrected;
 pub mod hyperbola;
 pub mod line;
 pub mod parabola;
 pub mod plane_torus_section;
 pub mod span;
+pub mod sphere_great_circle;
 pub mod torus_plane_section;
 
 pub use bspline::BSplineCurve2d;
@@ -32,11 +34,13 @@ pub use circle::Circle2d;
 pub use curve::Curve2d;
 pub use cylinder_plane_section::CylinderPlaneSection2d;
 pub use ellipse::Ellipse2d;
+pub use endpoint_corrected::EndpointCorrectedCurve2d;
 pub use hyperbola::Hyperbola2d;
 pub use line::Line2d;
 pub use parabola::Parabola2d;
 pub use plane_torus_section::PlaneTorusSection2d;
 pub use span::{CurveKind2d, CurveSpan};
+pub use sphere_great_circle::SphereGreatCircle2d;
 pub use torus_plane_section::TorusPlaneSection2d;
 
 /// An owned 2D curve: one of the concrete [`Curve2d`]s, storable by value.
@@ -62,6 +66,12 @@ pub enum GeomCurve2d {
     /// Exact oblique planar section in a cylinder's parameter space. Appended
     /// to preserve every existing serialized discriminant.
     CylinderPlaneSection(CylinderPlaneSection2d),
+    /// Exact great circle in a sphere's parameter space. Appended to preserve
+    /// every existing serialized discriminant.
+    SphereGreatCircle(SphereGreatCircle2d),
+    /// Analytic pcurve with topology-exact endpoint corrections. Appended to
+    /// preserve every existing serialized discriminant.
+    EndpointCorrected(EndpointCorrectedCurve2d),
 }
 
 impl GeomCurve2d {
@@ -118,6 +128,18 @@ impl GeomCurve2d {
     pub fn cylinder_plane_section(section: CylinderPlaneSection2d) -> Self {
         Self::CylinderPlaneSection(section)
     }
+
+    /// Construct an exact spherical great-circle pcurve.
+    #[inline]
+    pub fn sphere_great_circle(circle: SphereGreatCircle2d) -> Self {
+        Self::SphereGreatCircle(circle)
+    }
+
+    /// Construct a topology-endpoint-corrected pcurve.
+    #[inline]
+    pub fn endpoint_corrected(curve: EndpointCorrectedCurve2d) -> Self {
+        Self::EndpointCorrected(curve)
+    }
 }
 
 impl Curve2d for GeomCurve2d {
@@ -132,6 +154,8 @@ impl Curve2d for GeomCurve2d {
             Self::TorusPlaneSection(section) => section.point(u),
             Self::PlaneTorusSection(section) => section.point(u),
             Self::CylinderPlaneSection(section) => section.point(u),
+            Self::SphereGreatCircle(circle) => circle.point(u),
+            Self::EndpointCorrected(curve) => curve.point(u),
         }
     }
 
@@ -146,6 +170,8 @@ impl Curve2d for GeomCurve2d {
             Self::TorusPlaneSection(section) => section.d1(u),
             Self::PlaneTorusSection(section) => section.d1(u),
             Self::CylinderPlaneSection(section) => section.d1(u),
+            Self::SphereGreatCircle(circle) => circle.d1(u),
+            Self::EndpointCorrected(curve) => curve.d1(u),
         }
     }
 
@@ -160,6 +186,8 @@ impl Curve2d for GeomCurve2d {
             Self::TorusPlaneSection(section) => section.bounds(),
             Self::PlaneTorusSection(section) => section.bounds(),
             Self::CylinderPlaneSection(section) => section.bounds(),
+            Self::SphereGreatCircle(circle) => circle.bounds(),
+            Self::EndpointCorrected(curve) => curve.bounds(),
         }
     }
 
@@ -174,6 +202,8 @@ impl Curve2d for GeomCurve2d {
             Self::TorusPlaneSection(section) => section.is_closed(),
             Self::PlaneTorusSection(section) => section.is_closed(),
             Self::CylinderPlaneSection(section) => section.is_closed(),
+            Self::SphereGreatCircle(circle) => circle.is_closed(),
+            Self::EndpointCorrected(curve) => curve.is_closed(),
         }
     }
 
@@ -188,6 +218,8 @@ impl Curve2d for GeomCurve2d {
             Self::TorusPlaneSection(section) => section.is_periodic(),
             Self::PlaneTorusSection(section) => section.is_periodic(),
             Self::CylinderPlaneSection(section) => section.is_periodic(),
+            Self::SphereGreatCircle(circle) => circle.is_periodic(),
+            Self::EndpointCorrected(curve) => curve.is_periodic(),
         }
     }
 
@@ -202,6 +234,8 @@ impl Curve2d for GeomCurve2d {
             Self::TorusPlaneSection(section) => section.period(),
             Self::PlaneTorusSection(section) => section.period(),
             Self::CylinderPlaneSection(section) => section.period(),
+            Self::SphereGreatCircle(circle) => circle.period(),
+            Self::EndpointCorrected(curve) => curve.period(),
         }
     }
 }

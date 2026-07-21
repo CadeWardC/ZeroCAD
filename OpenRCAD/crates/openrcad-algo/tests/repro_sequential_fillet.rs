@@ -470,9 +470,9 @@ fn fillet_three_edges_makes_spherical_corner() {
     );
 }
 
-/// Freeze the established three-valent result before the generic Gregory
-/// network replaces its construction path. Selection order may not change the
-/// accepted topology class, analytic radius, or validation outcome.
+/// Lock the established three-valent result against the generic corner-network
+/// implementation. Selection order may not change the accepted topology class,
+/// analytic radius, or validation outcome.
 #[test]
 fn three_edge_corner_is_selection_order_independent() {
     let (w, h, d, r) = (40.0_f64, 30.0, 20.0, 4.0);
@@ -744,8 +744,7 @@ fn fillet_top_edge_into_existing_vertical_round() {
         "fillet-into-round body must be healthy"
     );
     // The new fillet meets the prior round of a DIFFERENT radius, so the
-    // equal-radius sphere can't fire; the join must round through a general
-    // (Gregory) corner patch rather than a flat-trim crease.
-    // A smooth Gregory transition remains the Phase 3 strengthening; the
-    // active Phase 1 safety net requires only a healthy, watertight result.
+    // equal-radius sphere can't fire. A supported general transition must be
+    // healthy and watertight; an unsupported transition rejects atomically in
+    // the branch above instead of substituting a flat-trim crease.
 }

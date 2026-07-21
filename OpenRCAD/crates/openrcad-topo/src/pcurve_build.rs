@@ -7,8 +7,8 @@ use openrcad_foundation::{
 };
 use openrcad_geom::{Curve, GeomCurve, GeomSurface, Plane, Surface};
 use openrcad_geom2d::{
-    BSplineCurve2d, Circle2d, CylinderPlaneSection2d, Ellipse2d, GeomCurve2d, Line2d,
-    PlaneTorusSection2d, TorusPlaneSection2d,
+    BSplineCurve2d, Circle2d, Curve2d, CylinderPlaneSection2d, Ellipse2d, EndpointCorrectedCurve2d,
+    GeomCurve2d, Line2d, PlaneTorusSection2d, SphereGreatCircle2d, TorusPlaneSection2d,
 };
 
 use crate::arena::{BRep, EdgeData, EdgeId, FaceId, LoopId};
@@ -394,6 +394,14 @@ fn exact_cylinder_curve_pcurve(
     let axis = GeomVec::from_dir(frame.direction());
     let scale = cylinder.radius().abs().max(f64::MIN_POSITIVE);
     let tolerance = policy.classification + scale * f64::EPSILON * 64.0;
+    // Exact analytic frames are only authoritative while their evaluated end
+    // points still agree tightly with the sewn topology. A classification-size
+    // allowance is appropriate for support recognition, but is too loose for
+    // coedge endpoints: at a small cylinder translated far from the origin it
+    // can accept two individually valid pcurves on visibly different UV
+    // branches. Declining the exact shortcut lets the general builder anchor
+    // both pcurves at their one shared topology vertex.
+    let endpoint_tolerance = policy.linear * 16.0 + scale * f64::EPSILON * 64.0;
     let topology_start = brep.vertices.get(edge.start)?.point;
     let topology_end = brep.vertices.get(edge.end)?.point;
     let start_uv = axial_uv(frame, topology_start, None);
@@ -406,10 +414,10 @@ fn exact_cylinder_curve_pcurve(
     // topology.
     let curve_first = curve.point(first);
     let curve_last = curve.point(last);
-    let direct = topology_start.distance(&curve_first) <= tolerance
-        && topology_end.distance(&curve_last) <= tolerance;
-    let reversed = topology_start.distance(&curve_last) <= tolerance
-        && topology_end.distance(&curve_first) <= tolerance;
+    let direct = topology_start.distance(&curve_first) <= endpoint_tolerance
+        && topology_end.distance(&curve_last) <= endpoint_tolerance;
+    let reversed = topology_start.distance(&curve_last) <= endpoint_tolerance
+        && topology_end.distance(&curve_first) <= endpoint_tolerance;
     let (topology_first, topology_last) = if direct {
         (first, last)
     } else if reversed {
@@ -506,9 +514,27 @@ fn exact_cylinder_curve_pcurve(
                 v_cosine,
                 v_sine,
             )?;
+            let base = GeomCurve2d::cylinder_plane_section(section);
+            let base_start = base.point(topology_first);
+            let base_end = base.point(topology_last);
+            let desired_start = Pnt2d::new(
+                unwrap_near(start_uv.x(), base_start.x(), Some(core::f64::consts::TAU)),
+                start_uv.y(),
+            );
+            let desired_end = Pnt2d::new(
+                unwrap_near(end_uv.x(), base_end.x(), Some(core::f64::consts::TAU)),
+                end_uv.y(),
+            );
+            let corrected = EndpointCorrectedCurve2d::new(
+                base,
+                topology_first,
+                topology_last,
+                desired_start - base_start,
+                desired_end - base_end,
+            )?;
             return Some(
                 PcurveData::new(
-                    GeomCurve2d::cylinder_plane_section(section),
+                    GeomCurve2d::endpoint_corrected(corrected),
                     topology_first,
                     topology_last,
                 )
@@ -520,10 +546,11 @@ fn exact_cylinder_curve_pcurve(
     line_pcurve(&endpoints, surface_periodicity(surface))
 }
 
-/// Exact UV line for the coordinate great circles used to bound native sphere
-/// patches. The classification and samples are evaluated only from the two
-/// analytic frames; far-origin world-coordinate subtraction is limited to the
-/// support and endpoint certificates.
+/// Exact UV representation for any great circle used to bound a native sphere
+/// patch. Coordinate great circles reduce naturally to straight UV spans;
+/// oblique circles retain their analytic trigonometric map. Classification is
+/// evaluated from the two analytic frames, so far-origin world-coordinate
+/// subtraction is limited to the support and endpoint certificates.
 fn exact_sphere_great_circle_pcurve(
     brep: &BRep,
     surface: &GeomSurface,
@@ -567,35 +594,20 @@ fn exact_sphere_great_circle_pcurve(
             radial.dot(&sphere_z).clamp(-1.0, 1.0),
         )
     };
-    let parameters = [0.0, 0.25, 0.5, 0.75, 1.0]
-        .map(|fraction| edge.first + (edge.last - edge.first) * fraction);
-    let reference = parameters
-        .iter()
-        .map(|parameter| local(*parameter))
-        .find(|(x, y, _)| x.hypot(*y) > policy.angular)?;
-    let reference_u = reference.1.atan2(reference.0);
-    let periodicity = surface_periodicity(surface);
-    let mut previous_u = reference_u;
-    let mut samples = Vec::with_capacity(parameters.len());
-    for parameter in parameters {
-        let (x, y, z) = local(parameter);
-        let raw_u = if x.hypot(y) <= policy.angular {
-            previous_u
-        } else {
-            y.atan2(x)
-        };
-        let u = unwrap_near(raw_u, previous_u, periodicity.u_period);
-        previous_u = u;
-        samples.push(Pnt2d::new(u, z.asin()));
-    }
-    let candidate = line_pcurve(&[samples[0], samples[4]], periodicity)?;
-    if samples.iter().enumerate().any(|(index, sample)| {
-        let expected = candidate.point_at_fraction(index as f64 / 4.0);
-        sample.distance(&expected) > policy.angular
-    }) {
-        return None;
-    }
-    Some(candidate)
+    let cosine = local(0.0);
+    let sine = local(core::f64::consts::FRAC_PI_2);
+    Some(
+        PcurveData::new(
+            GeomCurve2d::sphere_great_circle(SphereGreatCircle2d::new(
+                [cosine.0, cosine.1, cosine.2],
+                [sine.0, sine.1, sine.2],
+                edge.first,
+            )?),
+            edge.first,
+            edge.last,
+        )
+        .with_periodicity(surface_periodicity(surface)),
+    )
 }
 
 /// A [`GeomCurve::TorusSurfaceCurve`] owns its exact affine `(u, v)` map.

@@ -229,6 +229,8 @@ impl PcurveData {
                 GeomCurve2d::cylinder_plane_section((*curve).scaled_v(v_scale)?),
                 1.0,
             ),
+            GeomCurve2d::SphereGreatCircle(_) => return None,
+            GeomCurve2d::EndpointCorrected(_) => return None,
             _ => return None,
         };
 

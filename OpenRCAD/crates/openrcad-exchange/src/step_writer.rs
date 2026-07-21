@@ -255,7 +255,9 @@ impl StepWriter {
             | GeomCurve2d::Hyperbola(_)
             | GeomCurve2d::TorusPlaneSection(_)
             | GeomCurve2d::PlaneTorusSection(_)
-            | GeomCurve2d::CylinderPlaneSection(_) => {
+            | GeomCurve2d::CylinderPlaneSection(_)
+            | GeomCurve2d::SphereGreatCircle(_)
+            | GeomCurve2d::EndpointCorrected(_) => {
                 // These section pcurves are exact inside OpenRCAD but have no
                 // portable AP242 analytic entity. Export a denser,
                 // deterministic representation without changing the durable
@@ -265,6 +267,8 @@ impl StepWriter {
                     GeomCurve2d::TorusPlaneSection(_)
                         | GeomCurve2d::PlaneTorusSection(_)
                         | GeomCurve2d::CylinderPlaneSection(_)
+                        | GeomCurve2d::SphereGreatCircle(_)
+                        | GeomCurve2d::EndpointCorrected(_)
                 ) {
                     257
                 } else {

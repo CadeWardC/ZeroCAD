@@ -11,15 +11,17 @@ use openrcad_foundation::{
     TolerancePolicyError, Vec as GeomVec,
 };
 use openrcad_geom::{
-    Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface,
-    GregorySurface, Plane, RuledSurface, SphericalSurface, Surface, ToroidalSurface,
+    Circle, ConicalSurface, Curve, CylindricalSurface, Ellipse, GeomCurve, GeomSurface, Plane,
+    RuledSurface, SphericalSurface, Surface, ToroidalSurface,
 };
 use openrcad_mesh::tessellate_checked_with_policy_and_cancel;
 use openrcad_topo::{Edge, Face, FaceId, Orientation, Solid, Vertex, Wire};
 
 use crate::native_pcurve::analytic_face_with_pcurves;
 use crate::sew::sew_shell_with_policy as sew_with_policy;
-use crate::{BandSupportKind, CornerIncidentBand, CornerNetworkPlan};
+use crate::{
+    BandSupportKind, CornerIncidentBand, CornerNetworkError, CornerNetworkPlan, CornerTangentSphere,
+};
 
 fn native_blend_face(surface: GeomSurface, wire: Wire) -> Result<Face, RollingBallError> {
     analytic_face_with_pcurves(surface, wire, Orientation::Forward)
@@ -69,6 +71,8 @@ pub enum RollingBallError {
     InvalidTopology,
     /// A strict validation stage could not inspect the candidate.
     CandidateValidation { stage: &'static str, reason: String },
+    /// Multi-band corner planning rejected the requested network before commit.
+    CornerNetwork(CornerNetworkError),
 }
 
 impl fmt::Display for RollingBallError {
@@ -116,11 +120,18 @@ impl fmt::Display for RollingBallError {
                     "rolling ball: candidate validation failed during {stage}: {reason}"
                 )
             }
+            Self::CornerNetwork(error) => write!(f, "rolling ball: {error}"),
         }
     }
 }
 
 impl std::error::Error for RollingBallError {}
+
+impl From<CornerNetworkError> for RollingBallError {
+    fn from(error: CornerNetworkError) -> Self {
+        Self::CornerNetwork(error)
+    }
+}
 
 /// Contact-curve and blend-surface result for one planar rolling-ball edge.
 #[derive(Clone, Debug)]
@@ -279,42 +290,6 @@ fn radial(axis: Dir, xref: Dir, u: f64) -> GeomVec {
     let x = GeomVec::from_dir(xref);
     let y = GeomVec::from_dir(axis).cross(&GeomVec::from_dir(xref));
     x * u.cos() + y * u.sin()
-}
-
-fn make_gregory_corner_patch(corner: Pnt, p_a: Pnt, p_b: Pnt, _radius: f64) -> Face {
-    let p01 = corner;
-    let p02 = corner;
-
-    let p10 = corner + (p_a - corner) * 0.33;
-    let p20 = corner + (p_a - corner) * 0.66;
-
-    let p31 = p_a + (p_b - p_a) * 0.33;
-    let p32 = p_a + (p_b - p_a) * 0.66;
-
-    let p13 = corner + (p_b - corner) * 0.33;
-    let p23 = corner + (p_b - corner) * 0.66;
-
-    let p11_u = p10 + (p31 - p10) * 0.5;
-    let p11_v = p13 + (p32 - p13) * 0.5;
-    let p21_u = p20 + (p31 - p20) * 0.5;
-    let p21_v = p23 + (p32 - p23) * 0.5;
-
-    let p12_u = p11_u;
-    let p12_v = p11_v;
-    let p22_u = p21_u;
-    let p22_v = p21_v;
-
-    let surf = GregorySurface::new(
-        corner, p01, p02, corner, p10, p20, p_a, p31, p32, p_b, p13, p23, p11_u, p11_v, p21_u,
-        p21_v, p12_u, p12_v, p22_u, p22_v,
-    );
-
-    let e1 = Edge::between_points(corner, p_a);
-    let e2 = Edge::between_points(p_a, p_b);
-    let e3 = Edge::between_points(p_b, corner);
-
-    let wire = Wire::from_edges([e1, e2, e3]);
-    Face::new(Some(GeomSurface::gregory(surf)), wire)
 }
 
 /// Apply a selected-edge rolling-ball fillet to a simple planar or curved solid.
@@ -746,11 +721,23 @@ fn complete_blend_candidate_pcurves(
     candidate: &Solid,
     policy: &TolerancePolicy,
 ) -> Result<Solid, RollingBallError> {
-    candidate
+    let completed = candidate
         .complete_missing_pcurves(policy)
         .map(|(solid, _)| solid)
         .map_err(|error| RollingBallError::CandidateValidation {
             stage: "blend candidate pcurve construction",
+            reason: error.to_string(),
+        })?;
+    // Sewing canonicalizes coincident 3D vertices. At very small scales and
+    // large translations that rebase can move an endpoint by a few ulps after
+    // its native pcurve was constructed. Revalidate and, where necessary,
+    // rebuild against the sewn topology so UV loops share the same endpoint
+    // branch without relaxing the document policy.
+    completed
+        .repair_pcurves(policy)
+        .map(|(solid, _)| solid)
+        .map_err(|error| RollingBallError::CandidateValidation {
+            stage: "blend candidate pcurve rebinding",
             reason: error.to_string(),
         })
 }
@@ -852,7 +839,8 @@ struct CornerSphere {
 /// - The endpoint cap is a single prior *blend* surface (a cylinder/torus) — two
 ///   fillets share this corner. Round it with a [`corner_sphere_blend`].
 /// - The cap is a single planar face — trim that face for the blend's end arc.
-/// - Several cap faces (an n-valent vertex) — drop in a Gregory corner patch.
+/// - Several cap faces from one plane are merged; genuinely distinct planes
+///   reject here and require the simultaneous corner-network entry point.
 #[allow(clippy::too_many_arguments)]
 fn handle_corner_endpoint(
     solid: &Solid,
@@ -911,8 +899,8 @@ fn handle_corner_endpoint(
         // a boolean imprint left split (e.g. a fused boss's bottom disc sitting
         // coplanar with the base face, sharing a chord edge), merge them and run
         // the ordinary flat trim on the union — the corner vertex then owns both
-        // of its loop edges in a single wire. The Gregory patch below is for
-        // genuinely distinct cap planes at an n-valent vertex.
+        // of its loop edges in a single wire. Genuinely distinct cap planes at
+        // an N-valent vertex are handled only by the simultaneous network.
         if let Some(merged) = merged_coplanar_cap(caps) {
             let in_plane = match merged.surface() {
                 Some(GeomSurface::Plane(pl)) => {
@@ -938,15 +926,15 @@ fn handle_corner_endpoint(
                 }
             }
         }
-        let patch = make_gregory_corner_patch(corner, ca, cb, radius);
-        faces.push(patch);
-        for cap in caps {
-            if let Ok(trimmed) = trim_face_at_corner(cap, corner, ca, cb, arc) {
-                faces.push(trimmed);
-                skipped.insert(cap.id());
-            }
+        // Distinct cap planes identify a multi-band vertex. The old fallback
+        // reused this one band's trim curve on every cap and could return
+        // off-support topology. Complete selections route through the
+        // simultaneous corner-network builder; partial selections reject.
+        Err(CornerNetworkError::IncompleteSelection {
+            selected_bands: 1,
+            vertex_valence: caps.len() + 2,
         }
-        Ok(())
+        .into())
     }
 }
 
@@ -4001,13 +3989,546 @@ fn adjacent_planar_face(solid: &Solid, edge: &Edge, exclude: &Face) -> Option<Fa
     })
 }
 
+#[derive(Clone)]
+struct PlannedCornerBlend {
+    blend: RollingBallBlend,
+    corner_arc: Edge,
+    incident: CornerIncidentBand,
+}
+
+fn selected_edges_common_vertex(edges: &[Edge], tolerance: f64) -> Option<Pnt> {
+    let first = edges.first()?;
+    [first.source().point(), first.target().point()]
+        .into_iter()
+        .find(|candidate| {
+            edges.iter().all(|edge| {
+                edge.source().point().distance(candidate) <= tolerance
+                    || edge.target().point().distance(candidate) <= tolerance
+            })
+        })
+}
+
+fn opposite_endpoint(edge: &Edge, corner: Pnt) -> Pnt {
+    if edge.source().point().distance(&corner) <= edge.target().point().distance(&corner) {
+        edge.target().point()
+    } else {
+        edge.source().point()
+    }
+}
+
+fn truncate_straight_edge_at_corner(
+    edge: &Edge,
+    corner: Pnt,
+    truncation: Pnt,
+) -> Result<Edge, RollingBallError> {
+    let Some(GeomCurve::Line(line)) = edge.curve() else {
+        return Err(RollingBallError::UnsolvableAdjacency {
+            reason: AdjacencyReason::UnsupportedSurfacePair,
+        });
+    };
+    let direction = GeomVec::from_dir(line.direction());
+    let parameter = (truncation - line.location()).dot(&direction);
+    let start_is_corner =
+        edge.start().point().distance(&corner) <= edge.end().point().distance(&corner);
+    let shortened = if start_is_corner {
+        Edge::new(
+            Some(GeomCurve::line(*line)),
+            parameter,
+            edge.last(),
+            Vertex::new(truncation),
+            edge.end(),
+        )
+    } else {
+        Edge::new(
+            Some(GeomCurve::line(*line)),
+            edge.first(),
+            parameter,
+            edge.start(),
+            Vertex::new(truncation),
+        )
+    };
+    Ok(if edge.orientation().is_forward() {
+        shortened
+    } else {
+        shortened.reversed()
+    })
+}
+
+fn rebind_straight_edge_endpoint(
+    edge: &Edge,
+    old_endpoint: Pnt,
+    new_endpoint: Pnt,
+) -> Result<Edge, RollingBallError> {
+    let Some(GeomCurve::Line(line)) = edge.curve() else {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    };
+    let start_is_moved =
+        edge.start().point().distance(&old_endpoint) <= edge.end().point().distance(&old_endpoint);
+    let start = if start_is_moved {
+        new_endpoint
+    } else {
+        edge.start().point()
+    };
+    let end = if start_is_moved {
+        edge.end().point()
+    } else {
+        new_endpoint
+    };
+    let direction = GeomVec::from_dir(line.direction());
+    let parameter = |point: Pnt| (point - line.location()).dot(&direction);
+    let rebound = Edge::new(
+        Some(GeomCurve::line(*line)),
+        parameter(start),
+        parameter(end),
+        Vertex::new(start),
+        Vertex::new(end),
+    );
+    Ok(if edge.orientation().is_forward() {
+        rebound
+    } else {
+        rebound.reversed()
+    })
+}
+
+fn corner_arc_midpoint(arc: &Edge) -> Pnt {
+    arc.curve()
+        .map(|curve| curve.point(0.5 * (arc.first() + arc.last())))
+        .unwrap_or_else(|| {
+            let source = arc.source().point();
+            source + (arc.target().point() - source) * 0.5
+        })
+}
+
+fn blend_arc_on_sphere(blend: &RollingBallBlend, center: Pnt, radius: f64) -> Edge {
+    [&blend.start_arc, &blend.end_arc]
+        .into_iter()
+        .min_by(|first, second| {
+            let error = |arc: &Edge| (corner_arc_midpoint(arc).distance(&center) - radius).abs();
+            error(first).total_cmp(&error(second))
+        })
+        .expect("a rolling-ball blend always has two end arcs")
+        .clone()
+}
+
+fn chain_corner_arcs(
+    arcs: &[Edge],
+    tolerance: &ToleranceContext,
+) -> Result<Vec<Edge>, RollingBallError> {
+    if arcs.len() < CornerNetworkPlan::MIN_VERIFIED_VALENCE {
+        return Err(CornerNetworkError::UnsupportedValence {
+            valence: arcs.len(),
+        }
+        .into());
+    }
+    let near = |first: Pnt, second: Pnt| first.distance(&second) <= tolerance.welding;
+    let mut ordered = Vec::with_capacity(arcs.len());
+    let first = &arcs[0];
+    let second = &arcs[1];
+    let oriented_first = if near(first.target().point(), second.source().point())
+        || near(first.target().point(), second.target().point())
+    {
+        first.clone()
+    } else if near(first.source().point(), second.source().point())
+        || near(first.source().point(), second.target().point())
+    {
+        first.reversed()
+    } else {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    };
+    ordered.push(oriented_first);
+    for arc in &arcs[1..] {
+        let tail = ordered.last().unwrap().target().point();
+        if near(tail, arc.source().point()) {
+            ordered.push(arc.clone());
+        } else if near(tail, arc.target().point()) {
+            ordered.push(arc.reversed());
+        } else {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+    }
+    if !near(
+        ordered.last().unwrap().target().point(),
+        ordered[0].source().point(),
+    ) {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+    Ok(ordered)
+}
+
+/// Exact simultaneous specialization for equal-radius convex planar bands at
+/// one three-through-six-valent vertex. All offset planes must meet at one
+/// rolling-sphere center; otherwise the request rejects before topology is
+/// modified instead of falling back to an approximate corner.
+fn fillet_planar_corner_network_with_policy(
+    solid: &Solid,
+    edges: &[Edge],
+    corner: Pnt,
+    radius: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, RollingBallError> {
+    let tolerance = ToleranceContext::derive(policy, &[solid.bounding_box()], Some(radius), 1.0)
+        .map_err(RollingBallError::InvalidTolerancePolicy)?;
+
+    #[derive(Clone)]
+    struct SourceBand {
+        edge: Edge,
+        face_a: Face,
+        face_b: Face,
+        normal_a: Dir,
+        normal_b: Dir,
+    }
+
+    struct SupportTrim {
+        id: FaceId,
+        face: Face,
+        replacements: Vec<(Edge, Edge)>,
+    }
+
+    let mut support_normals: Vec<(FaceId, Dir)> = Vec::new();
+    let mut sources = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if !matches!(edge.curve(), Some(GeomCurve::Line(_)) | None) {
+            return Err(RollingBallError::UnsolvableAdjacency {
+                reason: AdjacencyReason::UnsupportedSurfacePair,
+            });
+        }
+        let adjacent = adjacent_faces(solid, edge);
+        if adjacent.len() != 2 {
+            return Err(RollingBallError::EdgeAdjacency {
+                count: adjacent.len(),
+            });
+        }
+        if !adjacent
+            .iter()
+            .all(|face| matches!(face.surface(), Some(GeomSurface::Plane(_))))
+        {
+            return Err(RollingBallError::UnsolvableAdjacency {
+                reason: AdjacencyReason::NotPlaneOrAnalytic,
+            });
+        }
+        let normal_a = planar_outward_normal_checked_with_policy(solid, &adjacent[0], policy)?;
+        let normal_b = planar_outward_normal_checked_with_policy(solid, &adjacent[1], policy)?;
+        if planar_edge_material_wedge_is_concave(solid, edge, normal_a, normal_b) == Some(true) {
+            return Err(RollingBallError::InvalidDihedral);
+        }
+        for (face, normal) in [(&adjacent[0], normal_a), (&adjacent[1], normal_b)] {
+            if !support_normals.iter().any(|(id, _)| *id == face.id()) {
+                support_normals.push((face.id(), normal));
+            }
+        }
+        sources.push(SourceBand {
+            edge: edge.clone(),
+            face_a: adjacent[0].clone(),
+            face_b: adjacent[1].clone(),
+            normal_a,
+            normal_b,
+        });
+    }
+    if support_normals.len() > edges.len() {
+        return Err(CornerNetworkError::IncompleteSelection {
+            selected_bands: edges.len(),
+            vertex_valence: support_normals.len(),
+        }
+        .into());
+    }
+    if support_normals.len() != edges.len() {
+        return Err(CornerNetworkError::UnsupportedValence {
+            valence: support_normals.len(),
+        }
+        .into());
+    }
+    let sphere = CornerTangentSphere::new(
+        corner,
+        support_normals.iter().map(|(_, normal)| *normal),
+        radius,
+        &tolerance,
+    )?;
+
+    let mut planned = Vec::with_capacity(sources.len());
+    for source in sources {
+        let full = planar_blend(
+            &source.edge,
+            &source.face_a,
+            &source.face_b,
+            source.normal_a,
+            source.normal_b,
+            radius,
+        )?;
+        let center_at_corner = nearest_endpoint(&full.centerline, corner);
+        let center_offset = center_at_corner - corner;
+        let truncation = sphere.center() - center_offset;
+        let source_point = source.edge.source().point();
+        let target_point = source.edge.target().point();
+        let edge_vector = target_point - source_point;
+        let edge_length_squared = edge_vector.magnitude_squared();
+        if edge_length_squared <= tolerance.arithmetic_floor * tolerance.arithmetic_floor {
+            return Err(RollingBallError::DegenerateSpine);
+        }
+        let parameter = (truncation - source_point).dot(&edge_vector) / edge_length_squared;
+        let projected = source_point + edge_vector * parameter;
+        if projected.distance(&truncation) > tolerance.policy.intersection
+            || parameter <= 0.0
+            || parameter >= 1.0
+            || truncation.distance(&corner) <= tolerance.welding
+            || truncation.distance(&opposite_endpoint(&source.edge, corner)) <= tolerance.welding
+        {
+            return Err(RollingBallError::UnsolvableAdjacency {
+                reason: AdjacencyReason::RadiusTooLarge,
+            });
+        }
+        let shortened = truncate_straight_edge_at_corner(&source.edge, corner, truncation)?;
+        let mut blend = planar_blend(
+            &shortened,
+            &source.face_a,
+            &source.face_b,
+            source.normal_a,
+            source.normal_b,
+            radius,
+        )?;
+        let generated_center = nearest_endpoint(&blend.centerline, truncation);
+        if generated_center.distance(&sphere.center()) > tolerance.policy.intersection {
+            return Err(CornerNetworkError::NonConcurrentOffsets {
+                maximum_error: generated_center.distance(&sphere.center()),
+            }
+            .into());
+        }
+        // Every support face owns one canonical tangent point on the common
+        // sphere. Compute it once from that face's checked outward normal and
+        // rebind both incident bands to the exact same topology vertex. This
+        // avoids a one-ulp 3D loop gap when the same point is reached through
+        // two different offset sums at a far origin.
+        let old_a = nearest_endpoint(&blend.contact_a, truncation);
+        let old_b = nearest_endpoint(&blend.contact_b, truncation);
+        let canonical_a = sphere.center() + GeomVec::from_dir(source.normal_a) * radius;
+        let canonical_b = sphere.center() + GeomVec::from_dir(source.normal_b) * radius;
+        let contact_a = rebind_straight_edge_endpoint(&blend.contact_a, old_a, canonical_a)?;
+        let contact_b = rebind_straight_edge_endpoint(&blend.contact_b, old_b, canonical_b)?;
+        let common_is_end = corner_arc_midpoint(&blend.end_arc).distance(&sphere.center())
+            < corner_arc_midpoint(&blend.start_arc).distance(&sphere.center());
+        let corner_arc = arc_on_sphere(sphere.center(), canonical_b, canonical_a, radius)?;
+        blend.blend_face =
+            build_blend_face_with_trim(&blend, &contact_a, &contact_b, &corner_arc, common_is_end);
+        blend.contact_a = contact_a;
+        blend.contact_b = contact_b;
+        if common_is_end {
+            blend.end_arc = corner_arc.clone();
+        } else {
+            blend.start_arc = corner_arc.clone();
+        }
+        let contact = corner_arc_midpoint(&corner_arc);
+        blend.spine = source.edge;
+        planned.push(PlannedCornerBlend {
+            blend,
+            corner_arc,
+            incident: CornerIncidentBand {
+                contact,
+                radius,
+                support: BandSupportKind::Cylinder,
+            },
+        });
+    }
+
+    let plan = CornerNetworkPlan::new(
+        sphere.center(),
+        planned.iter().map(|entry| entry.incident),
+        &tolerance,
+    )?;
+    let mut unordered = planned;
+    let mut planned = Vec::with_capacity(unordered.len());
+    for incident in plan.incidents() {
+        let Some((index, distance)) = unordered
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.incident.contact.distance(&incident.contact)))
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+        else {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        };
+        if distance > tolerance.welding {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        planned.push(unordered.remove(index));
+    }
+
+    // Trim each non-network endpoint. Several bands may terminate on the same
+    // cap (the base of a pyramid), so carry each face forward and emit only the
+    // final accumulated trim.
+    let mut cap_updates: Vec<(FaceId, Face)> = Vec::new();
+    for entry in &mut planned {
+        let far = opposite_endpoint(&entry.blend.spine, corner);
+        let caps = endpoint_cap_faces(solid, far, &entry.blend.face_a, &entry.blend.face_b);
+        if caps.len() != 1 || !matches!(caps[0].surface(), Some(GeomSurface::Plane(_))) {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        let original_id = caps[0].id();
+        let current = cap_updates
+            .iter()
+            .find(|(id, _)| *id == original_id)
+            .map(|(_, face)| face.clone())
+            .unwrap_or_else(|| caps[0].clone());
+        let mut generated = Vec::new();
+        let mut ignored_skips = std::collections::HashSet::new();
+        let applied = try_oblique_planar_cap(
+            &mut entry.blend,
+            far,
+            std::slice::from_ref(&current),
+            radius,
+            &mut generated,
+            &mut ignored_skips,
+        )?;
+        let next = if applied {
+            if generated.len() != 1 {
+                return Err(RollingBallError::UnsupportedTrimTopology);
+            }
+            generated.remove(0)
+        } else {
+            let corner_is_source = entry.blend.spine.source().point().distance(&corner)
+                <= entry.blend.spine.target().point().distance(&corner);
+            let far_arc = if corner_is_source {
+                &entry.blend.end_arc
+            } else {
+                &entry.blend.start_arc
+            };
+            trim_face_at_corner(
+                &current,
+                far,
+                nearest_endpoint(&entry.blend.contact_a, far),
+                nearest_endpoint(&entry.blend.contact_b, far),
+                far_arc,
+            )?
+        };
+        if let Some((_, face)) = cap_updates.iter_mut().find(|(id, _)| *id == original_id) {
+            *face = next;
+        } else {
+            cap_updates.push((original_id, next));
+        }
+        entry.corner_arc = blend_arc_on_sphere(&entry.blend, sphere.center(), radius);
+    }
+
+    let mut support_trims: Vec<SupportTrim> = Vec::new();
+    for entry in &planned {
+        for (support, contact) in [
+            (&entry.blend.face_a, &entry.blend.contact_a),
+            (&entry.blend.face_b, &entry.blend.contact_b),
+        ] {
+            if let Some(trim) = support_trims
+                .iter_mut()
+                .find(|trim| trim.id == support.id())
+            {
+                trim.replacements
+                    .push((entry.blend.spine.clone(), contact.clone()));
+            } else {
+                support_trims.push(SupportTrim {
+                    id: support.id(),
+                    face: support.clone(),
+                    replacements: vec![(entry.blend.spine.clone(), contact.clone())],
+                });
+            }
+        }
+    }
+    let trimmed_supports = support_trims
+        .iter()
+        .map(|trim| {
+            trim_face_along_multiple_spines(&trim.face, &trim.replacements)
+                .map(|face| (trim.id, face))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let arcs = chain_corner_arcs(
+        &planned
+            .iter()
+            .map(|entry| entry.corner_arc.clone())
+            .collect::<Vec<_>>(),
+        &tolerance,
+    )?;
+    let first_arc_axis = (arcs[0].source().point() - sphere.center())
+        .normalized()
+        .ok_or(CornerNetworkError::AmbiguousMaterialAxis)?;
+    let first_arc_x = (arcs[0].target().point() - sphere.center())
+        .normalized()
+        .ok_or(CornerNetworkError::AmbiguousMaterialAxis)?;
+    let orthogonal_trihedral = arcs.len() == 3
+        && first_arc_axis.dot(&first_arc_x).abs()
+            <= tolerance.policy.angular.max(tolerance.convergence / radius);
+    let (axis, projected_x) = if orthogonal_trihedral {
+        // Preserve the established trihedral sphere parameterization: two
+        // incident radii define the Z/X axes, making every boundary a sphere
+        // coordinate great circle. Besides reproducing the old geometry, this
+        // keeps the shared-edge tessellator's UV constraints straight and
+        // therefore crack-free.
+        (
+            Dir::new(first_arc_axis.x(), first_arc_axis.y(), first_arc_axis.z()),
+            first_arc_x,
+        )
+    } else {
+        // Keep both spherical parameter poles outside the corner patch. Using
+        // the material axis as the sphere Z axis puts a pole inside the patch,
+        // forcing its closed trim loop to wind by one full U period. A planar
+        // constrained triangulator cannot close that loop without duplicating
+        // the periodic seam. A deterministic axis perpendicular to both the
+        // material direction and the first boundary radius lies transverse to
+        // the verified convex 3..=6 patch, so its UV loop is contractible.
+        let material_axis = plan
+            .material_axis()
+            .normalized()
+            .ok_or(CornerNetworkError::AmbiguousMaterialAxis)?;
+        let transverse_axis = material_axis
+            .try_cross(&first_arc_axis)
+            .ok_or(CornerNetworkError::AmbiguousMaterialAxis)?;
+        (transverse_axis, material_axis)
+    };
+    let sphere_face = Face::new(
+        Some(GeomSurface::sphere(SphericalSurface::new(
+            Ax3::new_axes(
+                sphere.center(),
+                axis,
+                Dir::new(projected_x.x(), projected_x.y(), projected_x.z()),
+            ),
+            sphere.radius(),
+        ))),
+        Wire::from_edges(arcs),
+    );
+
+    let mut faces = Vec::new();
+    for face in solid.shell().faces() {
+        if support_trims.iter().any(|trim| trim.id == face.id())
+            || cap_updates.iter().any(|(id, _)| *id == face.id())
+        {
+            continue;
+        }
+        faces.push(face);
+    }
+    faces.extend(cap_updates.into_iter().map(|(_, face)| face));
+    faces.extend(trimmed_supports.into_iter().map(|(_, face)| face));
+    faces.extend(planned.into_iter().map(|entry| entry.blend.blend_face));
+    faces.push(sphere_face);
+
+    let candidate = Solid::new(
+        sew_with_policy(&faces, policy).map_err(RollingBallError::InvalidTolerancePolicy)?,
+    );
+    let candidate = complete_blend_candidate_pcurves(&candidate, policy)?;
+    if candidate.is_watertight() && candidate.health_report().is_healthy() {
+        Ok(candidate)
+    } else {
+        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+            eprintln!(
+                "corner-network candidate rejected: watertight={} health={:?} strict={:?}",
+                candidate.is_watertight(),
+                candidate.health_report(),
+                candidate.validate_strict_with_policy(policy)
+            );
+        }
+        Err(RollingBallError::InvalidTopology)
+    }
+}
+
 /// Apply a constant-`radius` rolling-ball fillet to several selected `edges`.
 ///
-/// Edges are filleted sequentially: after each blend the solid is rebuilt, so
-/// the next selected edge is re-located in the evolving body by matching its
-/// endpoint positions (within tolerance). Independent edges — and edges that
-/// share a corner, where [`fillet_planar_edge`] inserts a corner cap or Gregory
-/// patch — are supported; the order of `edges` does not need to be sorted.
+/// A complete three-through-six-valent planar selection at one vertex is solved
+/// simultaneously as one ordered spherical corner network. Other selections
+/// are filleted sequentially: after each blend the solid is rebuilt and the
+/// next edge is relocated in the evolving body. Selection order is irrelevant
+/// in either supported path.
 ///
 /// Returns the first [`RollingBallError`] encountered, or
 /// [`RollingBallError::SpineNotOnFace`] if a requested edge can no longer be
@@ -4026,8 +4547,30 @@ pub fn fillet_edges_with_policy(
     policy
         .validate()
         .map_err(RollingBallError::InvalidTolerancePolicy)?;
+    let relocated = edges
+        .iter()
+        .map(|edge| {
+            relocate_edge_with_policy(solid, edge, policy).ok_or(RollingBallError::SpineNotOnFace)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if relocated.len() >= CornerNetworkPlan::MIN_VERIFIED_VALENCE {
+        let tolerance =
+            ToleranceContext::derive(policy, &[solid.bounding_box()], Some(radius), 1.0)
+                .map_err(RollingBallError::InvalidTolerancePolicy)?;
+        if let Some(corner) = selected_edges_common_vertex(&relocated, tolerance.welding) {
+            if relocated.len() > CornerNetworkPlan::MAX_VERIFIED_VALENCE {
+                return Err(CornerNetworkError::UnsupportedValence {
+                    valence: relocated.len(),
+                }
+                .into());
+            }
+            return fillet_planar_corner_network_with_policy(
+                solid, &relocated, corner, radius, policy,
+            );
+        }
+    }
     let mut current = solid.clone();
-    for edge in edges {
+    for edge in &relocated {
         // Re-locate the edge in the evolving body. `relocate_edge` tolerates the
         // endpoint drift an earlier blend leaves when two requested edges share a
         // corner (the shared vertex is consumed, shortening the survivor) — an
@@ -6300,9 +6843,19 @@ fn planar_blend(
     let p0 = edge.source().point();
     let p1 = edge.target().point();
     let spine_vec = p1 - p0;
-    let spine_dir = spine_vec
-        .normalized()
-        .ok_or(RollingBallError::DegenerateSpine)?;
+    let spine_dir = match edge.curve() {
+        Some(GeomCurve::Line(line)) => {
+            let direction = line.direction();
+            if GeomVec::from_dir(direction).dot(&spine_vec) >= 0.0 {
+                direction
+            } else {
+                direction.reversed()
+            }
+        }
+        _ => spine_vec
+            .normalized()
+            .ok_or(RollingBallError::DegenerateSpine)?,
+    };
 
     let inward_a = -GeomVec::from_dir(n_a);
     let inward_b = -GeomVec::from_dir(n_b);
@@ -7721,7 +8274,7 @@ fn angle_about_axis(start: Dir, end: Dir, axis: Dir) -> f64 {
 mod tests {
     use super::*;
     use openrcad_foundation::Pnt;
-    use openrcad_geom::{Plane, Surface};
+    use openrcad_geom::Plane;
     use openrcad_primitives::make_box;
 
     #[test]
@@ -7860,6 +8413,7 @@ mod tests {
                 RollingBallError::UnsupportedTrimTopology => "t",
                 RollingBallError::NewtonDiverged { .. } => "n",
                 RollingBallError::BlendSurfaceBuild(_) => "b",
+                RollingBallError::CornerNetwork(_) => "c",
                 RollingBallError::InvalidTopology => "h",
                 RollingBallError::CandidateValidation { .. } => "v",
             }
@@ -8005,22 +8559,6 @@ mod tests {
             "longitudinal fillet not watertight: {:?}",
             filleted.manifold_report()
         );
-    }
-
-    #[test]
-    fn solves_gregory_corner_patch() {
-        let corner = Pnt::origin();
-        let p_a = Pnt::new(1.0, 0.0, 0.0);
-        let p_b = Pnt::new(0.0, 1.0, 0.0);
-        let patch = make_gregory_corner_patch(corner, p_a, p_b, 0.1);
-        assert!(patch.surface().is_some());
-        if let Some(GeomSurface::Gregory(surf)) = patch.surface() {
-            assert_eq!(surf.point(0.0, 0.0), corner);
-            assert_eq!(surf.point(1.0, 0.0), p_a);
-            assert_eq!(surf.point(1.0, 1.0), p_b);
-        } else {
-            panic!("Expected GregorySurface");
-        }
     }
 
     #[test]

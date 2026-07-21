@@ -1037,9 +1037,10 @@ pub(crate) fn provenance_fragment_stable_id(
 
 /// A body being assembled during evaluation. `parts` are the kernel solids that
 /// make it up (more than one only when disjoint lumps share a node); `pristine`
-/// holds the analytic mesh while the body is untouched by any boolean, so plain
-/// bodies keep their nice hidden-line wireframes. A boolean clears it, forcing a
-/// fresh tessellation from `parts`.
+/// is the current named display-mesh cache. Initially it holds the analytic
+/// sketch mesh; operations that can preserve durable face ownership replace it
+/// with a freshly named result mesh, while other topology changes clear it and
+/// force tessellation from `parts`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LiveBody {
     pub(crate) id: crate::document::BodyId,
