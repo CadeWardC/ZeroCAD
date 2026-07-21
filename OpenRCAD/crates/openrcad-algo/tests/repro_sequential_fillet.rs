@@ -381,28 +381,28 @@ fn fillet_three_edges_makes_spherical_corner() {
 
     let s2 = fillet_edges(&cube, &[front_top, right_top], r).expect("two top fillets (miter)");
     assert_eq!(spheres(&s2), 0, "two-edge stage must still miter");
-    let s = match fillet_edges(&s2, std::slice::from_ref(&vertical), r) {
-        Ok(solid) => solid,
-        Err(error) => {
-            assert!(!error.to_string().is_empty());
-            assert!(s2.is_watertight() && s2.health_report().is_healthy());
-            return;
-        }
-    };
+    let s = fillet_edges(&s2, std::slice::from_ref(&vertical), r)
+        .expect("the established three-edge corner path must remain supported");
     assert!(s.is_watertight() && s.health_report().is_healthy());
-    if s.validate_strict_with_policy(&TolerancePolicy::STANDARD)
-        .is_err()
-    {
-        return;
-    }
+    s.validate_strict_with_policy(&TolerancePolicy::STANDARD)
+        .expect("the established three-edge corner must pass strict validation");
     describe("three-edge corner", &s);
 
     assert!(
         s.is_watertight() && s.health_report().is_healthy(),
         "must be watertight+healthy"
     );
-    // The strict spherical trim-pcurve and winding assertions below apply only
-    // when the Phase 3 builder can produce an accepted result.
+    assert_eq!(
+        s.face_count(),
+        10,
+        "three-valent topology signature changed"
+    );
+    assert_eq!(cracks(&s), 0, "three-valent corner must tessellate closed");
+    assert_eq!(
+        nonmanifold(&s),
+        0,
+        "three-valent corner must not overlap itself"
+    );
     assert_eq!(
         spheres(&s),
         1,
@@ -413,6 +413,20 @@ fn fillet_three_edges_makes_spherical_corner() {
         0,
         "the sphere must subsume the two-fillet miter seam"
     );
+    let spherical_faces: Vec<_> = s
+        .shell()
+        .faces()
+        .into_iter()
+        .filter_map(|face| match face.surface() {
+            Some(GeomSurface::Sphere(sphere)) => Some(*sphere),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spherical_faces.len(), 1);
+    assert!((spherical_faces[0].radius() - r).abs() <= 1.0e-12);
+    assert!(spherical_faces[0]
+        .center()
+        .is_equal(&Pnt::new(w - r, r, d - r), 1.0e-12));
 
     // The spherical patch must render OUTWARD (mesh normals point away from the
     // ball center C). Only the patch's own vertices have a radial normal; boundary
@@ -454,6 +468,46 @@ fn fillet_three_edges_makes_spherical_corner() {
         outward, radial_pts,
         "spherical corner patch renders inside-out"
     );
+}
+
+/// Freeze the established three-valent result before the generic Gregory
+/// network replaces its construction path. Selection order may not change the
+/// accepted topology class, analytic radius, or validation outcome.
+#[test]
+fn three_edge_corner_is_selection_order_independent() {
+    let (w, h, d, r) = (40.0_f64, 30.0, 20.0, 4.0);
+    let cube = make_box(&Pnt::origin(), w, h, d);
+    let edges = [
+        Edge::between_points(Pnt::new(0.0, 0.0, d), Pnt::new(w, 0.0, d)),
+        Edge::between_points(Pnt::new(w, 0.0, d), Pnt::new(w, h, d)),
+        Edge::between_points(Pnt::new(w, 0.0, 0.0), Pnt::new(w, 0.0, d)),
+    ];
+    let permutations = [
+        [0usize, 1usize, 2usize],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+
+    for order in permutations {
+        let selected = [
+            edges[order[0]].clone(),
+            edges[order[1]].clone(),
+            edges[order[2]].clone(),
+        ];
+        let solid = fillet_edges(&cube, &selected, r)
+            .unwrap_or_else(|error| panic!("three-edge order {order:?} failed: {error}"));
+        solid
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .unwrap_or_else(|error| panic!("three-edge order {order:?} invalid: {error:?}"));
+        assert_eq!(solid.face_count(), 10, "order {order:?}");
+        assert_eq!(spheres(&solid), 1, "order {order:?}");
+        assert_eq!(miter_seams(&solid), 0, "order {order:?}");
+        assert_eq!(cracks(&solid), 0, "order {order:?}");
+        assert_eq!(nonmanifold(&solid), 0, "order {order:?}");
+    }
 }
 
 /// Two perpendicular top edges sharing a corner, filleted with DIFFERENT radii
