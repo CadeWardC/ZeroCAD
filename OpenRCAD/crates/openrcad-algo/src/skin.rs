@@ -12,9 +12,9 @@
 
 use core::fmt;
 
-use openrcad_foundation::{tolerance, Dir, Pnt, TolerancePolicy, Vec as GeomVec};
-use openrcad_geom::{GeomCurve, GeomSurface, Line, Plane, RuledSurface};
-use openrcad_topo::{Edge, Face, Orientation, Solid, Wire};
+use openrcad_foundation::{tolerance, Dir, Pnt, Pnt2d, TolerancePolicy, Vec as GeomVec};
+use openrcad_geom::{GeomCurve, GeomSurface, Line, Plane, ReparametrizedCurve, RuledSurface};
+use openrcad_topo::{Edge, Face, Orientation, Solid, SurfacePeriodicity, Wire};
 
 use crate::revolve::{loop_agrees_with_surface, reversed_wire};
 use crate::sew::sew_shell_with_policy as sew_with_policy;
@@ -45,6 +45,8 @@ pub enum SkinError {
     DegenerateRing,
     /// The skinned shell did not close watertight.
     NotWatertight,
+    /// A generated face could not bind its construction-time pcurves.
+    FaceBuild(String),
     /// The supplied document tolerance policy is internally inconsistent.
     InvalidTolerancePolicy(String),
 }
@@ -77,6 +79,7 @@ impl fmt::Display for SkinError {
             ),
             Self::DegenerateRing => f.write_str("skin: a ring is degenerate"),
             Self::NotWatertight => f.write_str("skin: result did not close watertight"),
+            Self::FaceBuild(reason) => write!(f, "skin: face construction failed: {reason}"),
             Self::InvalidTolerancePolicy(reason) => {
                 write!(f, "skin: invalid tolerance policy: {reason}")
             }
@@ -591,16 +594,66 @@ fn append_lateral_faces(rings: &[Vec<Pnt>], faces: &mut Vec<Face>) -> Result<(),
                     ((c - a).dot(&GeomVec::from_dir(normal))).abs() < tolerance::CONFUSION
                 })
                 .unwrap_or(false);
-            let surface = if coplanar {
+            let (surface, mut pcurves) = if coplanar {
                 let normal = quad_normal.normalized().ok_or(SkinError::DegenerateRing)?;
-                GeomSurface::plane(Plane::from_point_normal(a, normal))
+                (
+                    GeomSurface::plane(Plane::from_point_normal(a, normal)),
+                    None,
+                )
             } else {
                 let bottom_direction = (b - a).normalized().ok_or(SkinError::DegenerateRing)?;
                 let top_direction = (c - d).normalized().ok_or(SkinError::DegenerateRing)?;
-                GeomSurface::ruled(RuledSurface::new(
-                    GeomCurve::line(Line::from_point_dir(a, bottom_direction)),
-                    GeomCurve::line(Line::from_point_dir(d, top_direction)),
-                ))
+                let bottom_length = a.distance(&b);
+                let top_length = d.distance(&c);
+                // Both rails must use the same `u`: native line parameters are
+                // distances and therefore disagree whenever adjacent sections
+                // scale or rotate. Exact affine reparameterization keeps all
+                // four quad boundaries on the ruled surface.
+                let bottom = GeomCurve::reparametrized(
+                    ReparametrizedCurve::new(
+                        GeomCurve::line(Line::from_point_dir(a, bottom_direction)),
+                        0.0,
+                        1.0,
+                        0.0,
+                        bottom_length,
+                    )
+                    .ok_or(SkinError::DegenerateRing)?,
+                );
+                let top = GeomCurve::reparametrized(
+                    ReparametrizedCurve::new(
+                        GeomCurve::line(Line::from_point_dir(d, top_direction)),
+                        0.0,
+                        1.0,
+                        0.0,
+                        top_length,
+                    )
+                    .ok_or(SkinError::DegenerateRing)?,
+                );
+                (
+                    GeomSurface::ruled(RuledSurface::new(bottom, top)),
+                    Some(vec![
+                        crate::native_pcurve::uv_line(
+                            Pnt2d::new(0.0, 0.0),
+                            Pnt2d::new(1.0, 0.0),
+                            SurfacePeriodicity::NONE,
+                        ),
+                        crate::native_pcurve::uv_line(
+                            Pnt2d::new(1.0, 0.0),
+                            Pnt2d::new(1.0, 1.0),
+                            SurfacePeriodicity::NONE,
+                        ),
+                        crate::native_pcurve::uv_line(
+                            Pnt2d::new(1.0, 1.0),
+                            Pnt2d::new(0.0, 1.0),
+                            SurfacePeriodicity::NONE,
+                        ),
+                        crate::native_pcurve::uv_line(
+                            Pnt2d::new(0.0, 1.0),
+                            Pnt2d::new(0.0, 0.0),
+                            SurfacePeriodicity::NONE,
+                        ),
+                    ]),
+                )
             };
             let center = Pnt::new(
                 (a.x() + b.x() + c.x() + d.x()) / 4.0,
@@ -610,9 +663,17 @@ fn append_lateral_faces(rings: &[Vec<Pnt>], faces: &mut Vec<Face>) -> Result<(),
             let wire = if loop_agrees_with_surface(&wire, &surface, center) {
                 wire
             } else {
+                if let Some(pcurves) = &mut pcurves {
+                    pcurves.reverse();
+                }
                 reversed_wire(&wire)
             };
-            faces.push(Face::new(Some(surface), wire));
+            faces.push(if let Some(pcurves) = pcurves {
+                Face::with_pcurves(surface, wire, pcurves)
+                    .map_err(|error| SkinError::FaceBuild(error.to_string()))?
+            } else {
+                Face::new(Some(surface), wire)
+            });
         }
     }
     Ok(())
@@ -705,6 +766,50 @@ mod tests {
         assert!(solid.is_watertight());
         let v = volume(&solid);
         assert!((v - 16.0).abs() / 16.0 < 0.01, "sheared volume {v}");
+    }
+
+    #[test]
+    fn ordered_rotating_skin_uses_exactly_reparameterized_rails_and_native_pcurves() {
+        let ring = |angle: f64, z: f64| {
+            let (sin, cos) = angle.sin_cos();
+            [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
+                .into_iter()
+                .map(|(x, y)| Pnt::new(x * cos - y * sin, x * sin + y * cos, z))
+                .collect::<Vec<_>>()
+        };
+        let sections = [
+            SectionLoops {
+                outer: ring(0.0, 0.0),
+                holes: Vec::new(),
+            },
+            SectionLoops {
+                outer: ring(core::f64::consts::FRAC_PI_4, 2.0),
+                holes: Vec::new(),
+            },
+            SectionLoops {
+                outer: ring(core::f64::consts::FRAC_PI_2, 4.0),
+                holes: Vec::new(),
+            },
+        ];
+        let solid = crate::skin_ordered_section_loops_operation_with_policy(
+            &sections,
+            false,
+            &TolerancePolicy::STANDARD,
+        )
+        .expect("ordered rotating skin")
+        .value;
+        assert!(solid.is_watertight());
+        for face in solid
+            .faces()
+            .iter()
+            .filter(|face| matches!(face.surface(), Some(GeomSurface::Ruled(_))))
+        {
+            let wire = face.outer_wire().expect("ruled skin face outer wire");
+            assert!(
+                (0..wire.len()).all(|edge_index| wire.pcurve(edge_index).is_some()),
+                "every construction-owned ruled coedge must carry its pcurve"
+            );
+        }
     }
 
     #[test]

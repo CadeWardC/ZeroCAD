@@ -47,7 +47,7 @@ pub use parametric::{
     FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
     HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, LegacyReferenceBackfills,
     LoftSurfaceMode, ParametricGraph, PatternKind, PlaneBase, PristineMeshReuse,
-    ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily,
+    ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily, SweepGuide,
     TopologyEdgeRef, TopologyVertexRef, Variable, VariableDiagnostic, VariableResolution,
     VertexRef, HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID,
     STANDARDS_LIBRARY_VERSION,

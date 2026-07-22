@@ -4,12 +4,15 @@
 //! stable caller provenance. Corresponding spans are decomposed at the union
 //! of their normalized knots, degree-elevated exactly in homogeneous space,
 //! and interpolated across section parameters by a clamped B-spline. Accepted
-//! output therefore contains the input section curves exactly; sampled rings
-//! are used only for correspondence and fail-closed self-intersection checks.
+//! output therefore contains the input section curves exactly. Accepted skins
+//! also carry a control-net separation certificate: unresolved overlap is a
+//! typed rejection, so display tessellation samples never decide correctness.
 
 use core::fmt;
 
-use openrcad_foundation::{Dir, Dir2d, Pnt, Pnt2d, ToleranceContext, TolerancePolicy};
+use openrcad_foundation::{
+    Ax3, Dir, Dir2d, Pnt, Pnt2d, ToleranceContext, TolerancePolicy, Vec as GeomVec,
+};
 use openrcad_geom::{BSplineCurve, BSplineSurface, Curve, GeomCurve, GeomSurface, Plane};
 use openrcad_geom2d::{GeomCurve2d, Line2d};
 use openrcad_topo::{Edge, Face, Orientation, PcurveData, Solid, Vertex, Wire};
@@ -147,6 +150,13 @@ pub enum SmoothLoftError {
     SelfIntersection {
         section_interval: usize,
     },
+    SelfIntersectionUnresolved {
+        first_loop: usize,
+        second_loop: usize,
+        first_span: usize,
+        second_span: usize,
+        stage: &'static str,
+    },
     FaceBuild(String),
     Sew(String),
     InvalidTopology,
@@ -173,6 +183,7 @@ impl SmoothLoftError {
             Self::SingularInterpolation | Self::FaceBuild(_) | Self::Sew(_) => "operation.failed",
             Self::NonPositiveWeight { .. } => "loft.non_positive_weight",
             Self::SelfIntersection { .. } => "loft.self_intersection",
+            Self::SelfIntersectionUnresolved { .. } => "loft.self_intersection_unresolved",
             Self::InvalidTopology => "result.invalid_topology",
         }
     }
@@ -276,6 +287,16 @@ impl fmt::Display for SmoothLoftError {
             Self::SelfIntersection { section_interval } => write!(
                 formatter,
                 "Smooth Loft self-intersects in section interval {section_interval}"
+            ),
+            Self::SelfIntersectionUnresolved {
+                first_loop,
+                second_loop,
+                first_span,
+                second_span,
+                stage,
+            } => write!(
+                formatter,
+                "Smooth Loft could not certify loop/span {first_loop}/{first_span} and {second_loop}/{second_span} as non-self-intersecting during {stage}"
             ),
             Self::FaceBuild(reason) => write!(formatter, "Smooth Loft face build failed: {reason}"),
             Self::Sew(reason) => write!(formatter, "Smooth Loft sewing failed: {reason}"),
@@ -943,33 +964,12 @@ fn wire_from_beziers(spans: &[BezierSpan]) -> Wire {
     Wire::from_edges(spans.iter().map(|span| edge_from_curve(span.as_curve())))
 }
 
-fn append_smooth_loop_faces(
+fn smooth_loop_surfaces(
     prepared: &[Vec<BezierSpan>],
     parameters: &[f64],
     context: &ToleranceContext,
-    faces: &mut Vec<Face>,
-) -> Result<(), SmoothLoftError> {
-    for span in 0..prepared[0].len() {
-        let sections = prepared
-            .iter()
-            .map(|section| section[span].clone())
-            .collect::<Vec<_>>();
-        faces.push(surface_face(interpolate_surface(
-            &sections, parameters, span, context,
-        )?)?);
-    }
-    Ok(())
-}
-
-fn sampled_loop_self_intersects(
-    prepared: &[Vec<BezierSpan>],
-    parameters: &[f64],
-    context: &ToleranceContext,
-    budget: &mut GeometryWorkBudget,
-) -> Result<(), SmoothLoftError> {
-    // Build the same exact surfaces used for topology and sample only for a
-    // conservative fail-closed branch check. Samples never become B-Rep edges.
-    let surfaces = (0..prepared[0].len())
+) -> Result<Vec<BSplineSurface>, SmoothLoftError> {
+    (0..prepared[0].len())
         .map(|span| {
             let sections = prepared
                 .iter()
@@ -977,99 +977,462 @@ fn sampled_loop_self_intersects(
                 .collect::<Vec<_>>();
             interpolate_surface(&sections, parameters, span, context)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    for interval in 0..parameters.len() - 1 {
-        for fraction in [0.25, 0.5, 0.75] {
-            let v =
-                parameters[interval] + (parameters[interval + 1] - parameters[interval]) * fraction;
-            let mut points = Vec::new();
-            for surface in &surfaces {
-                for sample in 0..4 {
-                    points.push(openrcad_geom::Surface::point(
-                        surface,
-                        sample as f64 / 4.0,
-                        v,
-                    ));
-                }
+        .collect()
+}
+
+fn append_smooth_loop_faces(
+    surfaces: &[BSplineSurface],
+    faces: &mut Vec<Face>,
+) -> Result<(), SmoothLoftError> {
+    for surface in surfaces {
+        faces.push(surface_face(surface.clone())?);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CertificateFrame {
+    origin: Pnt,
+    x: GeomVec,
+    y: GeomVec,
+    normal: GeomVec,
+}
+
+impl CertificateFrame {
+    fn new(origin: Pnt, normal: Dir) -> Self {
+        let axes = Ax3::new(origin, normal);
+        Self {
+            origin,
+            x: GeomVec::from_dir(axes.x_direction()),
+            y: GeomVec::from_dir(axes.y_direction()),
+            normal: GeomVec::from_dir(normal),
+        }
+    }
+
+    fn project(self, point: Pnt) -> [f64; 2] {
+        let offset = point - self.origin;
+        [offset.dot(&self.x), offset.dot(&self.y)]
+    }
+
+    fn axial(self, point: Pnt) -> f64 {
+        (point - self.origin).dot(&self.normal)
+    }
+}
+
+fn unresolved_self_intersection(
+    first_loop: usize,
+    second_loop: usize,
+    first_span: usize,
+    second_span: usize,
+    stage: &'static str,
+) -> SmoothLoftError {
+    SmoothLoftError::SelfIntersectionUnresolved {
+        first_loop,
+        second_loop,
+        first_span,
+        second_span,
+        stage,
+    }
+}
+
+fn relative_close(first: f64, second: f64, tolerance: f64) -> bool {
+    (first - second).abs() <= tolerance * first.abs().max(second.abs()).max(1.0)
+}
+
+fn certify_common_axial_parameter(
+    loops: &[Vec<BSplineSurface>],
+    frame: CertificateFrame,
+    context: &ToleranceContext,
+    budget: &mut GeometryWorkBudget,
+) -> Result<(), SmoothLoftError> {
+    let reference_surface = &loops[0][0];
+    let reference_weights = &reference_surface
+        .weights()
+        .expect("Smooth Loft surfaces are rational")[0];
+    let v_controls = reference_weights.len();
+    let reference_heights = reference_surface.poles()[0]
+        .iter()
+        .map(|point| frame.axial(*point))
+        .collect::<Vec<_>>();
+    let weight_tolerance = context.policy.resolution * 64.0;
+
+    for (loop_index, surfaces) in loops.iter().enumerate() {
+        for (span_index, surface) in surfaces.iter().enumerate() {
+            let weights = surface
+                .weights()
+                .expect("Smooth Loft surfaces are rational");
+            if surface.poles()[0].len() != v_controls {
+                return Err(unresolved_self_intersection(
+                    loop_index,
+                    loop_index,
+                    span_index,
+                    span_index,
+                    "axial_control_count",
+                ));
             }
-            let count = points.len();
-            for first in 0..count {
-                let first_next = (first + 1) % count;
-                for second in first + 2..count {
-                    let second_next = (second + 1) % count;
-                    if first == second_next || first_next == second {
-                        continue;
+            for (poles, row_weights) in surface.poles().iter().zip(weights) {
+                charge_work(
+                    budget,
+                    GeometryWorkStage::Classification,
+                    u64::try_from(v_controls).unwrap_or(u64::MAX),
+                )?;
+                let scale = row_weights[0] / reference_weights[0];
+                for control in 0..v_controls {
+                    if !relative_close(
+                        row_weights[control],
+                        scale * reference_weights[control],
+                        weight_tolerance,
+                    ) {
+                        return Err(unresolved_self_intersection(
+                            loop_index,
+                            loop_index,
+                            span_index,
+                            span_index,
+                            "axial_weight_factorization",
+                        ));
                     }
-                    charge_work(budget, GeometryWorkStage::Classification, 1)?;
-                    let distance = crate::offset::segment_distance_for_certificate(
-                        points[first],
-                        points[first_next],
-                        points[second],
-                        points[second_next],
-                    );
-                    if distance <= context.policy.classification {
-                        return Err(SmoothLoftError::SelfIntersection {
-                            section_interval: interval,
-                        });
+                    if (frame.axial(poles[control]) - reference_heights[control]).abs()
+                        > context.policy.classification
+                    {
+                        return Err(unresolved_self_intersection(
+                            loop_index,
+                            loop_index,
+                            span_index,
+                            span_index,
+                            "common_axial_control",
+                        ));
                     }
                 }
             }
         }
     }
+
+    let direction = (reference_heights[v_controls - 1] - reference_heights[0]).signum();
+    if direction == 0.0
+        || reference_heights
+            .windows(2)
+            .any(|pair| (pair[1] - pair[0]) * direction <= context.policy.linear)
+    {
+        return Err(unresolved_self_intersection(
+            0,
+            0,
+            0,
+            0,
+            "axial_monotonicity",
+        ));
+    }
     Ok(())
 }
 
-fn sampled_loop_pair_intersects(
-    first: &[Vec<BezierSpan>],
-    second: &[Vec<BezierSpan>],
-    parameters: &[f64],
+fn normalize_2d(value: [f64; 2], tolerance: f64) -> Option<[f64; 2]> {
+    let length = value[0].hypot(value[1]);
+    (length > tolerance).then_some([value[0] / length, value[1] / length])
+}
+
+fn dot_2d(first: [f64; 2], second: [f64; 2]) -> f64 {
+    first[0] * second[0] + first[1] * second[1]
+}
+
+fn sub_2d(first: [f64; 2], second: [f64; 2]) -> [f64; 2] {
+    [first[0] - second[0], first[1] - second[1]]
+}
+
+fn certify_span_injective(
+    surface: &BSplineSurface,
+    loop_index: usize,
+    span_index: usize,
+    frame: CertificateFrame,
     context: &ToleranceContext,
     budget: &mut GeometryWorkBudget,
 ) -> Result<(), SmoothLoftError> {
-    let build_surfaces = |prepared: &[Vec<BezierSpan>]| {
-        (0..prepared[0].len())
-            .map(|span| {
-                let sections = prepared
-                    .iter()
-                    .map(|section| section[span].clone())
-                    .collect::<Vec<_>>();
-                interpolate_surface(&sections, parameters, span, context)
-            })
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let first_surfaces = build_surfaces(first)?;
-    let second_surfaces = build_surfaces(second)?;
-    let sampled_ring = |surfaces: &[BSplineSurface], v: f64| {
-        surfaces
+    let poles = surface.poles();
+    let mut candidates = Vec::new();
+    let mut average = [0.0, 0.0];
+    for control in 0..poles[0].len() {
+        let direction = sub_2d(
+            frame.project(poles[poles.len() - 1][control]),
+            frame.project(poles[0][control]),
+        );
+        average[0] += direction[0];
+        average[1] += direction[1];
+        candidates.push(direction);
+    }
+    candidates.push(average);
+
+    for axis in candidates
+        .into_iter()
+        .filter_map(|axis| normalize_2d(axis, context.policy.linear))
+    {
+        let mut positive = true;
+        let mut negative = true;
+        for rows in poles.windows(2) {
+            for control in 0..rows[0].len() {
+                charge_work(budget, GeometryWorkStage::Classification, 1)?;
+                let delta = sub_2d(
+                    frame.project(rows[1][control]),
+                    frame.project(rows[0][control]),
+                );
+                let projection = dot_2d(delta, axis);
+                positive &= projection > context.policy.linear;
+                negative &= projection < -context.policy.linear;
+            }
+        }
+        if positive || negative {
+            return Ok(());
+        }
+    }
+    Err(unresolved_self_intersection(
+        loop_index,
+        loop_index,
+        span_index,
+        span_index,
+        "span_injectivity",
+    ))
+}
+
+fn certify_adjacent_seam(
+    first: &BSplineSurface,
+    second: &BSplineSurface,
+    loop_index: usize,
+    first_span: usize,
+    second_span: usize,
+    frame: CertificateFrame,
+    context: &ToleranceContext,
+    budget: &mut GeometryWorkBudget,
+) -> Result<(), SmoothLoftError> {
+    let first_poles = first.poles();
+    let second_poles = second.poles();
+    let seam_first = &first_poles[first_poles.len() - 1];
+    let seam_second = &second_poles[0];
+    if seam_first.len() != seam_second.len()
+        || seam_first
             .iter()
-            .flat_map(|surface| {
-                (0..4).map(move |sample| {
-                    openrcad_geom::Surface::point(surface, sample as f64 / 4.0, v)
-                })
-            })
-            .collect::<Vec<_>>()
+            .zip(seam_second)
+            .any(|(left, right)| left.distance(right) > context.policy.pcurve_consistency)
+    {
+        return Err(unresolved_self_intersection(
+            loop_index,
+            loop_index,
+            first_span,
+            second_span,
+            "adjacent_seam_agreement",
+        ));
+    }
+
+    let mut first_offsets = Vec::new();
+    let mut second_offsets = Vec::new();
+    for control in 0..seam_first.len() {
+        let seam = frame.project(seam_first[control]);
+        first_offsets.extend(
+            first_poles[..first_poles.len() - 1]
+                .iter()
+                .map(|row| sub_2d(frame.project(row[control]), seam)),
+        );
+        second_offsets.extend(
+            second_poles[1..]
+                .iter()
+                .map(|row| sub_2d(frame.project(row[control]), seam)),
+        );
+    }
+    let mut first_average = [0.0, 0.0];
+    let mut second_average = [0.0, 0.0];
+    for offset in &first_offsets {
+        first_average[0] += offset[0];
+        first_average[1] += offset[1];
+    }
+    for offset in &second_offsets {
+        second_average[0] += offset[0];
+        second_average[1] += offset[1];
+    }
+    let mut candidates = vec![sub_2d(second_average, first_average)];
+    for first_offset in &first_offsets {
+        for second_offset in &second_offsets {
+            candidates.push(sub_2d(*second_offset, *first_offset));
+        }
+    }
+
+    for axis in candidates
+        .into_iter()
+        .filter_map(|axis| normalize_2d(axis, context.policy.linear))
+    {
+        charge_work(
+            budget,
+            GeometryWorkStage::Classification,
+            u64::try_from(first_offsets.len().saturating_add(second_offsets.len()))
+                .unwrap_or(u64::MAX),
+        )?;
+        let first_negative = first_offsets
+            .iter()
+            .all(|offset| dot_2d(*offset, axis) < -context.policy.linear);
+        let second_positive = second_offsets
+            .iter()
+            .all(|offset| dot_2d(*offset, axis) > context.policy.linear);
+        let first_positive = first_offsets
+            .iter()
+            .all(|offset| dot_2d(*offset, axis) > context.policy.linear);
+        let second_negative = second_offsets
+            .iter()
+            .all(|offset| dot_2d(*offset, axis) < -context.policy.linear);
+        if (first_negative && second_positive) || (first_positive && second_negative) {
+            return Ok(());
+        }
+    }
+    Err(unresolved_self_intersection(
+        loop_index,
+        loop_index,
+        first_span,
+        second_span,
+        "adjacent_seam_separation",
+    ))
+}
+
+fn certify_equal_parameter_separation(
+    first: &BSplineSurface,
+    second: &BSplineSurface,
+    frame: CertificateFrame,
+    context: &ToleranceContext,
+    budget: &mut GeometryWorkBudget,
+) -> Result<bool, SmoothLoftError> {
+    let first_poles = first.poles();
+    let second_poles = second.poles();
+    if first_poles[0].len() != second_poles[0].len() {
+        return Ok(false);
+    }
+    let v_controls = first_poles[0].len();
+    let center = |poles: &[Vec<Pnt>], control: usize| {
+        let mut result = [0.0, 0.0];
+        for row in poles {
+            let point = frame.project(row[control]);
+            result[0] += point[0];
+            result[1] += point[1];
+        }
+        [
+            result[0] / poles.len() as f64,
+            result[1] / poles.len() as f64,
+        ]
     };
-    for interval in 0..parameters.len() - 1 {
-        for fraction in [0.25, 0.5, 0.75] {
-            let v =
-                parameters[interval] + (parameters[interval + 1] - parameters[interval]) * fraction;
-            let first_points = sampled_ring(&first_surfaces, v);
-            let second_points = sampled_ring(&second_surfaces, v);
-            for first_index in 0..first_points.len() {
-                let first_next = (first_index + 1) % first_points.len();
-                for second_index in 0..second_points.len() {
-                    let second_next = (second_index + 1) % second_points.len();
-                    charge_work(budget, GeometryWorkStage::Classification, 1)?;
-                    let distance = crate::offset::segment_distance_for_certificate(
-                        first_points[first_index],
-                        first_points[first_next],
-                        second_points[second_index],
-                        second_points[second_next],
-                    );
-                    if distance <= context.policy.classification {
-                        return Err(SmoothLoftError::SelfIntersection {
-                            section_interval: interval,
-                        });
+    let mut candidates = vec![[1.0, 0.0], [0.0, 1.0]];
+    let mut average = [0.0, 0.0];
+    for control in 0..v_controls {
+        let direction = sub_2d(center(second_poles, control), center(first_poles, control));
+        average[0] += direction[0];
+        average[1] += direction[1];
+        candidates.push(direction);
+        for poles in [first_poles, second_poles] {
+            for rows in poles.windows(2) {
+                let edge = sub_2d(
+                    frame.project(rows[1][control]),
+                    frame.project(rows[0][control]),
+                );
+                candidates.push(edge);
+                candidates.push([-edge[1], edge[0]]);
+            }
+        }
+    }
+    candidates.push(average);
+
+    for axis in candidates
+        .into_iter()
+        .filter_map(|axis| normalize_2d(axis, context.policy.linear))
+    {
+        let mut first_before_second = true;
+        let mut second_before_first = true;
+        for control in 0..v_controls {
+            charge_work(
+                budget,
+                GeometryWorkStage::Classification,
+                u64::try_from(first_poles.len().saturating_add(second_poles.len()))
+                    .unwrap_or(u64::MAX),
+            )?;
+            let interval = |poles: &[Vec<Pnt>]| {
+                poles.iter().fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(minimum, maximum), row| {
+                        let value = dot_2d(frame.project(row[control]), axis);
+                        (minimum.min(value), maximum.max(value))
+                    },
+                )
+            };
+            let (first_min, first_max) = interval(first_poles);
+            let (second_min, second_max) = interval(second_poles);
+            first_before_second &= first_max + context.policy.classification < second_min;
+            second_before_first &= second_max + context.policy.classification < first_min;
+        }
+        if first_before_second || second_before_first {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn certify_smooth_surface_family(
+    loops: &[Vec<BSplineSurface>],
+    origin: Pnt,
+    normal: Dir,
+    context: &ToleranceContext,
+    budget: &mut GeometryWorkBudget,
+) -> Result<(), SmoothLoftError> {
+    let frame = CertificateFrame::new(origin, normal);
+    certify_common_axial_parameter(loops, frame, context, budget)?;
+
+    for (loop_index, surfaces) in loops.iter().enumerate() {
+        for (span_index, surface) in surfaces.iter().enumerate() {
+            certify_span_injective(surface, loop_index, span_index, frame, context, budget)?;
+            let next = (span_index + 1) % surfaces.len();
+            certify_adjacent_seam(
+                surface,
+                &surfaces[next],
+                loop_index,
+                span_index,
+                next,
+                frame,
+                context,
+                budget,
+            )?;
+        }
+        for first in 0..surfaces.len() {
+            for second in first + 1..surfaces.len() {
+                let adjacent = second == first + 1 || (first == 0 && second + 1 == surfaces.len());
+                if adjacent {
+                    continue;
+                }
+                if !certify_equal_parameter_separation(
+                    &surfaces[first],
+                    &surfaces[second],
+                    frame,
+                    context,
+                    budget,
+                )? {
+                    return Err(unresolved_self_intersection(
+                        loop_index,
+                        loop_index,
+                        first,
+                        second,
+                        "nonadjacent_control_bounds",
+                    ));
+                }
+            }
+        }
+    }
+
+    for first_loop in 0..loops.len() {
+        for second_loop in first_loop + 1..loops.len() {
+            for first_span in 0..loops[first_loop].len() {
+                for second_span in 0..loops[second_loop].len() {
+                    if !certify_equal_parameter_separation(
+                        &loops[first_loop][first_span],
+                        &loops[second_loop][second_span],
+                        frame,
+                        context,
+                        budget,
+                    )? {
+                        return Err(unresolved_self_intersection(
+                            first_loop,
+                            second_loop,
+                            first_span,
+                            second_span,
+                            "cross_loop_control_bounds",
+                        ));
                     }
                 }
             }
@@ -1211,7 +1574,6 @@ pub fn skin_smooth_section_loops_with_policy(
         .collect::<Vec<_>>();
     let prepared_outer = prepare_loop(&outer_loops, 0, &context.policy)?;
     let parameters = section_parameters(&prepared_outer, &context.policy)?;
-    sampled_loop_self_intersects(&prepared_outer, &parameters, &context, &mut budget)?;
 
     let mut prepared_holes = Vec::with_capacity(aligned[0].holes.len());
     for hole in 0..aligned[0].holes.len() {
@@ -1220,28 +1582,30 @@ pub fn skin_smooth_section_loops_with_policy(
             .map(|section| section.holes[hole].clone())
             .collect::<Vec<_>>();
         let prepared = prepare_loop(&loops, hole + 1, &context.policy)?;
-        sampled_loop_self_intersects(&prepared, &parameters, &context, &mut budget)?;
         prepared_holes.push(prepared);
     }
+
+    let mut loop_surfaces = Vec::with_capacity(prepared_holes.len() + 1);
+    loop_surfaces.push(smooth_loop_surfaces(
+        &prepared_outer,
+        &parameters,
+        &context,
+    )?);
     for hole in &prepared_holes {
-        sampled_loop_pair_intersects(&prepared_outer, hole, &parameters, &context, &mut budget)?;
+        loop_surfaces.push(smooth_loop_surfaces(hole, &parameters, &context)?);
     }
-    for first in 0..prepared_holes.len() {
-        for second in first + 1..prepared_holes.len() {
-            sampled_loop_pair_intersects(
-                &prepared_holes[first],
-                &prepared_holes[second],
-                &parameters,
-                &context,
-                &mut budget,
-            )?;
-        }
-    }
+    certify_smooth_surface_family(
+        &loop_surfaces,
+        aligned[0].outer[0].start(),
+        first_normal,
+        &context,
+        &mut budget,
+    )?;
 
     let mut faces = Vec::new();
-    append_smooth_loop_faces(&prepared_outer, &parameters, &context, &mut faces)?;
-    for hole in &prepared_holes {
-        append_smooth_loop_faces(hole, &parameters, &context, &mut faces)?;
+    append_smooth_loop_faces(&loop_surfaces[0], &mut faces)?;
+    for surfaces in &loop_surfaces[1..] {
+        append_smooth_loop_faces(surfaces, &mut faces)?;
     }
 
     for section in [0, aligned.len() - 1] {
@@ -1266,4 +1630,64 @@ pub fn skin_smooth_section_loops_with_policy(
         return Err(SmoothLoftError::InvalidTopology);
     }
     Ok(solid)
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::*;
+
+    fn strip(x_controls: [f64; 4]) -> BSplineSurface {
+        let poles = [0.0, 1.0]
+            .into_iter()
+            .map(|y| {
+                x_controls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(control, x)| Pnt::new(x, y, control as f64 / 3.0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        BSplineSurface::new(
+            1,
+            3,
+            poles,
+            Some(vec![vec![1.0; 4]; 2]),
+            vec![0.0, 1.0],
+            vec![2, 2],
+            vec![0.0, 1.0],
+            vec![4, 4],
+        )
+    }
+
+    #[test]
+    fn control_certificate_rejects_an_overlap_between_legacy_sample_stations() {
+        let fixed = strip([0.0; 4]);
+        let crossing = strip([0.01, -0.2, 1.0, 1.0]);
+        for station in [0.25, 0.5, 0.75] {
+            assert!(
+                openrcad_geom::Surface::point(&crossing, 0.5, station).x() > 0.0,
+                "the legacy station at {station} must miss the narrow crossing"
+            );
+        }
+
+        let mut bounds = openrcad_foundation::BndBox::new();
+        for point in fixed.poles().iter().chain(crossing.poles()).flatten() {
+            bounds.add(point);
+        }
+        let context =
+            ToleranceContext::derive(&TolerancePolicy::STANDARD, &[bounds], Some(1.0), 1.0)
+                .expect("test tolerance context");
+        let mut budget = GeometryWorkBudget::intersection_default();
+        assert!(
+            !certify_equal_parameter_separation(
+                &fixed,
+                &crossing,
+                CertificateFrame::new(Pnt::origin(), Dir::dz()),
+                &context,
+                &mut budget,
+            )
+            .expect("certificate work budget"),
+            "control-net overlap must reject even when fixed stations look clear"
+        );
+    }
 }

@@ -227,7 +227,11 @@ fn arbitrary_analytic_solid_returns_all_discovered_blockers_atomically() {
     let AllEdgeBlendError::BlockingEdges { blockers, .. } = error else {
         panic!("expected typed edge blockers, got {error:?}");
     };
-    assert!(!blockers.is_empty());
+    assert_eq!(
+        blockers.len(),
+        source.edges().len(),
+        "a grouped rejection must account for every canonical source edge"
+    );
     assert!(blockers
         .windows(2)
         .all(|pair| pair[0].ordinal < pair[1].ordinal));
@@ -247,5 +251,31 @@ fn invalid_values_reject_before_geometry() {
             chamfer_all_edges_strict_with_policy(&source, value, &TolerancePolicy::STANDARD),
             Err(AllEdgeBlendError::InvalidValue { .. })
         ));
+    }
+}
+
+#[test]
+fn sub_tolerance_values_reject_typed_and_leave_the_source_unchanged() {
+    let source = transformed_box(1.0, 0.0, GeomVec::ZERO);
+    let original_brep = source.brep().clone();
+    for value in [
+        0.0,
+        TolerancePolicy::STANDARD.linear * 0.5,
+        TolerancePolicy::STANDARD.linear,
+    ] {
+        for result in [
+            fillet_all_edges_strict_with_policy(&source, value, &TolerancePolicy::STANDARD),
+            chamfer_all_edges_strict_with_policy(&source, value, &TolerancePolicy::STANDARD),
+        ] {
+            assert!(matches!(
+                result,
+                Err(AllEdgeBlendError::BelowTolerance {
+                    value: rejected,
+                    minimum,
+                    ..
+                }) if rejected == value && minimum == TolerancePolicy::STANDARD.linear
+            ));
+        }
+        assert!(std::sync::Arc::ptr_eq(&original_brep, source.brep()));
     }
 }

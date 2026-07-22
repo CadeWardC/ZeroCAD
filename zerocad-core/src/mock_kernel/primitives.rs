@@ -699,12 +699,522 @@ pub(crate) fn smooth_lofted_solid(
         .map_err(SmoothLoftBuildError::Outcome)
 }
 
-/// Sweep a complete material profile (outer boundary plus holes) along
-/// `path_points` (an ordered 3D polyline) using rotation-minimizing frames
-/// (double-reflection method), so the profile is transported without twist.
-/// The profile is placed perpendicular to the path at its start (its drawn
-/// orientation about the tangent is preserved as closely as possible). `None`
-/// when the path is too short or the skin fails to close.
+/// Resolved one-guide input for Sweep. The guide and spine are sampled by
+/// normalized arc length; `profile_anchor` is in the profile sketch plane.
+pub struct SweepGuideGeometry<'a> {
+    pub points: &'a [crate::geometry::Vec3],
+    pub closed: bool,
+    pub profile_anchor: (f32, f32),
+}
+
+const SWEEP_MAX_WORK_UNITS: usize = 1_000_000;
+// Guided sections are refined until neighboring profile frames differ by no
+// more than 45 degrees. This is a construction limit, not a tolerance: larger
+// jumps make a ruled skin depend on input sampling and can fold between
+// otherwise valid stations.
+const GUIDED_SWEEP_MAX_FRAME_STEP: f32 = std::f32::consts::FRAC_PI_4;
+const GUIDED_SWEEP_MAX_REFINEMENT_PASSES: usize = 12;
+const GUIDED_SWEEP_MAX_STATIONS: usize = 4_096;
+
+fn sweep_polyline_metrics(
+    points: &[crate::geometry::Vec3],
+    closed: bool,
+) -> Option<(Vec<f32>, f32)> {
+    if points.len() < if closed { 3 } else { 2 } {
+        return None;
+    }
+    let mut cumulative = vec![0.0f32; points.len()];
+    for index in 1..points.len() {
+        cumulative[index] = cumulative[index - 1] + points[index].sub(points[index - 1]).length();
+    }
+    let closing_length = if closed {
+        points[0].sub(points[points.len() - 1]).length()
+    } else {
+        0.0
+    };
+    let total = cumulative[points.len() - 1] + closing_length;
+    (total.is_finite() && total > 0.0).then_some((cumulative, total))
+}
+
+fn sweep_polyline_point(
+    points: &[crate::geometry::Vec3],
+    closed: bool,
+    cumulative: &[f32],
+    total: f32,
+    fraction: f32,
+) -> Option<crate::geometry::Vec3> {
+    if points.len() != cumulative.len() || !fraction.is_finite() {
+        return None;
+    }
+    let target = fraction.clamp(0.0, 1.0) * total;
+    let segment_count = points.len().saturating_sub(1) + usize::from(closed);
+    for index in 0..segment_count {
+        let start_distance = cumulative[index];
+        let end_distance = if index + 1 < points.len() {
+            cumulative[index + 1]
+        } else {
+            total
+        };
+        if target <= end_distance || index + 1 == segment_count {
+            let length = end_distance - start_distance;
+            let local = if length > 0.0 {
+                ((target - start_distance) / length).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let a = points[index];
+            let b = if index + 1 < points.len() {
+                points[index + 1]
+            } else {
+                points[0]
+            };
+            return Some(a.add(b.sub(a).mul(local)));
+        }
+    }
+    None
+}
+
+fn sweep_rotate_about(
+    vector: crate::geometry::Vec3,
+    axis: crate::geometry::Vec3,
+    angle: f32,
+) -> crate::geometry::Vec3 {
+    vector
+        .mul(angle.cos())
+        .add(axis.cross(vector).mul(angle.sin()))
+        .add(axis.mul(axis.dot(vector) * (1.0 - angle.cos())))
+        .normalize()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SweepBuildError {
+    InvalidInput,
+    InvalidGuideTopology,
+    GuideStartMismatch {
+        distance: f64,
+    },
+    GuideSpineCrossing {
+        station: usize,
+    },
+    GuideFrameFlip {
+        station: usize,
+    },
+    GuideProgressMismatch {
+        station: usize,
+        normalized_parameter: f64,
+        axial_offset: f64,
+        tolerance: f64,
+    },
+    GuideRotationExcessive {
+        station: usize,
+        rotation_deg: f64,
+        limit_deg: f64,
+    },
+    GuideScaleInvalid {
+        station: usize,
+        scale: f64,
+    },
+    ClosedSeamMismatch,
+    WorkBudgetExhausted {
+        limit: usize,
+        consumed: usize,
+    },
+    SkinFailed(String),
+}
+
+impl SweepBuildError {
+    pub fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::InvalidInput => "parameter.invalid",
+            Self::InvalidGuideTopology => "sweep.invalid_guide",
+            Self::GuideStartMismatch { .. } => "sweep.guide_start_mismatch",
+            Self::GuideSpineCrossing { .. } => "sweep.guide_spine_crossing",
+            Self::GuideFrameFlip { .. } => "sweep.guide_frame_flip",
+            Self::GuideProgressMismatch { .. } => "sweep.guide_progress_mismatch",
+            Self::GuideRotationExcessive { .. } => "sweep.guide_rotation_excessive",
+            Self::GuideScaleInvalid { .. } => "sweep.guide_scale_invalid",
+            Self::ClosedSeamMismatch => "sweep.closed_seam_mismatch",
+            Self::WorkBudgetExhausted { .. } => "operation.budget_exhausted",
+            Self::SkinFailed(_) => "operation.failed",
+        }
+    }
+}
+
+impl std::fmt::Display for SweepBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput => formatter.write_str("the Sweep input is invalid"),
+            Self::InvalidGuideTopology => {
+                formatter.write_str("the guide is not one supported connected curve chain")
+            }
+            Self::GuideStartMismatch { distance } => write!(
+                formatter,
+                "the guide does not start at the selected profile anchor (distance {distance})"
+            ),
+            Self::GuideSpineCrossing { station } => write!(
+                formatter,
+                "the guide crosses the spine at station {station}"
+            ),
+            Self::GuideFrameFlip { station } => write!(
+                formatter,
+                "the guide reverses the profile frame at station {station}"
+            ),
+            Self::GuideProgressMismatch {
+                station,
+                normalized_parameter,
+                axial_offset,
+                tolerance,
+            } => write!(
+                formatter,
+                "the guide does not progress alongside the path at station {station} \
+                 (parameter {normalized_parameter}, axial mismatch {axial_offset}, \
+                 tolerance {tolerance})"
+            ),
+            Self::GuideRotationExcessive {
+                station,
+                rotation_deg,
+                limit_deg,
+            } => write!(
+                formatter,
+                "the guide rotates the profile frame by {rotation_deg} degrees near station \
+                 {station}, beyond the {limit_deg}-degree construction limit"
+            ),
+            Self::GuideScaleInvalid { station, scale } => write!(
+                formatter,
+                "the guide produces invalid scale {scale} at station {station}"
+            ),
+            Self::ClosedSeamMismatch => {
+                formatter.write_str("the guide and spine do not have matching open/closed seams")
+            }
+            Self::WorkBudgetExhausted { limit, consumed } => write!(
+                formatter,
+                "guided transport exhausted its work budget ({consumed} of {limit})"
+            ),
+            Self::SkinFailed(reason) => write!(formatter, "the guided skin was invalid: {reason}"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guided_sweep_sections(
+    profile_cs: &crate::geometry::CoordinateSystem,
+    profile_boundary: &[(f32, f32)],
+    profile_holes: &[Vec<(f32, f32)>],
+    path: &[crate::geometry::Vec3],
+    closed: bool,
+    guide_points: &[crate::geometry::Vec3],
+    guide_cumulative: &[f32],
+    guide_total: f32,
+    profile_anchor: (f32, f32),
+    profile_points: usize,
+    linear_tolerance: f32,
+    correspondence_tolerance: f32,
+    parameter_tolerance: f32,
+    angular_tolerance: f32,
+) -> Result<Vec<openrcad::algo::SectionLoops>, SweepBuildError> {
+    use crate::geometry::Vec3;
+
+    let (path_cumulative, path_total) =
+        sweep_polyline_metrics(path, closed).ok_or(SweepBuildError::InvalidInput)?;
+    let mut fractions = path_cumulative
+        .iter()
+        .map(|distance| *distance / path_total)
+        .chain(
+            guide_cumulative
+                .iter()
+                .map(|distance| *distance / guide_total),
+        )
+        .collect::<Vec<_>>();
+    fractions.sort_by(f32::total_cmp);
+    fractions
+        .dedup_by(|left, right| (*left - *right).abs() <= parameter_tolerance.max(f32::EPSILON));
+
+    let profile_point = |origin: Vec3, right: Vec3, up: Vec3, uv: (f32, f32)| -> Pnt {
+        let point = origin.add(right.mul(uv.0)).add(up.mul(uv.1));
+        Pnt::new(point.x as f64, point.y as f64, point.z as f64)
+    };
+    let section_at = |origin: Vec3, right: Vec3, up: Vec3| openrcad::algo::SectionLoops {
+        outer: profile_boundary
+            .iter()
+            .map(|&uv| profile_point(origin, right, up, uv))
+            .collect(),
+        holes: profile_holes
+            .iter()
+            .map(|hole| {
+                hole.iter()
+                    .map(|&uv| profile_point(origin, right, up, uv))
+                    .collect()
+            })
+            .collect(),
+    };
+
+    let reflection_threshold = linear_tolerance * linear_tolerance;
+    let mut refinement_pass = 0usize;
+    loop {
+        let consumed = profile_points.saturating_mul(fractions.len());
+        if fractions.len() > GUIDED_SWEEP_MAX_STATIONS || consumed > SWEEP_MAX_WORK_UNITS {
+            return Err(SweepBuildError::WorkBudgetExhausted {
+                limit: SWEEP_MAX_WORK_UNITS,
+                consumed,
+            });
+        }
+
+        let station_path = fractions
+            .iter()
+            .map(|fraction| {
+                sweep_polyline_point(path, closed, &path_cumulative, path_total, *fraction)
+                    .ok_or(SweepBuildError::InvalidInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let station_count = station_path.len();
+        if station_count < if closed { 3 } else { 2 } {
+            return Err(SweepBuildError::InvalidInput);
+        }
+        let tangents = (0..station_count)
+            .map(|index| {
+                let before = if index == 0 {
+                    if closed {
+                        station_path[station_count - 1]
+                    } else {
+                        station_path[0]
+                    }
+                } else {
+                    station_path[index - 1]
+                };
+                let after = if index + 1 < station_count {
+                    station_path[index + 1]
+                } else if closed {
+                    station_path[0]
+                } else {
+                    station_path[station_count - 1]
+                };
+                after.sub(before).normalize()
+            })
+            .collect::<Vec<_>>();
+        if tangents
+            .iter()
+            .any(|tangent| tangent.length() <= linear_tolerance)
+        {
+            return Err(SweepBuildError::InvalidInput);
+        }
+
+        let tangent0 = tangents[0];
+        let mut right = profile_cs
+            .u
+            .sub(tangent0.mul(profile_cs.u.dot(tangent0)))
+            .normalize();
+        if right.length() < linear_tolerance {
+            right = profile_cs
+                .v
+                .sub(tangent0.mul(profile_cs.v.dot(tangent0)))
+                .normalize();
+        }
+        if right.length() < linear_tolerance {
+            return Err(SweepBuildError::InvalidInput);
+        }
+        let mut up = tangent0.cross(right).normalize();
+        let guide_start =
+            sweep_polyline_point(guide_points, closed, guide_cumulative, guide_total, 0.0)
+                .ok_or(SweepBuildError::InvalidGuideTopology)?;
+        let anchor_radius = profile_anchor.0.hypot(profile_anchor.1);
+        let start_offset = guide_start.sub(station_path[0]);
+        let start_axial = start_offset.dot(tangent0);
+        let start_radial = start_offset.sub(tangent0.mul(start_axial));
+        let start_radius = start_radial.length();
+        if anchor_radius <= linear_tolerance || start_radius <= linear_tolerance {
+            return Err(SweepBuildError::GuideSpineCrossing { station: 0 });
+        }
+        let start_error = (start_radius - anchor_radius).abs().max(start_axial.abs());
+        if start_error > correspondence_tolerance {
+            return Err(SweepBuildError::GuideStartMismatch {
+                distance: start_error as f64,
+            });
+        }
+        let current_anchor = right
+            .mul(profile_anchor.0)
+            .add(up.mul(profile_anchor.1))
+            .normalize();
+        let wanted = start_radial.normalize();
+        let start_angle = tangent0
+            .dot(current_anchor.cross(wanted))
+            .atan2(current_anchor.dot(wanted));
+        right = sweep_rotate_about(right, tangent0, start_angle);
+        up = tangent0.cross(right).normalize();
+        let initial_right = right;
+
+        let mut frames = Vec::with_capacity(station_count);
+        let mut tangent = tangent0;
+        frames.push((right, up, tangent));
+        for index in 1..station_count {
+            let chord = station_path[index].sub(station_path[index - 1]);
+            let chord_len2 = chord.dot(chord);
+            let (right_line, tangent_line) = if chord_len2 > reflection_threshold {
+                (
+                    right.sub(chord.mul(2.0 / chord_len2 * chord.dot(right))),
+                    tangent.sub(chord.mul(2.0 / chord_len2 * chord.dot(tangent))),
+                )
+            } else {
+                (right, tangent)
+            };
+            let next_tangent = tangents[index];
+            let normal_delta = next_tangent.sub(tangent_line);
+            let normal_len2 = normal_delta.dot(normal_delta);
+            right = if normal_len2 > reflection_threshold {
+                right_line.sub(normal_delta.mul(2.0 / normal_len2 * normal_delta.dot(right_line)))
+            } else {
+                right_line
+            }
+            .normalize();
+            up = next_tangent.cross(right).normalize();
+            tangent = next_tangent;
+            frames.push((right, up, tangent));
+        }
+
+        let closure_correction = if closed {
+            let chord = station_path[0].sub(station_path[station_count - 1]);
+            let chord_len2 = chord.dot(chord);
+            let (right_line, tangent_line) = if chord_len2 > reflection_threshold {
+                (
+                    right.sub(chord.mul(2.0 / chord_len2 * chord.dot(right))),
+                    tangent.sub(chord.mul(2.0 / chord_len2 * chord.dot(tangent))),
+                )
+            } else {
+                (right, tangent)
+            };
+            let normal_delta = tangent0.sub(tangent_line);
+            let normal_len2 = normal_delta.dot(normal_delta);
+            let closure_right = if normal_len2 > reflection_threshold {
+                right_line.sub(normal_delta.mul(2.0 / normal_len2 * normal_delta.dot(right_line)))
+            } else {
+                right_line
+            }
+            .normalize();
+            tangent0
+                .dot(closure_right.cross(initial_right))
+                .atan2(closure_right.dot(initial_right))
+        } else {
+            0.0
+        };
+
+        let mut geometry = Vec::with_capacity(station_count);
+        for (index, ((frame_right, _, frame_tangent), fraction)) in
+            frames.iter().zip(&fractions).enumerate()
+        {
+            let base_right =
+                sweep_rotate_about(*frame_right, *frame_tangent, *fraction * closure_correction);
+            let base_up = frame_tangent.cross(base_right).normalize();
+            let guide_point = sweep_polyline_point(
+                guide_points,
+                closed,
+                guide_cumulative,
+                guide_total,
+                *fraction,
+            )
+            .ok_or(SweepBuildError::InvalidGuideTopology)?;
+            let offset = guide_point.sub(station_path[index]);
+            let axial_offset = offset.dot(*frame_tangent);
+            let radial = offset.sub(frame_tangent.mul(axial_offset));
+            let radial_length = radial.length();
+            if radial_length <= linear_tolerance {
+                return Err(SweepBuildError::GuideSpineCrossing { station: index });
+            }
+            if axial_offset.abs() > correspondence_tolerance {
+                return Err(SweepBuildError::GuideProgressMismatch {
+                    station: index,
+                    normalized_parameter: *fraction as f64,
+                    axial_offset: axial_offset as f64,
+                    tolerance: correspondence_tolerance as f64,
+                });
+            }
+            let current_anchor = base_right
+                .mul(profile_anchor.0)
+                .add(base_up.mul(profile_anchor.1))
+                .normalize();
+            let wanted = radial.normalize();
+            let guide_angle = frame_tangent
+                .dot(current_anchor.cross(wanted))
+                .atan2(current_anchor.dot(wanted));
+            let constrained_right = sweep_rotate_about(base_right, *frame_tangent, guide_angle);
+            let constrained_up = frame_tangent.cross(constrained_right).normalize();
+            let scale = radial_length / anchor_radius;
+            if !scale.is_finite() || scale <= parameter_tolerance {
+                return Err(SweepBuildError::GuideScaleInvalid {
+                    station: index,
+                    scale: scale as f64,
+                });
+            }
+            geometry.push((
+                station_path[index],
+                constrained_right,
+                constrained_up,
+                scale,
+            ));
+        }
+
+        let interval_count = geometry.len().saturating_sub(1) + usize::from(closed);
+        let mut midpoints = Vec::new();
+        let mut worst = None::<(usize, f32)>;
+        for index in 0..interval_count {
+            let next = (index + 1) % geometry.len();
+            let dot = geometry[index].1.dot(geometry[next].1).clamp(-1.0, 1.0);
+            let rotation = dot.acos();
+            if dot < -(1.0 - angular_tolerance) {
+                return Err(SweepBuildError::GuideFrameFlip { station: next });
+            }
+            if rotation > GUIDED_SWEEP_MAX_FRAME_STEP {
+                if worst.is_none_or(|(_, prior)| rotation > prior) {
+                    worst = Some((next, rotation));
+                }
+                let start = fractions[index];
+                let end = if next == 0 { 1.0 } else { fractions[next] };
+                let midpoint = 0.5 * (start + end);
+                if midpoint <= start || midpoint >= end {
+                    return Err(SweepBuildError::GuideRotationExcessive {
+                        station: next,
+                        rotation_deg: rotation.to_degrees() as f64,
+                        limit_deg: GUIDED_SWEEP_MAX_FRAME_STEP.to_degrees() as f64,
+                    });
+                }
+                midpoints.push(midpoint);
+            }
+        }
+        if !midpoints.is_empty() {
+            if refinement_pass >= GUIDED_SWEEP_MAX_REFINEMENT_PASSES {
+                let (station, rotation) = worst.expect("refinement has a worst rotation");
+                return Err(SweepBuildError::GuideRotationExcessive {
+                    station,
+                    rotation_deg: rotation.to_degrees() as f64,
+                    limit_deg: GUIDED_SWEEP_MAX_FRAME_STEP.to_degrees() as f64,
+                });
+            }
+            refinement_pass += 1;
+            fractions.extend(midpoints);
+            fractions.sort_by(f32::total_cmp);
+            fractions.dedup_by(|left, right| {
+                (*left - *right).abs() <= parameter_tolerance.max(f32::EPSILON)
+            });
+            continue;
+        }
+
+        let mut sections = geometry
+            .iter()
+            .map(|(origin, right, station_up, scale)| {
+                section_at(*origin, right.mul(*scale), station_up.mul(*scale))
+            })
+            .collect::<Vec<_>>();
+        if closed {
+            let (origin, section_right, section_up, scale) = geometry[0];
+            sections.push(section_at(
+                origin,
+                section_right.mul(scale),
+                section_up.mul(scale),
+            ));
+        }
+        return Ok(sections);
+    }
+}
+
+/// Compatibility entry point for the historical untapered/twisted Sweep.
 pub fn swept_solid(
     profile_cs: &crate::geometry::CoordinateSystem,
     profile_boundary: &[(f32, f32)],
@@ -713,13 +1223,82 @@ pub fn swept_solid(
     total_twist_deg: f32,
     closed: bool,
 ) -> Option<KernelSolid> {
+    swept_solid_with_guide(
+        profile_cs,
+        profile_boundary,
+        profile_holes,
+        path_points,
+        total_twist_deg,
+        closed,
+        None,
+    )
+    .ok()
+}
+
+/// Sweep a complete material profile (outer boundary plus holes) along
+/// `path_points` (an ordered 3D polyline) using rotation-minimizing frames
+/// (double-reflection method), so the profile is transported without twist.
+/// The profile is placed perpendicular to the path at its start (its drawn
+/// orientation about the tangent is preserved as closely as possible). Invalid
+/// inputs and unverified guide correspondence return a typed rejection.
+pub fn swept_solid_with_guide(
+    profile_cs: &crate::geometry::CoordinateSystem,
+    profile_boundary: &[(f32, f32)],
+    profile_holes: &[Vec<(f32, f32)>],
+    path_points: &[crate::geometry::Vec3],
+    total_twist_deg: f32,
+    closed: bool,
+    guide: Option<SweepGuideGeometry<'_>>,
+) -> Result<KernelSolid, SweepBuildError> {
     use crate::geometry::Vec3;
-    // Drop consecutive duplicate path points.
+    let profile_points = profile_holes
+        .iter()
+        .try_fold(profile_boundary.len(), |sum, hole| {
+            sum.checked_add(hole.len())
+        })
+        .ok_or(SweepBuildError::WorkBudgetExhausted {
+            limit: SWEEP_MAX_WORK_UNITS,
+            consumed: usize::MAX,
+        })?;
+    let stations = guide
+        .as_ref()
+        .map(|guide| guide.points.len().max(path_points.len()))
+        .unwrap_or(path_points.len());
+    let work_units = profile_points.saturating_mul(stations);
+    if work_units > SWEEP_MAX_WORK_UNITS {
+        return Err(SweepBuildError::WorkBudgetExhausted {
+            limit: SWEEP_MAX_WORK_UNITS,
+            consumed: work_units,
+        });
+    }
+    let mut bounds = openrcad::foundation::BndBox::new();
+    for point in path_points
+        .iter()
+        .chain(guide.iter().flat_map(|guide| guide.points.iter()))
+    {
+        bounds.add(&Pnt::new(point.x as f64, point.y as f64, point.z as f64));
+    }
+    let context = openrcad::foundation::ToleranceContext::derive(
+        &TolerancePolicy::STANDARD,
+        &[bounds],
+        None,
+        1.0,
+    )
+    .map_err(|_| SweepBuildError::InvalidInput)?;
+    // The public document path is still f32. Account for precision already
+    // lost before points enter the f64 kernel, especially at far origins.
+    let input_arithmetic_floor =
+        context.translation_magnitude as f32 * f32::EPSILON * context.conditioning as f32;
+    let linear_tolerance = (context.policy.linear as f32).max(input_arithmetic_floor);
+    let correspondence_tolerance =
+        (context.policy.pcurve_consistency as f32).max(input_arithmetic_floor);
+
+    // Drop consecutive duplicate path points with an operation-local tolerance.
     let mut path: Vec<Vec3> = Vec::with_capacity(path_points.len());
     for &p in path_points {
         if path
             .last()
-            .map(|q: &Vec3| q.sub(p).length() > 1e-6)
+            .map(|q: &Vec3| q.sub(p).length() > linear_tolerance)
             .unwrap_or(true)
         {
             path.push(p);
@@ -730,7 +1309,66 @@ pub fn swept_solid(
         || profile_holes.iter().any(|hole| hole.len() < 3)
         || !total_twist_deg.is_finite()
     {
-        return None;
+        return Err(SweepBuildError::InvalidInput);
+    }
+    if guide.is_some() && total_twist_deg.abs() > context.policy.angular.to_degrees() as f32 {
+        return Err(SweepBuildError::InvalidGuideTopology);
+    }
+    let resolved_guide = guide
+        .map(|guide| {
+            if guide.closed != closed
+                || !guide.profile_anchor.0.is_finite()
+                || !guide.profile_anchor.1.is_finite()
+            {
+                return Err(SweepBuildError::ClosedSeamMismatch);
+            }
+            let mut points = Vec::with_capacity(guide.points.len());
+            for &point in guide.points {
+                if points
+                    .last()
+                    .map(|last: &Vec3| last.sub(point).length() > linear_tolerance)
+                    .unwrap_or(true)
+                {
+                    points.push(point);
+                }
+            }
+            let (cumulative, total) = sweep_polyline_metrics(&points, closed)
+                .ok_or(SweepBuildError::InvalidGuideTopology)?;
+            Ok((points, cumulative, total, guide.profile_anchor))
+        })
+        .transpose()?;
+
+    if let Some((guide_points, guide_cumulative, guide_total, profile_anchor)) = &resolved_guide {
+        let sections = guided_sweep_sections(
+            profile_cs,
+            profile_boundary,
+            profile_holes,
+            &path,
+            closed,
+            guide_points,
+            guide_cumulative,
+            *guide_total,
+            *profile_anchor,
+            profile_points,
+            linear_tolerance,
+            correspondence_tolerance,
+            context.policy.resolution as f32,
+            context.policy.angular as f32,
+        )?;
+        return match consume_operation(
+            "guided sweep skin",
+            openrcad::algo::skin_ordered_section_loops_operation_with_policy(
+                &sections,
+                closed,
+                &TolerancePolicy::STANDARD,
+            ),
+        ) {
+            Ok(outcome) => Ok(outcome.solid),
+            Err(error) => {
+                log::warn!("guided sweep failed: {error}");
+                Err(SweepBuildError::SkinFailed(error.to_string()))
+            }
+        };
     }
 
     // Tangents by central difference (forward/back at the ends).
@@ -760,14 +1398,40 @@ pub fn swept_solid(
     // parallel to the tangent.
     let t0 = tangent(0);
     let mut r = profile_cs.u.sub(t0.mul(profile_cs.u.dot(t0))).normalize();
-    if r.length() < 1e-4 {
+    if r.length() < linear_tolerance {
         r = profile_cs.v.sub(t0.mul(profile_cs.v.dot(t0))).normalize();
     }
-    if r.length() < 1e-4 {
-        return None;
+    if r.length() < linear_tolerance {
+        return Err(SweepBuildError::InvalidInput);
     }
     let mut s = t0.cross(r).normalize();
     let mut t = t0;
+
+    // A guide owns the initial rotation but not an arbitrary initial scale:
+    // its first point must coincide with the selected profile anchor.
+    if let Some((guide_points, _, _, anchor)) = &resolved_guide {
+        let anchor_radius = anchor.0.hypot(anchor.1);
+        let offset = guide_points[0].sub(path[0]);
+        let tangent_offset = offset.dot(t0);
+        let radial = offset.sub(t0.mul(tangent_offset));
+        let radial_length = radial.length();
+        if anchor_radius <= linear_tolerance || radial_length <= linear_tolerance {
+            return Err(SweepBuildError::GuideSpineCrossing { station: 0 });
+        }
+        let start_error = (radial_length - anchor_radius)
+            .abs()
+            .max(tangent_offset.abs());
+        if start_error > correspondence_tolerance {
+            return Err(SweepBuildError::GuideStartMismatch {
+                distance: start_error as f64,
+            });
+        }
+        let current = r.mul(anchor.0).add(s.mul(anchor.1)).normalize();
+        let wanted = radial.normalize();
+        let angle = t0.dot(current.cross(wanted)).atan2(current.dot(wanted));
+        r = sweep_rotate_about(r, t0, angle);
+        s = t0.cross(r).normalize();
+    }
 
     let profile_point = |o: Vec3, r: Vec3, s: Vec3, uv: (f32, f32)| -> Pnt {
         let w = o.add(r.mul(uv.0)).add(s.mul(uv.1));
@@ -792,11 +1456,12 @@ pub fn swept_solid(
     let initial_s = s;
     let mut frames = Vec::with_capacity(m);
     frames.push((r, s, t));
+    let reflection_threshold = linear_tolerance * linear_tolerance;
     for i in 1..m {
         // Double-reflection RMF transport of (r) from frame i-1 to i.
         let v1 = path[i].sub(path[i - 1]);
         let c1 = v1.dot(v1);
-        let (r_l, t_l) = if c1 > 1e-12 {
+        let (r_l, t_l) = if c1 > reflection_threshold {
             let r_l = r.sub(v1.mul(2.0 / c1 * v1.dot(r)));
             let t_l = t.sub(v1.mul(2.0 / c1 * v1.dot(t)));
             (r_l, t_l)
@@ -806,7 +1471,7 @@ pub fn swept_solid(
         let t_next = tangent(i);
         let v2 = t_next.sub(t_l);
         let c2 = v2.dot(v2);
-        let r_next = if c2 > 1e-12 {
+        let r_next = if c2 > reflection_threshold {
             r_l.sub(v2.mul(2.0 / c2 * v2.dot(r_l)))
         } else {
             r_l
@@ -826,7 +1491,7 @@ pub fn swept_solid(
     let transport_right = |from: Vec3, to: Vec3, tangent_from: Vec3, right: Vec3| {
         let chord = to.sub(from);
         let chord_len2 = chord.dot(chord);
-        let (right_line, tangent_line) = if chord_len2 > 1.0e-12 {
+        let (right_line, tangent_line) = if chord_len2 > reflection_threshold {
             (
                 right.sub(chord.mul(2.0 / chord_len2 * chord.dot(right))),
                 tangent_from.sub(chord.mul(2.0 / chord_len2 * chord.dot(tangent_from))),
@@ -837,7 +1502,7 @@ pub fn swept_solid(
         let tangent_to = tangent(0);
         let normal_delta = tangent_to.sub(tangent_line);
         let normal_len2 = normal_delta.dot(normal_delta);
-        if normal_len2 > 1.0e-12 {
+        if normal_len2 > reflection_threshold {
             right_line
                 .sub(normal_delta.mul(2.0 / normal_len2 * normal_delta.dot(right_line)))
                 .normalize()
@@ -854,33 +1519,64 @@ pub fn swept_solid(
         0.0
     };
     let twist = (total_twist_deg as f64).to_radians() as f32;
-    let rotate_about = |vector: Vec3, axis: Vec3, angle: f32| {
-        vector
-            .mul(angle.cos())
-            .add(axis.cross(vector).mul(angle.sin()))
-            .add(axis.mul(axis.dot(vector) * (1.0 - angle.cos())))
-            .normalize()
-    };
-    let mut cumulative = vec![0.0f32; m];
-    for index in 1..m {
-        cumulative[index] = cumulative[index - 1] + path[index].sub(path[index - 1]).length();
-    }
-    let total_length = cumulative[m - 1]
-        + if closed {
-            path[0].sub(path[m - 1]).length()
-        } else {
-            0.0
-        };
-    if total_length <= f32::EPSILON {
-        return None;
-    }
+    let (cumulative, total_length) =
+        sweep_polyline_metrics(&path, closed).ok_or(SweepBuildError::InvalidInput)?;
     let mut sections = Vec::with_capacity(m + usize::from(closed));
+    let mut previous_right = None::<Vec3>;
     for (index, &(frame_r, _frame_s, frame_t)) in frames.iter().enumerate() {
         let fraction = cumulative[index] / total_length;
         let correction = fraction * (closure_correction + twist);
-        let right = rotate_about(frame_r, frame_t, correction);
-        let up = frame_t.cross(right).normalize();
-        sections.push(section_at(path[index], right, up));
+        let base_right = sweep_rotate_about(frame_r, frame_t, correction);
+        let base_up = frame_t.cross(base_right).normalize();
+        let (right, up, scale) =
+            if let Some((guide_points, guide_cumulative, guide_total, anchor)) = &resolved_guide {
+                let guide_point = sweep_polyline_point(
+                    guide_points,
+                    closed,
+                    guide_cumulative,
+                    *guide_total,
+                    fraction,
+                )
+                .ok_or(SweepBuildError::InvalidGuideTopology)?;
+                let offset = guide_point.sub(path[index]);
+                let tangent_offset = offset.dot(frame_t);
+                let radial = offset.sub(frame_t.mul(tangent_offset));
+                let radial_length = radial.length();
+                if radial_length <= linear_tolerance {
+                    return Err(SweepBuildError::GuideSpineCrossing { station: index });
+                }
+                if tangent_offset.abs() > correspondence_tolerance {
+                    return Err(SweepBuildError::InvalidGuideTopology);
+                }
+                let anchor_radius = anchor.0.hypot(anchor.1);
+                let current_anchor = base_right
+                    .mul(anchor.0)
+                    .add(base_up.mul(anchor.1))
+                    .normalize();
+                let wanted = radial.normalize();
+                let guide_angle = frame_t
+                    .dot(current_anchor.cross(wanted))
+                    .atan2(current_anchor.dot(wanted));
+                let right = sweep_rotate_about(base_right, frame_t, guide_angle);
+                let up = frame_t.cross(right).normalize();
+                let scale = radial_length / anchor_radius;
+                if !scale.is_finite() || scale <= context.policy.resolution as f32 {
+                    return Err(SweepBuildError::GuideScaleInvalid {
+                        station: index,
+                        scale: scale as f64,
+                    });
+                }
+                if previous_right.is_some_and(|previous| {
+                    previous.dot(right) < -(1.0 - context.policy.angular as f32)
+                }) {
+                    return Err(SweepBuildError::GuideFrameFlip { station: index });
+                }
+                (right, up, scale)
+            } else {
+                (base_right, base_up, 1.0)
+            };
+        previous_right = Some(right);
+        sections.push(section_at(path[index], right.mul(scale), up.mul(scale)));
     }
     if closed {
         // Exact duplicate, not a separately recomputed frame: ordered skinning
@@ -896,10 +1592,10 @@ pub fn swept_solid(
             &TolerancePolicy::STANDARD,
         ),
     ) {
-        Ok(outcome) => Some(outcome.solid),
+        Ok(outcome) => Ok(outcome.solid),
         Err(e) => {
             log::warn!("sweep failed: {e}");
-            None
+            Err(SweepBuildError::SkinFailed(e.to_string()))
         }
     }
 }

@@ -452,7 +452,10 @@ impl ZeroCadApp {
                                     modified |= *surface_mode != previous;
                                 }
                                 FeatureType::Sweep {
-                                    path_sketch, mode, ..
+                                    path_sketch,
+                                    guide,
+                                    mode,
+                                    ..
                                 } => {
                                     ui.label(
                                         egui::RichText::new(format!(
@@ -462,6 +465,34 @@ impl ZeroCadApp {
                                         .size(11.5)
                                         .color(pal.text_muted),
                                     );
+                                    if let Some(guide) = guide {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Guide '{}' Â· profile anchor {:.0}%",
+                                                guide.sketch,
+                                                guide.profile_parameter * 100.0
+                                            ))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Anchor position").size(12.0),
+                                            );
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut guide.profile_parameter,
+                                                    )
+                                                    .range(0.0..=1.0)
+                                                    .speed(0.01),
+                                                )
+                                                .changed()
+                                            {
+                                                modified = true;
+                                            }
+                                        });
+                                    }
                                 }
                                 FeatureType::Shell {
                                     thickness,

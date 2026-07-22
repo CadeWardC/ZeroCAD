@@ -110,6 +110,7 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             target: None,
             total_twist_deg: -45.0,
             total_twist_expr: Some("-twist".into()),
+            guide: None,
         },
         FeatureType::Shell {
             target: "missing_body".into(),
@@ -1309,6 +1310,7 @@ fn wave3_payloads_survive_real_save_to_disk_and_reload() {
             target: None,
             total_twist_deg: -90.0,
             total_twist_expr: Some("-twist".into()),
+            guide: None,
         },
     });
     graph.add_dependency("wave3_sketch", "wave3_sweep");
@@ -1399,7 +1401,7 @@ fn wave3_payloads_survive_real_save_to_disk_and_reload() {
             ..
         } if patterns == &vec![pattern]
     ));
-    assert_eq!(node("wave3_sweep").payload_version, 2);
+    assert_eq!(node("wave3_sweep").payload_version, 3);
     assert!(matches!(
         &node("wave3_sweep").feature,
         FeatureType::Sweep {
@@ -1438,6 +1440,122 @@ fn wave3_payloads_survive_real_save_to_disk_and_reload() {
             && *angle_deg == 3.0
             && expression == "draft_angle"
     ));
+}
+
+#[test]
+fn guided_sweep_v3_survives_real_disk_save_reload_and_rebuild() {
+    use zerocad_core::geometry::Vec3;
+    use zerocad_core::sketch::{EntityId, SketchShape};
+    use zerocad_core::{CoordinateSystem, ExtrudeMode, SketchCurves, SweepGuide};
+
+    let mut graph = ParametricGraph::new();
+    let mut profile = SketchCurves::new();
+    profile.add_rectangle((-1.0, -1.0), (1.0, 1.0));
+    graph.add_feature(FeatureNode {
+        id: "profile".into(),
+        name: "Profile".into(),
+        feature: FeatureType::Sketch {
+            cs: CoordinateSystem::XY,
+            curves: profile.clone(),
+            shapes: vec![SketchShape::Raw { curves: profile }],
+            corner_mods: vec![],
+            mirrors: vec![],
+            on_face: false,
+            entity_ids: vec![EntityId(42)],
+            next_entity_id: 43,
+            solver: None,
+        },
+    });
+    for (id, start, end) in [
+        ("spine", (0.0, 0.0), (0.0, 10.0)),
+        (
+            "guide",
+            (std::f32::consts::SQRT_2, 0.0),
+            (2.0 * std::f32::consts::SQRT_2, 10.0),
+        ),
+    ] {
+        let mut curves = SketchCurves::new();
+        curves.add_line(start, end);
+        graph.add_feature(FeatureNode {
+            id: id.into(),
+            name: id.into(),
+            feature: FeatureType::Sketch {
+                cs: CoordinateSystem::XZ.with_origin(Vec3::ZERO),
+                curves,
+                shapes: vec![],
+                corner_mods: vec![],
+                mirrors: vec![],
+                on_face: false,
+                entity_ids: vec![],
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+    }
+    graph.add_feature(FeatureNode {
+        id: "guided_sweep".into(),
+        name: "Guided Sweep".into(),
+        feature: FeatureType::Sweep {
+            profile_sketch: "profile".into(),
+            profile_region: 0,
+            path_sketch: "spine".into(),
+            guide: Some(SweepGuide {
+                sketch: "guide".into(),
+                profile_entity: EntityId(42),
+                profile_parameter: 0.0,
+            }),
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            total_twist_deg: 0.0,
+            total_twist_expr: None,
+        },
+    });
+    for dependency in ["profile", "spine", "guide"] {
+        graph.add_dependency(dependency, "guided_sweep");
+    }
+    let document = Document::from_graph(graph, Unit::Millimeter);
+    let before = document
+        .evaluate_bodies(&HashSet::new())
+        .expect("guided Sweep before save");
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("guided-sweep-v3.zcad");
+    write_document_file(
+        &path,
+        &document,
+        &SaveOptions::default(),
+        &HydrationBundle::default(),
+    )
+    .expect("save guided Sweep to disk");
+    let loaded =
+        read_document_file(&path, &LoadOptions::default()).expect("reload guided Sweep from disk");
+    let sweep = loaded
+        .document
+        .graph
+        .node_weights()
+        .find(|node| node.id == "guided_sweep")
+        .expect("reloaded guided Sweep");
+    assert_eq!(sweep.payload_version, 3);
+    assert!(matches!(
+        &sweep.feature,
+        FeatureType::Sweep {
+            guide: Some(SweepGuide {
+                sketch,
+                profile_entity: EntityId(42),
+                profile_parameter: 0.0,
+            }),
+            ..
+        } if sketch == "guide"
+    ));
+    let after = loaded
+        .document
+        .evaluate_bodies(&HashSet::new())
+        .expect("guided Sweep after reload");
+    assert_eq!(before.len(), 1);
+    assert_eq!(after.len(), 1);
+    assert_eq!(before[0].0, after[0].0);
+    assert_eq!(before[0].1.indices, after[0].1.indices);
+    assert_eq!(before[0].1.face_ids, after[0].1.face_ids);
 }
 
 #[test]

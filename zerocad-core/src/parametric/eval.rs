@@ -1970,6 +1970,7 @@ impl ParametricGraph {
                     profile_sketch,
                     profile_region,
                     path_sketch,
+                    guide,
                     mode,
                     target,
                     total_twist_deg,
@@ -1999,6 +2000,7 @@ impl ParametricGraph {
                     profile_sketch,
                     *profile_region,
                     path_sketch,
+                    guide.as_ref(),
                     *mode,
                     target.as_deref(),
                     total_twist_deg,
@@ -2006,6 +2008,7 @@ impl ParametricGraph {
                     context.datums,
                     &mut candidate_body_state,
                     &mut warnings,
+                    &mut diagnostics,
                 );
             }
             _ => return Err("non-skinning family reached the Loft/Sweep contract".into()),
@@ -3188,6 +3191,31 @@ impl ParametricGraph {
                     }
                 };
                 let provenance = build_region_provenance(&effective, shapes, entity_ids, &regions);
+                let mut durable_entity_ids =
+                    crate::sketch::effective_shape_ids(shapes.len(), entity_ids);
+                if let Some(model) = solver.as_ref() {
+                    for entity in &model.entities {
+                        durable_entity_ids.push(entity.id());
+                        if let Some(source) = entity.derived_from() {
+                            durable_entity_ids.push(source);
+                        }
+                    }
+                }
+                durable_entity_ids.sort_by_key(|entity| entity.0);
+                durable_entity_ids.dedup();
+                let entity_curves = durable_entity_ids
+                    .into_iter()
+                    .filter_map(|entity| {
+                        crate::sketch::entity_curves_solved(
+                            shapes,
+                            entity_ids,
+                            solver.as_ref(),
+                            entity,
+                            vars,
+                        )
+                        .map(|curves| (entity, curves))
+                    })
+                    .collect();
                 // Whole-shape outlines drive the overlapping-shapes-as-boolean
                 // path. Sketch fillets/chamfers (`corner_mods`) reshape the
                 // displayed geometry, which the raw shape outlines wouldn't
@@ -3208,6 +3236,7 @@ impl ParametricGraph {
                         regions,
                         provenance,
                         curves: effective,
+                        entity_curves,
                         face_boundary,
                         shape_loops,
                         solve_failure,
@@ -4995,7 +5024,10 @@ impl ParametricGraph {
                         .with_parameter("section_count", sections.len())
                         .with_parameter("failed_stage", "analytic_skinning")
                         .with_parameter("reason", error.to_string())
-                        .with_fallback("kept last valid body");
+                        .with_fallback(
+                            "kept last valid body; switch the Loft surface mode to Ruled \
+                             when the conservative Smooth certificate cannot prove the result",
+                        );
                         if let crate::mock_kernel::SmoothLoftBuildError::Kernel(
                             openrcad::algo::ModelingOperationError::SmoothLoft(kernel_error),
                         ) = &error
@@ -5088,6 +5120,20 @@ impl ParametricGraph {
                                     diagnostic = diagnostic
                                         .with_parameter("section_interval", *section_interval);
                                 }
+                                SmoothLoftError::SelfIntersectionUnresolved {
+                                    first_loop,
+                                    second_loop,
+                                    first_span,
+                                    second_span,
+                                    stage,
+                                } => {
+                                    diagnostic = diagnostic
+                                        .with_parameter("first_loop", *first_loop)
+                                        .with_parameter("second_loop", *second_loop)
+                                        .with_parameter("first_span", *first_span)
+                                        .with_parameter("second_span", *second_span)
+                                        .with_parameter("work_stage", *stage);
+                                }
                                 SmoothLoftError::WorkBudgetExhausted {
                                     stage,
                                     limit,
@@ -5125,6 +5171,7 @@ impl ParametricGraph {
         profile_sketch: &str,
         profile_region: usize,
         path_sketch: &str,
+        guide: Option<&SweepGuide>,
         mode: ExtrudeMode,
         boolean_target: Option<&str>,
         total_twist_deg: f32,
@@ -5132,6 +5179,7 @@ impl ParametricGraph {
         datums: &HashMap<String, DatumValue>,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
+        diagnostics: &mut Vec<EvaluationDiagnostic>,
     ) {
         let Some(profile) = self.sketch_eval_by_id(sketch_cache, profile_sketch) else {
             warnings.push(format!(
@@ -5173,7 +5221,9 @@ impl ParametricGraph {
                 return;
             }
         };
-        let Some((path_2d, closed)) = path.curves.sweep_path_polyline(1e-3) else {
+        let sweep_policy = openrcad::foundation::TolerancePolicy::STANDARD;
+        let chain_tolerance = sweep_policy.linear as f32;
+        let Some((path_2d, closed)) = path.curves.sweep_path_polyline(chain_tolerance) else {
             warnings.push(format!(
                 "Sweep '{node_id}': the path sketch must be one simple open or closed \
                  line/arc/circle chain (no branches or gaps)."
@@ -5187,26 +5237,299 @@ impl ParametricGraph {
         let twist_turn_remainder = (total_twist_deg as f64)
             .to_radians()
             .rem_euclid(std::f64::consts::TAU);
-        if closed && twist_turn_remainder.min(std::f64::consts::TAU - twist_turn_remainder) > 1.0e-6
+        if guide.is_none()
+            && closed
+            && twist_turn_remainder.min(std::f64::consts::TAU - twist_turn_remainder) > 1.0e-6
         {
             warnings.push(format!(
                 "Sweep '{node_id}': a closed path needs total twist to be a whole number of turns so its seam closes."
             ));
             return;
         }
-        let Some(solid) = crate::mock_kernel::swept_solid(
+        let mut guide_points = Vec::new();
+        let mut guide_closed = false;
+        let mut profile_anchor = (0.0f32, 0.0f32);
+        if let Some(guide) = guide {
+            if total_twist_deg.abs() > sweep_policy.angular.to_degrees() as f32 {
+                diagnostics.push(
+                    EvaluationDiagnostic::new(
+                        node_id,
+                        "guided sweep",
+                        DiagnosticCode::new("sweep.twist_with_guide").unwrap(),
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "Sweep '{node_id}': explicit twist cannot be combined with a guide."
+                        ),
+                    )
+                    .with_parameter(
+                        "twist_degrees",
+                        DiagnosticParameterValue::Decimal(total_twist_deg.to_string()),
+                    )
+                    .with_fallback("kept last valid body"),
+                );
+                return;
+            }
+            let Some(anchor_curves) = profile.entity_curves.get(&guide.profile_entity) else {
+                diagnostics.push(
+                    EvaluationDiagnostic::new(
+                        node_id,
+                        "guided sweep",
+                        DiagnosticCode::reference_missing(),
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "Sweep '{node_id}': profile anchor entity {} no longer exists.",
+                            guide.profile_entity.0
+                        ),
+                    )
+                    .with_parameter("profile_sketch", profile_sketch)
+                    .with_parameter("profile_entity", guide.profile_entity.0 as usize)
+                    .with_fallback("kept last valid body"),
+                );
+                return;
+            };
+            let Some(anchor) =
+                anchor_curves.normalized_chain_point(guide.profile_parameter, chain_tolerance)
+            else {
+                diagnostics.push(
+                    EvaluationDiagnostic::new(
+                        node_id,
+                        "guided sweep",
+                        DiagnosticCode::new("sweep.invalid_guide").unwrap(),
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "Sweep '{node_id}': profile anchor parameter is invalid or unresolved."
+                        ),
+                    )
+                    .with_parameter("profile_entity", guide.profile_entity.0 as usize)
+                    .with_parameter(
+                        "profile_parameter",
+                        DiagnosticParameterValue::Decimal(guide.profile_parameter.to_string()),
+                    )
+                    .with_fallback("kept last valid body"),
+                );
+                return;
+            };
+            profile_anchor = anchor;
+            let point_segment_distance = |point: (f32, f32), a: (f32, f32), b: (f32, f32)| {
+                let delta = (b.0 - a.0, b.1 - a.1);
+                let length_squared = delta.0 * delta.0 + delta.1 * delta.1;
+                let fraction = if length_squared > sweep_policy.resolution.powi(2) as f32 {
+                    (((point.0 - a.0) * delta.0 + (point.1 - a.1) * delta.1) / length_squared)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (point.0 - (a.0 + fraction * delta.0)).hypot(point.1 - (a.1 + fraction * delta.1))
+            };
+            let on_material_boundary = (0..region.boundary.len()).any(|index| {
+                point_segment_distance(
+                    anchor,
+                    region.boundary[index],
+                    region.boundary[(index + 1) % region.boundary.len()],
+                ) <= sweep_policy.pcurve_consistency as f32
+            }) || region.holes.iter().any(|hole| {
+                (0..hole.len()).any(|index| {
+                    point_segment_distance(anchor, hole[index], hole[(index + 1) % hole.len()])
+                        <= sweep_policy.pcurve_consistency as f32
+                })
+            });
+            if !on_material_boundary {
+                diagnostics.push(
+                    EvaluationDiagnostic::new(
+                        node_id,
+                        "guided sweep",
+                        DiagnosticCode::new("sweep.invalid_correspondence").unwrap(),
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "Sweep '{node_id}': the durable profile anchor is not on the selected material region."
+                        ),
+                    )
+                    .with_parameter("profile_entity", guide.profile_entity.0 as usize)
+                    .with_parameter("profile_region", profile_region)
+                    .with_fallback("kept last valid body"),
+                );
+                return;
+            }
+
+            let Some(guide_sketch) = self.sketch_eval_by_id(sketch_cache, &guide.sketch) else {
+                diagnostics.push(
+                    EvaluationDiagnostic::new(
+                        node_id,
+                        "guided sweep",
+                        DiagnosticCode::reference_missing(),
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "Sweep '{node_id}': guide sketch '{}' no longer exists.",
+                            guide.sketch
+                        ),
+                    )
+                    .with_parameter("guide_sketch", guide.sketch.clone())
+                    .with_fallback("kept last valid body"),
+                );
+                return;
+            };
+            let guide_cs =
+                match self.effective_sketch_cs(&guide.sketch, guide_sketch.cs, datums, live) {
+                    Ok(cs) => cs,
+                    Err(reason) => {
+                        diagnostics.push(
+                            EvaluationDiagnostic::new(
+                                node_id,
+                                "guided sweep",
+                                DiagnosticCode::new("sweep.invalid_guide").unwrap(),
+                                DiagnosticSeverity::Warning,
+                                format!("Sweep '{node_id}': guide {reason}."),
+                            )
+                            .with_parameter("guide_sketch", guide.sketch.clone())
+                            .with_fallback("kept last valid body"),
+                        );
+                        return;
+                    }
+                };
+            let Some((guide_2d, is_closed)) =
+                guide_sketch.curves.sweep_path_polyline(chain_tolerance)
+            else {
+                diagnostics.push(
+                    EvaluationDiagnostic::new(
+                        node_id,
+                        "guided sweep",
+                        DiagnosticCode::new("sweep.invalid_guide").unwrap(),
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "Sweep '{node_id}': the guide must be exactly one connected curve chain."
+                        ),
+                    )
+                    .with_parameter("guide_sketch", guide.sketch.clone())
+                    .with_fallback("kept last valid body"),
+                );
+                return;
+            };
+            guide_closed = is_closed;
+            guide_points = guide_2d
+                .iter()
+                .map(|&(u, v)| guide_cs.unproject(u, v))
+                .collect();
+            if !guide_closed && guide_points.len() >= 2 && path_3d.len() >= 2 {
+                let tangent = path_3d[1].sub(path_3d[0]).normalize();
+                let anchor_radius = profile_anchor.0.hypot(profile_anchor.1);
+                let start_error = |point: Vec3| {
+                    let offset = point.sub(path_3d[0]);
+                    let tangent_offset = offset.dot(tangent);
+                    let radial = offset.sub(tangent.mul(tangent_offset)).length();
+                    (radial - anchor_radius).abs().max(tangent_offset.abs())
+                };
+                if let Some(&last) = guide_points.last() {
+                    if start_error(last) < start_error(guide_points[0]) {
+                        guide_points.reverse();
+                    }
+                }
+            }
+        }
+        let guide_geometry = guide.map(|_| crate::mock_kernel::SweepGuideGeometry {
+            points: &guide_points,
+            closed: guide_closed,
+            profile_anchor,
+        });
+        let solid = match crate::mock_kernel::swept_solid_with_guide(
             &profile_cs,
             &region.boundary,
             &region.holes,
             &path_3d,
             total_twist_deg,
             closed,
-        ) else {
-            warnings.push(format!(
-                "Sweep '{node_id}': the profile could not be swept along the path \
-                 (it may self-intersect on a tight bend)."
-            ));
-            return;
+            guide_geometry,
+        ) {
+            Ok(solid) => solid,
+            Err(error) if guide.is_some() => {
+                let code = DiagnosticCode::new(error.diagnostic_code())
+                    .unwrap_or_else(|_| DiagnosticCode::operation_failed());
+                let mut diagnostic = EvaluationDiagnostic::new(
+                    node_id,
+                    "guided sweep",
+                    code,
+                    DiagnosticSeverity::Warning,
+                    format!("Sweep '{node_id}': {error}."),
+                )
+                .with_parameter("guide_sketch", guide.unwrap().sketch.clone())
+                .with_parameter("work_stage", "guide transport")
+                .with_fallback("kept last valid body; edit or remove the guide");
+                use crate::mock_kernel::SweepBuildError;
+                diagnostic = match error {
+                    SweepBuildError::GuideStartMismatch { distance } => diagnostic.with_parameter(
+                        "distance",
+                        DiagnosticParameterValue::Decimal(distance.to_string()),
+                    ),
+                    SweepBuildError::GuideSpineCrossing { station }
+                    | SweepBuildError::GuideFrameFlip { station } => {
+                        diagnostic.with_parameter("station", station)
+                    }
+                    SweepBuildError::GuideProgressMismatch {
+                        station,
+                        normalized_parameter,
+                        axial_offset,
+                        tolerance,
+                    } => diagnostic
+                        .with_parameter("station", station)
+                        .with_parameter(
+                            "normalized_parameter",
+                            DiagnosticParameterValue::Decimal(normalized_parameter.to_string()),
+                        )
+                        .with_parameter(
+                            "axial_offset",
+                            DiagnosticParameterValue::Decimal(axial_offset.to_string()),
+                        )
+                        .with_parameter(
+                            "tolerance",
+                            DiagnosticParameterValue::Decimal(tolerance.to_string()),
+                        )
+                        .with_fallback(
+                            "kept last valid body; edit the guide so it progresses alongside \
+                             the path, or remove the guide",
+                        ),
+                    SweepBuildError::GuideRotationExcessive {
+                        station,
+                        rotation_deg,
+                        limit_deg,
+                    } => diagnostic
+                        .with_parameter("station", station)
+                        .with_parameter(
+                            "rotation_deg",
+                            DiagnosticParameterValue::Decimal(rotation_deg.to_string()),
+                        )
+                        .with_parameter(
+                            "limit_deg",
+                            DiagnosticParameterValue::Decimal(limit_deg.to_string()),
+                        )
+                        .with_fallback(
+                            "kept last valid body; smooth the guide's direction changes or \
+                             remove the guide",
+                        ),
+                    SweepBuildError::GuideScaleInvalid { station, scale } => diagnostic
+                        .with_parameter("station", station)
+                        .with_parameter(
+                            "scale",
+                            DiagnosticParameterValue::Decimal(scale.to_string()),
+                        ),
+                    SweepBuildError::SkinFailed(reason) => {
+                        diagnostic.with_parameter("reason", reason)
+                    }
+                    SweepBuildError::WorkBudgetExhausted { limit, consumed } => diagnostic
+                        .with_parameter("work_limit", limit)
+                        .with_parameter("work_consumed", consumed),
+                    SweepBuildError::InvalidInput
+                    | SweepBuildError::InvalidGuideTopology
+                    | SweepBuildError::ClosedSeamMismatch => diagnostic,
+                };
+                diagnostics.push(diagnostic);
+                return;
+            }
+            Err(_) => {
+                warnings.push(format!(
+                    "Sweep '{node_id}': the profile could not be swept along the path \
+                     (it may self-intersect on a tight bend)."
+                ));
+                return;
+            }
         };
         self.assemble_generated_body(node_id, solid, mode, boolean_target, live, warnings, |m| {
             stamp_generated_face_refs(m, node_id, "sweep")

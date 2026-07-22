@@ -28,6 +28,18 @@ pub enum LoftSurfaceMode {
     Smooth,
 }
 
+/// Optional one-guide control for a Sweep.
+///
+/// `profile_entity` is a durable sketch-scoped identity. The normalized
+/// parameter locates the anchor along that entity's complete curve chain, so
+/// inserting or deleting unrelated profile entities cannot retarget it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SweepGuide {
+    pub sketch: String,
+    pub profile_entity: crate::sketch::EntityId,
+    pub profile_parameter: f32,
+}
+
 /// Separator used for additional solid-body outputs owned by one feature.
 /// The first output keeps the feature id for backward compatibility; later
 /// outputs use `feature_id::body:N` with a one-based display number.
@@ -390,6 +402,68 @@ fn decode_length_prefixed_names(
 #[cfg(test)]
 mod all_edge_selector_tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn unicode_text(max_chars: usize) -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..max_chars)
+            .prop_map(|characters| characters.into_iter().collect())
+    }
+
+    prop_compose! {
+        fn adversarial_selector_payload()
+            (pieces in prop::collection::vec((0_u8..8, unicode_text(48)), 0..32))
+            -> String
+        {
+            let mut payload = String::new();
+            for (mode, name) in pieces {
+                let byte_length = name.len();
+                match mode {
+                    0 => payload.push_str(&format!("{byte_length}:{name}")),
+                    1 => payload.push_str(&format!("0{byte_length}:{name}")),
+                    2 => payload.push_str(&format!("{}:{name}", byte_length.saturating_add(1))),
+                    3 => payload.push_str(&format!("{}:{name}", byte_length.saturating_sub(1))),
+                    4 => payload.push_str(&format!("{}:{name}", usize::MAX)),
+                    5 => payload.push_str(&format!("{byte_length}{name}")),
+                    6 => payload.push_str(&format!("x{byte_length}:{name}")),
+                    _ => payload.push_str(&name),
+                }
+            }
+            payload
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1_024))]
+
+        #[test]
+        fn adversarial_selector_decoder_is_total_and_only_accepts_canonical_bytes(
+            payload in adversarial_selector_payload(),
+        ) {
+            let encoded = format!("{}{payload}", AllEdgeSelector::PREFIX);
+            let decoded = AllEdgeSelector::decode(&encoded)
+                .expect("the reserved prefix must always enter the strict decoder");
+            if let Ok(selector) = decoded {
+                prop_assert_eq!(selector.encode().expect("accepted selector must encode"), encoded);
+            }
+        }
+
+        #[test]
+        fn valid_selector_sweep_round_trips_independent_of_input_order(
+            indices in prop::collection::btree_set(0_u32..1_000_000, 1..256),
+            reverse in any::<bool>(),
+        ) {
+            let mut names = indices
+                .into_iter()
+                .map(|index| format!("entity:{index}:edge-selector-property"))
+                .collect::<Vec<_>>();
+            if reverse {
+                names.reverse();
+            }
+            let selector = AllEdgeSelector::new(names).expect("generated durable selectors");
+            let encoded = selector.encode().expect("encode generated selector");
+            prop_assert_eq!(AllEdgeSelector::decode(&encoded), Some(Ok(selector)));
+        }
+    }
 
     #[test]
     fn selector_is_canonical_lossless_and_distinct_from_normal_edge_ids() {
@@ -716,14 +790,15 @@ pub enum FeatureType {
         #[serde(default)]
         target: Option<String>,
     },
-    /// Sweep a profile region along a path sketch's open chain (rotation-
-    /// minimizing frames — no twist). The profile, including holes, is placed
-    /// perpendicular to the path start; the path must be one line/arc chain.
+    /// Sweep a profile region along one open or closed path chain (rotation-
+    /// minimizing frames). The profile, including holes, is placed
+    /// perpendicular to the path start. An optional guide rotates and
+    /// uniformly scales that section frame around a durable profile anchor.
     Sweep {
         /// The profile: `(sketch_id, region_index)`.
         profile_sketch: String,
         profile_region: usize,
-        /// The path: a sketch id whose curves form one open chain.
+        /// The path: a sketch id whose curves form one connected chain.
         path_sketch: String,
         #[serde(default)]
         mode: ExtrudeMode,
@@ -735,6 +810,9 @@ pub enum FeatureType {
         total_twist_deg: f32,
         #[serde(default)]
         total_twist_expr: Option<String>,
+        /// Schema-v3 one-guide control. Earlier payloads decode without it.
+        #[serde(default)]
+        guide: Option<SweepGuide>,
     },
     /// Hollow out an existing body to a constant wall `thickness`, removing
     /// `open_faces` (at least one). Kernel support: boxes, cylinders, and any
@@ -1849,6 +1927,10 @@ pub(crate) struct SketchEval {
     /// must see only what the user drew. `regions` below were detected on
     /// drawn ⊕ `face_boundary`.
     pub(crate) curves: SketchCurves,
+    /// Variable-resolved curves indexed by durable sketch entity identity.
+    /// Guided Sweep uses this map for its profile anchor; keeping it beside the
+    /// region cache guarantees both are evaluated from the same sketch state.
+    pub(crate) entity_curves: HashMap<crate::sketch::EntityId, SketchCurves>,
     /// Sketch-on-face: the stored projected face outline that joined region
     /// detection (`graph.sketch_face_boundaries` snapshot). `None` for
     /// origin-plane / datum sketches. The extrude evaluator re-derives it from

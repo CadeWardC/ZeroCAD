@@ -677,6 +677,57 @@ impl SketchCurves {
         Some((chain_pts, closed))
     }
 
+    /// Resolve a normalized arc-length parameter on one connected curve chain.
+    ///
+    /// This is used by guided Sweep anchors. It deliberately shares the same
+    /// ordering and connectivity rules as the path/guide evaluator, so a
+    /// durable entity cannot preview one point and evaluate another.
+    pub fn normalized_chain_point(&self, parameter: f32, tol: f32) -> Option<(f32, f32)> {
+        if !parameter.is_finite() || !(0.0..=1.0).contains(&parameter) {
+            return None;
+        }
+        let (points, closed) = self.sweep_path_polyline(tol)?;
+        let segment_count = points.len().saturating_sub(1) + usize::from(closed);
+        if segment_count == 0 {
+            return None;
+        }
+        let segment = |index: usize| {
+            let a = points[index];
+            let b = if index + 1 < points.len() {
+                points[index + 1]
+            } else {
+                points[0]
+            };
+            (a, b)
+        };
+        let mut lengths = Vec::with_capacity(segment_count);
+        let mut total = 0.0f32;
+        for index in 0..segment_count {
+            let (a, b) = segment(index);
+            let length = (b.0 - a.0).hypot(b.1 - a.1);
+            lengths.push(length);
+            total += length;
+        }
+        if !total.is_finite() || total <= tol.max(f32::EPSILON) {
+            return None;
+        }
+        let target = parameter * total;
+        let mut traversed = 0.0f32;
+        for (index, length) in lengths.iter().copied().enumerate() {
+            if target <= traversed + length || index + 1 == segment_count {
+                let fraction = if length > 0.0 {
+                    ((target - traversed) / length).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (a, b) = segment(index);
+                return Some((a.0 + (b.0 - a.0) * fraction, a.1 + (b.1 - a.1) * fraction));
+            }
+            traversed += length;
+        }
+        None
+    }
+
     pub fn add_circle(&mut self, center: (f32, f32), radius: f32) {
         if radius > 0.0 {
             self.circles.push(Circle { center, radius });
@@ -1174,6 +1225,43 @@ pub fn effective_curves_solved_checked(
     }
     apply_mirrors(&mut c, mirrors);
     (c, Vec::new())
+}
+
+/// Resolve only the curve(s) owned by one durable sketch entity.
+///
+/// Solver-backed legacy shapes may expand into several low-level entities;
+/// their `derived_from` provenance keeps the original shape id addressable.
+/// Construction geometry is intentionally excluded from material anchors.
+pub fn entity_curves_solved(
+    shapes: &[SketchShape],
+    entity_ids: &[EntityId],
+    solver: Option<&SketchSolverModel>,
+    entity: EntityId,
+    vars: &HashMap<String, f64>,
+) -> Option<SketchCurves> {
+    if let Some(model) = solver.filter(|model| !model.is_empty()) {
+        let mut solved = model.clone();
+        if solve::has_variable_bound_constraint(model) {
+            let report = solve::solve_model(model, vars);
+            if report.outcome == SolveOutcome::Converged {
+                solve::apply_solution(&mut solved, &report);
+            }
+        }
+        let construction = solved.construction.clone();
+        solved.entities.retain(|candidate| {
+            !construction.contains(&candidate.id())
+                && (candidate.id() == entity || candidate.derived_from() == Some(entity))
+        });
+        solved.construction.clear();
+        let curves = constraints::bake_entities_to_curves(&solved);
+        return (!curves.is_empty()).then_some(curves);
+    }
+
+    let ids = effective_shape_ids(shapes.len(), entity_ids);
+    ids.iter()
+        .position(|candidate| *candidate == entity)
+        .map(|index| shapes[index].build(vars))
+        .filter(|curves| !curves.is_empty())
 }
 
 fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {

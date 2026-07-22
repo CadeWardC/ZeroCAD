@@ -10,10 +10,30 @@ use openrcad_topo::{
     Edge, Face, InputTopologyRef, Solid, TopologyChange, TopologyHistory, TopologyKind,
     TopologyRef, Vertex, Wire,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
 
 use crate::blend::{detect_cylinder_with_policy, shell_cylinder_with_policy, BlendError};
 use crate::sew::sew_shell_with_policy as sew_with_policy;
+
+fn shell_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some())
+}
+
+fn shell_trace(arguments: core::fmt::Arguments<'_>) {
+    if shell_trace_enabled() {
+        eprintln!("[openrcad-shell] {arguments}");
+    }
+}
+
+macro_rules! shell_trace {
+    ($($argument:tt)*) => {
+        shell_trace(format_args!($($argument)*))
+    };
+}
 
 /// Dispatch path selected before building a Shell candidate. Keeping this
 /// observable pins the primitive optimizations while mixed analytic networks
@@ -884,9 +904,7 @@ struct AnalyticShellSupport {
 }
 
 fn trace_shell_failure(stage: &'static str, error: BlendError) -> BlendError {
-    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-        eprintln!("shell stage {stage} rejected: {error}");
-    }
+    shell_trace!("stage {stage} rejected: {error}");
     error
 }
 
@@ -1246,11 +1264,9 @@ fn remap_analytic_vertex(
             let minimum = aligned.iter().copied().fold(f64::INFINITY, f64::min);
             let maximum = aligned.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             if maximum - minimum > context.policy.classification * 8.0 {
-                if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-                    eprintln!(
-                        "shell tangent support residual disagreement at source={original:?} result={point:?}: {aligned:?}"
-                    );
-                }
+                shell_trace!(
+                    "tangent support residual disagreement at source={original:?} result={point:?}: {aligned:?}"
+                );
                 return Err(BlendError::UnsupportedShape);
             }
             let residual = aligned.iter().sum::<f64>() / aligned.len() as f64;
@@ -1270,11 +1286,9 @@ fn remap_analytic_vertex(
             .map(|(residual, _)| residual.abs())
             .fold(0.0, f64::max);
         if residual > context.policy.classification * 8.0 {
-            if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-                eprintln!(
-                    "shell tangent remap residual {residual} at source={original:?} result={point:?}"
-                );
-            }
+            shell_trace!(
+                "tangent remap residual {residual} at source={original:?} result={point:?}"
+            );
             return Err(BlendError::UnsupportedShape);
         }
         if original.distance(&point) > thickness.abs() * MAX_VERTEX_TRAVEL_THICKNESSES {
@@ -1289,16 +1303,12 @@ fn remap_analytic_vertex(
         let Some((rows, rhs)) =
             independent_support_rows(supports, point, original, context.policy.angular)
         else {
-            if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-                eprintln!("shell remap could not select independent support rows at {point:?}");
-            }
+            shell_trace!("remap could not select independent support rows at {point:?}");
             return Err(BlendError::UnsupportedShape);
         };
         let determinant = det3(&rows);
         if determinant.abs() <= context.policy.angular {
-            if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-                eprintln!("shell remap determinant {determinant} at {point:?}");
-            }
+            shell_trace!("remap determinant {determinant} at {point:?}");
             return Err(BlendError::UnsupportedShape);
         }
         let delta = solve3(&rows, &rhs, determinant);
@@ -1319,13 +1329,13 @@ fn remap_analytic_vertex(
         .map(|(residual, _)| residual.abs())
         .fold(0.0, f64::max);
     if residual > context.policy.classification * 8.0 {
-        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+        if shell_trace_enabled() {
             let residuals = supports
                 .iter()
                 .filter_map(|support| support_residual_gradient(support, point))
                 .collect::<Vec<_>>();
-            eprintln!(
-                "shell remap residual {residual} at source={original:?} result={point:?}: {residuals:?}"
+            shell_trace!(
+                "remap residual {residual} at source={original:?} result={point:?}: {residuals:?}"
             );
         }
         return Err(BlendError::UnsupportedShape);
@@ -1655,9 +1665,9 @@ fn shell_analytic_general(
             }
         }
         let analytic: Vec<_> = analytic_owned.iter().collect();
-        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-            eprintln!(
-                "shell remap vertex {original:?} supports={:?}",
+        if shell_trace_enabled() {
+            shell_trace!(
+                "remap vertex {original:?} supports={:?}",
                 analytic
                     .iter()
                     .map(|support| crate::band_topology::BandSupportKind::of(support))
@@ -1790,9 +1800,7 @@ fn shell_analytic_general(
                         &context,
                     )
                     .ok_or_else(|| {
-                        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-                            eprintln!("shell torus edge is not a supported exact isocurve");
-                        }
+                        shell_trace!("torus edge is not a supported exact isocurve");
                         BlendError::UnsupportedShape
                     })?;
                     let (start_parameter, end_parameter) = transformed.bounds();
@@ -1801,13 +1809,13 @@ fn shell_analytic_general(
                         || transformed.point(end_parameter).distance(&end)
                             > context.policy.classification * 8.0
                     {
-                        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+                        if shell_trace_enabled() {
                             let start_uv =
                                 crate::intersect::uv_of(&GeomSurface::torus(*offset_torus), &start);
                             let end_uv =
                                 crate::intersect::uv_of(&GeomSurface::torus(*offset_torus), &end);
-                            eprintln!(
-                                "shell torus edge projection mismatch start={} end={} parameters=({start_parameter}, {end_parameter}) uv=({start_uv:?}, {end_uv:?})",
+                            shell_trace!(
+                                "torus edge projection mismatch start={} end={} parameters=({start_parameter}, {end_parameter}) uv=({start_uv:?}, {end_uv:?})",
                                 transformed.point(start_parameter).distance(&start),
                                 transformed.point(end_parameter).distance(&end)
                             );
@@ -1951,9 +1959,9 @@ fn shell_analytic_general(
             .iter()
             .map(|edge| {
                 rebuild_edge(edge).map_err(|error| {
-                    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-                        eprintln!(
-                            "shell edge rebuild failed curve={:?} source={:?} target={:?}",
+                    if shell_trace_enabled() {
+                        shell_trace!(
+                            "edge rebuild failed curve={:?} source={:?} target={:?}",
                             edge.curve(),
                             edge.source().point(),
                             edge.target().point()
@@ -2139,9 +2147,7 @@ fn shell_analytic_general(
         );
     }
 
-    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-        eprintln!("shell sewing {} candidate faces", result.len());
-    }
+    shell_trace!("sewing {} candidate faces", result.len());
     let shell = sew_with_policy(&result, &context.policy).map_err(|error| {
         trace_shell_failure(
             "sewing",
@@ -2150,9 +2156,9 @@ fn shell_analytic_general(
     })?;
     let candidate = Solid::new(shell);
     if !candidate.is_watertight_with_policy(&context.policy) {
-        if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
-            eprintln!(
-                "shell candidate is not watertight: health={:?} manifold={:?} counts=({}, {}, {})",
+        if shell_trace_enabled() {
+            shell_trace!(
+                "candidate is not watertight: health={:?} manifold={:?} counts=({}, {}, {})",
                 candidate.health_report_with_policy(&context.policy),
                 candidate.manifold_report_with_policy(&context.policy),
                 candidate.vertex_count(),
@@ -2201,12 +2207,12 @@ fn shell_analytic_general(
                 }
             }
             for entries in uses.values().filter(|entries| entries.len() == 1) {
-                eprintln!("shell free edge: {:?}", entries[0]);
+                shell_trace!("free edge: {:?}", entries[0]);
             }
         }
         return Err(BlendError::UnsupportedShape);
     }
-    if std::env::var_os("OPENRCAD_SHELL_DEBUG").is_some() {
+    if shell_trace_enabled() {
         for (face_index, face) in candidate.faces().iter().enumerate() {
             let surface = match face.surface() {
                 Some(GeomSurface::Plane(_)) => "plane",
@@ -2223,8 +2229,8 @@ fn shell_analytic_general(
             for (wire_index, wire) in face.wires().iter().enumerate() {
                 for edge_index in 0..wire.len() {
                     if wire.pcurve(edge_index).is_none() {
-                        eprintln!(
-                            "shell missing pcurve face_index={face_index} face_id={:?} surface={surface} wire={wire_index} edge={edge_index}",
+                        shell_trace!(
+                            "missing pcurve face_index={face_index} face_id={:?} surface={surface} wire={wire_index} edge={edge_index}",
                             face.id()
                         );
                     }

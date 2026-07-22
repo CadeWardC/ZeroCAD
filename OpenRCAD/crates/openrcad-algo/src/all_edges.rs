@@ -74,6 +74,11 @@ pub enum AllEdgeBlendError {
         kind: AllEdgeBlendKind,
         value: f64,
     },
+    BelowTolerance {
+        kind: AllEdgeBlendKind,
+        value: f64,
+        minimum: f64,
+    },
     NoEligibleEdges,
     BlockingEdges {
         kind: AllEdgeBlendKind,
@@ -104,6 +109,14 @@ impl fmt::Display for AllEdgeBlendError {
                     "all-edge {kind}: value must be finite and non-negative, got {value}"
                 )
             }
+            Self::BelowTolerance {
+                kind,
+                value,
+                minimum,
+            } => write!(
+                f,
+                "all-edge {kind}: value {value} must exceed the linear tolerance {minimum}"
+            ),
             Self::NoEligibleEdges => f.write_str("all-edge blend: the solid has no edges"),
             Self::BlockingEdges {
                 kind,
@@ -203,7 +216,11 @@ fn apply_all_edges_strict(
         return Err(AllEdgeBlendError::InvalidValue { kind, value });
     }
     if value <= policy.linear {
-        return Ok(solid.clone());
+        return Err(AllEdgeBlendError::BelowTolerance {
+            kind,
+            value,
+            minimum: policy.linear,
+        });
     }
 
     let edges = canonical_edges(solid);
@@ -248,62 +265,39 @@ fn apply_all_edges_strict(
         Err(error) => error,
     };
 
-    // Diagnostic replay is local and immutable. Successful candidates advance
-    // only this scratch solid; failed edges are recorded and skipped so callers
-    // receive the complete blocker set instead of merely the first error. The
-    // scratch result is returned only when every edge succeeds.
-    let mut current = solid.clone();
-    let mut blockers = Vec::new();
+    // Diagnostic replay is local and immutable. Every edge is tested against
+    // the same source solid, so blocker attribution cannot depend on mutation
+    // order. A successful individual replay is diagnostic evidence only: once
+    // the grouped solver rejects, no sequential substitute may escape this
+    // strict simultaneous-operation boundary.
+    let interaction_reason = grouped_failure.to_string();
+    let mut blockers = Vec::with_capacity(edges.len());
     for (ordinal, edge) in edges.iter().enumerate() {
         let result = match kind {
             AllEdgeBlendKind::Fillet => crate::rolling_ball::fillet_edges_with_policy(
-                &current,
+                solid,
                 std::slice::from_ref(edge),
                 value,
                 policy,
             )
             .map_err(AllEdgeBlendFailure::Fillet),
             AllEdgeBlendKind::Chamfer => crate::chamfer::chamfer_edges_with_policy(
-                &current,
+                solid,
                 std::slice::from_ref(edge),
                 value,
                 policy,
             )
             .map_err(AllEdgeBlendFailure::Chamfer),
         };
-        match result {
-            Ok(candidate) => current = candidate,
-            Err(failure) => blockers.push(AllEdgeBlocker {
-                ordinal,
-                edge: edge.clone(),
-                failure,
-            }),
-        }
-    }
-
-    if blockers.is_empty() {
-        // The grouped solver can reject a set whose canonical sequential form is
-        // nevertheless strict. Returning the fully-applied scratch candidate is
-        // still atomic and never skips an edge.
-        return Ok(current);
-    }
-    if blockers.len() == edges.len()
-        && blockers.iter().all(|blocker| {
-            matches!(
-                blocker.failure,
-                AllEdgeBlendFailure::Fillet(RollingBallError::SpineNotOnFace)
-                    | AllEdgeBlendFailure::Chamfer(ChamferError::SpineNotOnFace)
-            )
-        })
-    {
-        // Preserve the more informative grouped reason when every diagnostic
-        // relocation failed before reaching geometry.
-        let reason = grouped_failure.to_string();
-        for blocker in &mut blockers {
-            blocker.failure = AllEdgeBlendFailure::Interaction {
-                reason: reason.clone(),
-            };
-        }
+        blockers.push(AllEdgeBlocker {
+            ordinal,
+            edge: edge.clone(),
+            failure: result
+                .err()
+                .unwrap_or_else(|| AllEdgeBlendFailure::Interaction {
+                    reason: interaction_reason.clone(),
+                }),
+        });
     }
     Err(AllEdgeBlendError::BlockingEdges {
         kind,

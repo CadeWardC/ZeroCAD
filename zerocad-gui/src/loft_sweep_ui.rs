@@ -22,6 +22,9 @@ pub(crate) struct SweepOp {
     pub(crate) profile_sketch: String,
     pub(crate) profile_region: usize,
     pub(crate) path_sketch: Option<String>,
+    pub(crate) guide_sketch: Option<String>,
+    pub(crate) profile_entity: Option<zerocad_core::sketch::EntityId>,
+    pub(crate) profile_parameter: f32,
     pub(crate) mode: ExtrudeMode,
     pub(crate) total_twist_text: String,
 }
@@ -91,6 +94,9 @@ impl ZeroCadApp {
             profile_sketch,
             profile_region,
             path_sketch: None,
+            guide_sketch: None,
+            profile_entity: None,
+            profile_parameter: 0.0,
             mode: ExtrudeMode::NewBody,
             total_twist_text: "0".to_string(),
         });
@@ -113,6 +119,39 @@ impl ZeroCadApp {
                     .then(|| (node.id.clone(), node.name.clone()))
             })
             .collect();
+        let profile_entities: Vec<zerocad_core::sketch::EntityId> = self
+            .document
+            .graph
+            .node_indices()
+            .find_map(|index| {
+                let node = &self.document.graph[index];
+                if node.id != op.profile_sketch {
+                    return None;
+                }
+                let FeatureType::Sketch {
+                    shapes,
+                    entity_ids,
+                    solver,
+                    ..
+                } = &node.feature
+                else {
+                    return None;
+                };
+                let mut ids = zerocad_core::sketch::effective_shape_ids(shapes.len(), entity_ids);
+                if let Some(model) = solver {
+                    ids.extend(
+                        model
+                            .entities
+                            .iter()
+                            .filter(|entity| !model.construction.contains(&entity.id()))
+                            .map(zerocad_core::sketch::SketchEntity::id),
+                    );
+                }
+                ids.sort_by_key(|entity| entity.0);
+                ids.dedup();
+                Some(ids)
+            })
+            .unwrap_or_default();
 
         let mut commit = false;
         let mut cancel = false;
@@ -142,11 +181,13 @@ impl ZeroCadApp {
                             .selected_text(selected)
                             .show_ui(ui, |ui| {
                                 for (sid, name) in &sketches {
-                                    ui.selectable_value(
-                                        &mut op_new.path_sketch,
-                                        Some(sid.clone()),
-                                        name,
-                                    );
+                                    if op_new.guide_sketch.as_deref() != Some(sid) {
+                                        ui.selectable_value(
+                                            &mut op_new.path_sketch,
+                                            Some(sid.clone()),
+                                            name,
+                                        );
+                                    }
                                 }
                             });
                     });
@@ -159,8 +200,70 @@ impl ZeroCadApp {
                     }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        ui.label("Guide sketch");
+                        let selected = op_new
+                            .guide_sketch
+                            .as_ref()
+                            .and_then(|id| sketches.iter().find(|(sid, _)| sid == id))
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| "None".to_string());
+                        egui::ComboBox::from_id_salt("sweep_guide")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut op_new.guide_sketch, None, "None");
+                                for (sid, name) in &sketches {
+                                    if op_new.path_sketch.as_deref() != Some(sid) {
+                                        ui.selectable_value(
+                                            &mut op_new.guide_sketch,
+                                            Some(sid.clone()),
+                                            name,
+                                        );
+                                    }
+                                }
+                            });
+                    });
+                    if op_new.guide_sketch.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label("Profile anchor");
+                            let selected = op_new
+                                .profile_entity
+                                .and_then(|entity| {
+                                    profile_entities
+                                        .iter()
+                                        .position(|candidate| *candidate == entity)
+                                })
+                                .map(|index| format!("Profile curve {}", index + 1))
+                                .unwrap_or_else(|| "â€” pick â€”".to_string());
+                            egui::ComboBox::from_id_salt("sweep_profile_anchor")
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    for (index, entity) in profile_entities.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut op_new.profile_entity,
+                                            Some(*entity),
+                                            format!("Profile curve {}", index + 1),
+                                        );
+                                    }
+                                });
+                            ui.add(
+                                egui::DragValue::new(&mut op_new.profile_parameter)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "The anchor follows the guide; explicit twist is disabled.",
+                            )
+                            .size(11.0)
+                            .color(self.pal().text_faint),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
                         ui.label("Total twist");
-                        ui.add(
+                        ui.add_enabled(
+                            op_new.guide_sketch.is_none(),
                             egui::TextEdit::singleline(&mut op_new.total_twist_text)
                                 .desired_width(70.0),
                         );
@@ -181,7 +284,8 @@ impl ZeroCadApp {
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let can_ok = op_new.path_sketch.is_some();
+                        let can_ok = op_new.path_sketch.is_some()
+                            && (op_new.guide_sketch.is_none() || op_new.profile_entity.is_some());
                         if ui.add_enabled(can_ok, egui::Button::new("OK")).clicked() {
                             commit = true;
                         }
@@ -215,6 +319,22 @@ impl ZeroCadApp {
             self.status_msg = "Sweep twist must be finite.".to_string();
             return;
         }
+        if op.guide_sketch.is_some() && total_twist_deg != 0.0 {
+            self.status_msg = "A guided Sweep cannot also use explicit twist.".to_string();
+            return;
+        }
+        let guide = match (op.guide_sketch.clone(), op.profile_entity) {
+            (Some(sketch), Some(profile_entity)) => Some(zerocad_core::SweepGuide {
+                sketch,
+                profile_entity,
+                profile_parameter: op.profile_parameter,
+            }),
+            (Some(_), None) => {
+                self.status_msg = "Choose a durable profile anchor for the guide.".to_string();
+                return;
+            }
+            (None, _) => None,
+        };
         // Cut/Join from a face-attached profile targets that body.
         let target = if matches!(op.mode, ExtrudeMode::Cut | ExtrudeMode::Join) {
             self.document
@@ -240,10 +360,14 @@ impl ZeroCadApp {
                 total_twist_deg,
                 total_twist_expr: zerocad_core::expr::preserves_source(&op.total_twist_text)
                     .then(|| op.total_twist_text.trim().to_string()),
+                guide: guide.clone(),
             },
         });
         self.document.add_dependency(&op.profile_sketch, &id);
         self.document.add_dependency(&path_sketch, &id);
+        if let Some(guide) = &guide {
+            self.document.add_dependency(&guide.sketch, &id);
+        }
         self.hidden_nodes.insert(op.profile_sketch.clone());
         self.selected_faces.clear();
         self.selected_node_id = Some(id);

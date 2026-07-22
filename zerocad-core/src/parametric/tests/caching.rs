@@ -607,6 +607,11 @@ fn feature_mutation_corpus() -> Vec<FeatureType> {
             target: Some("missing_body".into()),
             total_twist_deg: 30.0,
             total_twist_expr: Some("twist".into()),
+            guide: Some(SweepGuide {
+                sketch: "guide".into(),
+                profile_entity: crate::sketch::EntityId(73),
+                profile_parameter: 0.375,
+            }),
         },
         FeatureType::Shell {
             target: "missing_body".into(),

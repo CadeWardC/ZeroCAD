@@ -903,11 +903,28 @@ fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
         FeatureType::Sweep {
             profile_sketch,
             path_sketch,
+            guide,
             ..
-        } => vec![
-            FeatureInput::sketch("profile", FeatureId::from(profile_sketch.as_str())),
-            FeatureInput::sketch("path", FeatureId::from(path_sketch.as_str())),
-        ],
+        } => {
+            let mut inputs = vec![
+                FeatureInput::sketch("profile", FeatureId::from(profile_sketch.as_str())),
+                FeatureInput::sketch("path", FeatureId::from(path_sketch.as_str())),
+            ];
+            if let Some(guide) = guide {
+                inputs.push(FeatureInput::sketch(
+                    "guide",
+                    FeatureId::from(guide.sketch.as_str()),
+                ));
+                inputs.push(FeatureInput::selection(
+                    "profile_anchor",
+                    SemanticSelector::sketch_entity(
+                        FeatureId::from(profile_sketch.as_str()),
+                        guide.profile_entity.0,
+                    ),
+                ));
+            }
+            inputs
+        }
         FeatureType::DatumPlane {
             def: DatumPlaneDef::PlanarFace { face },
         } => vec![FeatureInput::selection(
@@ -1154,8 +1171,8 @@ impl FeatureRegistry {
         ),
         registration_with_payload(
             "part.sweep",
-            2,
-            NUMERIC_FIELDS_V1_V2,
+            3,
+            NUMERIC_FIELDS_V1_V2_V3,
             "Sweep",
             FeatureEvaluatorKind::Sweep,
             FeatureEditorGroup::Solid,

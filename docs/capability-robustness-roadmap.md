@@ -496,8 +496,27 @@ circles/arcs, and supported rational B-spline arrangement spans, including
 reordered holes, `1e-3..1e3` scales, and far-origin placement. Public sketch
 ellipses still reach region detection as sampled display chords and therefore
 reject in Smooth mode instead of becoming approximate durable topology.
+The Smooth self-intersection certificate is intentionally conservative: a
+valid but insufficiently provable wiggly skin may reject, and Ruled mode is the
+supported fallback.
 Arbitrary section orientation changes and Shell on Smooth Loft output remain
 explicitly unsupported; users can retain Ruled mode for those cases.
+
+Wave 5G is implemented as Sweep payload v3 with one optional guide; payloads
+v1 and v2 continue to decode without a guide. A guided Sweep stores a durable
+profile `EntityId` and normalized profile parameter, resolves one connected
+guide chain, normalizes spine and guide by arc length, and transports the outer
+and hole loops through one continuous minimum-twist frame. Uniform section
+scale keeps the durable profile anchor on the guide while the section origin
+remains on the spine. The guide fields participate in dependency hashing,
+cache invalidation, undo, properties, and real disk save/reload. Missing or
+ambiguous anchors, invalid guide topology, spine crossings, frame flips,
+non-positive scale, unmatched closed seams, work-budget exhaustion, and any
+explicit Sweep Twist reject atomically with typed `sweep.*` diagnostics. The
+acceptance suite locks cold/warm equivalence, guide mutation, outer-plus-hole
+transport, `1e-3..1e3` scale, and local/far-origin behavior. Multiple guides,
+disconnected guide chains, and combined guide-plus-twist transport remain
+explicitly unsupported.
 
 ## Persistence schedule
 

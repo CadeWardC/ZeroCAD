@@ -397,7 +397,7 @@ fn smooth_loft_rejects_a_twisted_self_intersecting_correspondence() {
     assert!(matches!(
         skin_smooth_section_loops_operation_with_policy(&input, &TolerancePolicy::STANDARD),
         Err(ModelingOperationError::SmoothLoft(
-            SmoothLoftError::SelfIntersection { .. }
+            SmoothLoftError::SelfIntersectionUnresolved { .. }
         ))
     ));
 }

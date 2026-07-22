@@ -8,7 +8,7 @@ use crate::parametric::{
     AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DraftNeutral, EdgeRef, ExtrudeMode,
     FaceRef, FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
     FeatureType, HoleKind, HoleManufacturingMetadata, LoftSurfaceMode, PatternKind, PlaneBase,
-    StandardReference, Variable,
+    StandardReference, SweepGuide, Variable,
 };
 use crate::sketch::{
     CornerKind, CornerMod, EntityId, SketchMirror, SketchShape, SketchSolverModel,
@@ -383,12 +383,16 @@ pub(crate) fn encode_for_schema(
     if let FeatureType::Sweep {
         total_twist_deg,
         total_twist_expr,
+        guide,
         ..
     } = feature
     {
         if payload_schema >= 2 {
             put(&mut fields, 5, total_twist_deg);
             put(&mut fields, 6, total_twist_expr);
+        }
+        if payload_schema >= 3 {
+            put(&mut fields, 7, guide);
         }
     }
     if let FeatureType::Loft { surface_mode, .. } = feature {
@@ -426,27 +430,42 @@ pub(crate) fn decode_with_decoder(
 }
 
 fn decode_v3(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType, String> {
-    if kind != "sketch.sketch" {
-        return decode_v2(kind, fields);
-    }
-    let mut solver = take::<Option<SketchSolverModel>>(&mut fields, 8, "solver")?;
-    let patterns =
-        take::<Vec<crate::sketch::SketchPatternOperation>>(&mut fields, 9, "associative patterns")?;
-    if !patterns.is_empty() {
-        solver
-            .get_or_insert_with(SketchSolverModel::default)
-            .patterns = patterns;
-    }
-    let feature = FeatureType::Sketch {
-        cs: take::<CoordinateSystem>(&mut fields, 0, "coordinate system")?,
-        curves: take::<SketchCurves>(&mut fields, 1, "curves")?,
-        shapes: take::<Vec<SketchShape>>(&mut fields, 2, "shapes")?,
-        corner_mods: take::<Vec<CornerMod>>(&mut fields, 3, "corner modifiers")?,
-        mirrors: take::<Vec<SketchMirror>>(&mut fields, 4, "mirrors")?,
-        on_face: take(&mut fields, 5, "on face")?,
-        entity_ids: take::<Vec<EntityId>>(&mut fields, 6, "entity ids")?,
-        next_entity_id: take(&mut fields, 7, "next entity id")?,
-        solver,
+    let feature = match kind {
+        "sketch.sketch" => {
+            let mut solver = take::<Option<SketchSolverModel>>(&mut fields, 8, "solver")?;
+            let patterns = take::<Vec<crate::sketch::SketchPatternOperation>>(
+                &mut fields,
+                9,
+                "associative patterns",
+            )?;
+            if !patterns.is_empty() {
+                solver
+                    .get_or_insert_with(SketchSolverModel::default)
+                    .patterns = patterns;
+            }
+            FeatureType::Sketch {
+                cs: take::<CoordinateSystem>(&mut fields, 0, "coordinate system")?,
+                curves: take::<SketchCurves>(&mut fields, 1, "curves")?,
+                shapes: take::<Vec<SketchShape>>(&mut fields, 2, "shapes")?,
+                corner_mods: take::<Vec<CornerMod>>(&mut fields, 3, "corner modifiers")?,
+                mirrors: take::<Vec<SketchMirror>>(&mut fields, 4, "mirrors")?,
+                on_face: take(&mut fields, 5, "on face")?,
+                entity_ids: take::<Vec<EntityId>>(&mut fields, 6, "entity ids")?,
+                next_entity_id: take(&mut fields, 7, "next entity id")?,
+                solver,
+            }
+        }
+        "part.sweep" => FeatureType::Sweep {
+            profile_sketch: take(&mut fields, 0, "profile sketch")?,
+            profile_region: take(&mut fields, 1, "profile region")?,
+            path_sketch: take(&mut fields, 2, "path sketch")?,
+            mode: take::<ExtrudeMode>(&mut fields, 3, "mode")?,
+            target: take(&mut fields, 4, "target")?,
+            total_twist_deg: take(&mut fields, 5, "total twist")?,
+            total_twist_expr: take(&mut fields, 6, "total twist expression")?,
+            guide: take::<Option<SweepGuide>>(&mut fields, 7, "guide")?,
+        },
+        _ => return decode_v2(kind, fields),
     };
     finish(kind, fields)?;
     Ok(feature)
@@ -471,6 +490,7 @@ fn decode_v2(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
             target: take(&mut fields, 4, "target")?,
             total_twist_deg: take(&mut fields, 5, "total twist")?,
             total_twist_expr: take(&mut fields, 6, "total twist expression")?,
+            guide: None,
         },
         "part.loft" => FeatureType::Loft {
             sections: take::<Vec<(String, usize)>>(&mut fields, 0, "sections")?,
@@ -593,6 +613,7 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
             target: take(&mut fields, 4, "target")?,
             total_twist_deg: 0.0,
             total_twist_expr: None,
+            guide: None,
         },
         "part.shell" => FeatureType::Shell {
             target: take(&mut fields, 0, "target")?,
@@ -804,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_v1_decodes_zero_twist_and_v2_round_trips_signed_expression() {
+    fn sweep_v1_v2_decode_without_guide_and_v3_round_trips_it() {
         let feature = FeatureType::Sweep {
             profile_sketch: "profile".into(),
             profile_region: 2,
@@ -813,6 +834,11 @@ mod tests {
             target: None,
             total_twist_deg: -135.0,
             total_twist_expr: Some("-3*twist".into()),
+            guide: Some(SweepGuide {
+                sketch: "guide".into(),
+                profile_entity: EntityId(17),
+                profile_parameter: 0.25,
+            }),
         };
         let v1 = decode_with_decoder(
             "part.sweep",
@@ -826,6 +852,7 @@ mod tests {
             FeatureType::Sweep {
                 total_twist_deg: 0.0,
                 total_twist_expr: None,
+                guide: None,
                 ..
             }
         ));
@@ -842,8 +869,28 @@ mod tests {
             FeatureType::Sweep {
                 total_twist_deg,
                 total_twist_expr: Some(expression),
+                guide: None,
                 ..
             } if total_twist_deg == -135.0 && expression == "-3*twist"
+        ));
+
+        let v3 = decode_with_decoder(
+            "part.sweep",
+            3,
+            crate::document::FeaturePayloadDecoder::NumericFieldsV3,
+            encode_for_schema(&feature, 3),
+        )
+        .unwrap();
+        assert!(matches!(
+            v3,
+            FeatureType::Sweep {
+                guide: Some(SweepGuide {
+                    sketch,
+                    profile_entity: EntityId(17),
+                    profile_parameter,
+                }),
+                ..
+            } if sketch == "guide" && profile_parameter == 0.25
         ));
     }
 
