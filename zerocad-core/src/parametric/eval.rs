@@ -2507,6 +2507,7 @@ impl ParametricGraph {
                         depth: *d,
                         cs: CoordinateSystem::XY,
                         rect_circle: None,
+                        analytic: None,
                     }],
                 };
                 let solid = crate::mock_kernel::extruded_region_solid(
@@ -3395,6 +3396,72 @@ impl ParametricGraph {
         .with_fallback("used the last stored draft angle")
     }
 
+    /// A selected region produced no solid. Every builder on the path returns
+    /// an `Option`, so without this the face simply vanishes from the result —
+    /// the model gets a hole and the user gets no message at all. Name the
+    /// region and, when the boundary explains itself, say what is wrong with
+    /// it: a zero-width cusp from exact tangential contact is by far the most
+    /// common cause and is invisible at any zoom.
+    fn region_not_buildable_diagnostic(
+        node_id: &str,
+        region_index: usize,
+        region: &crate::sketch::Region,
+    ) -> EvaluationDiagnostic {
+        let (reason, fallback) = match region.degeneracy() {
+            Some(crate::sketch::RegionDegeneracy::Cusp { at, turn_degrees }) => (
+                format!(
+                    " Its boundary doubles back on itself at ({:.4}, {:.4}) (turning {turn_degrees:.1}°), \
+                     so the face is pinched to zero width there — usually a curve exactly tangent to \
+                     the edge it meets. Nudging either one slightly apart resolves it.",
+                    at.0, at.1
+                ),
+                "skipped this region; the rest of the sketch was extruded",
+            ),
+            None => (
+                String::new(),
+                "skipped this region; the rest of the sketch was extruded",
+            ),
+        };
+        let mut diagnostic = EvaluationDiagnostic::new(
+            node_id,
+            "extrude region",
+            DiagnosticCode::operation_failed(),
+            DiagnosticSeverity::Warning,
+            format!(
+                "Extrude '{node_id}': region {region_index} (area {:.4}) could not be built into a solid.{reason}",
+                region.area
+            ),
+        )
+        .with_parameter(
+            "region_index",
+            DiagnosticParameterValue::Decimal(region_index.to_string()),
+        )
+        .with_parameter(
+            "region_area",
+            DiagnosticParameterValue::Decimal(region.area.to_string()),
+        )
+        .with_fallback(fallback);
+        if let Some(crate::sketch::RegionDegeneracy::Cusp { at, turn_degrees }) =
+            region.degeneracy()
+        {
+            diagnostic = diagnostic
+                .with_parameter("degeneracy", "cusp")
+                .with_parameter(
+                    "cusp_x",
+                    DiagnosticParameterValue::Decimal(at.0.to_string()),
+                )
+                .with_parameter(
+                    "cusp_y",
+                    DiagnosticParameterValue::Decimal(at.1.to_string()),
+                )
+                .with_parameter(
+                    "cusp_turn_degrees",
+                    DiagnosticParameterValue::Decimal(turn_degrees.to_string()),
+                );
+        }
+        diagnostic
+    }
+
     fn standalone_draft_expression_diagnostic(
         node_id: &str,
         expression: &str,
@@ -3833,6 +3900,94 @@ impl ParametricGraph {
         let mut newbody_mesh = MockMesh::empty();
         let mut newbody_part_meshes: Vec<([i64; 6], MockMesh)> = Vec::new();
 
+        // A sketch arrangement deliberately exposes every bounded face, but a
+        // New Body selection can contain several adjacent faces that represent
+        // one continuous piece of material. Build their combined 2D outline
+        // before extrusion. This removes the shared sketch edges structurally
+        // instead of relying on a fragile coplanar 3D union to sew them later.
+        //
+        // Only zero-draft New Body uses this path for now: drafted profiles
+        // require their existing cross-region draft validation, while Join/Cut
+        // keep one tool per selected region for transactional semantics.
+        let prepared_newbody_regions = if matches!(mode, ExtrudeMode::NewBody) && !has_draft {
+            crate::parametric::extrude::prepare_extrude_regions(regions, &process_region)
+        } else {
+            Vec::new()
+        };
+        let uses_prepared_newbody = prepared_newbody_regions
+            .iter()
+            .any(|prepared| prepared.source_indices.len() > 1);
+        if uses_prepared_newbody {
+            for prepared in &prepared_newbody_regions {
+                let region = &prepared.region;
+                let region_index = prepared.source_indices[0];
+                let provenance = sketch
+                    .provenance
+                    .get(region_index)
+                    .or_else(|| sketch.provenance.first());
+                let body_tool = cyl_tool(region, cs, depth).or_else(|| {
+                    crate::mock_kernel::extruded_sketch_region_solid(
+                        region,
+                        depth,
+                        cs,
+                        &arc_circles,
+                    )
+                });
+                let Some(region_part) = body_tool else {
+                    diagnostics.push(Self::region_not_buildable_diagnostic(
+                        node_id,
+                        region_index,
+                        region,
+                    ));
+                    continue;
+                };
+
+                newbody_has_boolean |= prepared
+                    .source_indices
+                    .iter()
+                    .any(|index| region_is_boolean[*index]);
+                newbody_tools.push(region_part.clone());
+                sketch_source.regions.push(SketchExtrudeRegionSource {
+                    boundary: region.boundary.clone(),
+                    holes: region.holes.clone(),
+                    depth,
+                    cs: *cs,
+                    rect_circle: None,
+                    analytic: region.analytic.clone(),
+                });
+
+                let mut region_mesh = crate::mock_kernel::display_mesh_from_part(
+                    &region_part,
+                    &region.boundary,
+                    &region.holes,
+                    depth,
+                    cs,
+                );
+                stamp_sketch_extrude_edge_refs(
+                    &mut region_mesh,
+                    node_id,
+                    region_index,
+                    provenance,
+                    cs,
+                    depth,
+                );
+                stamp_sketch_extrude_face_refs(
+                    &mut region_mesh,
+                    node_id,
+                    region_index,
+                    provenance,
+                    cs,
+                    depth,
+                );
+                crate::mock_kernel::populate_edge_adjacent_face_names(&mut region_mesh);
+                newbody_part_meshes.push((
+                    crate::mock_kernel::part_key(&region_part),
+                    region_mesh.clone(),
+                ));
+                newbody_mesh.append(region_mesh);
+            }
+        }
+
         // An open construction/projected line can partition a drawn circle into
         // two or more selected regions. Extruding those pieces independently
         // leaves touching half-cylinders (and their diameter/generator seams)
@@ -3842,10 +3997,12 @@ impl ParametricGraph {
         // fragments below.
         let mut collapsed_circle_regions: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
-        if matches!(
-            mode,
-            ExtrudeMode::NewBody | ExtrudeMode::Join | ExtrudeMode::Cut
-        ) {
+        if !uses_prepared_newbody
+            && matches!(
+                mode,
+                ExtrudeMode::NewBody | ExtrudeMode::Join | ExtrudeMode::Cut
+            )
+        {
             for (circle, inside) in crate::parametric::extrude::complete_selected_circles(
                 &sketch.curves.circles,
                 regions,
@@ -3867,6 +4024,24 @@ impl ParametricGraph {
                             newbody_tools.push(solid);
                         }
                         ExtrudeMode::Join => {
+                            let mut circle_selection = vec![false; regions.len()];
+                            for &index in &inside {
+                                circle_selection[index] = true;
+                            }
+                            let profile = prepare_extrude_regions(regions, &circle_selection)
+                                .into_iter()
+                                .find(|prepared| prepared.source_indices.len() == inside.len())
+                                .map(|prepared| JoinProfileSource {
+                                    region: prepared.region,
+                                    depth,
+                                    cs: *cs,
+                                });
+                            let exact = crate::mock_kernel::extruded_region_solid(
+                                &boundary,
+                                &[],
+                                depth,
+                                cs,
+                            );
                             let dipped = crate::mock_kernel::circular_cylinder_tool(
                                 &boundary,
                                 &[],
@@ -3875,8 +4050,9 @@ impl ParametricGraph {
                             );
                             join_tools.push(JoinTool {
                                 smooth: Some(solid),
-                                exact: None,
+                                exact,
                                 dipped,
+                                profile,
                             });
                         }
                         ExtrudeMode::Cut => {
@@ -3936,6 +4112,9 @@ impl ParametricGraph {
         }
 
         for (i, region) in regions.iter().enumerate() {
+            if uses_prepared_newbody && matches!(mode, ExtrudeMode::NewBody) {
+                continue;
+            }
             if collapsed_circle_regions.contains(&i) {
                 continue;
             }
@@ -4017,6 +4196,9 @@ impl ParametricGraph {
                     // Keep the part so the display mesh derives directly from it
                     // (single source of truth) instead of an independently rebuilt twin.
                     let region_part = body_tool.clone();
+                    if body_tool.is_none() {
+                        diagnostics.push(Self::region_not_buildable_diagnostic(node_id, i, region));
+                    }
                     if let Some(s) = body_tool {
                         newbody_tools.push(s);
                     }
@@ -4027,6 +4209,7 @@ impl ParametricGraph {
                             depth,
                             cs: *cs,
                             rect_circle: canonical_rect_circle,
+                            analytic: region.analytic.clone(),
                         };
                         sketch_source.regions.push(region_source);
                     }
@@ -4170,6 +4353,8 @@ impl ParametricGraph {
                             expanded_rev,
                             circle,
                         });
+                    } else {
+                        diagnostics.push(Self::region_not_buildable_diagnostic(node_id, i, region));
                     }
                 }
                 ExtrudeMode::Join => {
@@ -4213,7 +4398,14 @@ impl ParametricGraph {
                             smooth,
                             exact,
                             dipped,
+                            profile: Some(JoinProfileSource {
+                                region: region.clone(),
+                                depth,
+                                cs: *cs,
+                            }),
                         });
+                    } else {
+                        diagnostics.push(Self::region_not_buildable_diagnostic(node_id, i, region));
                     }
                 }
             }
@@ -4451,7 +4643,8 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
                         }
                         crate::sketch::Constraint::DistanceX { d, .. }
                         | crate::sketch::Constraint::DistanceY { d, .. }
-                        | crate::sketch::Constraint::Diameter { d, .. } => {
+                        | crate::sketch::Constraint::Diameter { d, .. }
+                        | crate::sketch::Constraint::LineDistance { d, .. } => {
                             rename_dimension_expression(d, old, new)
                         }
                         crate::sketch::Constraint::Angle { angle_deg, .. } => {
@@ -4745,6 +4938,7 @@ impl ParametricGraph {
                         smooth: None,
                         exact: Some(solid),
                         dipped: None,
+                        profile: None,
                     });
                 }
             }
@@ -5585,6 +5779,7 @@ impl ParametricGraph {
                             smooth: None,
                             exact: Some(solid),
                             dipped: None,
+                            profile: None,
                         }],
                         boolean_target,
                         false,
@@ -5655,12 +5850,7 @@ fn apply_shell(
         warnings.push(format!("Shell '{node_id}': thickness must be positive."));
         return;
     }
-    if open_faces.is_empty() {
-        warnings.push(format!(
-            "Shell '{node_id}': select at least one face to remove."
-        ));
-        return;
-    }
+    let closed_hollow = open_faces.is_empty();
     let body = &live[body_idx];
     let input_mesh = body.pristine.as_deref().cloned().unwrap_or_else(|| {
         let mut mesh = MockMesh::empty();
@@ -5707,7 +5897,7 @@ fn apply_shell(
                 crate::mock_kernel::kernel_faces_matching(part, fref.centroid, fref.normal)
             })
             .collect();
-        if kernel_open.is_empty() {
+        if kernel_open.is_empty() && !closed_hollow {
             // This part doesn't own any of the removed faces (multi-part body)
             // — shell doesn't apply to it; keep it unchanged.
             new_parts.push(part.clone());
@@ -6695,6 +6885,7 @@ fn apply_feature_pattern(
                             smooth: None,
                             exact: Some(part),
                             dipped: None,
+                            profile: None,
                         })
                         .collect();
                     apply_join(

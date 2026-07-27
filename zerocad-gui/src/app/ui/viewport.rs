@@ -1,16 +1,34 @@
 use crate::app::editing::snap_line_angle;
 use crate::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewCubeFace {
+    Top,
+    Bottom,
+    Front,
+    Back,
+    Right,
+    Left,
+}
+
 impl ZeroCadApp {
     pub(crate) fn draw_workspace_viewport(&mut self, ctx: &egui::Context) {
         // CENTRAL PANEL: 3D CAD Viewport
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let mut viewport_rect = None;
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(self.pal().surface_subtle)
+                    .inner_margin(egui::Margin::same(12.0)),
+            )
+            .show(ctx, |ui| {
                     // Draw a nice border and frame around the viewport
                     egui::Frame::canvas(ui.style()).show(ui, |ui| {
                         let (rect, response) = ui.allocate_exact_size(
                             ui.available_size() - egui::vec2(0.0, 4.0),
                             egui::Sense::click() | egui::Sense::drag(),
                         );
+                        viewport_rect = Some(rect);
 
                         let context_body = self.selected_whole_body();
                         response.context_menu(|ui| {
@@ -254,9 +272,11 @@ impl ZeroCadApp {
                                 } else if middle_drag {
                                     // Drag right → model turns right, drag down → tilt
                                     // down (grab feel on both axes).
-                                    self.camera_yaw -= pointer_delta.x * 0.008;
-                                    self.camera_pitch = (self.camera_pitch + pointer_delta.y * 0.008)
-                                        .clamp(-std::f32::consts::FRAC_PI_2 + 0.05, std::f32::consts::FRAC_PI_2 - 0.05);
+                                    (self.camera_pitch, self.camera_yaw) = orbit_camera_angles(
+                                        self.camera_pitch,
+                                        self.camera_yaw,
+                                        pointer_delta,
+                                    );
                                 } else if primary_drag {
                                     // Push/pull ALONG the extrude axis (the sketch-plane
                                     // normal) projected into screen space, so the drag
@@ -302,9 +322,11 @@ impl ZeroCadApp {
                                 } else if middle_drag {
                                     // Drag right → model turns right, drag down → tilt
                                     // down (grab feel on both axes).
-                                    self.camera_yaw -= pointer_delta.x * 0.008;
-                                    self.camera_pitch = (self.camera_pitch + pointer_delta.y * 0.008)
-                                        .clamp(-std::f32::consts::FRAC_PI_2 + 0.05, std::f32::consts::FRAC_PI_2 - 0.05);
+                                    (self.camera_pitch, self.camera_yaw) = orbit_camera_angles(
+                                        self.camera_pitch,
+                                        self.camera_yaw,
+                                        pointer_delta,
+                                    );
                                 }
                             }
                         }
@@ -471,9 +493,63 @@ impl ZeroCadApp {
                             }
                         }
                         if self.is_sketch_mode
+                            && self.active_tool == Some(SketchTool::Dimension)
+                            && self.sketch_dimension_editor.is_none()
+                            && response.clicked()
+                            && !self.camera_anim_active
+                        {
+                            if let Some(position) = response.interact_pointer_pos() {
+                                const DIMENSION_PICK_PX: f32 = 9.0;
+                                let cs = self.active_sketch_cs;
+                                let is_persp = self.is_perspective;
+                                let to_screen = move |point: (f64, f64)| -> egui::Pos2 {
+                                    let world = cs.unproject(point.0 as f32, point.1 as f32);
+                                    let rx = cos_y * world.x - sin_y * world.z;
+                                    let rz = sin_y * world.x + cos_y * world.z;
+                                    let ry = cos_p * world.y - sin_p * rz;
+                                    let final_z = sin_p * world.y + cos_p * rz;
+                                    if is_persp {
+                                        let dist = crate::render::PERSP_DIST;
+                                        let factor =
+                                            dist / (dist - final_z.min(dist * 0.85));
+                                        egui::pos2(
+                                            center_x + rx * view_scale * factor,
+                                            center_y - ry * view_scale * factor,
+                                        )
+                                    } else {
+                                        egui::pos2(
+                                            center_x + rx * view_scale,
+                                            center_y - ry * view_scale,
+                                        )
+                                    }
+                                };
+                                let hit = self.sketch_solver_model.as_ref().and_then(|model| {
+                                    pick_solver_element(
+                                        model,
+                                        position,
+                                        &to_screen,
+                                        DIMENSION_PICK_PX,
+                                    )
+                                });
+                                if let Some(id) = hit {
+                                    self.select_for_dimension(id);
+                                } else {
+                                    let raw =
+                                        self.screen_to_sketch(position, rect, &self.active_sketch_cs);
+                                    if let Err(message) = self.place_inferred_dimension(
+                                        (raw.0 as f64, raw.1 as f64),
+                                        position,
+                                    ) {
+                                        self.status_msg = message;
+                                    }
+                                }
+                            }
+                        }
+                        if self.is_sketch_mode
                             && self.active_tool.is_some()
                             && self.active_tool != Some(SketchTool::Offset)
                             && self.active_tool != Some(SketchTool::Trim)
+                            && self.active_tool != Some(SketchTool::Dimension)
                             && (response.clicked() || begin_draw)
                             && !self.camera_anim_active
                         {
@@ -1172,6 +1248,23 @@ impl ZeroCadApp {
                         // Draw the 3D projected CAD viewport
                         let painter = ui.painter_at(rect);
                         self.draw_viewport(painter.clone(), rect, hover_pos, current_cursor_snap);
+                        if self.is_sketch_mode {
+                            if let Some(model) = &self.sketch_solver_model {
+                                let cs = self.active_sketch_cs;
+                                let to_screen = |point: (f64, f64)| {
+                                    let world =
+                                        cs.unproject(point.0 as f32, point.1 as f32);
+                                    let projected = project_3d(world.x, world.y, world.z);
+                                    egui::pos2(projected.0, projected.1)
+                                };
+                                self.draw_constraint_badges(
+                                    &painter,
+                                    model,
+                                    self.sketch_conflict_constraint,
+                                    &to_screen,
+                                );
+                            }
+                        }
                         let gizmo_project = |point: [f32; 3]| {
                             let p = project_3d(point[0], point[1], point[2]);
                             egui::pos2(p.0, p.1)
@@ -1181,8 +1274,17 @@ impl ZeroCadApp {
                     });
                 });
 
+        if let Some(rect) = viewport_rect {
+            self.draw_viewport_controls(ctx, rect);
+            self.draw_feature_tree(ctx, rect);
+            if self.inspector_has_content() {
+                self.draw_inspector(ctx, rect);
+            }
+        }
+
         // Dimension dialog overlay (drawn after the viewport, on top).
         self.show_dimension_dialog(ctx);
+        self.show_sketch_dimension_editor(ctx);
 
         // Inline extrude distance box overlay (Fusion-style, mirrors the sketch
         // dimension dialog). Drawn on top of the viewport while extruding.
@@ -1205,6 +1307,441 @@ impl ZeroCadApp {
 
         // Constraint palette + list for the active Edit Sketch session.
         self.show_constraints_panel(ctx);
+    }
+
+    fn draw_viewport_controls(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
+        if !self.is_sketch_mode {
+            let inspector_offset = if self.inspector_has_content() {
+                super::inspector::WORKSPACE_INSPECTOR_VIEWPORT_RESERVATION
+            } else {
+                0.0
+            };
+            egui::Area::new(egui::Id::new("view_cube"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(
+                    viewport.right() - 140.0 - inspector_offset,
+                    viewport.top() + 24.0,
+                ))
+                .show(ctx, |ui| {
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(112.0, 96.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if response.hovered() {
+                        ui.output_mut(|output| {
+                            output.cursor_icon = if response.dragged() {
+                                egui::CursorIcon::Grabbing
+                            } else {
+                                egui::CursorIcon::Grab
+                            };
+                        });
+                    }
+                    // Project a real 3D cube with the same yaw/pitch transform as
+                    // the viewport. The cube therefore follows every camera orbit,
+                    // including drags that begin directly on the cube.
+                    let center = rect.center();
+                    let scale = 25.0;
+                    let projected = [
+                        [-1.0, -1.0, -1.0],
+                        [1.0, -1.0, -1.0],
+                        [1.0, 1.0, -1.0],
+                        [-1.0, 1.0, -1.0],
+                        [-1.0, -1.0, 1.0],
+                        [1.0, -1.0, 1.0],
+                        [1.0, 1.0, 1.0],
+                        [-1.0, 1.0, 1.0],
+                    ]
+                    .map(|vertex| {
+                        project_view_cube_vertex(
+                            vertex,
+                            self.camera_pitch,
+                            self.camera_yaw,
+                            center,
+                            scale,
+                        )
+                    });
+                    let projected_positions = projected.map(|(position, _)| position);
+                    let mut faces: Vec<(ViewCubeFace, [egui::Pos2; 4], f32)> = [
+                        (ViewCubeFace::Left, [0, 3, 7, 4]),
+                        (ViewCubeFace::Right, [1, 5, 6, 2]),
+                        (ViewCubeFace::Bottom, [0, 4, 5, 1]),
+                        (ViewCubeFace::Top, [3, 2, 6, 7]),
+                        (ViewCubeFace::Back, [0, 1, 2, 3]),
+                        (ViewCubeFace::Front, [4, 7, 6, 5]),
+                    ]
+                    .into_iter()
+                    .map(|(face, indices)| {
+                        let points = indices.map(|index| projected[index].0);
+                        let depth =
+                            indices.iter().map(|index| projected[*index].1).sum::<f32>() / 4.0;
+                        (face, points, depth)
+                    })
+                    .collect();
+                    faces.sort_by(|left, right| {
+                        left.2
+                            .partial_cmp(&right.2)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    // The nearest polygon under the pointer is the face that
+                    // receives hover/click interaction.
+                    let pointer = response.interact_pointer_pos();
+                    let hovered_face = pointer.and_then(|point| {
+                        faces
+                            .iter()
+                            .rev()
+                            .find(|(_, points, _)| {
+                                polygon_area(points) > 8.0 && point_in_convex_polygon(point, points)
+                            })
+                            .map(|(face, _, _)| *face)
+                    });
+
+                    for (face, points, _) in &faces {
+                        if polygon_area(points) <= 8.0 {
+                            continue;
+                        }
+                        let hovered = hovered_face == Some(*face);
+                        let default_fill = view_cube_face_fill(*face, self.dark_mode);
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            points.to_vec(),
+                            if hovered {
+                                self.pal().accent_soft
+                            } else {
+                                default_fill
+                            },
+                            egui::Stroke::new(
+                                if hovered { 1.5 } else { 1.0 },
+                                if hovered {
+                                    self.pal().accent
+                                } else {
+                                    self.pal().border
+                                },
+                            ),
+                        ));
+                        draw_view_cube_face_label(
+                            ui.painter(),
+                            *face,
+                            &view_cube_label_quad(*face, &projected_positions),
+                            if hovered {
+                                self.pal().accent
+                            } else {
+                                self.pal().text_strong
+                            },
+                        );
+                    }
+
+                    if response.dragged() {
+                        let delta = ui.input(|input| input.pointer.delta());
+                        self.camera_anim_active = false;
+                        (self.camera_pitch, self.camera_yaw) =
+                            orbit_camera_angles(self.camera_pitch, self.camera_yaw, delta);
+                        self.is_perspective = true;
+                        ctx.request_repaint();
+                    } else if response.clicked() {
+                        match hovered_face {
+                            Some(ViewCubeFace::Top) => {
+                                self.animate_to_view(ctx, std::f32::consts::FRAC_PI_2, 0.0)
+                            }
+                            Some(ViewCubeFace::Bottom) => {
+                                self.animate_to_view(ctx, -std::f32::consts::FRAC_PI_2, 0.0)
+                            }
+                            Some(ViewCubeFace::Front) => self.animate_to_view(ctx, 0.0, 0.0),
+                            Some(ViewCubeFace::Back) => {
+                                self.animate_to_view(ctx, 0.0, std::f32::consts::PI)
+                            }
+                            Some(ViewCubeFace::Right) => {
+                                self.animate_to_view(ctx, 0.0, std::f32::consts::FRAC_PI_2)
+                            }
+                            Some(ViewCubeFace::Left) => {
+                                self.animate_to_view(ctx, 0.0, -std::f32::consts::FRAC_PI_2)
+                            }
+                            None => self.animate_to_view(ctx, 0.7, 0.7),
+                        }
+                    }
+
+                    response.on_hover_text("Drag to orbit, or click a face to align the view");
+                });
+        }
+
+        let controls_width = 238.0;
+        egui::Area::new(egui::Id::new("viewport_navigation"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(
+                viewport.center().x - controls_width * 0.5,
+                viewport.bottom() - 72.0,
+            ))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(self.pal().surface)
+                    .stroke(egui::Stroke::new(1.0, self.pal().border))
+                    .rounding(7.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 2.0),
+                        blur: 8.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(28),
+                    })
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let transparent = egui::Color32::TRANSPARENT;
+                            let hover = self.pal().accent_soft;
+                            let color = self.pal().text_body;
+                            if icons::Icon::Home
+                                .icon_button(ui, transparent, hover, color)
+                                .on_hover_text("Home / isometric view")
+                                .clicked()
+                            {
+                                self.camera_pan = egui::Vec2::ZERO;
+                                self.camera_zoom = 7.5;
+                                self.animate_to_view(ctx, 0.7, 0.7);
+                            }
+                            if icons::Icon::Fit
+                                .icon_button(ui, transparent, hover, color)
+                                .on_hover_text("Fit all bodies")
+                                .clicked()
+                            {
+                                self.fit_all_bodies();
+                            }
+                            if icons::Icon::ZoomIn
+                                .icon_button(ui, transparent, hover, color)
+                                .on_hover_text("Zoom in")
+                                .clicked()
+                            {
+                                self.camera_zoom = (self.camera_zoom * 0.82).clamp(1.0, 50.0);
+                            }
+                            if icons::Icon::ZoomOut
+                                .icon_button(ui, transparent, hover, color)
+                                .on_hover_text("Zoom out")
+                                .clicked()
+                            {
+                                self.camera_zoom = (self.camera_zoom * 1.22).clamp(1.0, 50.0);
+                            }
+                            let (pan_rect, pan_response) = ui
+                                .allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                            icons::Icon::Pan.draw(ui.painter(), pan_rect.shrink(4.0), color);
+                            pan_response.on_hover_text("Middle-drag to orbit; Shift-drag to pan");
+                            if ui
+                                .selectable_label(self.grid_visible, "Grid")
+                                .on_hover_text("Show or hide the reference grid")
+                                .clicked()
+                            {
+                                self.grid_visible = !self.grid_visible;
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn animate_to_view(&mut self, ctx: &egui::Context, pitch: f32, yaw: f32) {
+        self.camera_anim_active = true;
+        self.camera_anim_start_pitch = self.camera_pitch;
+        self.camera_anim_start_yaw = self.camera_yaw;
+        self.camera_anim_target_pitch = pitch;
+        self.camera_anim_target_yaw = yaw;
+        self.camera_anim_start_time = ctx.input(|input| input.time);
+        self.is_perspective = true;
+        ctx.request_repaint();
+    }
+
+    fn fit_all_bodies(&mut self) {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for (_, mesh) in self.body_meshes.iter() {
+            for vertex in mesh.vertices.chunks_exact(6) {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(vertex[axis]);
+                    max[axis] = max[axis].max(vertex[axis]);
+                }
+            }
+        }
+        if min[0].is_finite() {
+            let span = (0..3)
+                .map(|axis| max[axis] - min[axis])
+                .fold(0.0f32, f32::max)
+                .max(1.0);
+            self.camera_zoom = (span / 3.5).clamp(1.0, 50.0);
+            self.camera_pan = egui::Vec2::ZERO;
+        }
+    }
+}
+
+fn point_in_convex_polygon(point: egui::Pos2, polygon: &[egui::Pos2]) -> bool {
+    let mut winding_sign = 0.0f32;
+    for index in 0..polygon.len() {
+        let a = polygon[index];
+        let b = polygon[(index + 1) % polygon.len()];
+        let edge = b - a;
+        let offset = point - a;
+        let cross = edge.x * offset.y - edge.y * offset.x;
+        if cross.abs() <= 1.0e-4 {
+            continue;
+        }
+        if winding_sign == 0.0 {
+            winding_sign = cross.signum();
+        } else if winding_sign * cross < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn project_view_cube_vertex(
+    [x, y, z]: [f32; 3],
+    pitch: f32,
+    yaw: f32,
+    center: egui::Pos2,
+    scale: f32,
+) -> (egui::Pos2, f32) {
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let rotated_x = x * cos_yaw - z * sin_yaw;
+    let rotated_z = x * sin_yaw + z * cos_yaw;
+    let rotated_y = y * cos_pitch - rotated_z * sin_pitch;
+    let depth = y * sin_pitch + rotated_z * cos_pitch;
+    (
+        center + egui::vec2(rotated_x * scale, -rotated_y * scale),
+        depth,
+    )
+}
+
+fn polygon_area<const N: usize>(polygon: &[egui::Pos2; N]) -> f32 {
+    let twice_area = (0..N).fold(0.0, |area, index| {
+        let current = polygon[index];
+        let next = polygon[(index + 1) % N];
+        area + current.x * next.y - next.x * current.y
+    });
+    twice_area.abs() * 0.5
+}
+
+fn view_cube_face_label(face: ViewCubeFace) -> &'static str {
+    match face {
+        ViewCubeFace::Top => "TOP",
+        ViewCubeFace::Bottom => "BOTTOM",
+        ViewCubeFace::Front => "FRONT",
+        ViewCubeFace::Back => "BACK",
+        ViewCubeFace::Right => "RIGHT",
+        ViewCubeFace::Left => "LEFT",
+    }
+}
+
+/// Return the four projected corners in reading order: top-left, top-right,
+/// bottom-right, bottom-left when that face is viewed straight on. Keeping this
+/// order independent from the hit-test polygon lets the lettering remain
+/// printed onto the face instead of acting like screen-facing UI text.
+fn view_cube_label_quad(face: ViewCubeFace, projected: &[egui::Pos2; 8]) -> [egui::Pos2; 4] {
+    let indices = match face {
+        ViewCubeFace::Top => [3, 2, 6, 7],
+        ViewCubeFace::Bottom => [4, 5, 1, 0],
+        ViewCubeFace::Front => [7, 6, 5, 4],
+        ViewCubeFace::Back => [2, 3, 0, 1],
+        ViewCubeFace::Right => [6, 2, 1, 5],
+        ViewCubeFace::Left => [3, 7, 4, 0],
+    };
+    indices.map(|index| projected[index])
+}
+
+fn point_on_view_cube_face(quad: &[egui::Pos2; 4], u: f32, v: f32) -> egui::Pos2 {
+    let top = quad[0] + (quad[1] - quad[0]) * u;
+    let bottom = quad[3] + (quad[2] - quad[3]) * u;
+    top + (bottom - top) * v
+}
+
+/// Lay out the normal UI typeface, then project its textured glyph mesh through
+/// the face's local coordinate system. This keeps the antialiased font quality
+/// while making every letter rotate and foreshorten with the cube surface.
+fn draw_view_cube_face_label(
+    painter: &egui::Painter,
+    face: ViewCubeFace,
+    quad: &[egui::Pos2; 4],
+    color: egui::Color32,
+) {
+    if polygon_area(quad) < 70.0 {
+        return;
+    }
+
+    let galley = painter.layout_no_wrap(
+        view_cube_face_label(face).to_owned(),
+        egui::FontId::proportional(14.0),
+        color,
+    );
+    if galley.rect.width() <= f32::EPSILON || galley.rect.height() <= f32::EPSILON {
+        return;
+    }
+
+    let font_texture_size = painter.ctx().fonts(|fonts| fonts.font_image_size());
+    let uv_scale = egui::vec2(
+        1.0 / font_texture_size[0] as f32,
+        1.0 / font_texture_size[1] as f32,
+    );
+    let target_height = 0.31;
+    let target_width = (galley.rect.width() / galley.rect.height() * target_height).min(0.82);
+    let scale_x = target_width / galley.rect.width();
+    let scale_y = (target_width * galley.rect.height() / galley.rect.width()).min(target_height)
+        / galley.rect.height();
+    let origin_u = 0.5 - galley.rect.width() * scale_x * 0.5;
+    let origin_v = 0.5 - galley.rect.height() * scale_y * 0.5;
+    let mut mesh = egui::Mesh::with_texture(egui::TextureId::default());
+
+    for row in &galley.rows {
+        let index_offset = mesh.vertices.len() as u32;
+        mesh.indices.extend(
+            row.visuals
+                .mesh
+                .indices
+                .iter()
+                .map(|index| index + index_offset),
+        );
+        mesh.vertices
+            .extend(row.visuals.mesh.vertices.iter().map(|vertex| {
+                let local_x = vertex.pos.x - galley.rect.left();
+                let local_y = vertex.pos.y - galley.rect.top();
+                egui::epaint::Vertex {
+                    pos: point_on_view_cube_face(
+                        quad,
+                        origin_u + local_x * scale_x,
+                        origin_v + local_y * scale_y,
+                    ),
+                    uv: (vertex.uv.to_vec2() * uv_scale).to_pos2(),
+                    color,
+                }
+            }));
+    }
+    if !mesh.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+/// Apply the same unrestricted tumble to viewport and cube drags. Pitch is
+/// wrapped instead of clamped, so dragging FRONT upward can continue naturally
+/// over TOP and around to BACK.
+fn orbit_camera_angles(pitch: f32, yaw: f32, pointer_delta: egui::Vec2) -> (f32, f32) {
+    const SPEED: f32 = 0.008;
+    (
+        wrap_view_angle(pitch + pointer_delta.y * SPEED),
+        wrap_view_angle(yaw - pointer_delta.x * SPEED),
+    )
+}
+
+fn wrap_view_angle(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+fn view_cube_face_fill(face: ViewCubeFace, dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        match face {
+            ViewCubeFace::Top => egui::Color32::from_rgb(51, 65, 85),
+            ViewCubeFace::Bottom => egui::Color32::from_rgb(15, 23, 42),
+            ViewCubeFace::Front | ViewCubeFace::Left => egui::Color32::from_rgb(30, 41, 59),
+            ViewCubeFace::Back | ViewCubeFace::Right => egui::Color32::from_rgb(24, 34, 52),
+        }
+    } else {
+        match face {
+            ViewCubeFace::Top => egui::Color32::from_rgb(239, 246, 255),
+            ViewCubeFace::Bottom => egui::Color32::from_rgb(203, 213, 225),
+            ViewCubeFace::Front | ViewCubeFace::Left => egui::Color32::from_rgb(248, 250, 252),
+            ViewCubeFace::Back | ViewCubeFace::Right => egui::Color32::from_rgb(226, 232, 240),
+        }
     }
 }
 
@@ -1347,7 +1884,10 @@ pub(crate) fn pick_solver_element(
 
 #[cfg(test)]
 mod dimension_anchor_tests {
-    use super::offset_dimension_box;
+    use super::{
+        offset_dimension_box, orbit_camera_angles, point_in_convex_polygon,
+        project_view_cube_vertex,
+    };
     use eframe::egui;
 
     #[test]
@@ -1362,5 +1902,44 @@ mod dimension_anchor_tests {
         let anchored = offset_dimension_box(right_mid, center);
         // The wider horizontal footprint is also kept fully off the edge.
         assert_eq!(anchored, egui::pos2(198.0, 100.0));
+    }
+
+    #[test]
+    fn view_cube_face_hit_testing_accepts_inside_and_rejects_outside() {
+        let face = [
+            egui::pos2(50.0, 10.0),
+            egui::pos2(80.0, 30.0),
+            egui::pos2(50.0, 50.0),
+            egui::pos2(20.0, 30.0),
+        ];
+        assert!(point_in_convex_polygon(egui::pos2(50.0, 30.0), &face));
+        assert!(!point_in_convex_polygon(egui::pos2(90.0, 30.0), &face));
+    }
+
+    #[test]
+    fn view_cube_projection_tracks_camera_yaw() {
+        let center = egui::pos2(100.0, 100.0);
+        let (front, front_depth) =
+            project_view_cube_vertex([1.0, 0.0, 0.0], 0.0, 0.0, center, 25.0);
+        assert_eq!(front, egui::pos2(125.0, 100.0));
+        assert!(front_depth.abs() <= f32::EPSILON);
+
+        let (right, right_depth) = project_view_cube_vertex(
+            [1.0, 0.0, 0.0],
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            center,
+            25.0,
+        );
+        assert!((right.x - center.x).abs() < 1.0e-4);
+        assert!((right_depth - 1.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn orbit_drag_can_continue_over_the_top_of_the_cube() {
+        let nearly_top = std::f32::consts::FRAC_PI_2 - 0.01;
+        let (pitch, yaw) = orbit_camera_angles(nearly_top, 0.25, egui::vec2(0.0, 10.0));
+        assert!(pitch > std::f32::consts::FRAC_PI_2);
+        assert!((yaw - 0.25).abs() < 1.0e-4);
     }
 }

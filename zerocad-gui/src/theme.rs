@@ -16,6 +16,13 @@ pub(crate) struct Palette {
     pub(crate) text_muted: egui::Color32,
     /// Hints and disabled-looking text (light: slate-400).
     pub(crate) text_faint: egui::Color32,
+    pub(crate) surface: egui::Color32,
+    pub(crate) surface_subtle: egui::Color32,
+    pub(crate) border: egui::Color32,
+    pub(crate) accent: egui::Color32,
+    pub(crate) accent_soft: egui::Color32,
+    pub(crate) success: egui::Color32,
+    pub(crate) danger: egui::Color32,
 }
 
 impl Palette {
@@ -25,6 +32,13 @@ impl Palette {
             text_body: egui::Color32::from_rgb(71, 85, 105),  // slate-600
             text_muted: egui::Color32::from_rgb(100, 116, 139), // slate-500
             text_faint: egui::Color32::from_rgb(148, 163, 184), // slate-400
+            surface: egui::Color32::WHITE,
+            surface_subtle: egui::Color32::from_rgb(248, 250, 252),
+            border: egui::Color32::from_rgb(226, 232, 240),
+            accent: egui::Color32::from_rgb(37, 99, 235),
+            accent_soft: egui::Color32::from_rgb(239, 246, 255),
+            success: egui::Color32::from_rgb(22, 163, 74),
+            danger: egui::Color32::from_rgb(220, 38, 38),
         }
     }
 
@@ -34,6 +48,13 @@ impl Palette {
             text_body: egui::Color32::from_rgb(203, 213, 225),   // slate-300
             text_muted: egui::Color32::from_rgb(148, 163, 184),  // slate-400
             text_faint: egui::Color32::from_rgb(100, 116, 139),  // slate-500
+            surface: egui::Color32::from_rgb(30, 41, 59),
+            surface_subtle: egui::Color32::from_rgb(15, 23, 42),
+            border: egui::Color32::from_rgb(51, 65, 85),
+            accent: egui::Color32::from_rgb(96, 165, 250),
+            accent_soft: egui::Color32::from_rgb(30, 58, 138),
+            success: egui::Color32::from_rgb(74, 222, 128),
+            danger: egui::Color32::from_rgb(248, 113, 113),
         }
     }
 }

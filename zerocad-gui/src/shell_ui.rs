@@ -12,18 +12,28 @@ pub(crate) struct ShellOp {
 }
 
 impl ZeroCadApp {
-    /// The body + faces the shell tool would use: one or more selected faces,
-    /// all on the SAME body.
+    /// The body + faces the shell tool would use. A single whole-body selection
+    /// means a closed hollow (`fids` is empty); face selections must all belong
+    /// to the same body and become openings.
     pub(crate) fn shell_candidate(&self) -> Option<(String, Vec<u32>)> {
+        if self.selected_body.len() == 1 {
+            if let Some((id, BodyPick::Whole)) = self.selected_body.iter().next() {
+                return Some((id.clone(), Vec::new()));
+            }
+        }
+
         let mut body: Option<String> = None;
         let mut fids: Vec<u32> = Vec::new();
         for (id, pick) in &self.selected_body {
-            if let BodyPick::Face(f) = pick {
-                match &body {
-                    Some(b) if b != id => return None, // faces span two bodies
-                    _ => body = Some(id.clone()),
+            match pick {
+                BodyPick::Face(f) => {
+                    match &body {
+                        Some(b) if b != id => return None, // faces span two bodies
+                        _ => body = Some(id.clone()),
+                    }
+                    fids.push(*f);
                 }
-                fids.push(*f);
+                BodyPick::Whole | BodyPick::Edge(_) | BodyPick::Vertex(_) => return None,
             }
         }
         body.filter(|_| !fids.is_empty()).map(|b| (b, fids))
@@ -37,7 +47,7 @@ impl ZeroCadApp {
             .iter()
             .filter_map(|&fid| self.face_ref(&target, fid))
             .collect();
-        if open_faces.is_empty() {
+        if !fids.is_empty() && open_faces.is_empty() {
             self.status_msg = "Couldn't resolve the selected faces for shelling.".to_string();
             return;
         }
@@ -46,7 +56,11 @@ impl ZeroCadApp {
             open_faces,
             thickness_text: "2".to_string(),
         });
-        self.status_msg = "Shell: set the wall thickness, then OK.".to_string();
+        self.status_msg = if fids.is_empty() {
+            "Shell: creating a closed hollow body. Set the wall thickness, then OK.".to_string()
+        } else {
+            "Shell: set the wall thickness, then OK.".to_string()
+        };
     }
 
     /// The floating Shell dialog (drawn every frame while an op is active).
@@ -63,8 +77,10 @@ impl ZeroCadApp {
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.style()).show(ui, |ui| {
                     ui.set_min_width(220.0);
-                    ui.label(
-                        egui::RichText::new(format!(
+                    let title = if op_new.open_faces.is_empty() {
+                        "Shell (closed hollow)".to_string()
+                    } else {
+                        format!(
                             "Shell ({} open face{})",
                             op_new.open_faces.len(),
                             if op_new.open_faces.len() == 1 {
@@ -72,10 +88,13 @@ impl ZeroCadApp {
                             } else {
                                 "s"
                             }
-                        ))
-                        .strong()
-                        .size(13.5)
-                        .color(self.pal().text_strong),
+                        )
+                    };
+                    ui.label(
+                        egui::RichText::new(title)
+                            .strong()
+                            .size(13.5)
+                            .color(self.pal().text_strong),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -138,6 +157,38 @@ impl ZeroCadApp {
         self.selected_node_id = Some(id);
         self.shell_op = None;
         self.reevaluate_geometry();
-        self.status_msg = "Shell created.".to_string();
+        self.status_msg = if op.open_faces.is_empty() {
+            "Closed hollow shell created.".to_string()
+        } else {
+            "Shell created.".to_string()
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whole_body_is_a_closed_shell_candidate() {
+        let mut app = ZeroCadApp::new();
+        app.selected_body
+            .insert(("box_1".to_string(), BodyPick::Whole));
+
+        assert_eq!(
+            app.shell_candidate(),
+            Some(("box_1".to_string(), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn mixed_whole_body_selection_is_not_a_shell_candidate() {
+        let mut app = ZeroCadApp::new();
+        app.selected_body
+            .insert(("box_1".to_string(), BodyPick::Whole));
+        app.selected_body
+            .insert(("box_2".to_string(), BodyPick::Whole));
+
+        assert_eq!(app.shell_candidate(), None);
     }
 }

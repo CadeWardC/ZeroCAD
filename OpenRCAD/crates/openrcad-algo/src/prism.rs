@@ -36,6 +36,14 @@ pub enum SweepError {
         report: HealthReport,
         watertight: bool,
         pcurves_complete: bool,
+        /// The strict-validation failure, when that is what rejected the solid.
+        /// The general `ValidationReport` can pass while the strict pcurve
+        /// audit fails; without this field that rejection surfaced as an
+        /// "invalid output" carrying an EMPTY health report — an error message
+        /// that named no error, which made real tolerance failures (an f32
+        /// input whose pcurve deviates by 1.4e-6 against a 1e-6 audit)
+        /// undiagnosable from the log.
+        strict: Option<openrcad_topo::ValidationError>,
     },
 }
 
@@ -53,10 +61,17 @@ impl fmt::Display for SweepError {
                 report,
                 watertight,
                 pcurves_complete,
-            } => write!(
-                f,
-                "prism: invalid output (watertight={watertight}, pcurves_complete={pcurves_complete}): {report:?}"
-            ),
+                strict,
+            } => {
+                write!(
+                    f,
+                    "prism: invalid output (watertight={watertight}, pcurves_complete={pcurves_complete}): {report:?}"
+                )?;
+                if let Some(error) = strict {
+                    write!(f, "; strict validation: {error}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -129,11 +144,13 @@ pub fn prism_operation_with_policy(
         .map_err(SweepError::InvalidTolerancePolicy)?;
     let solid = build_prism(face, vector, policy)?;
     let validation = ValidationReport::for_solid(&solid, policy);
-    if !validation.is_valid() || solid.validate_strict_with_policy(policy).is_err() {
+    let strict = solid.validate_strict_with_policy(policy).err();
+    if !validation.is_valid() || strict.is_some() {
         return Err(SweepError::InvalidOutput {
             report: validation.health,
             watertight: validation.watertight,
             pcurves_complete: validation.pcurves_complete,
+            strict,
         });
     }
     let recovery = RecoveryReport::default();

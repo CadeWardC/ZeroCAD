@@ -82,8 +82,21 @@ pub fn extruded_region_solid_with_arcs(
             return Some(solid);
         }
     }
-    build_extrusion_solid_arcs(points, holes, depth as f64, cs, true, arc_circles)
-        .or_else(|| build_extrusion_solid_arcs(points, &[], depth as f64, cs, true, arc_circles))
+    build_extrusion_solid_arcs(points, holes, depth as f64, cs, true, arc_circles).or_else(|| {
+        // Last resort: retry without inner wires. This can only be reached
+        // when the holed build failed, and it trades the holes for a solid —
+        // acceptable for noise-level phantom holes, but a REAL hole silently
+        // becoming filled material is exactly the class of quiet wrongness the
+        // extrude diagnostics exist to prevent. Say so.
+        if !holes.is_empty() {
+            log::warn!(
+                "extrusion fell back to building without its {} inner wire(s); \
+                 holes are missing from the resulting solid",
+                holes.len()
+            );
+        }
+        build_extrusion_solid_arcs(points, &[], depth as f64, cs, true, arc_circles)
+    })
 }
 
 /// Extrude a detected sketch region from its exact arrangement when available.

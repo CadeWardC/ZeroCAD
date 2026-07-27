@@ -93,6 +93,93 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Keep the primary profile tools together at the start
+                        // of the strip: Line, Rectangle, Circle, then Polygon.
+                        for (family, key, hover) in [
+                            (
+                                ToolFamily::Rectangle,
+                                "Rectangle",
+                                "Rectangle (R) — click again or right-click for modes",
+                            ),
+                            (
+                                ToolFamily::Circle,
+                                "Circle",
+                                "Circle (C) — click again or right-click for ellipse / 3-point modes",
+                            ),
+                            (
+                                ToolFamily::Polygon,
+                                "Polygon",
+                                "Regular polygon — set the side count, click the center, then set the hidden guide-circle diameter. Click again or right-click for inscribed / circumscribed",
+                            ),
+                        ] {
+                            let active = self.active_tool.is_some_and(|tool| tool.family() == family);
+                            let icon = if active {
+                                self.active_tool.unwrap().icon()
+                            } else {
+                                family.default_mode().icon()
+                            };
+                            let btn =
+                                draw_tool_btn(ui, active, key, Some(icon)).on_hover_text(hover);
+                            let popup_id = ui.make_persistent_id(("tool_flyout", key));
+
+                            if btn.clicked() {
+                                if active {
+                                    ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+                                } else {
+                                    self.active_tool = Some(family.default_mode());
+                                    self.cancel_in_progress_shape();
+                                    self.line_chain_start = None;
+                                    self.clear_pending_corners();
+                                    ui.memory_mut(|memory| memory.close_popup());
+                                }
+                            }
+                            if btn.secondary_clicked() {
+                                ui.memory_mut(|memory| memory.open_popup(popup_id));
+                            }
+
+                            egui::popup_below_widget(
+                                ui,
+                                popup_id,
+                                &btn,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    ui.set_min_width(180.0);
+                                    for &mode in family.modes() {
+                                        let selected = self.active_tool == Some(mode);
+                                        let prefix = if selected { "● " } else { "   " };
+                                        let row = mode
+                                            .icon()
+                                            .menu_button(ui, &format!("{prefix}{}", mode.label()));
+                                        if row.clicked() {
+                                            self.active_tool = Some(mode);
+                                            self.cancel_in_progress_shape();
+                                            self.line_chain_start = None;
+                                            self.clear_pending_corners();
+                                            ui.memory_mut(|memory| memory.close_popup());
+                                            log::info!("Switched to {:?}", mode);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+
+                        // Keep polygon configuration beside the Polygon button.
+                        if self
+                            .active_tool
+                            .is_some_and(|tool| tool.family() == ToolFamily::Polygon)
+                        {
+                            ui.label(
+                                egui::RichText::new("Sides:")
+                                    .size(12.0)
+                                    .color(self.pal().text_body),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.polygon_sides)
+                                    .range(3..=64)
+                                    .speed(0.1),
+                            );
+                        }
+
                         // Mirror Tool (single mode, no flyout). Click two points
                         // to reflect the whole sketch across that axis.
                         {
@@ -180,6 +267,36 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Unified driving-dimension command. Geometry clicks
+                        // select the target; a click in empty space places the
+                        // inferred length, distance, radius/diameter, or angle.
+                        {
+                            let is_active = self.active_tool == Some(SketchTool::Dimension);
+                            let btn = draw_tool_btn(
+                                ui,
+                                is_active,
+                                "Dimension",
+                                Some(icons::Icon::Dimension),
+                            );
+                            if btn
+                                .on_hover_text(
+                                    "Dimension — select geometry, click to place, then enter a value, expression, or variable",
+                                )
+                                .clicked()
+                            {
+                                self.ensure_active_solver_model();
+                                self.active_tool = Some(SketchTool::Dimension);
+                                self.cancel_in_progress_shape();
+                                self.line_chain_start = None;
+                                self.clear_pending_corners();
+                                self.sketch_selected_ids.clear();
+                                self.status_msg =
+                                    "Select one line, one circle/arc, two points, or two lines."
+                                        .to_string();
+                                log::info!("Switched to Dimension tool");
+                            }
+                        }
+
                         let has_projectable_edge = self
                             .selected_body
                             .iter()
@@ -196,36 +313,13 @@ impl ZeroCadApp {
                             self.project_selected_edges_to_sketch();
                         }
 
-                        // Rectangle, Circle and the corner tool each expose a mode
-                        // flyout: click the active button again (or right-click it)
-                        // to choose corner/center/3-point, ellipse, or Fillet ↔
-                        // Chamfer. The corner button is a single button (like the 3D
-                        // edge fillet/chamfer) whose flyout switches the two kinds.
+                        // Spline follows the editing tools; the corner tool is
+                        // rendered after every other sketch action below.
                         for (family, key, hover) in [
                             (
                                 ToolFamily::Spline,
                                 "Spline",
                                 "Control-point / fit-point spline — click points, then double-click or press Enter to finish",
-                            ),
-                            (
-                                ToolFamily::Rectangle,
-                                "Rectangle",
-                                "Rectangle (R) — click again or right-click for modes",
-                            ),
-                            (
-                                ToolFamily::Circle,
-                                "Circle",
-                                "Circle (C) — click again or right-click for ellipse / 3-point modes",
-                            ),
-                            (
-                                ToolFamily::Polygon,
-                                "Polygon",
-                                "Regular polygon — set the side count, click the center, then set the hidden guide-circle diameter. Click again or right-click for inscribed / circumscribed",
-                            ),
-                            (
-                                ToolFamily::Corner,
-                                "Fillet",
-                                "Fillet / Chamfer — set the radius, then click a corner. Click again or right-click to switch kind",
                             ),
                         ] {
                             let active = self.active_tool.map_or(false, |t| t.family() == family);
@@ -288,24 +382,6 @@ impl ZeroCadApp {
                                     }
                                 }
                             });
-                        }
-
-                        // Side-count input for the active polygon tool. Clamped
-                        // to 3..=64; the live preview reads it directly.
-                        if self
-                            .active_tool
-                            .map_or(false, |t| t.family() == ToolFamily::Polygon)
-                        {
-                            ui.label(
-                                egui::RichText::new("Sides:")
-                                    .size(12.0)
-                                    .color(self.pal().text_body),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.polygon_sides)
-                                    .range(3..=64)
-                                    .speed(0.1),
-                            );
                         }
 
                         if self.active_tool == Some(SketchTool::Offset) {
@@ -421,6 +497,69 @@ impl ZeroCadApp {
                             self.create_sketch_pattern(true);
                         }
 
+                        // Fillet/Chamfer is intentionally the final sketch tool.
+                        // Re-click or right-click to switch between the two modes.
+                        {
+                            let family = ToolFamily::Corner;
+                            let active =
+                                self.active_tool.is_some_and(|tool| tool.family() == family);
+                            let icon = if active {
+                                self.active_tool.unwrap().icon()
+                            } else {
+                                family.default_mode().icon()
+                            };
+                            let label = if active {
+                                self.active_tool.unwrap().label()
+                            } else {
+                                "Fillet"
+                            };
+                            let btn = draw_tool_btn(ui, active, label, Some(icon)).on_hover_text(
+                                "Fillet / Chamfer — set the radius, then click a corner. Click again or right-click to switch kind",
+                            );
+                            let popup_id =
+                                ui.make_persistent_id(("tool_flyout", "Fillet"));
+
+                            if btn.clicked() {
+                                if active {
+                                    ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+                                } else {
+                                    self.active_tool = Some(family.default_mode());
+                                    self.cancel_in_progress_shape();
+                                    self.line_chain_start = None;
+                                    self.clear_pending_corners();
+                                    ui.memory_mut(|memory| memory.close_popup());
+                                }
+                            }
+                            if btn.secondary_clicked() {
+                                ui.memory_mut(|memory| memory.open_popup(popup_id));
+                            }
+
+                            egui::popup_below_widget(
+                                ui,
+                                popup_id,
+                                &btn,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    ui.set_min_width(180.0);
+                                    for &mode in family.modes() {
+                                        let selected = self.active_tool == Some(mode);
+                                        let prefix = if selected { "● " } else { "   " };
+                                        let row = mode
+                                            .icon()
+                                            .menu_button(ui, &format!("{prefix}{}", mode.label()));
+                                        if row.clicked() {
+                                            self.active_tool = Some(mode);
+                                            self.cancel_in_progress_shape();
+                                            self.line_chain_start = None;
+                                            self.clear_pending_corners();
+                                            ui.memory_mut(|memory| memory.close_popup());
+                                            log::info!("Switched to {:?}", mode);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+
                         // Radius/distance input for the active corner tool, with
                         // a unit suffix. Editing it re-previews the staged corners
                         // live. An OK button (and Enter) commits the pending set.
@@ -470,48 +609,6 @@ impl ZeroCadApp {
                             }
                         }
                     });
-
-            // Curve statistics, Undo / Clear Sketch row
-            let curve_count = self.sketch_curves.segments.len()
-                + self.sketch_curves.circles.len()
-                + self.sketch_curves.arcs.len()
-                + self.sketch_curves.splines.len();
-            if curve_count > 0 {
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Curves: {} · Faces: {}",
-                        curve_count,
-                        self.detected_regions.len()
-                    ))
-                    .color(self.pal().text_body)
-                    .size(12.0),
-                );
-
-                let undo_btn = ui.add(
-                    egui::Button::new(egui::RichText::new("↩ Undo").size(12.0))
-                        .fill(egui::Color32::from_rgb(241, 245, 249))
-                        .rounding(egui::Rounding::same(4.0)),
-                );
-                if undo_btn.on_hover_text("Undo last drawn shape").clicked() {
-                    self.undo_last_sketch_action();
-                }
-
-                let reset_btn = icons::Icon::Trash.labeled_button(
-                    ui,
-                    "Clear",
-                    egui::Color32::from_rgb(254, 242, 242),
-                    egui::Color32::from_rgb(254, 226, 226),
-                    egui::Color32::from_rgb(185, 28, 28),
-                    egui::Stroke::NONE,
-                );
-                if reset_btn
-                    .on_hover_text("Clear all curves in current sketch")
-                    .clicked()
-                {
-                    self.reset_sketch_state();
-                }
-            }
         }
     }
 }

@@ -2,16 +2,16 @@ use crate::*;
 
 impl ZeroCadApp {
     pub(crate) fn draw_top_bar_file_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // File Button Tab dropdown menu
+        // Compact application menu; the surrounding global header carries the
+        // project title and quick actions.
         let file_btn_id = ui.make_persistent_id("file_menu_dropdown");
-        let file_btn = icons::Icon::Folder.labeled_button(
+        let file_btn = icons::Icon::Menu.icon_button(
             ui,
-            "File",
-            egui::Color32::from_rgb(241, 245, 249), // Clean slate grey
-            egui::Color32::from_rgb(226, 232, 240), // Hover
+            egui::Color32::TRANSPARENT,
+            self.pal().accent_soft,
             self.pal().text_body,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
         );
+        let file_btn = file_btn.on_hover_text("Main menu");
         if file_btn.clicked() {
             ui.memory_mut(|mem| mem.toggle_popup(file_btn_id));
         }
@@ -31,6 +31,13 @@ impl ZeroCadApp {
                         .map(|h| h.label())
                         .unwrap_or_default()
                 };
+
+                if icons::Icon::Home.menu_button(ui, "Start Page").clicked() {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.onboarding_visible = true;
+                }
+
+                ui.separator();
 
                 if icons::Icon::New
                     .menu_button_hint(ui, "New Design", &hint(self, ShortcutAction::NewDesign))

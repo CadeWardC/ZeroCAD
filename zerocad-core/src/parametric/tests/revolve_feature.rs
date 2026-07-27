@@ -268,3 +268,96 @@ fn revolve_cut_bores_groove_into_box() {
         "cut volume {v} vs {exact}"
     );
 }
+
+/// End-to-end check of the display claim behind the planar surface-group fix:
+/// a full revolve's flat cap — built by the kernel as three 120° pie wedges —
+/// must reach the viewport as ONE selectable face with NO radial seam lines.
+/// This runs the exact GUI pipeline (sketch → Revolve node → evaluate →
+/// MockMesh), not the grouping function in isolation.
+#[test]
+fn full_revolve_cap_reads_as_one_face_without_radial_seams() {
+    let mut g = ParametricGraph::new();
+    add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (2.0, 5.0)));
+    add_revolve(
+        &mut g,
+        "revolve_2",
+        "sketch_1",
+        AxisBase::Y,
+        360.0,
+        ExtrudeMode::NewBody,
+    );
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .unwrap();
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(bodies.len(), 1);
+    let mesh = &bodies[0].1;
+
+    // Selection: each cap disc (y=0 and y=5) carries exactly one face id.
+    let vy = |vi: u32| mesh.vertices[vi as usize * 6 + 1];
+    for cap_y in [0.0f32, 5.0] {
+        let ids: std::collections::HashSet<u32> = mesh
+            .indices
+            .chunks_exact(3)
+            .enumerate()
+            .filter(|(_, t)| t.iter().all(|&v| (vy(v) - cap_y).abs() < 1e-4))
+            .map(|(t, _)| mesh.face_ids[t])
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "cap y={cap_y} must select as one face, got ids {ids:?}"
+        );
+    }
+
+    // Wireframe: every drawn segment lying in a cap plane sits on the rim
+    // (r≈2) — a segment endpoint well inside the disc would be a leaked
+    // radial construction seam (the old three-wedge pie lines).
+    let ep = |i: u32| {
+        let b = i as usize * 3;
+        (
+            mesh.edge_vertices[b],
+            mesh.edge_vertices[b + 1],
+            mesh.edge_vertices[b + 2],
+        )
+    };
+    let mut rim_segments = 0;
+    for seg in mesh.edge_indices.chunks_exact(2) {
+        let (a, b) = (ep(seg[0]), ep(seg[1]));
+        for cap_y in [0.0f32, 5.0] {
+            if (a.1 - cap_y).abs() < 1e-4 && (b.1 - cap_y).abs() < 1e-4 {
+                for p in [a, b] {
+                    let r = (p.0 * p.0 + p.2 * p.2).sqrt();
+                    assert!(
+                        r > 1.9,
+                        "cap wireframe segment off the rim (r={r}): radial seam leaked"
+                    );
+                }
+                rim_segments += 1;
+            }
+        }
+    }
+    assert!(
+        rim_segments > 8,
+        "expected dense rim polylines on the caps, got {rim_segments} segments"
+    );
+
+    // The rim segments of one cap chain into a single selectable edge group.
+    if !mesh.edge_groups.is_empty() {
+        let top_groups: std::collections::HashSet<u32> = mesh
+            .edge_indices
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, seg)| {
+                let (a, b) = (ep(seg[0]), ep(seg[1]));
+                (a.1 - 5.0).abs() < 1e-4 && (b.1 - 5.0).abs() < 1e-4
+            })
+            .map(|(s, _)| mesh.edge_groups[s])
+            .collect();
+        assert_eq!(
+            top_groups.len(),
+            1,
+            "top rim must be one closed selectable edge, got groups {top_groups:?}"
+        );
+    }
+}

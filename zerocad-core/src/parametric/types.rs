@@ -814,10 +814,11 @@ pub enum FeatureType {
         #[serde(default)]
         guide: Option<SweepGuide>,
     },
-    /// Hollow out an existing body to a constant wall `thickness`, removing
-    /// `open_faces` (at least one). Kernel support: boxes, cylinders, and any
-    /// planar-faced solid with straight edges (extruded profiles); curved
-    /// general shells report Unresolved rather than guessing.
+    /// Hollow out an existing body to a constant wall `thickness`. An empty
+    /// `open_faces` list creates a closed cavity; otherwise those faces are
+    /// removed as openings. Kernel support: closed boxes/cylinders, plus open
+    /// boxes, cylinders, and planar-faced straight-edge solids; unsupported
+    /// general closed shells report Unresolved rather than guessing.
     Shell {
         /// Node id of the body being hollowed.
         target: String,
@@ -826,7 +827,8 @@ pub enum FeatureType {
         #[serde(default)]
         thickness_expr: Option<String>,
         /// The faces to remove (captured centroid+normal; resolved
-        /// geometrically against the body at build time).
+        /// geometrically against the body at build time). Empty keeps every
+        /// outer face and creates a closed hollow.
         open_faces: Vec<FaceRef>,
     },
     /// A drilled hole in an existing body: a cylinder cut, optionally with a

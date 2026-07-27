@@ -2,6 +2,7 @@
 //! plus the small value types that back it.
 
 use eframe::egui;
+use zerocad_core::sketch::EntityId;
 use zerocad_core::Unit;
 
 use crate::{SketchTool, ZeroCadApp};
@@ -41,6 +42,53 @@ pub(crate) struct DimInput {
     /// The field currently rendered as a text editor. A selected field remains
     /// a display-only box until the user actually starts typing.
     pub(crate) editing_field: Option<usize>,
+}
+
+/// Inline value editor opened after the Dimension tool places a constraint.
+#[derive(Debug, Clone)]
+pub(crate) struct SketchDimensionEditor {
+    pub(crate) constraint_id: EntityId,
+    pub(crate) value: String,
+    pub(crate) is_angle: bool,
+    pub(crate) screen_position: egui::Pos2,
+    request_focus: bool,
+}
+
+impl SketchDimensionEditor {
+    pub(crate) fn new(
+        constraint_id: EntityId,
+        dimension: zerocad_core::Dimension,
+        is_angle: bool,
+        screen_position: egui::Pos2,
+    ) -> Self {
+        let value = dimension
+            .expr
+            .unwrap_or_else(|| compact_dimension_value(dimension.value));
+        Self {
+            constraint_id,
+            value,
+            is_angle,
+            screen_position,
+            request_focus: true,
+        }
+    }
+}
+
+fn compact_dimension_value(value: f32) -> String {
+    let text = format!("{value:.6}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn dimension_from_source(
+    source: &str,
+    variables: &std::collections::HashMap<String, f64>,
+) -> Option<zerocad_core::Dimension> {
+    let source = source.trim();
+    let value = crate::expr::eval(source, variables).ok()? as f32;
+    Some(zerocad_core::Dimension {
+        value,
+        expr: zerocad_core::expr::preserves_source(source).then(|| source.to_string()),
+    })
 }
 
 impl DimInput {
@@ -113,6 +161,7 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
         | SketchTool::Slot
         | SketchTool::Offset
         | SketchTool::Trim
+        | SketchTool::Dimension
         | SketchTool::ControlPointSpline
         | SketchTool::FitPointSpline
         | SketchTool::Mirror
@@ -131,6 +180,121 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
 }
 
 impl ZeroCadApp {
+    /// Value box for a newly placed solver dimension. Every valid edit updates
+    /// and solves immediately; malformed intermediate text simply leaves the
+    /// last valid dimension in place until the expression becomes valid.
+    pub(crate) fn show_sketch_dimension_editor(&mut self, ctx: &egui::Context) {
+        if !self.is_sketch_mode || self.sketch_dimension_editor.is_none() {
+            return;
+        }
+
+        let var_names = self.visible_variable_names();
+        let var_map = self.visible_variable_map();
+        let mut autocomplete = self.autocomplete.take();
+        let mut changed = false;
+        let mut accepted_via_key = false;
+        let mut request_focus = false;
+        let mut area_position = egui::Pos2::ZERO;
+        let mut constraint_id = EntityId(0);
+        let mut is_angle = false;
+
+        if let Some(editor) = &self.sketch_dimension_editor {
+            area_position = editor.screen_position;
+            constraint_id = editor.constraint_id;
+            is_angle = editor.is_angle;
+            request_focus = editor.request_focus;
+        }
+
+        egui::Area::new(egui::Id::new("placed_sketch_dimension_editor"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(area_position - egui::vec2(55.0, 18.0))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(250, 250, 250))
+                    .rounding(4.0)
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(37, 99, 235)))
+                    .inner_margin(egui::Margin::symmetric(7.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let field_id = egui::Id::new("placed_sketch_dimension_value");
+                            if let Some(editor) = self.sketch_dimension_editor.as_mut() {
+                                let outcome = crate::expr::autocomplete_field(
+                                    ui,
+                                    field_id,
+                                    &mut editor.value,
+                                    92.0,
+                                    true,
+                                    request_focus,
+                                    request_focus,
+                                    &var_names,
+                                    &mut autocomplete,
+                                );
+                                changed = outcome.response.changed() || outcome.accepted;
+                                accepted_via_key = outcome.accepted_via_key;
+                                editor.request_focus = false;
+                            }
+                            ui.label(
+                                egui::RichText::new(if is_angle {
+                                    "°"
+                                } else {
+                                    self.current_unit.suffix()
+                                })
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(100, 116, 139)),
+                            );
+                        });
+                    });
+            });
+        self.autocomplete = autocomplete;
+
+        let source = self
+            .sketch_dimension_editor
+            .as_ref()
+            .map(|editor| editor.value.trim().to_string())
+            .unwrap_or_default();
+        let parsed_dimension = dimension_from_source(&source, &var_map);
+
+        if changed {
+            if let Some(dimension) = parsed_dimension.clone() {
+                if self.set_live_constraint_dimension(constraint_id, dimension) {
+                    self.solve_live_sketch();
+                }
+            }
+        }
+
+        let enter = ctx.input(|input| input.key_pressed(egui::Key::Enter));
+        let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if enter && !accepted_via_key {
+            if parsed_dimension.is_some() {
+                self.sketch_dimension_editor = None;
+                self.autocomplete = None;
+                self.status_msg =
+                    "Dimension set — select more geometry to add another dimension.".to_string();
+            } else {
+                self.status_msg =
+                    "Enter a valid number, expression, or defined variable.".to_string();
+            }
+        } else if escape {
+            if let Some(model) = &mut self.sketch_solver_model {
+                model
+                    .constraints
+                    .retain(|constraint| constraint.id() != constraint_id);
+                model
+                    .driven_dimensions
+                    .retain(|candidate| *candidate != constraint_id);
+            }
+            self.sketch_dimension_positions.remove(&constraint_id);
+            self.sketch_selected_constraint = None;
+            self.sketch_dimension_editor = None;
+            self.autocomplete = None;
+            // The placement snapshot was pushed immediately before creation.
+            self.working_sketch_undo.pop();
+            self.solve_live_sketch();
+            self.status_msg =
+                "Dimension cancelled — the Dimension tool remains active.".to_string();
+        }
+    }
+
     /// Render Fusion 360-style inline dimension inputs at shape edge midpoints.
     /// Only shown while drawing (before the shape is finalized). Each field
     /// appears as a small box at the edge midpoint. The selected field has an
@@ -353,7 +517,7 @@ impl ZeroCadApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{dim_fields_for, DimField, DimInput};
+    use super::{dim_fields_for, dimension_from_source, DimField, DimInput};
     use crate::{SketchTool, ZeroCadApp};
     use eframe::egui;
 
@@ -455,5 +619,22 @@ mod tests {
             assert_eq!(fields.len(), 1);
             assert!(!fields[0].is_angle);
         }
+    }
+
+    #[test]
+    fn placed_dimension_preserves_arithmetic_and_variable_sources() {
+        let variables = std::collections::HashMap::from([("blade_width".to_string(), 42.8)]);
+
+        let arithmetic = dimension_from_source("42.8 / 2", &variables).unwrap();
+        assert!((arithmetic.value - 21.4).abs() < 1.0e-5);
+        assert_eq!(arithmetic.expr.as_deref(), Some("42.8 / 2"));
+
+        let variable = dimension_from_source("blade_width / 2", &variables).unwrap();
+        assert!((variable.value - 21.4).abs() < 1.0e-5);
+        assert_eq!(variable.expr.as_deref(), Some("blade_width / 2"));
+
+        let literal = dimension_from_source("21.4", &variables).unwrap();
+        assert_eq!(literal.value, 21.4);
+        assert_eq!(literal.expr, None);
     }
 }

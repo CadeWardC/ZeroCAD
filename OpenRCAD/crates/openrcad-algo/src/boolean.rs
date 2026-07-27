@@ -1345,28 +1345,70 @@ fn resolve_face_origins(
         .faces()
         .iter()
         .map(|face| {
-            let pos = point_on_face(face);
-            let n_face = effective_normal_at(face, &pos)?;
-            kept_faces
-                .iter()
-                .zip(kept_sources)
-                .find_map(|(kept, source)| {
-                    let surf = kept.surface()?;
-                    let (u, v) = crate::intersect::search_nearest_parameter(surf, &pos, (0.0, 0.0));
-                    if surf.point(u, v).distance(&pos) > surf_tol {
-                        return None;
-                    }
-                    let n_kept = effective_normal_uv(kept, u, v)?;
-                    if n_face.dot(&n_kept) < 0.5 {
-                        return None;
-                    }
-                    if !crate::intersect::is_inside_trimming_loops(u, v, kept) {
-                        return None;
-                    }
-                    *source
-                })
+            face_origin_sample_points(face).into_iter().find_map(|pos| {
+                let n_face = effective_normal_at(face, &pos)?;
+                kept_faces
+                    .iter()
+                    .zip(kept_sources)
+                    .find_map(|(kept, source)| {
+                        let source = (*source)?;
+                        let surf = kept.surface()?;
+                        let (u, v) =
+                            crate::intersect::search_nearest_parameter(surf, &pos, (0.0, 0.0));
+                        if surf.point(u, v).distance(&pos) > surf_tol {
+                            return None;
+                        }
+                        let n_kept = effective_normal_uv(kept, u, v)?;
+                        if n_face.dot(&n_kept) < 0.5 {
+                            return None;
+                        }
+                        if !crate::intersect::is_inside_trimming_loops(u, v, kept) {
+                            return None;
+                        }
+                        Some(source)
+                    })
+            })
         })
         .collect()
+}
+
+/// Interior samples used only for history attribution after boolean face
+/// healing/merging. A merged face's ordinary representative point can land
+/// exactly on an old imprint seam (the centre of a face-mirrored union is the
+/// common example), where neither kept half considers the point interior.
+/// Blending outer pcurve midpoints toward that representative produces
+/// deterministic points on both sides of the removed seam. Every candidate is
+/// checked against the final face's true trimming loops before it can establish
+/// lineage, so this broadens sampling without surface-signature guessing.
+fn face_origin_sample_points(face: &Face) -> Vec<Pnt> {
+    let primary = point_on_face(face);
+    let mut samples = vec![primary];
+    let (Some(outer), Some(surface)) = (face.outer_wire(), face.surface()) else {
+        return samples;
+    };
+    let (center_u, center_v) =
+        crate::intersect::search_nearest_parameter(surface, &primary, (0.0, 0.0));
+    for index in 0..outer.len() {
+        let Some(pcurve) = outer.pcurve(index) else {
+            continue;
+        };
+        let boundary = pcurve.point_at_fraction(0.5);
+        for interior_fraction in [0.35, 0.65] {
+            let u = boundary.x() + (center_u - boundary.x()) * interior_fraction;
+            let v = boundary.y() + (center_v - boundary.y()) * interior_fraction;
+            if !crate::intersect::is_inside_trimming_loops(u, v, face) {
+                continue;
+            }
+            let point = surface.point(u, v);
+            if samples
+                .iter()
+                .all(|existing| existing.distance(&point) > 1.0e-9)
+            {
+                samples.push(point);
+            }
+        }
+    }
+    samples
 }
 
 /// Outward normal of `face` at the surface point nearest `pos` (dU × dV with
@@ -2496,6 +2538,31 @@ mod tests {
             hist.face_source.iter().all(|s| s.is_some()),
             "every union face should be attributed, got {:?}",
             hist.face_source
+        );
+    }
+
+    #[test]
+    fn history_attributes_faces_merged_across_removed_imprint_seam() {
+        // A face-mirrored Join has this exact topology: the two operands share
+        // x=10, and coplanar exterior pairs merge into faces whose ordinary
+        // representative points lie on that removed centre seam.
+        let obj = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let tool = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+        let outcome = boolean_operation(&obj, &tool, BooleanOp::Fuse).expect("face-adjacent fuse");
+        let hist = face_history_from_operation(&outcome);
+
+        assert!(
+            hist.face_source.iter().all(Option::is_some),
+            "merged exterior faces must retain lineage from at least one contributing half: {:?}",
+            hist.face_source
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "openrcad.history.unattributed-face"),
+            "a removed imprint seam is not missing face history: {:?}",
+            outcome.diagnostics
         );
     }
 

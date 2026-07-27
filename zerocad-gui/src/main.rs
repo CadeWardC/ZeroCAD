@@ -61,7 +61,7 @@ use pattern_ui::PatternOp;
 use revolve_ui::RevolveOp;
 use shell_ui::ShellOp;
 use shortcuts::{Keymap, ShortcutAction};
-use sketch_ui::{dim_fields_for, DimInput};
+use sketch_ui::{dim_fields_for, DimInput, SketchDimensionEditor};
 use theme::{apply_premium_dark_theme, apply_premium_light_theme, Palette};
 use thread_ui::ThreadOp;
 use zerocad_core::parametric::FaceRef;
@@ -88,6 +88,12 @@ fn main() -> eframe::Result<()> {
     let mut builder = env_logger::Builder::from_default_env();
     if std::env::var("RUST_LOG").is_err() {
         builder.filter_level(log::LevelFilter::Info);
+        // Keep ZeroCAD's useful application messages while hiding routine GPU
+        // synchronization chatter. Graphics warnings and errors remain visible.
+        builder.filter_module("wgpu", log::LevelFilter::Warn);
+        builder.filter_module("wgpu_core", log::LevelFilter::Warn);
+        builder.filter_module("wgpu_hal", log::LevelFilter::Warn);
+        builder.filter_module("naga", log::LevelFilter::Warn);
     }
     builder.target(env_logger::Target::Pipe(Box::new(
         recovery::SessionLogWriter::new(),
@@ -115,7 +121,8 @@ fn main() -> eframe::Result<()> {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("ZeroCAD - 3D Parametric CAD Designer")
-                .with_inner_size([1200.0, 800.0]),
+                .with_inner_size([1200.0, 800.0])
+                .with_min_inner_size([960.0, 640.0]),
             // The workspace viewport renders its 3D scene on the GPU via
             // openrcad-render, embedded as an egui texture. That requires eframe
             // to run on the wgpu backend so `frame.wgpu_render_state()` yields
@@ -187,6 +194,9 @@ pub enum SketchTool {
     /// Remove the exact line/arc/circle span under the cursor. The hover result
     /// is the immutable replacement plan committed by the click.
     Trim,
+    /// Add a driving sketch dimension inferred from selected geometry, then
+    /// place and edit its value directly in the viewport.
+    Dimension,
     /// Reflect the whole sketch across a 2-point axis (center line). Not a draw
     /// tool in the shape sense — its two clicks define the mirror line.
     Mirror,
@@ -246,6 +256,7 @@ pub enum ToolFamily {
     Slot,
     Offset,
     Trim,
+    Dimension,
     /// The sketch mirror button (single mode, no flyout).
     Mirror,
     /// The corner-modifier button, holding both Fillet and Chamfer (its flyout
@@ -270,6 +281,7 @@ impl SketchTool {
             SketchTool::Slot => ToolFamily::Slot,
             SketchTool::Offset => ToolFamily::Offset,
             SketchTool::Trim => ToolFamily::Trim,
+            SketchTool::Dimension => ToolFamily::Dimension,
             SketchTool::Mirror => ToolFamily::Mirror,
             SketchTool::Fillet => ToolFamily::Corner,
             SketchTool::Chamfer => ToolFamily::Corner,
@@ -294,7 +306,11 @@ impl SketchTool {
             | SketchTool::Ellipse
             | SketchTool::ThreePointEllipse => 3,
             SketchTool::Slot => 3,
-            SketchTool::Offset | SketchTool::Trim | SketchTool::Fillet | SketchTool::Chamfer => 1,
+            SketchTool::Offset
+            | SketchTool::Trim
+            | SketchTool::Dimension
+            | SketchTool::Fillet
+            | SketchTool::Chamfer => 1,
         }
     }
 
@@ -311,6 +327,7 @@ impl SketchTool {
                 | SketchTool::Slot
                 | SketchTool::Offset
                 | SketchTool::Trim
+                | SketchTool::Dimension
                 | SketchTool::Mirror
         )
     }
@@ -347,6 +364,7 @@ impl SketchTool {
             SketchTool::Slot => icons::Icon::Slot,
             SketchTool::Offset => icons::Icon::Offset,
             SketchTool::Trim => icons::Icon::Trim,
+            SketchTool::Dimension => icons::Icon::Dimension,
             SketchTool::Mirror => icons::Icon::Mirror,
             SketchTool::Fillet => icons::Icon::Fillet,
             SketchTool::Chamfer => icons::Icon::Chamfer,
@@ -371,6 +389,7 @@ impl SketchTool {
             SketchTool::Slot => "Center-to-Center Slot",
             SketchTool::Offset => "Offset",
             SketchTool::Trim => "Trim",
+            SketchTool::Dimension => "Dimension",
             SketchTool::Mirror => "Mirror",
             SketchTool::Fillet => "Fillet",
             SketchTool::Chamfer => "Chamfer",
@@ -390,6 +409,7 @@ impl ToolFamily {
             ToolFamily::Slot => SketchTool::Slot,
             ToolFamily::Offset => SketchTool::Offset,
             ToolFamily::Trim => SketchTool::Trim,
+            ToolFamily::Dimension => SketchTool::Dimension,
             ToolFamily::Mirror => SketchTool::Mirror,
             ToolFamily::Corner => SketchTool::Fillet,
         }
@@ -418,6 +438,7 @@ impl ToolFamily {
             ToolFamily::Slot => &[SketchTool::Slot],
             ToolFamily::Offset => &[SketchTool::Offset],
             ToolFamily::Trim => &[SketchTool::Trim],
+            ToolFamily::Dimension => &[SketchTool::Dimension],
             ToolFamily::Mirror => &[SketchTool::Mirror],
             ToolFamily::Corner => &[SketchTool::Fillet, SketchTool::Chamfer],
         }
@@ -750,6 +771,9 @@ struct ZeroCadApp {
     /// from the loaded `.zcad` so re-saving preserves "created" rather than
     /// stamping it anew. `None` for a fresh/never-saved or legacy document.
     doc_created_unix: Option<u64>,
+    /// Path of the open/saved document, used only for the project title in the
+    /// application chrome. A fresh part is shown as "Untitled Project".
+    current_document_path: Option<PathBuf>,
 
     // Camera parameters for the 3D Viewport
     camera_pitch: f32,      // Pitch (up/down rotation) in radians
@@ -856,6 +880,12 @@ struct ZeroCadApp {
     sketch_selected_ids: Vec<zerocad_core::sketch::EntityId>,
     /// Constraint selected in the constraints panel (for delete / highlight).
     sketch_selected_constraint: Option<zerocad_core::sketch::EntityId>,
+    /// Active value editor for a dimension just placed with the Dimension tool.
+    sketch_dimension_editor: Option<SketchDimensionEditor>,
+    /// User-placed dimension-label anchors in sketch-plane coordinates. This is
+    /// presentation state for the current edit session; constraints themselves
+    /// remain fully durable in the solver model and project file.
+    sketch_dimension_positions: HashMap<zerocad_core::sketch::EntityId, (f64, f64)>,
     /// The conflicting constraint reported by the last live solve (None when
     /// the model solves clean) — drives the red badge + list highlight without
     /// re-solving in the render path.
@@ -1049,6 +1079,10 @@ struct ZeroCadApp {
 
     // Unit settings
     current_unit: Unit,
+    /// User-facing viewport controls shared by the sketch inspector and status
+    /// bar. These are application preferences, not document data.
+    snap_enabled: bool,
+    grid_visible: bool,
 
     /// Whether the Settings window is open.
     show_preferences: bool,

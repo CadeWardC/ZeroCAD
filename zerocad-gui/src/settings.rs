@@ -122,6 +122,13 @@ pub(crate) struct AppSettings {
     pub(crate) msaa: MsaaLevel,
     #[serde(default = "default_hydrated_cache_mb")]
     pub(crate) hydrated_cache_mb: u32,
+    /// Master sketch snapping toggle. Added with a default so existing
+    /// settings.json files remain compatible.
+    #[serde(default = "default_true")]
+    pub(crate) snap_enabled: bool,
+    /// Whether reference grids are drawn in the model and sketch viewports.
+    #[serde(default = "default_true")]
+    pub(crate) grid_visible: bool,
 }
 
 fn default_true() -> bool {
@@ -142,6 +149,8 @@ impl Default for AppSettings {
             backend: GraphicsBackend::Auto,
             msaa: MsaaLevel::X4,
             hydrated_cache_mb: default_hydrated_cache_mb(),
+            snap_enabled: true,
+            grid_visible: true,
         }
     }
 }

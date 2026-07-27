@@ -46,6 +46,7 @@ impl ZeroCadApp {
     pub(crate) fn handle_sketch_keys(&mut self, ctx: &egui::Context) {
         if self.is_sketch_mode
             && self.dim_input.is_none()
+            && self.sketch_dimension_editor.is_none()
             && self.active_tool.is_some_and(SketchTool::is_spline)
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
@@ -56,6 +57,7 @@ impl ZeroCadApp {
         // when open, owns Enter for its own fields — so only act when it's not).
         if self.is_sketch_mode
             && self.dim_input.is_none()
+            && self.sketch_dimension_editor.is_none()
             && !self.pending_corners.is_empty()
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
@@ -68,6 +70,7 @@ impl ZeroCadApp {
         // dialog), and deselecting the tool.
         if self.is_sketch_mode
             && self.dim_input.is_none()
+            && self.sketch_dimension_editor.is_none()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             if self.clear_pending_corners() {
@@ -150,6 +153,8 @@ impl ZeroCadApp {
             backend: self.graphics_backend,
             msaa: self.msaa_level,
             hydrated_cache_mb: self.hydrated_cache_mb,
+            snap_enabled: self.snap_enabled,
+            grid_visible: self.grid_visible,
         };
         if current != self.settings_baseline {
             current.save();

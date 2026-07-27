@@ -597,8 +597,14 @@ impl ZeroCadApp {
         };
 
         // --- 1. DRAW CAD BACKGROUND ---
-        // Light, elegant CAD viewport canvas color
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(245, 246, 248));
+        // Keep the modeling canvas in the same semantic surface family as the
+        // surrounding application chrome in both themes.
+        let viewport_background = if self.dark_mode {
+            egui::Color32::from_rgb(15, 23, 42)
+        } else {
+            egui::Color32::from_rgb(245, 246, 248)
+        };
+        painter.rect_filled(rect, 0.0, viewport_background);
 
         // Define coordinates of the 3 origin sheets in 3D
         let size = 18.0;
@@ -753,7 +759,7 @@ impl ZeroCadApp {
             .collect();
 
         // --- 2. GROUND REFERENCE GRID & CENTRAL AXES (when not in a planar mode) ---
-        if !self.is_planar_view() {
+        if self.grid_visible && !self.is_planar_view() {
             // Floor grid lies flat on the XZ plane (y = 0), drawn as a disc that
             // FADES OUT toward its rim rather than as full-length lines running to
             // the horizon. The old version drew every line across a 600mm span, so
@@ -900,68 +906,71 @@ impl ZeroCadApp {
                 None
             };
 
-        if let Some(cs) = grid_cs {
-            let r_grid = 150.0f32;
-            let step = 5.0f32;
+        if self.grid_visible {
+            if let Some(cs) = grid_cs {
+                let r_grid = 150.0f32;
+                let step = 5.0f32;
 
-            // Fade the whole grid out as its plane turns edge-on to the camera.
-            // A grid seen at a grazing angle is unreadable and its lines pile into
-            // converging rays; `facing` is |n · view| (1 = looking straight at the
-            // plane, 0 = edge-on). Full grid within ~50° of head-on, gone by ~80°.
-            let facing = (sin_p * cs.n.y + cos_p * (sin_y * cs.n.x + cos_y * cs.n.z)).abs();
-            let facing_mul = ((facing - 0.18) / 0.45).clamp(0.0, 1.0);
-            if facing_mul <= 0.01 {
-                // Effectively edge-on — skip the grid entirely this frame.
-            } else {
-                // Fade + clip each plane-grid line the same way the floor grid does:
-                // clip it to a disc of radius `r_grid` and fade each sub-segment by its
-                // distance from the plane origin. Drawing the grid full-span instead
-                // made every line run to ±150 and, on a VERTICAL sketch plane viewed
-                // in perspective, converge into bright rays fanning far above and
-                // below the model (visible straight through a fresh cut, too) — the
-                // exact artifact the floor grid was already fixed for.
-                let faded_plane_line =
-                    |u0: f32, v0: f32, u1: f32, v1: f32, width: f32, base_alpha: f32| {
-                        const SUBS: usize = 10;
-                        for s in 0..SUBS {
-                            let t0 = s as f32 / SUBS as f32;
-                            let t1 = (s + 1) as f32 / SUBS as f32;
-                            let (au, av) = (u0 + (u1 - u0) * t0, v0 + (v1 - v0) * t0);
-                            let (bu, bv) = (u0 + (u1 - u0) * t1, v0 + (v1 - v0) * t1);
-                            let mr = (((au + bu) * 0.5).powi(2) + ((av + bv) * 0.5).powi(2)).sqrt();
-                            let fade = (1.0 - mr / r_grid).clamp(0.0, 1.0).powf(1.5);
-                            let a = (base_alpha * fade) as u8;
-                            if a <= 3 {
-                                continue;
+                // Fade the whole grid out as its plane turns edge-on to the camera.
+                // A grid seen at a grazing angle is unreadable and its lines pile into
+                // converging rays; `facing` is |n · view| (1 = looking straight at the
+                // plane, 0 = edge-on). Full grid within ~50° of head-on, gone by ~80°.
+                let facing = (sin_p * cs.n.y + cos_p * (sin_y * cs.n.x + cos_y * cs.n.z)).abs();
+                let facing_mul = ((facing - 0.18) / 0.45).clamp(0.0, 1.0);
+                if facing_mul <= 0.01 {
+                    // Effectively edge-on — skip the grid entirely this frame.
+                } else {
+                    // Fade + clip each plane-grid line the same way the floor grid does:
+                    // clip it to a disc of radius `r_grid` and fade each sub-segment by its
+                    // distance from the plane origin. Drawing the grid full-span instead
+                    // made every line run to ±150 and, on a VERTICAL sketch plane viewed
+                    // in perspective, converge into bright rays fanning far above and
+                    // below the model (visible straight through a fresh cut, too) — the
+                    // exact artifact the floor grid was already fixed for.
+                    let faded_plane_line =
+                        |u0: f32, v0: f32, u1: f32, v1: f32, width: f32, base_alpha: f32| {
+                            const SUBS: usize = 10;
+                            for s in 0..SUBS {
+                                let t0 = s as f32 / SUBS as f32;
+                                let t1 = (s + 1) as f32 / SUBS as f32;
+                                let (au, av) = (u0 + (u1 - u0) * t0, v0 + (v1 - v0) * t0);
+                                let (bu, bv) = (u0 + (u1 - u0) * t1, v0 + (v1 - v0) * t1);
+                                let mr =
+                                    (((au + bu) * 0.5).powi(2) + ((av + bv) * 0.5).powi(2)).sqrt();
+                                let fade = (1.0 - mr / r_grid).clamp(0.0, 1.0).powf(1.5);
+                                let a = (base_alpha * fade) as u8;
+                                if a <= 3 {
+                                    continue;
+                                }
+                                let wa = cs.unproject(au, av);
+                                let wb = cs.unproject(bu, bv);
+                                let pa = project_3d(wa.x, wa.y, wa.z);
+                                let pb = project_3d(wb.x, wb.y, wb.z);
+                                painter.line_segment(
+                                    [egui::pos2(pa.0, pa.1), egui::pos2(pb.0, pb.1)],
+                                    egui::Stroke::new(
+                                        width,
+                                        egui::Color32::from_rgba_unmultiplied(110, 110, 124, a),
+                                    ),
+                                );
                             }
-                            let wa = cs.unproject(au, av);
-                            let wb = cs.unproject(bu, bv);
-                            let pa = project_3d(wa.x, wa.y, wa.z);
-                            let pb = project_3d(wb.x, wb.y, wb.z);
-                            painter.line_segment(
-                                [egui::pos2(pa.0, pa.1), egui::pos2(pb.0, pb.1)],
-                                egui::Stroke::new(
-                                    width,
-                                    egui::Color32::from_rgba_unmultiplied(110, 110, 124, a),
-                                ),
-                            );
-                        }
-                    };
+                        };
 
-                let mut i = -r_grid;
-                while i <= r_grid + 0.001 {
-                    // Clip each line to the grid disc so it never reaches the horizon.
-                    let inside = r_grid * r_grid - i * i;
-                    if inside > 0.0 {
-                        let half = inside.sqrt();
-                        // The lines through the plane origin read as its major axes.
-                        let is_major = i.abs() < 0.001;
-                        let (w, base) = if is_major { (1.2, 90.0) } else { (1.0, 40.0) };
-                        let base = base * facing_mul;
-                        faded_plane_line(i, -half, i, half, w, base);
-                        faded_plane_line(-half, i, half, i, w, base);
+                    let mut i = -r_grid;
+                    while i <= r_grid + 0.001 {
+                        // Clip each line to the grid disc so it never reaches the horizon.
+                        let inside = r_grid * r_grid - i * i;
+                        if inside > 0.0 {
+                            let half = inside.sqrt();
+                            // The lines through the plane origin read as its major axes.
+                            let is_major = i.abs() < 0.001;
+                            let (w, base) = if is_major { (1.2, 90.0) } else { (1.0, 40.0) };
+                            let base = base * facing_mul;
+                            faded_plane_line(i, -half, i, half, w, base);
+                            faded_plane_line(-half, i, half, i, w, base);
+                        }
+                        i += step;
                     }
-                    i += step;
                 }
             }
         }

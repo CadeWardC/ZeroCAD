@@ -511,10 +511,65 @@ pub(crate) fn analytic_loop_to_wire<P>(
         }
     }
 
-    let mut edges = Vec::with_capacity(sketch_loop.spans.len());
-    for span in &sketch_loop.spans {
-        let start = point_on_plane(span.start(), cs);
-        let end = point_on_plane(span.end(), cs);
+    // Weld the junctions. Consecutive spans of an arrangement loop meet at one
+    // arrangement vertex, but each span evaluates its own endpoint from
+    // f32-quantized sketch input, so the two sides of a junction can disagree
+    // by about one ulp of the coordinate (~1.4e-6 at magnitude 10). Downstream
+    // that noise is fatal twice over: `Wire::is_closed` compares at CONFUSION
+    // (1e-9), and the strict pcurve audit runs at 1e-6 — both below the input's
+    // own representation floor. So each junction gets ONE canonical point (the
+    // midpoint of the two evaluations), shared by both incident edges. Line
+    // edges are rebuilt through their welded endpoints, so the geometry stays
+    // exactly consistent with the vertices; curved edges keep their analytic
+    // curve and only the vertex moves, which stays within per-entity tolerance.
+    //
+    // Welding is only legitimate for noise, so it is BOUNDED: the limit is the
+    // f32 representation floor at this loop's own coordinate magnitude (the
+    // same scale-derived formula the sketch layer uses to decide when two
+    // points are the same point). Consecutive spans of an arrangement loop
+    // share a DCEL vertex, so in a well-formed loop the disagreement is far
+    // below that. If it ever is not, the loop carries a REAL gap rather than
+    // quantization noise, and closing it would silently deform the model — so
+    // bail to the sampled builder instead, which is what `None` selects.
+    let count = sketch_loop.spans.len();
+    let scale = sketch_loop
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let (start, end) = (span.start(), span.end());
+            [
+                start.x().abs(),
+                start.y().abs(),
+                end.x().abs(),
+                end.y().abs(),
+            ]
+        })
+        .fold(0.0_f64, f64::max);
+    let weld_limit = (scale * f64::from(f32::EPSILON) * 8.0).max(f64::EPSILON * 64.0);
+
+    let mut junctions = Vec::with_capacity(count);
+    for index in 0..count {
+        let previous_end = point_on_plane(sketch_loop.spans[(index + count - 1) % count].end(), cs);
+        let start = point_on_plane(sketch_loop.spans[index].start(), cs);
+        if previous_end.distance(&start) > weld_limit {
+            log::warn!(
+                "analytic sketch loop junction {index} disagrees by {:e} (limit {weld_limit:e}); \
+                 falling back to the sampled builder rather than closing a real gap",
+                previous_end.distance(&start)
+            );
+            return None;
+        }
+        junctions.push(Pnt::new(
+            (previous_end.x() + start.x()) * 0.5,
+            (previous_end.y() + start.y()) * 0.5,
+            (previous_end.z() + start.z()) * 0.5,
+        ));
+    }
+
+    let mut edges = Vec::with_capacity(count);
+    for (index, span) in sketch_loop.spans.iter().enumerate() {
+        let start = junctions[index];
+        let end = junctions[(index + 1) % count];
         let edge = if matches!(span.curve, GeomCurve2d::Line(_)) {
             Edge::between_points(start, end)
         } else {
@@ -574,6 +629,10 @@ pub(crate) fn build_analytic_extrusion_solid<P>(
         "analytic sketch prism extrusion",
         openrcad::algo::prism::prism_operation(&face, sweep),
     )
+    // The caller treats `None` as "try the next builder", so the kernel's
+    // reason must not vanish with it — log it, or a failed face is
+    // undiagnosable (a region that silently drops out of an extrude).
+    .map_err(|error| log::warn!("{error}"))
     .ok()
     .map(|outcome| outcome.solid)
 }
@@ -609,6 +668,48 @@ pub(crate) fn build_extrusion_solid_arcs(
         let p = cs.unproject(u, v);
         Pnt::new(p.x as f64, p.y as f64, p.z as f64)
     };
+    // Sampled region boundaries splice together points evaluated from
+    // different source curves, so where two curves meet the polygon can carry
+    // consecutive points ~1 ulp of the f32 input apart (1e-6 at coordinate
+    // magnitude 10). Each such pair becomes a micro-edge whose lateral wall is
+    // a sliver the kernel's strict audit rightly rejects (UV boundary gaps,
+    // 4-face-use edges). Weld them out at the input's own noise floor — the
+    // same scale-derived formula as `sketch_linear_tolerance` — before any
+    // wire is built. Genuine short edges are orders of magnitude longer.
+    let scale = points
+        .iter()
+        .chain(holes.iter().flatten())
+        .flat_map(|(u, v)| [u.abs(), v.abs()])
+        .fold(0.0_f32, f32::max);
+    let weld = (scale * f32::EPSILON * 8.0).max(f32::EPSILON * 64.0);
+    let weld_loop = |loop_pts: &[(f32, f32)]| -> Vec<(f32, f32)> {
+        let mut kept: Vec<(f32, f32)> = Vec::with_capacity(loop_pts.len());
+        for &point in loop_pts {
+            if kept
+                .last()
+                .is_some_and(|last| (last.0 - point.0).hypot(last.1 - point.1) <= weld)
+            {
+                continue;
+            }
+            kept.push(point);
+        }
+        while kept.len() > 1 {
+            let first = kept[0];
+            let last = *kept.last().expect("non-empty");
+            if (first.0 - last.0).hypot(first.1 - last.1) <= weld {
+                kept.pop();
+            } else {
+                break;
+            }
+        }
+        kept
+    };
+    let points = weld_loop(points);
+    let holes: Vec<Vec<(f32, f32)>> = holes.iter().map(|hole| weld_loop(hole)).collect();
+    if points.len() < 3 {
+        return None;
+    }
+    let points = points.as_slice();
     // Boolean solids can reconstruct circular arcs so swept circle fragments
     // become smooth cylindrical walls. Visible sketch-extrude meshes keep the
     // sampled polyline: OpenRCAD's cap tessellator is more reliable on compound
@@ -649,6 +750,9 @@ pub(crate) fn build_extrusion_solid_arcs(
         "prism extrusion",
         openrcad::algo::prism::prism_operation(&face, sweep),
     )
+    // Same contract as the analytic builder above: `None` may be recoverable
+    // for the caller, but the reason must reach the log.
+    .map_err(|error| log::warn!("{error}"))
     .ok()
     .map(|outcome| outcome.solid)
 }
@@ -819,6 +923,25 @@ pub(crate) fn solid_to_flat_mesh_with_cancel(
         // faces the centroid). Orient robustly by triangle adjacency + signed
         // volume instead, then recompute flat normals from the corrected winding.
         orient_mesh_outward(&mut vertices, &mut indices);
+        // `orient_mesh_outward` treats every disconnected component as an
+        // exterior boundary. In a multi-shell solid, however, every shell after
+        // the first bounds an enclosed void and must wind inward so rendering,
+        // sectioning, and mass properties subtract the cavity.
+        if solid.shells().len() > 1 {
+            let outer_face_count = solid.shell().faces().len() as u32;
+            for (triangle, face_id) in face_ids.iter().copied().enumerate() {
+                if face_id < outer_face_count {
+                    continue;
+                }
+                indices.swap(triangle * 3 + 1, triangle * 3 + 2);
+                for &vertex in &indices[triangle * 3..triangle * 3 + 3] {
+                    let base = vertex as usize * 6;
+                    vertices[base + 3] = -vertices[base + 3];
+                    vertices[base + 4] = -vertices[base + 4];
+                    vertices[base + 5] = -vertices[base + 5];
+                }
+            }
+        }
     } else {
         // Analytic primitives / sketch prisms: a per-triangle centroid repair
         // (the inverted cap is local and the geometry is convex enough).

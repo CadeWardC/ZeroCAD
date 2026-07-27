@@ -795,8 +795,8 @@ pub(crate) fn shell_topology_history(
     open_faces: &[Face],
     policy: &TolerancePolicy,
 ) -> TopologyHistory {
-    let source_faces = source.shell().faces();
-    let result_faces = result.shell().faces();
+    let source_faces = source.faces();
+    let result_faces = result.faces();
     let removed: Vec<bool> = source_faces
         .iter()
         .map(|face| open_faces.iter().any(|open| open == face))
@@ -2850,7 +2850,29 @@ fn shell_box(
         add_rim_segment((1, 1, 0), (1, 0, 0), (1, 1, 0), (1, 0, 0), n);
     }
 
-    // Sew the collection of faces into a watertight shell
+    if open_faces.is_empty() {
+        // A closed hollow is one material region bounded by two disconnected
+        // shells. `add_flat_face` appended each outer face immediately before
+        // its reversed inner partner, so keep those boundaries distinct rather
+        // than sewing all twelve faces into one Euler-4 shell.
+        let mut outer_faces = Vec::with_capacity(6);
+        let mut inner_faces = Vec::with_capacity(6);
+        for (index, face) in faces.into_iter().enumerate() {
+            if index % 2 == 0 {
+                outer_faces.push(face);
+            } else {
+                inner_faces.push(face);
+            }
+        }
+        let outer = sew_with_policy(&outer_faces, policy)
+            .expect("policy was validated by shell_solid_with_policy");
+        let inner = sew_with_policy(&inner_faces, policy)
+            .expect("policy was validated by shell_solid_with_policy");
+        return Solid::from_shells([outer, inner])
+            .expect("closed hollow always has outer and void shells");
+    }
+
+    // An open shell is one connected boundary joined by its opening rim(s).
     let shell =
         sew_with_policy(&faces, policy).expect("policy was validated by shell_solid_with_policy");
     Solid::new(shell)
@@ -2889,6 +2911,17 @@ mod tests {
             ]),
         );
         crate::prism::prism(&face, GeomVec::new(0.0, 0.0, h)).unwrap()
+    }
+
+    #[test]
+    fn closed_box_shell_has_outer_and_void_boundaries() {
+        let solid = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let hollow = shell_solid(&solid, 1.0, &[]).expect("closed box shell");
+
+        assert_eq!(hollow.shells().len(), 2);
+        assert_eq!(hollow.euler_characteristic(), 4);
+        assert!(hollow.validate().is_ok(), "{:?}", hollow.validate());
+        assert!(hollow.is_watertight());
     }
 
     #[test]

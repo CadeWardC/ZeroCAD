@@ -1313,6 +1313,7 @@ fn constraint_references_entity(constraint: &Constraint, target: EntityId) -> bo
         | Constraint::Perpendicular { a, b, .. }
         | Constraint::Equal { a, b, .. }
         | Constraint::Angle { a, b, .. }
+        | Constraint::LineDistance { a, b, .. }
         | Constraint::Concentric { a, b, .. }
         | Constraint::Collinear { a, b, .. } => *a == target || *b == target,
         Constraint::Tangent { line, circle, .. } => *line == target || *circle == target,
@@ -1349,6 +1350,7 @@ fn constraint_is_valid(
         | Constraint::Perpendicular { a, b, .. }
         | Constraint::Equal { a, b, .. }
         | Constraint::Angle { a, b, .. }
+        | Constraint::LineDistance { a, b, .. }
         | Constraint::Concentric { a, b, .. }
         | Constraint::Collinear { a, b, .. } => entities.contains(a) && entities.contains(b),
         Constraint::Tangent { line, circle, .. } => {

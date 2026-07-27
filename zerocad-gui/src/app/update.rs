@@ -27,9 +27,6 @@ impl eframe::App for ZeroCadApp {
 
         self.apply_theme(ctx);
 
-        // Welcome modal (drawn as a Foreground layer over everything below).
-        self.draw_onboarding(ctx);
-
         self.animate_camera(ctx);
 
         // SAVE DIALOG (modal overlay, drawn before the Settings window).
@@ -38,22 +35,23 @@ impl eframe::App for ZeroCadApp {
         self.draw_settings_window(ctx);
         self.draw_about_window(ctx);
 
-        self.show_parameters_dialog(ctx);
+        self.draw_top_bar(ctx);
 
+        self.show_parameters_dialog(ctx);
         self.show_inspection_dialog(ctx);
 
-        self.draw_top_bar(ctx);
+        if self.onboarding_visible {
+            self.draw_start_page(ctx);
+            self.persist_settings();
+            return;
+        }
 
         self.show_move_dialog(ctx);
         self.show_combine_dialog(ctx);
         self.show_split_body_dialog(ctx);
         self.show_scale_body_dialog(ctx);
 
-        self.draw_feature_tree(ctx);
-
         self.draw_status_bar(ctx);
-
-        self.draw_extrude_panel(ctx);
 
         self.draw_workspace_viewport(ctx);
 

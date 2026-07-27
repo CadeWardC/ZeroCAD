@@ -1434,6 +1434,68 @@ impl Region {
         }
         !self.holes.iter().any(|h| point_in_polygon(p, h))
     }
+
+    /// Why this face cannot be swept into a solid, when that is decidable from
+    /// its boundary alone. Sweeping needs a boundary with locally positive
+    /// width; the shapes below have none, so a solid builder can only return
+    /// "no solid" and the caller would otherwise drop the face in silence.
+    pub fn degeneracy(&self) -> Option<RegionDegeneracy> {
+        if let Some(cusp) = boundary_cusp(&self.boundary) {
+            return Some(cusp);
+        }
+        self.holes.iter().find_map(|hole| boundary_cusp(hole))
+    }
+}
+
+/// A boundary shape that cannot carry a swept wall.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RegionDegeneracy {
+    /// The boundary reverses on itself, pinching the face to zero width. Exact
+    /// tangential contact produces this: a circle resting on the edge it
+    /// touches leaves the contact point along the same line it arrived on, so
+    /// the face has a zero interior angle there. Perturbing either curve by a
+    /// fraction of a micron removes it, which is what makes it so easy to hit
+    /// by construction and so confusing to diagnose.
+    Cusp { at: (f32, f32), turn_degrees: f32 },
+}
+
+/// Smallest turn that counts as the boundary doubling back. A discretized
+/// tangential contact measures ~176°; ordinary corners (including the sharp
+/// ones a user draws deliberately) stay well below this, and a coarsely
+/// sampled arc turns only a few degrees per step.
+const CUSP_TURN_DEGREES: f32 = 165.0;
+
+fn boundary_cusp(boundary: &[(f32, f32)]) -> Option<RegionDegeneracy> {
+    let count = boundary.len();
+    if count < 3 {
+        return None;
+    }
+    let mut sharpest: Option<((f32, f32), f32)> = None;
+    for index in 0..count {
+        let previous = boundary[(index + count - 1) % count];
+        let point = boundary[index];
+        let next = boundary[(index + 1) % count];
+        let incoming = (point.0 - previous.0, point.1 - previous.1);
+        let outgoing = (next.0 - point.0, next.1 - point.1);
+        let incoming_length = incoming.0.hypot(incoming.1);
+        let outgoing_length = outgoing.0.hypot(outgoing.1);
+        // A repeated point carries no direction; it is the arrangement's own
+        // seam bookkeeping, not a cusp.
+        if incoming_length <= f32::EPSILON || outgoing_length <= f32::EPSILON {
+            continue;
+        }
+        let cosine = (incoming.0 * outgoing.0 + incoming.1 * outgoing.1)
+            / (incoming_length * outgoing_length);
+        let turn_degrees = cosine.clamp(-1.0, 1.0).acos().to_degrees();
+        let sharper = match sharpest {
+            Some((_, best)) => turn_degrees > best,
+            None => true,
+        };
+        if turn_degrees >= CUSP_TURN_DEGREES && sharper {
+            sharpest = Some((point, turn_degrees));
+        }
+    }
+    sharpest.map(|(at, turn_degrees)| RegionDegeneracy::Cusp { at, turn_degrees })
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3337,5 +3399,41 @@ mod tests {
         let regions = detect_regions(&curves);
         assert_eq!(regions.len(), 1);
         assert!(regions[0].area > 90.0);
+    }
+
+    #[test]
+    fn bugcase1_near_tangent_duplicate_has_no_tolerance_sliver() {
+        let mut curves = SketchCurves::new();
+        for (a, b) in [
+            ((-13.2, -13.4), (8.2, -13.4)),
+            ((8.2, -13.4), (8.2, -6.8999996)),
+            ((8.2, -6.8999996), (-13.2, -6.8999996)),
+            ((-13.2, -6.8999996), (-13.2, -13.4)),
+            ((8.2, -6.8999996), (-10.2, -6.900001)),
+            ((-10.2, -6.900001), (-10.2, -6.500001)),
+            ((-10.2, -6.900001), (8.2, -6.900001)),
+            ((8.2, -6.900001), (8.2, -6.100001)),
+            ((8.2, -6.100001), (-10.2, -6.100001)),
+            ((-10.2, -6.100001), (-10.2, -6.900001)),
+            ((8.2, -6.100001), (-10.3, -6.100001)),
+            ((-10.3, -6.100001), (-10.3, -2.9000008)),
+            ((-10.3, -2.9000008), (8.2, -2.9000008)),
+            ((8.2, -2.9000008), (8.2, -6.100001)),
+        ] {
+            curves.add_line(a, b);
+        }
+        curves.add_circle((-10.2, -6.500001), 0.4);
+
+        let regions = detect_regions(&curves);
+        let areas: Vec<f32> = regions.iter().map(|region| region.area).collect();
+        assert_eq!(
+            regions.len(),
+            5,
+            "the tolerance sliver must be removed: {areas:?}"
+        );
+        assert!(
+            areas.iter().all(|area| *area > 0.1),
+            "no microscopic region may survive: {areas:?}"
+        );
     }
 }

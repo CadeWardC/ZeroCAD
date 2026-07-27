@@ -295,6 +295,15 @@ pub enum Constraint {
         at_start: bool,
         radius: crate::sketch::Dimension,
     },
+    /// Perpendicular separation of two parallel infinite lines. The solver
+    /// enforces parallelism as part of this dimensional constraint, so it
+    /// remains a true line-to-line distance rather than an endpoint shortcut.
+    LineDistance {
+        id: EntityId,
+        a: EntityId,
+        b: EntityId,
+        d: crate::sketch::Dimension,
+    },
 }
 
 impl Constraint {
@@ -320,7 +329,8 @@ impl Constraint {
             | Constraint::Symmetric { id, .. }
             | Constraint::Diameter { id, .. }
             | Constraint::SplineTangent { id, .. }
-            | Constraint::SplineCurvature { id, .. } => *id,
+            | Constraint::SplineCurvature { id, .. }
+            | Constraint::LineDistance { id, .. } => *id,
         }
     }
 }
@@ -990,6 +1000,12 @@ mod tests {
                     spline: EntityId(15),
                     at_start: false,
                     radius: Dimension::literal(12.0),
+                },
+                Constraint::LineDistance {
+                    id: EntityId(28),
+                    a: EntityId(2),
+                    b: EntityId(2),
+                    d: Dimension::literal(5.0),
                 },
             ],
             construction: vec![EntityId(2)],

@@ -38,8 +38,17 @@ pub(crate) const MIRROR: &str = include_str!("../../icons/sketch/mirror.svg");
 pub(crate) const SLOT: &str = include_str!("../../icons/sketch/slot.svg");
 pub(crate) const OFFSET: &str = include_str!("../../icons/sketch/offset.svg");
 pub(crate) const TRIM: &str = include_str!("../../icons/sketch/trim.svg");
+pub(crate) const DIMENSION: &str = include_str!("../../icons/sketch/dimension.svg");
 pub(crate) const SKETCH: &str = include_str!("../../icons/sketch/sketch.svg");
 pub(crate) const EXTRUDE: &str = include_str!("../../icons/3d/extrude.svg");
+pub(crate) const CUBE: &str = include_str!("../../icons/3d/cube.svg");
+pub(crate) const ASSEMBLY: &str = include_str!("../../icons/3d/assembly.svg");
+pub(crate) const REVOLVE: &str = include_str!("../../icons/3d/revolve.svg");
+pub(crate) const SWEEP: &str = include_str!("../../icons/3d/sweep.svg");
+pub(crate) const LOFT: &str = include_str!("../../icons/3d/loft.svg");
+pub(crate) const SHELL: &str = include_str!("../../icons/3d/shell.svg");
+pub(crate) const DATUM: &str = include_str!("../../icons/3d/datum.svg");
+pub(crate) const SHEET: &str = include_str!("../../icons/sketch/sheet.svg");
 pub(crate) const CHECK: &str = include_str!("../../icons/general/check.svg");
 pub(crate) const EYE_OPEN: &str = include_str!("../../icons/general/eye-solid.svg");
 pub(crate) const EYE_CLOSED: &str = include_str!("../../icons/general/eye-closed.svg");
@@ -50,6 +59,17 @@ pub(crate) const SETTINGS: &str = include_str!("../../icons/general/settings.svg
 pub(crate) const FOLDER: &str = include_str!("../../icons/general/folder.svg");
 pub(crate) const LOG_OUT: &str = include_str!("../../icons/general/log-out.svg");
 pub(crate) const NEW_DESIGN: &str = include_str!("../../icons/general/new-design.svg");
+pub(crate) const MENU: &str = include_str!("../../icons/general/menu.svg");
+pub(crate) const UNDO: &str = include_str!("../../icons/general/undo.svg");
+pub(crate) const REDO: &str = include_str!("../../icons/general/redo.svg");
+pub(crate) const HELP: &str = include_str!("../../icons/general/help.svg");
+pub(crate) const SELECT: &str = include_str!("../../icons/general/select.svg");
+pub(crate) const INSPECT: &str = include_str!("../../icons/general/inspect.svg");
+pub(crate) const HOME: &str = include_str!("../../icons/general/home.svg");
+pub(crate) const FIT: &str = include_str!("../../icons/general/fit.svg");
+pub(crate) const ZOOM_IN: &str = include_str!("../../icons/general/zoom-in.svg");
+pub(crate) const ZOOM_OUT: &str = include_str!("../../icons/general/zoom-out.svg");
+pub(crate) const PAN: &str = include_str!("../../icons/general/pan.svg");
 
 /// Unified icon registry. Adding or replacing an icon is as simple as updating
 /// this enum and its path mapping in `svg()`.
@@ -70,7 +90,16 @@ pub(crate) enum Icon {
     Slot,
     Offset,
     Trim,
+    Dimension,
     Extrude,
+    Cube,
+    Assembly,
+    Revolve,
+    Sweep,
+    Loft,
+    Shell,
+    Datum,
+    Sheet,
     Check,
     EyeOpen,
     EyeClosed,
@@ -82,6 +111,17 @@ pub(crate) enum Icon {
     Exit,
     Folder,
     Sketch,
+    Menu,
+    Undo,
+    Redo,
+    Help,
+    Select,
+    Inspect,
+    Home,
+    Fit,
+    ZoomIn,
+    ZoomOut,
+    Pan,
 }
 
 impl Icon {
@@ -103,7 +143,16 @@ impl Icon {
             Icon::Slot => SLOT,
             Icon::Offset => OFFSET,
             Icon::Trim => TRIM,
+            Icon::Dimension => DIMENSION,
             Icon::Extrude => EXTRUDE,
+            Icon::Cube => CUBE,
+            Icon::Assembly => ASSEMBLY,
+            Icon::Revolve => REVOLVE,
+            Icon::Sweep => SWEEP,
+            Icon::Loft => LOFT,
+            Icon::Shell => SHELL,
+            Icon::Datum => DATUM,
+            Icon::Sheet => SHEET,
             Icon::Check => CHECK,
             Icon::EyeOpen => EYE_OPEN,
             Icon::EyeClosed => EYE_CLOSED,
@@ -115,6 +164,17 @@ impl Icon {
             Icon::Exit => LOG_OUT,
             Icon::New => NEW_DESIGN,
             Icon::Sketch => SKETCH,
+            Icon::Menu => MENU,
+            Icon::Undo => UNDO,
+            Icon::Redo => REDO,
+            Icon::Help => HELP,
+            Icon::Select => SELECT,
+            Icon::Inspect => INSPECT,
+            Icon::Home => HOME,
+            Icon::Fit => FIT,
+            Icon::ZoomIn => ZOOM_IN,
+            Icon::ZoomOut => ZOOM_OUT,
+            Icon::Pan => PAN,
         }
     }
 

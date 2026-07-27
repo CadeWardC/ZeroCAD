@@ -1078,6 +1078,11 @@ pub(crate) struct SketchExtrudeRegionSource {
     pub(crate) depth: f32,
     pub(crate) cs: CoordinateSystem,
     pub(crate) rect_circle: Option<RectCircleCanonicalSource>,
+    /// Exact runtime arrangement for guarded prismatic reconstruction. Cached
+    /// body payloads may omit it; evaluation always rebuilds it from the
+    /// authoritative sketch before a new operation can use the fallback.
+    #[serde(skip)]
+    pub(crate) analytic: Option<crate::sketch::AnalyticSketchRegion>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1612,6 +1617,580 @@ pub fn boolean_region_plan(
         process,
         is_boolean,
     }
+}
+
+/// One connected 2D material region prepared for a single extrusion. Adjacent
+/// arrangement faces are merged before entering the 3D kernel, so their shared
+/// sketch edges never become coplanar B-Rep seams that a later boolean must
+/// repair.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedExtrudeRegion {
+    pub(crate) region: Region,
+    pub(crate) source_indices: Vec<usize>,
+}
+
+type RegionVertexKey = usize;
+
+#[derive(Clone, Copy)]
+struct RegionBoundaryEdge {
+    from: RegionVertexKey,
+    to: RegionVertexKey,
+}
+
+fn signed_loop_area(points: &[(f32, f32)]) -> f32 {
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let next = points[(index + 1) % points.len()];
+            point.0 * next.1 - point.1 * next.0
+        })
+        .sum::<f32>()
+        * 0.5
+}
+
+fn simplify_collinear_loop(mut points: Vec<(f32, f32)>, tolerance: f32) -> Vec<(f32, f32)> {
+    loop {
+        if points.len() <= 3 {
+            return points;
+        }
+        let remove = (0..points.len()).find(|&index| {
+            let previous = points[(index + points.len() - 1) % points.len()];
+            let current = points[index];
+            let next = points[(index + 1) % points.len()];
+            let incoming = (current.0 - previous.0, current.1 - previous.1);
+            let outgoing = (next.0 - current.0, next.1 - current.1);
+            let incoming_len = incoming.0.hypot(incoming.1);
+            let outgoing_len = outgoing.0.hypot(outgoing.1);
+            let cross = incoming.0 * outgoing.1 - incoming.1 * outgoing.0;
+            let dot = incoming.0 * outgoing.0 + incoming.1 * outgoing.1;
+            dot > 0.0 && cross.abs() <= tolerance * (incoming_len + outgoing_len)
+        });
+        let Some(index) = remove else {
+            return points;
+        };
+        points.remove(index);
+    }
+}
+
+fn selected_region_tolerance(regions: &[Region], selected: &[usize]) -> f32 {
+    let scale = selected
+        .iter()
+        .flat_map(|index| {
+            let region = &regions[*index];
+            region.boundary.iter().chain(region.holes.iter().flatten())
+        })
+        .flat_map(|point| [f64::from(point.0.abs()), f64::from(point.1.abs())])
+        .fold(0.0_f64, f64::max);
+    (scale * f64::from(f32::EPSILON) * 8.0).max(f64::EPSILON * 64.0) as f32
+}
+
+fn region_loops(region: &Region) -> impl Iterator<Item = &[(f32, f32)]> {
+    std::iter::once(region.boundary.as_slice()).chain(region.holes.iter().map(Vec::as_slice))
+}
+
+#[derive(Clone)]
+struct AnalyticBoundarySpan {
+    from: usize,
+    to: usize,
+    span: openrcad::geom2d::CurveSpan<crate::sketch::SketchCurveProvenance>,
+}
+
+fn analytic_spans_match_reversed(
+    first: &openrcad::geom2d::CurveSpan<crate::sketch::SketchCurveProvenance>,
+    second: &openrcad::geom2d::CurveSpan<crate::sketch::SketchCurveProvenance>,
+    tolerance: f64,
+) -> bool {
+    use openrcad::geom2d::Curve2d;
+
+    first.kind() == second.kind()
+        && [0.25, 0.5, 0.75].into_iter().all(|fraction| {
+            let first_parameter = first.first + (first.last - first.first) * fraction;
+            let second_parameter = second.last + (second.first - second.last) * fraction;
+            first
+                .curve
+                .point(first_parameter)
+                .distance(&second.curve.point(second_parameter))
+                <= tolerance
+        })
+}
+
+fn analytic_loop_signed_area(
+    spans: &[openrcad::geom2d::CurveSpan<crate::sketch::SketchCurveProvenance>],
+) -> f64 {
+    use openrcad::geom2d::{Curve2d, CurveKind2d};
+
+    let mut points = Vec::new();
+    for span in spans {
+        let steps = match span.kind() {
+            CurveKind2d::Line => 1,
+            CurveKind2d::Circle | CurveKind2d::Ellipse => {
+                ((span.parameter_length() / std::f64::consts::TAU * 128.0).ceil() as usize).max(2)
+            }
+            _ => 32,
+        };
+        for step in 0..steps {
+            let parameter = span.first + (span.last - span.first) * step as f64 / steps as f64;
+            let point = span.curve.point(parameter);
+            points.push((point.x(), point.y()));
+        }
+    }
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(&(ax, ay), &(bx, by))| ax * by - bx * ay)
+        .sum::<f64>()
+        * 0.5
+}
+
+fn reverse_analytic_loop(
+    loop_: &mut openrcad::sketch::ArrangementLoop<crate::sketch::SketchCurveProvenance>,
+) {
+    loop_.spans = loop_
+        .spans
+        .drain(..)
+        .rev()
+        .map(openrcad::geom2d::CurveSpan::reversed)
+        .collect();
+    loop_.signed_area = -loop_.signed_area;
+}
+
+/// Exact counterpart to the sampled boundary cancellation below. Every
+/// detected region retains the arrangement's analytic line/arc spans; carry
+/// those through the union so a circular notch and the circle that later fills
+/// it use the identical cylindrical support. Re-fitting the merged point loop
+/// shifts a 0.4 mm arc by about 1e-3 mm, which is enough to create micro-edges
+/// when a partial-height Join splits that wall.
+fn merge_analytic_regions(
+    regions: &[Region],
+    source_indices: &[usize],
+    tolerance: f32,
+) -> Option<crate::sketch::AnalyticSketchRegion> {
+    let analytic_regions: Vec<_> = source_indices
+        .iter()
+        .map(|index| regions[*index].analytic.as_ref())
+        .collect::<Option<_>>()?;
+    let tolerance = f64::from(tolerance);
+    let mut vertices = Vec::new();
+    let mut vertex_key = |point: openrcad::foundation::Pnt2d| {
+        if let Some(index) = vertices
+            .iter()
+            .position(|existing: &openrcad::foundation::Pnt2d| {
+                existing.distance(&point) <= tolerance
+            })
+        {
+            index
+        } else {
+            vertices.push(point);
+            vertices.len() - 1
+        }
+    };
+    let mut unmatched: std::collections::HashMap<(usize, usize), Vec<AnalyticBoundarySpan>> =
+        std::collections::HashMap::new();
+    for region in analytic_regions {
+        for loop_ in std::iter::once(&region.outer).chain(region.holes.iter()) {
+            for span in &loop_.spans {
+                let (from, to) = (vertex_key(span.start()), vertex_key(span.end()));
+                let reverse = (to, from);
+                let match_index = unmatched.get(&reverse).and_then(|candidates| {
+                    candidates.iter().position(|candidate| {
+                        analytic_spans_match_reversed(&candidate.span, span, tolerance)
+                    })
+                });
+                if let Some(match_index) = match_index {
+                    let candidates = unmatched
+                        .get_mut(&reverse)
+                        .expect("matched analytic edge list");
+                    candidates.swap_remove(match_index);
+                    if candidates.is_empty() {
+                        unmatched.remove(&reverse);
+                    }
+                } else {
+                    unmatched
+                        .entry((from, to))
+                        .or_default()
+                        .push(AnalyticBoundarySpan {
+                            from,
+                            to,
+                            span: span.clone(),
+                        });
+                }
+            }
+        }
+    }
+
+    let edges: Vec<AnalyticBoundarySpan> = unmatched.into_values().flatten().collect();
+    let mut outgoing: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut incoming: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (index, edge) in edges.iter().enumerate() {
+        outgoing.entry(edge.from).or_default().push(index);
+        *incoming.entry(edge.to).or_default() += 1;
+    }
+    if outgoing.values().any(|edges| edges.len() != 1) || incoming.values().any(|count| *count != 1)
+    {
+        return None;
+    }
+
+    let mut used = vec![false; edges.len()];
+    let mut loops = Vec::new();
+    for start in 0..edges.len() {
+        if used[start] {
+            continue;
+        }
+        let first = edges[start].from;
+        let mut current = start;
+        let mut spans = Vec::new();
+        loop {
+            if used[current] {
+                return None;
+            }
+            used[current] = true;
+            let edge = &edges[current];
+            spans.push(edge.span.clone());
+            if edge.to == first {
+                break;
+            }
+            current = *outgoing.get(&edge.to)?.first()?;
+        }
+        let signed_area = analytic_loop_signed_area(&spans);
+        if spans.len() < 2 || signed_area.abs() <= tolerance * tolerance {
+            return None;
+        }
+        loops.push(openrcad::sketch::ArrangementLoop { spans, signed_area });
+    }
+    if used.iter().any(|used| !used) || loops.is_empty() {
+        return None;
+    }
+
+    loops.sort_by(|left, right| right.area().total_cmp(&left.area()));
+    let mut outer = loops.remove(0);
+    if outer.signed_area < 0.0 {
+        reverse_analytic_loop(&mut outer);
+    }
+    for hole in &mut loops {
+        if hole.signed_area > 0.0 {
+            reverse_analytic_loop(hole);
+        }
+    }
+    // A straight-only union is represented more cleanly by the simplified
+    // polygon assembled below. Keeping every arrangement subspan here would
+    // reintroduce collinear face divisions (for example, two overlapping
+    // rectangles would tessellate as 28 triangles instead of the canonical
+    // box-like 12). Curves still need the analytic loop so a later shared-wall
+    // Join sees the exact same arc/cylinder rather than a sampled refit.
+    if std::iter::once(&outer)
+        .chain(loops.iter())
+        .flat_map(|loop_| loop_.spans.iter())
+        .all(|span| span.kind() == openrcad::geom2d::CurveKind2d::Line)
+    {
+        return None;
+    }
+    let area = outer.area() - loops.iter().map(|hole| hole.area()).sum::<f64>();
+    (area > tolerance * tolerance).then_some(openrcad::sketch::ArrangementRegion {
+        outer,
+        holes: loops,
+        area,
+    })
+}
+
+/// Merge selected arrangement tiles that share a complete boundary edge.
+/// Point/line tangency without a shared 2D edge is deliberately not considered
+/// connectivity: extruding that contact would create a non-manifold solid.
+pub(crate) fn prepare_extrude_regions(
+    regions: &[Region],
+    process: &[bool],
+) -> Vec<PreparedExtrudeRegion> {
+    let selected: Vec<usize> = process
+        .iter()
+        .enumerate()
+        .filter_map(|(index, selected)| (*selected).then_some(index))
+        .collect();
+    if selected.len() <= 1 {
+        return selected
+            .into_iter()
+            .map(|index| PreparedExtrudeRegion {
+                region: regions[index].clone(),
+                source_indices: vec![index],
+            })
+            .collect();
+    }
+
+    let tolerance = selected_region_tolerance(regions, &selected);
+    // Assign tolerance-close endpoints to one canonical vertex. Rounding to a
+    // fixed grid is insufficient: two points can be much closer than the
+    // tolerance yet fall on opposite sides of a cell boundary (the exact
+    // BugCase1 coordinates do). Searching the current cell and its neighbours
+    // makes the equivalence depend on physical distance instead.
+    let cell_for = |point: (f32, f32)| {
+        (
+            (point.0 / tolerance).floor() as i64,
+            (point.1 / tolerance).floor() as i64,
+        )
+    };
+    let mut canonical_positions: Vec<(f32, f32)> = Vec::new();
+    let mut canonical_cells: std::collections::HashMap<(i64, i64), Vec<RegionVertexKey>> =
+        std::collections::HashMap::new();
+    let mut point_keys: std::collections::HashMap<(u32, u32), RegionVertexKey> =
+        std::collections::HashMap::new();
+    for &region_index in &selected {
+        for loop_ in region_loops(&regions[region_index]) {
+            for &point in loop_ {
+                let bits = (point.0.to_bits(), point.1.to_bits());
+                if point_keys.contains_key(&bits) {
+                    continue;
+                }
+                let cell = cell_for(point);
+                let mut key = None;
+                'neighbours: for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let neighbour = (cell.0 + dx, cell.1 + dy);
+                        for &candidate in canonical_cells.get(&neighbour).into_iter().flatten() {
+                            let existing = canonical_positions[candidate];
+                            if (existing.0 - point.0).hypot(existing.1 - point.1) <= tolerance {
+                                key = Some(candidate);
+                                break 'neighbours;
+                            }
+                        }
+                    }
+                }
+                let key = key.unwrap_or_else(|| {
+                    let key = canonical_positions.len();
+                    canonical_positions.push(point);
+                    canonical_cells.entry(cell).or_default().push(key);
+                    key
+                });
+                point_keys.insert(bits, key);
+            }
+        }
+    }
+    let vertex_key = |point: (f32, f32)| -> RegionVertexKey {
+        point_keys[&(point.0.to_bits(), point.1.to_bits())]
+    };
+    let edge_key = |a: RegionVertexKey, b: RegionVertexKey| {
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    };
+
+    let mut parent: Vec<usize> = (0..selected.len()).collect();
+    fn find(parent: &mut [usize], index: usize) -> usize {
+        if parent[index] != index {
+            parent[index] = find(parent, parent[index]);
+        }
+        parent[index]
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (a, b) = (find(parent, a), find(parent, b));
+        if a != b {
+            parent[b] = a;
+        }
+    }
+
+    let mut edge_owner: std::collections::HashMap<(RegionVertexKey, RegionVertexKey), usize> =
+        std::collections::HashMap::new();
+    for (local_index, &region_index) in selected.iter().enumerate() {
+        for loop_ in region_loops(&regions[region_index]) {
+            for edge in loop_
+                .iter()
+                .copied()
+                .zip(loop_.iter().copied().cycle().skip(1))
+                .take(loop_.len())
+            {
+                let key = edge_key(vertex_key(edge.0), vertex_key(edge.1));
+                if let Some(&other) = edge_owner.get(&key) {
+                    union(&mut parent, local_index, other);
+                } else {
+                    edge_owner.insert(key, local_index);
+                }
+            }
+        }
+    }
+
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (local_index, region_index) in selected.into_iter().enumerate() {
+        let root = find(&mut parent, local_index);
+        groups.entry(root).or_default().push(region_index);
+    }
+
+    let mut prepared = Vec::new();
+    for mut source_indices in groups.into_values() {
+        source_indices.sort_unstable();
+        if source_indices.len() == 1 {
+            prepared.push(PreparedExtrudeRegion {
+                region: regions[source_indices[0]].clone(),
+                source_indices,
+            });
+            continue;
+        }
+
+        let mut positions: std::collections::HashMap<RegionVertexKey, ([f64; 2], usize)> =
+            std::collections::HashMap::new();
+        let mut unmatched: std::collections::HashMap<
+            (RegionVertexKey, RegionVertexKey),
+            Vec<RegionBoundaryEdge>,
+        > = std::collections::HashMap::new();
+        for &region_index in &source_indices {
+            for loop_ in region_loops(&regions[region_index]) {
+                for (a, b) in loop_
+                    .iter()
+                    .copied()
+                    .zip(loop_.iter().copied().cycle().skip(1))
+                    .take(loop_.len())
+                {
+                    let (from, to) = (vertex_key(a), vertex_key(b));
+                    for (key, point) in [(from, a), (to, b)] {
+                        let entry = positions.entry(key).or_insert(([0.0, 0.0], 0));
+                        entry.0[0] += f64::from(point.0);
+                        entry.0[1] += f64::from(point.1);
+                        entry.1 += 1;
+                    }
+                    let reverse = (to, from);
+                    let mut cancelled = false;
+                    if let Some(edges) = unmatched.get_mut(&reverse) {
+                        if edges.pop().is_some() {
+                            cancelled = true;
+                        }
+                        if edges.is_empty() {
+                            unmatched.remove(&reverse);
+                        }
+                    }
+                    if !cancelled {
+                        unmatched
+                            .entry((from, to))
+                            .or_default()
+                            .push(RegionBoundaryEdge { from, to });
+                    }
+                }
+            }
+        }
+
+        let edges: Vec<RegionBoundaryEdge> = unmatched.into_values().flatten().collect();
+        let mut outgoing: std::collections::HashMap<RegionVertexKey, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut incoming: std::collections::HashMap<RegionVertexKey, usize> =
+            std::collections::HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            outgoing.entry(edge.from).or_default().push(index);
+            *incoming.entry(edge.to).or_default() += 1;
+        }
+        let manifold = outgoing.values().all(|edges| edges.len() == 1)
+            && incoming.values().all(|count| *count == 1);
+        if !manifold {
+            prepared.extend(
+                source_indices
+                    .into_iter()
+                    .map(|index| PreparedExtrudeRegion {
+                        region: regions[index].clone(),
+                        source_indices: vec![index],
+                    }),
+            );
+            continue;
+        }
+
+        let point_for = |key: RegionVertexKey| {
+            let (sum, count) = positions[&key];
+            (
+                (sum[0] / count as f64) as f32,
+                (sum[1] / count as f64) as f32,
+            )
+        };
+        let mut used = vec![false; edges.len()];
+        let mut loops = Vec::new();
+        for start in 0..edges.len() {
+            if used[start] {
+                continue;
+            }
+            let first = edges[start].from;
+            let mut current = start;
+            let mut loop_ = Vec::new();
+            loop {
+                if used[current] {
+                    break;
+                }
+                used[current] = true;
+                let edge = edges[current];
+                loop_.push(point_for(edge.from));
+                if edge.to == first {
+                    break;
+                }
+                let Some(next) = outgoing.get(&edge.to).and_then(|next| next.first()) else {
+                    loop_.clear();
+                    break;
+                };
+                current = *next;
+            }
+            if loop_.len() >= 3 && signed_loop_area(&loop_).abs() > tolerance * tolerance {
+                loops.push(simplify_collinear_loop(loop_, tolerance));
+            }
+        }
+        if loops.is_empty() || used.iter().any(|used| !used) {
+            prepared.extend(
+                source_indices
+                    .into_iter()
+                    .map(|index| PreparedExtrudeRegion {
+                        region: regions[index].clone(),
+                        source_indices: vec![index],
+                    }),
+            );
+            continue;
+        }
+
+        loops.sort_by(|left, right| {
+            signed_loop_area(right)
+                .abs()
+                .total_cmp(&signed_loop_area(left).abs())
+        });
+        let mut outer = loops.remove(0);
+        if signed_loop_area(&outer) < 0.0 {
+            outer.reverse();
+        }
+        let mut holes = Vec::new();
+        let mut valid = true;
+        for mut loop_ in loops {
+            let interior = crate::sketch::polygon_interior_point(&loop_);
+            if !crate::sketch::point_in_polygon(interior, &outer) {
+                valid = false;
+                break;
+            }
+            if signed_loop_area(&loop_) > 0.0 {
+                loop_.reverse();
+            }
+            holes.push(loop_);
+        }
+        if !valid {
+            prepared.extend(
+                source_indices
+                    .into_iter()
+                    .map(|index| PreparedExtrudeRegion {
+                        region: regions[index].clone(),
+                        source_indices: vec![index],
+                    }),
+            );
+            continue;
+        }
+        let area = signed_loop_area(&outer).abs()
+            - holes
+                .iter()
+                .map(|hole| signed_loop_area(hole).abs())
+                .sum::<f32>();
+        let analytic = merge_analytic_regions(regions, &source_indices, tolerance);
+        prepared.push(PreparedExtrudeRegion {
+            region: Region {
+                boundary: outer,
+                holes,
+                area,
+                analytic,
+            },
+            source_indices,
+        });
+    }
+    prepared.sort_by_key(|region| region.source_indices[0]);
+    prepared
 }
 
 /// Fuse a body's parts so that adjacent/overlapping kept regions of a boolean

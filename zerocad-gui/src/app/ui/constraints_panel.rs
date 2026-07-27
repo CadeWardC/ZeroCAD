@@ -11,6 +11,7 @@ use crate::*;
 use zerocad_core::sketch::{Constraint, EntityId, SketchEntity, SolveOutcome};
 
 /// What the current selection can be constrained as.
+#[derive(Default)]
 struct SelectionShape {
     points: Vec<EntityId>,
     lines: Vec<EntityId>,
@@ -31,6 +32,298 @@ struct SplineEdit {
 }
 
 impl ZeroCadApp {
+    pub(crate) fn set_live_constraint_dimension(
+        &mut self,
+        id: EntityId,
+        dimension: Dimension,
+    ) -> bool {
+        let Some(constraint) = self.sketch_solver_model.as_mut().and_then(|model| {
+            model
+                .constraints
+                .iter_mut()
+                .find(|constraint| constraint.id() == id)
+        }) else {
+            return false;
+        };
+        set_constraint_dimension(constraint, dimension);
+        true
+    }
+
+    /// Dimension-tool selection is intentionally modal: the first point or line
+    /// is replaced by a compatible second pick without requiring Shift. This
+    /// keeps the common "pick two, place, type" workflow fast while preventing
+    /// unrelated geometry from accumulating in the selection.
+    pub(crate) fn select_for_dimension(&mut self, id: EntityId) {
+        let Some(model) = &self.sketch_solver_model else {
+            return;
+        };
+        let is_point = model.points.iter().any(|point| point.id == id);
+        let entity_kind = model
+            .entities
+            .iter()
+            .find(|entity| entity.id() == id)
+            .map(|entity| match entity {
+                SketchEntity::Line { .. } => 1_u8,
+                SketchEntity::Circle { .. } | SketchEntity::Arc { .. } => 2,
+                SketchEntity::Ellipse { .. } | SketchEntity::Spline { .. } => 3,
+            });
+
+        let selection = self.classify_selection();
+        let can_extend = if is_point {
+            selection.points.len() == 1
+                && selection.lines.is_empty()
+                && selection.circles.is_empty()
+                && selection.splines.is_empty()
+        } else if entity_kind == Some(1) {
+            selection.points.is_empty()
+                && selection.lines.len() == 1
+                && selection.circles.is_empty()
+                && selection.splines.is_empty()
+        } else {
+            false
+        };
+
+        if self.sketch_selected_ids.contains(&id) {
+            return;
+        }
+        if !can_extend {
+            self.sketch_selected_ids.clear();
+        }
+        self.sketch_selected_ids.push(id);
+
+        let selection = self.classify_selection();
+        self.status_msg = if selection.points.len() == 1 {
+            "Point selected — select a second point.".to_string()
+        } else if selection.points.len() == 2 {
+            "Two points selected — click away from the geometry to place the dimension.".to_string()
+        } else if selection.lines.len() == 1 {
+            "Line selected — click away for its length, or select a second line for an angle/parallel distance."
+                .to_string()
+        } else if selection.lines.len() == 2 {
+            let a = selection.lines[0];
+            let b = selection.lines[1];
+            if self.lines_share_endpoint(a, b) {
+                "Connected lines selected — click away to place the angle.".to_string()
+            } else if self.lines_are_parallel(a, b) {
+                "Parallel lines selected — click between them to place their distance.".to_string()
+            } else {
+                "These lines neither share a point nor run parallel; select a compatible pair."
+                    .to_string()
+            }
+        } else if selection.circles.len() == 1 {
+            "Circle/arc selected — click away from it to place the diameter/radius.".to_string()
+        } else {
+            "That geometry cannot be dimensioned by this selection.".to_string()
+        };
+    }
+
+    /// Infer and create the standard dimensional constraint represented by the
+    /// current Dimension-tool selection. The seed value is the geometry's
+    /// current measurement, so placement does not make the sketch jump.
+    pub(crate) fn place_inferred_dimension(
+        &mut self,
+        sketch_position: (f64, f64),
+        screen_position: egui::Pos2,
+    ) -> Result<(), String> {
+        let id = EntityId(self.sketch_next_entity_id);
+        let (constraint, initial, is_angle) =
+            self.infer_dimension_constraint(id, sketch_position)?;
+
+        self.push_working_sketch_undo();
+        self.sketch_next_entity_id = self.sketch_next_entity_id.saturating_add(1);
+        if let Some(model) = &mut self.sketch_solver_model {
+            model.constraints.push(constraint);
+        }
+        self.sketch_dimension_positions.insert(id, sketch_position);
+        self.sketch_selected_ids.clear();
+        self.sketch_selected_constraint = Some(id);
+        self.sketch_dimension_editor = Some(SketchDimensionEditor::new(
+            id,
+            initial,
+            is_angle,
+            screen_position,
+        ));
+        self.solve_live_sketch();
+        self.status_msg =
+            "Dimension placed — enter a value, expression, or variable; Enter accepts.".to_string();
+        Ok(())
+    }
+
+    fn infer_dimension_constraint(
+        &self,
+        id: EntityId,
+        placement: (f64, f64),
+    ) -> Result<(Constraint, Dimension, bool), String> {
+        let selection = self.classify_selection();
+        let model = self
+            .sketch_solver_model
+            .as_ref()
+            .ok_or_else(|| "Dimension requires editable sketch geometry.".to_string())?;
+
+        if selection.points.len() == 2
+            && selection.lines.is_empty()
+            && selection.circles.is_empty()
+            && selection.splines.is_empty()
+        {
+            let a = selection.points[0];
+            let b = selection.points[1];
+            let pa = model
+                .point(a)
+                .ok_or_else(|| "The first selected point no longer exists.".to_string())?
+                .pos;
+            let pb = model
+                .point(b)
+                .ok_or_else(|| "The second selected point no longer exists.".to_string())?
+                .pos;
+            let midpoint = ((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5);
+            let offset = (placement.0 - midpoint.0, placement.1 - midpoint.1);
+            let delta = ((pb.0 - pa.0) as f32, (pb.1 - pa.1) as f32);
+            if offset.1.abs() > offset.0.abs() * 1.3 {
+                let dimension = Dimension::literal(delta.0);
+                return Ok((
+                    Constraint::DistanceX {
+                        id,
+                        a,
+                        b,
+                        d: dimension.clone(),
+                    },
+                    dimension,
+                    false,
+                ));
+            }
+            if offset.0.abs() > offset.1.abs() * 1.3 {
+                let dimension = Dimension::literal(delta.1);
+                return Ok((
+                    Constraint::DistanceY {
+                        id,
+                        a,
+                        b,
+                        d: dimension.clone(),
+                    },
+                    dimension,
+                    false,
+                ));
+            }
+            let dimension = Dimension::literal((delta.0 * delta.0 + delta.1 * delta.1).sqrt());
+            return Ok((
+                Constraint::Distance {
+                    id,
+                    a,
+                    b,
+                    d: dimension.clone(),
+                },
+                dimension,
+                false,
+            ));
+        }
+
+        if selection.lines.len() == 1
+            && selection.points.is_empty()
+            && selection.circles.is_empty()
+            && selection.splines.is_empty()
+        {
+            let line = selection.lines[0];
+            let (a, b) = model
+                .entities
+                .iter()
+                .find_map(|entity| match entity {
+                    SketchEntity::Line { id, p0, p1, .. } if *id == line => Some((*p0, *p1)),
+                    _ => None,
+                })
+                .ok_or_else(|| "The selected line no longer exists.".to_string())?;
+            let dimension = Dimension::literal(self.current_point_distance(a, b));
+            return Ok((
+                Constraint::Distance {
+                    id,
+                    a,
+                    b,
+                    d: dimension.clone(),
+                },
+                dimension,
+                false,
+            ));
+        }
+
+        if selection.lines.len() == 2
+            && selection.points.is_empty()
+            && selection.circles.is_empty()
+            && selection.splines.is_empty()
+        {
+            let a = selection.lines[0];
+            let b = selection.lines[1];
+            if self.lines_share_endpoint(a, b) {
+                let dimension = Dimension::literal(self.current_line_angle(a, b));
+                return Ok((
+                    Constraint::Angle {
+                        id,
+                        a,
+                        b,
+                        angle_deg: dimension.clone(),
+                    },
+                    dimension,
+                    true,
+                ));
+            }
+            if self.lines_are_parallel(a, b) {
+                let dimension = Dimension::literal(self.current_line_distance(a, b));
+                return Ok((
+                    Constraint::LineDistance {
+                        id,
+                        a,
+                        b,
+                        d: dimension.clone(),
+                    },
+                    dimension,
+                    false,
+                ));
+            }
+            return Err(
+                "Two-line dimensions require connected lines for an angle or parallel lines for a distance."
+                    .to_string(),
+            );
+        }
+
+        if selection.circles.len() == 1
+            && selection.points.is_empty()
+            && selection.lines.is_empty()
+            && selection.splines.is_empty()
+        {
+            let circle = selection.circles[0];
+            let is_arc = model
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, SketchEntity::Arc { id, .. } if *id == circle));
+            let radius = self.current_circle_radius(circle);
+            if is_arc {
+                let dimension = Dimension::literal(radius);
+                return Ok((
+                    Constraint::Radius {
+                        id,
+                        circle,
+                        r: dimension.clone(),
+                    },
+                    dimension,
+                    false,
+                ));
+            }
+            let dimension = Dimension::literal(radius * 2.0);
+            return Ok((
+                Constraint::Diameter {
+                    id,
+                    circle,
+                    d: dimension.clone(),
+                },
+                dimension,
+                false,
+            ));
+        }
+
+        Err(
+            "Select one line, one circle/arc, two points, or two lines before placing a dimension."
+                .to_string(),
+        )
+    }
+
     pub(crate) fn show_constraints_panel(&mut self, ctx: &egui::Context) {
         if !self.is_sketch_mode || self.sketch_solver_model.is_none() {
             return;
@@ -259,6 +552,22 @@ impl ZeroCadApp {
                             b: sel.lines[1],
                             angle_deg: Dimension::literal(
                                 self.current_line_angle(sel.lines[0], sel.lines[1]),
+                            ),
+                        });
+                    }
+                    if btn(
+                        ui,
+                        "↔ Line distance",
+                        "Perpendicular distance between 2 parallel lines",
+                        only(0, 2, 0)
+                            && self.lines_are_parallel(sel.lines[0], sel.lines[1]),
+                    ) {
+                        add = Some(Constraint::LineDistance {
+                            id: alloc(),
+                            a: sel.lines[0],
+                            b: sel.lines[1],
+                            d: Dimension::literal(
+                                self.current_line_distance(sel.lines[0], sel.lines[1]),
                             ),
                         });
                     }
@@ -677,6 +986,7 @@ impl ZeroCadApp {
                 model.constraints.retain(|c| c.id() != id);
                 model.driven_dimensions.retain(|candidate| *candidate != id);
             }
+            self.sketch_dimension_positions.remove(&id);
             if self.sketch_selected_constraint == Some(id) {
                 self.sketch_selected_constraint = None;
             }
@@ -760,6 +1070,70 @@ impl ZeroCadApp {
         cross.atan2(dot).abs().to_degrees() as f32
     }
 
+    fn line_endpoint_ids(&self, id: EntityId) -> Option<(EntityId, EntityId)> {
+        self.sketch_solver_model
+            .as_ref()?
+            .entities
+            .iter()
+            .find_map(|entity| match entity {
+                SketchEntity::Line {
+                    id: entity_id,
+                    p0,
+                    p1,
+                    ..
+                } if *entity_id == id => Some((*p0, *p1)),
+                _ => None,
+            })
+    }
+
+    fn lines_share_endpoint(&self, a: EntityId, b: EntityId) -> bool {
+        let (Some((a0, a1)), Some((b0, b1))) =
+            (self.line_endpoint_ids(a), self.line_endpoint_ids(b))
+        else {
+            return false;
+        };
+        a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1
+    }
+
+    fn line_direction(&self, id: EntityId) -> Option<(f64, f64)> {
+        let model = self.sketch_solver_model.as_ref()?;
+        let (p0, p1) = self.line_endpoint_ids(id)?;
+        let p0 = model.point(p0)?.pos;
+        let p1 = model.point(p1)?.pos;
+        Some((p1.0 - p0.0, p1.1 - p0.1))
+    }
+
+    fn lines_are_parallel(&self, a: EntityId, b: EntityId) -> bool {
+        let (Some(da), Some(db)) = (self.line_direction(a), self.line_direction(b)) else {
+            return false;
+        };
+        let lengths = da.0.hypot(da.1) * db.0.hypot(db.1);
+        lengths > 1.0e-12 && (da.0 * db.1 - da.1 * db.0).abs() / lengths <= 1.0e-5
+    }
+
+    fn current_line_distance(&self, a: EntityId, b: EntityId) -> f32 {
+        let Some(model) = &self.sketch_solver_model else {
+            return 0.0;
+        };
+        let (Some((a0, a1)), Some((b0, _))) =
+            (self.line_endpoint_ids(a), self.line_endpoint_ids(b))
+        else {
+            return 0.0;
+        };
+        let (Some(a0), Some(a1), Some(b0)) = (model.point(a0), model.point(a1), model.point(b0))
+        else {
+            return 0.0;
+        };
+        let direction = (a1.pos.0 - a0.pos.0, a1.pos.1 - a0.pos.1);
+        let offset = (b0.pos.0 - a0.pos.0, b0.pos.1 - a0.pos.1);
+        let length = direction.0.hypot(direction.1);
+        if length <= 1.0e-12 {
+            0.0
+        } else {
+            ((direction.0 * offset.1 - direction.1 * offset.0).abs() / length) as f32
+        }
+    }
+
     fn current_circle_radius(&self, id: EntityId) -> f32 {
         self.sketch_solver_model
             .as_ref()
@@ -826,6 +1200,7 @@ impl ZeroCadApp {
             Constraint::Radius { circle, .. } => self.current_circle_radius(*circle),
             Constraint::Diameter { circle, .. } => self.current_circle_radius(*circle) * 2.0,
             Constraint::Angle { a, b, .. } => self.current_line_angle(*a, *b),
+            Constraint::LineDistance { a, b, .. } => self.current_line_distance(*a, *b),
             Constraint::SplineCurvature {
                 spline, at_start, ..
             } => self.current_spline_radius(*spline, *at_start),
@@ -895,7 +1270,101 @@ impl ZeroCadApp {
         // One glyph per constraint; stacked badges at a shared anchor step
         // sideways so overlapping constraints stay individually readable.
         let mut stacked: HashMap<(i64, i64), usize> = HashMap::new();
+        let variables = self.document.variable_map();
         for c in &model.constraints {
+            let is_conflict = conflict == Some(c.id());
+            let is_selected = self.sketch_selected_constraint == Some(c.id());
+
+            if let Some((_name, dimension)) = constraint_dimension(c) {
+                let automatic_anchor = match c {
+                    Constraint::Distance { a, b, .. }
+                    | Constraint::DistanceX { a, b, .. }
+                    | Constraint::DistanceY { a, b, .. } => match (pos(*a), pos(*b)) {
+                        (Some(pa), Some(pb)) => Some(((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5)),
+                        _ => None,
+                    },
+                    Constraint::Radius { circle, .. } | Constraint::Diameter { circle, .. } => {
+                        entity_anchor(*circle)
+                    }
+                    Constraint::Angle { a, .. } => entity_anchor(*a),
+                    Constraint::LineDistance { a, b, .. } => {
+                        match (entity_anchor(*a), entity_anchor(*b)) {
+                            (Some(a), Some(b)) => Some(((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)),
+                            _ => None,
+                        }
+                    }
+                    Constraint::SplineCurvature { spline, .. } => entity_anchor(*spline),
+                    _ => None,
+                };
+                let anchor = self
+                    .sketch_dimension_positions
+                    .get(&c.id())
+                    .copied()
+                    .or(automatic_anchor);
+                let Some(anchor) = anchor else { continue };
+                let at = to_screen(anchor);
+                let driven = model.is_driven_dimension(c.id());
+                let is_angle = matches!(c, Constraint::Angle { .. });
+                let measured = if driven {
+                    self.measured_constraint_value(c)
+                } else {
+                    dimension.resolve(&variables)
+                };
+                let display_value = if is_angle {
+                    measured as f64
+                } else {
+                    self.current_unit.from_base(measured as f64)
+                };
+                let prefix = match c {
+                    Constraint::Radius { .. } => "R ",
+                    Constraint::Diameter { .. } => "Ø ",
+                    _ => "",
+                };
+                let suffix = if is_angle {
+                    "°"
+                } else {
+                    self.current_unit.suffix()
+                };
+                let resolved = format!("{prefix}{display_value:.3} {suffix}");
+                let text = if driven {
+                    format!("({resolved})")
+                } else if let Some(expression) = dimension.expr.as_deref() {
+                    format!("{expression} = {resolved}")
+                } else {
+                    resolved
+                };
+                let (fill, foreground, outline) = if is_conflict {
+                    (
+                        egui::Color32::from_rgb(220, 38, 38),
+                        egui::Color32::WHITE,
+                        egui::Color32::from_rgb(185, 28, 28),
+                    )
+                } else if is_selected {
+                    (
+                        egui::Color32::from_rgb(37, 99, 235),
+                        egui::Color32::WHITE,
+                        egui::Color32::from_rgb(29, 78, 216),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235),
+                        egui::Color32::from_rgb(30, 41, 59),
+                        egui::Color32::from_rgb(148, 163, 184),
+                    )
+                };
+                let font = egui::FontId::proportional(11.0);
+                let galley = painter.layout_no_wrap(text, font, foreground);
+                let label_rect =
+                    egui::Rect::from_center_size(at, galley.size() + egui::vec2(12.0, 7.0));
+                painter.rect(label_rect, 3.0, fill, egui::Stroke::new(1.0, outline));
+                painter.galley(
+                    label_rect.center() - galley.size() * 0.5,
+                    galley,
+                    foreground,
+                );
+                continue;
+            }
+
             let (glyph, anchor) = match c {
                 Constraint::Coincident { a, .. } => ("◎", pos(*a)),
                 Constraint::Horizontal { line, .. } => ("H", entity_anchor(*line)),
@@ -929,6 +1398,13 @@ impl ZeroCadApp {
                 Constraint::Diameter { circle, .. } => ("⌀", entity_anchor(*circle)),
                 Constraint::SplineTangent { spline, .. } => ("⌁", entity_anchor(*spline)),
                 Constraint::SplineCurvature { spline, .. } => ("◠", entity_anchor(*spline)),
+                Constraint::LineDistance { a, b, .. } => (
+                    "↔",
+                    match (entity_anchor(*a), entity_anchor(*b)) {
+                        (Some(a), Some(b)) => Some(((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)),
+                        _ => None,
+                    },
+                ),
             };
             let Some(anchor) = anchor else { continue };
             let base = to_screen(anchor);
@@ -937,8 +1413,6 @@ impl ZeroCadApp {
             let at = egui::pos2(base.x + 10.0 + (*n as f32) * 13.0, base.y - 10.0);
             *n += 1;
 
-            let is_conflict = conflict == Some(c.id());
-            let is_selected = self.sketch_selected_constraint == Some(c.id());
             let (fill, fg) = if is_conflict {
                 (egui::Color32::from_rgb(220, 38, 38), egui::Color32::WHITE)
             } else if is_selected {
@@ -967,11 +1441,12 @@ impl ZeroCadApp {
 }
 
 /// Short human label for one constraint (the list row text).
-fn constraint_dimension(constraint: &Constraint) -> Option<(&'static str, Dimension)> {
+pub(crate) fn constraint_dimension(constraint: &Constraint) -> Option<(&'static str, Dimension)> {
     match constraint {
         Constraint::Distance { d, .. } => Some(("Distance", d.clone())),
         Constraint::DistanceX { d, .. } => Some(("Horizontal distance", d.clone())),
         Constraint::DistanceY { d, .. } => Some(("Vertical distance", d.clone())),
+        Constraint::LineDistance { d, .. } => Some(("Line distance", d.clone())),
         Constraint::Radius { r, .. } => Some(("Radius", r.clone())),
         Constraint::Diameter { d, .. } => Some(("Diameter", d.clone())),
         Constraint::Angle { angle_deg, .. } => Some(("Angle (degrees)", angle_deg.clone())),
@@ -982,12 +1457,13 @@ fn constraint_dimension(constraint: &Constraint) -> Option<(&'static str, Dimens
     }
 }
 
-fn set_constraint_dimension(constraint: &mut Constraint, dimension: Dimension) {
+pub(crate) fn set_constraint_dimension(constraint: &mut Constraint, dimension: Dimension) {
     match constraint {
         Constraint::Distance { d, .. }
         | Constraint::DistanceX { d, .. }
         | Constraint::DistanceY { d, .. }
-        | Constraint::Diameter { d, .. } => *d = dimension,
+        | Constraint::Diameter { d, .. }
+        | Constraint::LineDistance { d, .. } => *d = dimension,
         Constraint::Radius { r, .. } => *r = dimension,
         Constraint::Angle { angle_deg, .. } => *angle_deg = dimension,
         Constraint::SplineCurvature { radius, .. } => *radius = dimension,
@@ -1104,5 +1580,277 @@ pub(crate) fn constraint_label(c: &Constraint) -> String {
                 .as_deref()
                 .map_or_else(|| format!("{:.3}", radius.value), str::to_string)
         ),
+        Constraint::LineDistance { id, a, b, d } => format!(
+            "c{} ↔ Line distance e{} e{} = {}",
+            id.0,
+            a.0,
+            b.0,
+            d.expr
+                .as_deref()
+                .map_or_else(|| format!("{:.3}", d.value), str::to_string)
+        ),
+    }
+}
+
+#[cfg(test)]
+mod dimension_tool_tests {
+    use super::*;
+    use zerocad_core::sketch::{SketchPoint, SketchSolverModel};
+
+    fn app_with_model(model: SketchSolverModel, selected: Vec<EntityId>) -> ZeroCadApp {
+        let mut app = ZeroCadApp::new();
+        app.is_sketch_mode = true;
+        app.sketch_solver_model = Some(model);
+        app.sketch_selected_ids = selected;
+        app.sketch_next_entity_id = 100;
+        app
+    }
+
+    #[test]
+    fn one_line_infers_its_current_length() {
+        let model = SketchSolverModel {
+            points: vec![
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(2),
+                    pos: (3.0, 4.0),
+                },
+            ],
+            entities: vec![SketchEntity::Line {
+                id: EntityId(3),
+                p0: EntityId(1),
+                p1: EntityId(2),
+                derived_from: None,
+            }],
+            ..Default::default()
+        };
+        let app = app_with_model(model, vec![EntityId(3)]);
+        let (constraint, dimension, is_angle) = app
+            .infer_dimension_constraint(EntityId(100), (2.0, 3.0))
+            .expect("line dimension");
+        assert!(matches!(
+            constraint,
+            Constraint::Distance {
+                a: EntityId(1),
+                b: EntityId(2),
+                ..
+            }
+        ));
+        assert_eq!(dimension.value, 5.0);
+        assert!(!is_angle);
+    }
+
+    #[test]
+    fn circle_uses_diameter_and_arc_uses_radius() {
+        for (entity, expects_diameter) in [
+            (
+                SketchEntity::Circle {
+                    id: EntityId(2),
+                    center: EntityId(1),
+                    radius: 4.0,
+                    derived_from: None,
+                },
+                true,
+            ),
+            (
+                SketchEntity::Arc {
+                    id: EntityId(2),
+                    center: EntityId(1),
+                    start: EntityId(3),
+                    end: EntityId(4),
+                    radius: 4.0,
+                    clockwise: false,
+                    derived_from: None,
+                },
+                false,
+            ),
+        ] {
+            let model = SketchSolverModel {
+                points: vec![SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                }],
+                entities: vec![entity],
+                ..Default::default()
+            };
+            let app = app_with_model(model, vec![EntityId(2)]);
+            let (constraint, dimension, _) = app
+                .infer_dimension_constraint(EntityId(100), (6.0, 6.0))
+                .expect("radial dimension");
+            assert_eq!(
+                matches!(constraint, Constraint::Diameter { .. }),
+                expects_diameter
+            );
+            assert_eq!(dimension.value, if expects_diameter { 8.0 } else { 4.0 });
+        }
+    }
+
+    #[test]
+    fn two_point_placement_selects_horizontal_vertical_or_aligned_distance() {
+        let model = SketchSolverModel {
+            points: vec![
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(2),
+                    pos: (6.0, 4.0),
+                },
+            ],
+            ..Default::default()
+        };
+        let app = app_with_model(model, vec![EntityId(1), EntityId(2)]);
+
+        let (above, _, _) = app
+            .infer_dimension_constraint(EntityId(100), (3.0, 20.0))
+            .unwrap();
+        assert!(matches!(above, Constraint::DistanceX { .. }));
+
+        let (beside, _, _) = app
+            .infer_dimension_constraint(EntityId(101), (20.0, 2.0))
+            .unwrap();
+        assert!(matches!(beside, Constraint::DistanceY { .. }));
+
+        let (diagonal, _, _) = app
+            .infer_dimension_constraint(EntityId(102), (10.0, 10.0))
+            .unwrap();
+        assert!(matches!(diagonal, Constraint::Distance { .. }));
+    }
+
+    #[test]
+    fn two_lines_infer_an_angle_dimension() {
+        let model = SketchSolverModel {
+            points: vec![
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(2),
+                    pos: (1.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(3),
+                    pos: (0.0, 1.0),
+                },
+            ],
+            entities: vec![
+                SketchEntity::Line {
+                    id: EntityId(4),
+                    p0: EntityId(1),
+                    p1: EntityId(2),
+                    derived_from: None,
+                },
+                SketchEntity::Line {
+                    id: EntityId(5),
+                    p0: EntityId(1),
+                    p1: EntityId(3),
+                    derived_from: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let app = app_with_model(model, vec![EntityId(4), EntityId(5)]);
+        let (constraint, dimension, is_angle) = app
+            .infer_dimension_constraint(EntityId(100), (2.0, 2.0))
+            .unwrap();
+        assert!(matches!(constraint, Constraint::Angle { .. }));
+        assert!((dimension.value - 90.0).abs() < 1.0e-5);
+        assert!(is_angle);
+    }
+
+    #[test]
+    fn two_parallel_unconnected_lines_infer_perpendicular_distance() {
+        let model = SketchSolverModel {
+            points: vec![
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(2),
+                    pos: (10.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(3),
+                    pos: (2.0, 5.0),
+                },
+                SketchPoint {
+                    id: EntityId(4),
+                    pos: (12.0, 5.0),
+                },
+            ],
+            entities: vec![
+                SketchEntity::Line {
+                    id: EntityId(5),
+                    p0: EntityId(1),
+                    p1: EntityId(2),
+                    derived_from: None,
+                },
+                SketchEntity::Line {
+                    id: EntityId(6),
+                    p0: EntityId(3),
+                    p1: EntityId(4),
+                    derived_from: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let app = app_with_model(model, vec![EntityId(5), EntityId(6)]);
+        let (constraint, dimension, is_angle) = app
+            .infer_dimension_constraint(EntityId(100), (5.0, 2.5))
+            .unwrap();
+        assert!(matches!(constraint, Constraint::LineDistance { .. }));
+        assert!((dimension.value - 5.0).abs() < 1.0e-5);
+        assert!(!is_angle);
+    }
+
+    #[test]
+    fn disconnected_nonparallel_lines_are_not_misclassified_as_an_angle() {
+        let model = SketchSolverModel {
+            points: vec![
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(2),
+                    pos: (10.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(3),
+                    pos: (2.0, 5.0),
+                },
+                SketchPoint {
+                    id: EntityId(4),
+                    pos: (8.0, 9.0),
+                },
+            ],
+            entities: vec![
+                SketchEntity::Line {
+                    id: EntityId(5),
+                    p0: EntityId(1),
+                    p1: EntityId(2),
+                    derived_from: None,
+                },
+                SketchEntity::Line {
+                    id: EntityId(6),
+                    p0: EntityId(3),
+                    p1: EntityId(4),
+                    derived_from: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let app = app_with_model(model, vec![EntityId(5), EntityId(6)]);
+        let error = app
+            .infer_dimension_constraint(EntityId(100), (5.0, 2.5))
+            .unwrap_err();
+        assert!(error.contains("connected lines"));
+        assert!(error.contains("parallel lines"));
     }
 }

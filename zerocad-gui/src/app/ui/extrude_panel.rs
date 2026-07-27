@@ -1,6 +1,7 @@
 use crate::*;
 
 impl ZeroCadApp {
+    #[allow(dead_code)] // Retained while the stable workspace inspector replaces this panel.
     pub(crate) fn draw_extrude_panel(&mut self, ctx: &egui::Context) {
         // RIGHT PANEL: Extrude tool window, shown alongside the inline distance
         // box (the floating "n.nn mm" field, drawn after the viewport in

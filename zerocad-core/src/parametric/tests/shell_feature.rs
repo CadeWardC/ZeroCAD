@@ -50,7 +50,7 @@ fn shell_box_open_top_matches_cup_volume() {
 }
 
 #[test]
-fn shell_without_open_faces_warns() {
+fn shell_without_open_faces_creates_closed_box_cavity() {
     let mut g = ParametricGraph::new();
     g.add_feature(FeatureNode {
         id: "box_1".to_string(),
@@ -82,16 +82,18 @@ fn shell_without_open_faces_warns() {
         .unwrap();
     assert_eq!(output.bodies.len(), 1);
     assert!(
-        output.diagnostics.iter().any(|diagnostic| {
-            diagnostic.feature_id == "shell_2"
-                && diagnostic.code.as_str() == DiagnosticCode::FEATURE_UNRESOLVED
-        }),
+        output.diagnostics.is_empty(),
         "diagnostics: {:?}",
         output.diagnostics
     );
-    // Box untouched.
     let mp = output.bodies[0].1.mass_properties().unwrap();
-    assert!((mp.volume - 1000.0).abs() < 1e-3);
+    // Closed 10Â³ box with a 1 mm wall: subtract the enclosed 8Â³ cavity.
+    let expected = 1000.0 - 8.0 * 8.0 * 8.0;
+    assert!(
+        (mp.volume - expected).abs() / expected < 0.01,
+        "closed shell volume {} vs {expected}",
+        mp.volume
+    );
 }
 
 fn captured_face(face: &crate::mock_kernel::MeshFaceRef) -> FaceRef {

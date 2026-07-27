@@ -82,8 +82,11 @@ impl ZeroCadApp {
 
                                         ui.add_space(12.0);
 
-                                        // --- Onboarding ---
-                                        ui.checkbox(&mut self.show_onboarding, "Onboarding Screen");
+                                        // --- Start page ---
+                                        ui.checkbox(
+                                            &mut self.show_onboarding,
+                                            "Show start page on launch",
+                                        );
 
                                         ui.add_space(12.0);
 

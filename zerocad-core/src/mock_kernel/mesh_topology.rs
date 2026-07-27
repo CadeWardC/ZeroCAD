@@ -184,22 +184,34 @@ pub fn mesh_face_boundary_2d(
 /// so it contributes no edge, and back edges now get proper hidden-line removal
 /// instead of x-raying through the body.
 /// Group B-rep faces that lie on the *same* analytic surface (cylinder, torus,
-/// or cone), returning one group id per face in `solid.shell().faces()` order
-/// (which matches the mesh's `face_id`s). The kernel emits a cylindrical wall —
-/// a bored hole, a round boss — as 3 arc-faces (thirds), and a circular-rim
-/// fillet/chamfer band as one torus/cone sector per rim fragment; the seams
-/// between those sectors are construction artifacts, not design edges: drawn,
-/// they make a hole read as a notched circle and a rim fillet read as a
-/// segmented band. Faces sharing a group are recognised as one surface so those
+/// cone, or adjacent coplanar planes), returning one group id per face in
+/// `solid.shell().faces()` order (which matches the mesh's `face_id`s). The
+/// kernel emits a cylindrical wall — a bored hole, a round boss — as 3
+/// arc-faces (thirds), a circular-rim fillet/chamfer band as one torus/cone
+/// sector per rim fragment, and a full revolve's planar cap as 3 pie wedges
+/// (the same 120° stations); the seams between those sectors are construction
+/// artifacts, not design edges: drawn, they make a hole read as a notched
+/// circle, a rim fillet read as a segmented band, and a revolved disc read as
+/// sliced pie. Faces sharing a group are recognised as one surface so those
 /// seams can be suppressed (and the whole band selects as one face). Every
 /// other face (and each distinct surface) gets its own id, so only true
 /// same-surface faces match.
+///
+/// Planar faces group only when they are BOTH coplanar and edge-adjacent
+/// (union-find over shared boundary spans) — never by plane identity alone.
+/// Two disjoint coplanar faces (the two top lands of a U-shaped part) are
+/// distinct design faces and must keep separate ids; a revolve cap's wedges
+/// share their radial seam edges, so they merge. Curved surfaces keep the
+/// identity-only rule: a boolean can fragment one cylinder wall into
+/// non-adjacent pieces that must still read as one surface.
 pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
     // Quantized surface identity. Cylinder: (axis-foot xyz, axis-dir xyz,
     // radius, 0). Torus: (centre xyz, axis-dir xyz, major radius, minor
     // radius). Cone: (apex xyz, axis-dir xyz, tan(semi-angle), 0). A leading
     // tag keeps the kinds from ever colliding.
     type SurfSig = (u8, i64, i64, i64, i64, i64, i64, i64, i64);
+    /// A point quantized to the same grid, for geometric edge-span matching.
+    type QPnt = (i64, i64, i64);
     let q = |v: f64| (v * 1.0e4).round() as i64;
     // Sign-normalize a direction so +axis and -axis hash the same; returns the
     // (possibly flipped) components and whether it flipped.
@@ -291,28 +303,109 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
         ))
     };
 
-    let mut groups = Vec::with_capacity(solid.shell().faces().len());
-    let mut seen: HashMap<SurfSig, u32> = HashMap::new();
-    let mut next = 0u32;
-    for face in solid.shell().faces() {
-        let sig = match face.surface() {
-            Some(GeomSurface::Cylinder(c)) => Some(cyl_sig(c)),
-            Some(GeomSurface::Torus(t)) => Some(torus_sig(t)),
-            Some(GeomSurface::Cone(c)) => cone_sig(c),
-            _ => None,
-        };
-        let id = match sig {
-            Some(sig) => *seen.entry(sig).or_insert_with(|| {
-                let g = next;
-                next += 1;
-                g
-            }),
-            // Ungroupable: a fresh, unshareable id.
-            None => {
-                let g = next;
-                next += 1;
-                g
+    // A plane's identity is its normal *line* direction + signed offset from
+    // the origin along that (sign-canonicalized) normal. Used only as the
+    // coplanarity test for the adjacency merge below — never as a standalone
+    // grouping key.
+    let plane_sig = |s: &Plane| -> SurfSig {
+        let (dx, dy, dz, _) = canon_dir(s.normal());
+        let loc = s.location();
+        let d = loc.x() * dx + loc.y() * dy + loc.z() * dz;
+        (3, q(dx), q(dy), q(dz), q(d), 0, 0, 0, 0)
+    };
+
+    enum Kind {
+        /// Curved analytic surface: group by identity alone.
+        Analytic(SurfSig),
+        /// Plane: group only with coplanar edge-adjacent neighbours.
+        Planar(SurfSig),
+        /// Ungroupable: a fresh, unshareable id.
+        Other,
+    }
+    let faces = solid.shell().faces();
+    let kinds: Vec<Kind> = faces
+        .iter()
+        .map(|face| match face.surface() {
+            Some(GeomSurface::Cylinder(c)) => Kind::Analytic(cyl_sig(c)),
+            Some(GeomSurface::Torus(t)) => Kind::Analytic(torus_sig(t)),
+            Some(GeomSurface::Cone(c)) => cone_sig(c).map_or(Kind::Other, Kind::Analytic),
+            Some(GeomSurface::Plane(p)) => Kind::Planar(plane_sig(p)),
+            _ => Kind::Other,
+        })
+        .collect();
+
+    // Union-find over planar faces, joined when two faces are coplanar AND
+    // share a boundary span. Spans match geometrically (quantized endpoints +
+    // curve midpoint), not by EdgeId — sew usually unifies coincident edges but
+    // adjacent faces may still hold independent copies. The midpoint keeps a
+    // straight chord from ever matching an arc between the same endpoints.
+    let mut parent: Vec<usize> = (0..faces.len()).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let qp = |p: &Pnt| (q(p.x()), q(p.y()), q(p.z()));
+    let mut edge_owners: HashMap<(QPnt, QPnt, QPnt), Vec<usize>> = HashMap::new();
+    for (fi, face) in faces.iter().enumerate() {
+        if !matches!(kinds[fi], Kind::Planar(_)) {
+            continue;
+        }
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                let a = edge.source().point();
+                let b = edge.target().point();
+                let (qa, qb) = (qp(&a), qp(&b));
+                if qa == qb {
+                    continue; // degenerate span — never adjacency evidence
+                }
+                let mid = edge
+                    .curve()
+                    .map(|c| c.point(0.5 * (edge.first() + edge.last())))
+                    .unwrap_or_else(|| {
+                        Pnt::new(
+                            0.5 * (a.x() + b.x()),
+                            0.5 * (a.y() + b.y()),
+                            0.5 * (a.z() + b.z()),
+                        )
+                    });
+                let (lo, hi) = if qa <= qb { (qa, qb) } else { (qb, qa) };
+                edge_owners.entry((lo, hi, qp(&mid))).or_default().push(fi);
             }
+        }
+    }
+    for owners in edge_owners.values() {
+        for (k, &i) in owners.iter().enumerate() {
+            for &j in &owners[k + 1..] {
+                if let (Kind::Planar(si), Kind::Planar(sj)) = (&kinds[i], &kinds[j]) {
+                    if si == sj {
+                        let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                        parent[rj] = ri;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut groups = Vec::with_capacity(faces.len());
+    let mut seen: HashMap<SurfSig, u32> = HashMap::new();
+    let mut planar_roots: HashMap<usize, u32> = HashMap::new();
+    let mut next = 0u32;
+    for fi in 0..faces.len() {
+        let mut fresh = || {
+            let g = next;
+            next += 1;
+            g
+        };
+        let id = match &kinds[fi] {
+            Kind::Analytic(sig) => *seen.entry(*sig).or_insert_with(fresh),
+            Kind::Planar(_) => {
+                let root = find(&mut parent, fi);
+                *planar_roots.entry(root).or_insert_with(fresh)
+            }
+            Kind::Other => fresh(),
         };
         groups.push(id);
     }
@@ -1115,5 +1208,128 @@ pub(crate) fn angle_in_span_f32(angle: f32, start: f32, end: f32, tol: f32) -> b
             rel -= std::f32::consts::TAU;
         }
         rel <= -span + tol
+    }
+}
+
+#[cfg(test)]
+mod surface_group_tests {
+    use super::*;
+
+    /// Axis-adjacent rectangle in the XZ plane (y=0), the standard revolve
+    /// profile: x from `x0` to `x1`, z from `z0` to `z1`.
+    fn rect_profile(x0: f64, z0: f64, x1: f64, z1: f64) -> Face {
+        let p = [
+            Pnt::new(x0, 0.0, z0),
+            Pnt::new(x1, 0.0, z0),
+            Pnt::new(x1, 0.0, z1),
+            Pnt::new(x0, 0.0, z1),
+        ];
+        let edges: Vec<Edge> = (0..4)
+            .map(|i| Edge::between_points(p[i], p[(i + 1) % 4]))
+            .collect();
+        Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                p[0],
+                Dir::dy(),
+            ))),
+            Wire::from_edges(edges),
+        )
+    }
+
+    /// A full revolve's flat annular cap is emitted as three 120° pie wedges
+    /// (the kernel's thirds). Coplanar + edge-adjacent, so they must share ONE
+    /// surface group — the seams are construction artifacts, and the disc must
+    /// read/select as a single face. A washer has exactly 4 true surfaces.
+    #[test]
+    fn revolved_washer_caps_group_as_one_face_each() {
+        let face = rect_profile(1.0, 0.0, 2.0, 3.0);
+        let solid = openrcad::algo::revolve::revolve_operation(
+            &face,
+            Pnt::origin(),
+            Dir::dz(),
+            std::f64::consts::TAU,
+        )
+        .expect("washer revolve")
+        .value;
+        let faces = solid.shell().faces();
+        assert_eq!(faces.len(), 12, "4 profile edges x 3 stations");
+        let groups = cylinder_surface_groups(&solid);
+        let distinct: HashSet<u32> = groups.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "outer wall, inner wall, top cap, bottom cap; got groups {groups:?}"
+        );
+        // Each cap's three wedges carry one shared id.
+        for (target_z, name) in [(0.0f64, "bottom"), (3.0, "top")] {
+            let ids: HashSet<u32> = faces
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    matches!(
+                        f.surface(),
+                        Some(GeomSurface::Plane(p))
+                            if (p.location().z() - target_z).abs() < 1e-9
+                    )
+                })
+                .map(|(i, _)| groups[i])
+                .collect();
+            assert_eq!(ids.len(), 1, "{name} cap wedges must share one group");
+        }
+    }
+
+    /// Coplanar but NON-adjacent planar faces must keep distinct groups: the
+    /// two arm-tip faces of an extruded U both lie on y=3 but are separated by
+    /// the notch — grouping them would make a click select both. Plane
+    /// identity alone is never enough; adjacency is required.
+    #[test]
+    fn disjoint_coplanar_faces_stay_separate() {
+        let pts = [
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 3.0),
+            (2.0, 3.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+        ];
+        let edges: Vec<Edge> = (0..pts.len())
+            .map(|i| {
+                let (ax, ay) = pts[i];
+                let (bx, by) = pts[(i + 1) % pts.len()];
+                Edge::between_points(Pnt::new(ax, ay, 0.0), Pnt::new(bx, by, 0.0))
+            })
+            .collect();
+        let face = Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                Dir::dz(),
+            ))),
+            Wire::from_edges(edges),
+        );
+        let solid = openrcad::algo::prism::prism_operation(&face, GeomVec::new(0.0, 0.0, 2.0))
+            .expect("U prism")
+            .value;
+        let faces = solid.shell().faces();
+        let groups = cylinder_surface_groups(&solid);
+        // The two arm-tip laterals on the plane y=3.
+        let tip_ids: Vec<u32> = faces
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                matches!(
+                    f.surface(),
+                    Some(GeomSurface::Plane(p))
+                        if p.normal().y().abs() > 0.99 && (p.location().y() - 3.0).abs() < 1e-9
+                )
+            })
+            .map(|(i, _)| groups[i])
+            .collect();
+        assert_eq!(tip_ids.len(), 2, "expected the two arm-tip faces");
+        assert_ne!(
+            tip_ids[0], tip_ids[1],
+            "disjoint coplanar faces must not share a group"
+        );
     }
 }

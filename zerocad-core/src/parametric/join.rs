@@ -143,6 +143,14 @@ pub(crate) struct JoinTool {
     pub(crate) smooth: Option<KernelSolid>,
     pub(crate) exact: Option<KernelSolid>,
     pub(crate) dipped: Option<KernelSolid>,
+    pub(crate) profile: Option<JoinProfileSource>,
+}
+
+#[derive(Clone)]
+pub(crate) struct JoinProfileSource {
+    pub(crate) region: crate::sketch::Region,
+    pub(crate) depth: f32,
+    pub(crate) cs: CoordinateSystem,
 }
 
 /// Grow (`outward`) or shrink a closed 2D loop about its centroid so its
@@ -241,13 +249,73 @@ pub(crate) fn apply_join(
         }
 
         if !merged {
+            let detail = join_failure_detail(&original, tool, boolean_target);
             *live = original;
             warnings.push(format!(
                 "Join '{extrude_id}' could not produce one valid fused solid; \
-                 the feature was not applied and its input bodies were left unchanged."
+                 the feature was not applied and its input bodies were left unchanged.{detail}"
             ));
             return;
         }
+    }
+}
+
+/// Explain the geometric class of a failed Join without weakening its atomic
+/// validity checks. A Common operation distinguishes real volume overlap from
+/// boundary-only contact; the latter is the important modeling case because an
+/// edge/point tangent cannot be sewn into a manifold solid no matter how many
+/// times Fuse is retried.
+fn join_failure_detail(
+    bodies: &[LiveBody],
+    tool: &JoinTool,
+    boolean_target: Option<&str>,
+) -> &'static str {
+    let Some(reference) = tool.exact.as_ref().or(tool.smooth.as_ref()) else {
+        return "";
+    };
+    let Some(tool_bb) = crate::mock_kernel::solid_aabb(reference) else {
+        return "";
+    };
+    let mut aabb_contact = false;
+    let mut boundary_contact = false;
+    let mut volume_overlap = false;
+
+    for body in bodies {
+        if boolean_target.is_some_and(|target| target != body.id) {
+            continue;
+        }
+        for part in &body.parts {
+            let Some(part_bb) = crate::mock_kernel::solid_aabb(part) else {
+                continue;
+            };
+            if !crate::mock_kernel::aabbs_overlap(&part_bb, &tool_bb, 0.05) {
+                continue;
+            }
+            aabb_contact = true;
+            let connected = crate::mock_kernel::components_form_connected_material(&[
+                part.clone(),
+                reference.clone(),
+            ]);
+            match crate::mock_kernel::common_bodies_with_history(part, reference, None) {
+                Ok(common) if !common.bodies.is_empty() => volume_overlap = true,
+                Ok(_) if connected => boundary_contact = true,
+                Err(
+                    crate::mock_kernel::CommonBodiesError::Empty
+                    | crate::mock_kernel::CommonBodiesError::Failed(_),
+                ) if connected => boundary_contact = true,
+                _ => {}
+            }
+        }
+    }
+
+    if boundary_contact && !volume_overlap {
+        " The new material only touches the body along a boundary. Edge- or point-only \
+         tangency is non-manifold; make the profiles overlap slightly or draw the final \
+         outline as one profile."
+    } else if !aabb_contact {
+        " The new material does not touch or overlap the selected body."
+    } else {
+        ""
     }
 }
 
@@ -263,6 +331,19 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
         (Some(mesh), [part]) => Some(crate::mock_kernel::input_shell_face_names(mesh, part)),
         _ => None,
     };
+
+    // Resolve exact shared-profile boundaries before invoking the general
+    // boolean. Besides being more deterministic, this avoids feeding its
+    // splitter the coincident curved wall that this construction recognizes.
+    if let Some(rebuilt) = try_prismatic_boundary_join(body, tool) {
+        let named = input_mesh
+            .as_ref()
+            .map(|mesh| crate::mock_kernel::propagate_face_names(mesh, &rebuilt, &body.id));
+        body.parts = vec![rebuilt];
+        body.pristine = named.map(std::sync::Arc::new);
+        body.sketch_source = None;
+        return true;
+    }
 
     for (label, variant) in [
         ("smooth", tool.smooth.as_ref()),
@@ -324,6 +405,171 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
     false
 }
 
+fn loop_area(points: &[(f32, f32)]) -> f32 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(&(ax, ay), &(bx, by))| ax * by - bx * ay)
+        .sum::<f32>()
+        .abs()
+        * 0.5
+}
+
+fn source_region(source: &SketchExtrudeRegionSource) -> Option<crate::sketch::Region> {
+    let analytic = source.analytic.clone()?;
+    let area =
+        loop_area(&source.boundary) - source.holes.iter().map(|hole| loop_area(hole)).sum::<f32>();
+    (area > 0.0).then_some(crate::sketch::Region {
+        boundary: source.boundary.clone(),
+        holes: source.holes.clone(),
+        area,
+        analytic: Some(analytic),
+    })
+}
+
+fn frames_match(first: &CoordinateSystem, second: &CoordinateSystem) -> bool {
+    const FRAME_TOLERANCE: f32 = 1.0e-5;
+    first.origin.sub(second.origin).length() <= FRAME_TOLERANCE
+        && first.u.sub(second.u).length() <= FRAME_TOLERANCE
+        && first.v.sub(second.v).length() <= FRAME_TOLERANCE
+        && first.n.sub(second.n).length() <= FRAME_TOLERANCE
+}
+
+fn face_on_section(
+    face: &openrcad::topo::Face,
+    cs: &CoordinateSystem,
+    height: f32,
+    tolerance: f32,
+) -> bool {
+    let Some(wire) = face.outer_wire() else {
+        return false;
+    };
+    let points: Vec<_> = wire
+        .edges()
+        .iter()
+        .map(|edge| edge.start().point())
+        .collect();
+    !points.is_empty()
+        && points.iter().all(|point| {
+            let relative = crate::geometry::Vec3::new(
+                point.x() as f32 - cs.origin.x,
+                point.y() as f32 - cs.origin.y,
+                point.z() as f32 - cs.origin.z,
+            );
+            (relative.dot(cs.n) - height).abs() <= tolerance
+        })
+}
+
+/// Exact fallback for two compatible sketch prisms that share a full profile
+/// boundary but have different heights. The lower section is their 2D union;
+/// above the shorter sweep only the longer profile continues. Selecting the
+/// exposed cap from the shorter profile closes the transition without asking
+/// the 3D boolean to split a coincident cylindrical wall.
+fn try_prismatic_boundary_join(body: &LiveBody, tool: &JoinTool) -> Option<KernelSolid> {
+    let [body_part] = body.parts.as_slice() else {
+        return None;
+    };
+    let [body_source] = body.sketch_source.as_ref()?.regions.as_slice() else {
+        return None;
+    };
+    let tool_source = tool.profile.as_ref()?;
+    if !frames_match(&body_source.cs, &tool_source.cs)
+        || !body_source.depth.is_finite()
+        || !tool_source.depth.is_finite()
+        || body_source.depth.abs() <= f32::EPSILON
+        || tool_source.depth.abs() <= f32::EPSILON
+        || body_source.depth.signum() != tool_source.depth.signum()
+    {
+        return None;
+    }
+
+    let body_region = source_region(body_source)?;
+    if tool_source.region.analytic.is_none() {
+        return None;
+    }
+    let profiles = [body_region.clone(), tool_source.region.clone()];
+    let prepared = prepare_extrude_regions(&profiles, &[true, true]);
+    let [unified] = prepared.as_slice() else {
+        return None;
+    };
+    if unified.source_indices.len() != 2 || unified.region.analytic.is_none() {
+        // Point/line tangencies have no cancellable 2D boundary span and stay
+        // as two prepared regions. They must remain a clear Join failure.
+        return None;
+    }
+
+    let sign = body_source.depth.signum();
+    let common_depth = sign * body_source.depth.abs().min(tool_source.depth.abs());
+    let lower = crate::mock_kernel::extruded_sketch_region_solid(
+        &unified.region,
+        common_depth,
+        &body_source.cs,
+        &[],
+    )?;
+    let reference = tool.exact.as_ref().or(tool.smooth.as_ref())?;
+    const SECTION_TOLERANCE: f32 = 1.0e-5;
+    if (body_source.depth - tool_source.depth).abs() <= SECTION_TOLERANCE {
+        return valid_union_result(body_part, reference, &lower).then_some(lower);
+    }
+
+    let (tail_region, cap_region, longer_depth) =
+        if body_source.depth.abs() > tool_source.depth.abs() {
+            (&body_region, &tool_source.region, body_source.depth)
+        } else {
+            (&tool_source.region, &body_region, tool_source.depth)
+        };
+    let transition_origin = body_source
+        .cs
+        .origin
+        .add(body_source.cs.n.mul(common_depth));
+    let tail_cs = body_source.cs.with_origin(transition_origin);
+    let tail = crate::mock_kernel::extruded_sketch_region_solid(
+        tail_region,
+        longer_depth - common_depth,
+        &tail_cs,
+        &[],
+    )?;
+    let cap_source = crate::mock_kernel::extruded_sketch_region_solid(
+        cap_region,
+        common_depth,
+        &body_source.cs,
+        &[],
+    )?;
+
+    let mut faces: Vec<_> = lower
+        .shell()
+        .faces()
+        .iter()
+        .filter(|face| !face_on_section(face, &body_source.cs, common_depth, SECTION_TOLERANCE))
+        .cloned()
+        .collect();
+    faces.extend(
+        tail.shell()
+            .faces()
+            .iter()
+            .filter(|face| !face_on_section(face, &body_source.cs, common_depth, SECTION_TOLERANCE))
+            .cloned(),
+    );
+    faces.extend(
+        cap_source
+            .shell()
+            .faces()
+            .iter()
+            .filter(|face| face_on_section(face, &body_source.cs, common_depth, SECTION_TOLERANCE))
+            .cloned(),
+    );
+    let shell =
+        openrcad::algo::sew_with_policy(&faces, &openrcad::foundation::TolerancePolicy::STANDARD)
+            .ok()?
+            .value;
+    let rebuilt = KernelSolid::new(shell);
+    valid_union_result(body_part, reference, &rebuilt).then_some(rebuilt)
+}
+
 /// Fuse `tool` into a cloned part set and normalize the connected component it
 /// enters. The returned history is valid only for the single-part first union.
 fn union_variant_into_parts(
@@ -383,9 +629,13 @@ fn union_variant_into_parts(
                 index += 1;
             }
         }
-        remaining.push(merged);
-        remaining.sort_by_key(crate::mock_kernel::part_key);
-        return Some((remaining, history));
+        // A Join is complete only when the tool and every pre-existing part of
+        // the target body become one kernel solid. Returning the partially
+        // merged set here made the feature look successful while leaving the
+        // exact seam the operation promised to remove.
+        if remaining.is_empty() {
+            return Some((vec![merged], history));
+        }
     }
     None
 }

@@ -3,6 +3,7 @@ mod extrude_panel;
 mod feature_properties;
 mod feature_tree;
 mod frame;
+mod inspector;
 mod settings_window;
 mod status_bar;
 mod top_bar;

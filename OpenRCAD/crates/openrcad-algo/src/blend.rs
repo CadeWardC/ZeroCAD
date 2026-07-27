@@ -502,6 +502,7 @@ pub fn shell_cylinder_with_policy(
         false,
         straight,
     ));
+    let outer_wall_end = faces.len();
 
     // Inner wall (reversed so its material side faces the wall).
     let ri_floor = ring(floor, axis, xref, inner_r);
@@ -513,6 +514,7 @@ pub fn shell_cylinder_with_policy(
         true,
         straight,
     ));
+    let inner_wall_end = faces.len();
 
     // Bottom: outer cap + inner cap, or a rim annulus if open.
     if bottom_open {
@@ -530,6 +532,22 @@ pub fn shell_cylinder_with_policy(
     } else {
         faces.push(cap_face(ro_t, top, axis));
         faces.push(cap_face(ring(ceil, axis, xref, inner_r), ceil, axis.reversed()).reversed());
+    }
+
+    if open_faces.is_empty() {
+        let mut outer_faces = faces[..outer_wall_end].to_vec();
+        let mut inner_faces = faces[outer_wall_end..inner_wall_end].to_vec();
+        // With both caps retained, they were appended outer/inner for bottom,
+        // then outer/inner for top.
+        outer_faces.push(faces[inner_wall_end].clone());
+        inner_faces.push(faces[inner_wall_end + 1].clone());
+        outer_faces.push(faces[inner_wall_end + 2].clone());
+        inner_faces.push(faces[inner_wall_end + 3].clone());
+        let outer = sew_with_policy(&outer_faces, policy)
+            .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+        let inner = sew_with_policy(&inner_faces, policy)
+            .map_err(|error| BlendError::InvalidTolerancePolicy(error.to_string()))?;
+        return Solid::from_shells([outer, inner]).ok_or(BlendError::UnsupportedShape);
     }
 
     let shell = sew_with_policy(&faces, policy)
@@ -613,6 +631,17 @@ mod tests {
             .filter(|f| matches!(f.surface(), Some(GeomSurface::Offset(_))))
             .count();
         assert_eq!(offsets, 3, "inner wall is three offset faces");
+    }
+
+    #[test]
+    fn shell_cylinder_without_open_caps_has_void_boundary() {
+        let cylinder = unit_cyl();
+        let hollow = shell_cylinder(&detect_cylinder(&cylinder).unwrap(), 0.3, &[]).unwrap();
+
+        assert_eq!(hollow.shells().len(), 2);
+        assert_eq!(hollow.euler_characteristic(), 4);
+        assert!(hollow.validate().is_ok(), "{:?}", hollow.validate());
+        assert!(hollow.is_watertight());
     }
 
     #[test]

@@ -62,10 +62,10 @@ pub use sketch::{
     build_sketch_curves, detect_regions, detect_regions_with_provenance, effective_curves,
     effective_curves_solved, overlap_clusters, reflect_curves_across, shape_loops, shapes_cross,
     shapes_overlap, Circle, CornerKind, CornerMod, Dimension, ImportedSketchMetadata, LineSegment,
-    Region, RegionProvenance, RegionProvenanceFragment, RegionWithProvenance, ShapeLoop,
-    SketchCurves, SketchImportFormat, SketchMirror, SketchPatternError, SketchPatternEvaluation,
-    SketchPatternKind, SketchPatternOperation, SketchPatternSpanId, SketchShape, Spline,
-    SplineContinuity, SplineKind,
+    Region, RegionDegeneracy, RegionProvenance, RegionProvenanceFragment, RegionWithProvenance,
+    ShapeLoop, SketchCurves, SketchImportFormat, SketchMirror, SketchPatternError,
+    SketchPatternEvaluation, SketchPatternKind, SketchPatternOperation, SketchPatternSpanId,
+    SketchShape, Spline, SplineContinuity, SplineKind,
 };
 pub use stl::{
     meshes_to_3mf, meshes_to_binary_stl, read_stl_mesh, write_binary_stl, StlImportError,

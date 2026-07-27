@@ -226,7 +226,7 @@ impl ZeroCadApp {
         scale: f32,
         suppress_snap: bool,
     ) -> SnapResult {
-        if suppress_snap {
+        if suppress_snap || !self.snap_enabled {
             return SnapResult {
                 pos: raw,
                 kind: None,
@@ -660,6 +660,7 @@ impl ZeroCadApp {
             SketchTool::Mirror
             | SketchTool::Offset
             | SketchTool::Trim
+            | SketchTool::Dimension
             | SketchTool::Fillet
             | SketchTool::Chamfer => return None,
         };

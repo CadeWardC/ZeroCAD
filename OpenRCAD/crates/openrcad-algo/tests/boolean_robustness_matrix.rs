@@ -340,6 +340,23 @@ fn coplanar_two_box_flush_union() {
 }
 
 #[test]
+fn coincident_cylinder_fills_bore_back_to_one_box() {
+    let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    let bore_tool = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 4.0, 12.0);
+    let plug = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 0.0), Dir::dz()), 4.0, 10.0);
+    let bored = boolean_checked(&block, &bore_tool, BooleanOp::Cut).expect("make through bore");
+    let filled = assert_sound(
+        "coincident cylinder filling a bore",
+        boolean_checked(&bored, &plug, BooleanOp::Fuse),
+    );
+    assert_eq!(
+        filled.face_count(),
+        6,
+        "filling an exact cylindrical bore must restore one seam-free box"
+    );
+}
+
+#[test]
 fn coplanar_flush_through_cut() {
     // Tool spans the full Y/Z and removes a middle X-slab (severing the bar).
     let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);

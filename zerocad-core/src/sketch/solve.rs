@@ -502,6 +502,28 @@ impl System {
                         });
                     }
                 }
+                Constraint::LineDistance { a, b, d, .. } => {
+                    if let (Some(pa), Some(pb)) =
+                        (self.line_params(model, *a), self.line_params(model, *b))
+                    {
+                        // A line-to-line distance is only defined for parallel
+                        // lines. Keep parallelism inside the same durable
+                        // dimensional constraint.
+                        self.push_cross_or_dot(pa, pb, true);
+                        let (ax0, ay0, ax1, ay1) = pa;
+                        let (bx0, by0, _, _) = pb;
+                        let target = d.resolve(vars).abs() as f64;
+                        let indices = vec![ax0, ay0, ax1, ay1, bx0, by0];
+                        self.rows.push(numerical_row(indices, move |values| {
+                            let ux = values[ax1] - values[ax0];
+                            let uy = values[ay1] - values[ay0];
+                            let wx = values[bx0] - values[ax0];
+                            let wy = values[by0] - values[ay0];
+                            let cross = ux * wy - uy * wx;
+                            cross * cross - target * target * (ux * ux + uy * uy)
+                        }));
+                    }
+                }
                 Constraint::Concentric { a, b, .. } => {
                     let center = |entity_id: EntityId| {
                         model.entities.iter().find_map(|entity| match entity {
@@ -939,7 +961,8 @@ pub fn has_variable_bound_constraint(model: &SketchSolverModel) -> bool {
                 Constraint::Radius { r, .. } => r.expr.is_some(),
                 Constraint::DistanceX { d, .. }
                 | Constraint::DistanceY { d, .. }
-                | Constraint::Diameter { d, .. } => d.expr.is_some(),
+                | Constraint::Diameter { d, .. }
+                | Constraint::LineDistance { d, .. } => d.expr.is_some(),
                 Constraint::Angle { angle_deg, .. } => angle_deg.expr.is_some(),
                 Constraint::SplineCurvature { radius, .. } => radius.expr.is_some(),
                 _ => false,
@@ -1383,5 +1406,63 @@ mod tests {
         );
         assert!((direction.1.abs() - 5.0).abs() < 1.0e-6);
         assert!(points[&EntityId(4)].1.abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn line_distance_keeps_lines_parallel_at_the_requested_separation() {
+        let mut model = SketchSolverModel::default();
+        for (id, pos) in [
+            (0, (0.0, 0.0)),
+            (1, (10.0, 0.0)),
+            (2, (1.0, 5.0)),
+            (3, (11.0, 5.5)),
+        ] {
+            model.points.push(SketchPoint {
+                id: EntityId(id),
+                pos,
+            });
+        }
+        model.entities.extend([
+            SketchEntity::Line {
+                id: EntityId(4),
+                p0: EntityId(0),
+                p1: EntityId(1),
+                derived_from: None,
+            },
+            SketchEntity::Line {
+                id: EntityId(5),
+                p0: EntityId(2),
+                p1: EntityId(3),
+                derived_from: None,
+            },
+        ]);
+        model.constraints.extend([
+            Constraint::Fixed {
+                id: EntityId(6),
+                p: EntityId(0),
+            },
+            Constraint::Fixed {
+                id: EntityId(7),
+                p: EntityId(1),
+            },
+            Constraint::LineDistance {
+                id: EntityId(8),
+                a: EntityId(4),
+                b: EntityId(5),
+                d: Dimension {
+                    value: 5.0,
+                    expr: Some("gap".to_string()),
+                },
+            },
+        ]);
+
+        assert!(has_variable_bound_constraint(&model));
+        let report = solve_model(&model, &HashMap::from([("gap".to_string(), 8.0)]));
+        assert_eq!(report.outcome, SolveOutcome::Converged, "{report:?}");
+        let points: HashMap<_, _> = report.positions.iter().copied().collect();
+        let b0 = points[&EntityId(2)];
+        let b1 = points[&EntityId(3)];
+        assert!((b1.1 - b0.1).abs() < 1.0e-6, "second line is parallel");
+        assert!((b0.1.abs() - 8.0).abs() < 1.0e-6, "distance is 8 mm");
     }
 }

@@ -465,6 +465,35 @@ fn line_ellipse<A, B>(
     let qa = dx * dx / (major * major) + dy * dy / (minor * minor);
     let qb = 2.0 * (px * dx / (major * major) + py * dy / (minor * minor));
     let qc = px * px / (major * major) + py * py / (minor * minor) - 1.0;
+    // Treat a tolerance-close grazing line as one tangent intersection. With
+    // persisted f32 sketch coordinates, two edges that the arrangement already
+    // regards as coincident can differ by a few ulp. If one is meant to be
+    // tangent to a circle, that microscopic offset otherwise turns the tangent
+    // into two roots about sqrt(radius * offset) apart—large enough to create a
+    // long, needle-thin face even though the physical penetration is below the
+    // modeling tolerance.
+    //
+    // Measure the miss in model space, not by comparing the quadratic
+    // discriminant with a dimensionally unrelated epsilon. The radial
+    // parameter is sufficient here because the candidate is already within one
+    // tolerance of the ellipse; it also works for ordinary ellipses.
+    if qa > f64::EPSILON {
+        let line_parameter = -qb / (2.0 * qa);
+        if in_span(line_parameter, line_span, tolerance) {
+            let point = line.point(line_parameter);
+            if let Some(ellipse_parameter) =
+                ellipse_parameter(ellipse, point, ellipse_span, tolerance)
+            {
+                let on_ellipse = ellipse.point(ellipse_parameter);
+                if point.distance(&on_ellipse) <= tolerance {
+                    return vec![Intersection {
+                        first: line_parameter,
+                        second: ellipse_parameter,
+                    }];
+                }
+            }
+        }
+    }
     quadratic_roots(qa, qb, qc, tolerance)
         .into_iter()
         .filter_map(|line_parameter| {
@@ -871,6 +900,21 @@ fn compute_next<P>(
                 vertices,
             ))
         });
+        // Tangential contact leaves several half-edges on the SAME outgoing
+        // tangent — a circle resting on the line it touches, or two arcs
+        // meeting smoothly. Their angles are then equal (often bit-identical),
+        // the sort above ties arbitrarily on input order, and `next` below can
+        // step from one curve onto the other. The face walk crosses between the
+        // regions either side of the contact and fuses them into one.
+        //
+        // Break those ties by how each curve *leaves* the shared tangent:
+        // sample a short way along and compare signed lateral offset. That
+        // orders them by curvature using only `point`/`d1`, which every curve
+        // kind implements — no second derivative required. For edges whose
+        // angles merely differ slightly the lateral offset has the same sign as
+        // the angle difference, so widening the tie band cannot reorder a
+        // genuinely non-degenerate fan.
+        resolve_tangential_ties(edges, half_edges, atomics, vertices);
     }
     let mut position = vec![0; half_edges.len()];
     for edges in &outgoing {
@@ -897,12 +941,157 @@ fn half_edge_angle<P>(edge: HalfEdge, atomics: &[AtomicSpan<P>], vertices: &[Pnt
         let tangent = span.start_tangent();
         (tangent.x(), tangent.y())
     };
-    if tangent.0.hypot(tangent.1) > 1.0e-15 {
+    let angle = if tangent.0.hypot(tangent.1) > 1.0e-15 {
         tangent.1.atan2(tangent.0)
     } else {
         let from = vertices[edge.from];
         let to = vertices[edge.to];
         (to.y() - from.y()).atan2(to.x() - from.x())
+    };
+    // Canonicalize the ±π seam. atan2 maps (-x, +0.0) to +π but (-x, -0.0) to
+    // -π, and REVERSED half-edges of axis-aligned lines manufacture the -0.0
+    // systematically (negating a +0.0 tangent). Left unfixed, two half-edges
+    // leaving a vertex in the identical -x direction land at opposite ends of
+    // the sorted fan, the tangential tie between them never forms, and the
+    // resulting cyclic order is wrong — the face walk then swallows entire
+    // faces as there-and-back excursions (a tangent contact at a shared edge
+    // lost a whole rectangle this way).
+    if angle == -PI {
+        PI
+    } else {
+        angle
+    }
+}
+
+/// Angular width within which two outgoing half-edges are treated as sharing a
+/// tangent. Exact tangency makes the angles bit-identical; f32-rounded sketch
+/// input spreads them by a few ulp, so the band must be wider than zero.
+const TANGENT_TIE_RADIANS: f64 = 1.0e-6;
+
+/// The half-edge's parameter interval, oriented along the direction of travel
+/// (a reversed half-edge runs from `last` back to `first`).
+fn half_edge_domain<P>(edge: HalfEdge, atomics: &[AtomicSpan<P>]) -> (f64, f64) {
+    let span = &atomics[edge.atomic].span;
+    if edge.reversed {
+        (span.last, span.first)
+    } else {
+        (span.first, span.last)
+    }
+}
+
+/// Approximate arc length, from the parameter span and the speed at the start.
+/// Exact for lines and circles (the kinds that actually produce tangential
+/// contact); for a spline it only has to be the right order of magnitude, since
+/// it just sets how far along to probe.
+fn half_edge_arc_length<P>(edge: HalfEdge, atomics: &[AtomicSpan<P>]) -> f64 {
+    let span = &atomics[edge.atomic].span;
+    let (start, end) = half_edge_domain(edge, atomics);
+    let (_, derivative) = span.curve.d1(start);
+    let speed = derivative.x().hypot(derivative.y());
+    ((end - start).abs() * speed).max(f64::MIN_POSITIVE)
+}
+
+/// Signed lateral offset of the curve from `reference` after travelling roughly
+/// `probe` arc length from the vertex. Positive means it bends to the left of
+/// the shared tangent, which is the direction of increasing angle — so ordering
+/// by this value continues the angle sort rather than fighting it.
+fn half_edge_lateral<P>(
+    edge: HalfEdge,
+    atomics: &[AtomicSpan<P>],
+    vertices: &[Pnt2d],
+    reference: (f64, f64),
+    probe: f64,
+) -> f64 {
+    let span = &atomics[edge.atomic].span;
+    let (start, end) = half_edge_domain(edge, atomics);
+    let fraction = (probe / half_edge_arc_length(edge, atomics)).clamp(0.0, 1.0);
+    // Atomic spans carry no interior crossings, so sampling anywhere inside one
+    // stays in the same face and cannot jump past another vertex.
+    let sample = span.curve.point(start + (end - start) * fraction);
+    let origin = vertices[edge.from];
+    let (dx, dy) = (sample.x() - origin.x(), sample.y() - origin.y());
+    reference.0 * dy - reference.1 * dx
+}
+
+/// Re-order runs of `edges` that leave the vertex on a shared tangent, in place.
+/// `edges` must already be sorted by angle.
+fn resolve_tangential_ties<P>(
+    edges: &mut [usize],
+    half_edges: &[HalfEdge],
+    atomics: &[AtomicSpan<P>],
+    vertices: &[Pnt2d],
+) {
+    let angle = |edge: usize| half_edge_angle(half_edges[edge], atomics, vertices);
+    // The fan is CIRCULAR but the sorted list is linear, cut at the ±π seam. A
+    // tangential tie whose members straddle that seam (one at π−ε, one at
+    // −π+ε) would be invisible to the linear run scan below. Rotating the list
+    // so it begins just after the LARGEST angular gap moves the cut into open
+    // space where no tie can straddle it — a rotation changes nothing else,
+    // since only cyclic adjacency feeds the next-pointer construction. If
+    // every edge shares one tangent there is no gap to hide the seam in; the
+    // run scan then covers the whole list in one pass, which is exactly right.
+    let count = edges.len();
+    if count > 1 {
+        let mut split = 0;
+        let mut largest = f64::MIN;
+        for index in 0..count {
+            let here = angle(edges[index]);
+            let next = if index + 1 == count {
+                angle(edges[0]) + TAU
+            } else {
+                angle(edges[index + 1])
+            };
+            if next - here > largest {
+                largest = next - here;
+                split = (index + 1) % count;
+            }
+        }
+        if largest > TANGENT_TIE_RADIANS {
+            edges.rotate_left(split);
+        }
+    }
+    // After the rotation the list ascends in angle except for ONE descending
+    // transition where the sorted order wraps (the old list head). Compare
+    // consecutive angles CIRCULARLY: rem_euclid folds that wrap into its true
+    // angular gap — the largest at the vertex, so it always terminates a run —
+    // while ordinary ascending pairs are unaffected. A raw difference would be
+    // hugely negative at the wrap and `<=` would silently fuse two unrelated
+    // runs.
+    let angles: Vec<f64> = edges.iter().map(|&edge| angle(edge)).collect();
+    let circular_gap =
+        |previous: usize, current: usize| (angles[current] - angles[previous]).rem_euclid(TAU);
+    let mut start = 0;
+    while start < edges.len() {
+        let mut end = start + 1;
+        while end < edges.len() && circular_gap(end - 1, end) <= TANGENT_TIE_RADIANS {
+            end += 1;
+        }
+        if end - start > 1 {
+            let run = &mut edges[start..end];
+            // Compare every edge in the run at the same distance out, short
+            // enough to stay well inside the shortest of them.
+            let probe = run
+                .iter()
+                .map(|edge| half_edge_arc_length(half_edges[*edge], atomics))
+                .fold(f64::INFINITY, f64::min)
+                * 0.25;
+            let first = half_edges[run[0]];
+            let reference = {
+                let theta = half_edge_angle(first, atomics, vertices);
+                (theta.cos(), theta.sin())
+            };
+            run.sort_by(|first, second| {
+                half_edge_lateral(half_edges[*first], atomics, vertices, reference, probe)
+                    .total_cmp(&half_edge_lateral(
+                        half_edges[*second],
+                        atomics,
+                        vertices,
+                        reference,
+                        probe,
+                    ))
+            });
+        }
+        start = end;
     }
 }
 
@@ -1119,6 +1308,160 @@ mod tests {
             TAU,
             id,
         )
+    }
+
+    fn circle_at(id: u32, center: (f64, f64), radius: f64) -> CurveSpan<u32> {
+        CurveSpan::new(
+            GeomCurve2d::circle(Circle2d::from_center(
+                Pnt2d::new(center.0, center.1),
+                radius,
+            )),
+            0.0,
+            TAU,
+            id,
+        )
+    }
+
+    /// Two rectangles stacked on a shared edge, with a circle resting
+    /// tangentially on that edge. The tangency leaves three half-edges on one
+    /// outgoing tangent at the contact point; ordering them by angle alone tied
+    /// arbitrarily, so the face walk stepped from one rectangle onto the other
+    /// and reported a single fused face spanning both.
+    #[test]
+    fn circle_tangent_to_a_shared_edge_does_not_fuse_the_faces_either_side() {
+        let spans = vec![
+            line(1, (-3.0, -6.5), (40.0, -6.5)),
+            line(2, (40.0, -6.5), (40.0, 0.0)),
+            line(3, (40.0, 0.0), (-3.0, 0.0)),
+            line(4, (-3.0, 0.0), (-3.0, -6.5)),
+            line(5, (0.0, 0.0), (37.0, 0.0)),
+            line(6, (37.0, 0.0), (37.0, 0.4)),
+            line(7, (37.0, 0.4), (0.0, 0.4)),
+            line(8, (0.0, 0.4), (0.0, 0.0)),
+            // Lowest point is exactly (0.0, 0.0), on the shared edge.
+            circle_at(9, (0.0, 0.4), 0.4),
+        ];
+        let arrangement = arrange_curve_spans(&spans, ArrangementOptions::default()).unwrap();
+        let areas: Vec<f64> = arrangement.regions.iter().map(|r| r.area).collect();
+        let lower = 43.0 * 6.5;
+        assert!(
+            areas.iter().any(|area| (area - lower).abs() < 1.0e-6),
+            "the lower rectangle must remain its own face; got {areas:?}"
+        );
+        assert!(
+            areas.iter().all(|area| *area < lower + 1.0e-6),
+            "no face may span both rectangles; got {areas:?}"
+        );
+    }
+
+    /// Three stacked rectangles with a circle tangent to BOTH edges of the
+    /// thin middle band, so each contact point is a five-way vertex: two
+    /// collinear line pieces (deduplicated to one), a vertical edge, and the
+    /// circle's two tangent half-edges. The killer detail: the REVERSED
+    /// half-edge of an axis-aligned line negates a +0.0 tangent into -0.0, and
+    /// atan2(-0.0, -1) = -π while atan2(+0.0, -1) = +π — two half-edges
+    /// leaving in the identical direction landed at OPPOSITE ends of the
+    /// sorted fan, the tangential tie between them never formed, and the face
+    /// walk swallowed the top rectangle and half the circle as a
+    /// there-and-back excursion of the outer face (59.45 of 213.27 area
+    /// vanished). Guards the ±π seam canonicalization in `half_edge_angle`
+    /// plus the circular run detection in `resolve_tangential_ties`.
+    #[test]
+    fn four_way_tangential_contact_keeps_every_face() {
+        let spans = vec![
+            line(1, (-13.2, -13.4), (8.2, -13.4)),
+            line(2, (8.2, -13.4), (8.2, -6.9)),
+            line(3, (8.2, -6.9), (-13.2, -6.9)),
+            line(4, (-13.2, -6.9), (-13.2, -13.4)),
+            line(5, (-10.2, -6.9), (8.2, -6.9)),
+            line(6, (8.2, -6.9), (8.2, -6.1)),
+            line(7, (8.2, -6.1), (-10.2, -6.1)),
+            line(8, (-10.2, -6.1), (-10.2, -6.9)),
+            line(9, (-10.3, -6.1), (8.2, -6.1)),
+            line(10, (8.2, -6.1), (8.2, -2.9)),
+            line(11, (8.2, -2.9), (-10.3, -2.9)),
+            line(12, (-10.3, -2.9), (-10.3, -6.1)),
+            // Tangent to y = -6.9 at (-10.2, -6.9) and y = -6.1 at (-10.2, -6.1).
+            circle_at(13, (-10.2, -6.5), 0.4),
+        ];
+        let arrangement = arrange_curve_spans(&spans, ArrangementOptions::default()).unwrap();
+        let mut areas: Vec<f64> = arrangement.regions.iter().map(|r| r.area).collect();
+        areas.sort_by(f64::total_cmp);
+        let total: f64 = areas.iter().sum();
+        let half_disc = core::f64::consts::PI * 0.4 * 0.4 * 0.5;
+        let expected = [
+            half_disc,
+            half_disc,
+            18.4 * 0.8 - half_disc, // the band minus the tangent circle's right half
+            18.5 * 3.2,             // the top rectangle — the face the seam bug lost
+            21.4 * 6.5,             // the bottom rectangle
+        ];
+        assert_eq!(
+            areas.len(),
+            expected.len(),
+            "expected {} faces, got areas {areas:?}",
+            expected.len()
+        );
+        for (area, want) in areas.iter().zip(expected) {
+            assert!(
+                (area - want).abs() < 1.0e-6,
+                "face areas diverge: got {areas:?}"
+            );
+        }
+        assert!(
+            (total - 213.27).abs() < 0.01,
+            "total area must be preserved; got {total}"
+        );
+    }
+
+    /// Persisted BugCase1 coordinates: the long duplicate edge differs by only
+    /// 1.43e-6 mm from the rectangle edge, but its tiny slope used to turn the
+    /// intended circle tangency into two intersections 0.001 mm apart. That
+    /// produced a sixth, 5.9e-6 mm² triangular face. The physical penetration
+    /// is below the arrangement tolerance, so it must collapse to tangency.
+    #[test]
+    fn f32_near_tangent_duplicate_does_not_create_a_microscopic_region() {
+        let spans = vec![
+            line(1, (-13.2, -13.4), (8.2, -13.4)),
+            line(2, (8.2, -13.4), (8.2, -6.899999619)),
+            line(3, (8.2, -6.899999619), (-13.2, -6.899999619)),
+            line(4, (-13.2, -6.899999619), (-13.2, -13.4)),
+            // Duplicate support with the exact f32 slope from BugCase1.
+            line(5, (8.2, -6.899999619), (-10.2, -6.900001049)),
+            line(6, (-10.2, -6.900001049), (-10.2, -6.500000954)),
+            line(7, (-10.2, -6.900001049), (8.2, -6.900001049)),
+            line(8, (8.2, -6.900001049), (8.2, -6.100000858)),
+            line(9, (8.2, -6.100000858), (-10.2, -6.100000858)),
+            line(10, (-10.2, -6.100000858), (-10.2, -6.900001049)),
+            line(11, (8.2, -6.100000858), (-10.3, -6.100000858)),
+            line(12, (-10.3, -6.100000858), (-10.3, -2.900000811)),
+            line(13, (-10.3, -2.900000811), (8.2, -2.900000811)),
+            line(14, (8.2, -2.900000811), (8.2, -6.100000858)),
+            circle_at(15, (-10.2, -6.500000954), 0.400000006),
+        ];
+        let tolerance = 1.3e-5;
+        let arrangement = arrange_curve_spans(
+            &spans,
+            ArrangementOptions {
+                tolerance,
+                ..ArrangementOptions::default()
+            },
+        )
+        .unwrap();
+        let areas: Vec<f64> = arrangement
+            .regions
+            .iter()
+            .map(|region| region.area)
+            .collect();
+        assert_eq!(
+            areas.len(),
+            5,
+            "the tolerance sliver must disappear: {areas:?}"
+        );
+        assert!(
+            areas.iter().all(|area| *area > 0.1),
+            "no microscopic face may survive: {areas:?}"
+        );
     }
 
     #[test]

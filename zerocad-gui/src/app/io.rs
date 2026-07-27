@@ -89,6 +89,7 @@ impl ZeroCadApp {
         self.push_undo();
         self.document = Document::new();
         self.doc_created_unix = None;
+        self.current_document_path = None;
         self.set_body_meshes(Vec::new());
         self.selected_node_id = None;
         self.pending_visual = None;
@@ -206,6 +207,7 @@ impl ZeroCadApp {
                         " (hydrated)"
                     };
                     self.status_msg = format!("Design saved to {}{how}", done.path.display());
+                    self.current_document_path = Some(done.path.clone());
                     self.recent_files.record(&done.path);
                     if saved_revision == Some(self.document_revision) {
                         let snapshot = self.current_document_snapshot();
@@ -437,11 +439,454 @@ impl ZeroCadApp {
         Some(tex)
     }
 
+    /// Dedicated start page shown before a document is opened. Unlike the old
+    /// modal onboarding card this is a real application page: workspace panels
+    /// are not constructed behind it and no modeling input can leak through.
+    pub(crate) fn draw_start_page(&mut self, ctx: &egui::Context) {
+        let pal = self.pal();
+        let recents: Vec<(PathBuf, String)> = self
+            .recent_files
+            .entries
+            .iter()
+            .take(4)
+            .map(|entry| {
+                let name = entry
+                    .path
+                    .file_stem()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.path.to_string_lossy().into_owned());
+                (entry.path.clone(), name)
+            })
+            .collect();
+        let textures: Vec<Option<egui::TextureHandle>> = recents
+            .iter()
+            .map(|(path, _)| self.thumb_texture(ctx, path))
+            .collect();
+
+        let mut create_part = false;
+        let mut open_project = false;
+        let mut open_recent = None;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.surface_subtle))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let available_width = ui.available_width();
+                    let content_width = (available_width - 64.0).max(320.0).min(1080.0);
+                    let left_pad = ((available_width - content_width) * 0.5).max(0.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(left_pad);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(content_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // `allocate_ui_with_layout` inherits the parent's
+                                // clip bounds, so explicitly constrain the child.
+                                // Without this, multi-column rows can size against
+                                // the scroll area's virtual width and run offscreen.
+                                ui.set_width(content_width);
+                                ui.add_space(42.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 1.0;
+                                    ui.label(
+                                        egui::RichText::new("Welcome to ")
+                                            .size(30.0)
+                                            .color(pal.text_strong),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Zero")
+                                            .strong()
+                                            .size(30.0)
+                                            .color(pal.text_strong),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("CAD")
+                                            .strong()
+                                            .size(30.0)
+                                            .color(pal.accent),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new("Design, model, and build with precision.")
+                                        .size(14.0)
+                                        .color(pal.text_muted),
+                                );
+                                ui.add_space(24.0);
+                                ui.label(
+                                    egui::RichText::new("Start a Project")
+                                        .strong()
+                                        .size(15.0)
+                                        .color(pal.text_strong),
+                                );
+                                ui.add_space(8.0);
+
+                                ui.columns(4, |columns| {
+                                    create_part = Self::project_type_card(
+                                        &mut columns[0],
+                                        &pal,
+                                        icons::Icon::Cube,
+                                        "Part",
+                                        "Create a new 3D model.",
+                                        true,
+                                        false,
+                                    )
+                                    .clicked();
+                                    Self::project_type_card(
+                                        &mut columns[1],
+                                        &pal,
+                                        icons::Icon::Assembly,
+                                        "Assembly",
+                                        "Combine parts and sub-assemblies.",
+                                        false,
+                                        true,
+                                    );
+                                    Self::project_type_card(
+                                        &mut columns[2],
+                                        &pal,
+                                        icons::Icon::Sheet,
+                                        "Sheet / Sketch",
+                                        "Create 2D sketches and drawings.",
+                                        false,
+                                        true,
+                                    );
+                                    open_project = Self::project_type_card(
+                                        &mut columns[3],
+                                        &pal,
+                                        icons::Icon::Folder,
+                                        "Open Project",
+                                        "Open an existing ZeroCAD file.",
+                                        true,
+                                        false,
+                                    )
+                                    .clicked();
+                                });
+
+                                ui.add_space(20.0);
+                                ui.columns(2, |columns| {
+                                    Self::start_panel(
+                                        &mut columns[0],
+                                        &pal,
+                                        "Recent Projects",
+                                        |ui| {
+                                            if recents.is_empty() {
+                                                ui.add_space(24.0);
+                                                ui.label(
+                                                    egui::RichText::new("No recent projects yet.")
+                                                        .size(13.0)
+                                                        .color(pal.text_muted),
+                                                );
+                                                ui.label(
+                                                egui::RichText::new(
+                                                    "Saved and opened projects will appear here.",
+                                                )
+                                                .size(12.0)
+                                                .color(pal.text_faint),
+                                            );
+                                                ui.add_space(24.0);
+                                            } else {
+                                                for ((path, name), texture) in
+                                                    recents.iter().zip(textures.iter())
+                                                {
+                                                    if Self::recent_project_row(
+                                                        ui,
+                                                        &pal,
+                                                        path,
+                                                        name,
+                                                        texture.as_ref(),
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        open_recent = Some(path.clone());
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+
+                                    Self::start_panel(&mut columns[1], &pal, "Get Started", |ui| {
+                                        for (icon, title, description) in [
+                                            (
+                                                icons::Icon::Help,
+                                                "Learn the Basics",
+                                                "Step-by-step tutorials and guides.",
+                                            ),
+                                            (
+                                                icons::Icon::Settings,
+                                                "Keyboard Shortcuts",
+                                                "View and customize shortcuts.",
+                                            ),
+                                            (
+                                                icons::Icon::Cube,
+                                                "Example Projects",
+                                                "Explore sample models and projects.",
+                                            ),
+                                        ] {
+                                            Self::coming_soon_row(
+                                                ui,
+                                                &pal,
+                                                icon,
+                                                title,
+                                                description,
+                                            );
+                                        }
+                                    });
+                                });
+
+                                ui.add_space(18.0);
+                                ui.horizontal_centered(|ui| {
+                                    ui.checkbox(
+                                        &mut self.show_onboarding,
+                                        "Show this page on startup",
+                                    );
+                                });
+                                ui.add_space(24.0);
+                            },
+                        );
+                    });
+                });
+            });
+
+        if create_part {
+            self.new_design();
+            self.onboarding_visible = false;
+        } else if open_project {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Open ZeroCAD Design")
+                .add_filter("ZeroCAD Design", &["zcad", "zcadh"])
+                .pick_file()
+            {
+                self.load_design_from(path.clone());
+                if self.current_document_path.as_ref() == Some(&path) {
+                    self.onboarding_visible = false;
+                }
+            }
+        } else if let Some(path) = open_recent {
+            self.load_design_from(path.clone());
+            if self.current_document_path.as_ref() == Some(&path) {
+                self.onboarding_visible = false;
+            }
+        }
+    }
+
+    fn project_type_card(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        icon: icons::Icon,
+        title: &str,
+        description: &str,
+        enabled: bool,
+        coming_soon: bool,
+    ) -> egui::Response {
+        let size = egui::vec2(ui.available_width(), 100.0);
+        let sense = if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, response) = ui.allocate_exact_size(size, sense);
+        let hovered = enabled && response.hovered();
+        let border = if hovered || (enabled && title == "Part") {
+            pal.accent
+        } else {
+            pal.border
+        };
+        ui.painter().rect(
+            rect,
+            7.0,
+            if hovered {
+                pal.accent_soft
+            } else {
+                pal.surface
+            },
+            egui::Stroke::new(1.0, border),
+        );
+        let content = rect.shrink2(egui::vec2(15.0, 13.0));
+        let icon_rect = egui::Rect::from_min_size(content.min, egui::vec2(28.0, 28.0));
+        let foreground = if enabled {
+            pal.text_strong
+        } else {
+            pal.text_faint
+        };
+        icon.draw(
+            ui.painter(),
+            icon_rect,
+            if enabled { pal.accent } else { pal.text_faint },
+        );
+        ui.painter().text(
+            egui::pos2(icon_rect.right() + 12.0, content.top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(13.5),
+            foreground,
+        );
+        ui.painter().text(
+            egui::pos2(icon_rect.right() + 12.0, content.top() + 27.0),
+            egui::Align2::LEFT_TOP,
+            description,
+            egui::FontId::proportional(11.0),
+            if enabled {
+                pal.text_muted
+            } else {
+                pal.text_faint
+            },
+        );
+        if coming_soon {
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(content.right() - 82.0, content.bottom() - 23.0),
+                egui::vec2(82.0, 20.0),
+            );
+            ui.painter().rect(
+                badge,
+                4.0,
+                pal.surface_subtle,
+                egui::Stroke::new(1.0, pal.border),
+            );
+            ui.painter().text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                "COMING SOON",
+                egui::FontId::proportional(9.5),
+                pal.text_faint,
+            );
+        }
+        response
+    }
+
+    fn start_panel(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        title: &str,
+        content: impl FnOnce(&mut egui::Ui),
+    ) {
+        egui::Frame::none()
+            .fill(pal.surface)
+            .stroke(egui::Stroke::new(1.0, pal.border))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.set_min_height(310.0);
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(15.0)
+                        .color(pal.text_strong),
+                );
+                ui.add_space(10.0);
+                content(ui);
+            });
+    }
+
+    fn recent_project_row(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        path: &Path,
+        name: &str,
+        texture: Option<&egui::TextureHandle>,
+    ) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 66.0), egui::Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 5.0, pal.accent_soft);
+        }
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0, pal.border),
+        );
+        let image_rect = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(4.0, 6.0),
+            egui::vec2(58.0, 52.0),
+        );
+        if let Some(texture) = texture {
+            ui.painter().image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect(
+                image_rect,
+                5.0,
+                pal.surface_subtle,
+                egui::Stroke::new(1.0, pal.border),
+            );
+            icons::Icon::Cube.draw(ui.painter(), image_rect.shrink(15.0), pal.text_faint);
+        }
+        let text_left = image_rect.right() + 14.0;
+        ui.painter().text(
+            egui::pos2(text_left, rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            name,
+            egui::FontId::proportional(13.0),
+            pal.text_strong,
+        );
+        ui.painter().text(
+            egui::pos2(text_left, rect.top() + 36.0),
+            egui::Align2::LEFT_TOP,
+            path.to_string_lossy(),
+            egui::FontId::proportional(10.5),
+            pal.text_faint,
+        );
+        response
+    }
+
+    fn coming_soon_row(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        icon: icons::Icon,
+        title: &str,
+        description: &str,
+    ) {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0, pal.border),
+        );
+        let icon_rect = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(4.0, 17.0),
+            egui::vec2(28.0, 28.0),
+        );
+        icon.draw(ui.painter(), icon_rect, pal.text_faint);
+        ui.painter().text(
+            egui::pos2(icon_rect.right() + 12.0, rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(13.0),
+            pal.text_muted,
+        );
+        ui.painter().text(
+            egui::pos2(icon_rect.right() + 12.0, rect.top() + 36.0),
+            egui::Align2::LEFT_TOP,
+            description,
+            egui::FontId::proportional(10.5),
+            pal.text_faint,
+        );
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 82.0, rect.top() + 26.0),
+            egui::vec2(78.0, 20.0),
+        );
+        ui.painter().rect(
+            badge,
+            4.0,
+            pal.surface_subtle,
+            egui::Stroke::new(1.0, pal.border),
+        );
+        ui.painter().text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            "COMING SOON",
+            egui::FontId::proportional(9.0),
+            pal.text_faint,
+        );
+    }
+
     /// The centered Welcome modal: New / Open / Recent. Drawn over a dimmed,
     /// click-swallowing backdrop so the workspace beneath is inert. A no-op
     /// unless `onboarding_visible`. Esc, the Close button, or choosing any action
     /// dismisses it (without touching the persisted "show on startup" preference,
     /// which the footer checkbox edits separately).
+    #[allow(dead_code)] // Kept temporarily for compatibility with older UI entry points.
     pub(crate) fn draw_onboarding(&mut self, ctx: &egui::Context) {
         if !self.onboarding_visible {
             return;
@@ -645,6 +1090,7 @@ impl ZeroCadApp {
 
     /// One clickable Recent card: thumbnail (or placeholder) above the project
     /// name, with a hover highlight. Returns its click response.
+    #[allow(dead_code)] // Paired with the retained legacy onboarding renderer above.
     pub(crate) fn recent_card(
         ui: &mut egui::Ui,
         pal: &Palette,
@@ -738,6 +1184,7 @@ impl ZeroCadApp {
         self.current_unit = loaded.document.state.units;
         self.doc_created_unix = loaded.document.state.created_unix;
         self.document = loaded.document;
+        self.current_document_path = Some(path.clone());
         // Continue the user-facing feature id sequence after the largest loaded
         // suffix. Dependencies and semantic timelines determine evaluation.
         self.reseed_id_counter_from_graph();

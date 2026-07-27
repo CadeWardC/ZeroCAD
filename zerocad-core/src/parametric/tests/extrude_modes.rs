@@ -93,6 +93,228 @@ fn join_with_no_overlap_is_atomic_and_does_not_create_a_body() {
 }
 
 #[test]
+fn bugcase1_partial_height_split_circle_join_fuses_to_one_solid() {
+    let mut curves = SketchCurves::new();
+    for (a, b) in [
+        ((-13.2, -13.4), (8.2, -13.4)),
+        ((8.2, -13.4), (8.2, -6.8999996)),
+        ((8.2, -6.8999996), (-13.2, -6.8999996)),
+        ((-13.2, -6.8999996), (-13.2, -13.4)),
+        ((8.2, -6.8999996), (-10.2, -6.900001)),
+        ((-10.2, -6.900001), (-10.2, -6.500001)),
+        ((-10.2, -6.900001), (8.2, -6.900001)),
+        ((8.2, -6.900001), (8.2, -6.100001)),
+        ((8.2, -6.100001), (-10.2, -6.100001)),
+        ((-10.2, -6.100001), (-10.2, -6.900001)),
+        ((8.2, -6.100001), (-10.3, -6.100001)),
+        ((-10.3, -6.100001), (-10.3, -2.9000008)),
+        ((-10.3, -2.9000008), (8.2, -2.9000008)),
+        ((8.2, -2.9000008), (8.2, -6.100001)),
+    ] {
+        curves.add_line(a, b);
+    }
+    curves.add_circle((-10.2, -6.500001), 0.4);
+    let regions = crate::sketch::detect_regions(&curves);
+    assert_eq!(regions.len(), 5, "the tolerance sliver is normalized first");
+    let base_regions: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, region)| (region.area > 1.0).then_some(index))
+        .collect();
+    let circle_regions: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, region)| (region.area < 1.0).then_some(index))
+        .collect();
+    assert_eq!(base_regions.len(), 3);
+    assert_eq!(circle_regions.len(), 2);
+    let mut selected = vec![false; regions.len()];
+    for &index in &base_regions {
+        selected[index] = true;
+    }
+    let prepared = crate::parametric::extrude::prepare_extrude_regions(&regions, &selected);
+    assert_eq!(prepared.len(), 1, "the base faces must become one profile");
+    assert!(
+        prepared[0].region.analytic.is_some(),
+        "the merged profile must retain the exact circular notch"
+    );
+    let mut selected_circle = vec![false; regions.len()];
+    for &index in &circle_regions {
+        selected_circle[index] = true;
+    }
+    let prepared_circle =
+        crate::parametric::extrude::prepare_extrude_regions(&regions, &selected_circle);
+    assert_eq!(prepared_circle.len(), 1);
+
+    let mut graph = ParametricGraph::new();
+    add_sketch(&mut graph, "sketch", curves);
+    graph.add_feature(FeatureNode {
+        id: "base".into(),
+        name: "Base".into(),
+        feature: FeatureType::Extrude {
+            target: None,
+            depth: 2.2,
+            region_indices: base_regions,
+            mode: ExtrudeMode::NewBody,
+            depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
+        },
+    });
+    graph.add_dependency("sketch", "base");
+
+    let base_solids = graph
+        .debug_kernel_solids(&Default::default())
+        .expect("inspect normalized base extrusion");
+    assert_eq!(base_solids.len(), 1);
+    assert_eq!(
+        base_solids[0].1.len(),
+        1,
+        "adjacent selected faces must be extruded from one combined outline"
+    );
+
+    graph.add_feature(FeatureNode {
+        id: "plug".into(),
+        name: "Plug".into(),
+        feature: FeatureType::Extrude {
+            target: Some("base".into()),
+            // The real UI case uses a different extent from the base. This
+            // leaves a partial-height coincident cylindrical wall that must be
+            // split and sewn rather than mistaken for line-only tangency.
+            depth: 1.43,
+            region_indices: circle_regions,
+            mode: ExtrudeMode::Join,
+            depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
+        },
+    });
+    graph.add_dependency("sketch", "plug");
+    graph.add_dependency("base", "plug");
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&Default::default())
+        .expect("evaluate split-circle join");
+    assert!(
+        warnings.is_empty(),
+        "the partial-height shared wall must use the sectional Join fallback: {warnings:?}"
+    );
+    assert_eq!(bodies.len(), 1, "the joined result stays one body");
+    let solids = graph
+        .debug_kernel_solids(&Default::default())
+        .expect("inspect joined kernel body");
+    assert_eq!(solids.len(), 1);
+    assert_eq!(
+        solids[0].1.len(),
+        1,
+        "the Join must replace the segmented fallback with one kernel solid"
+    );
+    assert!(solids[0].1[0].is_watertight());
+    assert!(solids[0].1[0].health_report().is_healthy());
+
+    let mirror_face = bodies[0]
+        .1
+        .face_refs
+        .iter()
+        .find(|face| face.normal[0] > 0.99 && (face.centroid[0] - 8.2).abs() < 1.0e-3)
+        .expect("BugCase1 +X end face")
+        .clone();
+    graph.add_feature(FeatureNode {
+        id: "mirror".into(),
+        name: "Mirror".into(),
+        feature: FeatureType::Pattern {
+            source: "base".into(),
+            kind: PatternKind::Mirror {
+                plane: PlaneBase::YZ,
+                face: Some(FaceRef {
+                    centroid: mirror_face.centroid,
+                    normal: mirror_face.normal,
+                    topology: mirror_face.topology.map(|topology| TopologyFaceRef {
+                        body_id: topology.body_id,
+                        component_id: topology.component_id,
+                        topology_version: topology.topology_version,
+                        face_id: topology.face_id,
+                        surface_kind: topology.surface_kind,
+                        producer_feature_id: topology.producer_feature_id,
+                        source_entity_id: topology.source_entity_id,
+                    }),
+                }),
+                offset: 0.0,
+                offset_expr: None,
+                join: true,
+            },
+        },
+    });
+    graph.add_dependency("base", "mirror");
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let mirrored = graph
+        .evaluate_request(
+            &Default::default(),
+            EvaluationQuality::Final,
+            &EvaluationCancellation::new(1, latest),
+        )
+        .expect("evaluate joined mirror");
+    assert_eq!(
+        mirrored.bodies.len(),
+        1,
+        "the mirror must join to the source"
+    );
+    assert!(
+        mirrored.diagnostics.iter().all(|diagnostic| {
+            !diagnostic
+                .message
+                .contains("boolean result face could not be attributed")
+        }),
+        "joined mirror faces must retain input lineage: {:#?}",
+        mirrored.diagnostics
+    );
+}
+
+#[test]
+fn line_tangent_cylinder_join_reports_non_manifold_contact() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let mut circle = SketchCurves::new();
+    // The circle touches the box's x=10 side at one point in the sketch; after
+    // extrusion the solids share only one generator line.
+    circle.add_circle((13.0, 5.0), 3.0);
+    add_sketch(&mut graph, "sketch", circle);
+    graph.add_feature(FeatureNode {
+        id: "tangent_join".into(),
+        name: "Tangent Join".into(),
+        feature: FeatureType::Extrude {
+            target: Some("box".into()),
+            depth: 10.0,
+            region_indices: Vec::new(),
+            mode: ExtrudeMode::Join,
+            depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
+        },
+    });
+    graph.add_dependency("sketch", "tangent_join");
+    graph.add_dependency("box", "tangent_join");
+
+    let (_bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&Default::default())
+        .expect("evaluate line-tangent join");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("non-manifold")),
+        "the failed tangent Join must explain how to repair the profile: {warnings:?}"
+    );
+}
+
+#[test]
 fn multi_region_join_rolls_back_when_any_region_cannot_fuse() {
     use crate::geometry::Vec3;
 

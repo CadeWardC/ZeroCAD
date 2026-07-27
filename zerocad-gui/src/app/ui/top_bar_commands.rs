@@ -1,19 +1,201 @@
 use crate::*;
 
 impl ZeroCadApp {
+    /// Commit the active sketch and return to Model mode.
+    ///
+    /// Both the context-toolbar "Finish Sketch" button and the global "Model"
+    /// tab use this path so sketch completion behaves identically from either
+    /// control.
+    pub(crate) fn finish_active_sketch(&mut self, ctx: &egui::Context) {
+        if !self.is_sketch_mode && !self.is_plane_selection_mode {
+            return;
+        }
+
+        log::info!("Finishing sketch - saving it as a 2D object.");
+        self.commit_pending_corners();
+        self.recompute_sketch_regions();
+        let projection_sources: Vec<String> = self
+            .sketch_solver_model
+            .as_ref()
+            .map(|model| {
+                let mut sources: Vec<String> = model
+                    .projected_edges
+                    .iter()
+                    .map(|projection| projection.source_body.clone())
+                    .collect();
+                sources.sort();
+                sources.dedup();
+                sources
+            })
+            .unwrap_or_default();
+
+        // Editing an existing sketch updates the node in place so durable
+        // references and downstream dependencies survive.
+        if let Some(editing_id) = self.editing_sketch_id.clone() {
+            if !self.sketch_curves.is_empty() {
+                self.push_undo();
+                for idx in self.document.graph.node_indices() {
+                    if self.document.graph[idx].id != editing_id {
+                        continue;
+                    }
+                    if let FeatureType::Sketch {
+                        curves,
+                        shapes,
+                        corner_mods,
+                        mirrors,
+                        entity_ids,
+                        next_entity_id,
+                        solver,
+                        ..
+                    } = &mut self.document.graph[idx].feature
+                    {
+                        *curves = self.sketch_curves.clone();
+                        *shapes = self.sketch_shapes.clone();
+                        *corner_mods = self.sketch_corner_mods.clone();
+                        *mirrors = self.sketch_mirrors.clone();
+                        let mut ids = self.sketch_entity_ids.clone();
+                        let mut next = self.sketch_next_entity_id;
+                        while ids.len() < self.sketch_shapes.len() {
+                            ids.push(zerocad_core::sketch::EntityId(next));
+                            next += 1;
+                        }
+                        ids.truncate(self.sketch_shapes.len());
+                        *entity_ids = ids;
+                        *next_entity_id = next;
+                        *solver = self.sketch_solver_model.clone();
+                    }
+                    break;
+                }
+                for source in &projection_sources {
+                    self.document.add_dependency(source, &editing_id);
+                }
+                self.selected_node_id = Some(editing_id);
+                self.reset_sketch_state();
+                self.restore_camera(ctx);
+                self.is_sketch_mode = false;
+                self.is_plane_selection_mode = false;
+                self.reevaluate_geometry();
+                self.status_msg = "Sketch updated.".to_string();
+            } else {
+                self.status_msg = "Empty sketch edit discarded.".to_string();
+                self.reset_sketch_state();
+                self.restore_camera(ctx);
+                self.is_sketch_mode = false;
+                self.is_plane_selection_mode = false;
+            }
+            return;
+        }
+
+        if !self.sketch_curves.is_empty() {
+            let sketch_id = format!("sketch_{}", self.next_id());
+            let sketch_name = self.next_sketch_name();
+            log::info!(
+                "Saving sketch {} ({}) ({} curves, {} faces).",
+                sketch_id,
+                sketch_name,
+                self.sketch_curves.segments.len()
+                    + self.sketch_curves.circles.len()
+                    + self.sketch_curves.arcs.len()
+                    + self.sketch_curves.splines.len(),
+                self.detected_regions.len(),
+            );
+
+            let sketch_node = FeatureNode {
+                id: sketch_id.clone(),
+                name: sketch_name,
+                feature: FeatureType::Sketch {
+                    cs: self.active_sketch_cs,
+                    curves: self.sketch_curves.clone(),
+                    shapes: self.sketch_shapes.clone(),
+                    corner_mods: self.sketch_corner_mods.clone(),
+                    mirrors: self.sketch_mirrors.clone(),
+                    on_face: self.active_sketch_on_face,
+                    entity_ids: if self.sketch_entity_ids.len() == self.sketch_shapes.len() {
+                        self.sketch_entity_ids.clone()
+                    } else {
+                        zerocad_core::sketch::EntityId::sequence(self.sketch_shapes.len())
+                    },
+                    next_entity_id: self
+                        .sketch_next_entity_id
+                        .max(self.sketch_shapes.len() as u32),
+                    solver: self.sketch_solver_model.clone(),
+                },
+            };
+
+            self.push_undo();
+            self.document.add_feature(sketch_node);
+            for source in &projection_sources {
+                self.document.add_dependency(source, &sketch_id);
+            }
+            if let Some(fref) = self.active_sketch_face_ref.take() {
+                if let Some(body_id) = fref.topology.as_ref().and_then(|t| t.body_id.clone()) {
+                    self.document.add_dependency(&body_id, &sketch_id);
+                }
+                self.document
+                    .sketch_face_refs
+                    .insert(sketch_id.as_str().into(), fref);
+            }
+            if self.active_sketch_on_face && !self.active_face_boundary.is_empty() {
+                self.document
+                    .sketch_face_boundaries
+                    .insert(sketch_id.as_str().into(), self.active_face_boundary.clone());
+            }
+            if let Some(datum_id) = self.active_sketch_datum_ref.take() {
+                self.document.add_dependency(&datum_id, &sketch_id);
+                self.document
+                    .sketch_datum_refs
+                    .insert(sketch_id.as_str().into(), datum_id.into());
+            }
+            self.selected_node_id = Some(sketch_id);
+            self.reset_sketch_state();
+            self.status_msg =
+                "Sketch saved as a 2D object. Use the Extrude tool to make a body.".to_string();
+        } else {
+            self.status_msg = "Empty sketch discarded.".to_string();
+            log::warn!("Sketch discarded: nothing drawn.");
+            self.reset_sketch_state();
+        }
+
+        log::info!(
+            "Restoring previous 3D camera state: pitch: {:.2}, yaw: {:.2}",
+            self.pre_sketch_pitch,
+            self.pre_sketch_yaw
+        );
+        self.restore_camera(ctx);
+        self.is_sketch_mode = false;
+        self.is_plane_selection_mode = false;
+    }
+
     pub(crate) fn draw_top_bar_modeling_commands(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         active_sketching: bool,
     ) {
+        if !active_sketching {
+            let select = icons::Icon::Select.labeled_button(
+                ui,
+                "Select",
+                self.pal().accent_soft,
+                self.pal().accent_soft,
+                self.pal().accent,
+                egui::Stroke::new(1.0, self.pal().accent),
+            );
+            if select
+                .on_hover_text("Select faces, edges, bodies, and features")
+                .clicked()
+            {
+                self.status_msg = "Selection tool active.".to_string();
+            }
+        }
+
         // Draw Sketch / Finish Sketch CTA Button
         if active_sketching {
             let finish_btn = icons::Icon::Check.labeled_button(
                 ui,
                 "Finish Sketch",
-                egui::Color32::from_rgb(16, 185, 129), // Emerald Green CTA
-                egui::Color32::from_rgb(5, 150, 105),  // Hover
+                self.pal().accent,
+                egui::Color32::from_rgb(29, 78, 216),
                 egui::Color32::WHITE,
                 egui::Stroke::NONE,
             );
@@ -200,11 +382,11 @@ impl ZeroCadApp {
         } else {
             let draw_btn = icons::Icon::Sketch.labeled_button(
                 ui,
-                "Draw Sketch",
-                egui::Color32::from_rgb(241, 245, 249), // Clean slate grey
-                egui::Color32::from_rgb(226, 232, 240), // Hover
+                "Sketch",
+                self.pal().surface_subtle,
+                self.pal().accent_soft,
                 self.pal().text_strong,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                egui::Stroke::new(1.0, self.pal().border),
             );
             if draw_btn.on_hover_text("Enter sketch mode — sketches on the selected body face if one is selected, else pick an origin plane").clicked() {
                         // Context-aware: if exactly one body FACE is selected,
@@ -303,29 +485,40 @@ impl ZeroCadApp {
                     .labeled_button(
                         ui,
                         "Extrude",
-                        egui::Color32::from_rgb(241, 245, 249),
-                        egui::Color32::from_rgb(241, 245, 249),
+                        self.pal().surface_subtle,
+                        self.pal().surface_subtle,
                         self.pal().text_faint,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240)),
+                        egui::Stroke::new(1.0, self.pal().border),
                     )
                     .on_hover_text("Select one or more 3D faces first");
             }
 
             // REVOLVE: same sketch-face selection as Extrude, spun about an axis.
-            if extrude_enabled && self.revolve_op.is_none() {
-                let revolve_btn = icons::Icon::Extrude.labeled_button(
+            if self.revolve_op.is_none() {
+                let revolve_btn = icons::Icon::Revolve.labeled_button(
                     ui,
                     "Revolve",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
-                    self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    self.pal().surface_subtle,
+                    if extrude_enabled {
+                        self.pal().accent_soft
+                    } else {
+                        self.pal().surface_subtle
+                    },
+                    if extrude_enabled {
+                        self.pal().text_strong
+                    } else {
+                        self.pal().text_faint
+                    },
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if revolve_btn
-                    .on_hover_text(
-                        "Revolve the selected sketch face(s) about an axis in the sketch plane",
-                    )
+                    .on_hover_text(if extrude_enabled {
+                        "Revolve the selected sketch face(s) about an axis in the sketch plane"
+                    } else {
+                        "Select one or more sketch profiles first"
+                    })
                     .clicked()
+                    && extrude_enabled
                 {
                     self.begin_revolve_from_selection();
                 }
@@ -333,40 +526,114 @@ impl ZeroCadApp {
 
             // SWEEP: one selected profile face, swept along a path sketch.
             if self.sweep_op.is_none() {
-                if let Some((profile_sketch, profile_region)) = self.sweep_profile_candidate() {
-                    let sweep_btn = icons::Icon::Extrude.labeled_button(
-                        ui,
-                        "Sweep",
-                        egui::Color32::from_rgb(241, 245, 249),
-                        egui::Color32::from_rgb(226, 232, 240),
-                        self.pal().text_strong,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
-                    );
-                    if sweep_btn
-                        .on_hover_text("Sweep the selected profile along a path sketch")
-                        .clicked()
-                    {
+                let sweep_candidate = self.sweep_profile_candidate();
+                let sweep_enabled = sweep_candidate.is_some();
+                let sweep_btn = icons::Icon::Sweep.labeled_button(
+                    ui,
+                    "Sweep",
+                    self.pal().surface_subtle,
+                    if sweep_enabled {
+                        self.pal().accent_soft
+                    } else {
+                        self.pal().surface_subtle
+                    },
+                    if sweep_enabled {
+                        self.pal().text_strong
+                    } else {
+                        self.pal().text_faint
+                    },
+                    egui::Stroke::new(1.0, self.pal().border),
+                );
+                if sweep_btn
+                    .on_hover_text(if sweep_enabled {
+                        "Sweep the selected profile along a path sketch"
+                    } else {
+                        "Select a profile and a path sketch first"
+                    })
+                    .clicked()
+                {
+                    if let Some((profile_sketch, profile_region)) = sweep_candidate {
                         self.begin_sweep(profile_sketch, profile_region);
                     }
                 }
             }
 
             // LOFT: two or more selected sketch faces across sketches.
-            if let Some(sections) = self.loft_sections() {
-                let loft_btn = icons::Icon::Extrude.labeled_button(
-                    ui,
-                    &format!("Loft ({})", sections.len()),
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
-                    self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
-                );
-                if loft_btn
-                    .on_hover_text("Loft through the selected section profiles (creation order)")
-                    .clicked()
-                {
+            let loft_sections = self.loft_sections();
+            let loft_enabled = loft_sections.is_some();
+            let loft_label = loft_sections.as_ref().map_or_else(
+                || "Loft".to_string(),
+                |sections| format!("Loft ({})", sections.len()),
+            );
+            let loft_btn = icons::Icon::Loft.labeled_button(
+                ui,
+                &loft_label,
+                self.pal().surface_subtle,
+                if loft_enabled {
+                    self.pal().accent_soft
+                } else {
+                    self.pal().surface_subtle
+                },
+                if loft_enabled {
+                    self.pal().text_strong
+                } else {
+                    self.pal().text_faint
+                },
+                egui::Stroke::new(1.0, self.pal().border),
+            );
+            if loft_btn
+                .on_hover_text(if loft_enabled {
+                    "Loft through the selected section profiles (creation order)"
+                } else {
+                    "Select profiles from two or more sketches to create a loft"
+                })
+                .clicked()
+            {
+                if let Some(sections) = loft_sections {
                     self.commit_loft(sections);
                 }
+            }
+
+            // Keep the primary modeling vocabulary stable even before its
+            // required selection exists. This avoids a toolbar that jumps
+            // around as the user selects geometry.
+            if self.selected_body_edges().is_none() {
+                for (icon, label, hint) in [
+                    (
+                        icons::Icon::Fillet,
+                        "Fillet",
+                        "Select one or more body edges to fillet",
+                    ),
+                    (
+                        icons::Icon::Chamfer,
+                        "Chamfer",
+                        "Select one or more body edges to chamfer",
+                    ),
+                ] {
+                    icon.labeled_button(
+                        ui,
+                        label,
+                        self.pal().surface_subtle,
+                        self.pal().surface_subtle,
+                        self.pal().text_faint,
+                        egui::Stroke::new(1.0, self.pal().border),
+                    )
+                    .on_hover_text(hint);
+                }
+            }
+            if self.shell_candidate().is_none() {
+                icons::Icon::Shell
+                    .labeled_button(
+                        ui,
+                        "Shell",
+                        self.pal().surface_subtle,
+                        self.pal().surface_subtle,
+                        self.pal().text_faint,
+                        egui::Stroke::new(1.0, self.pal().border),
+                    )
+                    .on_hover_text(
+                        "Double-click a body for a closed hollow, or select face(s) to open",
+                    );
             }
 
             if sel > 0 {
@@ -468,29 +735,45 @@ impl ZeroCadApp {
                 .flatten();
         if all_edge_body.is_some() {
             ui.separator();
-            ui.label(
-                egui::RichText::new("Modify All Edges")
-                    .strong()
-                    .size(12.0)
-                    .color(self.pal().text_strong),
+            let popup_id = ui.make_persistent_id("all_edges_flyout");
+            let button = icons::Icon::Fillet
+                .labeled_button(
+                    ui,
+                    "All Edges  ▾",
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
+                    self.pal().text_strong,
+                    egui::Stroke::new(1.0, self.pal().border),
+                )
+                .on_hover_text("Fillet or chamfer every durable edge atomically");
+            if button.clicked() {
+                ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+            }
+            egui::popup_below_widget(
+                ui,
+                popup_id,
+                &button,
+                egui::PopupCloseBehavior::CloseOnClickOutside,
+                |ui| {
+                    ui.set_min_width(150.0);
+                    if icons::Icon::Fillet
+                        .menu_button(ui, "Fillet All")
+                        .on_hover_text("Round every durable edge atomically; report all blockers")
+                        .clicked()
+                    {
+                        self.begin_all_edge_mod(CornerKind::Fillet);
+                        ui.memory_mut(|memory| memory.close_popup());
+                    }
+                    if icons::Icon::Chamfer
+                        .menu_button(ui, "Chamfer All")
+                        .on_hover_text("Bevel every durable edge atomically; report all blockers")
+                        .clicked()
+                    {
+                        self.begin_all_edge_mod(CornerKind::Chamfer);
+                        ui.memory_mut(|memory| memory.close_popup());
+                    }
+                },
             );
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if icons::Icon::Fillet
-                    .menu_button(ui, "Fillet All")
-                    .on_hover_text("Round every durable edge atomically; report all blockers")
-                    .clicked()
-                {
-                    self.begin_all_edge_mod(CornerKind::Fillet);
-                }
-                if icons::Icon::Chamfer
-                    .menu_button(ui, "Chamfer All")
-                    .on_hover_text("Bevel every durable edge atomically; report all blockers")
-                    .clicked()
-                {
-                    self.begin_all_edge_mod(CornerKind::Chamfer);
-                }
-            });
         }
 
         // HOLE: drill into the selected body face.
@@ -504,10 +787,10 @@ impl ZeroCadApp {
                 let hole_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Hole",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if hole_btn
                     .on_hover_text(
@@ -532,10 +815,10 @@ impl ZeroCadApp {
                 let thread_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Thread",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if thread_btn
                     .on_hover_text(
@@ -548,23 +831,27 @@ impl ZeroCadApp {
             }
         }
 
-        // SHELL: hollow the selected body, removing the selected face(s).
+        // SHELL: hollow a double-clicked whole body, or remove selected face(s).
         if !active_sketching
             && self.extrude_op.is_none()
             && self.edge_mod_op.is_none()
             && self.shell_op.is_none()
         {
             if let Some((target, fids)) = self.shell_candidate() {
-                let shell_btn = icons::Icon::Extrude.labeled_button(
+                let shell_btn = icons::Icon::Shell.labeled_button(
                     ui,
                     "Shell",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if shell_btn
-                    .on_hover_text("Hollow the body, removing the selected face(s)")
+                    .on_hover_text(if fids.is_empty() {
+                        "Hollow the entire body with no open faces"
+                    } else {
+                        "Hollow the body, removing the selected face(s)"
+                    })
                     .clicked()
                 {
                     self.begin_shell(target, fids);
@@ -583,10 +870,10 @@ impl ZeroCadApp {
                 let draft_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Draft",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if draft_btn
                     .on_hover_text("Taper the selected planar side face(s)")
@@ -641,10 +928,10 @@ impl ZeroCadApp {
                 let join_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Combine",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if join_btn
                     .on_hover_text("Join, cut, or keep the common volume of two bodies")
@@ -667,10 +954,10 @@ impl ZeroCadApp {
                 let move_btn = icons::Icon::Mirror.labeled_button(
                     ui,
                     "Move",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if move_btn
                     .on_hover_text("Translate the selected body or align one of its faces")
@@ -681,10 +968,10 @@ impl ZeroCadApp {
                 let split_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Split",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if split_btn
                     .on_hover_text("Split the selected body with an origin, datum, or planar face")
@@ -695,10 +982,10 @@ impl ZeroCadApp {
                 let scale_btn = icons::Icon::Mirror.labeled_button(
                     ui,
                     "Scale",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if scale_btn
                     .on_hover_text("Uniformly scale the selected body about an explicit pivot")
@@ -721,10 +1008,10 @@ impl ZeroCadApp {
                 let pattern_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Feature Pattern",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if pattern_btn
                     .on_hover_text("Repeat the selected Hole or Join/Cut operation")
@@ -737,10 +1024,10 @@ impl ZeroCadApp {
                 let pattern_btn = icons::Icon::Extrude.labeled_button(
                     ui,
                     "Pattern",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if pattern_btn
                     .on_hover_text("Create a linear or circular array of the selected body")
@@ -751,10 +1038,10 @@ impl ZeroCadApp {
                 let mirror_btn = icons::Icon::Mirror.labeled_button(
                     ui,
                     "Mirror",
-                    egui::Color32::from_rgb(241, 245, 249),
-                    egui::Color32::from_rgb(226, 232, 240),
+                    self.pal().surface_subtle,
+                    self.pal().accent_soft,
                     self.pal().text_strong,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                    egui::Stroke::new(1.0, self.pal().border),
                 );
                 if mirror_btn
                     .on_hover_text("Mirror the selected body across a picked plane or planar face")
@@ -774,13 +1061,13 @@ impl ZeroCadApp {
             let selected_datum_edge = self.selected_datum_edge();
             let selected_datum_vertices = self.selected_datum_vertices();
             let datum_btn_id = ui.make_persistent_id("datum_menu_dropdown");
-            let datum_btn = icons::Icon::Sketch.labeled_button(
+            let datum_btn = icons::Icon::Datum.labeled_button(
                 ui,
-                "Datum  ▾",
-                egui::Color32::from_rgb(241, 245, 249),
-                egui::Color32::from_rgb(226, 232, 240),
+                "Datum",
+                self.pal().surface_subtle,
+                self.pal().accent_soft,
                 self.pal().text_strong,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+                egui::Stroke::new(1.0, self.pal().border),
             );
             let datum_btn = datum_btn.on_hover_text("Create a reference plane, axis, or point");
             if datum_btn.clicked() {
@@ -904,5 +1191,22 @@ impl ZeroCadApp {
                             .strong()
                     );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_active_sketch_returns_to_model_mode() {
+        let mut app = ZeroCadApp::new();
+        app.is_sketch_mode = true;
+
+        app.finish_active_sketch(&egui::Context::default());
+
+        assert!(!app.is_sketch_mode);
+        assert!(!app.is_plane_selection_mode);
+        assert_eq!(app.status_msg, "Empty sketch discarded.");
     }
 }

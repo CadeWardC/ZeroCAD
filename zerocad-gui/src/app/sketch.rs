@@ -28,6 +28,8 @@ impl ZeroCadApp {
         self.line_chain_start = None;
         self.sketch_selected_ids.clear();
         self.sketch_selected_constraint = None;
+        self.sketch_dimension_editor = None;
+        self.sketch_dimension_positions.clear();
         self.sketch_conflict_constraint = None;
         self.sketch_trim_preview = None;
         self.cancel_in_progress_shape();
@@ -786,6 +788,7 @@ impl ZeroCadApp {
                         | Constraint::Perpendicular { a, b, .. }
                         | Constraint::Equal { a, b, .. }
                         | Constraint::Angle { a, b, .. }
+                        | Constraint::LineDistance { a, b, .. }
                         | Constraint::Concentric { a, b, .. }
                         | Constraint::Collinear { a, b, .. } => {
                             entity_ids.contains(a) && entity_ids.contains(b)
@@ -895,6 +898,8 @@ impl ZeroCadApp {
         self.line_chain_start = None;
         self.sketch_selected_ids.clear();
         self.sketch_selected_constraint = None;
+        self.sketch_dimension_editor = None;
+        self.sketch_dimension_positions.clear();
         self.sketch_conflict_constraint = None;
         self.sketch_trim_preview = None;
         self.cancel_in_progress_shape();

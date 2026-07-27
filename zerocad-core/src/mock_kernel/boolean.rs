@@ -58,7 +58,13 @@ pub(crate) fn quiet_panic<R>(f: impl FnOnce() -> R) -> R {
 /// configuration, panics, or produces a non-watertight result — callers decide
 /// how to degrade. `boolean_checked` catches panics and rejects leaky output.
 pub fn union(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
-    union_diagnostic(a, b).ok()
+    // A discarded reason here is expensive: callers degrade by leaving bodies
+    // unfused, which the user sees only as a seam on what should be one face,
+    // or as a Join that quietly does nothing. Keep the `Option` contract for
+    // callers that legitimately probe, but never lose the explanation.
+    union_diagnostic(a, b)
+        .map_err(|error| log::warn!("boolean union failed: {error}"))
+        .ok()
 }
 
 /// Boolean union that preserves the kernel's failure reason for operation-level
@@ -71,7 +77,14 @@ pub(crate) fn union_diagnostic(a: &KernelSolid, b: &KernelSolid) -> Result<Kerne
 /// Boolean difference (`a − b`): subtract `b`'s volume from `a`. Returns `None`
 /// on kernel failure or non-watertight output.
 pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
-    quiet_panic(|| checked_boolean(a, b, BooleanOp::Cut).ok())
+    // Same contract as `union`: the reason must survive even though the
+    // signature degrades to `Option` — a Cut that silently does nothing is
+    // indistinguishable from a Cut that was never requested.
+    quiet_panic(|| {
+        checked_boolean(a, b, BooleanOp::Cut)
+            .map_err(|error| log::warn!("boolean difference failed: {error}"))
+            .ok()
+    })
 }
 
 /// Boolean union with the kernel's exact face history (see

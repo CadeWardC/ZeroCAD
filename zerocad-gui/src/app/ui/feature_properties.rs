@@ -37,8 +37,35 @@ fn expression_editor(
     }
 }
 
+fn variable_value_source(variable: &Variable) -> String {
+    variable
+        .expression
+        .clone()
+        .unwrap_or_else(|| variable.value.to_string())
+}
+
+fn apply_variable_value_source(variable: &mut Variable, source: &str) {
+    let source = source.trim();
+    if source.is_empty() {
+        variable.expression = None;
+    } else if let Ok(value) = source.parse::<f64>() {
+        if value.is_finite() {
+            variable.value = value;
+            variable.expression = None;
+        } else {
+            variable.expression = Some(source.to_string());
+        }
+    } else {
+        variable.expression = Some(source.to_string());
+    }
+}
+
 impl ZeroCadApp {
     pub(crate) fn draw_selected_feature_properties(&mut self, ui: &mut egui::Ui) {
+        // Property rows live in the compact workspace inspector. Keep sliders
+        // short enough that their label, track, and value do not enlarge the
+        // overlay beyond its declared width.
+        ui.spacing_mut().slider_width = 72.0;
         ui.add_space(15.0);
         ui.label(
             egui::RichText::new("Properties")
@@ -75,7 +102,8 @@ impl ZeroCadApp {
                 // show what an expression-driven depth resolves to).
                 let pal = self.pal();
                 let current_unit = self.current_unit;
-                let var_map = self.document.variable_map();
+                let variable_resolution = self.document.resolve_variables();
+                let var_map = variable_resolution.values.clone();
                 let mirror_join_outcome = match &self.document.graph[idx].feature {
                     FeatureType::Pattern {
                         source,
@@ -97,14 +125,12 @@ impl ZeroCadApp {
                     .cloned();
                 let node = &mut self.document.graph[idx];
 
-                // Render inside a highly visual white inspector card
+                // Render inside a semantic inspector card so the same hierarchy
+                // remains legible in both light and dark themes.
                 egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
+                    .fill(pal.surface)
                     .rounding(8.0)
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(226, 232, 240),
-                    ))
+                    .stroke(egui::Stroke::new(1.0, pal.border))
                     .inner_margin(12.0)
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
@@ -1196,7 +1222,7 @@ impl ZeroCadApp {
                                     draft_angle_expr,
                                     ..
                                 } => {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(
                                             egui::RichText::new("Extrusion Depth:").size(12.0),
                                         );
@@ -1213,7 +1239,7 @@ impl ZeroCadApp {
                                     // Variable/expression binding: a depth like `width / 2`
                                     // re-evaluates whenever the variable changes. Empty clears it.
                                     ui.add_space(4.0);
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(
                                             egui::RichText::new("=")
                                                 .size(13.0)
@@ -1247,7 +1273,7 @@ impl ZeroCadApp {
                                         ui.label(egui::RichText::new(txt).size(11.0).weak());
                                     }
                                     ui.add_space(6.0);
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(egui::RichText::new("Draft Angle:").size(12.0));
                                         let response = ui.add(
                                             egui::Slider::new(draft_angle_deg, -88.9..=88.9)
@@ -1258,7 +1284,7 @@ impl ZeroCadApp {
                                             modified = true;
                                         }
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(
                                             egui::RichText::new("=")
                                                 .size(13.0)
@@ -1299,7 +1325,7 @@ impl ZeroCadApp {
                                         ui.label(egui::RichText::new(text).size(11.0).weak());
                                     }
                                     ui.add_space(6.0);
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(egui::RichText::new("Operation:").size(12.0));
                                         for (m, label) in [
                                             (ExtrudeMode::NewBody, "New Body"),
@@ -1916,7 +1942,8 @@ impl ZeroCadApp {
                                     }
 
                                     // Each variable is its own soft card: a full-width
-                                    // name field on top, then value + unit + delete.
+                                    // name field on top, then a value-or-expression
+                                    // field, unit, and delete action.
                                     let mut remove_idx: Option<usize> = None;
                                     for (i, var) in variables.iter_mut().enumerate() {
                                         egui::Frame::none()
@@ -1928,21 +1955,67 @@ impl ZeroCadApp {
                                             ))
                                             .inner_margin(8.0)
                                             .show(ui, |ui| {
-                                                ui.add(
-                                                    egui::TextEdit::singleline(&mut var.name)
-                                                        .desired_width(f32::INFINITY)
-                                                        .hint_text("name")
-                                                        .font(egui::FontId::proportional(12.5)),
-                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::TextEdit::singleline(&mut var.name)
+                                                            .desired_width(f32::INFINITY)
+                                                            .hint_text("name")
+                                                            .font(egui::FontId::proportional(12.5)),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    modified = true;
+                                                }
                                                 ui.add_space(6.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut var.value)
-                                                            .speed(0.1)
-                                                            .min_decimals(0)
-                                                            .max_decimals(3),
+                                                ui.horizontal_wrapped(|ui| {
+                                                    let editor_id = egui::Id::new((
+                                                        "variable_value_expression",
+                                                        &selected_feature_id,
+                                                        i,
+                                                    ));
+                                                    let was_focused = ui
+                                                        .memory(|memory| memory.has_focus(editor_id));
+                                                    let mut source = if was_focused {
+                                                        ui.ctx()
+                                                            .data(|data| {
+                                                                data.get_temp::<String>(editor_id)
+                                                            })
+                                                            .unwrap_or_else(|| {
+                                                                variable_value_source(var)
+                                                            })
+                                                    } else {
+                                                        variable_value_source(var)
+                                                    };
+                                                    let response = ui.add(
+                                                        egui::TextEdit::singleline(&mut source)
+                                                            .id(editor_id)
+                                                            .desired_width(104.0)
+                                                            .hint_text("value or expression")
+                                                            .font(egui::FontId::monospace(11.5)),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Enter a number or an expression using \
+                                                         other variables, e.g. blade_width / 2",
                                                     );
-                                                    egui::ComboBox::from_id_salt(("var_unit", i))
+                                                    if response.changed() {
+                                                        apply_variable_value_source(var, &source);
+                                                        modified = true;
+                                                    }
+                                                    if response.has_focus() {
+                                                        ui.ctx().data_mut(|data| {
+                                                            data.insert_temp(editor_id, source);
+                                                        });
+                                                    } else {
+                                                        ui.ctx().data_mut(|data| {
+                                                            data.remove::<String>(editor_id);
+                                                        });
+                                                    }
+                                                    let old_unit = var.unit;
+                                                    egui::ComboBox::from_id_salt((
+                                                        "var_unit",
+                                                        &selected_feature_id,
+                                                        i,
+                                                    ))
                                                         .selected_text(var.unit.suffix())
                                                         .width(50.0)
                                                         .show_ui(ui, |ui| {
@@ -1962,6 +2035,9 @@ impl ZeroCadApp {
                                                                 "m",
                                                             );
                                                         });
+                                                    if var.unit != old_unit {
+                                                        modified = true;
+                                                    }
                                                     ui.with_layout(
                                                         egui::Layout::right_to_left(
                                                             egui::Align::Center,
@@ -1983,10 +2059,39 @@ impl ZeroCadApp {
                                                                 .clicked()
                                                             {
                                                                 remove_idx = Some(i);
+                                                                modified = true;
                                                             }
                                                         },
                                                     );
                                                 });
+                                                if let Some(diagnostic) = variable_resolution
+                                                    .diagnostics
+                                                    .iter()
+                                                    .find(|diagnostic| {
+                                                        diagnostic.name == var.name.trim()
+                                                    })
+                                                {
+                                                    ui.label(
+                                                        egui::RichText::new(&diagnostic.message)
+                                                            .size(10.5)
+                                                            .color(pal.danger),
+                                                    );
+                                                } else if var.expression.is_some() {
+                                                    if let Some(value) =
+                                                        var_map.get(var.name.trim())
+                                                    {
+                                                        let display_value =
+                                                            var.unit.from_base(*value);
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "Resolved: {display_value:.4} {}",
+                                                                var.unit.suffix()
+                                                            ))
+                                                            .size(10.5)
+                                                            .color(pal.text_muted),
+                                                        );
+                                                    }
+                                                }
                                             });
                                         ui.add_space(6.0);
                                     }
@@ -2007,6 +2112,7 @@ impl ZeroCadApp {
                                         let n = variables.len() + 1;
                                         variables
                                             .push(Variable::new(format!("var{}", n), current_unit));
+                                        modified = true;
                                     }
                                 }
                             }
@@ -2063,12 +2169,9 @@ impl ZeroCadApp {
                 if let Some(mp) = measured {
                     ui.add_space(10.0);
                     egui::Frame::none()
-                        .fill(egui::Color32::WHITE)
+                        .fill(pal.surface)
                         .rounding(8.0)
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(226, 232, 240),
-                        ))
+                        .stroke(egui::Stroke::new(1.0, pal.border))
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.label(
@@ -2141,5 +2244,42 @@ impl ZeroCadApp {
                     });
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod variable_value_editor_tests {
+    use super::*;
+
+    #[test]
+    fn literal_input_updates_value_and_clears_expression() {
+        let mut variable = Variable {
+            name: "width".to_string(),
+            value: 10.0,
+            unit: Unit::Millimeter,
+            expression: Some("base * 2".to_string()),
+        };
+
+        apply_variable_value_source(&mut variable, "42.8");
+
+        assert_eq!(variable.value, 42.8);
+        assert_eq!(variable.expression, None);
+        assert_eq!(variable_value_source(&variable), "42.8");
+    }
+
+    #[test]
+    fn expression_input_preserves_fallback_and_becomes_editor_source() {
+        let mut variable = Variable {
+            name: "width".to_string(),
+            value: 10.0,
+            unit: Unit::Millimeter,
+            expression: None,
+        };
+
+        apply_variable_value_source(&mut variable, " blade_length / 2 ");
+
+        assert_eq!(variable.value, 10.0);
+        assert_eq!(variable.expression.as_deref(), Some("blade_length / 2"));
+        assert_eq!(variable_value_source(&variable), "blade_length / 2");
     }
 }

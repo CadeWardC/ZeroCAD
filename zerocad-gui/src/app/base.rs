@@ -51,6 +51,7 @@ impl ZeroCadApp {
             active_sketch_face_ref: None,
             active_sketch_datum_ref: None,
             doc_created_unix: None,
+            current_document_path: None,
             // Positive pitch starts the camera above the XZ ground plane,
             // looking down at it (negative would start underneath).
             camera_pitch: 0.7,
@@ -99,6 +100,8 @@ impl ZeroCadApp {
             sketch_drag_point: None,
             sketch_selected_ids: Vec::new(),
             sketch_selected_constraint: None,
+            sketch_dimension_editor: None,
+            sketch_dimension_positions: HashMap::new(),
             sketch_conflict_constraint: None,
             sketch_temp_start: None,
             sketch_points: Vec::new(),
@@ -159,6 +162,8 @@ impl ZeroCadApp {
             dim_screen_positions: Vec::new(),
             id_counter: 1,
             current_unit: prefs.unit,
+            snap_enabled: prefs.snap_enabled,
+            grid_visible: prefs.grid_visible,
             show_preferences: false,
             show_about: false,
             parameters_dialog: None,
@@ -191,6 +196,7 @@ impl ZeroCadApp {
     /// lives in one place and each consumer builds exactly the collection it
     /// needs (no intermediate `Vec` just to `collect` it into something else).
     pub(crate) fn for_each_visible_variable(&self, mut f: impl FnMut(&str, f64)) {
+        let resolved = self.document.resolve_variables();
         for idx in self.document.graph.node_indices() {
             let node = &self.document.graph[idx];
             if self.hidden_nodes.contains(&node.id) {
@@ -198,11 +204,9 @@ impl ZeroCadApp {
             }
             if let FeatureType::VariableSet { variables } = &node.feature {
                 for v in variables {
-                    // Trim only gates emptiness; the *untrimmed* name is the key
-                    // so it matches `ParametricGraph::variable_map` exactly (a
-                    // typed preview must resolve to the same value core commits).
-                    if !v.name.trim().is_empty() {
-                        f(&v.name, v.value_in_base());
+                    let name = v.name.trim();
+                    if let Some(value) = resolved.values.get(name).copied() {
+                        f(name, value);
                     }
                 }
             }
@@ -245,5 +249,39 @@ impl ZeroCadApp {
         } else {
             Palette::light()
         }
+    }
+}
+
+#[cfg(test)]
+mod variable_expression_tests {
+    use super::*;
+
+    #[test]
+    fn visible_variable_map_uses_resolved_expression_values() {
+        let mut app = ZeroCadApp::new();
+        app.document.add_feature(FeatureNode {
+            id: "variables_1".to_string(),
+            name: "Variables".to_string(),
+            feature: FeatureType::VariableSet {
+                variables: vec![
+                    Variable {
+                        name: "blade_width".to_string(),
+                        value: 42.8,
+                        unit: Unit::Millimeter,
+                        expression: None,
+                    },
+                    Variable {
+                        name: "half_width".to_string(),
+                        value: 0.0,
+                        unit: Unit::Millimeter,
+                        expression: Some("blade_width / 2".to_string()),
+                    },
+                ],
+            },
+        });
+
+        let variables = app.visible_variable_map();
+        assert!((variables["blade_width"] - 42.8).abs() < 1.0e-9);
+        assert!((variables["half_width"] - 21.4).abs() < 1.0e-9);
     }
 }
