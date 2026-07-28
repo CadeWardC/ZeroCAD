@@ -644,6 +644,19 @@ struct PendingSave {
     started: std::time::Instant,
     dispatched: bool,
     revision: Option<u64>,
+    workspace_generation: u64,
+}
+
+/// The active application workspace.
+///
+/// This is intentionally separate from the future on-disk project-kind schema:
+/// it is the UI routing boundary that prevents part-only commands from reaching
+/// an assembly session while the assembly document and container milestones are
+/// still landing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectKind {
+    Part,
+    Assembly,
 }
 
 struct ExportCompletion {
@@ -681,6 +694,12 @@ enum MirrorJoinOutcome {
 }
 
 struct ZeroCadApp {
+    /// Selects the active workspace and the commands that are valid within it.
+    project_kind: ProjectKind,
+    /// Advances whenever a different project replaces the active one. Async
+    /// completions use this to avoid attaching an old path or status to the new
+    /// workspace.
+    workspace_generation: u64,
     pending_visual: Option<PendingCommitVisual>,
     /// A just-created Mirror+Join whose actual joined/separate outcome is
     /// waiting on the committed evaluator. This is UI-only derived state.
@@ -689,6 +708,10 @@ struct ZeroCadApp {
     /// projection owned by this document rather than the application root.
     document: Document,
     selected_node_id: Option<String>,
+    /// Feature whose Properties window is open. Properties are opt-in from the
+    /// document-tree context menu rather than appearing whenever a row is
+    /// selected.
+    feature_properties_dialog: Option<String>,
     /// Part-evaluator and hydrated-cache compatibility storage. Viewport,
     /// picking, bounds, sectioning, and thumbnail consumers use
     /// `evaluated_scene`, which shares this allocation.
@@ -1080,10 +1103,13 @@ struct ZeroCadApp {
 
     // Unit settings
     current_unit: Unit,
-    /// User-facing viewport controls shared by the sketch inspector and status
-    /// bar. These are application preferences, not document data.
+    /// User-facing viewport preferences. Snapping is exposed in the status bar;
+    /// grid visibility lives in Settings. These are not document data.
     snap_enabled: bool,
     grid_visible: bool,
+    /// Opt-in visibility for the sketch constraint palette and inferred
+    /// constraint glyphs. Constraint solving is independent of this preference.
+    show_sketch_constraints: bool,
 
     /// Whether the Settings window is open.
     show_preferences: bool,

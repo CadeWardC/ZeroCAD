@@ -155,6 +155,7 @@ impl ZeroCadApp {
             hydrated_cache_mb: self.hydrated_cache_mb,
             snap_enabled: self.snap_enabled,
             grid_visible: self.grid_visible,
+            show_sketch_constraints: self.show_sketch_constraints,
         };
         if current != self.settings_baseline {
             current.save();

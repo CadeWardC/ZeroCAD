@@ -388,3 +388,46 @@ fn rename_variable_rewrites_identifier_references_atomically() {
     assert!(graph.rename_variable("span", "double_width").is_err());
     assert_eq!(serde_json::to_vec(&graph).unwrap(), before);
 }
+
+#[test]
+fn feature_variable_references_include_nested_sketch_measurements() {
+    use crate::sketch::{Dimension, SketchShape};
+
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "sketch_1".to_string(),
+        name: "Sketch".to_string(),
+        feature: FeatureType::Sketch {
+            entity_ids: vec![],
+            next_entity_id: 0,
+            solver: None,
+            cs: CoordinateSystem::XY,
+            curves: SketchCurves::new(),
+            shapes: vec![SketchShape::Rectangle {
+                origin: (0.0, 0.0),
+                sx: 1.0,
+                sy: 1.0,
+                w: Dimension {
+                    value: 10.0,
+                    expr: Some("width - gap".to_string()),
+                },
+                h: Dimension {
+                    value: 5.0,
+                    expr: Some("height".to_string()),
+                },
+                from_center: false,
+            }],
+            corner_mods: vec![],
+            mirrors: vec![],
+            on_face: false,
+        },
+    });
+
+    assert_eq!(
+        graph.feature_variable_references("sketch_1"),
+        ["gap", "height", "width"]
+    );
+    assert!(graph
+        .feature_variable_references("missing_feature")
+        .is_empty());
+}

@@ -40,19 +40,38 @@ impl ZeroCadApp {
                 ui.separator();
 
                 if icons::Icon::New
-                    .menu_button_hint(ui, "New Design", &hint(self, ShortcutAction::NewDesign))
+                    .menu_button_hint(ui, "New Part", &hint(self, ShortcutAction::NewDesign))
                     .clicked()
                 {
                     ui.memory_mut(|mem| mem.close_popup());
                     self.new_design();
                 }
 
-                if icons::Icon::Save
-                    .menu_button_hint(ui, "Save Design", &hint(self, ShortcutAction::SaveDesign))
+                if icons::Icon::Assembly
+                    .menu_button(ui, "New Assembly")
                     .clicked()
                 {
                     ui.memory_mut(|mem| mem.close_popup());
-                    self.open_save_dialog();
+                    self.new_assembly();
+                }
+
+                if self.project_kind == ProjectKind::Part {
+                    if icons::Icon::Save
+                        .menu_button_hint(
+                            ui,
+                            "Save Design",
+                            &hint(self, ShortcutAction::SaveDesign),
+                        )
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.open_save_dialog();
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("Save Assembly"))
+                        .on_hover_text(
+                            "Assembly saving arrives with the assembly file-format milestone",
+                        );
                 }
 
                 if icons::Icon::Download
@@ -63,61 +82,63 @@ impl ZeroCadApp {
                     self.open_design();
                 }
 
-                ui.separator();
+                if self.project_kind == ProjectKind::Part {
+                    ui.separator();
 
-                if icons::Icon::Download
-                    .menu_button(ui, "Import STEP")
-                    .clicked()
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.import_step();
-                }
+                    if icons::Icon::Download
+                        .menu_button(ui, "Import STEP")
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.import_step();
+                    }
 
-                if icons::Icon::Download
-                    .menu_button(ui, "Import STL")
-                    .clicked()
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.import_stl();
-                }
+                    if icons::Icon::Download
+                        .menu_button(ui, "Import STL")
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.import_stl();
+                    }
 
-                if icons::Icon::Download
-                    .menu_button(ui, "Import DXF to Sketch")
-                    .clicked()
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.import_dxf();
-                }
+                    if icons::Icon::Download
+                        .menu_button(ui, "Import DXF to Sketch")
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.import_dxf();
+                    }
 
-                if icons::Icon::Download
-                    .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
-                    .clicked()
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.export_stl();
-                }
+                    if icons::Icon::Download
+                        .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.export_stl();
+                    }
 
-                if icons::Icon::Download
-                    .menu_button(ui, "Export 3MF")
-                    .clicked()
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.export_3mf();
-                }
+                    if icons::Icon::Download
+                        .menu_button(ui, "Export 3MF")
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.export_3mf();
+                    }
 
-                ui.separator();
+                    ui.separator();
 
-                if icons::Icon::Settings
-                    .menu_button(ui, "Parameters")
-                    .clicked()
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.open_parameters_dialog();
-                }
+                    if icons::Icon::Settings
+                        .menu_button(ui, "Parameters")
+                        .clicked()
+                    {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.open_parameters_dialog();
+                    }
 
-                if icons::Icon::EyeOpen.menu_button(ui, "Inspect").clicked() {
-                    ui.memory_mut(|mem| mem.close_popup());
-                    self.open_inspection_dialog();
+                    if icons::Icon::EyeOpen.menu_button(ui, "Inspect").clicked() {
+                        ui.memory_mut(|mem| mem.close_popup());
+                        self.open_inspection_dialog();
+                    }
                 }
 
                 if icons::Icon::Settings

@@ -658,6 +658,18 @@ impl ZeroCadApp {
                         // rebuild happens once, at Finish Sketch.
                         if self.is_sketch_mode
                             && self.active_tool.is_none()
+                            && self.sketch_solver_model.is_none()
+                            && (response.clicked()
+                                || response.drag_started_by(egui::PointerButton::Primary))
+                        {
+                            self.ensure_active_solver_model();
+                            self.rebuild_active_sketch_curves();
+                        }
+
+                        let mut active_sketch_hit = false;
+
+                        if self.is_sketch_mode
+                            && self.active_tool.is_none()
                             && self.sketch_solver_model.is_some()
                             && !self.camera_anim_active
                         {
@@ -733,11 +745,40 @@ impl ZeroCadApp {
                             // Plain click replaces the selection; Shift extends.
                             if response.clicked() && self.sketch_drag_point.is_none() {
                                 if let Some(pos) = response.interact_pointer_pos() {
-                                    let hit = self.sketch_solver_model.as_ref().and_then(|model| {
-                                        pick_solver_element(model, pos, &to_screen, POINT_GRAB_PX)
-                                    });
-                                    match hit {
-                                        Some(id) => {
+                                    let entity_hit =
+                                        self.sketch_solver_model.as_ref().and_then(|model| {
+                                            pick_solver_element(
+                                                model,
+                                                pos,
+                                                &to_screen,
+                                                POINT_GRAB_PX,
+                                            )
+                                        });
+                                    let region_hit = entity_hit
+                                        .is_none()
+                                        .then(|| {
+                                            let local = self.screen_to_sketch(
+                                                pos,
+                                                rect,
+                                                &self.active_sketch_cs,
+                                            );
+                                            self.detected_regions
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, region)| region.contains(local))
+                                                .min_by(|(_, a), (_, b)| {
+                                                    a.area
+                                                        .partial_cmp(&b.area)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                })
+                                                .map(|(index, _)| index)
+                                        })
+                                        .flatten();
+                                    active_sketch_hit =
+                                        entity_hit.is_some() || region_hit.is_some();
+                                    match (entity_hit, region_hit) {
+                                        (Some(id), _) => {
+                                            self.selected_region_indices.clear();
                                             if !shift {
                                                 self.sketch_selected_ids.clear();
                                             }
@@ -751,8 +792,20 @@ impl ZeroCadApp {
                                                 self.sketch_selected_ids.push(id);
                                             }
                                         }
-                                        None if !shift => self.sketch_selected_ids.clear(),
-                                        None => {}
+                                        (None, Some(index)) => {
+                                            self.sketch_selected_ids.clear();
+                                            if !shift {
+                                                self.selected_region_indices.clear();
+                                            }
+                                            if !self.selected_region_indices.insert(index) {
+                                                self.selected_region_indices.remove(&index);
+                                            }
+                                        }
+                                        (None, None) if !shift => {
+                                            self.sketch_selected_ids.clear();
+                                            self.selected_region_indices.clear();
+                                        }
+                                        (None, None) => {}
                                     }
                                 }
                             }
@@ -830,6 +883,7 @@ impl ZeroCadApp {
                             && self.split_body_op.is_none()
                             && self.scale_body_op.is_none()
                             && !self.camera_anim_active
+                            && !active_sketch_hit
                         {
                             let is_double = response.double_clicked();
                             // Shift / Ctrl (⌘ on macOS) extend the selection: each modified
@@ -1305,7 +1359,7 @@ impl ZeroCadApp {
         self.drag_corner_radius_handle(ctx);
         self.show_corner_radius_box(ctx);
 
-        // Constraint palette + list for the active Edit Sketch session.
+        // Opt-in constraint palette + list for the active Edit Sketch session.
         self.show_constraints_panel(ctx);
     }
 
@@ -1463,7 +1517,7 @@ impl ZeroCadApp {
                 });
         }
 
-        let controls_width = 238.0;
+        let controls_width = 190.0;
         egui::Area::new(egui::Id::new("viewport_navigation"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(
@@ -1521,13 +1575,6 @@ impl ZeroCadApp {
                                 .allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
                             icons::Icon::Pan.draw(ui.painter(), pan_rect.shrink(4.0), color);
                             pan_response.on_hover_text("Middle-drag to orbit; Shift-drag to pan");
-                            if ui
-                                .selectable_label(self.grid_visible, "Grid")
-                                .on_hover_text("Show or hide the reference grid")
-                                .clicked()
-                            {
-                                self.grid_visible = !self.grid_visible;
-                            }
                         });
                     });
             });

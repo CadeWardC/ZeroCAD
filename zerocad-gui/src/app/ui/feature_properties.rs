@@ -60,28 +60,253 @@ fn apply_variable_value_source(variable: &mut Variable, source: &str) {
     }
 }
 
-impl ZeroCadApp {
-    pub(crate) fn draw_selected_feature_properties(&mut self, ui: &mut egui::Ui) {
-        // Property rows live in the compact workspace inspector. Keep sliders
-        // short enough that their label, track, and value do not enlarge the
-        // overlay beyond its declared width.
-        ui.spacing_mut().slider_width = 72.0;
-        ui.add_space(15.0);
-        ui.label(
-            egui::RichText::new("Properties")
-                .font(egui::FontId::proportional(14.0))
-                .strong()
-                .color(self.pal().text_strong), // Slate-900
-        );
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(8.0);
+#[derive(Debug, Clone)]
+struct DrivingParameterRow {
+    feature_id: String,
+    name: String,
+    value: f64,
+    unit: Unit,
+    expression: Option<String>,
+}
 
-        // Render dynamic sliders based on selected node's feature type
-        if let Some(ref selected_id) = self.selected_node_id {
+#[derive(Debug, Clone)]
+struct DrivingParameterEdit {
+    feature_id: String,
+    name: String,
+    value: f64,
+    unit: Unit,
+}
+
+fn driving_parameter_rows(
+    document: &zerocad_core::ParametricGraph,
+    feature_id: &str,
+    resolved: &std::collections::HashMap<String, f64>,
+) -> Vec<DrivingParameterRow> {
+    let references = document.feature_variable_references(feature_id);
+    let mut definitions = std::collections::HashMap::new();
+    for idx in document.graph.node_indices() {
+        let node = &document.graph[idx];
+        if let FeatureType::VariableSet { variables } = &node.feature {
+            for variable in variables {
+                let name = variable.name.trim();
+                if references
+                    .binary_search_by(|reference| reference.as_str().cmp(name))
+                    .is_ok()
+                {
+                    let value_in_base = resolved
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| variable.value_in_base());
+                    definitions.insert(
+                        name.to_string(),
+                        DrivingParameterRow {
+                            feature_id: node.id.clone(),
+                            name: name.to_string(),
+                            value: variable.unit.from_base(value_in_base),
+                            unit: variable.unit,
+                            expression: variable.expression.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    references
+        .into_iter()
+        .filter_map(|name| definitions.remove(&name))
+        .collect()
+}
+
+fn apply_driving_parameter_edit(
+    document: &mut zerocad_core::ParametricGraph,
+    edit: &DrivingParameterEdit,
+) -> Result<(), String> {
+    if !edit.value.is_finite() {
+        return Err(format!(
+            "parameter '{}' requires a finite measurement",
+            edit.name
+        ));
+    }
+    let idx = document
+        .graph
+        .node_indices()
+        .find(|idx| document.graph[*idx].id == edit.feature_id)
+        .ok_or_else(|| format!("parameter container '{}' no longer exists", edit.feature_id))?;
+    let FeatureType::VariableSet { variables } = &mut document.graph[idx].feature else {
+        return Err(format!(
+            "feature '{}' is not a parameter container",
+            edit.feature_id
+        ));
+    };
+    let variable = variables
+        .iter_mut()
+        .find(|variable| variable.name.trim() == edit.name)
+        .ok_or_else(|| format!("parameter '{}' no longer exists", edit.name))?;
+    variable.value = edit.value;
+    // An explicit measurement is authoritative. This mirrors dragging an
+    // expression-backed feature property, which converts it back to a literal.
+    variable.expression = None;
+    document.commit_feature_edit(&edit.feature_id)
+}
+
+fn driving_parameters_editor(
+    ui: &mut egui::Ui,
+    selected_feature_id: &str,
+    rows: &[DrivingParameterRow],
+    edits: &mut Vec<DrivingParameterEdit>,
+    edit_started: &mut bool,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("Driving parameters")
+            .strong()
+            .size(12.0),
+    );
+    ui.label(
+        egui::RichText::new("Enter a measurement to rebuild the part immediately.")
+            .small()
+            .weak(),
+    );
+    ui.add_space(5.0);
+    for row in rows {
+        let editor_id = egui::Id::new((
+            "inline_driving_parameter",
+            selected_feature_id,
+            row.feature_id.as_str(),
+            row.name.as_str(),
+        ));
+        let was_focused = ui.memory(|memory| memory.has_focus(editor_id));
+        let mut source = if was_focused {
+            ui.ctx()
+                .data(|data| data.get_temp::<String>(editor_id))
+                .unwrap_or_else(|| row.value.to_string())
+        } else {
+            row.value.to_string()
+        };
+        let mut parse_error = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&row.name).monospace().size(11.5));
+            let mut response = ui.add(
+                egui::TextEdit::singleline(&mut source)
+                    .id(editor_id)
+                    .desired_width(86.0)
+                    .hint_text("measurement"),
+            );
+            response = if let Some(expression) = &row.expression {
+                response.on_hover_text(format!(
+                    "Currently computed by '{expression}'. Entering a measurement replaces that \
+                     formula with a literal value."
+                ))
+            } else {
+                response.on_hover_text(
+                    "Changing this value rebuilds every dependent feature immediately.",
+                )
+            };
+            if response.gained_focus() {
+                *edit_started = true;
+            }
+            if response.changed() {
+                match source.trim().parse::<f64>() {
+                    Ok(value) if value.is_finite() => edits.push(DrivingParameterEdit {
+                        feature_id: row.feature_id.clone(),
+                        name: row.name.clone(),
+                        value,
+                        unit: row.unit,
+                    }),
+                    _ => parse_error = !source.trim().is_empty(),
+                }
+            }
+            if response.has_focus() {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(editor_id, source.clone()));
+            } else {
+                ui.ctx().data_mut(|data| data.remove::<String>(editor_id));
+            }
+            ui.label(egui::RichText::new(row.unit.suffix()).small().weak());
+        });
+        if parse_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(185, 28, 28),
+                egui::RichText::new("Enter a number.").small(),
+            );
+        } else if let Some(expression) = &row.expression {
+            ui.label(
+                egui::RichText::new(format!("Currently: = {expression}"))
+                    .small()
+                    .weak(),
+            );
+        }
+        ui.add_space(3.0);
+    }
+}
+
+impl ZeroCadApp {
+    pub(crate) fn open_feature_properties(&mut self, feature_id: &str) {
+        if self
+            .document
+            .graph
+            .node_weights()
+            .any(|node| node.id == feature_id)
+        {
+            self.selected_node_id = Some(feature_id.to_owned());
+            self.feature_properties_dialog = Some(feature_id.to_owned());
+        }
+    }
+
+    pub(crate) fn show_feature_properties_window(&mut self, ctx: &egui::Context) {
+        let Some(feature_id) = self.feature_properties_dialog.clone() else {
+            return;
+        };
+        let Some(feature_name) = self
+            .document
+            .graph
+            .node_weights()
+            .find(|node| node.id == feature_id)
+            .map(|node| node.name.clone())
+        else {
+            self.feature_properties_dialog = None;
+            return;
+        };
+
+        let mut open = true;
+        egui::Window::new(format!("Properties — {feature_name}"))
+            .id(egui::Id::new("feature_properties_dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(360.0)
+            .default_height(540.0)
+            .min_width(300.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("feature_properties_dialog_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(560.0)
+                    .show(ui, |ui| {
+                        self.draw_selected_feature_properties(ui, Some(&feature_id))
+                    });
+            });
+
+        if !open || self.is_sketch_mode || self.extrude_op.is_some() {
+            self.feature_properties_dialog = None;
+        }
+    }
+
+    fn draw_selected_feature_properties(&mut self, ui: &mut egui::Ui, selected_id: Option<&str>) {
+        ui.spacing_mut().slider_width = 96.0;
+        ui.add_space(4.0);
+
+        // Render dynamic controls for the feature requested by the Properties
+        // window. The target stays stable even if the tree selection changes.
+        if let Some(selected_id) = selected_id {
             let mut node_idx = None;
             for idx in self.document.graph.node_indices() {
-                if self.document.graph[idx].id == *selected_id {
+                if self.document.graph[idx].id == selected_id {
                     node_idx = Some(idx);
                     break;
                 }
@@ -104,6 +329,16 @@ impl ZeroCadApp {
                 let current_unit = self.current_unit;
                 let variable_resolution = self.document.resolve_variables();
                 let var_map = variable_resolution.values.clone();
+                let driving_parameters = if matches!(
+                    self.document.graph[idx].feature,
+                    FeatureType::VariableSet { .. }
+                ) {
+                    Vec::new()
+                } else {
+                    driving_parameter_rows(&self.document, &selected_feature_id, &var_map)
+                };
+                let mut driving_parameter_edits = Vec::new();
+                let mut driving_parameter_edit_started = false;
                 let mirror_join_outcome = match &self.document.graph[idx].feature {
                     FeatureType::Pattern {
                         source,
@@ -2116,8 +2351,37 @@ impl ZeroCadApp {
                                     }
                                 }
                             }
+                            driving_parameters_editor(
+                                ui,
+                                &selected_feature_id,
+                                &driving_parameters,
+                                &mut driving_parameter_edits,
+                                &mut driving_parameter_edit_started,
+                            );
                         });
                     });
+
+                if driving_parameter_edit_started {
+                    self.push_undo();
+                }
+                let mut needs_reevaluation = false;
+                for edit in driving_parameter_edits {
+                    match apply_driving_parameter_edit(&mut self.document, &edit) {
+                        Ok(()) => {
+                            needs_reevaluation = true;
+                            self.status_msg = format!(
+                                "Updated parameter '{}' to {} {}.",
+                                edit.name,
+                                edit.value,
+                                edit.unit.suffix()
+                            );
+                        }
+                        Err(error) => {
+                            self.status_msg =
+                                format!("Could not update parameter '{}': {error}", edit.name);
+                        }
+                    }
+                }
 
                 if let Some(suppressed) = suppression_request {
                     self.push_undo();
@@ -2136,7 +2400,7 @@ impl ZeroCadApp {
 
                 if modified {
                     match self.document.commit_feature_edit(&selected_feature_id) {
-                        Ok(()) => self.reevaluate_geometry(),
+                        Ok(()) => needs_reevaluation = true,
                         Err(error) => {
                             log::error!(
                                 "Failed to synchronize feature '{}': {error}",
@@ -2148,6 +2412,9 @@ impl ZeroCadApp {
                             );
                         }
                     }
+                }
+                if needs_reevaluation {
+                    self.reevaluate_geometry();
                 }
 
                 if let Some(sketch_id) = extrude_request {
@@ -2162,9 +2429,9 @@ impl ZeroCadApp {
                 // Computed on demand from the already-tessellated buffers, so
                 // it's exact for what's on screen.
                 let measured = self
-                    .selected_node_id
-                    .as_ref()
-                    .and_then(|id| self.body_meshes.iter().find(|(mid, _)| mid == id))
+                    .body_meshes
+                    .iter()
+                    .find(|(id, _)| id == &selected_feature_id)
                     .and_then(|(_, mesh)| mesh.mass_properties());
                 if let Some(mp) = measured {
                     ui.add_space(10.0);
@@ -2252,6 +2519,16 @@ mod variable_value_editor_tests {
     use super::*;
 
     #[test]
+    fn properties_window_targets_the_requested_feature() {
+        let mut app = ZeroCadApp::new();
+
+        app.open_feature_properties("origin");
+
+        assert_eq!(app.selected_node_id.as_deref(), Some("origin"));
+        assert_eq!(app.feature_properties_dialog.as_deref(), Some("origin"));
+    }
+
+    #[test]
     fn literal_input_updates_value_and_clears_expression() {
         let mut variable = Variable {
             name: "width".to_string(),
@@ -2281,5 +2558,89 @@ mod variable_value_editor_tests {
         assert_eq!(variable.value, 10.0);
         assert_eq!(variable.expression.as_deref(), Some("blade_length / 2"));
         assert_eq!(variable_value_source(&variable), "blade_length / 2");
+    }
+
+    #[test]
+    fn inline_measurement_updates_the_driver_and_clears_its_formula() {
+        let mut document = zerocad_core::ParametricGraph::new();
+        document.add_feature(FeatureNode {
+            id: "variables_1".to_string(),
+            name: "Parameters".to_string(),
+            feature: FeatureType::VariableSet {
+                variables: vec![Variable {
+                    name: "width".to_string(),
+                    value: 1.0,
+                    unit: Unit::Inch,
+                    expression: Some("base_width * 2".to_string()),
+                }],
+            },
+        });
+        apply_driving_parameter_edit(
+            &mut document,
+            &DrivingParameterEdit {
+                feature_id: "variables_1".to_string(),
+                name: "width".to_string(),
+                value: 2.5,
+                unit: Unit::Inch,
+            },
+        )
+        .unwrap();
+
+        let variable = document
+            .graph
+            .node_weights()
+            .find_map(|node| match &node.feature {
+                FeatureType::VariableSet { variables } => variables.first(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(variable.value, 2.5);
+        assert_eq!(variable.unit, Unit::Inch);
+        assert_eq!(variable.expression, None);
+        assert!((document.variable_map()["width"] - 63.5).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn inspector_rows_follow_the_selected_features_references() {
+        let mut document = zerocad_core::ParametricGraph::new();
+        document.add_feature(FeatureNode {
+            id: "variables_1".to_string(),
+            name: "Parameters".to_string(),
+            feature: FeatureType::VariableSet {
+                variables: vec![
+                    Variable {
+                        name: "width".to_string(),
+                        value: 25.0,
+                        unit: Unit::Millimeter,
+                        expression: None,
+                    },
+                    Variable {
+                        name: "unused".to_string(),
+                        value: 99.0,
+                        unit: Unit::Millimeter,
+                        expression: None,
+                    },
+                ],
+            },
+        });
+        document.add_feature(FeatureNode {
+            id: "extrude_2".to_string(),
+            name: "Extrude".to_string(),
+            feature: FeatureType::Extrude {
+                depth: 25.0,
+                region_indices: vec![],
+                mode: ExtrudeMode::NewBody,
+                target: None,
+                depth_expr: Some("width / 2".to_string()),
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+
+        let resolved = document.variable_map();
+        let rows = driving_parameter_rows(&document, "extrude_2", &resolved);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "width");
+        assert_eq!(rows[0].value, 25.0);
     }
 }

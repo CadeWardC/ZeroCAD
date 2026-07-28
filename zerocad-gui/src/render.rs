@@ -2079,7 +2079,7 @@ impl ZeroCadApp {
                 &painter,
                 &self.sketch_curves,
                 &self.detected_regions,
-                &empty_sel,
+                &self.selected_region_indices,
                 &empty_sel,
                 &to_screen,
                 true,

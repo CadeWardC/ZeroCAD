@@ -82,6 +82,21 @@ impl ZeroCadApp {
 
                                         ui.add_space(12.0);
 
+                                        // --- Grid ---
+                                        ui.checkbox(
+                                            &mut self.grid_visible,
+                                            "Show reference grid",
+                                        );
+                                        ui.checkbox(
+                                            &mut self.show_sketch_constraints,
+                                            "Show sketch constraints",
+                                        )
+                                        .on_hover_text(
+                                            "Show the constraint palette and inferred constraint symbols while sketching",
+                                        );
+
+                                        ui.add_space(12.0);
+
                                         // --- Start page ---
                                         ui.checkbox(
                                             &mut self.show_onboarding,

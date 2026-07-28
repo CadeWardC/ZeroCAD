@@ -32,6 +32,7 @@ impl ZeroCadApp {
         self.document = snap.document;
         self.document.rebuild_node_map();
         self.selected_node_id = None;
+        self.feature_properties_dialog = None;
         self.selected_faces.clear();
         self.selected_body.clear();
         self.extrude_op = None;
@@ -86,27 +87,123 @@ impl ZeroCadApp {
     /// Replace the model with a fresh empty design (undoable).
     pub(crate) fn new_design(&mut self) {
         log::info!("Creating new empty model.");
-        self.push_undo();
+        if self.project_kind == ProjectKind::Part {
+            self.push_undo();
+        } else {
+            // Part snapshots cannot be restored into an assembly workspace.
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+        }
+        self.project_kind = ProjectKind::Part;
+        self.reset_to_empty_project();
+        self.status_msg = "New blank design created.".to_string();
+    }
+
+    /// Enter a new, empty assembly workspace.
+    ///
+    /// Assembly persistence and occurrence editing intentionally remain behind
+    /// their later milestones. This route is nevertheless real: part tools are
+    /// unavailable and the renderer-facing scene is reset at the project
+    /// boundary, ready for assembly instances to be attached.
+    pub(crate) fn new_assembly(&mut self) {
+        log::info!("Creating new empty assembly.");
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.project_kind = ProjectKind::Assembly;
+        self.reset_to_empty_project();
+        self.status_msg = "New blank assembly created.".to_string();
+    }
+
+    fn begin_project_replacement(&mut self) {
+        self.workspace_generation = self.workspace_generation.wrapping_add(1);
+        // A queued save has not captured its document yet, so carrying it into
+        // the next project would save the wrong document. A dispatched save
+        // already owns its snapshot and may finish safely in the background.
+        if self
+            .pending_save
+            .as_ref()
+            .is_some_and(|save| !save.dispatched)
+        {
+            self.pending_save = None;
+        }
+
+        // A late result from the part evaluator must never populate the new
+        // workspace. `cancel` advances the worker generation immediately.
+        self.evaluator.cancel();
+        self.eval_generation = self.evaluator.current_generation();
+        self.eval_pending = false;
+        self.eval_started = None;
+    }
+
+    fn reset_to_empty_project(&mut self) {
+        self.begin_project_replacement();
+
         self.document = Document::new();
         self.doc_created_unix = None;
         self.current_document_path = None;
         self.set_body_meshes(Vec::new());
+        self.datum_values.clear();
+        self.unresolved_features.clear();
+        self.hidden_nodes.clear();
+        self.error_msg = None;
         self.selected_node_id = None;
+        self.feature_properties_dialog = None;
         self.pending_visual = None;
+        self.pending_mirror_join_feedback = None;
         self.reset_sketch_state();
+        self.is_sketch_mode = false;
+        self.is_plane_selection_mode = false;
+        self.active_tool = None;
+        self.active_sketch_face_ref = None;
+        self.active_sketch_datum_ref = None;
         self.selected_faces.clear();
         self.selected_edges.clear();
         self.selected_body.clear();
         self.body_clipboard = None;
         self.move_op = None;
         self.combine_op = None;
+        self.split_body_op = None;
+        self.scale_body_op = None;
         self.move_preview_bodies = None;
-        self.status_msg = "New blank design created.".to_string();
+        self.extrude_op = None;
+        self.revolve_op = None;
+        self.pattern_op = None;
+        self.hole_op = None;
+        self.shell_op = None;
+        self.thread_op = None;
+        self.sweep_op = None;
+        self.draft_op = None;
+        self.edge_mod_op = None;
+        self.extrude_preview_cache = None;
+        self.extrude_preview_mesh_cache = None;
+        self.extrude_ghost_base = None;
+        self.extrude_preview_inflight = None;
+        self.extrude_preview_settle = None;
+        self.edge_mod_preview_cache = None;
+        self.edge_mod_preview_mesh_cache = None;
+        self.edge_mod_arc_cache = None;
+        self.edge_mod_arc_lru.clear();
+        self.edge_mod_arc_inflight = None;
+        self.edge_mod_arc_failed = None;
+        self.extrude_depth_dragging = false;
+        self.extrude_dim_pos = None;
+        self.edge_mod_dim_pos = None;
+        self.edge_mod_handle = None;
+        self.inspection_dialog = None;
+        self.section_view = None;
+        self.parameters_dialog = None;
+        self.save_dialog = None;
     }
 
     /// Open the in-app save dialog. The dialog presents a project title, format
     /// dropdown, recent folders, and a browse button.
     pub(crate) fn open_save_dialog(&mut self) {
+        if self.project_kind == ProjectKind::Assembly {
+            self.status_msg =
+                "Assembly saving will be enabled with the assembly file format.".to_string();
+            return;
+        }
+
         // Default directory: parent of last saved/opened project, else the
         // user's home / documents folder.
         let default_dir = self
@@ -152,6 +249,7 @@ impl ZeroCadApp {
             started: std::time::Instant::now(),
             dispatched: false,
             revision: None,
+            workspace_generation: self.workspace_generation,
         });
         self.status_msg = if self.eval_pending {
             "Save queued — waiting for the current model update…".to_string()
@@ -198,7 +296,11 @@ impl ZeroCadApp {
             self.status_msg = "Saving design…".to_string();
         }
         if let Some(done) = self.document_worker.try_recv() {
-            let saved_revision = self.pending_save.take().and_then(|save| save.revision);
+            let completed_save = self.pending_save.take();
+            let saved_revision = completed_save.as_ref().and_then(|save| save.revision);
+            let belongs_to_active_workspace = completed_save
+                .as_ref()
+                .is_some_and(|save| save.workspace_generation == self.workspace_generation);
             match done.result {
                 Ok(()) => {
                     let how = if matches!(done.profile, zerocad_core::SaveProfile::Compact) {
@@ -206,16 +308,21 @@ impl ZeroCadApp {
                     } else {
                         " (hydrated)"
                     };
-                    self.status_msg = format!("Design saved to {}{how}", done.path.display());
-                    self.current_document_path = Some(done.path.clone());
                     self.recent_files.record(&done.path);
-                    if saved_revision == Some(self.document_revision) {
-                        let snapshot = self.current_document_snapshot();
-                        self.recovery.mark_saved(&snapshot);
+                    if belongs_to_active_workspace {
+                        self.status_msg = format!("Design saved to {}{how}", done.path.display());
+                        self.current_document_path = Some(done.path.clone());
+                        if saved_revision == Some(self.document_revision) {
+                            let snapshot = self.current_document_snapshot();
+                            self.recovery.mark_saved(&snapshot);
+                        }
                     }
                     self.defer_onboarding_texture_eviction(&done.path);
                 }
-                Err(error) => self.status_msg = format!("Save failed: {error}"),
+                Err(error) if belongs_to_active_workspace => {
+                    self.status_msg = format!("Save failed: {error}");
+                }
+                Err(error) => log::warn!("Background save for prior project failed: {error}"),
             }
         }
         let completions = {
@@ -234,13 +341,21 @@ impl ZeroCadApp {
     pub(crate) fn recover_latest_autosave(&mut self) {
         match self.recovery.load_latest() {
             Ok(document) => {
-                self.push_undo();
+                self.begin_project_replacement();
+                if self.project_kind == ProjectKind::Part {
+                    self.push_undo();
+                } else {
+                    self.undo_stack.clear();
+                    self.redo_stack.clear();
+                }
+                self.project_kind = ProjectKind::Part;
                 self.current_unit = document.state.units;
                 self.doc_created_unix = document.state.created_unix;
                 self.hidden_nodes = document.hidden_entities();
                 self.document = document;
                 self.document.rebuild_node_map();
                 self.selected_node_id = None;
+                self.feature_properties_dialog = None;
                 self.selected_faces.clear();
                 self.selected_edges.clear();
                 self.selected_body.clear();
@@ -464,6 +579,7 @@ impl ZeroCadApp {
             .collect();
 
         let mut create_part = false;
+        let mut create_assembly = false;
         let mut open_project = false;
         let mut open_recent = None;
 
@@ -531,15 +647,16 @@ impl ZeroCadApp {
                                         false,
                                     )
                                     .clicked();
-                                    Self::project_type_card(
+                                    create_assembly = Self::project_type_card(
                                         &mut columns[1],
                                         &pal,
                                         icons::Icon::Assembly,
                                         "Assembly",
                                         "Combine parts and sub-assemblies.",
-                                        false,
                                         true,
-                                    );
+                                        false,
+                                    )
+                                    .clicked();
                                     Self::project_type_card(
                                         &mut columns[2],
                                         &pal,
@@ -648,6 +765,9 @@ impl ZeroCadApp {
 
         if create_part {
             self.new_design();
+            self.onboarding_visible = false;
+        } else if create_assembly {
+            self.new_assembly();
             self.onboarding_visible = false;
         } else if open_project {
             if let Some(path) = rfd::FileDialog::new()
@@ -1179,7 +1299,15 @@ impl ZeroCadApp {
                 }
             };
 
-        self.push_undo();
+        self.begin_project_replacement();
+
+        if self.project_kind == ProjectKind::Part {
+            self.push_undo();
+        } else {
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+        }
+        self.project_kind = ProjectKind::Part;
         self.hidden_nodes = loaded.document.hidden_entities();
         self.current_unit = loaded.document.state.units;
         self.doc_created_unix = loaded.document.state.created_unix;
@@ -1189,6 +1317,7 @@ impl ZeroCadApp {
         // suffix. Dependencies and semantic timelines determine evaluation.
         self.reseed_id_counter_from_graph();
         self.selected_node_id = None;
+        self.feature_properties_dialog = None;
         self.selected_faces.clear();
         self.selected_edges.clear();
         self.selected_body.clear();
@@ -1462,12 +1591,96 @@ impl ZeroCadApp {
         if self.selected_node_id.as_deref() == Some(del_id) {
             self.selected_node_id = None;
         }
+        if self.feature_properties_dialog.as_deref() == Some(del_id) {
+            self.feature_properties_dialog = None;
+        }
         self.selected_faces.retain(|(sid, _)| sid != del_id);
         self.selected_edges.retain(|(sid, _)| sid != del_id);
         self.selected_body.retain(|(nid, _)| nid != del_id);
         self.hidden_nodes.remove(del_id);
         self.reevaluate_geometry();
         true
+    }
+}
+
+#[cfg(test)]
+mod workspace_routing_tests {
+    use super::*;
+
+    #[test]
+    fn new_assembly_enters_an_isolated_empty_workspace() {
+        let mut app = ZeroCadApp::new();
+        app.document.add_feature(FeatureNode {
+            id: "box_1".to_string(),
+            name: "Box".to_string(),
+            feature: FeatureType::Box {
+                w: 1.0,
+                h: 2.0,
+                d: 3.0,
+            },
+        });
+        app.current_document_path = Some(PathBuf::from("C:/parts/source.zcad"));
+        app.hidden_nodes.insert("box_1".to_string());
+        app.selected_node_id = Some("box_1".to_string());
+        app.is_sketch_mode = true;
+
+        app.new_assembly();
+
+        assert_eq!(app.project_kind, ProjectKind::Assembly);
+        assert_eq!(app.project_title(), "Untitled Assembly");
+        assert_eq!(app.document.graph.node_count(), 1, "empty origin only");
+        assert!(app.body_meshes.is_empty());
+        assert!(app.evaluated_scene.instances().is_empty());
+        assert!(app.current_document_path.is_none());
+        assert!(app.hidden_nodes.is_empty());
+        assert!(app.selected_node_id.is_none());
+        assert!(!app.is_sketch_mode);
+        assert!(!app.is_plane_selection_mode);
+        assert!(app.undo_stack.is_empty());
+        assert!(app.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn returning_to_part_does_not_restore_assembly_through_part_undo() {
+        let mut app = ZeroCadApp::new();
+        app.new_assembly();
+
+        app.new_design();
+
+        assert_eq!(app.project_kind, ProjectKind::Part);
+        assert_eq!(app.project_title(), "Untitled Project");
+        assert!(app.undo_stack.is_empty());
+        assert!(app.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn project_switch_cancels_a_save_that_has_not_captured_its_document() {
+        let mut app = ZeroCadApp::new();
+        app.pending_save = Some(PendingSave {
+            path: PathBuf::from("queued.zcad"),
+            profile: zerocad_core::SaveProfile::Hydrated {
+                total_accelerator_budget: 1024,
+            },
+            started: std::time::Instant::now(),
+            dispatched: false,
+            revision: None,
+            workspace_generation: app.workspace_generation,
+        });
+
+        app.new_assembly();
+
+        assert!(app.pending_save.is_none());
+    }
+
+    #[test]
+    fn assembly_cannot_open_the_part_save_dialog() {
+        let mut app = ZeroCadApp::new();
+        app.new_assembly();
+
+        app.open_save_dialog();
+
+        assert!(app.save_dialog.is_none());
+        assert!(app.status_msg.contains("Assembly saving"));
     }
 }
 

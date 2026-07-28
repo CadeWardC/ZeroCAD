@@ -17,10 +17,13 @@ impl ZeroCadApp {
         let recovery_available = recovery.has_recovery();
 
         Self {
+            project_kind: ProjectKind::Part,
+            workspace_generation: 0,
             pending_visual: None,
             pending_mirror_join_feedback: None,
             document,
             selected_node_id: None,
+            feature_properties_dialog: None,
             body_meshes,
             evaluated_scene,
             datum_values: std::collections::HashMap::new(),
@@ -169,6 +172,7 @@ impl ZeroCadApp {
             current_unit: prefs.unit,
             snap_enabled: prefs.snap_enabled,
             grid_visible: prefs.grid_visible,
+            show_sketch_constraints: prefs.show_sketch_constraints,
             show_preferences: false,
             show_about: false,
             parameters_dialog: None,

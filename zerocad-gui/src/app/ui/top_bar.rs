@@ -2,6 +2,9 @@ use crate::*;
 
 impl ZeroCadApp {
     pub(crate) fn project_title(&self) -> String {
+        if self.project_kind == ProjectKind::Assembly {
+            return "Untitled Assembly".to_string();
+        }
         self.current_document_path
             .as_ref()
             .and_then(|path| path.file_stem())
@@ -30,15 +33,16 @@ impl ZeroCadApp {
                         if !self.onboarding_visible {
                             ui.separator();
 
-                            if icons::Icon::Save
-                                .icon_button(
-                                    ui,
-                                    egui::Color32::TRANSPARENT,
-                                    self.pal().accent_soft,
-                                    self.pal().text_body,
-                                )
-                                .on_hover_text("Save design (Ctrl+S)")
-                                .clicked()
+                            if self.project_kind == ProjectKind::Part
+                                && icons::Icon::Save
+                                    .icon_button(
+                                        ui,
+                                        egui::Color32::TRANSPARENT,
+                                        self.pal().accent_soft,
+                                        self.pal().text_body,
+                                    )
+                                    .on_hover_text("Save design (Ctrl+S)")
+                                    .clicked()
                             {
                                 self.open_save_dialog();
                             }
@@ -50,35 +54,37 @@ impl ZeroCadApp {
                                     .color(self.pal().text_strong),
                             );
 
-                            let undo = icons::Icon::Undo
-                                .icon_button(
-                                    ui,
-                                    egui::Color32::TRANSPARENT,
-                                    self.pal().accent_soft,
-                                    if self.undo_stack.is_empty() {
-                                        self.pal().text_faint
-                                    } else {
-                                        self.pal().text_body
-                                    },
-                                )
-                                .on_hover_text("Undo (Ctrl+Z)");
-                            if undo.clicked() && !self.undo_stack.is_empty() {
-                                self.undo();
-                            }
-                            let redo = icons::Icon::Redo
-                                .icon_button(
-                                    ui,
-                                    egui::Color32::TRANSPARENT,
-                                    self.pal().accent_soft,
-                                    if self.redo_stack.is_empty() {
-                                        self.pal().text_faint
-                                    } else {
-                                        self.pal().text_body
-                                    },
-                                )
-                                .on_hover_text("Redo (Ctrl+Y)");
-                            if redo.clicked() && !self.redo_stack.is_empty() {
-                                self.redo();
+                            if self.project_kind == ProjectKind::Part {
+                                let undo = icons::Icon::Undo
+                                    .icon_button(
+                                        ui,
+                                        egui::Color32::TRANSPARENT,
+                                        self.pal().accent_soft,
+                                        if self.undo_stack.is_empty() {
+                                            self.pal().text_faint
+                                        } else {
+                                            self.pal().text_body
+                                        },
+                                    )
+                                    .on_hover_text("Undo (Ctrl+Z)");
+                                if undo.clicked() && !self.undo_stack.is_empty() {
+                                    self.undo();
+                                }
+                                let redo = icons::Icon::Redo
+                                    .icon_button(
+                                        ui,
+                                        egui::Color32::TRANSPARENT,
+                                        self.pal().accent_soft,
+                                        if self.redo_stack.is_empty() {
+                                            self.pal().text_faint
+                                        } else {
+                                            self.pal().text_body
+                                        },
+                                    )
+                                    .on_hover_text("Redo (Ctrl+Y)");
+                                if redo.clicked() && !self.redo_stack.is_empty() {
+                                    self.redo();
+                                }
                             }
                         }
                     });
@@ -111,30 +117,35 @@ impl ZeroCadApp {
 
                         if !self.onboarding_visible {
                             ui.separator();
-                            if self
-                                .mode_tab(ui, "Inspect", icons::Icon::Inspect, false)
-                                .clicked()
-                            {
-                                self.open_inspection_dialog();
-                            }
-                            let sketch_active = self.is_sketch_mode || self.is_plane_selection_mode;
-                            let sketch_tab =
-                                self.mode_tab(ui, "Sketch", icons::Icon::Sketch, sketch_active);
-                            if sketch_tab.clicked() && !sketch_active {
-                                self.begin_sketch_from_header(ui.input(|input| input.time));
-                            }
-                            let model_tab =
-                                self.mode_tab(ui, "Model", icons::Icon::Cube, !sketch_active);
-                            if model_tab
-                                .on_hover_text(if sketch_active {
-                                    "Finish the active sketch and return to Model"
-                                } else {
-                                    "Model workspace"
-                                })
-                                .clicked()
-                                && sketch_active
-                            {
-                                self.finish_active_sketch(ctx);
+                            if self.project_kind == ProjectKind::Assembly {
+                                self.mode_tab(ui, "Assembly", icons::Icon::Assembly, true);
+                            } else {
+                                if self
+                                    .mode_tab(ui, "Inspect", icons::Icon::Inspect, false)
+                                    .clicked()
+                                {
+                                    self.open_inspection_dialog();
+                                }
+                                let sketch_active =
+                                    self.is_sketch_mode || self.is_plane_selection_mode;
+                                let sketch_tab =
+                                    self.mode_tab(ui, "Sketch", icons::Icon::Sketch, sketch_active);
+                                if sketch_tab.clicked() && !sketch_active {
+                                    self.begin_sketch_from_header(ui.input(|input| input.time));
+                                }
+                                let model_tab =
+                                    self.mode_tab(ui, "Model", icons::Icon::Cube, !sketch_active);
+                                if model_tab
+                                    .on_hover_text(if sketch_active {
+                                        "Finish the active sketch and return to Model"
+                                    } else {
+                                        "Model workspace"
+                                    })
+                                    .clicked()
+                                    && sketch_active
+                                {
+                                    self.finish_active_sketch(ctx);
+                                }
                             }
                         }
                     });
@@ -153,9 +164,25 @@ impl ZeroCadApp {
                 .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-                        let active_sketching = self.is_sketch_mode || self.is_plane_selection_mode;
-                        self.draw_top_bar_modeling_commands(ui, ctx, active_sketching);
-                        self.draw_sketch_tool_strip(ui);
+                        if self.project_kind == ProjectKind::Assembly {
+                            ui.label(
+                                egui::RichText::new("ASSEMBLY WORKSPACE")
+                                    .strong()
+                                    .size(11.0)
+                                    .color(self.pal().accent),
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("0 components")
+                                    .size(11.5)
+                                    .color(self.pal().text_muted),
+                            );
+                        } else {
+                            let active_sketching =
+                                self.is_sketch_mode || self.is_plane_selection_mode;
+                            self.draw_top_bar_modeling_commands(ui, ctx, active_sketching);
+                            self.draw_sketch_tool_strip(ui);
+                        }
                     });
                 });
         }
@@ -256,5 +283,7 @@ mod tests {
         assert_eq!(app.project_title(), "Untitled Project");
         app.current_document_path = Some(PathBuf::from("C:/parts/motor_mount.zcad"));
         assert_eq!(app.project_title(), "motor_mount");
+        app.new_assembly();
+        assert_eq!(app.project_title(), "Untitled Assembly");
     }
 }

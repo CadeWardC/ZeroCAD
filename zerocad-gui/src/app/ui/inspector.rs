@@ -1,5 +1,4 @@
 use crate::*;
-use zerocad_core::sketch::{Constraint, SolveOutcome};
 
 pub(super) const WORKSPACE_INSPECTOR_CONTENT_WIDTH: f32 = 246.0;
 pub(super) const WORKSPACE_INSPECTOR_VIEWPORT_RESERVATION: f32 =
@@ -8,11 +7,12 @@ const WORKSPACE_INSPECTOR_EDGE_PADDING: f32 = 16.0;
 
 impl ZeroCadApp {
     pub(crate) fn inspector_has_content(&self) -> bool {
+        if self.is_sketch_mode {
+            return false;
+        }
         self.extrude_op.is_some()
-            || self.is_sketch_mode
             || self.is_plane_selection_mode
             || self.other_active_operation_name().is_some()
-            || self.selected_node_id.is_some()
             || self.has_viewport_selection()
     }
 
@@ -76,8 +76,8 @@ impl ZeroCadApp {
 
                         if self.extrude_op.is_some() {
                             self.draw_extrude_inspector(ui);
-                        } else if self.is_sketch_mode || self.is_plane_selection_mode {
-                            self.draw_sketch_inspector(ui);
+                        } else if self.is_plane_selection_mode {
+                            self.draw_plane_selection_inspector(ui);
                         } else if let Some(operation) = self.other_active_operation_name() {
                             ui.add_space(12.0);
                             Self::inspector_section(ui, &self.pal(), "Active operation", |ui| {
@@ -138,11 +138,6 @@ impl ZeroCadApp {
                                     ));
                                 }
                             });
-                        } else if self.selected_node_id.is_some() {
-                            egui::ScrollArea::vertical()
-                                .id_salt("feature_properties_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| self.draw_selected_feature_properties(ui));
                         }
                     });
             });
@@ -151,8 +146,8 @@ impl ZeroCadApp {
     fn inspector_title(&self) -> &'static str {
         if self.extrude_op.is_some() {
             "EXTRUDE"
-        } else if self.is_sketch_mode || self.is_plane_selection_mode {
-            "SKETCH"
+        } else if self.is_plane_selection_mode {
+            "SKETCH PLANE"
         } else if let Some(name) = self.other_active_operation_name() {
             name
         } else {
@@ -317,123 +312,18 @@ impl ZeroCadApp {
         }
     }
 
-    fn draw_sketch_inspector(&mut self, ui: &mut egui::Ui) {
+    fn draw_plane_selection_inspector(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
-        if self.is_plane_selection_mode {
-            ui.add_space(12.0);
-            Self::inspector_section(ui, &pal, "Choose a plane", |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Select an origin plane, datum plane, or planar body face in the viewport.",
-                    )
-                    .size(12.0)
-                    .color(pal.text_muted),
-                );
-            });
-            return;
-        }
-
-        let area: f32 = self.detected_regions.iter().map(|region| region.area).sum();
-        let perimeter: f32 = self
-            .detected_regions
-            .iter()
-            .map(|region| {
-                polygon_perimeter(&region.boundary)
-                    + region
-                        .holes
-                        .iter()
-                        .map(|hole| polygon_perimeter(hole))
-                        .sum::<f32>()
-            })
-            .sum();
-        let vars = self.document.variable_map();
-        let solve = self
-            .sketch_solver_model
-            .as_ref()
-            .map(|model| zerocad_core::sketch::solve_model(model, &vars));
-
-        egui::ScrollArea::vertical()
-            .id_salt("sketch_inspector_scroll")
-            .show(ui, |ui| {
-                ui.add_space(12.0);
-                Self::inspector_section(ui, &pal, "Profile", |ui| {
-                    let closed = self.detected_regions.len();
-                    ui.horizontal(|ui| {
-                        ui.colored_label(pal.success, "●");
-                        ui.label(format!(
-                            "{closed} closed profile{}",
-                            if closed == 1 { "" } else { "s" }
-                        ));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Area").color(pal.text_muted));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("{area:.2} mm²"));
-                        });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Perimeter").color(pal.text_muted));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("{perimeter:.2} mm"));
-                        });
-                    });
-                });
-
-                Self::inspector_section(ui, &pal, "Constraints", |ui| {
-                    if let Some(report) = &solve {
-                        let (label, color) = match report.outcome {
-                            SolveOutcome::Conflicting => {
-                                ("Over-constrained".to_string(), pal.danger)
-                            }
-                            SolveOutcome::DidNotConverge => {
-                                ("Did not converge".to_string(), pal.danger)
-                            }
-                            SolveOutcome::Converged if report.dof == 0 => {
-                                ("Fully defined".to_string(), pal.success)
-                            }
-                            SolveOutcome::Converged => {
-                                (format!("{} DOF remaining", report.dof), pal.accent)
-                            }
-                        };
-                        ui.colored_label(color, label);
-                    }
-                    if let Some(model) = &self.sketch_solver_model {
-                        for constraint in model.constraints.iter().take(9) {
-                            ui.label(
-                                egui::RichText::new(constraint_label(constraint))
-                                    .size(11.5)
-                                    .color(pal.text_body),
-                            );
-                        }
-                        if model.constraints.len() > 9 {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "+ {} more",
-                                    model.constraints.len() - 9
-                                ))
-                                .size(10.5)
-                                .color(pal.accent),
-                            );
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new("No solver constraints yet.").color(pal.text_faint),
-                        );
-                    }
-                });
-
-                Self::inspector_section(ui, &pal, "Snapping", |ui| {
-                    ui.checkbox(&mut self.snap_enabled, "Enable snapping");
-                    ui.checkbox(&mut self.grid_visible, "Show grid");
-                    ui.label(
-                        egui::RichText::new(
-                            "Hold Ctrl while drawing to temporarily bypass snapping.",
-                        )
-                        .size(10.5)
-                        .color(pal.text_faint),
-                    );
-                });
-            });
+        ui.add_space(12.0);
+        Self::inspector_section(ui, &pal, "Choose a plane", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Select an origin plane, datum plane, or planar body face in the viewport.",
+                )
+                .size(12.0)
+                .color(pal.text_muted),
+            );
+        });
     }
 
     fn inspector_section(
@@ -456,54 +346,24 @@ impl ZeroCadApp {
     }
 }
 
-fn polygon_perimeter(points: &[(f32, f32)]) -> f32 {
-    if points.len() < 2 {
-        return 0.0;
-    }
-    points
-        .iter()
-        .zip(points.iter().cycle().skip(1))
-        .take(points.len())
-        .map(|(a, b)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt())
-        .sum()
-}
-
-fn constraint_label(constraint: &Constraint) -> &'static str {
-    match constraint {
-        Constraint::Coincident { .. } => "Coincident",
-        Constraint::Horizontal { .. } => "Horizontal",
-        Constraint::Vertical { .. } => "Vertical",
-        Constraint::Distance { .. } => "Distance",
-        Constraint::Radius { .. } => "Radius",
-        Constraint::Parallel { .. } => "Parallel",
-        Constraint::Perpendicular { .. } => "Perpendicular",
-        Constraint::Tangent { .. } => "Tangent",
-        Constraint::Equal { .. } => "Equal",
-        Constraint::Fixed { .. } => "Fixed",
-        Constraint::DistanceX { .. } => "Horizontal distance",
-        Constraint::DistanceY { .. } => "Vertical distance",
-        Constraint::Angle { .. } => "Angle",
-        Constraint::Concentric { .. } => "Concentric",
-        Constraint::Midpoint { .. } => "Midpoint",
-        Constraint::PointOnObject { .. } => "Point on object",
-        Constraint::Collinear { .. } => "Collinear",
-        Constraint::Symmetric { .. } => "Symmetric",
-        Constraint::Diameter { .. } => "Diameter",
-        Constraint::SplineTangent { .. } => "Spline tangent",
-        Constraint::SplineCurvature { .. } => "Spline curvature",
-        Constraint::LineDistance { .. } => "Line distance",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::polygon_perimeter;
+    use super::*;
 
     #[test]
-    fn perimeter_closes_polygon() {
-        assert_eq!(
-            polygon_perimeter(&[(0.0, 0.0), (3.0, 0.0), (3.0, 4.0)]),
-            12.0
-        );
+    fn sketch_mode_suppresses_the_workspace_inspector() {
+        let mut app = ZeroCadApp::new();
+        app.is_sketch_mode = true;
+        app.selected_node_id = Some("selected_feature".to_string());
+
+        assert!(!app.inspector_has_content());
+    }
+
+    #[test]
+    fn selected_feature_does_not_open_the_workspace_inspector() {
+        let mut app = ZeroCadApp::new();
+        app.selected_node_id = Some("selected_feature".to_string());
+
+        assert!(!app.inspector_has_content());
     }
 }

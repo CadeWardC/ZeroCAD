@@ -502,6 +502,10 @@ impl ZeroCadApp {
             }
 
             response.context_menu(|ui| {
+                if ui.button("Properties").clicked() {
+                    self.open_feature_properties(&owner_id);
+                    ui.close_menu();
+                }
                 if ui.button("Rename").clicked() {
                     self.renaming_node = Some(id.to_owned());
                     self.rename_buffer = name.to_owned();

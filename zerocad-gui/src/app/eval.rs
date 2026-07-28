@@ -42,6 +42,21 @@ impl ZeroCadApp {
     /// Run a keyboard-shortcut action. Single dispatch point shared by the global
     /// hotkey handler and (where relevant) menu items.
     pub(crate) fn run_shortcut(&mut self, action: ShortcutAction) {
+        if self.project_kind == ProjectKind::Assembly {
+            match action {
+                ShortcutAction::NewDesign => self.new_design(),
+                ShortcutAction::OpenDesign => self.open_design(),
+                ShortcutAction::SaveDesign => self.open_save_dialog(),
+                ShortcutAction::ToggleTheme => self.dark_mode = !self.dark_mode,
+                ShortcutAction::OpenSettings => self.show_preferences = true,
+                _ => {
+                    self.status_msg =
+                        "That command is not available in the assembly workspace yet.".to_string();
+                }
+            }
+            return;
+        }
+
         match action {
             ShortcutAction::NewDesign => self.new_design(),
             ShortcutAction::OpenDesign => self.open_design(),

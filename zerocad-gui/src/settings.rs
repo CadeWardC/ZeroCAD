@@ -129,6 +129,11 @@ pub(crate) struct AppSettings {
     /// Whether reference grids are drawn in the model and sketch viewports.
     #[serde(default = "default_true")]
     pub(crate) grid_visible: bool,
+    /// Whether the sketch constraint palette and inferred-constraint glyphs are
+    /// visible. The solver remains active when this presentation preference is
+    /// off.
+    #[serde(default)]
+    pub(crate) show_sketch_constraints: bool,
 }
 
 fn default_true() -> bool {
@@ -151,6 +156,7 @@ impl Default for AppSettings {
             hydrated_cache_mb: default_hydrated_cache_mb(),
             snap_enabled: true,
             grid_visible: true,
+            show_sketch_constraints: false,
         }
     }
 }
@@ -185,6 +191,24 @@ impl AppSettings {
             }
             Err(e) => log::warn!("Could not serialize settings: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn sketch_constraints_are_opt_in_for_defaults_and_older_settings() {
+        assert!(!AppSettings::default().show_sketch_constraints);
+
+        let older = r#"{
+            "show_onboarding": true,
+            "dark_mode": false,
+            "unit": "Millimeter"
+        }"#;
+        let loaded: AppSettings = serde_json::from_str(older).expect("older settings");
+        assert!(!loaded.show_sketch_constraints);
     }
 }
 

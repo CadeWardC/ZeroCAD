@@ -46,6 +46,13 @@ impl eframe::App for ZeroCadApp {
             return;
         }
 
+        if self.project_kind == ProjectKind::Assembly {
+            self.draw_status_bar(ctx);
+            self.draw_assembly_workspace(ctx);
+            self.persist_settings();
+            return;
+        }
+
         self.show_move_dialog(ctx);
         self.show_combine_dialog(ctx);
         self.show_split_body_dialog(ctx);
@@ -54,6 +61,7 @@ impl eframe::App for ZeroCadApp {
         self.draw_status_bar(ctx);
 
         self.draw_workspace_viewport(ctx);
+        self.show_feature_properties_window(ctx);
 
         self.handle_sketch_keys(ctx);
 

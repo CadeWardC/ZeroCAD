@@ -2,10 +2,11 @@
 //! palette (buttons enabled by the current point/entity selection), the live
 //! constraint list with per-row delete, and the DOF / conflict status line.
 //!
-//! Shown only while an Edit Sketch session is active (a solver model exists).
-//! Every mutation re-solves the live model immediately (`solve_live_sketch`),
-//! so the sketch follows each constraint the moment it is added or removed;
-//! nothing touches the document until Finish Sketch commits in place.
+//! Opt-in through Settings and shown only while an Edit Sketch session is
+//! active (a solver model exists). Every mutation re-solves the live model
+//! immediately (`solve_live_sketch`), so the sketch follows each constraint the
+//! moment it is added or removed; nothing touches the document until Finish
+//! Sketch commits in place.
 
 use crate::*;
 use zerocad_core::sketch::{Constraint, EntityId, SketchEntity, SolveOutcome};
@@ -325,7 +326,10 @@ impl ZeroCadApp {
     }
 
     pub(crate) fn show_constraints_panel(&mut self, ctx: &egui::Context) {
-        if !self.is_sketch_mode || self.sketch_solver_model.is_none() {
+        if !self.show_sketch_constraints
+            || !self.is_sketch_mode
+            || self.sketch_solver_model.is_none()
+        {
             return;
         }
         let vars = self.document.variable_map();
@@ -1210,6 +1214,15 @@ impl ZeroCadApp {
 }
 
 impl ZeroCadApp {
+    fn constraint_annotation_visible(&self, constraint: &Constraint) -> bool {
+        if constraint_dimension(constraint).is_some() {
+            self.sketch_dimension_positions
+                .contains_key(&constraint.id())
+        } else {
+            self.show_sketch_constraints
+        }
+    }
+
     /// Paint each constraint's glyph at its anchor (red for the reported
     /// conflict), plus highlight rings on the selected points/entities. Pure
     /// painter overlay — clicking/deleting happens in the constraints panel.
@@ -1272,36 +1285,19 @@ impl ZeroCadApp {
         let mut stacked: HashMap<(i64, i64), usize> = HashMap::new();
         let variables = self.document.variable_map();
         for c in &model.constraints {
+            if !self.constraint_annotation_visible(c) {
+                continue;
+            }
             let is_conflict = conflict == Some(c.id());
             let is_selected = self.sketch_selected_constraint == Some(c.id());
 
             if let Some((_name, dimension)) = constraint_dimension(c) {
-                let automatic_anchor = match c {
-                    Constraint::Distance { a, b, .. }
-                    | Constraint::DistanceX { a, b, .. }
-                    | Constraint::DistanceY { a, b, .. } => match (pos(*a), pos(*b)) {
-                        (Some(pa), Some(pb)) => Some(((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5)),
-                        _ => None,
-                    },
-                    Constraint::Radius { circle, .. } | Constraint::Diameter { circle, .. } => {
-                        entity_anchor(*circle)
-                    }
-                    Constraint::Angle { a, .. } => entity_anchor(*a),
-                    Constraint::LineDistance { a, b, .. } => {
-                        match (entity_anchor(*a), entity_anchor(*b)) {
-                            (Some(a), Some(b)) => Some(((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)),
-                            _ => None,
-                        }
-                    }
-                    Constraint::SplineCurvature { spline, .. } => entity_anchor(*spline),
-                    _ => None,
+                // A solver dimension is not automatically a viewport
+                // annotation. Only the Dimension tool records a label anchor,
+                // so shape-internal width/height/radius constraints stay hidden.
+                let Some(anchor) = self.sketch_dimension_positions.get(&c.id()).copied() else {
+                    continue;
                 };
-                let anchor = self
-                    .sketch_dimension_positions
-                    .get(&c.id())
-                    .copied()
-                    .or(automatic_anchor);
-                let Some(anchor) = anchor else { continue };
                 let at = to_screen(anchor);
                 let driven = model.is_driven_dimension(c.id());
                 let is_angle = matches!(c, Constraint::Angle { .. });
@@ -1604,6 +1600,37 @@ mod dimension_tool_tests {
         app.sketch_selected_ids = selected;
         app.sketch_next_entity_id = 100;
         app
+    }
+
+    #[test]
+    fn inferred_constraint_glyphs_follow_the_visibility_preference() {
+        let constraint = Constraint::Horizontal {
+            id: EntityId(10),
+            line: EntityId(2),
+        };
+        let mut app = ZeroCadApp::new();
+
+        assert!(!app.constraint_annotation_visible(&constraint));
+        app.show_sketch_constraints = true;
+        assert!(app.constraint_annotation_visible(&constraint));
+    }
+
+    #[test]
+    fn numeric_annotations_require_dimension_tool_placement() {
+        let constraint = Constraint::Distance {
+            id: EntityId(10),
+            a: EntityId(1),
+            b: EntityId(2),
+            d: Dimension::literal(12.0),
+        };
+        let mut app = ZeroCadApp::new();
+        app.show_sketch_constraints = true;
+
+        assert!(!app.constraint_annotation_visible(&constraint));
+        app.sketch_dimension_positions
+            .insert(EntityId(10), (6.0, 2.0));
+        app.show_sketch_constraints = false;
+        assert!(app.constraint_annotation_visible(&constraint));
     }
 
     #[test]

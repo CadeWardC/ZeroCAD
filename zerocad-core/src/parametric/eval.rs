@@ -933,6 +933,17 @@ impl ParametricGraph {
         self.resolve_variables().values
     }
 
+    /// Sorted parameter names referenced by expression-backed measurements on
+    /// one feature. The inspector uses this to surface the actual driving
+    /// parameters beside the feature they control.
+    pub fn feature_variable_references(&self, id: &str) -> Vec<String> {
+        self.graph
+            .node_weights()
+            .find(|feature| feature.id == id)
+            .map(|feature| feature_expression_references(&feature.feature))
+            .unwrap_or_default()
+    }
+
     /// Resolve literal and expression-backed parameters, including forward
     /// references, while reporting duplicate names, invalid identifiers,
     /// unknown dependencies, malformed expressions, and cycles. Failed rows
@@ -4639,6 +4650,172 @@ fn rename_expression(expression: &mut Option<String>, old: &str, new: &str) {
 
 fn rename_dimension_expression(dimension: &mut crate::sketch::Dimension, old: &str, new: &str) {
     rename_expression(&mut dimension.expr, old, new);
+}
+
+fn collect_expression_references(
+    expression: &Option<String>,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    let Some(expression) = expression.as_deref() else {
+        return;
+    };
+    if let Ok(references) = crate::expr::identifiers(expression) {
+        names.extend(references);
+    }
+}
+
+fn collect_dimension_references(
+    dimension: &crate::sketch::Dimension,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    collect_expression_references(&dimension.expr, names);
+}
+
+fn feature_expression_references(feature: &FeatureType) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    match feature {
+        FeatureType::Sketch {
+            shapes,
+            corner_mods,
+            solver,
+            ..
+        } => {
+            for shape in shapes {
+                match shape {
+                    crate::sketch::SketchShape::Rectangle { w, h, .. } => {
+                        collect_dimension_references(w, &mut names);
+                        collect_dimension_references(h, &mut names);
+                    }
+                    crate::sketch::SketchShape::Circle { diameter, .. }
+                    | crate::sketch::SketchShape::RegularPolygon { diameter, .. } => {
+                        collect_dimension_references(diameter, &mut names);
+                    }
+                    crate::sketch::SketchShape::Slot { width, .. } => {
+                        collect_dimension_references(width, &mut names);
+                    }
+                    crate::sketch::SketchShape::Line {
+                        length, angle_deg, ..
+                    } => {
+                        collect_dimension_references(length, &mut names);
+                        collect_dimension_references(angle_deg, &mut names);
+                    }
+                    crate::sketch::SketchShape::Spline { .. }
+                    | crate::sketch::SketchShape::Imported { .. }
+                    | crate::sketch::SketchShape::Raw { .. } => {}
+                }
+            }
+            for corner in corner_mods {
+                collect_dimension_references(&corner.radius, &mut names);
+            }
+            if let Some(solver) = solver {
+                for constraint in &solver.constraints {
+                    match constraint {
+                        crate::sketch::Constraint::Distance { d, .. } => {
+                            collect_dimension_references(d, &mut names)
+                        }
+                        crate::sketch::Constraint::Radius { r, .. } => {
+                            collect_dimension_references(r, &mut names)
+                        }
+                        crate::sketch::Constraint::DistanceX { d, .. }
+                        | crate::sketch::Constraint::DistanceY { d, .. }
+                        | crate::sketch::Constraint::Diameter { d, .. }
+                        | crate::sketch::Constraint::LineDistance { d, .. } => {
+                            collect_dimension_references(d, &mut names)
+                        }
+                        crate::sketch::Constraint::Angle { angle_deg, .. } => {
+                            collect_dimension_references(angle_deg, &mut names)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        FeatureType::Extrude {
+            depth_expr,
+            draft_angle_expr,
+            ..
+        } => {
+            collect_expression_references(depth_expr, &mut names);
+            collect_expression_references(draft_angle_expr, &mut names);
+        }
+        FeatureType::EdgeMod { dist_expr, .. } => {
+            collect_expression_references(dist_expr, &mut names)
+        }
+        FeatureType::VariableSet { variables } => {
+            for variable in variables {
+                collect_expression_references(&variable.expression, &mut names);
+            }
+        }
+        FeatureType::Revolve { angle_expr, .. } => {
+            collect_expression_references(angle_expr, &mut names)
+        }
+        FeatureType::Sweep {
+            total_twist_expr, ..
+        } => collect_expression_references(total_twist_expr, &mut names),
+        FeatureType::Shell { thickness_expr, .. } => {
+            collect_expression_references(thickness_expr, &mut names)
+        }
+        FeatureType::Hole { diameter_expr, .. } => {
+            collect_expression_references(diameter_expr, &mut names)
+        }
+        FeatureType::Pattern { kind, .. } => match kind {
+            PatternKind::Linear { spacing_expr, .. } => {
+                collect_expression_references(spacing_expr, &mut names)
+            }
+            PatternKind::Mirror { offset_expr, .. } => {
+                collect_expression_references(offset_expr, &mut names)
+            }
+            PatternKind::Circular { .. } => {}
+        },
+        FeatureType::FeaturePattern { kind, .. } => match kind {
+            FeaturePatternKind::Linear { spacing_expr, .. } => {
+                collect_expression_references(spacing_expr, &mut names)
+            }
+            FeaturePatternKind::Circular {
+                total_angle_expr, ..
+            } => collect_expression_references(total_angle_expr, &mut names),
+        },
+        FeatureType::DatumPlane { def } => match def {
+            DatumPlaneDef::Offset { distance_expr, .. } => {
+                collect_expression_references(distance_expr, &mut names)
+            }
+            DatumPlaneDef::Angle { angle_expr, .. } => {
+                collect_expression_references(angle_expr, &mut names)
+            }
+            DatumPlaneDef::ThreePoints { .. }
+            | DatumPlaneDef::MidPlane { .. }
+            | DatumPlaneDef::PlanarFace { .. } => {}
+        },
+        FeatureType::BodyScale { factor_expr, .. } => {
+            collect_expression_references(factor_expr, &mut names)
+        }
+        FeatureType::FaceOffset { distance_expr, .. } => {
+            collect_expression_references(distance_expr, &mut names)
+        }
+        FeatureType::FaceThicken { thickness_expr, .. } => {
+            collect_expression_references(thickness_expr, &mut names)
+        }
+        FeatureType::Draft { angle_expr, .. } => {
+            collect_expression_references(angle_expr, &mut names)
+        }
+        FeatureType::Origin
+        | FeatureType::Box { .. }
+        | FeatureType::Cylinder { .. }
+        | FeatureType::Import { .. }
+        | FeatureType::ImportStl { .. }
+        | FeatureType::Loft { .. }
+        | FeatureType::BodyTransform { .. }
+        | FeatureType::Thread { .. }
+        | FeatureType::DatumAxis { .. }
+        | FeatureType::DatumPoint { .. }
+        | FeatureType::BodyJoin { .. }
+        | FeatureType::BodyCut { .. }
+        | FeatureType::BodyIntersect { .. }
+        | FeatureType::BodySplit { .. }
+        | FeatureType::FaceMove { .. }
+        | FeatureType::FaceDelete { .. } => {}
+    }
+    names.into_iter().collect()
 }
 
 fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
