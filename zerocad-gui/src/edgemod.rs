@@ -1779,6 +1779,7 @@ impl ZeroCadApp {
         self.edge_mod_dist_text = op.dist_text;
         self.selected_body.clear();
         self.selected_edges.clear();
+        self.selected_sketch_points.clear();
         // If the smooth one-face arc geometry for this exact size was already
         // computed while the user was adjusting it, apply it instantly — no
         // faceted-then-arc "pop" a second later. Otherwise fall back to the normal

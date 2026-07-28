@@ -10,16 +10,7 @@ impl ZeroCadApp {
         if self.is_sketch_mode {
             return false;
         }
-        self.extrude_op.is_some()
-            || self.is_plane_selection_mode
-            || self.other_active_operation_name().is_some()
-            || self.has_viewport_selection()
-    }
-
-    fn has_viewport_selection(&self) -> bool {
-        !self.selected_body.is_empty()
-            || !self.selected_faces.is_empty()
-            || !self.selected_edges.is_empty()
+        self.extrude_op.is_some() || self.other_active_operation_name().is_some()
     }
 
     pub(crate) fn draw_inspector(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
@@ -76,8 +67,6 @@ impl ZeroCadApp {
 
                         if self.extrude_op.is_some() {
                             self.draw_extrude_inspector(ui);
-                        } else if self.is_plane_selection_mode {
-                            self.draw_plane_selection_inspector(ui);
                         } else if let Some(operation) = self.other_active_operation_name() {
                             ui.add_space(12.0);
                             Self::inspector_section(ui, &self.pal(), "Active operation", |ui| {
@@ -96,48 +85,6 @@ impl ZeroCadApp {
                             .color(self.pal().text_muted),
                         );
                             });
-                        } else if self.has_viewport_selection() {
-                            ui.add_space(12.0);
-                            Self::inspector_section(ui, &self.pal(), "Selection", |ui| {
-                                if !self.selected_body.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} solid element{} selected",
-                                            self.selected_body.len(),
-                                            if self.selected_body.len() == 1 {
-                                                ""
-                                            } else {
-                                                "s"
-                                            }
-                                        ))
-                                        .strong()
-                                        .size(13.0)
-                                        .color(self.pal().text_strong),
-                                    );
-                                }
-                                if !self.selected_faces.is_empty() {
-                                    ui.label(format!(
-                                        "{} sketch profile{} selected",
-                                        self.selected_faces.len(),
-                                        if self.selected_faces.len() == 1 {
-                                            ""
-                                        } else {
-                                            "s"
-                                        }
-                                    ));
-                                }
-                                if !self.selected_edges.is_empty() {
-                                    ui.label(format!(
-                                        "{} sketch edge{} selected",
-                                        self.selected_edges.len(),
-                                        if self.selected_edges.len() == 1 {
-                                            ""
-                                        } else {
-                                            "s"
-                                        }
-                                    ));
-                                }
-                            });
                         }
                     });
             });
@@ -146,8 +93,6 @@ impl ZeroCadApp {
     fn inspector_title(&self) -> &'static str {
         if self.extrude_op.is_some() {
             "EXTRUDE"
-        } else if self.is_plane_selection_mode {
-            "SKETCH PLANE"
         } else if let Some(name) = self.other_active_operation_name() {
             name
         } else {
@@ -312,20 +257,6 @@ impl ZeroCadApp {
         }
     }
 
-    fn draw_plane_selection_inspector(&mut self, ui: &mut egui::Ui) {
-        let pal = self.pal();
-        ui.add_space(12.0);
-        Self::inspector_section(ui, &pal, "Choose a plane", |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Select an origin plane, datum plane, or planar body face in the viewport.",
-                )
-                .size(12.0)
-                .color(pal.text_muted),
-            );
-        });
-    }
-
     fn inspector_section(
         ui: &mut egui::Ui,
         pal: &Palette,
@@ -363,6 +294,22 @@ mod tests {
     fn selected_feature_does_not_open_the_workspace_inspector() {
         let mut app = ZeroCadApp::new();
         app.selected_node_id = Some("selected_feature".to_string());
+
+        assert!(!app.inspector_has_content());
+    }
+
+    #[test]
+    fn viewport_selection_does_not_open_the_workspace_inspector() {
+        let mut app = ZeroCadApp::new();
+        app.selected_faces.insert(("sketch_1".to_string(), 0));
+
+        assert!(!app.inspector_has_content());
+    }
+
+    #[test]
+    fn plane_selection_does_not_open_the_workspace_inspector() {
+        let mut app = ZeroCadApp::new();
+        app.is_plane_selection_mode = true;
 
         assert!(!app.inspector_has_content());
     }

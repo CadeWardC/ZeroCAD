@@ -4846,7 +4846,7 @@ dependencies = [
 
 [[package]]
 name = "zerocad-core"
-version = "0.1.0"
+version = "0.7.5"
 dependencies = [
  "blake3",
  "ciborium",
@@ -4864,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "zerocad-gui"
-version = "0.1.0"
+version = "0.7.5"
 dependencies = [
  "eframe",
  "egui-wgpu",

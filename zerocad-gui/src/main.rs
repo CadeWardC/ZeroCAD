@@ -950,6 +950,9 @@ struct ZeroCadApp {
     /// Selected sketch edges, keyed by `(sketch_id, edge_index)` where the index
     /// is `segment i` for `i < segments.len()` else `circle (i - segments.len())`.
     selected_edges: HashSet<(String, usize)>,
+    /// Selected visible point handles of finished sketches, keyed by
+    /// `(sketch_id, point_index)` using `geom2d::selectable_sketch_points`.
+    selected_sketch_points: HashSet<(String, usize)>,
     /// Selected elements of solid bodies, keyed by `(body_node_id, BodyPick)`.
     /// Separate from the sketch selection above so the extrude workflow is
     /// unaffected.

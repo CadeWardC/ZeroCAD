@@ -918,7 +918,9 @@ impl ZeroCadApp {
 
                                 let mut best: Option<(String, usize, f32)> = None; // (sketch, region, depth)
                                 let mut best_edge: Option<(String, usize, f32)> = None; // (sketch, edge, px dist)
+                                let mut best_point: Option<(String, usize, f32)> = None; // (sketch, point, px dist)
                                 const EDGE_TOL_PX: f32 = 6.0;
+                                const POINT_TOL_PX: f32 = 8.0;
                                 let var_map = self.document.variable_map();
                                 for idx in self.document.graph.node_indices() {
                                     let node = &self.document.graph[idx];
@@ -945,6 +947,24 @@ impl ZeroCadApp {
                                                 })
                                                 .collect()
                                         };
+
+                                        // Visible sketch points take priority over edges, just
+                                        // like solid-body vertices do in the body picker.
+                                        for (point_index, point) in
+                                            crate::geom2d::selectable_sketch_points(curves)
+                                                .into_iter()
+                                                .enumerate()
+                                        {
+                                            let distance = click_pos.distance(to_scr(point.0, point.1));
+                                            if distance < POINT_TOL_PX
+                                                && best_point
+                                                    .as_ref()
+                                                    .is_none_or(|best| distance < best.2)
+                                            {
+                                                best_point =
+                                                    Some((node.id.clone(), point_index, distance));
+                                            }
+                                        }
 
                                         // Edge candidates: drawn segments, circles, then splines.
                                         let seg_count = curves.segments.len();
@@ -1055,7 +1075,8 @@ impl ZeroCadApp {
                                 let hit_sketch = best
                                     .as_ref()
                                     .map(|b| b.0.clone())
-                                    .or_else(|| best_edge.as_ref().map(|b| b.0.clone()));
+                                    .or_else(|| best_edge.as_ref().map(|b| b.0.clone()))
+                                    .or_else(|| best_point.as_ref().map(|b| b.0.clone()));
 
                                 if hit_sketch.is_some() {
                                     // A sketch is under the cursor — select it, clearing
@@ -1075,8 +1096,24 @@ impl ZeroCadApp {
                                     if !multi_select {
                                         self.selected_faces.clear();
                                         self.selected_edges.clear();
+                                        self.selected_sketch_points.clear();
                                     }
-                                    if let Some((sid, ei, _)) = best_edge {
+                                    if let Some((sid, point_index, _)) = best_point {
+                                        let key = (sid, point_index);
+                                        if multi_select
+                                            && !self.selected_sketch_points.insert(key.clone())
+                                        {
+                                            self.selected_sketch_points.remove(&key);
+                                        } else {
+                                            self.selected_sketch_points.insert(key.clone());
+                                        }
+                                        self.status_msg = format!(
+                                            "Point {} of {} selected. Points: {}.",
+                                            key.1,
+                                            key.0,
+                                            self.selected_sketch_points.len(),
+                                        );
+                                    } else if let Some((sid, ei, _)) = best_edge {
                                         let key = (sid, ei);
                                         if multi_select && !self.selected_edges.insert(key.clone()) {
                                             self.selected_edges.remove(&key);
@@ -1096,12 +1133,13 @@ impl ZeroCadApp {
                                         } else {
                                             self.selected_faces.insert(key.clone());
                                         }
-                                        self.status_msg = format!(
-                                            "Face {} of {} selected. Faces: {} (click Extrude to build).",
-                                            key.1,
-                                            key.0,
-                                            self.selected_faces.len(),
-                                        );
+                                        self.status_msg = if self.selected_faces.len() == 1 {
+                                            "Click Extrude to build the selected sketch profile."
+                                                .to_string()
+                                        } else {
+                                            "Click Extrude to build the selected sketch profiles."
+                                                .to_string()
+                                        };
                                     }
                                 } else {
                                     // No sketch hit — try body picking instead. The face
@@ -1121,6 +1159,7 @@ impl ZeroCadApp {
                                         // concept; a body pick always supersedes them.
                                         self.selected_faces.clear();
                                         self.selected_edges.clear();
+                                        self.selected_sketch_points.clear();
                                         self.select_body_hit(node, pick, is_double, multi_select);
                                     } else if !multi_select {
                                         // Nothing hit and no modifier held — clear everything
@@ -1130,6 +1169,7 @@ impl ZeroCadApp {
                                         self.selected_body.clear();
                                         self.selected_faces.clear();
                                         self.selected_edges.clear();
+                                        self.selected_sketch_points.clear();
                                     }
                                 } // end: sketch-first picking
                             }

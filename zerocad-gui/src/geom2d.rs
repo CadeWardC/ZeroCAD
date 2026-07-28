@@ -11,16 +11,18 @@ use zerocad_core::{Region, SketchCurves};
 /// the face picker.
 ///
 /// `interactive` brightens the curves (used for the sketch being drawn). Faces
-/// in `selected` are highlighted blue and edges in `selected_edges` are
-/// highlighted orange; everything else stays faint so picking one element never
-/// recolors the whole sketch. Edge indices are segments, then circles, then
-/// splines in their stored order.
+/// in `selected` are highlighted blue and edges/points in the corresponding
+/// selection sets are highlighted orange; everything else stays faint so
+/// picking one element never recolors the whole sketch. Edge indices are
+/// segments, then circles, then splines in their stored order. Point indices
+/// follow [`selectable_sketch_points`].
 pub(crate) fn draw_sketch_geometry(
     painter: &egui::Painter,
     curves: &SketchCurves,
     regions: &[Region],
     selected: &HashSet<usize>,
     selected_edges: &HashSet<usize>,
+    selected_points: &HashSet<usize>,
     to_screen: &dyn Fn((f32, f32)) -> egui::Pos2,
     interactive: bool,
 ) {
@@ -153,53 +155,91 @@ pub(crate) fn draw_sketch_geometry(
         }
     }
 
-    let dot_fill = egui::Color32::WHITE;
-    let dot_stroke = egui::Stroke::new(1.3, seg_color);
-    let draw_dot = |p: (f32, f32)| {
-        let s = to_screen(p);
-        painter.circle_filled(s, 3.5, dot_fill);
-        painter.circle_stroke(s, 3.5, dot_stroke);
-    };
+    for (index, point) in selectable_sketch_points(curves).into_iter().enumerate() {
+        let selected = selected_points.contains(&index);
+        let dot_fill = if selected {
+            egui::Color32::from_rgb(255, 140, 0)
+        } else {
+            egui::Color32::WHITE
+        };
+        let dot_stroke = if selected {
+            egui::Stroke::new(1.6, egui::Color32::from_rgb(190, 90, 0))
+        } else {
+            egui::Stroke::new(1.3, seg_color)
+        };
+        let radius = if selected { 4.5 } else { 3.5 };
+        let s = to_screen(point);
+        painter.circle_filled(s, radius, dot_fill);
+        painter.circle_stroke(s, radius, dot_stroke);
+    }
+}
 
-    // Vertex handles: draw a dot only at *real* vertices, not at every segment
-    // endpoint. A fillet (and an ellipse) is a polyline of many tiny segments, so
-    // dotting each one beads the curve and hides its smoothness. Group segment
-    // ends by position and skip any vertex where exactly two segments meet
-    // near-straight (an arc sample, or the tangent point where a fillet blends
-    // into a line) — keeping dots on open ends, junctions, and genuine corners.
+/// Stable, visible point handles for a finished sketch. The encounter order is
+/// intentional: projected/reference curves may be appended after authored
+/// geometry without changing the indices of the original points.
+pub(crate) fn selectable_sketch_points(curves: &SketchCurves) -> Vec<(f32, f32)> {
     let qkey = |p: (f32, f32)| ((p.0 * 1000.0).round() as i32, (p.1 * 1000.0).round() as i32);
     let mut nodes: HashMap<(i32, i32), ((f32, f32), Vec<(f32, f32)>)> = HashMap::new();
+    let mut node_order = Vec::new();
     let mut add_end = |p: (f32, f32), other: (f32, f32)| {
         let d = (other.0 - p.0, other.1 - p.1);
         let len = (d.0 * d.0 + d.1 * d.1).sqrt();
         if len > 1e-6 {
+            let key = qkey(p);
+            if !nodes.contains_key(&key) {
+                node_order.push(key);
+            }
             nodes
-                .entry(qkey(p))
+                .entry(key)
                 .or_insert((p, Vec::new()))
                 .1
                 .push((d.0 / len, d.1 / len));
         }
     };
-    for seg in &curves.segments {
-        add_end(seg.a, seg.b);
-        add_end(seg.b, seg.a);
+    for segment in &curves.segments {
+        add_end(segment.a, segment.b);
+        add_end(segment.b, segment.a);
     }
-    for (_, (p, dirs)) in &nodes {
-        let is_handle = if dirs.len() == 2 {
-            // Two outgoing directions: a straight pass-through has them opposite
-            // (dot ≈ −1). Keep a dot only once the turn exceeds ~15° (a corner).
-            let d = dirs[0].0 * dirs[1].0 + dirs[0].1 * dirs[1].1;
-            d > -0.966
-        } else {
-            true // open endpoint (1) or junction (3+)
-        };
-        if is_handle {
-            draw_dot(*p);
+    for arc in &curves.arcs {
+        add_end(arc.start, arc.end);
+        add_end(arc.end, arc.start);
+    }
+    for spline in &curves.splines {
+        if spline.closed {
+            continue;
+        }
+        let samples = spline.sampled_points(0.01);
+        if let [first, second, ..] = samples.as_slice() {
+            add_end(*first, *second);
+        }
+        if samples.len() >= 2 {
+            add_end(samples[samples.len() - 1], samples[samples.len() - 2]);
         }
     }
-    for c in &curves.circles {
-        draw_dot(c.center);
+
+    let mut points = Vec::new();
+    let mut point_keys = HashSet::new();
+    for key in node_order {
+        let Some((point, directions)) = nodes.get(&key) else {
+            continue;
+        };
+        let is_handle = if directions.len() == 2 {
+            let dot = directions[0].0 * directions[1].0 + directions[0].1 * directions[1].1;
+            dot > -0.966
+        } else {
+            true
+        };
+        if is_handle && point_keys.insert(key) {
+            points.push(*point);
+        }
     }
+    for circle in &curves.circles {
+        let key = qkey(circle.center);
+        if point_keys.insert(key) {
+            points.push(circle.center);
+        }
+    }
+    points
 }
 
 /// The circle through three points (center, radius), or `None` if they are
@@ -585,7 +625,8 @@ pub(crate) fn triangulate_nested_loops(loops: &[Vec<egui::Pos2>]) -> Vec<[egui::
 
 #[cfg(test)]
 mod tests {
-    use super::circumcircle;
+    use super::{circumcircle, selectable_sketch_points};
+    use zerocad_core::SketchCurves;
 
     #[test]
     fn circumcircle_of_unit_axis_points() {
@@ -601,6 +642,29 @@ mod tests {
     #[test]
     fn circumcircle_collinear_is_none() {
         assert!(circumcircle((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn selectable_points_include_finished_sketch_corners_in_stable_order() {
+        let mut curves = SketchCurves::new();
+        curves.add_rectangle((0.0, 0.0), (4.0, 3.0));
+
+        assert_eq!(
+            selectable_sketch_points(&curves),
+            vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)]
+        );
+    }
+
+    #[test]
+    fn selectable_points_hide_collinear_pass_through_samples() {
+        let mut curves = SketchCurves::new();
+        curves.add_line((0.0, 0.0), (1.0, 0.0));
+        curves.add_line((1.0, 0.0), (2.0, 0.0));
+
+        assert_eq!(
+            selectable_sketch_points(&curves),
+            vec![(0.0, 0.0), (2.0, 0.0)]
+        );
     }
 
     #[test]

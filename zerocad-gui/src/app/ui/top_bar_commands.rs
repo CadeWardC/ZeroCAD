@@ -650,6 +650,7 @@ impl ZeroCadApp {
                 if clear_sel_btn.clicked() {
                     self.selected_faces.clear();
                     self.selected_edges.clear();
+                    self.selected_sketch_points.clear();
                     self.selected_body.clear();
                 }
             }

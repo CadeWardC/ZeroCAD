@@ -496,6 +496,7 @@ impl ZeroCadApp {
                 if is_live_body {
                     self.selected_faces.clear();
                     self.selected_edges.clear();
+                    self.selected_sketch_points.clear();
                     self.selected_body.clear();
                     self.selected_body.insert((id.to_owned(), BodyPick::Whole));
                 }

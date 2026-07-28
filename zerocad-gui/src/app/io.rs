@@ -34,6 +34,8 @@ impl ZeroCadApp {
         self.selected_node_id = None;
         self.feature_properties_dialog = None;
         self.selected_faces.clear();
+        self.selected_edges.clear();
+        self.selected_sketch_points.clear();
         self.selected_body.clear();
         self.extrude_op = None;
         self.edge_mod_op = None;
@@ -158,6 +160,7 @@ impl ZeroCadApp {
         self.active_sketch_datum_ref = None;
         self.selected_faces.clear();
         self.selected_edges.clear();
+        self.selected_sketch_points.clear();
         self.selected_body.clear();
         self.body_clipboard = None;
         self.move_op = None;
@@ -358,6 +361,7 @@ impl ZeroCadApp {
                 self.feature_properties_dialog = None;
                 self.selected_faces.clear();
                 self.selected_edges.clear();
+                self.selected_sketch_points.clear();
                 self.selected_body.clear();
                 self.reevaluate_geometry();
                 self.status_msg =
@@ -1320,6 +1324,7 @@ impl ZeroCadApp {
         self.feature_properties_dialog = None;
         self.selected_faces.clear();
         self.selected_edges.clear();
+        self.selected_sketch_points.clear();
         self.selected_body.clear();
         self.extrude_op = None;
         self.edge_mod_op = None;
@@ -1596,6 +1601,8 @@ impl ZeroCadApp {
         }
         self.selected_faces.retain(|(sid, _)| sid != del_id);
         self.selected_edges.retain(|(sid, _)| sid != del_id);
+        self.selected_sketch_points
+            .retain(|(sketch_id, _)| sketch_id != del_id);
         self.selected_body.retain(|(nid, _)| nid != del_id);
         self.hidden_nodes.remove(del_id);
         self.reevaluate_geometry();

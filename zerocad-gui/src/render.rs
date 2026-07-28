@@ -2050,11 +2050,19 @@ impl ZeroCadApp {
                 let regions = detect_regions(curves);
                 let selected = self.selected_regions_for(&node.id);
                 let sel_edges = self.selected_edges_for(&node.id);
+                let sel_points = self.selected_sketch_points_for(&node.id);
                 // Finished sketches always draw "passive": unselected faces stay
-                // faint/neutral and only picked faces/edges are highlighted,
+                // faint/neutral and only picked faces/edges/points are highlighted,
                 // instead of the whole sketch lighting up.
                 draw_sketch_geometry(
-                    &painter, curves, &regions, &selected, &sel_edges, &to_screen, false,
+                    &painter,
+                    curves,
+                    &regions,
+                    &selected,
+                    &sel_edges,
+                    &sel_points,
+                    &to_screen,
+                    false,
                 );
                 if let Some(solver) = solver.as_ref() {
                     let construction = zerocad_core::sketch::bake_construction_curves(solver);
@@ -2080,6 +2088,7 @@ impl ZeroCadApp {
                 &self.sketch_curves,
                 &self.detected_regions,
                 &self.selected_region_indices,
+                &empty_sel,
                 &empty_sel,
                 &to_screen,
                 true,

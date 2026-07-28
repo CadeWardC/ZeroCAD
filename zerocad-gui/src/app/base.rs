@@ -122,6 +122,7 @@ impl ZeroCadApp {
             hovered_sketch_face: None,
             selected_faces: HashSet::new(),
             selected_edges: HashSet::new(),
+            selected_sketch_points: HashSet::new(),
             selected_body: HashSet::new(),
             body_clipboard: None,
             move_op: None,

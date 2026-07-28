@@ -558,6 +558,15 @@ impl ZeroCadApp {
             .collect()
     }
 
+    /// The selected visible point-handle indices belonging to one sketch.
+    pub(crate) fn selected_sketch_points_for(&self, sketch_id: &str) -> HashSet<usize> {
+        self.selected_sketch_points
+            .iter()
+            .filter(|(sid, _)| sid == sketch_id)
+            .map(|(_, point_index)| *point_index)
+            .collect()
+    }
+
     /// Pick the body element under `click`, in priority vertex > edge > face.
     /// `proj` maps world (x,y,z) to (screen_x, screen_y, depth) — larger depth is
     /// nearer the camera. The `sin/cos` are the camera angles, used to cull

@@ -131,11 +131,13 @@ impl ZeroCadApp {
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
             && (!self.selected_body.is_empty()
                 || !self.selected_faces.is_empty()
-                || !self.selected_edges.is_empty())
+                || !self.selected_edges.is_empty()
+                || !self.selected_sketch_points.is_empty())
         {
             self.selected_body.clear();
             self.selected_faces.clear();
             self.selected_edges.clear();
+            self.selected_sketch_points.clear();
             self.status_msg = "Selection cleared.".to_string();
         }
     }
