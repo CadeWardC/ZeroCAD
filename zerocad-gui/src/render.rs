@@ -6,7 +6,8 @@ use std::collections::HashSet;
 
 use eframe::egui;
 use zerocad_core::{
-    detect_regions, CoordinateSystem, ExtrudeMode, FeatureType, MockMesh, SketchPlane,
+    detect_regions, CoordinateSystem, ExtrudeMode, FeatureType, MockMesh, ScenePlacement,
+    SketchPlane,
 };
 
 use crate::geom2d::{draw_sketch_geometry, fill_nested_loops};
@@ -1016,6 +1017,7 @@ impl ZeroCadApp {
         struct Drawable<'a> {
             node_id: Option<&'a str>,
             mesh: &'a MockMesh,
+            placement: ScenePlacement,
             base: (f32, f32, f32),
             alpha: u8,
             cull_back: bool,
@@ -1029,13 +1031,31 @@ impl ZeroCadApp {
             Option<Vec<(String, MockMesh)>>,
             Vec<Vec<[f32; 3]>>,
         ) = if let Some(section) = &self.section_view {
-            let source = preview_bodies.as_ref().unwrap_or(&self.body_meshes);
-            let mut bodies = Vec::with_capacity(source.len());
+            let mut bodies = Vec::new();
             let mut contours = Vec::new();
-            for (id, mesh) in source.iter() {
-                let (clipped, mut loops) = section_mesh(mesh, section);
-                bodies.push((id.clone(), clipped));
-                contours.append(&mut loops);
+            if let Some(source) = preview_bodies.as_ref() {
+                bodies.reserve(source.len());
+                for (id, mesh) in source.iter() {
+                    let (clipped, mut loops) = section_mesh(mesh, section);
+                    bodies.push((id.clone(), clipped));
+                    contours.append(&mut loops);
+                }
+            } else {
+                bodies.reserve(self.evaluated_scene.instances().len());
+                for instance in self.evaluated_scene.instances() {
+                    let mesh = self.evaluated_scene.mesh(instance);
+                    let placement = instance.placement();
+                    let transformed;
+                    let world_mesh = if placement.is_identity() {
+                        mesh
+                    } else {
+                        transformed = placement.transform_mesh(mesh);
+                        &transformed
+                    };
+                    let (clipped, mut loops) = section_mesh(world_mesh, section);
+                    bodies.push((instance.entity_id().to_string(), clipped));
+                    contours.append(&mut loops);
+                }
             }
             (Some(bodies), contours)
         } else {
@@ -1056,6 +1076,7 @@ impl ZeroCadApp {
                 .map(|(id, m)| Drawable {
                     node_id: Some(id.as_str()),
                     mesh: m,
+                    placement: ScenePlacement::IDENTITY,
                     base: NORMAL_BODY_BASE,
                     alpha,
                     cull_back: alpha == 255,
@@ -1069,6 +1090,7 @@ impl ZeroCadApp {
                 .map(|(id, m)| Drawable {
                     node_id: Some(id.as_str()),
                     mesh: m,
+                    placement: ScenePlacement::IDENTITY,
                     base: NORMAL_BODY_BASE,
                     alpha: body_alpha,
                     // A translucent ghost (Cut result) keeps its back faces.
@@ -1078,11 +1100,13 @@ impl ZeroCadApp {
                 })
                 .collect()
         } else {
-            self.body_meshes
+            self.evaluated_scene
+                .instances()
                 .iter()
-                .map(|(id, m)| Drawable {
-                    node_id: Some(id.as_str()),
-                    mesh: m,
+                .map(|instance| Drawable {
+                    node_id: Some(instance.entity_id()),
+                    mesh: self.evaluated_scene.mesh(instance),
+                    placement: instance.placement(),
                     base: NORMAL_BODY_BASE,
                     alpha: 255,
                     cull_back: true,
@@ -1105,6 +1129,7 @@ impl ZeroCadApp {
                     meshes.push(Drawable {
                         node_id: None,
                         mesh: pm,
+                        placement: ScenePlacement::IDENTITY,
                         base: (232.0, 66.0, 66.0),
                         alpha: 90,
                         cull_back: true,
@@ -1121,6 +1146,7 @@ impl ZeroCadApp {
                     meshes.push(Drawable {
                         node_id: None,
                         mesh: pm,
+                        placement: ScenePlacement::IDENTITY,
                         base: (255.0, 178.0, 96.0),
                         alpha: 255,
                         cull_back: true,
@@ -1135,6 +1161,7 @@ impl ZeroCadApp {
                     meshes.push(Drawable {
                         node_id: None,
                         mesh: pm,
+                        placement: ScenePlacement::IDENTITY,
                         base: (255.0, 178.0, 96.0),
                         alpha: 255,
                         cull_back: true,
@@ -1149,6 +1176,7 @@ impl ZeroCadApp {
                 meshes.push(Drawable {
                     node_id: None,
                     mesh,
+                    placement: ScenePlacement::IDENTITY,
                     base: (70.0, 170.0, 245.0),
                     alpha: 115,
                     cull_back: false,
@@ -1162,6 +1190,7 @@ impl ZeroCadApp {
                 meshes.push(Drawable {
                     node_id: None,
                     mesh,
+                    placement: ScenePlacement::IDENTITY,
                     base: (70.0, 145.0, 245.0),
                     alpha: 220,
                     cull_back: false,
@@ -1175,6 +1204,7 @@ impl ZeroCadApp {
                 meshes.push(Drawable {
                     node_id: None,
                     mesh: pm,
+                    placement: ScenePlacement::IDENTITY,
                     base: (255.0, 178.0, 96.0),
                     alpha: 200,
                     cull_back: false,
@@ -1303,14 +1333,22 @@ impl ZeroCadApp {
         // projection, so overlays keep the same hidden-surface behavior in
         // both render modes.
         if gpu_active && build_occlusion {
-            let occluders: Option<&[(String, MockMesh)]> =
-                if let Some(bodies) = preview_bodies.as_ref() {
-                    (body_alpha == 255).then_some(bodies.as_slice())
-                } else {
-                    Some(self.body_meshes.as_slice())
-                };
-            let mut occluder_meshes: Vec<&MockMesh> =
-                occluders.into_iter().flatten().map(|(_, m)| m).collect();
+            let mut occluder_meshes: Vec<(&MockMesh, ScenePlacement)> = Vec::new();
+            if let Some(bodies) = preview_bodies.as_ref() {
+                if body_alpha == 255 {
+                    occluder_meshes.extend(
+                        bodies
+                            .iter()
+                            .map(|(_, mesh)| (mesh, ScenePlacement::IDENTITY)),
+                    );
+                }
+            } else {
+                occluder_meshes.extend(
+                    self.evaluated_scene.instances().iter().map(|instance| {
+                        (self.evaluated_scene.mesh(instance), instance.placement())
+                    }),
+                );
+            }
             // The warm extrude tool ghost is drawn OPAQUE (depth-written) by the
             // GPU — New Body always, Join while push/pull dragging — so it must
             // occlude overlays exactly like a committed body. The translucent
@@ -1322,43 +1360,46 @@ impl ZeroCadApp {
             };
             if warm_ghost_opaque {
                 if let Some(m) = extrude_preview_mesh.as_ref() {
-                    occluder_meshes.push(m);
+                    occluder_meshes.push((m, ScenePlacement::IDENTITY));
                 }
             }
-            for mesh in occluder_meshes {
+            for (mesh, placement) in occluder_meshes {
                 let num_tris = mesh.indices.len() / 3;
                 for i in 0..num_tris {
                     let i0 = mesh.indices[i * 3] as usize * 6;
                     let i1 = mesh.indices[i * 3 + 1] as usize * 6;
                     let i2 = mesh.indices[i * 3 + 2] as usize * 6;
                     // Average vertex normal decides front/back, as in section A.
-                    let navg = (
+                    let navg = placement.transform_vector([
                         (mesh.vertices[i0 + 3] + mesh.vertices[i1 + 3] + mesh.vertices[i2 + 3])
                             / 3.0,
                         (mesh.vertices[i0 + 4] + mesh.vertices[i1 + 4] + mesh.vertices[i2 + 4])
                             / 3.0,
                         (mesh.vertices[i0 + 5] + mesh.vertices[i1 + 5] + mesh.vertices[i2 + 5])
                             / 3.0,
-                    );
-                    let rz_n = sin_y * navg.0 + cos_y * navg.2;
-                    if sin_p * navg.1 + cos_p * rz_n <= 0.0 {
+                    ]);
+                    let rz_n = sin_y * navg[0] + cos_y * navg[2];
+                    if sin_p * navg[1] + cos_p * rz_n <= 0.0 {
                         continue;
                     }
-                    let p0 = project_3d(
+                    let point0 = placement.transform_point([
                         mesh.vertices[i0],
                         mesh.vertices[i0 + 1],
                         mesh.vertices[i0 + 2],
-                    );
-                    let p1 = project_3d(
+                    ]);
+                    let point1 = placement.transform_point([
                         mesh.vertices[i1],
                         mesh.vertices[i1 + 1],
                         mesh.vertices[i1 + 2],
-                    );
-                    let p2 = project_3d(
+                    ]);
+                    let point2 = placement.transform_point([
                         mesh.vertices[i2],
                         mesh.vertices[i2 + 1],
                         mesh.vertices[i2 + 2],
-                    );
+                    ]);
+                    let p0 = project_3d(point0[0], point0[1], point0[2]);
+                    let p1 = project_3d(point1[0], point1[1], point1[2]);
+                    let p2 = project_3d(point2[0], point2[1], point2[2]);
                     for p in [p0, p1, p2] {
                         depth_min = depth_min.min(p.2);
                         depth_max = depth_max.max(p.2);
@@ -1371,38 +1412,36 @@ impl ZeroCadApp {
         // A. Gather Solid Mesh Triangles (committed model + extrude preview)
         for d in &meshes {
             let (mesh, alpha, cull_back) = (d.mesh, &d.alpha, d.cull_back);
+            let placement = d.placement;
             let num_tris = mesh.indices.len() / 3;
             for i in 0..num_tris {
                 let i0 = mesh.indices[i * 3] as usize * 6;
                 let i1 = mesh.indices[i * 3 + 1] as usize * 6;
                 let i2 = mesh.indices[i * 3 + 2] as usize * 6;
 
-                let v0 = (
-                    mesh.vertices[i0],
-                    mesh.vertices[i0 + 1],
-                    mesh.vertices[i0 + 2],
-                );
-                let v1 = (
-                    mesh.vertices[i1],
-                    mesh.vertices[i1 + 1],
-                    mesh.vertices[i1 + 2],
-                );
-                let v2 = (
-                    mesh.vertices[i2],
-                    mesh.vertices[i2 + 1],
-                    mesh.vertices[i2 + 2],
-                );
+                let vertex = |offset: usize| {
+                    let point = placement.transform_point([
+                        mesh.vertices[offset],
+                        mesh.vertices[offset + 1],
+                        mesh.vertices[offset + 2],
+                    ]);
+                    (point[0], point[1], point[2])
+                };
+                let v0 = vertex(i0);
+                let v1 = vertex(i1);
+                let v2 = vertex(i2);
 
                 // Per-vertex normals (smoothed across shallow creases at mesh
                 // build time, so a fillet's facets share a continuous normal
                 // field). Each drives its own vertex shade for Gouraud; their
                 // average decides back-face culling for the whole triangle.
                 let vnorm = |o: usize| {
-                    (
+                    let normal = placement.transform_vector([
                         mesh.vertices[o + 3],
                         mesh.vertices[o + 4],
                         mesh.vertices[o + 5],
-                    )
+                    ]);
+                    (normal[0], normal[1], normal[2])
                 };
                 let n0 = vnorm(i0);
                 let n1 = vnorm(i1);
@@ -1767,38 +1806,42 @@ impl ZeroCadApp {
                 continue;
             }
             let mesh = d.mesh;
+            let placement = d.placement;
             let num_edges = mesh.edge_indices.len() / 2;
             let has_normals = mesh.edge_face_normals.len() >= num_edges * 6;
             for i in 0..num_edges {
                 if has_normals {
                     let o = i * 6;
-                    let na = (
+                    let na = placement.transform_vector([
                         mesh.edge_face_normals[o],
                         mesh.edge_face_normals[o + 1],
                         mesh.edge_face_normals[o + 2],
-                    );
-                    let nb = (
+                    ]);
+                    let nb = placement.transform_vector([
                         mesh.edge_face_normals[o + 3],
                         mesh.edge_face_normals[o + 4],
                         mesh.edge_face_normals[o + 5],
-                    );
-                    if !faces_camera(na) && !faces_camera(nb) {
+                    ]);
+                    if !faces_camera((na[0], na[1], na[2])) && !faces_camera((nb[0], nb[1], nb[2]))
+                    {
                         continue;
                     }
                 }
 
                 let i0 = mesh.edge_indices[i * 2] as usize * 3;
                 let i1 = mesh.edge_indices[i * 2 + 1] as usize * 3;
-                let p0 = project_3d(
+                let point0 = placement.transform_point([
                     mesh.edge_vertices[i0],
                     mesh.edge_vertices[i0 + 1],
                     mesh.edge_vertices[i0 + 2],
-                );
-                let p1 = project_3d(
+                ]);
+                let point1 = placement.transform_point([
                     mesh.edge_vertices[i1],
                     mesh.edge_vertices[i1 + 1],
                     mesh.edge_vertices[i1 + 2],
-                );
+                ]);
+                let p0 = project_3d(point0[0], point0[1], point0[2]);
+                let p1 = project_3d(point1[0], point1[1], point1[2]);
 
                 // Walk the edge in screen space, stroking the contiguous visible
                 // runs. ~2px steps when still (crisp hidden-line cuts); coarser
@@ -1837,9 +1880,10 @@ impl ZeroCadApp {
             let sel_edge = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 140, 0));
             let sel_vert = egui::Color32::from_rgb(255, 140, 0);
             for (node_id, pick) in &self.selected_body {
-                let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+                let Some((instance, mesh)) = self.evaluated_scene.find(node_id) else {
                     continue;
                 };
+                let placement = instance.placement();
 
                 // Highlight one edge. Whole-body selection uses the same
                 // front-face and depth-buffer clipping as the normal hidden-line
@@ -1847,32 +1891,36 @@ impl ZeroCadApp {
                 let highlight_edge = |painter: &egui::Painter, e: usize, visible_only: bool| {
                     if visible_only && mesh.edge_face_normals.len() >= (e + 1) * 6 {
                         let o = e * 6;
-                        let na = (
+                        let na = placement.transform_vector([
                             mesh.edge_face_normals[o],
                             mesh.edge_face_normals[o + 1],
                             mesh.edge_face_normals[o + 2],
-                        );
-                        let nb = (
+                        ]);
+                        let nb = placement.transform_vector([
                             mesh.edge_face_normals[o + 3],
                             mesh.edge_face_normals[o + 4],
                             mesh.edge_face_normals[o + 5],
-                        );
-                        if !faces_camera(na) && !faces_camera(nb) {
+                        ]);
+                        if !faces_camera((na[0], na[1], na[2]))
+                            && !faces_camera((nb[0], nb[1], nb[2]))
+                        {
                             return;
                         }
                     }
                     let i0 = mesh.edge_indices[e * 2] as usize * 3;
                     let i1 = mesh.edge_indices[e * 2 + 1] as usize * 3;
-                    let a = project_3d(
+                    let point_a = placement.transform_point([
                         mesh.edge_vertices[i0],
                         mesh.edge_vertices[i0 + 1],
                         mesh.edge_vertices[i0 + 2],
-                    );
-                    let b = project_3d(
+                    ]);
+                    let point_b = placement.transform_point([
                         mesh.edge_vertices[i1],
                         mesh.edge_vertices[i1 + 1],
                         mesh.edge_vertices[i1 + 2],
-                    );
+                    ]);
+                    let a = project_3d(point_a[0], point_a[1], point_a[2]);
+                    let b = project_3d(point_b[0], point_b[1], point_b[2]);
                     if !visible_only {
                         painter
                             .line_segment([egui::pos2(a.0, a.1), egui::pos2(b.0, b.1)], sel_edge);
@@ -1925,11 +1973,12 @@ impl ZeroCadApp {
                     BodyPick::Vertex(v) => {
                         let i = v as usize * 3;
                         if i + 2 < mesh.edge_vertices.len() {
-                            let p = project_3d(
+                            let point = placement.transform_point([
                                 mesh.edge_vertices[i],
                                 mesh.edge_vertices[i + 1],
                                 mesh.edge_vertices[i + 2],
-                            );
+                            ]);
+                            let p = project_3d(point[0], point[1], point[2]);
                             painter.circle_filled(egui::pos2(p.0, p.1), 5.0, sel_vert);
                             painter.circle_stroke(
                                 egui::pos2(p.0, p.1),

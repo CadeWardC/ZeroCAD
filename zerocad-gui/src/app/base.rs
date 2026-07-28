@@ -8,6 +8,11 @@ impl ZeroCadApp {
 
     pub(crate) fn new_with_settings(prefs: settings::AppSettings) -> Self {
         let document = Document::new();
+        let body_meshes = std::sync::Arc::new(Vec::new());
+        let evaluated_scene = app::ViewportSceneState::new(std::sync::Arc::new(
+            EvaluatedScene::from_part_bodies(body_meshes.clone()),
+        ));
+        let scene_stats = evaluated_scene.stats();
         let recovery = recovery::RecoveryManager::new();
         let recovery_available = recovery.has_recovery();
 
@@ -16,10 +21,10 @@ impl ZeroCadApp {
             pending_mirror_join_feedback: None,
             document,
             selected_node_id: None,
-            body_meshes: std::sync::Arc::new(Vec::new()),
+            body_meshes,
+            evaluated_scene,
             datum_values: std::collections::HashMap::new(),
-            mesh_stats: (0, 0),
-            mesh_epoch: 0,
+            scene_stats,
             gpu: gpu_viewport::GpuViewport::default(),
             gpu_render: prefs.gpu_render,
             graphics_backend: prefs.backend,

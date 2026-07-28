@@ -862,14 +862,6 @@ impl ZeroCadApp {
         };
     }
 
-    /// Total `(vertices, triangles)` across a body-mesh list. Vertices are 6
-    /// floats (pos + normal); indices are 3 per triangle.
-    pub(crate) fn mesh_totals(meshes: &[(String, MockMesh)]) -> (usize, usize) {
-        meshes.iter().fold((0, 0), |(v, t), (_, m)| {
-            (v + m.vertices.len() / 6, t + m.indices.len() / 3)
-        })
-    }
-
     /// Count graph features matching `pred`, then add one — the 1-based index
     /// for the next feature of that kind. Shared by the `next_*_name` helpers.
     pub(crate) fn next_feature_index(&self, pred: impl Fn(&FeatureType) -> bool) -> usize {
@@ -994,7 +986,7 @@ mod snap_tests {
             "opaque-secondary-output".to_string(),
             zerocad_core::document::FeatureId::from("extrude_5"),
         );
-        app.body_meshes = std::sync::Arc::new(vec![
+        app.set_body_meshes(vec![
             ("extrude_5".to_string(), MockMesh::empty()),
             ("opaque-secondary-output".to_string(), MockMesh::empty()),
         ]);

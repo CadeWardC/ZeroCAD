@@ -8,7 +8,7 @@
 //! with a fixed 3/4 view, a z-buffer, and simple flat shading — no egui, no GPU,
 //! and no new dependencies. The result is cached to disk by `settings::save_thumb`.
 
-use zerocad_core::MockMesh;
+use zerocad_core::EvaluatedScene;
 
 /// Fixed camera angles for the preview — the app's own default 3/4 orientation
 /// (`ZeroCadApp::new`), so a thumbnail reads the same way the model first
@@ -22,10 +22,7 @@ const YAW: f32 = 0.7;
 ///
 /// Empty / triangle-less input yields a plain background tile (the caller skips
 /// caching in that case, but this never panics).
-pub(crate) fn render_thumbnail(
-    meshes: &[(String, MockMesh)],
-    size: usize,
-) -> (usize, usize, Vec<u8>) {
+pub(crate) fn render_thumbnail(scene: &EvaluatedScene, size: usize) -> (usize, usize, Vec<u8>) {
     const BG: [u8; 3] = [243, 245, 248]; // matches the onboarding card surface
     const BASE: [f32; 3] = [168.0, 180.0, 198.0]; // slate-blue body color
     const MARGIN: f32 = 0.12; // fraction of the frame left as padding
@@ -54,9 +51,12 @@ pub(crate) fn render_thumbnail(
     let mut min = (f32::MAX, f32::MAX);
     let mut max = (f32::MIN, f32::MIN);
     let mut any = false;
-    for (_, m) in meshes {
+    for instance in scene.instances() {
+        let m = scene.mesh(instance);
+        let placement = instance.placement();
         for v in m.vertices.chunks_exact(6) {
-            let (rx, ry, _) = rotate(v[0], v[1], v[2]);
+            let point = placement.transform_point([v[0], v[1], v[2]]);
+            let (rx, ry, _) = rotate(point[0], point[1], point[2]);
             min.0 = min.0.min(rx);
             min.1 = min.1.min(ry);
             max.0 = max.0.max(rx);
@@ -83,18 +83,30 @@ pub(crate) fn render_thumbnail(
     let light = normalize3([-0.35, 0.55, 1.0]);
 
     let mut zbuf = vec![f32::MIN; size * size];
-    for (_, m) in meshes {
+    for instance in scene.instances() {
+        let m = scene.mesh(instance);
+        let placement = instance.placement();
         for tri in m.indices.chunks_exact(3) {
             let p: Vec<(f32, f32, f32)> = tri
                 .iter()
                 .map(|&i| {
                     let b = i as usize * 6;
-                    project(m.vertices[b], m.vertices[b + 1], m.vertices[b + 2])
+                    let point = placement.transform_point([
+                        m.vertices[b],
+                        m.vertices[b + 1],
+                        m.vertices[b + 2],
+                    ]);
+                    project(point[0], point[1], point[2])
                 })
                 .collect();
             // Flat shade from the first vertex's normal (rotated into camera space).
             let nb = tri[0] as usize * 6;
-            let (nx, ny, nz) = rotate(m.vertices[nb + 3], m.vertices[nb + 4], m.vertices[nb + 5]);
+            let normal = placement.transform_vector([
+                m.vertices[nb + 3],
+                m.vertices[nb + 4],
+                m.vertices[nb + 5],
+            ]);
+            let (nx, ny, nz) = rotate(normal[0], normal[1], normal[2]);
             let n = normalize3([nx, ny, nz]);
             // Two-sided: meshes are outward-facing, but a stray inverted normal
             // shouldn't render a face pure black.
@@ -191,5 +203,45 @@ fn fill_triangle(
                 rgba[o + 3] = 255;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_thumbnail;
+    use std::sync::Arc;
+    use zerocad_core::{
+        EvaluatedScene, MockMesh, SceneInstance, ScenePlacement, SharedSceneGeometries,
+    };
+
+    #[test]
+    fn thumbnail_renders_each_scene_instance_at_its_resolved_placement() {
+        let geometries: SharedSceneGeometries =
+            Arc::new(vec![("box".into(), MockMesh::make_box(2.0, 3.0, 4.0))]);
+        let overlapping = EvaluatedScene::from_instances(
+            geometries.clone(),
+            vec![
+                SceneInstance::new("first", 0, ScenePlacement::IDENTITY),
+                SceneInstance::new("second", 0, ScenePlacement::IDENTITY),
+            ],
+        )
+        .unwrap();
+        let translated = ScenePlacement::from_rotation_translation(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [20.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let separated = EvaluatedScene::from_instances(
+            geometries,
+            vec![
+                SceneInstance::new("first", 0, ScenePlacement::IDENTITY),
+                SceneInstance::new("second", 0, translated),
+            ],
+        )
+        .unwrap();
+
+        let (_, _, overlapping_pixels) = render_thumbnail(&overlapping, 64);
+        let (_, _, separated_pixels) = render_thumbnail(&separated, 64);
+        assert_ne!(separated_pixels, overlapping_pixels);
     }
 }

@@ -328,6 +328,54 @@ fn mirror_join_unions_connected_copy_into_source_body() {
         1,
         "the coplanar top halves must be one continuous selectable face"
     );
+    assert!(
+        bodies[0].1.face_refs.iter().all(|face| {
+            face.topology
+                .as_ref()
+                .and_then(|topology| topology.face_id.as_deref())
+                .is_some()
+                && face
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.body_id.as_deref())
+                    == Some("box_1")
+        }),
+        "joined mirror faces must remain durably selectable on the source body"
+    );
+}
+
+#[test]
+fn offset_mirror_join_names_result_faces_without_plane_cleanup() {
+    let mut graph = ParametricGraph::new();
+    add_box(&mut graph, "box_1", 2.0, 2.0, 2.0);
+    add_pattern(
+        &mut graph,
+        "mirror_2",
+        "box_1",
+        PatternKind::Mirror {
+            plane: PlaneBase::YZ,
+            face: None,
+            // Mirrored [-2,0] translated to [-1,1], overlapping source [0,2].
+            offset: 1.0,
+            offset_expr: None,
+            join: true,
+        },
+    );
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("offset mirror join");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].0, "box_1");
+    assert!(
+        bodies[0].1.face_refs.iter().all(|face| {
+            face.topology
+                .as_ref()
+                .and_then(|topology| topology.face_id.as_deref())
+                .is_some()
+        }),
+        "joined offset mirror faces must all have durable identities"
+    );
 }
 
 #[test]

@@ -6,6 +6,39 @@
 use crate::geometry::Vec3;
 use crate::mock_kernel::{KernelSolid, MockMesh};
 
+fn named_pattern_part_meshes(
+    parts: &[KernelSolid],
+    source_names: Option<&MockMesh>,
+    body_id: &str,
+) -> Vec<MockMesh> {
+    parts
+        .iter()
+        .map(|part| {
+            source_names.map_or_else(
+                || MockMesh::from_solid(part),
+                |source| crate::mock_kernel::propagate_face_names(source, part, body_id),
+            )
+        })
+        .collect()
+}
+
+/// Name every face of a joined pattern result, preserving source owners where
+/// geometry continued and assigning the operation as owner of genuinely new
+/// faces. Used when no mirror-plane display cleanup is necessary.
+pub(crate) fn joined_pattern_display_mesh(
+    node_id: &str,
+    parts: &[KernelSolid],
+    source_names: Option<&MockMesh>,
+    body_id: &str,
+) -> MockMesh {
+    let mut combined = MockMesh::empty();
+    for mesh in named_pattern_part_meshes(parts, source_names, body_id) {
+        combined.append(mesh);
+    }
+    super::stamp_joined_pattern_face_refs(&mut combined, body_id, node_id);
+    combined
+}
+
 /// Display mesh for Mirror+Join. Guarded boolean fallbacks can retain coincident
 /// caps and distinct face ids at the mirror plane even though they are one logical
 /// body. Remove those internal caps and merge continuous coplanar faces before
@@ -15,12 +48,14 @@ pub(crate) fn mirror_join_display_mesh(
     parts: &[KernelSolid],
     origin: Vec3,
     normal: Vec3,
+    source_names: Option<&MockMesh>,
+    body_id: &str,
 ) -> MockMesh {
     let mut combined = MockMesh::empty();
     let mut removed_plane_triangles = 0usize;
     let mut removed_plane_edges = 0usize;
     let mut removed_overlap_edges = 0usize;
-    let raw_meshes: Vec<MockMesh> = parts.iter().map(MockMesh::from_solid).collect();
+    let raw_meshes = named_pattern_part_meshes(parts, source_names, body_id);
     for (part_index, mut mesh) in raw_meshes.iter().cloned().enumerate() {
         let triangles_before = mesh.indices.len() / 3;
         suppress_faces_on_plane(&mut mesh, origin, normal);
@@ -43,6 +78,7 @@ pub(crate) fn mirror_join_display_mesh(
         .collect::<std::collections::HashSet<_>>()
         .len();
     regroup_joined_mirror_edges(&mut combined);
+    super::stamp_joined_pattern_face_refs(&mut combined, body_id, node_id);
     log::debug!(
         "[mirror_join:{node_id}] display cleanup parts={} removed_plane_triangles={} removed_plane_edges={} removed_overlap_edges={} merged_faces={} edge_segments={}->{} edge_groups={}->{} final_triangles={} final_faces={}",
         parts.len(),
@@ -579,8 +615,14 @@ mod tests {
         )
         .unwrap()
         .value;
-        let mesh =
-            mirror_join_display_mesh("test_mirror", &[source, mirrored], Vec3::ZERO, Vec3::X);
+        let mesh = mirror_join_display_mesh(
+            "test_mirror",
+            &[source, mirrored],
+            Vec3::ZERO,
+            Vec3::X,
+            None,
+            "source",
+        );
 
         assert_eq!(
             mesh.face_refs

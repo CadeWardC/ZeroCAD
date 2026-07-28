@@ -1,6 +1,7 @@
 pub mod boolean_case;
 pub mod document;
 pub mod dxf;
+pub mod evaluated_scene;
 pub mod expr;
 mod feature_dto;
 pub mod geometry;
@@ -33,6 +34,10 @@ pub use document::{
 };
 pub use dxf::{
     read_dxf_file, read_dxf_str, DxfDiagnostic, DxfDiagnosticSeverity, DxfError, DxfImport, DxfUnit,
+};
+pub use evaluated_scene::{
+    EvaluatedScene, SceneBuildError, SceneInstance, ScenePlacement, SceneStats,
+    SharedEvaluatedScene, SharedSceneGeometries,
 };
 pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};

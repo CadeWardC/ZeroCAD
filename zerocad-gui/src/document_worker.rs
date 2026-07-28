@@ -1,12 +1,14 @@
-use crate::SharedBodyMeshes;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use zerocad_core::{Document, EvaluationCacheSnapshot, HydrationBundle, SaveOptions, SaveProfile};
+use zerocad_core::{
+    Document, EvaluatedScene, EvaluationCacheSnapshot, HydrationBundle, SaveOptions, SaveProfile,
+    SharedEvaluatedScene,
+};
 
 pub(crate) struct SaveRequest {
     pub path: PathBuf,
     pub document: Document,
-    pub bodies: SharedBodyMeshes,
+    pub scene: SharedEvaluatedScene,
     pub profile: SaveProfile,
     pub cache: EvaluationCacheSnapshot,
 }
@@ -56,19 +58,19 @@ impl DocumentWorker {
 }
 
 fn save(request: SaveRequest) -> Result<(), zerocad_core::ZcadError> {
-    let small_preview_png = preview_with_cap(&request.bodies, 128, 96, 32 * 1024);
-    if let Some((w, h, rgba)) = (!request.bodies.is_empty())
-        .then(|| crate::thumbnail::render_thumbnail(&request.bodies, 128))
+    let small_preview_png = preview_with_cap(&request.scene, 128, 96, 32 * 1024);
+    if let Some((w, h, rgba)) =
+        (!request.scene.is_empty()).then(|| crate::thumbnail::render_thumbnail(&request.scene, 128))
     {
         crate::settings::save_thumb(&request.path, w, h, &rgba);
     }
     let large_preview_png = matches!(request.profile, SaveProfile::Hydrated { .. })
-        .then(|| crate::thumbnail::render_thumbnail(&request.bodies, 256))
+        .then(|| crate::thumbnail::render_thumbnail(&request.scene, 256))
         .and_then(|(w, h, rgba)| crate::thumbnail::encode_png(w, h, &rgba));
     let accelerators = HydrationBundle {
         small_preview_png,
         large_preview_png,
-        display_meshes: Some(request.bodies.as_ref().clone()),
+        display_meshes: Some(request.scene.geometries().as_ref().clone()),
         evaluation_cache: Some(request.cache),
     };
     zerocad_core::write_document_file(
@@ -82,16 +84,16 @@ fn save(request: SaveRequest) -> Result<(), zerocad_core::ZcadError> {
 }
 
 fn preview_with_cap(
-    bodies: &[(String, zerocad_core::MockMesh)],
+    scene: &EvaluatedScene,
     preferred: usize,
     fallback: usize,
     cap: usize,
 ) -> Option<Vec<u8>> {
-    if bodies.is_empty() {
+    if scene.is_empty() {
         return None;
     }
     for size in [preferred, fallback] {
-        let (w, h, rgba) = crate::thumbnail::render_thumbnail(bodies, size);
+        let (w, h, rgba) = crate::thumbnail::render_thumbnail(scene, size);
         if let Some(png) = crate::thumbnail::encode_png(w, h, &rgba) {
             if png.len() <= cap {
                 return Some(png);

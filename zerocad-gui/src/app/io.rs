@@ -189,7 +189,7 @@ impl ZeroCadApp {
             self.document_worker.submit(document_worker::SaveRequest {
                 path: save.path.clone(),
                 document,
-                bodies: self.body_meshes.clone(),
+                scene: self.evaluated_scene.shared(),
                 profile: save.profile,
                 cache: self.document.evaluation_cache_snapshot(),
             });
@@ -394,8 +394,8 @@ impl ZeroCadApp {
     /// successful save/open, when `body_meshes` reflects `path`'s model.
     pub(crate) fn remember_project(&mut self, path: &Path) {
         self.recent_files.record(path);
-        if !self.body_meshes.is_empty() {
-            let (w, h, rgba) = thumbnail::render_thumbnail(&self.body_meshes, 256);
+        if !self.evaluated_scene.is_empty() {
+            let (w, h, rgba) = thumbnail::render_thumbnail(&self.evaluated_scene, 256);
             settings::save_thumb(path, w, h, &rgba);
         }
         // Reload this thumbnail on a later frame. It may already have been

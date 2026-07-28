@@ -7,3 +7,5 @@ mod picking;
 mod sketch;
 mod ui;
 mod update;
+
+pub(crate) use eval::ViewportSceneState;

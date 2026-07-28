@@ -10,8 +10,8 @@ use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{
     detect_regions, CoordinateSystem, CornerKind, CornerMod, Dimension, Document, EdgeRef,
-    ExtrudeMode, FeatureNode, FeatureType, LineSegment, MockMesh, Region, SketchCurves,
-    SketchPlane, SketchShape, Unit, Variable, Vec3,
+    EvaluatedScene, ExtrudeMode, FeatureNode, FeatureType, LineSegment, MockMesh, Region,
+    SceneStats, SketchCurves, SketchPlane, SketchShape, Unit, Variable, Vec3,
 };
 
 mod body_ops_ui;
@@ -689,19 +689,20 @@ struct ZeroCadApp {
     /// projection owned by this document rather than the application root.
     document: Document,
     selected_node_id: Option<String>,
-    /// One mesh per solid body (node id + mesh), so faces/edges/points can be
-    /// picked per body. Replaces the old single combined `current_mesh`.
+    /// Part-evaluator and hydrated-cache compatibility storage. Viewport,
+    /// picking, bounds, sectioning, and thumbnail consumers use
+    /// `evaluated_scene`, which shares this allocation.
     body_meshes: SharedBodyMeshes,
+    /// Immutable renderer-facing view of `body_meshes`, coupled to the GPU
+    /// invalidation epoch. Part documents currently use identity placements.
+    evaluated_scene: app::ViewportSceneState,
     /// Construction geometry resolved alongside `body_meshes` at the same
     /// document revision. This includes face/edge/vertex-derived datums.
     datum_values: std::collections::HashMap<String, zerocad_core::DatumValue>,
-    /// Cached `(vertices, triangles)` totals across `body_meshes`, refreshed
-    /// only when the meshes change so the status bar doesn't re-sum every
-    /// vertex/index of the whole model on every frame.
-    mesh_stats: (usize, usize),
-    /// Monotonic counter bumped every time `body_meshes` is reassigned, so the
-    /// GPU viewport re-uploads its scene only when the geometry actually changed.
-    mesh_epoch: u64,
+    /// Explicit geometry-pool, referenced, and instance-expanded complexity
+    /// measures. A future status bar can choose a labeled meaning rather than
+    /// overloading one ambiguous vertex/triangle tuple.
+    scene_stats: SceneStats,
     /// GPU-accelerated 3D viewport: renders the committed bodies via
     /// `openrcad-render` into an offscreen texture composited under the CPU
     /// overlays. Falls back to the CPU rasterizer when `gpu_render` is off or the

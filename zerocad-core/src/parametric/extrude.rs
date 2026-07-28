@@ -46,6 +46,445 @@ pub(crate) struct DraftedRegionLoops {
     pub(crate) top_holes: Vec<Vec<(f32, f32)>>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ExactFaceExtrudeError {
+    MissingOwner,
+    TargetMismatch { target: String, owner: String },
+    MissingBody(String),
+    Unresolved,
+    Ambiguous,
+    UnsupportedSurface,
+    InvalidDepth,
+    Prism(String),
+}
+
+impl std::fmt::Display for ExactFaceExtrudeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingOwner => formatter.write_str(
+                "the selected face has no owning body; reselect the face before retrying",
+            ),
+            Self::TargetMismatch { target, owner } => write!(
+                formatter,
+                "the selected face belongs to body '{owner}', but the feature targets '{target}'"
+            ),
+            Self::MissingBody(body) => {
+                write!(formatter, "the selected face's body '{body}' no longer exists")
+            }
+            Self::Unresolved => formatter.write_str(
+                "the selected face could not be resolved to one exact B-Rep face",
+            ),
+            Self::Ambiguous => formatter.write_str(
+                "the legacy face reference matches more than one exact B-Rep face; reselect it to record a durable face identity",
+            ),
+            Self::UnsupportedSurface => {
+                formatter.write_str("the selected face is not planar")
+            }
+            Self::InvalidDepth => {
+                formatter.write_str("the extrusion distance must be finite and non-zero")
+            }
+            Self::Prism(reason) => {
+                write!(formatter, "OpenRCAD could not construct the exact face prism ({reason})")
+            }
+        }
+    }
+}
+
+struct ExactFaceCandidate {
+    component_index: usize,
+    face: openrcad::topo::Face,
+    centroid: [f32; 3],
+    normal: [f32; 3],
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedExactPlanarFace {
+    pub(crate) body_id: String,
+    pub(crate) component_index: usize,
+    pub(crate) face: openrcad::topo::Face,
+    pub(crate) normal: Vec3,
+}
+
+fn capture_ulp(value: f32) -> f32 {
+    let value = value.abs();
+    if !value.is_finite() {
+        return f32::INFINITY;
+    }
+    if value == 0.0 {
+        return f32::from_bits(1);
+    }
+    let next = f32::from_bits(value.to_bits().saturating_add(1));
+    (next - value).abs()
+}
+
+fn legacy_face_match_tolerance(body: &LiveBody, reference: &FaceRef) -> f32 {
+    let model_scale = body
+        .parts
+        .iter()
+        .filter_map(crate::mock_kernel::solid_aabb)
+        .map(|(min, max)| {
+            (0..3)
+                .map(|axis| (max[axis] - min[axis]).abs())
+                .fold(0.0_f32, f32::max)
+        })
+        .fold(0.0_f32, f32::max);
+    let coordinate_ulp = reference
+        .centroid
+        .iter()
+        .copied()
+        .map(capture_ulp)
+        .fold(0.0_f32, f32::max);
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+    let policy_floor = policy
+        .classification
+        .max(policy.intersection)
+        .max(policy.sewing) as f32
+        * 32.0;
+    policy_floor
+        .max(coordinate_ulp * 8.0)
+        .max((model_scale * 1.0e-4).min(0.1))
+}
+
+fn exact_face_candidates(
+    body: &LiveBody,
+    reference: &FaceRef,
+    component_filter: Option<usize>,
+    requested_name: Option<&str>,
+) -> Vec<ExactFaceCandidate> {
+    let reference_mesh = body
+        .pristine
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| edge_mod_reference_mesh(body));
+    let reference_normal = Vec3::new(
+        reference.normal[0],
+        reference.normal[1],
+        reference.normal[2],
+    )
+    .normalize();
+    let mut candidates = Vec::new();
+    for (component_index, component) in body.parts.iter().enumerate() {
+        if component_filter.is_some_and(|filter| filter != component_index) {
+            continue;
+        }
+        let shell_faces = component.shell().faces();
+        let names = requested_name
+            .map(|_| crate::mock_kernel::input_shell_face_names(&reference_mesh, component));
+        let component_mesh = MockMesh::from_solid(component);
+        let mut seen = std::collections::HashSet::new();
+        for face_ref in &component_mesh.face_refs {
+            let shell_index = face_ref.face_id as usize;
+            if !seen.insert(shell_index) {
+                continue;
+            }
+            let Some(face) = shell_faces.get(shell_index) else {
+                continue;
+            };
+            if !matches!(face.surface(), Some(openrcad::geom::GeomSurface::Plane(_))) {
+                continue;
+            }
+            if requested_name.is_some_and(|requested| {
+                names
+                    .as_ref()
+                    .and_then(|names| names.get(shell_index))
+                    .and_then(|name| name.as_deref())
+                    != Some(requested)
+            }) {
+                continue;
+            }
+            let normal =
+                Vec3::new(face_ref.normal[0], face_ref.normal[1], face_ref.normal[2]).normalize();
+            if normal.dot(reference_normal) < 0.999 {
+                continue;
+            }
+            candidates.push(ExactFaceCandidate {
+                component_index,
+                face: face.clone(),
+                centroid: face_ref.centroid,
+                normal: face_ref.normal,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        crate::mock_kernel::dist3(left.centroid, reference.centroid).total_cmp(
+            &crate::mock_kernel::dist3(right.centroid, reference.centroid),
+        )
+    });
+    candidates
+}
+
+/// Resolve a display-mesh face capture back to exactly one planar kernel face.
+/// Durable names win. Legacy unnamed captures are accepted only when one exact
+/// candidate lies within the f32 capture envelope; ambiguous captures never
+/// silently choose whichever shell face happens to enumerate first.
+pub(crate) fn resolve_exact_planar_face(
+    live: &[LiveBody],
+    reference: &FaceRef,
+    boolean_target: Option<&str>,
+) -> Result<ResolvedExactPlanarFace, ExactFaceExtrudeError> {
+    let captured_owner = reference
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.body_id.as_deref());
+    if let (Some(target), Some(owner)) = (boolean_target, captured_owner) {
+        if target != owner {
+            return Err(ExactFaceExtrudeError::TargetMismatch {
+                target: target.to_string(),
+                owner: owner.to_string(),
+            });
+        }
+    }
+    let body_id = boolean_target
+        .or(captured_owner)
+        .ok_or(ExactFaceExtrudeError::MissingOwner)?;
+    let body = live
+        .iter()
+        .find(|body| body.id == body_id)
+        .ok_or_else(|| ExactFaceExtrudeError::MissingBody(body_id.to_string()))?;
+    let resolved =
+        resolve_face_on_body(body, reference).ok_or(ExactFaceExtrudeError::Unresolved)?;
+    let requested_name = reference
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.face_id.as_deref());
+    let has_component_name = reference
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.component_id.as_deref())
+        .is_some();
+    let component_filter =
+        (requested_name.is_some() || has_component_name).then_some(resolved.component_index);
+    let candidates = exact_face_candidates(body, reference, component_filter, requested_name);
+
+    let candidate = if requested_name.is_some() {
+        match candidates.as_slice() {
+            [candidate] => candidate,
+            [] => return Err(ExactFaceExtrudeError::Unresolved),
+            _ => {
+                let tolerance = legacy_face_match_tolerance(body, reference);
+                let mut close = candidates.iter().filter(|candidate| {
+                    crate::mock_kernel::dist3(candidate.centroid, reference.centroid) <= tolerance
+                });
+                let Some(candidate) = close.next() else {
+                    return Err(ExactFaceExtrudeError::Ambiguous);
+                };
+                if close.next().is_some() {
+                    return Err(ExactFaceExtrudeError::Ambiguous);
+                }
+                candidate
+            }
+        }
+    } else {
+        let tolerance = legacy_face_match_tolerance(body, reference);
+        let mut close = candidates.iter().filter(|candidate| {
+            crate::mock_kernel::dist3(candidate.centroid, reference.centroid) <= tolerance
+        });
+        let Some(candidate) = close.next() else {
+            return Err(ExactFaceExtrudeError::Unresolved);
+        };
+        if close.next().is_some() {
+            return Err(ExactFaceExtrudeError::Ambiguous);
+        }
+        candidate
+    };
+
+    let normal = Vec3::new(
+        candidate.normal[0],
+        candidate.normal[1],
+        candidate.normal[2],
+    )
+    .normalize();
+    if normal == Vec3::ZERO {
+        return Err(ExactFaceExtrudeError::UnsupportedSurface);
+    }
+    Ok(ResolvedExactPlanarFace {
+        body_id: body_id.to_string(),
+        component_index: candidate.component_index,
+        face: candidate.face.clone(),
+        normal,
+    })
+}
+
+fn exact_face_recovery_overlap(component: &KernelSolid) -> f32 {
+    let model_scale = crate::mock_kernel::solid_aabb(component)
+        .map(|(min, max)| {
+            (0..3)
+                .map(|axis| (max[axis] - min[axis]).abs())
+                .fold(0.0_f32, f32::max)
+        })
+        .unwrap_or(0.0);
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+    let policy_floor = policy
+        .classification
+        .max(policy.intersection)
+        .max(policy.sewing) as f32
+        * 32.0;
+    policy_floor.max(model_scale * 1.0e-5).min(0.1)
+}
+
+fn exact_face_prism(
+    face: &openrcad::topo::Face,
+    normal: Vec3,
+    start_offset: f32,
+    end_offset: f32,
+) -> Result<KernelSolid, ExactFaceExtrudeError> {
+    let start = if start_offset.abs() <= f32::EPSILON {
+        face.clone()
+    } else {
+        face.transformed(&openrcad::foundation::Trsf::translation(
+            openrcad::foundation::Vec::new(
+                f64::from(normal.x * start_offset),
+                f64::from(normal.y * start_offset),
+                f64::from(normal.z * start_offset),
+            ),
+        ))
+    };
+    let sweep = end_offset - start_offset;
+    let vector = openrcad::foundation::Vec::new(
+        f64::from(normal.x * sweep),
+        f64::from(normal.y * sweep),
+        f64::from(normal.z * sweep),
+    );
+    crate::mock_kernel::consume_operation(
+        "exact selected-face prism",
+        openrcad::algo::prism_operation_with_policy(
+            &start,
+            vector,
+            &openrcad::foundation::TolerancePolicy::STANDARD,
+        ),
+    )
+    .map(|outcome| outcome.solid)
+    .map_err(|reason| ExactFaceExtrudeError::Prism(reason.to_string()))
+}
+
+fn stamp_direct_face_extrude_refs(mesh: &mut MockMesh, body_id: &str) {
+    let quant = |value: f32| (f64::from(value) * 1.0e3).round() as i64;
+    let mut order: Vec<usize> = (0..mesh.face_refs.len()).collect();
+    order.sort_by_key(|&index| {
+        let centroid = mesh.face_refs[index].centroid;
+        (quant(centroid[0]), quant(centroid[1]), quant(centroid[2]))
+    });
+    for (face_index, index) in order.into_iter().enumerate() {
+        mesh.face_refs[index].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            component_id: None,
+            topology_version: Some(0),
+            face_id: Some(format!("face-extrude:{body_id}:face:{face_index}")),
+            surface_kind: None,
+            producer_feature_id: Some(body_id.to_string()),
+            source_entity_id: None,
+        });
+    }
+    crate::mock_kernel::populate_edge_adjacent_face_names(mesh);
+}
+
+/// Execute an outline-only face extrusion from the selected face's exact
+/// OpenRCAD wires. The coincident prism is always attempted first. Recovery
+/// extends only the hidden/entry end of the boolean tool, so the requested far
+/// plane remains exact and no tolerance adjustment enters model dimensions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_exact_face_extrude(
+    node_id: &str,
+    depth: f32,
+    mode: ExtrudeMode,
+    boolean_target: Option<&str>,
+    reference: &FaceRef,
+    draft: bool,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) {
+    if !depth.is_finite() || depth.abs() <= 1.0e-5 {
+        warnings.push(format!(
+            "Extrude '{node_id}': {}; the feature was not applied.",
+            ExactFaceExtrudeError::InvalidDepth
+        ));
+        return;
+    }
+    let resolved = match resolve_exact_planar_face(live, reference, boolean_target) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            warnings.push(format!(
+                "Extrude '{node_id}': {error}; the feature was not applied."
+            ));
+            return;
+        }
+    };
+    let Some(component) = live
+        .iter()
+        .find(|body| body.id == resolved.body_id)
+        .and_then(|body| body.parts.get(resolved.component_index))
+    else {
+        warnings.push(format!(
+            "Extrude '{node_id}': the resolved body component no longer exists; the feature was not applied."
+        ));
+        return;
+    };
+    let overlap = exact_face_recovery_overlap(component);
+    let exact = match exact_face_prism(&resolved.face, resolved.normal, 0.0, depth) {
+        Ok(exact) => exact,
+        Err(error) => {
+            warnings.push(format!(
+                "Extrude '{node_id}': {error}; the feature was not applied."
+            ));
+            return;
+        }
+    };
+
+    match mode {
+        ExtrudeMode::NewBody => {
+            let mut mesh = MockMesh::from_solid(&exact);
+            stamp_direct_face_extrude_refs(&mut mesh, node_id);
+            apply_new(
+                live,
+                LiveBody {
+                    id: node_id.into(),
+                    parts: vec![exact],
+                    pristine: (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh)),
+                    sketch_source: None,
+                },
+            );
+        }
+        ExtrudeMode::Join => {
+            let dipped = exact_face_prism(&resolved.face, resolved.normal, -overlap, depth).ok();
+            apply_join(
+                live,
+                node_id,
+                vec![JoinTool {
+                    smooth: None,
+                    exact: Some(exact),
+                    dipped,
+                    profile: None,
+                }],
+                Some(&resolved.body_id),
+                draft,
+                warnings,
+            );
+        }
+        ExtrudeMode::Cut => {
+            let expanded = exact_face_prism(&resolved.face, resolved.normal, overlap, depth).ok();
+            let exact_rev = exact_face_prism(&resolved.face, resolved.normal, 0.0, -depth).ok();
+            let expanded_rev =
+                exact_face_prism(&resolved.face, resolved.normal, overlap, -depth).ok();
+            apply_cut(
+                live,
+                node_id,
+                vec![CutTool {
+                    smooth: None,
+                    exact: Some(exact),
+                    expanded,
+                    smooth_rev: None,
+                    exact_rev,
+                    expanded_rev,
+                    circle: None,
+                }],
+                Some(&resolved.body_id),
+                draft,
+                warnings,
+            );
+        }
+    }
+}
+
 fn signed_area(points: &[(f32, f32)]) -> f64 {
     points
         .iter()
@@ -806,6 +1245,33 @@ pub(crate) fn stamp_pattern_face_refs(mesh: &mut MockMesh, body_id: &str, instan
             source_entity_id: None,
         });
     }
+}
+
+/// Give previously unnamed faces created by a joined pattern a durable owner
+/// while keeping the body identity of the modified source. Source faces that
+/// survived the join are named before this runs and remain untouched.
+pub(crate) fn stamp_joined_pattern_face_refs(mesh: &mut MockMesh, body_id: &str, pattern_id: &str) {
+    let quant = |value: f32| (f64::from(value) * 1.0e3).round() as i64;
+    let mut order: Vec<usize> = (0..mesh.face_refs.len())
+        .filter(|&index| mesh.face_refs[index].topology.is_none())
+        .collect();
+    order.sort_by_key(|&index| {
+        let centroid = mesh.face_refs[index].centroid;
+        (quant(centroid[0]), quant(centroid[1]), quant(centroid[2]))
+    });
+    for (face_index, index) in order.into_iter().enumerate() {
+        let face_id = format!("pattern:{pattern_id}:joined:face:{face_index}");
+        mesh.face_refs[index].topology = Some(crate::mock_kernel::MeshTopologyFaceRef {
+            body_id: Some(body_id.to_string()),
+            component_id: None,
+            topology_version: Some(0),
+            face_id: Some(face_id),
+            surface_kind: None,
+            producer_feature_id: Some(pattern_id.to_string()),
+            source_entity_id: None,
+        });
+    }
+    crate::mock_kernel::populate_edge_adjacent_face_names(mesh);
 }
 
 /// Stamp durable PRIMITIVE names onto a cylinder body's faces:

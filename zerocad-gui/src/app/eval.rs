@@ -1,4 +1,42 @@
 use crate::*;
+use zerocad_core::SharedEvaluatedScene;
+
+/// The immutable evaluated scene paired with the revision consumed by the GPU.
+///
+/// The inner fields stay private to this module so replacing the scene cannot
+/// accidentally bypass epoch invalidation. Read-only viewport consumers use
+/// the `Deref<EvaluatedScene>` implementation.
+pub(crate) struct ViewportSceneState {
+    scene: SharedEvaluatedScene,
+    epoch: u64,
+}
+
+impl ViewportSceneState {
+    pub(crate) fn new(scene: SharedEvaluatedScene) -> Self {
+        Self { scene, epoch: 0 }
+    }
+
+    fn replace(&mut self, scene: SharedEvaluatedScene) {
+        self.scene = scene;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn shared(&self) -> SharedEvaluatedScene {
+        self.scene.clone()
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl std::ops::Deref for ViewportSceneState {
+    type Target = EvaluatedScene;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scene
+    }
+}
 
 impl ZeroCadApp {
     /// Run a keyboard-shortcut action. Single dispatch point shared by the global
@@ -103,14 +141,22 @@ impl ZeroCadApp {
         self.status_msg = "Updating model...".to_string();
     }
 
-    /// The ONE way to replace the displayed body meshes. Bumps `mesh_epoch`
-    /// (the GPU viewport re-uploads its scene only when this changes — a
-    /// forgotten bump means it silently renders a stale model) and refreshes
-    /// the cached mesh stats. Never assign `self.body_meshes` directly.
+    /// The one mutation seam for the evaluated viewport scene. Geometry and
+    /// placement changes both pass through here, so the GPU epoch and cached
+    /// scene statistics cannot be forgotten.
+    pub(crate) fn replace_evaluated_scene(&mut self, scene: SharedEvaluatedScene) {
+        self.scene_stats = scene.stats();
+        self.evaluated_scene.replace(scene);
+    }
+
+    /// The ONE way to replace the displayed part meshes. The evaluator/cache
+    /// body vector and identity-placement scene share one geometry allocation.
+    /// Never assign `self.body_meshes` directly.
     pub(crate) fn set_body_meshes(&mut self, bodies: Vec<(String, MockMesh)>) {
-        self.body_meshes = std::sync::Arc::new(bodies);
-        self.mesh_epoch = self.mesh_epoch.wrapping_add(1);
-        self.mesh_stats = Self::mesh_totals(&self.body_meshes);
+        let bodies = std::sync::Arc::new(bodies);
+        let scene = std::sync::Arc::new(EvaluatedScene::from_part_bodies(bodies.clone()));
+        self.body_meshes = bodies;
+        self.replace_evaluated_scene(scene);
     }
 
     pub(crate) fn mirror_join_outcome(
@@ -363,6 +409,53 @@ fn classify_mirror_join_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerocad_core::{SceneInstance, ScenePlacement};
+
+    #[test]
+    fn every_scene_replacement_advances_the_gpu_epoch() {
+        let mut app = ZeroCadApp::new();
+        let initial_epoch = app.evaluated_scene.epoch();
+
+        app.set_body_meshes(vec![("box".to_string(), MockMesh::make_box(2.0, 3.0, 4.0))]);
+        assert_eq!(app.evaluated_scene.epoch(), initial_epoch.wrapping_add(1));
+        assert_eq!(app.scene_stats, app.evaluated_scene.stats());
+        assert_eq!(app.scene_stats.geometry_pool_count, 1);
+        assert_eq!(app.scene_stats.referenced_geometry_count, 1);
+        assert_eq!(app.scene_stats.instance_count, 1);
+        assert_eq!(
+            app.scene_stats.instance_expanded_triangles,
+            app.scene_stats.geometry_pool_triangles
+        );
+
+        let placement = ScenePlacement::from_rotation_translation(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [10.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let placed = std::sync::Arc::new(
+            EvaluatedScene::from_instances(
+                app.body_meshes.clone(),
+                vec![SceneInstance::new("placed-box", 0, placement)],
+            )
+            .unwrap(),
+        );
+        let before_placement = app.evaluated_scene.epoch();
+        app.replace_evaluated_scene(placed.clone());
+
+        assert_eq!(
+            app.evaluated_scene.epoch(),
+            before_placement.wrapping_add(1)
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &app.evaluated_scene.shared(),
+            &placed
+        ));
+        assert_eq!(
+            app.evaluated_scene.world_bounds(),
+            Some(([10.0, 0.0, 0.0], [12.0, 3.0, 4.0]))
+        );
+        assert_eq!(app.scene_stats, placed.stats());
+    }
 
     #[test]
     fn mirror_join_outcome_tracks_evaluating_joined_separate_and_unresolved() {

@@ -87,7 +87,7 @@ impl ZeroCadApp {
     /// This is the CAD "tangent chain" behavior: an analytic sketch fillet arc
     /// pulls in its straight tangent runs, while sharp corners stop the walk.
     pub(crate) fn tangent_edge_chain(&self, node_id: &str, seeds: &[u32]) -> Vec<u32> {
-        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+        let Some((_, mesh)) = self.evaluated_scene.find(node_id) else {
             return seeds.to_vec();
         };
         let mut groups: Vec<u32> = mesh.edge_refs.iter().map(|edge| edge.group).collect();
@@ -111,8 +111,15 @@ impl ZeroCadApp {
     /// ends — for a straight edge that's its own two corners; for a multi-chord
     /// fillet arc, the arc's ends.
     pub(crate) fn edge_ref_from(&self, node_id: &str, e: u32) -> Option<EdgeRef> {
-        let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == node_id)?;
-        Self::edge_ref_from_mesh(node_id, mesh, e)
+        let (instance, mesh) = self.evaluated_scene.find(node_id)?;
+        let transformed;
+        let world_mesh = if instance.placement().is_identity() {
+            mesh
+        } else {
+            transformed = instance.placement().transform_mesh(mesh);
+            &transformed
+        };
+        Self::edge_ref_from_mesh(node_id, world_mesh, e)
     }
 
     /// Mesh-level body of [`edge_ref_from`], separated so tests can drive the
@@ -606,7 +613,10 @@ impl ZeroCadApp {
             !(has_neg && has_pos)
         };
 
-        for (node_id, mesh) in self.body_meshes.iter() {
+        for instance in self.evaluated_scene.instances() {
+            let node_id = instance.entity_id();
+            let mesh = self.evaluated_scene.mesh(instance);
+            let placement = instance.placement();
             if self.hidden_nodes.contains(node_id) {
                 continue;
             }
@@ -655,14 +665,15 @@ impl ZeroCadApp {
                         continue;
                     }
                 }
-                let p = proj(
+                let point = placement.transform_point([
                     mesh.edge_vertices[v * 3],
                     mesh.edge_vertices[v * 3 + 1],
                     mesh.edge_vertices[v * 3 + 2],
-                );
+                ]);
+                let p = proj(point[0], point[1], point[2]);
                 let d = (egui::pos2(p.0, p.1) - click).length();
-                if d < VERT_TOL_PX && best_vertex.as_ref().map_or(true, |b| d < b.2) {
-                    best_vertex = Some((node_id.clone(), v as u32, d));
+                if d < VERT_TOL_PX && best_vertex.as_ref().is_none_or(|b| d < b.2) {
+                    best_vertex = Some((node_id.to_string(), v as u32, d));
                 }
             }
 
@@ -671,23 +682,25 @@ impl ZeroCadApp {
             for e in 0..ecount {
                 let i0 = mesh.edge_indices[e * 2] as usize * 3;
                 let i1 = mesh.edge_indices[e * 2 + 1] as usize * 3;
-                let a = proj(
+                let point_a = placement.transform_point([
                     mesh.edge_vertices[i0],
                     mesh.edge_vertices[i0 + 1],
                     mesh.edge_vertices[i0 + 2],
-                );
-                let b = proj(
+                ]);
+                let point_b = placement.transform_point([
                     mesh.edge_vertices[i1],
                     mesh.edge_vertices[i1 + 1],
                     mesh.edge_vertices[i1 + 2],
-                );
+                ]);
+                let a = proj(point_a[0], point_a[1], point_a[2]);
+                let b = proj(point_b[0], point_b[1], point_b[2]);
                 let d = dist_point_to_segment(click, egui::pos2(a.0, a.1), egui::pos2(b.0, b.1));
-                if d < EDGE_TOL_PX && best_edge.as_ref().map_or(true, |b| d < b.2) {
+                if d < EDGE_TOL_PX && best_edge.as_ref().is_none_or(|b| d < b.2) {
                     // Map the hit chord to its topological edge group, so the whole
                     // curve (a fillet arc, a circular rim) selects as one. Legacy
                     // meshes without grouping fall back to the raw segment index.
                     let g = mesh.edge_groups.get(e).copied().unwrap_or(e as u32);
-                    best_edge = Some((node_id.clone(), g, d));
+                    best_edge = Some((node_id.to_string(), g, d));
                 }
             }
 
@@ -702,44 +715,47 @@ impl ZeroCadApp {
                 let i0 = mesh.indices[t * 3] as usize * 6;
                 let i1 = mesh.indices[t * 3 + 1] as usize * 6;
                 let i2 = mesh.indices[t * 3 + 2] as usize * 6;
-                let n0 = (
+                let n0 = placement.transform_vector([
                     mesh.vertices[i0 + 3],
                     mesh.vertices[i0 + 4],
                     mesh.vertices[i0 + 5],
-                );
-                let n1 = (
+                ]);
+                let n1 = placement.transform_vector([
                     mesh.vertices[i1 + 3],
                     mesh.vertices[i1 + 4],
                     mesh.vertices[i1 + 5],
-                );
-                let n2 = (
+                ]);
+                let n2 = placement.transform_vector([
                     mesh.vertices[i2 + 3],
                     mesh.vertices[i2 + 4],
                     mesh.vertices[i2 + 5],
-                );
+                ]);
                 let normal = (
-                    (n0.0 + n1.0 + n2.0) / 3.0,
-                    (n0.1 + n1.1 + n2.1) / 3.0,
-                    (n0.2 + n1.2 + n2.2) / 3.0,
+                    (n0[0] + n1[0] + n2[0]) / 3.0,
+                    (n0[1] + n1[1] + n2[1]) / 3.0,
+                    (n0[2] + n1[2] + n2[2]) / 3.0,
                 );
                 if !faces_camera(normal) {
                     continue;
                 }
-                let p0 = proj(
+                let point0 = placement.transform_point([
                     mesh.vertices[i0],
                     mesh.vertices[i0 + 1],
                     mesh.vertices[i0 + 2],
-                );
-                let p1 = proj(
+                ]);
+                let point1 = placement.transform_point([
                     mesh.vertices[i1],
                     mesh.vertices[i1 + 1],
                     mesh.vertices[i1 + 2],
-                );
-                let p2 = proj(
+                ]);
+                let point2 = placement.transform_point([
                     mesh.vertices[i2],
                     mesh.vertices[i2 + 1],
                     mesh.vertices[i2 + 2],
-                );
+                ]);
+                let p0 = proj(point0[0], point0[1], point0[2]);
+                let p1 = proj(point1[0], point1[1], point1[2]);
+                let p2 = proj(point2[0], point2[1], point2[2]);
                 if point_in_tri(
                     click,
                     egui::pos2(p0.0, p0.1),
@@ -747,9 +763,9 @@ impl ZeroCadApp {
                     egui::pos2(p2.0, p2.1),
                 ) {
                     let depth = (p0.2 + p1.2 + p2.2) / 3.0;
-                    if best_face.as_ref().map_or(true, |b| depth > b.2) {
+                    if best_face.as_ref().is_none_or(|b| depth > b.2) {
                         let fid = mesh.face_ids.get(t).copied().unwrap_or(0);
-                        best_face = Some((node_id.clone(), fid, depth));
+                        best_face = Some((node_id.to_string(), fid, depth));
                     }
                 }
             }
@@ -794,7 +810,7 @@ impl ZeroCadApp {
     /// stored `surface_kind` can't be trusted (GUI-reconstructed refs have topology
     /// `None`), so this decides purely from the tessellation geometry.
     pub(crate) fn face_is_planar(&self, node_id: &str, fid: u32) -> bool {
-        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+        let Some((_, mesh)) = self.evaluated_scene.find(node_id) else {
             return false;
         };
         let ntris = mesh.indices.len() / 3;
@@ -856,7 +872,8 @@ impl ZeroCadApp {
     /// centroid, normal = the face's outward normal, with in-plane axes derived
     /// so `u × v == n`. Returns `None` if the face/body isn't found.
     pub(crate) fn face_cs(&self, node_id: &str, fid: u32) -> Option<CoordinateSystem> {
-        let (_, mesh) = self.body_meshes.iter().find(|(id, _)| id == node_id)?;
+        let (instance, mesh) = self.evaluated_scene.find(node_id)?;
+        let placement = instance.placement();
         let ntris = mesh.indices.len() / 3;
         let (mut cx, mut cy, mut cz) = (0.0f32, 0.0f32, 0.0f32);
         let (mut nx, mut ny, mut nz) = (0.0f32, 0.0f32, 0.0f32);
@@ -880,8 +897,10 @@ impl ZeroCadApp {
         if count == 0.0 {
             return None;
         }
-        let origin = Vec3::new(cx / count, cy / count, cz / count);
-        let n = Vec3::new(nx, ny, nz).normalize();
+        let origin = placement.transform_point([cx / count, cy / count, cz / count]);
+        let normal = placement.transform_vector([nx, ny, nz]);
+        let origin = Vec3::new(origin[0], origin[1], origin[2]);
+        let n = Vec3::new(normal[0], normal[1], normal[2]).normalize();
         // In-plane axes: u perpendicular to both world-up and n (fall back to
         // world-X if the face is horizontal), v completes the right-handed frame.
         let mut u = Vec3::Y.cross(n);
@@ -906,10 +925,17 @@ impl ZeroCadApp {
         fid: u32,
         cs: &CoordinateSystem,
     ) -> SketchCurves {
-        let Some((_, mesh)) = self.body_meshes.iter().find(|(id, _)| id == node_id) else {
+        let Some((instance, mesh)) = self.evaluated_scene.find(node_id) else {
             return SketchCurves::new();
         };
-        zerocad_core::mock_kernel::mesh_face_boundary_2d(mesh, fid, cs)
+        let transformed;
+        let world_mesh = if instance.placement().is_identity() {
+            mesh
+        } else {
+            transformed = instance.placement().transform_mesh(mesh);
+            &transformed
+        };
+        zerocad_core::mock_kernel::mesh_face_boundary_2d(world_mesh, fid, cs)
     }
 
     /// The durable [`FaceRef`] for a picked body face, so a sketch placed on it can
@@ -1110,6 +1136,56 @@ mod body_selection_tests {
                 .into_iter()
                 .collect()
         );
+    }
+}
+
+#[cfg(test)]
+mod placed_scene_picking_tests {
+    use crate::{egui, gpu_viewport, BodyPick, MockMesh, ZeroCadApp};
+    use zerocad_core::{EvaluatedScene, SceneInstance, ScenePlacement};
+
+    #[test]
+    fn cpu_fallback_picks_transformed_scene_geometry_not_local_geometry() {
+        let mut app = ZeroCadApp::new();
+        app.set_body_meshes(vec![("box".to_string(), MockMesh::make_box(2.0, 2.0, 2.0))]);
+        let placement = ScenePlacement::from_rotation_translation(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [100.0, 0.0, 0.0],
+        )
+        .unwrap();
+        app.replace_evaluated_scene(std::sync::Arc::new(
+            EvaluatedScene::from_instances(
+                app.body_meshes.clone(),
+                vec![SceneInstance::new("placed-box", 0, placement)],
+            )
+            .unwrap(),
+        ));
+        let project = |x: f32, y: f32, z: f32| (x, y, z);
+
+        let placed = app.pick_body_element(
+            egui::pos2(100.0, 0.0),
+            &project,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            gpu_viewport::GpuFacePick::Unavailable,
+        );
+        assert!(matches!(
+            placed,
+            Some((ref id, BodyPick::Vertex(_))) if id == "placed-box"
+        ));
+
+        let local = app.pick_body_element(
+            egui::pos2(0.0, 0.0),
+            &project,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            gpu_viewport::GpuFacePick::Unavailable,
+        );
+        assert_eq!(local, None);
     }
 }
 

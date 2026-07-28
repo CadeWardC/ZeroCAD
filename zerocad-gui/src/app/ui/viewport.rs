@@ -1545,17 +1545,7 @@ impl ZeroCadApp {
     }
 
     fn fit_all_bodies(&mut self) {
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for (_, mesh) in self.body_meshes.iter() {
-            for vertex in mesh.vertices.chunks_exact(6) {
-                for axis in 0..3 {
-                    min[axis] = min[axis].min(vertex[axis]);
-                    max[axis] = max[axis].max(vertex[axis]);
-                }
-            }
-        }
-        if min[0].is_finite() {
+        if let Some((min, max)) = self.evaluated_scene.world_bounds() {
             let span = (0..3)
                 .map(|axis| max[axis] - min[axis])
                 .fold(0.0f32, f32::max)

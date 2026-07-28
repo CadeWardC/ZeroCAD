@@ -3644,6 +3644,7 @@ impl ParametricGraph {
         // attachment re-derives from wherever the face is now; otherwise the
         // sketch's saved plane. A datum that no longer resolves fails loud and
         // falls back to the saved plane snapshot.
+        let attached_face = self.sketch_face_refs.get(sketch_id.as_str());
         let datum_cs = self
             .sketch_datum_refs
             .get(sketch_id.as_str())
@@ -3679,6 +3680,50 @@ impl ParametricGraph {
             .unwrap_or(sketch.cs);
         let cs = &cs_owned;
 
+        // A direct viewport face extrusion is persisted as an outline-only
+        // helper sketch. Its display boundary is reference/picking data, not a
+        // modeling profile: resolve the capture back to one exact OpenRCAD face
+        // and prism that face's own wires. A non-zero draft or any user-drawn
+        // sketch content deliberately stays on the region path below.
+        let direct_face_helper = attached_face.is_some()
+            && sketch.face_boundary.is_some()
+            && sketch.curves.is_empty()
+            && sketch.shape_loops.is_empty()
+            && !region_indices.is_empty()
+            && region_indices
+                .iter()
+                .all(|index| *index < sketch.regions.len())
+            && draft_angle_deg.abs() <= f32::EPSILON
+            && matches!(
+                &self.graph[parent_idx].feature,
+                FeatureType::Sketch {
+                    on_face: true,
+                    curves,
+                    shapes,
+                    corner_mods,
+                    mirrors,
+                    solver,
+                    ..
+                } if curves.is_empty()
+                    && shapes.is_empty()
+                    && corner_mods.is_empty()
+                    && mirrors.is_empty()
+                    && solver.as_ref().is_none_or(|solver| solver.is_empty())
+            );
+        if direct_face_helper {
+            apply_exact_face_extrude(
+                node_id,
+                depth,
+                mode,
+                boolean_target,
+                attached_face.expect("direct face helper has a face reference"),
+                draft,
+                live,
+                warnings,
+            );
+            return;
+        }
+
         // Associative face outline: a sketch-on-face carries the projected face
         // boundary as reference geometry. Re-project it from wherever the face
         // is NOW (the body may have changed upstream); when it differs from the
@@ -3691,7 +3736,6 @@ impl ParametricGraph {
         // detected in. Only genuinely unnamed legacy references may fall back
         // to the stored snapshot.
         let mut refreshed: Option<(Vec<Region>, Vec<usize>)> = None;
-        let attached_face = self.sketch_face_refs.get(sketch_id.as_str());
         let fresh_face_boundary =
             attached_face.and_then(|face_ref| rederive_face_boundary(face_ref, live, cs));
         if attached_face.is_some_and(face_ref_is_named) && fresh_face_boundary.is_none() {
@@ -6967,6 +7011,7 @@ fn apply_pattern(
         return;
     };
     let parts = src.parts.clone();
+    let source_pristine = src.pristine.clone();
     if parts.is_empty() {
         warnings.push(format!(
             "Pattern '{node_id}': source body '{source}' has no solid geometry."
@@ -7134,14 +7179,22 @@ fn apply_pattern(
             mirror_join_plane.map_or(Vec3::ZERO, |plane| plane.1).z,
         );
         if let Some(joined_parts) = try_join_mirrored_parts(node_id, &parts, &new_parts) {
-            let pristine = mirror_join_plane.map(|(origin, normal)| {
-                std::sync::Arc::new(super::mesh_support::mirror_join_display_mesh(
+            let pristine = Some(std::sync::Arc::new(match mirror_join_plane {
+                Some((origin, normal)) => super::mesh_support::mirror_join_display_mesh(
                     node_id,
                     &joined_parts,
                     origin,
                     normal,
-                ))
-            });
+                    source_pristine.as_deref(),
+                    source,
+                ),
+                None => super::mesh_support::joined_pattern_display_mesh(
+                    node_id,
+                    &joined_parts,
+                    source_pristine.as_deref(),
+                    source,
+                ),
+            }));
             if let Some(source_index) = live.iter().position(|body| body.id == source) {
                 live.remove(source_index);
             }

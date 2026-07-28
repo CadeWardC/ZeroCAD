@@ -47,6 +47,97 @@ fn mesh_z_range(mesh: &crate::MockMesh) -> (f32, f32) {
     (min_z, max_z)
 }
 
+fn attach_direct_top_face(graph: &mut ParametricGraph, body_id: &str, sketch_id: &str) -> usize {
+    let bodies = graph
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .expect("evaluate face owner");
+    let (_, mesh) = bodies
+        .iter()
+        .find(|(id, _)| id == body_id)
+        .expect("face owner body");
+    let top = mesh
+        .face_refs
+        .iter()
+        .filter(|face| face.normal[2] > 0.99)
+        .max_by(|left, right| left.centroid[2].total_cmp(&right.centroid[2]))
+        .expect("top planar face")
+        .clone();
+    let cs = CoordinateSystem::new(
+        Vec3::new(top.centroid[0], top.centroid[1], top.centroid[2]),
+        Vec3::X,
+        Vec3::Y,
+    );
+    let boundary = crate::mock_kernel::mesh_face_boundary_2d(mesh, top.face_id, &cs);
+    let regions = detect_regions(&boundary);
+    assert!(!regions.is_empty(), "direct face has no detected material");
+    graph.add_feature(FeatureNode {
+        id: sketch_id.to_string(),
+        name: sketch_id.to_string(),
+        feature: FeatureType::Sketch {
+            cs,
+            curves: SketchCurves::new(),
+            shapes: Vec::new(),
+            corner_mods: Vec::new(),
+            mirrors: Vec::new(),
+            on_face: true,
+            entity_ids: Vec::new(),
+            next_entity_id: 0,
+            solver: None,
+        },
+    });
+    graph.add_dependency(body_id, sketch_id);
+    graph.sketch_face_refs.insert(
+        sketch_id.into(),
+        FaceRef {
+            centroid: top.centroid,
+            normal: top.normal,
+            topology: top.topology.map(|topology| TopologyFaceRef {
+                body_id: topology.body_id.or_else(|| Some(body_id.to_string())),
+                component_id: topology.component_id,
+                topology_version: topology.topology_version,
+                face_id: topology.face_id,
+                surface_kind: topology.surface_kind,
+                producer_feature_id: topology.producer_feature_id,
+                source_entity_id: topology.source_entity_id,
+            }),
+        },
+    );
+    graph
+        .sketch_face_boundaries
+        .insert(sketch_id.into(), boundary);
+    regions
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.area.total_cmp(&right.area))
+        .map(|(index, _)| index)
+        .expect("top material region")
+}
+
+fn add_direct_face_extrude(
+    graph: &mut ParametricGraph,
+    id: &str,
+    sketch_id: &str,
+    target: Option<&str>,
+    region_index: usize,
+    depth: f32,
+    mode: ExtrudeMode,
+) {
+    graph.add_feature(FeatureNode {
+        id: id.to_string(),
+        name: id.to_string(),
+        feature: FeatureType::Extrude {
+            target: target.map(str::to_string),
+            depth,
+            region_indices: vec![region_index],
+            mode,
+            depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
+        },
+    });
+    graph.add_dependency(sketch_id, id);
+}
+
 /// ASSOCIATIVITY: the projected face outline must re-derive from wherever the
 /// face is after the parent body changes — an outline-only face sketch's boss
 /// follows the widened face instead of staying frozen at the captured 10×10
@@ -181,6 +272,377 @@ fn face_boundary_only_sketch_extrudes_the_whole_face() {
         (min_z - 0.0).abs() < 1.0e-3 && (max_z - 15.0).abs() < 1.0e-3,
         "expected the box to grow to z=15, got z range {min_z}..{max_z}"
     );
+}
+
+#[test]
+fn direct_face_join_uses_exact_face_wires_and_removes_the_shared_face() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let region = attach_direct_top_face(&mut graph, "box_1", "face_sketch");
+    add_direct_face_extrude(
+        &mut graph,
+        "join_3",
+        "face_sketch",
+        Some("box_1"),
+        region,
+        6.07,
+        ExtrudeMode::Join,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("exact face join");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].0, "box_1");
+    let (min_z, max_z) = mesh_z_range(&bodies[0].1);
+    assert!((min_z - 0.0).abs() < 1.0e-4);
+    assert!((max_z - 16.07).abs() < 1.0e-4, "max z {max_z}");
+    let volume = bodies[0]
+        .1
+        .mass_properties()
+        .expect("joined mass properties")
+        .volume;
+    assert!((volume - 1_607.0).abs() < 0.05, "volume {volume}");
+    assert!(
+        bodies[0].1.face_refs.iter().all(|face| {
+            !(face.normal[2].abs() > 0.99 && (face.centroid[2] - 10.0).abs() < 1.0e-4)
+        }),
+        "the coincident input cap must not remain as a modeled face"
+    );
+    assert!(
+        bodies[0].1.face_refs.iter().all(|face| {
+            face.topology
+                .as_ref()
+                .and_then(|topology| topology.face_id.as_deref())
+                .is_some()
+        }),
+        "the exact boolean result must keep durable face identities"
+    );
+}
+
+#[test]
+fn direct_face_cut_keeps_the_requested_far_plane_exact() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let region = attach_direct_top_face(&mut graph, "box_1", "face_sketch");
+    add_direct_face_extrude(
+        &mut graph,
+        "cut_3",
+        "face_sketch",
+        Some("box_1"),
+        region,
+        -4.0,
+        ExtrudeMode::Cut,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("exact face cut");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    assert_eq!(bodies.len(), 1);
+    let (min_z, max_z) = mesh_z_range(&bodies[0].1);
+    assert!((min_z - 0.0).abs() < 1.0e-4);
+    assert!((max_z - 6.0).abs() < 1.0e-4, "max z {max_z}");
+    let volume = bodies[0]
+        .1
+        .mass_properties()
+        .expect("cut mass properties")
+        .volume;
+    assert!((volume - 600.0).abs() < 0.05, "volume {volume}");
+}
+
+#[test]
+fn direct_face_new_body_uses_the_exact_selected_face() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let region = attach_direct_top_face(&mut graph, "box_1", "face_sketch");
+    add_direct_face_extrude(
+        &mut graph,
+        "new_3",
+        "face_sketch",
+        None,
+        region,
+        2.5,
+        ExtrudeMode::NewBody,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("exact face new body");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    assert_eq!(bodies.len(), 2);
+    let new_body = bodies
+        .iter()
+        .find(|(id, _)| id == "new_3")
+        .expect("new exact prism body");
+    let (min_z, max_z) = mesh_z_range(&new_body.1);
+    assert!((min_z - 10.0).abs() < 1.0e-4);
+    assert!((max_z - 12.5).abs() < 1.0e-4);
+    assert!(
+        new_body.1.face_refs.iter().all(|face| face
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.face_id.as_deref())
+            .is_some()),
+        "new exact prism faces need durable identities"
+    );
+}
+
+#[test]
+fn direct_face_join_preserves_inner_wires() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 20.0,
+            h: 20.0,
+            d: 10.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "hole_2".into(),
+        name: "Hole".into(),
+        feature: FeatureType::Hole {
+            target: "box_1".into(),
+            position: [10.0, 10.0, 10.0],
+            direction: [0.0, 0.0, -1.0],
+            diameter: 6.0,
+            diameter_expr: None,
+            depth: None,
+            kind: HoleKind::Simple,
+            standard: None,
+            manufacturing: None,
+        },
+    });
+    graph.add_dependency("box_1", "hole_2");
+    let before = graph
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .expect("body with through hole");
+    let before_volume = before[0]
+        .1
+        .mass_properties()
+        .expect("initial holed body")
+        .volume;
+
+    let region = attach_direct_top_face(&mut graph, "box_1", "face_sketch");
+    add_direct_face_extrude(
+        &mut graph,
+        "join_4",
+        "face_sketch",
+        Some("box_1"),
+        region,
+        2.5,
+        ExtrudeMode::Join,
+    );
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("exact annular face join");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    let after_volume = bodies[0]
+        .1
+        .mass_properties()
+        .expect("joined holed body")
+        .volume;
+    let expected_added = (400.0 - std::f64::consts::PI * 9.0) * 2.5;
+    assert!(
+        ((after_volume - before_volume) - expected_added).abs() < 0.5,
+        "inner wire was not preserved: before={before_volume}, after={after_volume}, expected added={expected_added}"
+    );
+    let (_, max_z) = mesh_z_range(&bodies[0].1);
+    assert!((max_z - 12.5).abs() < 1.0e-4);
+}
+
+#[test]
+fn direct_face_join_preserves_a_concave_outline() {
+    let mut outline = SketchCurves::new();
+    let points = [
+        (0.0, 0.0),
+        (10.0, 0.0),
+        (10.0, 4.0),
+        (4.0, 4.0),
+        (4.0, 10.0),
+        (0.0, 10.0),
+    ];
+    for (&start, &end) in points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+    {
+        outline.add_line(start, end);
+    }
+    let mut graph = ParametricGraph::new();
+    add_sketch(&mut graph, "base_sketch", outline);
+    add_extrude(&mut graph, "base", "base_sketch", 5.0, ExtrudeMode::NewBody);
+    let region = attach_direct_top_face(&mut graph, "base", "face_sketch");
+    add_direct_face_extrude(
+        &mut graph,
+        "join_3",
+        "face_sketch",
+        Some("base"),
+        region,
+        3.0,
+        ExtrudeMode::Join,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("exact concave face join");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    let volume = bodies[0]
+        .1
+        .mass_properties()
+        .expect("concave joined body")
+        .volume;
+    assert!((volume - 512.0).abs() < 0.1, "volume {volume}");
+    let (_, max_z) = mesh_z_range(&bodies[0].1);
+    assert!((max_z - 8.0).abs() < 1.0e-4);
+}
+
+#[test]
+fn unnamed_ambiguous_face_reference_is_rejected() {
+    let solid = crate::mock_kernel::box_solid(10.0, 10.0, 10.0);
+    let mesh = MockMesh::from_solid(&solid);
+    let top = mesh
+        .face_refs
+        .iter()
+        .find(|face| face.normal[2] > 0.99)
+        .expect("top face");
+    let live = vec![LiveBody {
+        id: "legacy_body".into(),
+        parts: vec![solid.clone(), solid],
+        pristine: None,
+        sketch_source: None,
+    }];
+    let error = resolve_exact_planar_face(
+        &live,
+        &FaceRef {
+            centroid: top.centroid,
+            normal: top.normal,
+            topology: Some(TopologyFaceRef {
+                body_id: Some("legacy_body".into()),
+                component_id: None,
+                topology_version: None,
+                face_id: None,
+                surface_kind: Some("plane".into()),
+                producer_feature_id: None,
+                source_entity_id: None,
+            }),
+        },
+        Some("legacy_body"),
+    )
+    .expect_err("two identical unnamed faces must be ambiguous");
+    assert!(matches!(error, ExactFaceExtrudeError::Ambiguous));
+}
+
+#[test]
+fn unique_unnamed_legacy_face_still_uses_exact_brep_geometry() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    let region = attach_direct_top_face(&mut graph, "box_1", "legacy_face_sketch");
+    let reference = graph
+        .sketch_face_refs
+        .get_mut("legacy_face_sketch")
+        .expect("captured face");
+    let topology = reference.topology.as_mut().expect("body topology");
+    topology.face_id = None;
+    topology.component_id = None;
+    add_direct_face_extrude(
+        &mut graph,
+        "join_3",
+        "legacy_face_sketch",
+        Some("box_1"),
+        region,
+        2.0,
+        ExtrudeMode::Join,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("legacy exact face join");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    let (_, max_z) = mesh_z_range(&bodies[0].1);
+    assert!((max_z - 12.0).abs() < 1.0e-4);
+}
+
+#[test]
+fn direct_face_resolution_is_stable_at_large_world_coordinates() {
+    let mut graph = ParametricGraph::new();
+    graph.add_feature(FeatureNode {
+        id: "box_1".into(),
+        name: "Box".into(),
+        feature: FeatureType::Box {
+            w: 10.0,
+            h: 10.0,
+            d: 10.0,
+        },
+    });
+    graph.add_feature(FeatureNode {
+        id: "transform_2".into(),
+        name: "Move".into(),
+        feature: FeatureType::BodyTransform {
+            source: "box_1".into(),
+            translation: [1_000_000.0, -1_000_000.0, 0.0],
+            copy: false,
+        },
+    });
+    graph.add_dependency("box_1", "transform_2");
+    let region = attach_direct_top_face(&mut graph, "transform_2", "face_sketch");
+    add_direct_face_extrude(
+        &mut graph,
+        "join_4",
+        "face_sketch",
+        Some("transform_2"),
+        region,
+        1.25,
+        ExtrudeMode::Join,
+    );
+
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+        .expect("large-coordinate exact face join");
+    assert!(warnings.is_empty(), "warnings: {warnings:#?}");
+    let (_, max_z) = mesh_z_range(&bodies[0].1);
+    assert!((max_z - 11.25).abs() < 1.0e-4);
+    let volume = bodies[0]
+        .1
+        .mass_properties()
+        .expect("large-coordinate body")
+        .volume;
+    assert!((volume - 1_125.0).abs() < 0.1, "volume {volume}");
 }
 
 /// A circle drawn half-off the face splits against the projected outline into

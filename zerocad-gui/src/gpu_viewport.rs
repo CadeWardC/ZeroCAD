@@ -1,4 +1,4 @@
-//! GPU viewport: renders the committed body meshes on the GPU (via
+//! GPU viewport: renders the committed evaluated scene on the GPU (via
 //! `openrcad-render`'s `RenderCore`) into an off-screen texture that is then
 //! composited into the egui viewport as an image, underneath the CPU-drawn 2D
 //! overlays (planes, sketches, dimensions, gizmos).
@@ -26,6 +26,7 @@ use openrcad_render::{
     mesh_bounds, FaceHighlight, GpuMesh, LayerStyle, OffscreenTarget, PickTarget, RenderCore,
     SceneGlobals,
 };
+use zerocad_core::{EvaluatedScene, ScenePlacement};
 
 use crate::*;
 
@@ -52,7 +53,7 @@ pub(crate) type FaceIdMap = HashMap<(String, u32), u32>;
 /// Everything one frame hands the GPU viewport: the committed scene, this
 /// frame's preview layers, selection/hover inputs, camera, and quality knobs.
 pub(crate) struct SceneFrame<'a> {
-    pub body_meshes: &'a [(String, MockMesh)],
+    pub scene: &'a EvaluatedScene,
     pub epoch: u64,
     /// Draw the committed bodies (false while a preview result set replaces them).
     pub draw_bodies: bool,
@@ -76,16 +77,20 @@ pub(crate) struct SceneFrame<'a> {
     pub clip_plane: Option<[f32; 4]>,
 }
 
-/// Per-body upload cache entry: geometry fingerprint + the derived face-id
-/// shape, so an unchanged body is never re-interleaved/re-uploaded.
+/// Per-instance lowering cache entry. Geometry and placement are still baked
+/// into one upload slot here; milestone 4 replaces this with shared geometry
+/// buffers plus instance buffers without changing the evaluated-scene input.
 struct BodyCache {
-    node: String,
+    entity: String,
     fingerprint: u64,
+    placement_fingerprint: u64,
     /// Distinct faces in this body; the body owns merged ids `base..base+count`.
     face_count: u32,
     base: u32,
     /// MockMesh face id → dense local id (0..face_count).
     local: HashMap<u32, u32>,
+    local_min: [f32; 3],
+    local_max: [f32; 3],
     min: [f32; 3],
     max: [f32; 3],
 }
@@ -270,32 +275,47 @@ impl GpuViewport {
         // are re-interleaved and re-uploaded, so editing one body of a large
         // assembly no longer costs a whole-scene upload.
         if frame.epoch != self.uploaded_epoch {
-            let bodies = frame.body_meshes;
-            let mut new_cache: Vec<BodyCache> = Vec::with_capacity(bodies.len());
-            let mut rebuilt: Vec<Option<GpuMesh>> = Vec::with_capacity(bodies.len());
+            let scene = frame.scene;
+            let mut new_cache: Vec<BodyCache> = Vec::with_capacity(scene.instances().len());
+            let mut rebuilt: Vec<Option<GpuMesh>> = Vec::with_capacity(scene.instances().len());
             let mut next_base: u32 = 0;
-            for (slot, (node, mesh)) in bodies.iter().enumerate() {
+            for (slot, instance) in scene.instances().iter().enumerate() {
+                let entity = instance.entity_id();
+                let mesh = scene.mesh(instance);
+                let placement = instance.placement();
                 let fingerprint = mock_mesh_fingerprint(mesh);
+                let placement_fingerprint = placement.fingerprint();
                 let cached = self
                     .body_cache
                     .get(slot)
-                    .filter(|c| c.node == *node && c.fingerprint == fingerprint);
-                let (local, face_count, min, max) = match cached {
-                    Some(c) => (c.local.clone(), c.face_count, c.min, c.max),
+                    .filter(|cache| cache.entity == entity && cache.fingerprint == fingerprint);
+                let (local, face_count, local_min, local_max) = match cached {
+                    Some(cache) => (
+                        cache.local.clone(),
+                        cache.face_count,
+                        cache.local_min,
+                        cache.local_max,
+                    ),
                     None => body_shape(mesh),
                 };
+                let (min, max) = placement.transform_bounds(local_min, local_max);
                 let base = next_base;
                 next_base = next_base.saturating_add(face_count);
                 // Same geometry AND same id base ⇒ the uploaded buffers are
                 // still exact; keep them.
-                let keep = cached.is_some_and(|c| c.base == base);
-                rebuilt.push((!keep).then(|| body_to_gpu(mesh, base, &local)));
+                let keep = cached.is_some_and(|cache| {
+                    cache.base == base && cache.placement_fingerprint == placement_fingerprint
+                });
+                rebuilt.push((!keep).then(|| body_to_gpu(mesh, placement, base, &local)));
                 new_cache.push(BodyCache {
-                    node: node.clone(),
+                    entity: entity.to_string(),
                     fingerprint,
+                    placement_fingerprint,
                     face_count,
                     base,
                     local,
+                    local_min,
+                    local_max,
                     min,
                     max,
                 });
@@ -312,8 +332,10 @@ impl GpuViewport {
             for cache in &new_cache {
                 for (&mock_fid, &local_id) in &cache.local {
                     let merged = cache.base + local_id;
-                    self.face_map.insert((cache.node.clone(), mock_fid), merged);
-                    self.face_rev.insert(merged, (cache.node.clone(), mock_fid));
+                    self.face_map
+                        .insert((cache.entity.clone(), mock_fid), merged);
+                    self.face_rev
+                        .insert(merged, (cache.entity.clone(), mock_fid));
                 }
                 for k in 0..3 {
                     wmin[k] = wmin[k].min(cache.min[k]);
@@ -718,7 +740,12 @@ fn body_shape(mesh: &MockMesh) -> (HashMap<u32, u32>, u32, [f32; 3], [f32; 3]) {
 /// Unweld one body into a triangle-soup [`GpuMesh`] whose face ids are the
 /// body's dense local ids offset by `base` — the merged id space shared with
 /// the face-state texture and the pick buffer.
-fn body_to_gpu(mesh: &MockMesh, base: u32, local: &HashMap<u32, u32>) -> GpuMesh {
+fn body_to_gpu(
+    mesh: &MockMesh,
+    placement: ScenePlacement,
+    base: u32,
+    local: &HashMap<u32, u32>,
+) -> GpuMesh {
     let tri_count = mesh.indices.len() / 3;
     let mut positions = Vec::with_capacity(tri_count * 9);
     let mut normals = Vec::with_capacity(tri_count * 9);
@@ -730,8 +757,18 @@ fn body_to_gpu(mesh: &MockMesh, base: u32, local: &HashMap<u32, u32>) -> GpuMesh
             let vi = mesh.indices[t * 3 + k] as usize;
             let b = vi * 6;
             if b + 6 <= mesh.vertices.len() {
-                positions.extend_from_slice(&mesh.vertices[b..b + 3]);
-                normals.extend_from_slice(&mesh.vertices[b + 3..b + 6]);
+                let point = placement.transform_point([
+                    mesh.vertices[b],
+                    mesh.vertices[b + 1],
+                    mesh.vertices[b + 2],
+                ]);
+                let normal = placement.transform_vector([
+                    mesh.vertices[b + 3],
+                    mesh.vertices[b + 4],
+                    mesh.vertices[b + 5],
+                ]);
+                positions.extend_from_slice(&point);
+                normals.extend_from_slice(&normal);
             } else {
                 positions.extend_from_slice(&[0.0, 0.0, 0.0]);
                 normals.extend_from_slice(&[0.0, 0.0, 1.0]);
@@ -1004,14 +1041,21 @@ fn mock_meshes_to_layer_soup<'a>(meshes: impl Iterator<Item = &'a MockMesh>) -> 
 /// extractor is shared with the CPU section path and loop triangulation is
 /// shared through `geom2d`, leaving only projection/unprojection backend-local.
 fn section_cap_mesh<'a>(
-    meshes: impl Iterator<Item = &'a MockMesh>,
+    meshes: impl Iterator<Item = (&'a MockMesh, ScenePlacement)>,
     section: &SectionView,
 ) -> Option<GpuMesh> {
     let (origin, normal) = section.plane();
     let mut contours = Vec::new();
-    for mesh in meshes {
+    for (mesh, placement) in meshes {
+        let transformed;
+        let world_mesh = if placement.is_identity() {
+            mesh
+        } else {
+            transformed = placement.transform_mesh(mesh);
+            &transformed
+        };
         let clipped = zerocad_core::mock_kernel::clip_mesh_by_plane(
-            mesh,
+            world_mesh,
             origin,
             normal,
             section.keep_positive,
@@ -1247,8 +1291,22 @@ impl ZeroCadApp {
             ));
         }
         if let Some(section) = self.section_view.as_ref().filter(|section| section.capped) {
-            let source = plan.preview_bodies.as_ref().unwrap_or(&self.body_meshes);
-            if let Some(cap) = section_cap_mesh(source.iter().map(|(_, mesh)| mesh), section) {
+            let cap = if let Some(source) = plan.preview_bodies.as_ref() {
+                section_cap_mesh(
+                    source
+                        .iter()
+                        .map(|(_, mesh)| (mesh, ScenePlacement::IDENTITY)),
+                    section,
+                )
+            } else {
+                section_cap_mesh(
+                    self.evaluated_scene.instances().iter().map(|instance| {
+                        (self.evaluated_scene.mesh(instance), instance.placement())
+                    }),
+                    section,
+                )
+            };
+            if let Some(cap) = cap {
                 layers.push((
                     cap,
                     LayerStyle {
@@ -1331,8 +1389,8 @@ impl ZeroCadApp {
         let edge_px = 1.5 * ppp;
 
         let scene = SceneFrame {
-            body_meshes: &self.body_meshes,
-            epoch: self.mesh_epoch,
+            scene: &self.evaluated_scene,
+            epoch: self.evaluated_scene.epoch(),
             draw_bodies,
             layers: &layers,
             preview_faces: preview_map.as_ref().map(|(m, c)| (m, *c)),
@@ -1427,7 +1485,7 @@ mod tests {
             keep_positive: true,
             capped: true,
         };
-        let cap = section_cap_mesh(std::iter::once(&body), &section)
+        let cap = section_cap_mesh(std::iter::once((&body, ScenePlacement::IDENTITY)), &section)
             .expect("an oblique box section should produce a GPU cap");
         assert!(!cap.indices.is_empty());
         assert_eq!(cap.positions.len(), cap.normals.len());
@@ -1454,6 +1512,55 @@ mod tests {
             area += 0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
         }
         assert!(area > 1.0, "section cap must contain non-degenerate area");
+    }
+
+    #[test]
+    fn section_cap_uses_scene_placement_before_clipping() {
+        let body = MockMesh::make_box(2.0, 2.0, 2.0);
+        let placement = ScenePlacement::from_rotation_translation(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [10.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let section = SectionView {
+            origin: [11.0, 0.0, 0.0],
+            normal: [1.0, 0.0, 0.0],
+            offset: 0.0,
+            keep_positive: true,
+            capped: true,
+        };
+
+        let cap = section_cap_mesh(std::iter::once((&body, placement)), &section)
+            .expect("placed box must intersect its world-space section plane");
+        assert!(!cap.indices.is_empty());
+        assert!(cap
+            .positions
+            .chunks_exact(3)
+            .all(|point| (point[0] - 11.0).abs() < 1.0e-4));
+    }
+
+    #[test]
+    fn gpu_lowering_applies_scene_placement_to_positions_and_normals() {
+        let mut mesh = MockMesh::empty();
+        mesh.vertices = vec![
+            1.0, 2.0, 3.0, 1.0, 0.0, 0.0, //
+            2.0, 2.0, 3.0, 1.0, 0.0, 0.0, //
+            1.0, 3.0, 3.0, 1.0, 0.0, 0.0,
+        ];
+        mesh.indices = vec![0, 1, 2];
+        mesh.face_ids = vec![9];
+        let placement = ScenePlacement::from_rotation_translation(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [10.0, 20.0, 30.0],
+        )
+        .unwrap();
+        let (local, count, _, _) = body_shape(&mesh);
+        let gpu = body_to_gpu(&mesh, placement, 4, &local);
+
+        assert_eq!(count, 1);
+        assert_eq!(&gpu.positions[..3], &[8.0, 21.0, 33.0]);
+        assert_eq!(&gpu.normals[..3], &[0.0, 1.0, 0.0]);
+        assert_eq!(gpu.face_ids, vec![4]);
     }
 
     /// Reference reimplementation of `render.rs`'s `project_3d`, returning the

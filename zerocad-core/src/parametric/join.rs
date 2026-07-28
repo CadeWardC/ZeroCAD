@@ -269,16 +269,18 @@ fn join_failure_detail(
     bodies: &[LiveBody],
     tool: &JoinTool,
     boolean_target: Option<&str>,
-) -> &'static str {
+) -> String {
     let Some(reference) = tool.exact.as_ref().or(tool.smooth.as_ref()) else {
-        return "";
+        return String::new();
     };
     let Some(tool_bb) = crate::mock_kernel::solid_aabb(reference) else {
-        return "";
+        return String::new();
     };
     let mut aabb_contact = false;
-    let mut boundary_contact = false;
+    let mut edge_or_point_contact = false;
+    let mut face_area_contact = false;
     let mut volume_overlap = false;
+    let mut boolean_errors = Vec::new();
 
     for body in bodies {
         if boolean_target.is_some_and(|target| target != body.id) {
@@ -296,27 +298,241 @@ fn join_failure_detail(
                 part.clone(),
                 reference.clone(),
             ]);
+            if let Err(error) = crate::mock_kernel::union_diagnostic(part, reference) {
+                if !boolean_errors.contains(&error) {
+                    boolean_errors.push(error);
+                }
+            }
+            let mut classify_boundary_contact = || {
+                if solids_share_face_area(part, reference) {
+                    face_area_contact = true;
+                } else {
+                    edge_or_point_contact = true;
+                }
+            };
             match crate::mock_kernel::common_bodies_with_history(part, reference, None) {
                 Ok(common) if !common.bodies.is_empty() => volume_overlap = true,
-                Ok(_) if connected => boundary_contact = true,
-                Err(
-                    crate::mock_kernel::CommonBodiesError::Empty
-                    | crate::mock_kernel::CommonBodiesError::Failed(_),
-                ) if connected => boundary_contact = true,
+                Ok(_) if connected => classify_boundary_contact(),
+                Err(crate::mock_kernel::CommonBodiesError::Empty) if connected => {
+                    classify_boundary_contact()
+                }
+                // A failed Common is numerical evidence, not proof of
+                // non-manifold tangency. Preserve the kernel failure below.
+                Err(crate::mock_kernel::CommonBodiesError::Failed(_)) => {}
                 _ => {}
             }
         }
     }
 
-    if boundary_contact && !volume_overlap {
-        " The new material only touches the body along a boundary. Edge- or point-only \
-         tangency is non-manifold; make the profiles overlap slightly or draw the final \
-         outline as one profile."
+    let kernel_reports_non_manifold = boolean_errors
+        .iter()
+        .any(|error| error.contains("NonManifoldEdges"));
+    if (edge_or_point_contact || kernel_reports_non_manifold)
+        && !face_area_contact
+        && !volume_overlap
+    {
+        " The new material touches the body only along an edge or point, which is non-manifold; make the profiles overlap by area or draw one final outline.".to_string()
     } else if !aabb_contact {
-        " The new material does not touch or overlap the selected body."
+        " The new material does not touch or overlap the selected body.".to_string()
+    } else if let Some(error) = boolean_errors.first() {
+        format!(" The exact fuse reached the selected body but OpenRCAD rejected it ({error}).")
+    } else if face_area_contact && !volume_overlap {
+        " The solids meet across a face, but the kernel could not remove their shared interface."
+            .to_string()
     } else {
-        ""
+        String::new()
     }
+}
+
+fn triangle_point(mesh: &MockMesh, vertex: u32) -> [f64; 3] {
+    let base = vertex as usize * 6;
+    [
+        f64::from(mesh.vertices[base]),
+        f64::from(mesh.vertices[base + 1]),
+        f64::from(mesh.vertices[base + 2]),
+    ]
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot64(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn triangle_bounds(points: [[f64; 3]; 3]) -> ([f64; 3], [f64; 3]) {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for point in points {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(point[axis]);
+            max[axis] = max[axis].max(point[axis]);
+        }
+    }
+    (min, max)
+}
+
+fn project2(point: [f64; 3], dropped_axis: usize) -> [f64; 2] {
+    match dropped_axis {
+        0 => [point[1], point[2]],
+        1 => [point[0], point[2]],
+        _ => [point[0], point[1]],
+    }
+}
+
+fn cross2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    a[0] * b[1] - a[1] * b[0]
+}
+
+fn polygon_area2(points: &[[f64; 2]]) -> f64 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| cross2(*a, *b))
+        .sum::<f64>()
+        .abs()
+        * 0.5
+}
+
+fn clip_polygon_to_triangle(mut polygon: Vec<[f64; 2]>, triangle: [[f64; 2]; 3]) -> Vec<[f64; 2]> {
+    let orientation = cross2(
+        [
+            triangle[1][0] - triangle[0][0],
+            triangle[1][1] - triangle[0][1],
+        ],
+        [
+            triangle[2][0] - triangle[0][0],
+            triangle[2][1] - triangle[0][1],
+        ],
+    )
+    .signum();
+    if orientation == 0.0 {
+        return Vec::new();
+    }
+    for edge in 0..3 {
+        let start = triangle[edge];
+        let end = triangle[(edge + 1) % 3];
+        let direction = [end[0] - start[0], end[1] - start[1]];
+        let signed_distance = |point: [f64; 2]| {
+            orientation * cross2(direction, [point[0] - start[0], point[1] - start[1]])
+        };
+        let input = std::mem::take(&mut polygon);
+        if input.is_empty() {
+            break;
+        }
+        for (current, next) in input
+            .iter()
+            .copied()
+            .zip(input.iter().copied().cycle().skip(1))
+            .take(input.len())
+        {
+            let current_distance = signed_distance(current);
+            let next_distance = signed_distance(next);
+            let current_inside = current_distance >= -1.0e-10;
+            let next_inside = next_distance >= -1.0e-10;
+            if current_inside {
+                polygon.push(current);
+            }
+            if current_inside != next_inside {
+                let denominator = current_distance - next_distance;
+                if denominator.abs() > 1.0e-15 {
+                    let t = current_distance / denominator;
+                    polygon.push([
+                        current[0] + (next[0] - current[0]) * t,
+                        current[1] + (next[1] - current[1]) * t,
+                    ]);
+                }
+            }
+        }
+    }
+    polygon
+}
+
+/// Conservative proof that two solids share positive-area boundary material.
+/// This is diagnostic-only: tessellated triangles may prove face contact, but
+/// they never enter a modeling operation. If the proof fails, a successful
+/// empty Common is reported as edge/point tangency.
+fn solids_share_face_area(first: &KernelSolid, second: &KernelSolid) -> bool {
+    let first_mesh = MockMesh::from_solid(first);
+    let second_mesh = MockMesh::from_solid(second);
+    const PLANE_TOLERANCE: f64 = 1.0e-5;
+    const AREA_TOLERANCE: f64 = 1.0e-8;
+    for first_triangle in first_mesh.indices.chunks_exact(3) {
+        let a = triangle_point(&first_mesh, first_triangle[0]);
+        let b = triangle_point(&first_mesh, first_triangle[1]);
+        let c = triangle_point(&first_mesh, first_triangle[2]);
+        let first_normal = cross3(sub3(b, a), sub3(c, a));
+        let first_length = dot64(first_normal, first_normal).sqrt();
+        if first_length <= AREA_TOLERANCE {
+            continue;
+        }
+        let unit_normal = [
+            first_normal[0] / first_length,
+            first_normal[1] / first_length,
+            first_normal[2] / first_length,
+        ];
+        let dropped_axis = (0..3)
+            .max_by(|left, right| {
+                unit_normal[*left]
+                    .abs()
+                    .total_cmp(&unit_normal[*right].abs())
+            })
+            .unwrap_or(2);
+        let first_projected = [
+            project2(a, dropped_axis),
+            project2(b, dropped_axis),
+            project2(c, dropped_axis),
+        ];
+        let first_bounds = triangle_bounds([a, b, c]);
+        for second_triangle in second_mesh.indices.chunks_exact(3) {
+            let d = triangle_point(&second_mesh, second_triangle[0]);
+            let e = triangle_point(&second_mesh, second_triangle[1]);
+            let f = triangle_point(&second_mesh, second_triangle[2]);
+            let second_bounds = triangle_bounds([d, e, f]);
+            if (0..3).any(|axis| {
+                first_bounds.1[axis] < second_bounds.0[axis] - PLANE_TOLERANCE
+                    || second_bounds.1[axis] < first_bounds.0[axis] - PLANE_TOLERANCE
+            }) {
+                continue;
+            }
+            if [d, e, f]
+                .iter()
+                .any(|point| dot64(sub3(*point, a), unit_normal).abs() > PLANE_TOLERANCE)
+            {
+                continue;
+            }
+            let second_normal = cross3(sub3(e, d), sub3(f, d));
+            let second_length = dot64(second_normal, second_normal).sqrt();
+            if second_length <= AREA_TOLERANCE
+                || (dot64(first_normal, second_normal).abs() / (first_length * second_length))
+                    < 0.999
+            {
+                continue;
+            }
+            let overlap = clip_polygon_to_triangle(
+                vec![
+                    project2(d, dropped_axis),
+                    project2(e, dropped_axis),
+                    project2(f, dropped_axis),
+                ],
+                first_projected,
+            );
+            if polygon_area2(&overlap) > AREA_TOLERANCE {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Transactionally union one Join tool into a non-threaded body. All tool
