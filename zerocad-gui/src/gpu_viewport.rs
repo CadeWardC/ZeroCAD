@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use egui_wgpu::RenderState;
 use openrcad_render::{
-    mesh_bounds, FaceHighlight, GpuMesh, LayerStyle, OffscreenTarget, PickTarget, RenderCore,
-    SceneGlobals,
+    mesh_bounds, FaceHighlight, GpuMesh, LayerStyle, MeshInstance, OffscreenTarget, PickTarget,
+    RenderCore, SceneGlobals,
 };
 use zerocad_core::{EvaluatedScene, ScenePlacement};
 
@@ -77,20 +77,20 @@ pub(crate) struct SceneFrame<'a> {
     pub clip_plane: Option<[f32; 4]>,
 }
 
-/// Per-instance lowering cache entry. Geometry and placement are still baked
-/// into one upload slot here; milestone 4 replaces this with shared geometry
-/// buffers plus instance buffers without changing the evaluated-scene input.
-struct BodyCache {
-    entity: String,
+struct GeometryCache {
     fingerprint: u64,
-    placement_fingerprint: u64,
-    /// Distinct faces in this body; the body owns merged ids `base..base+count`.
     face_count: u32,
-    base: u32,
-    /// MockMesh face id → dense local id (0..face_count).
     local: HashMap<u32, u32>,
     local_min: [f32; 3],
     local_max: [f32; 3],
+}
+
+/// Per-occurrence identity and derived world bounds. The actual mesh is shared
+/// through `geometry_index`.
+struct BodyCache {
+    entity: String,
+    geometry_index: usize,
+    base: u32,
     min: [f32; 3],
     max: [f32; 3],
 }
@@ -104,8 +104,9 @@ pub(crate) struct GpuViewport {
     texture_id: Option<egui::TextureId>,
     /// The mesh epoch last uploaded to the GPU (`u64::MAX` = nothing uploaded).
     uploaded_epoch: u64,
-    /// Per-body upload cache — an epoch bump re-uploads only the bodies whose
-    /// fingerprint (or merged-id base) actually changed.
+    /// One upload fingerprint per unique evaluated geometry.
+    geometry_cache: Vec<GeometryCache>,
+    /// Per-occurrence face ranges and world bounds.
     body_cache: Vec<BodyCache>,
     /// Map from a selectable `(body node id, MockMesh face id)` to the merged
     /// GpuMesh face id, so selection/hover can be turned into highlight states.
@@ -154,6 +155,7 @@ impl Default for GpuViewport {
             target: None,
             texture_id: None,
             uploaded_epoch: u64::MAX,
+            geometry_cache: Vec::new(),
             body_cache: Vec::new(),
             face_map: HashMap::new(),
             face_rev: HashMap::new(),
@@ -201,6 +203,11 @@ impl GpuViewport {
     /// active). If false, the GPU viewport can't run and the CPU path is used.
     pub(crate) fn is_available(&self) -> bool {
         self.render_state.is_some()
+    }
+
+    /// Face resolved by the latest asynchronous hover sample.
+    pub(crate) fn hovered_face(&self) -> Option<(String, u32)> {
+        self.last_hover.clone()
     }
 
     /// Human-readable description of the adapter actually in use, e.g.
@@ -256,6 +263,7 @@ impl GpuViewport {
         {
             self.core = None;
             self.uploaded_epoch = u64::MAX;
+            self.geometry_cache.clear();
             self.body_cache.clear();
             self.layers_fp = 0;
         }
@@ -270,25 +278,19 @@ impl GpuViewport {
             self.core = Some(core);
         }
 
-        // (Re)upload the committed scene when the epoch changed — per body:
-        // only slots whose geometry fingerprint (or merged-face-id base) moved
-        // are re-interleaved and re-uploaded, so editing one body of a large
-        // assembly no longer costs a whole-scene upload.
+        // Unique geometries and occurrence records have independent GPU
+        // storage. Placement-only edits rebuild the compact instance buffer
+        // without touching vertex/index/edge uploads.
         if frame.epoch != self.uploaded_epoch {
             let scene = frame.scene;
-            let mut new_cache: Vec<BodyCache> = Vec::with_capacity(scene.instances().len());
-            let mut rebuilt: Vec<Option<GpuMesh>> = Vec::with_capacity(scene.instances().len());
-            let mut next_base: u32 = 0;
-            for (slot, instance) in scene.instances().iter().enumerate() {
-                let entity = instance.entity_id();
-                let mesh = scene.mesh(instance);
-                let placement = instance.placement();
+            let mut new_geometry_cache = Vec::with_capacity(scene.geometries().len());
+            let mut rebuilt = Vec::<Option<GpuMesh>>::with_capacity(scene.geometries().len());
+            for (geometry_index, (_, mesh)) in scene.geometries().iter().enumerate() {
                 let fingerprint = mock_mesh_fingerprint(mesh);
-                let placement_fingerprint = placement.fingerprint();
                 let cached = self
-                    .body_cache
-                    .get(slot)
-                    .filter(|cache| cache.entity == entity && cache.fingerprint == fingerprint);
+                    .geometry_cache
+                    .get(geometry_index)
+                    .filter(|cache| cache.fingerprint == fingerprint);
                 let (local, face_count, local_min, local_max) = match cached {
                     Some(cache) => (
                         cache.local.clone(),
@@ -298,39 +300,59 @@ impl GpuViewport {
                     ),
                     None => body_shape(mesh),
                 };
-                let (min, max) = placement.transform_bounds(local_min, local_max);
-                let base = next_base;
-                next_base = next_base.saturating_add(face_count);
-                // Same geometry AND same id base ⇒ the uploaded buffers are
-                // still exact; keep them.
-                let keep = cached.is_some_and(|cache| {
-                    cache.base == base && cache.placement_fingerprint == placement_fingerprint
-                });
-                rebuilt.push((!keep).then(|| body_to_gpu(mesh, placement, base, &local)));
-                new_cache.push(BodyCache {
-                    entity: entity.to_string(),
+                rebuilt.push(
+                    cached
+                        .is_none()
+                        .then(|| body_to_gpu(mesh, ScenePlacement::IDENTITY, 0, &local)),
+                );
+                new_geometry_cache.push(GeometryCache {
                     fingerprint,
-                    placement_fingerprint,
                     face_count,
-                    base,
                     local,
                     local_min,
                     local_max,
-                    min,
-                    max,
                 });
             }
             if let Some(core) = self.core.as_mut() {
-                let refs: Vec<Option<&GpuMesh>> = rebuilt.iter().map(|m| m.as_ref()).collect();
+                let refs: Vec<Option<&GpuMesh>> = rebuilt.iter().map(Option::as_ref).collect();
                 core.update_bodies(&device, &refs);
             }
-            // Merged face maps + world bounds from the (partly reused) cache.
+
+            let mut new_cache = Vec::<BodyCache>::with_capacity(scene.instances().len());
+            let mut gpu_instances = Vec::<MeshInstance>::with_capacity(scene.instances().len());
+            let mut next_base: u32 = 0;
+            for instance in scene.instances() {
+                let entity = instance.entity_id();
+                let placement = instance.placement();
+                let geometry_index = instance.geometry_index();
+                let geometry = &new_geometry_cache[geometry_index];
+                let (min, max) = placement.transform_bounds(geometry.local_min, geometry.local_max);
+                let base = next_base;
+                next_base = next_base.saturating_add(geometry.face_count);
+                new_cache.push(BodyCache {
+                    entity: entity.to_string(),
+                    geometry_index,
+                    base,
+                    min,
+                    max,
+                });
+                gpu_instances.push(MeshInstance {
+                    geometry_index,
+                    model: placement.to_column_major_matrix(),
+                    face_id_base: base,
+                });
+            }
+            if let Some(core) = self.core.as_mut() {
+                core.set_instances(&device, &gpu_instances);
+            }
+
             self.face_map.clear();
             self.face_rev.clear();
             let mut wmin = [f32::INFINITY; 3];
             let mut wmax = [f32::NEG_INFINITY; 3];
             for cache in &new_cache {
-                for (&mock_fid, &local_id) in &cache.local {
+                let geometry = &new_geometry_cache[cache.geometry_index];
+                for (&mock_fid, &local_id) in &geometry.local {
                     let merged = cache.base + local_id;
                     self.face_map
                         .insert((cache.entity.clone(), mock_fid), merged);
@@ -348,6 +370,7 @@ impl GpuViewport {
             self.face_count = next_base;
             self.world_min = wmin;
             self.world_max = wmax;
+            self.geometry_cache = new_geometry_cache;
             self.body_cache = new_cache;
             self.uploaded_epoch = frame.epoch;
         }
@@ -397,7 +420,7 @@ impl GpuViewport {
         };
         if state_count > 0 {
             let mut states = vec![FaceHighlight::None; state_count as usize];
-            if frame.draw_bodies {
+            if frame.draw_bodies && frame.hover_px.is_some() {
                 if let Some((node, fid)) = self.last_hover.as_ref() {
                     if let Some(&g) = state_map.get(&(node.clone(), *fid)) {
                         if let Some(s) = states.get_mut(g as usize) {
@@ -1369,7 +1392,12 @@ impl ZeroCadApp {
             && self.pending_visual.is_none()
             && !self.is_sketch_mode
             && !self.plane_pick_active()
-            && !self.orbiting;
+            && !self.orbiting
+            && self.hovered_sketch_element.is_none()
+            && !self
+                .hovered_body_element
+                .as_ref()
+                .is_some_and(|(_, pick)| matches!(pick, BodyPick::Edge(_) | BodyPick::Vertex(_)));
         let hover_px = if hover_allowed {
             ctx.pointer_latest_pos()
                 .filter(|p| rect.contains(*p))

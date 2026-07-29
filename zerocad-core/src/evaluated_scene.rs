@@ -8,7 +8,7 @@
 
 use crate::mock_kernel::EdgeCurveHint;
 use crate::MockMesh;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub type SharedSceneGeometries = std::sync::Arc<Vec<(String, MockMesh)>>;
@@ -105,6 +105,21 @@ impl ScenePlacement {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
+    }
+
+    /// Column-major local-to-world matrix for GPU instance records.
+    pub fn to_column_major_matrix(self) -> [[f32; 4]; 4] {
+        [
+            [self.linear[0][0], self.linear[1][0], self.linear[2][0], 0.0],
+            [self.linear[0][1], self.linear[1][1], self.linear[2][1], 0.0],
+            [self.linear[0][2], self.linear[1][2], self.linear[2][2], 0.0],
+            [
+                self.translation[0],
+                self.translation[1],
+                self.translation[2],
+                1.0,
+            ],
+        ]
     }
 
     /// Materialize a world-space mesh only for legacy algorithms that require
@@ -223,6 +238,7 @@ impl SceneInstance {
 pub struct EvaluatedScene {
     geometries: SharedSceneGeometries,
     instances: Vec<SceneInstance>,
+    entity_index: HashMap<String, usize>,
     world_bounds: Option<([f32; 3], [f32; 3])>,
     stats: SceneStats,
 }
@@ -277,9 +293,20 @@ impl EvaluatedScene {
             .collect();
         let world_bounds = scene_bounds(&geometries, &instances);
         let stats = scene_stats(&geometries, &instances);
+        let entity_index = instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| (instance.entity_id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            entity_index.len(),
+            instances.len(),
+            "part evaluator emitted duplicate body entity ids"
+        );
         Self {
             geometries,
             instances,
+            entity_index,
             world_bounds,
             stats,
         }
@@ -292,9 +319,15 @@ impl EvaluatedScene {
         validate_instances(&geometries, &instances)?;
         let world_bounds = scene_bounds(&geometries, &instances);
         let stats = scene_stats(&geometries, &instances);
+        let entity_index = instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| (instance.entity_id.clone(), index))
+            .collect();
         Ok(Self {
             geometries,
             instances,
+            entity_index,
             world_bounds,
             stats,
         })
@@ -309,10 +342,7 @@ impl EvaluatedScene {
     }
 
     pub fn find(&self, entity_id: &str) -> Option<(&SceneInstance, &MockMesh)> {
-        let instance = self
-            .instances
-            .iter()
-            .find(|instance| instance.entity_id == entity_id)?;
+        let instance = &self.instances[*self.entity_index.get(entity_id)?];
         Some((instance, self.mesh(instance)))
     }
 

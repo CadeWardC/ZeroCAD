@@ -171,6 +171,10 @@ impl ZeroCadApp {
                         self.hovered_plane = None;
                         self.hovered_datum_plane = None;
                         self.hovered_sketch_face = None;
+                        self.hovered_body_element = None;
+                        self.hovered_sketch_element = None;
+                        self.hovered_active_sketch_element = None;
+                        self.hovered_active_sketch_region = None;
                         let plane_pick_active =
                             self.is_plane_selection_mode || self.mirror_plane_pick_active();
                         if plane_pick_active {
@@ -340,10 +344,11 @@ impl ZeroCadApp {
 
                         // Zoom: Mouse scroll
                         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-                        if scroll_delta != 0.0 {
-                            self.camera_zoom =
-                                (self.camera_zoom * (scroll_delta * 0.002).exp()).clamp(1.0, 50.0);
-                        }
+                        self.camera_zoom = viewport_zoom_after_scroll(
+                            self.camera_zoom,
+                            scroll_delta,
+                            response.hovered(),
+                        );
 
                         // Standalone 3D Mirror plane/face selection. This shares
                         // the sketch plane sheets and planar-face hit testing but
@@ -697,6 +702,40 @@ impl ZeroCadApp {
                                     egui::pos2(center_x + rx * view_scale, center_y - ry * view_scale)
                                 }
                             };
+                            if !self.orbiting && self.sketch_drag_point.is_none() {
+                                if let Some(pos) = hover_pos {
+                                    self.hovered_active_sketch_element = self
+                                        .sketch_solver_model
+                                        .as_ref()
+                                        .and_then(|model| {
+                                            pick_solver_element(
+                                                model,
+                                                pos,
+                                                &to_screen,
+                                                POINT_GRAB_PX,
+                                            )
+                                        });
+                                    if self.hovered_active_sketch_element.is_none() {
+                                        let local = self.screen_to_sketch(
+                                            pos,
+                                            rect,
+                                            &self.active_sketch_cs,
+                                        );
+                                        self.hovered_active_sketch_region = self
+                                            .detected_regions
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, region)| region.contains(local))
+                                            .min_by(|(_, first), (_, second)| {
+                                                first
+                                                    .area
+                                                    .partial_cmp(&second.area)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            })
+                                            .map(|(index, _)| index);
+                                    }
+                                }
+                            }
                             if response.drag_started_by(egui::PointerButton::Primary) {
                                 if let Some(pos) = response.interact_pointer_pos() {
                                     self.sketch_drag_point = self
@@ -868,6 +907,50 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Ordinary Model-mode preselection. The same sketch
+                        // picker and body priority used by a click drive this
+                        // subtle hover, so the preview never advertises a
+                        // different target than the next click will select.
+                        let preselection_allowed = !self.is_sketch_mode
+                            && !plane_pick_active
+                            && self.extrude_op.is_none()
+                            && self.edge_mod_op.is_none()
+                            && self.move_op.is_none()
+                            && self.combine_op.is_none()
+                            && self.split_body_op.is_none()
+                            && self.scale_body_op.is_none()
+                            && !self.camera_anim_active
+                            && !self.orbiting;
+                        if preselection_allowed {
+                            if let Some(position) = hover_pos {
+                                self.hovered_sketch_element =
+                                    self.pick_finished_sketch_element(position, &project_3d);
+                                if self.hovered_sketch_element.is_none() {
+                                    let gpu_composited =
+                                        self.gpu_render && self.gpu_texture_id.is_some();
+                                    let detail_hit = self.pick_body_element(
+                                        position,
+                                        &project_3d,
+                                        sin_p,
+                                        cos_p,
+                                        sin_y,
+                                        cos_y,
+                                        if gpu_composited {
+                                            crate::gpu_viewport::GpuFacePick::Hit(None)
+                                        } else {
+                                            crate::gpu_viewport::GpuFacePick::Unavailable
+                                        },
+                                    );
+                                    self.hovered_body_element = detail_hit.or_else(|| {
+                                        gpu_composited
+                                            .then(|| self.gpu.hovered_face())
+                                            .flatten()
+                                            .map(|(node, face)| (node, BodyPick::Face(face)))
+                                    });
+                                }
+                            }
+                        }
+
                         // 3D selection: click picks a body face/edge/vertex (or a finished
                         // sketch's face/edge); double-click selects the whole body/sketch.
                         // Works in normal 3D view, and while sketching when no drawing
@@ -1000,7 +1083,29 @@ impl ZeroCadApp {
                                                 best_edge = Some((node.id.clone(), seg_count + j, mind));
                                             }
                                         }
-                                        let spline_offset = seg_count + curves.circles.len();
+                                        let arc_offset = seg_count + curves.circles.len();
+                                        for (j, arc) in curves.arcs.iter().enumerate() {
+                                            let mind = crate::geom2d::sample_arc_points(arc, 48)
+                                                .windows(2)
+                                                .map(|pair| {
+                                                    dist_point_to_segment(
+                                                        click_pos,
+                                                        to_scr(pair[0].0, pair[0].1),
+                                                        to_scr(pair[1].0, pair[1].1),
+                                                    )
+                                                })
+                                                .fold(f32::INFINITY, f32::min);
+                                            if mind < EDGE_TOL_PX
+                                                && best_edge.as_ref().map_or(true, |b| mind < b.2)
+                                            {
+                                                best_edge = Some((
+                                                    node.id.clone(),
+                                                    arc_offset + j,
+                                                    mind,
+                                                ));
+                                            }
+                                        }
+                                        let spline_offset = arc_offset + curves.arcs.len();
                                         for (j, spline) in curves.splines.iter().enumerate() {
                                             let mind = spline
                                                 .sampled_points(0.01)
@@ -1792,12 +1897,23 @@ fn draw_view_cube_face_label(
 /// Apply the same unrestricted tumble to viewport and cube drags. Pitch is
 /// wrapped instead of clamped, so dragging FRONT upward can continue naturally
 /// over TOP and around to BACK.
-fn orbit_camera_angles(pitch: f32, yaw: f32, pointer_delta: egui::Vec2) -> (f32, f32) {
+pub(crate) fn orbit_camera_angles(pitch: f32, yaw: f32, pointer_delta: egui::Vec2) -> (f32, f32) {
     const SPEED: f32 = 0.008;
     (
         wrap_view_angle(pitch + pointer_delta.y * SPEED),
         wrap_view_angle(yaw - pointer_delta.x * SPEED),
     )
+}
+
+pub(crate) fn viewport_zoom_after_scroll(
+    current_zoom: f32,
+    scroll_delta: f32,
+    viewport_hovered: bool,
+) -> f32 {
+    if !viewport_hovered || scroll_delta == 0.0 {
+        return current_zoom;
+    }
+    (current_zoom * (scroll_delta * 0.002).exp()).clamp(1.0, 50.0)
 }
 
 fn wrap_view_angle(angle: f32) -> f32 {
@@ -1876,13 +1992,40 @@ pub(crate) fn pick_solver_element(
                 SketchEntity::Line { p0, p1, .. } => {
                     seg_dist(to_screen(point_pos(*p0)?), to_screen(point_pos(*p1)?))
                 }
-                SketchEntity::Circle { center, radius, .. }
-                | SketchEntity::Arc { center, radius, .. } => {
+                SketchEntity::Circle { center, radius, .. } => {
                     let c2 = point_pos(*center)?;
                     let c = to_screen(c2);
                     // Screen-space radius from a second projected sample.
                     let rim = to_screen((c2.0 + *radius, c2.1));
                     (c.distance(pos) - c.distance(rim)).abs()
+                }
+                SketchEntity::Arc {
+                    center,
+                    start,
+                    end,
+                    radius,
+                    clockwise,
+                    ..
+                } => {
+                    let center = point_pos(*center)?;
+                    let start = point_pos(*start)?;
+                    let end = point_pos(*end)?;
+                    let arc = zerocad_core::sketch::Arc {
+                        center: (center.0 as f32, center.1 as f32),
+                        radius: *radius as f32,
+                        start: (start.0 as f32, start.1 as f32),
+                        end: (end.0 as f32, end.1 as f32),
+                        clockwise: *clockwise,
+                    };
+                    crate::geom2d::sample_arc_points(&arc, 48)
+                        .windows(2)
+                        .map(|pair| {
+                            seg_dist(
+                                to_screen((pair[0].0 as f64, pair[0].1 as f64)),
+                                to_screen((pair[1].0 as f64, pair[1].1 as f64)),
+                            )
+                        })
+                        .fold(f32::INFINITY, f32::min)
                 }
                 SketchEntity::Ellipse {
                     center,
@@ -1962,10 +2105,11 @@ pub(crate) fn pick_solver_element(
 #[cfg(test)]
 mod dimension_anchor_tests {
     use super::{
-        offset_dimension_box, orbit_camera_angles, point_in_convex_polygon,
-        project_view_cube_vertex,
+        offset_dimension_box, orbit_camera_angles, pick_solver_element, point_in_convex_polygon,
+        project_view_cube_vertex, viewport_zoom_after_scroll,
     };
     use eframe::egui;
+    use zerocad_core::sketch::{EntityId, SketchEntity, SketchPoint, SketchSolverModel};
 
     #[test]
     fn dimension_anchor_stays_close_to_its_edge_midpoint() {
@@ -1979,6 +2123,53 @@ mod dimension_anchor_tests {
         let anchored = offset_dimension_box(right_mid, center);
         // The wider horizontal footprint is also kept fully off the edge.
         assert_eq!(anchored, egui::pos2(198.0, 100.0));
+    }
+
+    #[test]
+    fn scroll_only_zooms_while_the_viewport_is_hovered() {
+        let zoom = 7.5;
+        assert_eq!(viewport_zoom_after_scroll(zoom, 120.0, false), zoom);
+        assert!(viewport_zoom_after_scroll(zoom, 120.0, true) > zoom);
+    }
+
+    #[test]
+    fn solver_arc_pick_uses_the_arc_span_instead_of_its_full_circle() {
+        let model = SketchSolverModel {
+            points: vec![
+                SketchPoint {
+                    id: EntityId(1),
+                    pos: (0.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(2),
+                    pos: (10.0, 0.0),
+                },
+                SketchPoint {
+                    id: EntityId(3),
+                    pos: (0.0, 10.0),
+                },
+            ],
+            entities: vec![SketchEntity::Arc {
+                id: EntityId(4),
+                center: EntityId(1),
+                start: EntityId(2),
+                end: EntityId(3),
+                radius: 10.0,
+                clockwise: false,
+                derived_from: None,
+            }],
+            ..Default::default()
+        };
+        let to_screen = |point: (f64, f64)| egui::pos2(point.0 as f32, point.1 as f32);
+
+        assert_eq!(
+            pick_solver_element(&model, egui::pos2(7.1, 7.1), &to_screen, 1.5),
+            Some(EntityId(4))
+        );
+        assert_eq!(
+            pick_solver_element(&model, egui::pos2(-10.0, 0.0), &to_screen, 1.5),
+            None
+        );
     }
 
     #[test]

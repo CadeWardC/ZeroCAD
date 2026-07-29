@@ -16,6 +16,7 @@ ciborium.workspace = true
 zstd.workspace = true
 blake3.workspace = true
 sha2.workspace = true
+nalgebra.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"

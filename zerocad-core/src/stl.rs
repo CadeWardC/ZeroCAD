@@ -10,10 +10,24 @@
 //! document remains the `.zcad` JSON; STL is for downstream consumption
 //! (3D printing, rendering, mesh inspection).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::mock_kernel::{MeshEdgeRef, MeshFaceRef};
-use crate::MockMesh;
+use crate::{AssemblyDocument, MockMesh, ModelHash, RigidPlacement};
+
+/// ZeroCAD models in a right-handed Y-up world, while its manufacturing-mesh
+/// interchange convention is right-handed Z-up to match common slicers and CAD
+/// tools. These two quarter-turns stay at the file boundary so modeling,
+/// picking, and saved parametric coordinates remain unchanged.
+fn z_up_to_y_up(point: [f32; 3]) -> [f32; 3] {
+    [point[0], point[2], -point[1]]
+}
+
+fn y_up_to_z_up(point: [f32; 3]) -> [f32; 3] {
+    [point[0], -point[2], point[1]]
+}
 
 /// Validation facts retained for every imported STL mesh body. Geometry can be
 /// displayed even when it is open, but callers can distinguish printable
@@ -107,9 +121,10 @@ impl std::fmt::Display for StlImportError {
 
 impl std::error::Error for StlImportError {}
 
-/// Parse an ASCII or binary STL into a mesh body plus deterministic topology
-/// diagnostics. Degenerate facets are discarded and reported; non-finite or
-/// structurally malformed data is rejected.
+/// Parse an ASCII or binary Z-up STL into ZeroCAD's Y-up world, returning a mesh
+/// body plus deterministic topology diagnostics. Degenerate facets are
+/// discarded and reported; non-finite or structurally malformed data is
+/// rejected.
 pub fn read_stl_mesh(data: &[u8]) -> Result<ValidatedMeshBody, StlImportError> {
     if data.is_empty() {
         return Err(StlImportError::Empty);
@@ -119,6 +134,10 @@ pub fn read_stl_mesh(data: &[u8]) -> Result<ValidatedMeshBody, StlImportError> {
     } else {
         parse_ascii_stl(data)?
     };
+    let triangles = triangles
+        .into_iter()
+        .map(|triangle| triangle.map(z_up_to_y_up))
+        .collect();
     let (mesh, validation) = build_import_mesh(triangles)?;
     Ok(ValidatedMeshBody { mesh, validation })
 }
@@ -411,17 +430,19 @@ fn gather_triangles<'a>(meshes: impl IntoIterator<Item = &'a MockMesh>) -> Vec<[
     tris
 }
 
-/// Serialize one or more meshes into a single binary STL blob. The meshes are
-/// merged into one triangle soup (STL has no concept of separate bodies).
+/// Serialize one or more Y-up ZeroCAD meshes into one Z-up binary STL blob. The
+/// meshes are merged into one triangle soup (STL has no concept of separate
+/// bodies or an up-axis declaration).
 pub fn meshes_to_binary_stl<'a>(meshes: impl IntoIterator<Item = &'a MockMesh>) -> Vec<u8> {
     let tris = gather_triangles(meshes);
     // 80-byte header + 4-byte count + 50 bytes per triangle.
     let mut out = Vec::with_capacity(84 + tris.len() * 50);
     out.extend_from_slice(&[0u8; 80]);
     out.extend_from_slice(&(tris.len() as u32).to_le_bytes());
-    for [a, b, c] in &tris {
-        let n = facet_normal(*a, *b, *c);
-        for comp in n.iter().chain(a).chain(b).chain(c) {
+    for triangle in tris {
+        let [a, b, c] = triangle.map(y_up_to_z_up);
+        let n = facet_normal(a, b, c);
+        for comp in n.iter().chain(&a).chain(&b).chain(&c) {
             out.extend_from_slice(&comp.to_le_bytes());
         }
         // "Attribute byte count" — unused, always zero.
@@ -438,42 +459,16 @@ pub fn write_binary_stl<'a, W: Write>(
     w.write_all(&meshes_to_binary_stl(meshes))
 }
 
-/// Build a 3MF package from named meshes — one 3MF `<object>` per mesh, so
-/// multi-body designs stay separate parts in the slicer (unlike STL's single
-/// merged soup). Vertices are welded by quantized position, as 3MF indexes a
-/// shared vertex table.
+/// Build a Z-up 3MF package from named Y-up ZeroCAD meshes — one 3MF `<object>`
+/// per mesh, so multi-body designs stay separate parts in the slicer (unlike
+/// STL's single merged soup). Vertices are welded by quantized position, as 3MF
+/// indexes a shared vertex table.
 pub fn meshes_to_3mf<'a>(meshes: impl IntoIterator<Item = (&'a str, &'a MockMesh)>) -> Vec<u8> {
-    use openrcad::foundation::Pnt;
     use openrcad::mesh::TriangleMesh;
 
-    let quant = |v: f32| (v as f64 * 1.0e5).round() as i64;
     let mut owned: Vec<(String, TriangleMesh)> = Vec::new();
     for (name, mesh) in meshes {
-        let mut tri = TriangleMesh::new();
-        let mut index_of: std::collections::HashMap<(i64, i64, i64), u32> =
-            std::collections::HashMap::new();
-        let mut remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len() / 6);
-        for v in mesh.vertices.chunks(6) {
-            let key = (quant(v[0]), quant(v[1]), quant(v[2]));
-            let id = *index_of.entry(key).or_insert_with(|| {
-                tri.vertices
-                    .push(Pnt::new(v[0] as f64, v[1] as f64, v[2] as f64));
-                (tri.vertices.len() - 1) as u32
-            });
-            remap.push(id);
-        }
-        for t in mesh.indices.chunks(3) {
-            let (Some(&a), Some(&b), Some(&c)) = (t.first(), t.get(1), t.get(2)) else {
-                continue;
-            };
-            let map = |i: u32| remap.get(i as usize).copied();
-            if let (Some(a), Some(b), Some(c)) = (map(a), map(b), map(c)) {
-                // A weld can collapse a sliver triangle to a degenerate one.
-                if a != b && b != c && a != c {
-                    tri.triangles.push([a, b, c]);
-                }
-            }
-        }
+        let tri = mock_mesh_to_3mf(mesh);
         if !tri.triangles.is_empty() {
             owned.push((name.to_string(), tri));
         }
@@ -482,9 +477,252 @@ pub fn meshes_to_3mf<'a>(meshes: impl IntoIterator<Item = (&'a str, &'a MockMesh
     openrcad::exchange::to_3mf_bytes(&refs)
 }
 
+fn mock_mesh_to_3mf(mesh: &MockMesh) -> openrcad::mesh::TriangleMesh {
+    use openrcad::foundation::Pnt;
+    use openrcad::mesh::TriangleMesh;
+
+    let quant = |value: f32| (value as f64 * 1.0e5).round() as i64;
+    let mut triangle_mesh = TriangleMesh::new();
+    let mut index_of = std::collections::HashMap::<(i64, i64, i64), u32>::new();
+    let mut remap = Vec::with_capacity(mesh.vertices.len() / 6);
+    for vertex in mesh.vertices.chunks_exact(6) {
+        let point = y_up_to_z_up([vertex[0], vertex[1], vertex[2]]);
+        let key = (quant(point[0]), quant(point[1]), quant(point[2]));
+        let id = *index_of.entry(key).or_insert_with(|| {
+            triangle_mesh.vertices.push(Pnt::new(
+                point[0] as f64,
+                point[1] as f64,
+                point[2] as f64,
+            ));
+            (triangle_mesh.vertices.len() - 1) as u32
+        });
+        remap.push(id);
+    }
+    for triangle in mesh.indices.chunks_exact(3) {
+        let map = |index: u32| remap.get(index as usize).copied();
+        if let (Some(a), Some(b), Some(c)) = (map(triangle[0]), map(triangle[1]), map(triangle[2]))
+        {
+            if a != b && b != c && a != c {
+                triangle_mesh.triangles.push([a, b, c]);
+            }
+        }
+    }
+    triangle_mesh
+}
+
+#[derive(Debug)]
+pub enum AssemblyMeshExportError {
+    MissingVisibleGeometry { occurrence_id: u64, name: String },
+    NoVisibleGeometry,
+    ThreeMf(io::Error),
+}
+
+impl std::fmt::Display for AssemblyMeshExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingVisibleGeometry {
+                occurrence_id,
+                name,
+            } => write!(
+                formatter,
+                "visible component {occurrence_id} (`{name}`) has no evaluated display geometry"
+            ),
+            Self::NoVisibleGeometry => formatter.write_str("assembly has no visible geometry"),
+            Self::ThreeMf(error) => write!(formatter, "3MF export failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AssemblyMeshExportError {}
+
+/// Flatten visible, resolved assembly geometry into an STL triangle soup.
+///
+/// Hidden unresolved occurrences are omitted. Any visible occurrence whose
+/// definition failed to evaluate rejects export rather than silently producing
+/// an incomplete manufacturing file.
+pub fn assembly_to_binary_stl(
+    assembly: &AssemblyDocument,
+    geometry: &BTreeMap<ModelHash, Arc<Vec<(String, MockMesh)>>>,
+) -> Result<Vec<u8>, AssemblyMeshExportError> {
+    let mut transformed = Vec::new();
+    for occurrence in assembly.occurrences.values() {
+        if assembly
+            .presentation
+            .hidden_occurrences
+            .contains(&occurrence.id)
+        {
+            continue;
+        }
+        let bodies = geometry
+            .get(&occurrence.definition_model_hash)
+            .ok_or_else(|| AssemblyMeshExportError::MissingVisibleGeometry {
+                occurrence_id: occurrence.id,
+                name: occurrence.name.clone(),
+            })?;
+        if bodies.is_empty() {
+            return Err(AssemblyMeshExportError::MissingVisibleGeometry {
+                occurrence_id: occurrence.id,
+                name: occurrence.name.clone(),
+            });
+        }
+        let placement = occurrence.resolved_placement().to_scene_placement();
+        for (body_id, mesh) in bodies.iter() {
+            if !assembly
+                .presentation
+                .hidden_bodies
+                .contains(&(occurrence.id, body_id.clone()))
+            {
+                transformed.push(placement.transform_mesh(mesh));
+            }
+        }
+    }
+    if transformed.is_empty() {
+        return Err(AssemblyMeshExportError::NoVisibleGeometry);
+    }
+    Ok(meshes_to_binary_stl(transformed.iter()))
+}
+
+/// Export a deduplicated 3MF assembly with one mesh resource per used
+/// definition body and transformed build items for visible occurrences.
+pub fn assembly_to_3mf(
+    assembly: &AssemblyDocument,
+    geometry: &BTreeMap<ModelHash, Arc<Vec<(String, MockMesh)>>>,
+) -> Result<Vec<u8>, AssemblyMeshExportError> {
+    use openrcad::exchange::{ThreeMfBuildItem, ThreeMfDefinition};
+    use openrcad::mesh::TriangleMesh;
+
+    let mut used_bodies = BTreeSet::<(ModelHash, String)>::new();
+    let mut occurrence_bodies = Vec::<(u64, ModelHash, Vec<String>, RigidPlacement)>::new();
+    for occurrence in assembly.occurrences.values() {
+        if assembly
+            .presentation
+            .hidden_occurrences
+            .contains(&occurrence.id)
+        {
+            continue;
+        }
+        let bodies = geometry
+            .get(&occurrence.definition_model_hash)
+            .ok_or_else(|| AssemblyMeshExportError::MissingVisibleGeometry {
+                occurrence_id: occurrence.id,
+                name: occurrence.name.clone(),
+            })?;
+        if bodies.is_empty() {
+            return Err(AssemblyMeshExportError::MissingVisibleGeometry {
+                occurrence_id: occurrence.id,
+                name: occurrence.name.clone(),
+            });
+        }
+        let visible: Vec<String> = bodies
+            .iter()
+            .filter(|(body_id, _)| {
+                !assembly
+                    .presentation
+                    .hidden_bodies
+                    .contains(&(occurrence.id, body_id.clone()))
+            })
+            .map(|(body_id, _)| body_id.clone())
+            .collect();
+        for body_id in &visible {
+            used_bodies.insert((occurrence.definition_model_hash, body_id.clone()));
+        }
+        if !visible.is_empty() {
+            occurrence_bodies.push((
+                occurrence.id,
+                occurrence.definition_model_hash,
+                visible,
+                occurrence.resolved_placement(),
+            ));
+        }
+    }
+    if occurrence_bodies.is_empty() {
+        return Err(AssemblyMeshExportError::NoVisibleGeometry);
+    }
+
+    let mut mesh_objects = Vec::<(String, TriangleMesh)>::new();
+    let mut mesh_index = BTreeMap::<(ModelHash, String), usize>::new();
+    for (model_hash, body_id) in &used_bodies {
+        let bodies = geometry
+            .get(model_hash)
+            .expect("used bodies were collected from evaluated definitions");
+        let mesh = &bodies
+            .iter()
+            .find(|(candidate, _)| candidate == body_id)
+            .expect("used body id came from this definition")
+            .1;
+        let definition_name = &assembly.definitions[model_hash].name;
+        let index = mesh_objects.len();
+        mesh_objects.push((
+            format!("{definition_name}/{body_id}"),
+            mock_mesh_to_3mf(mesh),
+        ));
+        mesh_index.insert((*model_hash, body_id.clone()), index);
+    }
+
+    let mut definitions = Vec::<ThreeMfDefinition>::new();
+    let mut definition_variants = BTreeMap::<(ModelHash, Vec<String>), usize>::new();
+    let mut build_items = Vec::<ThreeMfBuildItem>::new();
+    for (_, model_hash, body_ids, placement) in occurrence_bodies {
+        let key = (model_hash, body_ids.clone());
+        let definition_index = *definition_variants.entry(key).or_insert_with(|| {
+            let index = definitions.len();
+            definitions.push(ThreeMfDefinition {
+                name: assembly.definitions[&model_hash].name.clone(),
+                body_object_indices: body_ids
+                    .iter()
+                    .map(|body_id| mesh_index[&(model_hash, body_id.clone())])
+                    .collect(),
+            });
+            index
+        });
+        build_items.push(ThreeMfBuildItem {
+            definition_index,
+            transform: placement_to_3mf_transform(placement),
+        });
+    }
+    let refs: Vec<(String, &TriangleMesh)> = mesh_objects
+        .iter()
+        .map(|(name, mesh)| (name.clone(), mesh))
+        .collect();
+    openrcad::exchange::to_3mf_assembly_bytes(&refs, &definitions, &build_items)
+        .map_err(AssemblyMeshExportError::ThreeMf)
+}
+
+fn placement_to_3mf_transform(placement: RigidPlacement) -> [f64; 12] {
+    let scene = placement.to_scene_placement();
+    let transform_basis =
+        |basis_z_up: [f32; 3]| y_up_to_z_up(scene.transform_vector(z_up_to_y_up(basis_z_up)));
+    let x = transform_basis([1.0, 0.0, 0.0]);
+    let y = transform_basis([0.0, 1.0, 0.0]);
+    let z = transform_basis([0.0, 0.0, 1.0]);
+    let [tx, ty, tz] = placement.translation();
+    let translation = [tx, -tz, ty];
+    [
+        x[0] as f64,
+        x[1] as f64,
+        x[2] as f64,
+        y[0] as f64,
+        y[1] as f64,
+        y[2] as f64,
+        z[0] as f64,
+        z[1] as f64,
+        z[2] as f64,
+        translation[0],
+        translation[1],
+        translation[2],
+    ]
+    .map(|value| if value == 0.0 { 0.0 } else { value })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        insert_part_snapshot, Document, FeatureNode, FeatureType, HydrationBundle, LoadOptions,
+        ProjectDocument, SaveOptions,
+    };
+
+    type AssemblyGeometry = BTreeMap<ModelHash, Arc<Vec<(String, MockMesh)>>>;
 
     /// A two-triangle quad mesh (only positions matter for STL).
     fn quad() -> MockMesh {
@@ -498,6 +736,58 @@ mod tests {
         ];
         m.indices = vec![0, 1, 2, 0, 2, 3];
         m
+    }
+
+    fn axis_triangle() -> MockMesh {
+        let mut mesh = MockMesh::empty();
+        mesh.vertices = vec![
+            1.0, 2.0, 3.0, 0.0, 0.0, 1.0, // v0
+            2.0, 2.0, 3.0, 0.0, 0.0, 1.0, // v1
+            1.0, 3.0, 3.0, 0.0, 0.0, 1.0, // v2
+        ];
+        mesh.indices = vec![0, 1, 2];
+        mesh
+    }
+
+    fn repeated_box_assembly() -> (AssemblyDocument, AssemblyGeometry) {
+        let mut part = Document::new();
+        part.evaluator_graph_mut().add_feature(FeatureNode {
+            id: "box".into(),
+            name: "Box".into(),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 20.0,
+                d: 30.0,
+            },
+        });
+        let snapshot = crate::write_project_document_to_vec(
+            &ProjectDocument::Part(part),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        let mut assembly = AssemblyDocument::new();
+        let first = insert_part_snapshot(
+            &mut assembly,
+            &snapshot,
+            Some("Bracket.zcad"),
+            RigidPlacement::IDENTITY,
+            false,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        insert_part_snapshot(
+            &mut assembly,
+            &snapshot,
+            Some("Bracket.zcad"),
+            RigidPlacement::new([10.0, 20.0, 30.0], [1.0, 0.0, 0.0, 0.0]).unwrap(),
+            false,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let mut geometry = BTreeMap::new();
+        geometry.insert(first.definition_model_hash, first.display_bodies);
+        (assembly, geometry)
     }
 
     #[test]
@@ -516,6 +806,75 @@ mod tests {
         let count = u32::from_le_bytes([stl[80], stl[81], stl[82], stl[83]]);
         assert_eq!(count, 4);
         assert_eq!(stl.len(), 84 + 4 * 50);
+    }
+
+    #[test]
+    fn interchange_rotation_maps_internal_y_up_to_external_z_up() {
+        assert_eq!(y_up_to_z_up([1.0, 2.0, 3.0]), [1.0, -3.0, 2.0]);
+        assert_eq!(z_up_to_y_up(y_up_to_z_up([1.0, 2.0, 3.0])), [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn binary_stl_export_writes_z_up_coordinates() {
+        let bytes = meshes_to_binary_stl(std::iter::once(&axis_triangle()));
+        let coordinate = |offset: usize| {
+            f32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .expect("STL coordinate"),
+            )
+        };
+        // Facet 0 starts at byte 84: 12 bytes of normal, then vertex 0.
+        let first_vertex = [coordinate(96), coordinate(100), coordinate(104)];
+        assert_eq!(first_vertex, [1.0, -3.0, 2.0]);
+    }
+
+    #[test]
+    fn ascii_stl_import_maps_external_z_up_to_internal_y_up() {
+        let ascii = b"solid axis\nfacet normal 0 -1 0\nouter loop\nvertex 1 2 3\nvertex 2 2 3\nvertex 1 2 4\nendloop\nendfacet\nendsolid axis\n";
+        let imported = read_stl_mesh(ascii).expect("valid axis fixture");
+        assert_eq!(&imported.mesh.vertices[0..3], &[1.0, 3.0, -2.0]);
+    }
+
+    #[test]
+    fn three_mf_export_writes_z_up_coordinates() {
+        let mesh = axis_triangle();
+        let bytes = meshes_to_3mf(std::iter::once(("axis", &mesh)));
+        let expected = br#"<vertex x="1" y="-3" z="2"/>"#;
+        assert!(
+            bytes
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "stored 3MF model XML should contain the converted vertex"
+        );
+    }
+
+    #[test]
+    fn assembly_3mf_reuses_geometry_and_places_two_build_items() {
+        let (assembly, geometry) = repeated_box_assembly();
+        let bytes = assembly_to_3mf(&assembly, &geometry).unwrap();
+        let xml = String::from_utf8_lossy(&bytes);
+        assert_eq!(xml.matches("<mesh>").count(), 1);
+        assert_eq!(xml.matches("<item objectid=").count(), 2);
+        assert!(xml.contains("1 0 0 0 1 0 0 0 1 10 -30 20"));
+    }
+
+    #[test]
+    fn assembly_export_refuses_visible_unresolved_geometry() {
+        let (mut assembly, _) = repeated_box_assembly();
+        let empty = BTreeMap::new();
+        assert!(matches!(
+            assembly_to_binary_stl(&assembly, &empty),
+            Err(AssemblyMeshExportError::MissingVisibleGeometry {
+                occurrence_id: 1,
+                ..
+            })
+        ));
+        assembly.presentation.hidden_occurrences.extend([1, 2]);
+        assert!(matches!(
+            assembly_to_binary_stl(&assembly, &empty),
+            Err(AssemblyMeshExportError::NoVisibleGeometry)
+        ));
     }
 
     #[test]
@@ -560,6 +919,8 @@ mod tests {
         assert_eq!(report.accepted_triangles, 2);
         assert_eq!(restored.indices.len(), source.indices.len());
         assert_eq!(report.boundary_edges, 4);
+        assert_eq!(&restored.vertices[0..3], &source.vertices[0..3]);
+        assert_eq!(&restored.vertices[12..15], &source.vertices[12..15]);
     }
 
     #[test]

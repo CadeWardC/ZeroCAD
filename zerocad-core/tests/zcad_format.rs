@@ -297,6 +297,7 @@ fn v5_compact_save_is_deterministic_and_strips_accelerators() {
         large_preview_png: Some(vec![7; 1024]),
         display_meshes: Some(bodies),
         evaluation_cache: Some(document.evaluation_cache_snapshot()),
+        world_bbox: None,
     };
     let options = SaveOptions {
         profile: SaveProfile::Compact,
@@ -554,6 +555,7 @@ fn hydrated_budget_is_hard_and_profile_comes_from_content() {
         large_preview_png: Some(vec![1; 512]),
         display_meshes: Some(bodies),
         evaluation_cache: Some(document.evaluation_cache_snapshot()),
+        world_bbox: None,
     };
     let profile = SaveProfile::Hydrated {
         total_accelerator_budget: 1,
@@ -579,6 +581,7 @@ fn compact_profile_has_bounded_overhead_and_no_forbidden_sections() {
             large_preview_png: Some(vec![1; 4096]),
             display_meshes: Some(document.evaluate_bodies(&HashSet::new()).unwrap()),
             evaluation_cache: Some(document.evaluation_cache_snapshot()),
+            world_bbox: None,
         },
     )
     .unwrap();
@@ -633,6 +636,7 @@ fn hydrated_sections_fail_independently_without_losing_the_recipe() {
             large_preview_png: Some(vec![3; 4096]),
             display_meshes: Some(bodies),
             evaluation_cache: Some(document.evaluation_cache_snapshot()),
+            world_bbox: None,
         },
     )
     .unwrap();

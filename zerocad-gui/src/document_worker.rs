@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 use zerocad_core::{
-    Document, EvaluatedScene, EvaluationCacheSnapshot, HydrationBundle, SaveOptions, SaveProfile,
-    SharedEvaluatedScene,
+    EvaluatedScene, EvaluationCacheSnapshot, HydrationBundle, ProjectDocument, SaveOptions,
+    SaveProfile, SharedEvaluatedScene,
 };
 
 pub(crate) struct SaveRequest {
     pub path: PathBuf,
-    pub document: Document,
+    pub document: ProjectDocument,
     pub scene: SharedEvaluatedScene,
     pub profile: SaveProfile,
     pub cache: EvaluationCacheSnapshot,
@@ -72,8 +72,12 @@ fn save(request: SaveRequest) -> Result<(), zerocad_core::ZcadError> {
         large_preview_png,
         display_meshes: Some(request.scene.geometries().as_ref().clone()),
         evaluation_cache: Some(request.cache),
+        world_bbox: request
+            .scene
+            .world_bounds()
+            .map(|(min, max)| [min[0], min[1], min[2], max[0], max[1], max[2]]),
     };
-    zerocad_core::write_document_file(
+    zerocad_core::write_project_document_file(
         &request.path,
         &request.document,
         &SaveOptions {

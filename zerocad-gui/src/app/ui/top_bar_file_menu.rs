@@ -1,7 +1,7 @@
 use crate::*;
 
 impl ZeroCadApp {
-    pub(crate) fn draw_top_bar_file_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub(crate) fn draw_top_bar_file_menu(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         // Compact application menu; the surrounding global header carries the
         // project title and quick actions.
         let file_btn_id = ui.make_persistent_id("file_menu_dropdown");
@@ -55,23 +55,16 @@ impl ZeroCadApp {
                     self.new_assembly();
                 }
 
-                if self.project_kind == ProjectKind::Part {
-                    if icons::Icon::Save
-                        .menu_button_hint(
-                            ui,
-                            "Save Design",
-                            &hint(self, ShortcutAction::SaveDesign),
-                        )
-                        .clicked()
-                    {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.open_save_dialog();
-                    }
-                } else {
-                    ui.add_enabled(false, egui::Button::new("Save Assembly"))
-                        .on_hover_text(
-                            "Assembly saving arrives with the assembly file-format milestone",
-                        );
+                let save_label = match self.project_kind {
+                    ProjectKind::Part => "Save Design",
+                    ProjectKind::Assembly => "Save Assembly",
+                };
+                if icons::Icon::Save
+                    .menu_button_hint(ui, save_label, &hint(self, ShortcutAction::SaveDesign))
+                    .clicked()
+                {
+                    ui.memory_mut(|mem| mem.close_popup());
+                    self.open_save_dialog();
                 }
 
                 if icons::Icon::Download
@@ -183,7 +176,7 @@ impl ZeroCadApp {
 
                 if icons::Icon::Exit.menu_button(ui, "Exit ZeroCAD").clicked() {
                     ui.memory_mut(|mem| mem.close_popup());
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_window_close();
                 }
             },
         );

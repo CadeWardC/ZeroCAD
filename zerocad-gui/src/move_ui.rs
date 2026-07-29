@@ -244,7 +244,7 @@ impl ZeroCadApp {
         self.update_face_alignment();
     }
 
-    fn update_face_alignment(&mut self) {
+    pub(crate) fn update_face_alignment(&mut self) {
         let Some(op) = self.move_op.as_mut() else {
             return;
         };
@@ -276,118 +276,6 @@ impl ZeroCadApp {
             FacePlacement::Coplanar => "Faces placed in line (coplanar), preserving side offset.",
         }
         .to_string();
-    }
-
-    pub(crate) fn show_move_dialog(&mut self, ctx: &egui::Context) {
-        if self.move_op.is_none() {
-            return;
-        }
-        let mut commit = false;
-        let mut cancel = false;
-        let mut changed = false;
-        egui::Window::new("Move Body")
-            .id(egui::Id::new("move_body_dialog"))
-            .collapsible(false)
-            .resizable(false)
-            .default_pos(egui::pos2(24.0, 90.0))
-            .show(ctx, |ui| {
-                let op = self.move_op.as_mut().unwrap();
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut op.method, MoveMethod::Translate, "Translate");
-                    ui.selectable_value(&mut op.method, MoveMethod::AlignFaces, "Align faces");
-                });
-                ui.separator();
-                match op.method {
-                    MoveMethod::Translate => {
-                        ui.label("Drag the red/green/blue arrows, or enter an offset:");
-                        for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(label);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut op.translation[axis])
-                                            .speed(0.25)
-                                            .suffix(" mm"),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            });
-                        }
-                    }
-                    MoveMethod::AlignFaces => {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(
-                                    op.placement == FacePlacement::Touching,
-                                    "Touching",
-                                )
-                                .clicked()
-                            {
-                                op.placement = FacePlacement::Touching;
-                                changed = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    op.placement == FacePlacement::Coplanar,
-                                    "In line",
-                                )
-                                .clicked()
-                            {
-                                op.placement = FacePlacement::Coplanar;
-                                changed = true;
-                            }
-                        });
-                        ui.label(match op.placement {
-                            FacePlacement::Touching => {
-                                "Touching aligns the source-face center to the target-face center."
-                            }
-                            FacePlacement::Coplanar => {
-                                "In line makes the faces coplanar without changing the side offset."
-                            }
-                        });
-                        if ui.button("Pick moving-body face").clicked() {
-                            op.picking = Some(MoveFacePick::Source);
-                        }
-                        if ui.button("Pick target-body face").clicked() {
-                            op.picking = Some(MoveFacePick::Target);
-                        }
-                        let picked =
-                            |face: &Option<FaceRef>| if face.is_some() { "✓" } else { "—" };
-                        ui.label(format!(
-                            "Moving face: {}    Target face: {}",
-                            picked(&op.source_face),
-                            picked(&op.target_face)
-                        ));
-                    }
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        commit = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if changed {
-            if self
-                .move_op
-                .as_ref()
-                .is_some_and(|op| op.method == MoveMethod::AlignFaces)
-            {
-                self.update_face_alignment();
-            } else {
-                self.refresh_move_preview();
-            }
-        }
-        if commit {
-            self.commit_move_body();
-        } else if cancel {
-            self.cancel_move_body();
-        }
     }
 
     /// Draw and interact with the three-axis translation gizmo. `project`

@@ -47,6 +47,8 @@ impl ZeroCadApp {
                 ShortcutAction::NewDesign => self.new_design(),
                 ShortcutAction::OpenDesign => self.open_design(),
                 ShortcutAction::SaveDesign => self.open_save_dialog(),
+                ShortcutAction::Undo => self.undo(),
+                ShortcutAction::Redo => self.redo(),
                 ShortcutAction::ToggleTheme => self.dark_mode = !self.dark_mode,
                 ShortcutAction::OpenSettings => self.show_preferences = true,
                 _ => {
@@ -150,7 +152,7 @@ impl ZeroCadApp {
     /// faceted-preview/arc-refine swap.
     pub(crate) fn reevaluate_geometry(&mut self) {
         self.document_revision = self.document_revision.wrapping_add(1);
-        let snapshot = self.current_document_snapshot();
+        let snapshot = self.current_project_snapshot();
         self.recovery.note_edit(snapshot);
         self.spawn_refine_eval();
         self.status_msg = "Updating model...".to_string();

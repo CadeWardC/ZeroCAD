@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
-use zerocad_core::{Region, SketchCurves};
+use zerocad_core::{sketch::Arc, Region, SketchCurves};
 
 /// Draw a sketch's faces, curves, and vertex dots using a caller supplied
 /// 2D→screen projection. Shared by the active sketch, finished 2D objects, and
@@ -14,7 +14,7 @@ use zerocad_core::{Region, SketchCurves};
 /// in `selected` are highlighted blue and edges/points in the corresponding
 /// selection sets are highlighted orange; everything else stays faint so
 /// picking one element never recolors the whole sketch. Edge indices are
-/// segments, then circles, then splines in their stored order. Point indices
+/// segments, then circles, arcs, and splines in their stored order. Point indices
 /// follow [`selectable_sketch_points`].
 pub(crate) fn draw_sketch_geometry(
     painter: &egui::Painter,
@@ -23,6 +23,9 @@ pub(crate) fn draw_sketch_geometry(
     selected: &HashSet<usize>,
     selected_edges: &HashSet<usize>,
     selected_points: &HashSet<usize>,
+    hovered_face: Option<usize>,
+    hovered_edge: Option<usize>,
+    hovered_point: Option<usize>,
     to_screen: &dyn Fn((f32, f32)) -> egui::Pos2,
     interactive: bool,
 ) {
@@ -35,6 +38,14 @@ pub(crate) fn draw_sketch_geometry(
             (
                 egui::Color32::from_rgba_unmultiplied(0, 160, 240, 95),
                 egui::Stroke::new(1.8, egui::Color32::from_rgb(0, 120, 210)),
+            )
+        } else if hovered_face == Some(i) {
+            (
+                egui::Color32::from_rgba_unmultiplied(80, 150, 215, 25),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(75, 145, 205, 125),
+                ),
             )
         } else if interactive {
             // Active drawing: light, uniform blue tint.
@@ -80,11 +91,17 @@ pub(crate) fn draw_sketch_geometry(
     let seg_stroke = egui::Stroke::new(2.0, seg_color);
     // Highlight for a selected edge (orange, thicker).
     let sel_edge_stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 140, 0));
+    let hover_edge_stroke = egui::Stroke::new(
+        2.35,
+        egui::Color32::from_rgba_unmultiplied(65, 145, 210, 145),
+    );
 
     let seg_count = curves.segments.len();
     for (i, seg) in curves.segments.iter().enumerate() {
         let stroke = if selected_edges.contains(&i) {
             sel_edge_stroke
+        } else if hovered_edge == Some(i) {
+            hover_edge_stroke
         } else {
             seg_stroke
         };
@@ -94,6 +111,8 @@ pub(crate) fn draw_sketch_geometry(
     for (j, c) in curves.circles.iter().enumerate() {
         let stroke = if selected_edges.contains(&(seg_count + j)) {
             sel_edge_stroke
+        } else if hovered_edge == Some(seg_count + j) {
+            hover_edge_stroke
         } else {
             seg_stroke
         };
@@ -112,10 +131,27 @@ pub(crate) fn draw_sketch_geometry(
         }
     }
 
-    let spline_offset = seg_count + curves.circles.len();
+    let arc_offset = seg_count + curves.circles.len();
+    for (index, arc) in curves.arcs.iter().enumerate() {
+        let edge_index = arc_offset + index;
+        let stroke = if selected_edges.contains(&edge_index) {
+            sel_edge_stroke
+        } else if hovered_edge == Some(edge_index) {
+            hover_edge_stroke
+        } else {
+            seg_stroke
+        };
+        for pair in sample_arc_points(arc, 48).windows(2) {
+            painter.line_segment([to_screen(pair[0]), to_screen(pair[1])], stroke);
+        }
+    }
+
+    let spline_offset = arc_offset + curves.arcs.len();
     for (index, spline) in curves.splines.iter().enumerate() {
         let stroke = if selected_edges.contains(&(spline_offset + index)) {
             sel_edge_stroke
+        } else if hovered_edge == Some(spline_offset + index) {
+            hover_edge_stroke
         } else {
             seg_stroke
         };
@@ -157,17 +193,31 @@ pub(crate) fn draw_sketch_geometry(
 
     for (index, point) in selectable_sketch_points(curves).into_iter().enumerate() {
         let selected = selected_points.contains(&index);
+        let hovered = hovered_point == Some(index);
         let dot_fill = if selected {
             egui::Color32::from_rgb(255, 140, 0)
+        } else if hovered {
+            egui::Color32::from_rgba_unmultiplied(125, 180, 225, 90)
         } else {
             egui::Color32::WHITE
         };
         let dot_stroke = if selected {
             egui::Stroke::new(1.6, egui::Color32::from_rgb(190, 90, 0))
+        } else if hovered {
+            egui::Stroke::new(
+                1.35,
+                egui::Color32::from_rgba_unmultiplied(60, 135, 195, 165),
+            )
         } else {
             egui::Stroke::new(1.3, seg_color)
         };
-        let radius = if selected { 4.5 } else { 3.5 };
+        let radius = if selected {
+            4.5
+        } else if hovered {
+            4.0
+        } else {
+            3.5
+        };
         let s = to_screen(point);
         painter.circle_filled(s, radius, dot_fill);
         painter.circle_stroke(s, radius, dot_stroke);
@@ -240,6 +290,42 @@ pub(crate) fn selectable_sketch_points(curves: &SketchCurves) -> Vec<(f32, f32)>
         }
     }
     points
+}
+
+/// Sample an analytic sketch arc along its authored direction.
+pub(crate) fn sample_arc_points(arc: &Arc, segments: usize) -> Vec<(f32, f32)> {
+    let (start, end) = arc_parameter_bounds(arc);
+    let segments = segments.max(1);
+    (0..=segments)
+        .map(|index| {
+            let parameter = index as f32 / segments as f32;
+            let angle = start + (end - start) * parameter;
+            (
+                arc.center.0 + arc.radius * angle.cos(),
+                arc.center.1 + arc.radius * angle.sin(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn arc_sweep_radians(arc: &Arc) -> f32 {
+    let (start, end) = arc_parameter_bounds(arc);
+    end - start
+}
+
+fn arc_parameter_bounds(arc: &Arc) -> (f32, f32) {
+    let start = (arc.start.1 - arc.center.1).atan2(arc.start.0 - arc.center.0);
+    let mut end = (arc.end.1 - arc.center.1).atan2(arc.end.0 - arc.center.0);
+    while end - start > std::f32::consts::PI {
+        end -= std::f32::consts::TAU;
+    }
+    while end - start < -std::f32::consts::PI {
+        end += std::f32::consts::TAU;
+    }
+    if arc.clockwise && end > start {
+        end -= std::f32::consts::TAU;
+    }
+    (start, end)
 }
 
 /// The circle through three points (center, radius), or `None` if they are
@@ -625,8 +711,8 @@ pub(crate) fn triangulate_nested_loops(loops: &[Vec<egui::Pos2>]) -> Vec<[egui::
 
 #[cfg(test)]
 mod tests {
-    use super::{circumcircle, selectable_sketch_points};
-    use zerocad_core::SketchCurves;
+    use super::{circumcircle, sample_arc_points, selectable_sketch_points};
+    use zerocad_core::{sketch::Arc, SketchCurves};
 
     #[test]
     fn circumcircle_of_unit_axis_points() {
@@ -665,6 +751,40 @@ mod tests {
             selectable_sketch_points(&curves),
             vec![(0.0, 0.0), (2.0, 0.0)]
         );
+    }
+
+    #[test]
+    fn sampled_arc_starts_and_ends_at_its_selectable_points() {
+        let arc = Arc {
+            center: (0.0, 0.0),
+            radius: 2.0,
+            start: (2.0, 0.0),
+            end: (0.0, 2.0),
+            clockwise: false,
+        };
+        let points = sample_arc_points(&arc, 12);
+
+        assert_eq!(points.len(), 13);
+        assert!((points[0].0 - 2.0).abs() < 1.0e-5);
+        assert!(points[0].1.abs() < 1.0e-5);
+        assert!(points[12].0.abs() < 1.0e-5);
+        assert!((points[12].1 - 2.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn sampled_clockwise_arc_follows_the_requested_side() {
+        let arc = Arc {
+            center: (0.0, 0.0),
+            radius: 1.0,
+            start: (1.0, 0.0),
+            end: (0.0, 1.0),
+            clockwise: true,
+        };
+        let points = sample_arc_points(&arc, 4);
+
+        assert!(points[1].1 < 0.0, "clockwise sample should sweep below X");
+        assert!((points[4].0 - arc.end.0).abs() < 1.0e-5);
+        assert!((points[4].1 - arc.end.1).abs() < 1.0e-5);
     }
 
     #[test]

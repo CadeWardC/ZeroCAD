@@ -56,6 +56,12 @@ impl ZeroCadApp {
                             );
                             ui.separator();
                             ui.label(
+                                egui::RichText::new(self.assembly_geometry_status())
+                                    .size(10.5)
+                                    .color(self.pal().text_muted),
+                            );
+                            ui.separator();
+                            ui.label(
                                 egui::RichText::new("Assembly")
                                     .size(10.5)
                                     .color(self.pal().text_muted),
@@ -105,6 +111,55 @@ impl ZeroCadApp {
                     });
                 });
             });
+    }
+
+    fn assembly_geometry_status(&self) -> String {
+        let mut unique_bodies = 0usize;
+        let mut unique_triangles = 0usize;
+        for bodies in self.assembly_definition_geometry.values() {
+            unique_bodies += bodies.len();
+            unique_triangles += bodies
+                .iter()
+                .map(|(_, mesh)| mesh.indices.len() / 3)
+                .sum::<usize>();
+        }
+        let mut displayed_occurrences = 0usize;
+        let mut displayed_bodies = 0usize;
+        let mut displayed_triangles = 0usize;
+        for occurrence in self.assembly_document.occurrences.values() {
+            if self
+                .assembly_document
+                .presentation
+                .hidden_occurrences
+                .contains(&occurrence.id)
+            {
+                continue;
+            }
+            let Some(bodies) = self
+                .assembly_definition_geometry
+                .get(&occurrence.definition_model_hash)
+            else {
+                continue;
+            };
+            displayed_occurrences += 1;
+            for (body_id, mesh) in bodies.iter() {
+                if self
+                    .assembly_document
+                    .presentation
+                    .hidden_bodies
+                    .contains(&(occurrence.id, body_id.clone()))
+                {
+                    continue;
+                }
+                displayed_bodies += 1;
+                displayed_triangles += mesh.indices.len() / 3;
+            }
+        }
+        format!(
+            "Unique geometry: {unique_bodies} bodies / {unique_triangles} tris · \
+             Displayed: {displayed_occurrences} components / {displayed_bodies} bodies / \
+             {displayed_triangles} tris"
+        )
     }
 
     fn bottom_selection_status(&self) -> Option<String> {
@@ -365,6 +420,7 @@ impl ZeroCadApp {
             );
             let segment_count = curves.segments.len();
             let circle_count = curves.circles.len();
+            let arc_count = curves.arcs.len();
             let edge = if let Some(segment) = curves.segments.get(edge_index) {
                 let points = vec![
                     sketch_world_point(cs, segment.a),
@@ -388,9 +444,31 @@ impl ZeroCadApp {
                     }),
                     closed: true,
                 })
+            } else if let Some(arc) = edge_index
+                .checked_sub(segment_count + circle_count)
+                .and_then(|index| curves.arcs.get(index))
+            {
+                let center = sketch_world_point(cs, arc.center);
+                let normal = [cs.n.x as f64, cs.n.y as f64, cs.n.z as f64];
+                let points = crate::geom2d::sample_arc_points(arc, 192)
+                    .into_iter()
+                    .map(|point| sketch_world_point(cs, point))
+                    .collect();
+                Some(MeasuredEdge {
+                    points,
+                    length_mm: f64::from(
+                        arc.radius.abs() * crate::geom2d::arc_sweep_radians(arc).abs(),
+                    ),
+                    circle: Some(MeasuredCircle {
+                        center,
+                        normal,
+                        radius: arc.radius.abs() as f64,
+                    }),
+                    closed: false,
+                })
             } else {
                 edge_index
-                    .checked_sub(segment_count + circle_count)
+                    .checked_sub(segment_count + circle_count + arc_count)
                     .and_then(|index| curves.splines.get(index))
                     .map(|spline| {
                         let points = spline

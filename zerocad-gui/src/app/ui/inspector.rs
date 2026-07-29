@@ -1,16 +1,19 @@
+use crate::move_ui::{FacePlacement, MoveFacePick, MoveMethod};
 use crate::*;
 
-pub(super) const WORKSPACE_INSPECTOR_CONTENT_WIDTH: f32 = 246.0;
+pub(super) const WORKSPACE_INSPECTOR_CONTENT_WIDTH: f32 = 220.0;
 pub(super) const WORKSPACE_INSPECTOR_VIEWPORT_RESERVATION: f32 =
-    WORKSPACE_INSPECTOR_CONTENT_WIDTH + 42.0;
-const WORKSPACE_INSPECTOR_EDGE_PADDING: f32 = 16.0;
+    WORKSPACE_INSPECTOR_CONTENT_WIDTH + 36.0;
+const WORKSPACE_INSPECTOR_EDGE_PADDING: f32 = 12.0;
 
 impl ZeroCadApp {
     pub(crate) fn inspector_has_content(&self) -> bool {
         if self.is_sketch_mode {
             return false;
         }
-        self.extrude_op.is_some() || self.other_active_operation_name().is_some()
+        self.extrude_op.is_some()
+            || self.move_op.is_some()
+            || self.other_active_operation_name().is_some()
     }
 
     pub(crate) fn draw_inspector(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
@@ -34,11 +37,11 @@ impl ZeroCadApp {
                         spread: 0.0,
                         color: egui::Color32::from_black_alpha(24),
                     })
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.set_width(content_width);
                         ui.set_max_height(overlay_height);
-                        ui.add_space(9.0);
+                        ui.add_space(6.0);
                         let title = self.inspector_title();
                         ui.horizontal(|ui| {
                             ui.label(
@@ -62,13 +65,15 @@ impl ZeroCadApp {
                                 },
                             );
                         });
-                        ui.add_space(5.0);
+                        ui.add_space(3.0);
                         ui.separator();
 
                         if self.extrude_op.is_some() {
                             self.draw_extrude_inspector(ui);
+                        } else if self.move_op.is_some() {
+                            self.draw_move_body_inspector(ui);
                         } else if let Some(operation) = self.other_active_operation_name() {
-                            ui.add_space(12.0);
+                            ui.add_space(8.0);
                             Self::inspector_section(ui, &self.pal(), "Active operation", |ui| {
                                 ui.label(
                                     egui::RichText::new(operation)
@@ -93,6 +98,8 @@ impl ZeroCadApp {
     fn inspector_title(&self) -> &'static str {
         if self.extrude_op.is_some() {
             "EXTRUDE"
+        } else if self.move_op.is_some() {
+            "MOVE BODY"
         } else if let Some(name) = self.other_active_operation_name() {
             name
         } else {
@@ -117,8 +124,6 @@ impl ZeroCadApp {
             Some("DRAFT")
         } else if self.pattern_op.is_some() {
             Some("PATTERN")
-        } else if self.move_op.is_some() {
-            Some("MOVE")
         } else if self.combine_op.is_some() {
             Some("COMBINE")
         } else if self.split_body_op.is_some() {
@@ -257,22 +262,195 @@ impl ZeroCadApp {
         }
     }
 
+    fn draw_move_body_inspector(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let unit_suffix = self.current_unit.suffix();
+        let mut commit = false;
+        let mut cancel = false;
+        let mut changed = false;
+
+        egui::ScrollArea::vertical()
+            .id_salt("move_body_inspector_scroll")
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                let Some(op) = self.move_op.as_mut() else {
+                    return;
+                };
+
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    changed |= ui
+                        .selectable_value(&mut op.method, MoveMethod::Translate, "Translate")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(&mut op.method, MoveMethod::AlignFaces, "Align faces")
+                        .changed();
+                });
+
+                match op.method {
+                    MoveMethod::Translate => {
+                        Self::inspector_section(ui, &pal, "Offset", |ui| {
+                            ui.label(
+                                egui::RichText::new("Drag an axis arrow or enter an offset.")
+                                    .size(10.5)
+                                    .color(pal.text_muted),
+                            );
+                            ui.add_space(3.0);
+                            for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .strong()
+                                            .size(11.0)
+                                            .color(pal.text_strong),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut op.translation[axis])
+                                                        .speed(0.25)
+                                                        .suffix(unit_suffix),
+                                                )
+                                                .changed();
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    }
+                    MoveMethod::AlignFaces => {
+                        Self::inspector_section(ui, &pal, "Alignment", |ui| {
+                            ui.horizontal(|ui| {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut op.placement,
+                                        FacePlacement::Touching,
+                                        "Touching",
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut op.placement,
+                                        FacePlacement::Coplanar,
+                                        "In line",
+                                    )
+                                    .changed();
+                            });
+                            ui.label(
+                                egui::RichText::new(match op.placement {
+                                    FacePlacement::Touching => {
+                                        "Aligns the centers of the two selected faces."
+                                    }
+                                    FacePlacement::Coplanar => {
+                                        "Makes the faces coplanar and keeps the side offset."
+                                    }
+                                })
+                                .size(10.5)
+                                .color(pal.text_muted),
+                            );
+                        });
+
+                        Self::inspector_section(ui, &pal, "Faces", |ui| {
+                            let source_picked = op.source_face.is_some();
+                            let target_picked = op.target_face.is_some();
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 28.0],
+                                    egui::Button::new(if source_picked {
+                                        "✓  Moving face"
+                                    } else {
+                                        "Pick moving face"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                op.picking = Some(MoveFacePick::Source);
+                            }
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 28.0],
+                                    egui::Button::new(if target_picked {
+                                        "✓  Target face"
+                                    } else {
+                                        "Pick target face"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                op.picking = Some(MoveFacePick::Target);
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Apply")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(pal.accent)
+                            .stroke(egui::Stroke::NONE)
+                            .rounding(6.0)
+                            .min_size(egui::vec2(92.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        commit = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(76.0, 32.0)))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Esc = Cancel")
+                        .size(9.5)
+                        .color(pal.text_faint),
+                );
+            });
+
+        if changed {
+            if self
+                .move_op
+                .as_ref()
+                .is_some_and(|op| op.method == MoveMethod::AlignFaces)
+            {
+                self.update_face_alignment();
+            } else {
+                self.refresh_move_preview();
+            }
+        }
+        if commit {
+            self.commit_move_body();
+        } else if cancel {
+            self.cancel_move_body();
+        }
+    }
+
     fn inspector_section(
         ui: &mut egui::Ui,
         pal: &Palette,
         title: &str,
         content: impl FnOnce(&mut egui::Ui),
     ) {
-        ui.add_space(4.0);
+        ui.add_space(3.0);
         ui.label(
             egui::RichText::new(title)
                 .strong()
                 .size(12.0)
                 .color(pal.text_strong),
         );
-        ui.add_space(5.0);
+        ui.add_space(4.0);
         content(ui);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         ui.separator();
     }
 }
@@ -312,5 +490,20 @@ mod tests {
         app.is_plane_selection_mode = true;
 
         assert!(!app.inspector_has_content());
+    }
+
+    #[test]
+    fn move_body_uses_the_dedicated_compact_inspector() {
+        let mut app = ZeroCadApp::new();
+        app.set_body_meshes(vec![(
+            "body".to_string(),
+            MockMesh::make_box(2.0, 2.0, 2.0),
+        )]);
+        app.begin_move_body("body".to_string());
+
+        assert!(app.inspector_has_content());
+        assert_eq!(app.inspector_title(), "MOVE BODY");
+        assert_eq!(app.other_active_operation_name(), None);
+        assert_eq!(WORKSPACE_INSPECTOR_CONTENT_WIDTH, 220.0);
     }
 }

@@ -12,7 +12,9 @@ pub mod threemf;
 
 pub use step_writer::write_step;
 pub use stl::{write_stl_ascii, write_stl_binary};
-pub use threemf::{to_3mf_bytes, write_3mf};
+pub use threemf::{
+    to_3mf_assembly_bytes, to_3mf_bytes, write_3mf, ThreeMfBuildItem, ThreeMfDefinition,
+};
 
 use std::io;
 

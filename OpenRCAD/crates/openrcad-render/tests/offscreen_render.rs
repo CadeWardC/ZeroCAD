@@ -10,8 +10,8 @@
 //! test skips rather than fails.
 
 use openrcad_render::{
-    FaceHighlight, GpuMesh, LayerStyle, OffscreenTarget, PickTarget, RenderCore, SceneGlobals,
-    SAMPLE_COUNT,
+    FaceHighlight, GpuMesh, LayerStyle, MeshInstance, OffscreenTarget, PickTarget, RenderCore,
+    SceneGlobals, SAMPLE_COUNT,
 };
 
 const SIZE: u32 = 64;
@@ -373,6 +373,82 @@ fn pick_pass_reads_back_the_nearer_face_id() {
     assert_eq!(center, Some(9), "expected the nearer face id at center");
     let corner = core.read_pick_at(&device, &queue, &pick, 1, 1);
     assert_eq!(corner, None, "expected background at the corner");
+}
+
+#[test]
+fn shared_geometry_instances_have_distinct_transforms_and_pick_ids() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let Some(adapter) =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+    else {
+        eprintln!("no GPU adapter available; skipping instance test");
+        return;
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("openrcad-render instance test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::default(),
+        },
+        None,
+    ))
+    .expect("request device");
+
+    let mesh = GpuMesh {
+        positions: vec![-0.28, -0.28, 0.5, 0.28, -0.28, 0.5, 0.0, 0.28, 0.5],
+        normals: [0.0f32, 0.0, 1.0].repeat(3),
+        indices: vec![0, 1, 2],
+        face_ids: vec![2],
+    };
+    let mut core = RenderCore::new(&device, wgpu::TextureFormat::Rgba8Unorm, 1);
+    core.set_mesh(&device, &mesh);
+    let translated = |x: f32| {
+        let mut model = identity();
+        model[3][0] = x;
+        model
+    };
+    core.set_instances(
+        &device,
+        &[
+            MeshInstance {
+                geometry_index: 0,
+                model: translated(-0.5),
+                face_id_base: 3,
+            },
+            MeshInstance {
+                geometry_index: 0,
+                model: translated(0.5),
+                face_id_base: 20,
+            },
+        ],
+    );
+    let pick = PickTarget::new(&device, SIZE, SIZE);
+    let globals = SceneGlobals {
+        view_proj: identity(),
+        light_dir: [0.0, 0.0, 1.0],
+        ambient: 1.0,
+        color: [1.0; 3],
+        viewport_px: [SIZE as f32; 2],
+        edge_px: 1.5,
+        clip_plane: None,
+    };
+    core.render_pick(&device, &queue, &pick, &globals);
+    assert_eq!(
+        core.read_pick_at(&device, &queue, &pick, SIZE / 4, SIZE / 2),
+        Some(5)
+    );
+    assert_eq!(
+        core.read_pick_at(&device, &queue, &pick, SIZE * 3 / 4, SIZE / 2),
+        Some(22)
+    );
 }
 
 #[test]

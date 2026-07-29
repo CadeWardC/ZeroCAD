@@ -2,15 +2,15 @@ use crate::*;
 
 impl ZeroCadApp {
     pub(crate) fn project_title(&self) -> String {
-        if self.project_kind == ProjectKind::Assembly {
-            return "Untitled Assembly".to_string();
-        }
         self.current_document_path
             .as_ref()
             .and_then(|path| path.file_stem())
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Untitled Project".to_string())
+            .unwrap_or_else(|| match self.project_kind {
+                ProjectKind::Part => "Untitled Project".to_string(),
+                ProjectKind::Assembly => "Untitled Assembly".to_string(),
+            })
     }
 
     pub(crate) fn draw_top_bar(&mut self, ctx: &egui::Context) {
@@ -33,16 +33,15 @@ impl ZeroCadApp {
                         if !self.onboarding_visible {
                             ui.separator();
 
-                            if self.project_kind == ProjectKind::Part
-                                && icons::Icon::Save
-                                    .icon_button(
-                                        ui,
-                                        egui::Color32::TRANSPARENT,
-                                        self.pal().accent_soft,
-                                        self.pal().text_body,
-                                    )
-                                    .on_hover_text("Save design (Ctrl+S)")
-                                    .clicked()
+                            if icons::Icon::Save
+                                .icon_button(
+                                    ui,
+                                    egui::Color32::TRANSPARENT,
+                                    self.pal().accent_soft,
+                                    self.pal().text_body,
+                                )
+                                .on_hover_text("Save project (Ctrl+S)")
+                                .clicked()
                             {
                                 self.open_save_dialog();
                             }
@@ -173,10 +172,16 @@ impl ZeroCadApp {
                             );
                             ui.separator();
                             ui.label(
-                                egui::RichText::new("0 components")
-                                    .size(11.5)
-                                    .color(self.pal().text_muted),
+                                egui::RichText::new(format!(
+                                    "{} components",
+                                    self.assembly_document.occurrences.len()
+                                ))
+                                .size(11.5)
+                                .color(self.pal().text_muted),
                             );
+                            if ui.button("Insert Part…").clicked() {
+                                self.insert_part_into_assembly();
+                            }
                         } else {
                             let active_sketching =
                                 self.is_sketch_mode || self.is_plane_selection_mode;

@@ -10,6 +10,10 @@ impl eframe::App for ZeroCadApp {
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }
+        if ctx.input(|input| input.viewport().close_requested()) && !self.allow_window_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_window_close();
+        }
         // Hand the GPU viewport eframe's wgpu device/queue for this frame. Cloned
         // (the render state is Arc-backed) so nothing borrows `frame` past here.
         self.gpu
@@ -21,7 +25,7 @@ impl eframe::App for ZeroCadApp {
         self.tick_speculative_edge_mod(ctx);
         // While the Welcome modal is up the workspace is inert, so its hotkeys
         // are suppressed (the modal reads Esc itself).
-        if !self.onboarding_visible {
+        if !self.onboarding_visible && self.pending_project_transition.is_none() {
             self.handle_shortcuts(ctx);
         }
 
@@ -31,6 +35,8 @@ impl eframe::App for ZeroCadApp {
 
         // SAVE DIALOG (modal overlay, drawn before the Settings window).
         self.show_save_dialog(ctx);
+        self.reconcile_transition_save_dialog();
+        self.show_unsaved_changes_dialog(ctx);
 
         self.draw_settings_window(ctx);
         self.draw_about_window(ctx);
@@ -53,7 +59,6 @@ impl eframe::App for ZeroCadApp {
             return;
         }
 
-        self.show_move_dialog(ctx);
         self.show_combine_dialog(ctx);
         self.show_split_body_dialog(ctx);
         self.show_scale_body_dialog(ctx);

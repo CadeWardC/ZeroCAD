@@ -1,3 +1,9 @@
+pub mod assembly;
+pub mod assembly_mates;
+pub mod assembly_ops;
+pub mod assembly_release;
+pub mod assembly_solver;
+pub mod assembly_solver_release;
 pub mod boolean_case;
 pub mod document;
 pub mod dxf;
@@ -20,6 +26,44 @@ pub mod zcad_format;
 pub const CIRCLE_SEGS: usize = 48;
 
 // Re-export common structures for easy access
+pub use assembly::{
+    AssemblyDefinition, AssemblyDocument, AssemblyError, AssemblyOccurrence,
+    AssemblyPresentationV1, AssetHash, ModelHash, OccurrenceId, ProjectDocument, ProjectKind,
+    RigidPlacement,
+};
+pub use assembly_mates::{
+    AssemblyEntityRef, AssemblyLocalSelector, AssemblyMate, AssemblyMateError, AssemblyMateKind,
+    AssemblyMateSet, MateId, MateSense,
+};
+pub use assembly_ops::{
+    align_faces, assembly_bom, assembly_bom_csv, insert_part_snapshot, insert_prepared_occurrence,
+    prepare_part_definition, replace_occurrences_with_prepared, AlignFaceFrame, AssemblyBomRow,
+    AssemblyOperationError, InsertOccurrenceResult, PreparedPartDefinition,
+    ReplaceOccurrencesResult, ALIGN_FACES_DEGENERATE_CROSS_THRESHOLD,
+};
+pub use assembly_release::{
+    validate_assembly_v1_release_evidence, validate_assembly_v1_release_evidence_for_commit,
+    AssemblyV1ReleaseEvidence, ASSEMBLY_V1_DRAG_MEDIAN_BUDGET_MS, ASSEMBLY_V1_EVIDENCE_SCHEMA,
+    ASSEMBLY_V1_OPEN_MEDIAN_BUDGET_MS, ASSEMBLY_V1_REFERENCE_OCCURRENCES,
+    ASSEMBLY_V1_REQUIRED_SAMPLES,
+};
+pub use assembly_solver::{
+    add_mate_transactionally, apply_ephemeral_mate_target_transactionally, apply_mate_solution,
+    apply_pose_target_transactionally, solve_assembly_mates, solve_assembly_mates_committed,
+    solve_assembly_mates_interactive, MateComponentEvidence, MateFrame, MateSolveContext,
+    MateSolvePath, MateSolveResult, MateSolveStatus, ResolvedMateFrames,
+    ANGLE_TOLERANCE_CEILING_RAD, ANGLE_TOLERANCE_RAD, COMMITTED_NONLINEAR_ITERATION_LIMIT,
+    DENSE_FREE_OCCURRENCE_LIMIT, DENSE_RESIDUAL_ROW_LIMIT, INITIAL_DAMPING,
+    INTERACTIVE_NONLINEAR_ITERATION_LIMIT, TRANSLATION_TOLERANCE_ABS_MM,
+    TRANSLATION_TOLERANCE_CEILING_ABS_MM, TRANSLATION_TOLERANCE_CEILING_RELATIVE,
+    TRANSLATION_TOLERANCE_RELATIVE,
+};
+pub use assembly_solver_release::{
+    calibration_decision, validate_assembly_v2_release_evidence,
+    validate_assembly_v2_release_evidence_for_commit, AssemblyV2ReleaseEvidence,
+    MateCalibrationCaseEvidence, MateCalibrationDecision, MateStressCorpusKind, MateStressEvidence,
+    ASSEMBLY_V2_EVIDENCE_SCHEMA, ASSEMBLY_V2_REQUIRED_SAMPLES, ASSEMBLY_V2_STRESS_OCCURRENCES,
+};
 pub use boolean_case::{
     AnalyticPrimitiveV1, BooleanCaseError, BooleanCaseIdentity, BooleanCaseV1, BooleanContactClass,
     BooleanOperandV1, BooleanReplayOutcome, BooleanReplaySummary, BooleanVerificationOp,
@@ -73,15 +117,19 @@ pub use sketch::{
     SketchShape, Spline, SplineContinuity, SplineKind,
 };
 pub use stl::{
-    meshes_to_3mf, meshes_to_binary_stl, read_stl_mesh, write_binary_stl, StlImportError,
-    StlValidationReport, ValidatedMeshBody,
+    assembly_to_3mf, assembly_to_binary_stl, meshes_to_3mf, meshes_to_binary_stl, read_stl_mesh,
+    write_binary_stl, AssemblyMeshExportError, StlImportError, StlValidationReport,
+    ValidatedMeshBody,
 };
 pub use units::{Parameter, Unit};
 #[allow(deprecated)]
 pub use zcad_format::{
-    read_document, read_document_file, read_document_from_slice, read_zcad, read_zcad_file,
-    write_document, write_document_file, write_document_to_vec, write_zcad, write_zcad_file,
+    read_document, read_document_file, read_document_from_slice, read_project_document,
+    read_project_document_file, read_project_document_from_slice, read_zcad, read_zcad_file,
+    write_document, write_document_file, write_document_to_vec, write_project_document,
+    write_project_document_file, write_project_document_to_vec, write_zcad, write_zcad_file,
+    AssemblyRecipeDefinitionV1, AssemblyRecipeOccurrenceV1, AssemblyRecipeV1, AssemblyRecipeV2,
     DocumentRecipeV3, HydrationBundle, LoadDiagnostic, LoadLimits, LoadOptions, LoadedDocument,
-    LoadedZcad, RecipeDependency, RecipeFeature, SaveOptions, SaveProfile, ZcadDocument, ZcadError,
-    ZcadMetadata,
+    LoadedProjectDocument, LoadedZcad, RecipeDependency, RecipeFeature, SaveOptions, SaveProfile,
+    ZcadDocument, ZcadError, ZcadMetadata,
 };

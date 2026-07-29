@@ -14,6 +14,7 @@
 //! samples the resolved color texture; nothing here touches a swapchain.
 
 use openrcad_mesh::GpuMesh;
+use wgpu::util::DeviceExt;
 
 use crate::scene::{self, SceneMesh};
 
@@ -102,6 +103,32 @@ impl SceneGlobals {
     fn to_bytes(self) -> [f32; 32] {
         self.pack(self.color, 1.0, true)
     }
+}
+
+/// One occurrence of a shared uploaded geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshInstance {
+    pub geometry_index: usize,
+    /// Column-major local-to-world matrix.
+    pub model: [[f32; 4]; 4],
+    /// Added to each local face id in the highlight and pick id space.
+    pub face_id_base: u32,
+}
+
+impl MeshInstance {
+    pub fn identity(geometry_index: usize) -> Self {
+        Self {
+            geometry_index,
+            model: identity4(),
+            face_id_base: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GpuMeshInstance {
+    geometry_index: usize,
+    uniform_offset: u32,
 }
 
 /// Style of one auxiliary scene layer (live-preview ghosts, tool volumes).
@@ -409,6 +436,12 @@ pub struct RenderCore {
     uniform_buffer: wgpu::Buffer,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
+    instance_bind_group_layout: wgpu::BindGroupLayout,
+    instance_buffer: wgpu::Buffer,
+    instance_bind_group: wgpu::BindGroup,
+    instance_stride: u32,
+    identity_instance_offset: u32,
+    instances: Vec<GpuMeshInstance>,
     /// One texel per face id, holding its [`FaceHighlight`] state. Laid out in
     /// rows of [`FACE_STATE_ROW`] texels (`texel(i) = (i % row, i / row)`).
     face_state_tex: wgpu::Texture,
@@ -417,8 +450,8 @@ pub struct RenderCore {
     face_state_capacity: u32,
     /// The states of the last upload, so an unchanged per-frame call is free.
     last_face_states: Vec<FaceHighlight>,
-    /// The base scene, one uploaded mesh per body slot — hosts re-upload only
-    /// the slots whose geometry changed (see [`update_bodies`](Self::update_bodies)).
+    /// Unique base-scene geometry slots. Occurrences are stored separately, so
+    /// repeated components never duplicate these uploads.
     bodies: Vec<SceneMesh>,
     /// Auxiliary layers drawn over (or instead of) the base scene.
     layers: Vec<GpuLayer>,
@@ -484,6 +517,32 @@ impl RenderCore {
             &uniform_buffer,
             &face_state_view,
         );
+        let instance_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openrcad-render instance layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let instance_stride = align_up(
+            std::mem::size_of::<[f32; 20]>() as u32,
+            device.limits().min_uniform_buffer_offset_alignment,
+        );
+        let identity_data = pack_instance(identity4(), 0, instance_stride as usize);
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("openrcad-render instances"),
+            contents: &identity_data,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let instance_bind_group =
+            make_instance_bind_group(device, &instance_bind_group_layout, &instance_buffer);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("openrcad-render shader"),
@@ -491,7 +550,7 @@ impl RenderCore {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("openrcad-render pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &instance_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -707,6 +766,12 @@ impl RenderCore {
             uniform_buffer,
             bind_group_layout,
             bind_group,
+            instance_bind_group_layout,
+            instance_buffer,
+            instance_bind_group,
+            instance_stride,
+            identity_instance_offset: 0,
+            instances: Vec::new(),
             face_state_tex,
             face_state_view,
             face_state_capacity,
@@ -738,6 +803,7 @@ impl RenderCore {
     /// Replace the entire base scene with one mesh (single-body hosts).
     pub fn set_mesh(&mut self, device: &wgpu::Device, mesh: &GpuMesh) {
         self.bodies = vec![SceneMesh::upload(device, mesh)];
+        self.set_instances(device, &[MeshInstance::identity(0)]);
     }
 
     /// Incrementally update the base scene's per-body slots. `updates[i]`
@@ -761,11 +827,62 @@ impl RenderCore {
                 }
             }
         }
+        let identities: Vec<MeshInstance> =
+            (0..self.bodies.len()).map(MeshInstance::identity).collect();
+        self.set_instances(device, &identities);
+    }
+
+    /// Replace only the occurrence records. Geometry uploads are untouched.
+    ///
+    /// The records are packed into one dynamic uniform buffer, and every draw
+    /// selects its transform by offset. Invalid geometry indices are ignored in
+    /// release builds and asserted in debug builds.
+    pub fn set_instances(&mut self, device: &wgpu::Device, instances: &[MeshInstance]) {
+        let mut packed = Vec::with_capacity((instances.len() + 1) * self.instance_stride as usize);
+        let mut gpu_instances = Vec::with_capacity(instances.len());
+        for instance in instances {
+            if instance.geometry_index >= self.bodies.len() {
+                debug_assert!(
+                    false,
+                    "instance references missing geometry {}",
+                    instance.geometry_index
+                );
+                continue;
+            }
+            let offset = packed.len() as u32;
+            packed.extend_from_slice(&pack_instance(
+                instance.model,
+                instance.face_id_base,
+                self.instance_stride as usize,
+            ));
+            gpu_instances.push(GpuMeshInstance {
+                geometry_index: instance.geometry_index,
+                uniform_offset: offset,
+            });
+        }
+        self.identity_instance_offset = packed.len() as u32;
+        packed.extend_from_slice(&pack_instance(
+            identity4(),
+            0,
+            self.instance_stride as usize,
+        ));
+        self.instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("openrcad-render instances"),
+            contents: &packed,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.instance_bind_group = make_instance_bind_group(
+            device,
+            &self.instance_bind_group_layout,
+            &self.instance_buffer,
+        );
+        self.instances = gpu_instances;
     }
 
     /// Drop any uploaded geometry (renders an empty scene).
     pub fn clear_mesh(&mut self) {
         self.bodies.clear();
+        self.instances.clear();
     }
 
     /// Replace all auxiliary layers (live-preview ghosts / tool volumes). Each
@@ -964,16 +1081,18 @@ impl RenderCore {
     /// write) with their edges — so ghosts never occlude solids and edges stay
     /// on top of their own fill.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        let base: &[SceneMesh] = if self.base_visible { &self.bodies } else { &[] };
         let fill = |pass: &mut wgpu::RenderPass<'a>,
                     pipeline: &'a wgpu::RenderPipeline,
                     bind_group: &'a wgpu::BindGroup,
+                    instance_bind_group: &'a wgpu::BindGroup,
+                    instance_offset: u32,
                     mesh: &'a SceneMesh| {
             if mesh.index_count == 0 {
                 return;
             }
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(1, instance_bind_group, &[instance_offset]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -981,19 +1100,31 @@ impl RenderCore {
         // Edge quads: 6 vertices per segment instance (see vs_edge).
         let edges = |pass: &mut wgpu::RenderPass<'a>,
                      bind_group: &'a wgpu::BindGroup,
+                     instance_bind_group: &'a wgpu::BindGroup,
+                     instance_offset: u32,
                      mesh: &'a SceneMesh| {
             if mesh.edge_segment_count == 0 {
                 return;
             }
             pass.set_pipeline(&self.edge_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(1, instance_bind_group, &[instance_offset]);
             pass.set_vertex_buffer(0, mesh.edge_buffer.slice(..));
             pass.draw(0..6, 0..mesh.edge_segment_count);
         };
 
         // 1. Opaque fills.
-        for body in base {
-            fill(pass, &self.pipeline, &self.bind_group, body);
+        if self.base_visible {
+            for instance in &self.instances {
+                fill(
+                    pass,
+                    &self.pipeline,
+                    &self.bind_group,
+                    &self.instance_bind_group,
+                    instance.uniform_offset,
+                    &self.bodies[instance.geometry_index],
+                );
+            }
         }
         for layer in self.layers.iter().filter(|l| l.style.is_opaque()) {
             let pipeline = if layer.style.cull_back {
@@ -1001,16 +1132,37 @@ impl RenderCore {
             } else {
                 &self.pipeline
             };
-            fill(pass, pipeline, &layer.bind_group, &layer.mesh);
+            fill(
+                pass,
+                pipeline,
+                &layer.bind_group,
+                &self.instance_bind_group,
+                self.identity_instance_offset,
+                &layer.mesh,
+            );
         }
 
         // 2. Edge overlays of the opaque geometry.
-        for body in base {
-            edges(pass, &self.bind_group, body);
+        if self.base_visible {
+            for instance in &self.instances {
+                edges(
+                    pass,
+                    &self.bind_group,
+                    &self.instance_bind_group,
+                    instance.uniform_offset,
+                    &self.bodies[instance.geometry_index],
+                );
+            }
         }
         for layer in self.layers.iter().filter(|l| l.style.is_opaque()) {
             if layer.style.draw_edges {
-                edges(pass, &layer.bind_group, &layer.mesh);
+                edges(
+                    pass,
+                    &layer.bind_group,
+                    &self.instance_bind_group,
+                    self.identity_instance_offset,
+                    &layer.mesh,
+                );
             }
         }
 
@@ -1022,9 +1174,22 @@ impl RenderCore {
                 (false, true) => &self.pipeline_blend_cull,
                 (false, false) => &self.pipeline_blend,
             };
-            fill(pass, pipeline, &layer.bind_group, &layer.mesh);
+            fill(
+                pass,
+                pipeline,
+                &layer.bind_group,
+                &self.instance_bind_group,
+                self.identity_instance_offset,
+                &layer.mesh,
+            );
             if layer.style.draw_edges {
-                edges(pass, &layer.bind_group, &layer.mesh);
+                edges(
+                    pass,
+                    &layer.bind_group,
+                    &self.instance_bind_group,
+                    self.identity_instance_offset,
+                    &layer.mesh,
+                );
             }
         }
     }
@@ -1072,10 +1237,12 @@ impl RenderCore {
             });
             pass.set_pipeline(&self.pick_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            for body in &self.bodies {
+            for instance in &self.instances {
+                let body = &self.bodies[instance.geometry_index];
                 if body.index_count == 0 {
                     continue;
                 }
+                pass.set_bind_group(1, &self.instance_bind_group, &[instance.uniform_offset]);
                 pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
                 pass.set_index_buffer(body.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..body.index_count, 0, 0..1);
@@ -1288,6 +1455,42 @@ fn make_bind_group(
             },
         ],
     })
+}
+
+fn make_instance_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("openrcad-render instance bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(std::mem::size_of::<[f32; 20]>() as u64),
+            }),
+        }],
+    })
+}
+
+fn pack_instance(model: [[f32; 4]; 4], face_id_base: u32, stride: usize) -> Vec<u8> {
+    let mut values = [0.0f32; 20];
+    for (column, entries) in model.iter().enumerate() {
+        values[column * 4..column * 4 + 4].copy_from_slice(entries);
+    }
+    values[16] = face_id_base as f32;
+    let bytes = bytemuck::bytes_of(&values);
+    let mut packed = vec![0u8; stride];
+    packed[..bytes.len()].copy_from_slice(bytes);
+    packed
+}
+
+fn align_up(value: u32, alignment: u32) -> u32 {
+    let alignment = alignment.max(1);
+    value.div_ceil(alignment) * alignment
 }
 
 fn identity4() -> [[f32; 4]; 4] {

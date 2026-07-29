@@ -567,19 +567,207 @@ impl ZeroCadApp {
             .collect()
     }
 
-    /// Pick the body element under `click`, in priority vertex > edge > face.
-    /// `proj` maps world (x,y,z) to (screen_x, screen_y, depth) — larger depth is
-    /// nearer the camera. The `sin/cos` are the camera angles, used to cull
-    /// back-facing triangles so only visible faces are pickable. Returns the
-    /// body node id and which element was hit.
+    /// Pick a finished sketch element under the pointer in Model mode. Point
+    /// handles take priority over edges, and edges over filled profiles, matching
+    /// the click behavior and the subtle preselection highlight.
+    pub(crate) fn pick_finished_sketch_element(
+        &self,
+        click: egui::Pos2,
+        project: &dyn Fn(f32, f32, f32) -> (f32, f32, f32),
+    ) -> Option<(String, SketchPick)> {
+        const POINT_TOLERANCE: f32 = 8.0;
+        const EDGE_TOLERANCE: f32 = 6.0;
+
+        let mut best_point: Option<(String, usize, f32)> = None;
+        let mut best_edge: Option<(String, usize, f32)> = None;
+        let mut best_face: Option<(String, usize, f32)> = None;
+        let variables = self.document.variable_map();
+
+        for index in self.document.graph.node_indices() {
+            let node = &self.document.graph[index];
+            if self.hidden_nodes.contains(&node.id) {
+                continue;
+            }
+            let FeatureType::Sketch {
+                cs,
+                curves,
+                shapes,
+                corner_mods,
+                mirrors,
+                solver,
+                ..
+            } = &node.feature
+            else {
+                continue;
+            };
+            let curves = zerocad_core::effective_curves_solved(
+                curves,
+                shapes,
+                corner_mods,
+                mirrors,
+                solver.as_ref(),
+                &variables,
+            );
+            let to_screen = |point: (f32, f32)| {
+                let world = cs.unproject(point.0, point.1);
+                let projected = project(world.x, world.y, world.z);
+                egui::pos2(projected.0, projected.1)
+            };
+
+            for (point_index, point) in crate::geom2d::selectable_sketch_points(&curves)
+                .into_iter()
+                .enumerate()
+            {
+                let distance = click.distance(to_screen(point));
+                if distance < POINT_TOLERANCE
+                    && best_point
+                        .as_ref()
+                        .is_none_or(|candidate| distance < candidate.2)
+                {
+                    best_point = Some((node.id.clone(), point_index, distance));
+                }
+            }
+
+            for (edge_index, segment) in curves.segments.iter().enumerate() {
+                let distance =
+                    dist_point_to_segment(click, to_screen(segment.a), to_screen(segment.b));
+                if distance < EDGE_TOLERANCE
+                    && best_edge
+                        .as_ref()
+                        .is_none_or(|candidate| distance < candidate.2)
+                {
+                    best_edge = Some((node.id.clone(), edge_index, distance));
+                }
+            }
+
+            let circle_offset = curves.segments.len();
+            for (circle_index, circle) in curves.circles.iter().enumerate() {
+                let distance = (0..=48)
+                    .map(|sample| {
+                        let angle = std::f32::consts::TAU * sample as f32 / 48.0;
+                        to_screen((
+                            circle.center.0 + circle.radius * angle.cos(),
+                            circle.center.1 + circle.radius * angle.sin(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .map(|pair| dist_point_to_segment(click, pair[0], pair[1]))
+                    .fold(f32::INFINITY, f32::min);
+                if distance < EDGE_TOLERANCE
+                    && best_edge
+                        .as_ref()
+                        .is_none_or(|candidate| distance < candidate.2)
+                {
+                    best_edge = Some((node.id.clone(), circle_offset + circle_index, distance));
+                }
+            }
+
+            let arc_offset = circle_offset + curves.circles.len();
+            for (arc_index, arc) in curves.arcs.iter().enumerate() {
+                let distance = crate::geom2d::sample_arc_points(arc, 48)
+                    .windows(2)
+                    .map(|pair| {
+                        dist_point_to_segment(click, to_screen(pair[0]), to_screen(pair[1]))
+                    })
+                    .fold(f32::INFINITY, f32::min);
+                if distance < EDGE_TOLERANCE
+                    && best_edge
+                        .as_ref()
+                        .is_none_or(|candidate| distance < candidate.2)
+                {
+                    best_edge = Some((node.id.clone(), arc_offset + arc_index, distance));
+                }
+            }
+
+            let spline_offset = arc_offset + curves.arcs.len();
+            for (spline_index, spline) in curves.splines.iter().enumerate() {
+                let distance = spline
+                    .sampled_points(0.01)
+                    .windows(2)
+                    .map(|pair| {
+                        dist_point_to_segment(click, to_screen(pair[0]), to_screen(pair[1]))
+                    })
+                    .fold(f32::INFINITY, f32::min);
+                if distance < EDGE_TOLERANCE
+                    && best_edge
+                        .as_ref()
+                        .is_none_or(|candidate| distance < candidate.2)
+                {
+                    best_edge = Some((node.id.clone(), spline_offset + spline_index, distance));
+                }
+            }
+
+            let mut region_curves = curves;
+            if let Some(boundary) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
+                region_curves.extend_curves(boundary);
+            }
+            for (region_index, region) in detect_regions(&region_curves).iter().enumerate() {
+                let screen_boundary: Vec<_> =
+                    region.boundary.iter().copied().map(to_screen).collect();
+                if screen_boundary.len() < 3
+                    || !zerocad_core::sketch::point_in_polygon(
+                        (click.x, click.y),
+                        &screen_boundary
+                            .iter()
+                            .map(|point| (point.x, point.y))
+                            .collect::<Vec<_>>(),
+                    )
+                {
+                    continue;
+                }
+                let inside_hole = region.holes.iter().any(|hole| {
+                    let screen_hole: Vec<_> = hole
+                        .iter()
+                        .copied()
+                        .map(to_screen)
+                        .map(|point| (point.x, point.y))
+                        .collect();
+                    screen_hole.len() >= 3
+                        && zerocad_core::sketch::point_in_polygon((click.x, click.y), &screen_hole)
+                });
+                if inside_hole {
+                    continue;
+                }
+                let depth = region
+                    .boundary
+                    .iter()
+                    .map(|point| {
+                        let world = cs.unproject(point.0, point.1);
+                        project(world.x, world.y, world.z).2
+                    })
+                    .sum::<f32>()
+                    / region.boundary.len().max(1) as f32;
+                if best_face
+                    .as_ref()
+                    .is_none_or(|candidate| depth > candidate.2)
+                {
+                    best_face = Some((node.id.clone(), region_index, depth));
+                }
+            }
+        }
+
+        if let Some((node, point, _)) = best_point {
+            Some((node, SketchPick::Point(point)))
+        } else if let Some((node, edge, _)) = best_edge {
+            Some((node, SketchPick::Edge(edge)))
+        } else if let Some((node, face, _)) = best_face {
+            Some((node, SketchPick::Face(face)))
+        } else {
+            None
+        }
+    }
+
+    /// Pick the visible body element under `click`, in priority vertex > edge >
+    /// face. `proj` maps world (x,y,z) to (screen_x, screen_y, depth) — larger
+    /// depth is nearer the camera. The `sin/cos` are the camera angles, used to
+    /// cull back-facing triangles so only visible geometry is pickable.
     ///
     /// `gpu_face` is the GPU pick buffer's answer for this pixel (see
     /// [`ZeroCadApp::gpu_pick_face`]): when it's authoritative
-    /// ([`GpuFacePick::Hit`]) the CPU face triangle scan is skipped entirely —
-    /// the id buffer is exact to the rendered silhouette and O(1). Vertex and
-    /// edge picks keep their CPU proximity search (they select within a pixel
-    /// *tolerance*, which a coverage buffer can't express) and still take
-    /// priority over the face.
+    /// ([`GpuFacePick::Hit`]) the CPU face-id scan is skipped. Vertex and edge
+    /// picks keep their CPU pixel-tolerance search, then pass a solid-surface
+    /// depth test so an edge hidden behind a nearer face cannot win.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pick_body_element(
         &self,
@@ -594,8 +782,16 @@ impl ZeroCadApp {
         const VERT_TOL_PX: f32 = 7.0;
         const EDGE_TOL_PX: f32 = 6.0;
 
-        let mut best_vertex: Option<(String, u32, f32)> = None; // (node, vert, px)
-        let mut best_edge: Option<(String, u32, f32)> = None; // (node, edge GROUP, px)
+        struct ProximityCandidate {
+            node: String,
+            pick: BodyPick,
+            priority: u8,
+            distance: f32,
+            screen: egui::Pos2,
+            depth: f32,
+        }
+
+        let mut proximity_candidates = Vec::new();
         let mut best_face: Option<(String, u32, f32)> = None; // (node, face, depth)
         let scan_faces = match gpu_face {
             gpu_viewport::GpuFacePick::Hit(hit) => {
@@ -609,19 +805,38 @@ impl ZeroCadApp {
             let rz_n = sin_y * n.0 + cos_y * n.2;
             sin_p * n.1 + cos_p * rz_n > 0.0
         };
-        // 2D point-in-triangle via consistent winding sign.
-        let point_in_tri = |p: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| -> bool {
-            let s = |u: egui::Pos2, v: egui::Pos2, w: egui::Pos2| {
-                (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x)
-            };
-            let d1 = s(a, b, p);
-            let d2 = s(b, c, p);
-            let d3 = s(c, a, p);
-            let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-            let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-            !(has_neg && has_pos)
+        let triangle_depth_at = |p: egui::Pos2,
+                                 a: (f32, f32, f32),
+                                 b: (f32, f32, f32),
+                                 c: (f32, f32, f32)|
+         -> Option<f32> {
+            let denominator = (b.1 - c.1) * (a.0 - c.0) + (c.0 - b.0) * (a.1 - c.1);
+            if denominator.abs() < 1.0e-9 {
+                return None;
+            }
+            let wa = ((b.1 - c.1) * (p.x - c.0) + (c.0 - b.0) * (p.y - c.1)) / denominator;
+            let wb = ((c.1 - a.1) * (p.x - c.0) + (a.0 - c.0) * (p.y - c.1)) / denominator;
+            let wc = 1.0 - wa - wb;
+            (wa >= -1.0e-4 && wb >= -1.0e-4 && wc >= -1.0e-4)
+                .then_some(wa * a.2 + wb * b.2 + wc * c.2)
         };
+        let closest_segment_sample =
+            |p: egui::Pos2, a: (f32, f32, f32), b: (f32, f32, f32)| -> (f32, egui::Pos2, f32) {
+                let a2 = egui::pos2(a.0, a.1);
+                let b2 = egui::pos2(b.0, b.1);
+                let ab = b2 - a2;
+                let length_sq = ab.length_sq();
+                let t = if length_sq > 1.0e-12 {
+                    ((p - a2).dot(ab) / length_sq).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let screen = a2 + ab * t;
+                ((p - screen).length(), screen, a.2 + (b.2 - a.2) * t)
+            };
 
+        // Gather every nearby edge and topological vertex first. Visibility is
+        // decided after the front surfaces of all bodies have been considered.
         for instance in self.evaluated_scene.instances() {
             let node_id = instance.entity_id();
             let mesh = self.evaluated_scene.mesh(instance);
@@ -681,8 +896,15 @@ impl ZeroCadApp {
                 ]);
                 let p = proj(point[0], point[1], point[2]);
                 let d = (egui::pos2(p.0, p.1) - click).length();
-                if d < VERT_TOL_PX && best_vertex.as_ref().is_none_or(|b| d < b.2) {
-                    best_vertex = Some((node_id.to_string(), v as u32, d));
+                if d < VERT_TOL_PX {
+                    proximity_candidates.push(ProximityCandidate {
+                        node: node_id.to_string(),
+                        pick: BodyPick::Vertex(v as u32),
+                        priority: 0,
+                        distance: d,
+                        screen: egui::pos2(p.0, p.1),
+                        depth: p.2,
+                    });
                 }
             }
 
@@ -703,87 +925,128 @@ impl ZeroCadApp {
                 ]);
                 let a = proj(point_a[0], point_a[1], point_a[2]);
                 let b = proj(point_b[0], point_b[1], point_b[2]);
-                let d = dist_point_to_segment(click, egui::pos2(a.0, a.1), egui::pos2(b.0, b.1));
-                if d < EDGE_TOL_PX && best_edge.as_ref().is_none_or(|b| d < b.2) {
+                let (distance, screen, depth) = closest_segment_sample(click, a, b);
+                if distance < EDGE_TOL_PX {
                     // Map the hit chord to its topological edge group, so the whole
                     // curve (a fillet arc, a circular rim) selects as one. Legacy
                     // meshes without grouping fall back to the raw segment index.
                     let g = mesh.edge_groups.get(e).copied().unwrap_or(e as u32);
-                    best_edge = Some((node_id.to_string(), g, d));
+                    proximity_candidates.push(ProximityCandidate {
+                        node: node_id.to_string(),
+                        pick: BodyPick::Edge(g),
+                        priority: 1,
+                        distance,
+                        screen,
+                        depth,
+                    });
                 }
             }
+        }
 
-            // Faces (front-facing triangles under the cursor; nearest wins).
-            // Skipped when the GPU pick buffer already answered for this pixel.
-            let tcount = if scan_faces {
-                mesh.indices.len() / 3
-            } else {
-                0
-            };
-            for t in 0..tcount {
-                let i0 = mesh.indices[t * 3] as usize * 6;
-                let i1 = mesh.indices[t * 3 + 1] as usize * 6;
-                let i2 = mesh.indices[t * 3 + 2] as usize * 6;
-                let n0 = placement.transform_vector([
-                    mesh.vertices[i0 + 3],
-                    mesh.vertices[i0 + 4],
-                    mesh.vertices[i0 + 5],
-                ]);
-                let n1 = placement.transform_vector([
-                    mesh.vertices[i1 + 3],
-                    mesh.vertices[i1 + 4],
-                    mesh.vertices[i1 + 5],
-                ]);
-                let n2 = placement.transform_vector([
-                    mesh.vertices[i2 + 3],
-                    mesh.vertices[i2 + 4],
-                    mesh.vertices[i2 + 5],
-                ]);
-                let normal = (
-                    (n0[0] + n1[0] + n2[0]) / 3.0,
-                    (n0[1] + n1[1] + n2[1]) / 3.0,
-                    (n0[2] + n1[2] + n2[2]) / 3.0,
-                );
-                if !faces_camera(normal) {
+        // Scan front-facing triangles once. Besides the CPU face fallback, this
+        // supplies projected surface depth at each nearby edge/vertex sample.
+        let mut surface_depths = vec![f32::NEG_INFINITY; proximity_candidates.len()];
+        let (mut depth_min, mut depth_max) = (f32::INFINITY, f32::NEG_INFINITY);
+        if scan_faces || !proximity_candidates.is_empty() {
+            for instance in self.evaluated_scene.instances() {
+                let node_id = instance.entity_id();
+                if self.hidden_nodes.contains(node_id) {
                     continue;
                 }
-                let point0 = placement.transform_point([
-                    mesh.vertices[i0],
-                    mesh.vertices[i0 + 1],
-                    mesh.vertices[i0 + 2],
-                ]);
-                let point1 = placement.transform_point([
-                    mesh.vertices[i1],
-                    mesh.vertices[i1 + 1],
-                    mesh.vertices[i1 + 2],
-                ]);
-                let point2 = placement.transform_point([
-                    mesh.vertices[i2],
-                    mesh.vertices[i2 + 1],
-                    mesh.vertices[i2 + 2],
-                ]);
-                let p0 = proj(point0[0], point0[1], point0[2]);
-                let p1 = proj(point1[0], point1[1], point1[2]);
-                let p2 = proj(point2[0], point2[1], point2[2]);
-                if point_in_tri(
-                    click,
-                    egui::pos2(p0.0, p0.1),
-                    egui::pos2(p1.0, p1.1),
-                    egui::pos2(p2.0, p2.1),
-                ) {
-                    let depth = (p0.2 + p1.2 + p2.2) / 3.0;
-                    if best_face.as_ref().is_none_or(|b| depth > b.2) {
-                        let fid = mesh.face_ids.get(t).copied().unwrap_or(0);
-                        best_face = Some((node_id.to_string(), fid, depth));
+                let mesh = self.evaluated_scene.mesh(instance);
+                let placement = instance.placement();
+                for t in 0..mesh.indices.len() / 3 {
+                    let i0 = mesh.indices[t * 3] as usize * 6;
+                    let i1 = mesh.indices[t * 3 + 1] as usize * 6;
+                    let i2 = mesh.indices[t * 3 + 2] as usize * 6;
+                    let n0 = placement.transform_vector([
+                        mesh.vertices[i0 + 3],
+                        mesh.vertices[i0 + 4],
+                        mesh.vertices[i0 + 5],
+                    ]);
+                    let n1 = placement.transform_vector([
+                        mesh.vertices[i1 + 3],
+                        mesh.vertices[i1 + 4],
+                        mesh.vertices[i1 + 5],
+                    ]);
+                    let n2 = placement.transform_vector([
+                        mesh.vertices[i2 + 3],
+                        mesh.vertices[i2 + 4],
+                        mesh.vertices[i2 + 5],
+                    ]);
+                    let normal = (
+                        (n0[0] + n1[0] + n2[0]) / 3.0,
+                        (n0[1] + n1[1] + n2[1]) / 3.0,
+                        (n0[2] + n1[2] + n2[2]) / 3.0,
+                    );
+                    if !faces_camera(normal) {
+                        continue;
+                    }
+                    let point0 = placement.transform_point([
+                        mesh.vertices[i0],
+                        mesh.vertices[i0 + 1],
+                        mesh.vertices[i0 + 2],
+                    ]);
+                    let point1 = placement.transform_point([
+                        mesh.vertices[i1],
+                        mesh.vertices[i1 + 1],
+                        mesh.vertices[i1 + 2],
+                    ]);
+                    let point2 = placement.transform_point([
+                        mesh.vertices[i2],
+                        mesh.vertices[i2 + 1],
+                        mesh.vertices[i2 + 2],
+                    ]);
+                    let p0 = proj(point0[0], point0[1], point0[2]);
+                    let p1 = proj(point1[0], point1[1], point1[2]);
+                    let p2 = proj(point2[0], point2[1], point2[2]);
+                    for projected in [p0, p1, p2] {
+                        depth_min = depth_min.min(projected.2);
+                        depth_max = depth_max.max(projected.2);
+                    }
+
+                    if scan_faces {
+                        if let Some(depth) = triangle_depth_at(click, p0, p1, p2) {
+                            if best_face.as_ref().is_none_or(|b| depth > b.2) {
+                                let fid = mesh.face_ids.get(t).copied().unwrap_or(0);
+                                best_face = Some((node_id.to_string(), fid, depth));
+                            }
+                        }
+                    }
+
+                    for (candidate, surface_depth) in
+                        proximity_candidates.iter().zip(surface_depths.iter_mut())
+                    {
+                        if let Some(depth) = triangle_depth_at(candidate.screen, p0, p1, p2) {
+                            *surface_depth = surface_depth.max(depth);
+                        }
                     }
                 }
             }
         }
 
-        if let Some((n, v, _)) = best_vertex {
-            Some((n, BodyPick::Vertex(v)))
-        } else if let Some((n, e, _)) = best_edge {
-            Some((n, BodyPick::Edge(e)))
+        // Permit self-contact within the same scale-aware tolerance used by the
+        // hidden-line renderer, but reject candidates covered by a nearer face.
+        let depth_bias = if depth_min.is_finite() && depth_max.is_finite() {
+            ((depth_max - depth_min) * 0.01).max(0.02)
+        } else {
+            0.02
+        };
+        let visible_candidate = proximity_candidates
+            .into_iter()
+            .zip(surface_depths)
+            .filter(|(candidate, surface_depth)| {
+                !surface_depth.is_finite() || *surface_depth <= candidate.depth + depth_bias
+            })
+            .min_by(|(a, _), (b, _)| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.distance.total_cmp(&b.distance))
+                    .then_with(|| b.depth.total_cmp(&a.depth))
+            });
+
+        if let Some((candidate, _)) = visible_candidate {
+            Some((candidate.node, candidate.pick))
         } else if let Some((n, f, _)) = best_face {
             Some((n, BodyPick::Face(f)))
         } else {
@@ -1153,6 +1416,24 @@ mod placed_scene_picking_tests {
     use crate::{egui, gpu_viewport, BodyPick, MockMesh, ZeroCadApp};
     use zerocad_core::{EvaluatedScene, SceneInstance, ScenePlacement};
 
+    fn front_square(z: f32) -> MockMesh {
+        let mut mesh = MockMesh::empty();
+        mesh.vertices = vec![
+            -20.0, -20.0, z, 0.0, 0.0, 1.0, 20.0, -20.0, z, 0.0, 0.0, 1.0, 20.0, 20.0, z, 0.0, 0.0,
+            1.0, -20.0, 20.0, z, 0.0, 0.0, 1.0,
+        ];
+        mesh.indices = vec![0, 1, 2, 0, 2, 3];
+        mesh.face_ids = vec![7, 7];
+        mesh
+    }
+
+    fn horizontal_edge(z: f32) -> MockMesh {
+        let mut mesh = MockMesh::empty();
+        mesh.edge_vertices = vec![-10.0, 0.0, z, 10.0, 0.0, z];
+        mesh.edge_indices = vec![0, 1];
+        mesh
+    }
+
     #[test]
     fn cpu_fallback_picks_transformed_scene_geometry_not_local_geometry() {
         let mut app = ZeroCadApp::new();
@@ -1195,6 +1476,67 @@ mod placed_scene_picking_tests {
             gpu_viewport::GpuFacePick::Unavailable,
         );
         assert_eq!(local, None);
+    }
+
+    #[test]
+    fn nearer_face_blocks_an_edge_pick_through_the_body() {
+        let mut app = ZeroCadApp::new();
+        app.set_body_meshes(vec![
+            ("hidden-edge".to_string(), horizontal_edge(0.0)),
+            ("front-face".to_string(), front_square(10.0)),
+        ]);
+        let project = |x: f32, y: f32, z: f32| (x, y, z);
+
+        let cpu_pick = app.pick_body_element(
+            egui::pos2(0.0, 0.0),
+            &project,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            gpu_viewport::GpuFacePick::Unavailable,
+        );
+        assert_eq!(
+            cpu_pick,
+            Some(("front-face".to_string(), BodyPick::Face(7)))
+        );
+
+        let gpu_pick = app.pick_body_element(
+            egui::pos2(0.0, 0.0),
+            &project,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            gpu_viewport::GpuFacePick::Hit(Some(("front-face".to_string(), 7))),
+        );
+
+        assert_eq!(
+            gpu_pick,
+            Some(("front-face".to_string(), BodyPick::Face(7)))
+        );
+    }
+
+    #[test]
+    fn edge_in_front_of_the_surface_remains_pickable() {
+        let mut app = ZeroCadApp::new();
+        app.set_body_meshes(vec![
+            ("visible-edge".to_string(), horizontal_edge(12.0)),
+            ("front-face".to_string(), front_square(10.0)),
+        ]);
+        let project = |x: f32, y: f32, z: f32| (x, y, z);
+
+        let pick = app.pick_body_element(
+            egui::pos2(0.0, 0.0),
+            &project,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            gpu_viewport::GpuFacePick::Hit(Some(("front-face".to_string(), 7))),
+        );
+
+        assert_eq!(pick, Some(("visible-edge".to_string(), BodyPick::Edge(0))));
     }
 }
 

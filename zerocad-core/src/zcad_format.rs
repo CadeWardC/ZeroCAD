@@ -9,7 +9,7 @@
 //!   0   4   magic           = b"ZCAD"
 //!   4   2   format_version  u16  = CURRENT_VERSION
 //!   6   1   save_profile    u8   (0 = compact, 1 = hydrated)
-//!   7   1   container_flags u8   (reserved)
+//!   7   1   project_kind u8      (bits 0-1: 0 Part, 1 Assembly; others reserved)
 //!   8   2   section_count   u16
 //!   10  2   reserved        = 0
 //!   12  16  header_digest   truncated BLAKE3 of bytes [0..12)
@@ -51,12 +51,18 @@ use crate::parametric::{FaceRef, FeatureNode, ParametricGraph};
 use crate::sketch::SketchCurves;
 use crate::units::Unit;
 use crate::EvaluationCacheSnapshot;
+use crate::{
+    AssemblyDefinition, AssemblyDocument, AssemblyOccurrence, AssemblyPresentationV1, AssetHash,
+    ModelHash, ProjectDocument, ProjectKind,
+};
 
 /// Magic bytes at the start of every binary `.zcad` file.
 pub const MAGIC: &[u8; 4] = b"ZCAD";
 /// The one deliberately incompatible Part Design document reset.
 pub const CURRENT_VERSION: u16 = 5;
 const DOCUMENT_RECIPE_SCHEMA: u16 = 3;
+const ASSEMBLY_RECIPE_SCHEMA_V1: u16 = 1;
+const ASSEMBLY_RECIPE_SCHEMA_V2: u16 = 2;
 const REQUIRED_ASSETS_SCHEMA: u16 = 1;
 const FEATURE_PAYLOAD_ABI: u16 = 1;
 const TOLERANCE_POLICY_ABI: u16 = 1;
@@ -77,6 +83,9 @@ const SEC_HIDDEN_NODES: u16 = 5;
 const SEC_HYDRATED_CHECKPOINTS: u16 = 6;
 const SEC_LARGE_PREVIEW: u16 = 7;
 const SEC_REQUIRED_ASSETS: u16 = 8;
+const SEC_ASSEMBLY_RECIPE: u16 = 9;
+const SEC_ASSEMBLY_PRESENTATION: u16 = 10;
+const SEC_ASSEMBLY_HYDRATION: u16 = 11;
 const HYDRATED_CACHE_SCHEMA: u16 = 3;
 const OPENRCAD_CACHE_ABI: u16 = 2;
 const MESH_CACHE_ABI: u16 = 3;
@@ -127,6 +136,8 @@ pub struct LoadLimits {
     pub max_recipe_bytes: u64,
     pub max_required_assets_bytes: u64,
     pub max_accelerator_bytes: u64,
+    pub max_definition_snapshot_bytes: u64,
+    pub max_definition_snapshot_total_bytes: u64,
 }
 
 impl Default for LoadLimits {
@@ -137,6 +148,8 @@ impl Default for LoadLimits {
             max_recipe_bytes: 256 * 1024 * 1024,
             max_required_assets_bytes: 2 * 1024 * 1024 * 1024,
             max_accelerator_bytes: 1024 * 1024 * 1024,
+            max_definition_snapshot_bytes: 256 * 1024 * 1024,
+            max_definition_snapshot_total_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -167,11 +180,23 @@ pub struct HydrationBundle {
     pub large_preview_png: Option<Vec<u8>>,
     pub display_meshes: Option<Vec<(String, MockMesh)>>,
     pub evaluation_cache: Option<EvaluationCacheSnapshot>,
+    /// Optional world-space bounds used only for preview/index metadata.
+    /// Readers and runtime framing never trust or hash this value.
+    pub world_bbox: Option<[f32; 6]>,
 }
 
 #[derive(Debug)]
 pub struct LoadedDocument {
     pub document: crate::document::Document,
+    pub profile: SaveProfile,
+    pub accelerators: HydrationBundle,
+    pub diagnostics: Vec<LoadDiagnostic>,
+}
+
+#[derive(Debug)]
+pub struct LoadedProjectDocument {
+    pub document: ProjectDocument,
+    pub metadata: ZcadMetadata,
     pub profile: SaveProfile,
     pub accelerators: HydrationBundle,
     pub diagnostics: Vec<LoadDiagnostic>,
@@ -225,6 +250,40 @@ pub struct ZcadMetadata {
     pub model_hash: [u8; 32],
     #[serde(default)]
     pub presentation_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssemblyRecipeDefinitionV1 {
+    pub model_hash: ModelHash,
+    pub name: String,
+    pub source_basename: Option<String>,
+    pub snapshot_asset_hash: AssetHash,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AssemblyRecipeOccurrenceV1 {
+    pub id: u64,
+    pub definition_model_hash: ModelHash,
+    pub name: String,
+    pub manual_placement: crate::RigidPlacement,
+    pub grounded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AssemblyRecipeV1 {
+    pub schema_version: u16,
+    pub definitions: Vec<AssemblyRecipeDefinitionV1>,
+    pub occurrences: Vec<AssemblyRecipeOccurrenceV1>,
+    pub next_occurrence_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AssemblyRecipeV2 {
+    pub schema_version: u16,
+    pub definitions: Vec<AssemblyRecipeDefinitionV1>,
+    pub occurrences: Vec<AssemblyRecipeOccurrenceV1>,
+    pub next_occurrence_id: u64,
+    pub mate_set: crate::AssemblyMateSet,
 }
 
 /// What the caller hands to [`write_zcad`].
@@ -356,6 +415,261 @@ impl Default for RequiredAssetsV1 {
 struct RequiredAssetBlob {
     content_hash: [u8; 32],
     bytes: Vec<u8>,
+}
+
+impl AssemblyRecipeV1 {
+    fn from_document(document: &AssemblyDocument) -> Result<(Self, RequiredAssetsV1), ZcadError> {
+        document
+            .validate_structural_contracts()
+            .map_err(|error| ZcadError::Decode(format!("invalid assembly document: {error}")))?;
+
+        let mut asset_map = BTreeMap::<AssetHash, Vec<u8>>::new();
+        let mut definitions = Vec::with_capacity(document.definitions.len());
+        for definition in document.definitions.values() {
+            let snapshot_asset_hash = definition.snapshot_asset_hash();
+            if let Some(existing) = asset_map.get(&snapshot_asset_hash) {
+                if existing.as_slice() != definition.compact_snapshot.as_slice() {
+                    return Err(ZcadError::Decode(
+                        "definition snapshot content-hash collision".into(),
+                    ));
+                }
+            } else {
+                asset_map.insert(
+                    snapshot_asset_hash,
+                    definition.compact_snapshot.as_ref().clone(),
+                );
+            }
+            definitions.push(AssemblyRecipeDefinitionV1 {
+                model_hash: definition.model_hash,
+                name: definition.name.clone(),
+                source_basename: definition.source_basename.clone(),
+                snapshot_asset_hash,
+            });
+        }
+
+        let occurrences = document
+            .occurrences
+            .values()
+            .map(|occurrence| AssemblyRecipeOccurrenceV1 {
+                id: occurrence.id,
+                definition_model_hash: occurrence.definition_model_hash,
+                name: occurrence.name.clone(),
+                manual_placement: occurrence.manual_placement,
+                grounded: occurrence.grounded,
+            })
+            .collect();
+        let assets = RequiredAssetsV1 {
+            schema_version: REQUIRED_ASSETS_SCHEMA,
+            blobs: asset_map
+                .into_iter()
+                .map(|(content_hash, bytes)| RequiredAssetBlob {
+                    content_hash,
+                    bytes,
+                })
+                .collect(),
+        };
+        Ok((
+            Self {
+                schema_version: ASSEMBLY_RECIPE_SCHEMA_V1,
+                definitions,
+                occurrences,
+                next_occurrence_id: document.next_occurrence_id,
+            },
+            assets,
+        ))
+    }
+
+    fn into_document(
+        self,
+        presentation: AssemblyPresentationV1,
+        created_unix: Option<u64>,
+        assets: &RequiredAssetsV1,
+        limits: &LoadLimits,
+    ) -> Result<AssemblyDocument, ZcadError> {
+        if self.schema_version != ASSEMBLY_RECIPE_SCHEMA_V1 {
+            return Err(ZcadError::Decode(format!(
+                "unsupported assembly recipe schema {}",
+                self.schema_version
+            )));
+        }
+        validate_required_assets(assets)?;
+        let asset_map: BTreeMap<AssetHash, &[u8]> = assets
+            .blobs
+            .iter()
+            .map(|asset| (asset.content_hash, asset.bytes.as_slice()))
+            .collect();
+        let referenced_assets: HashSet<AssetHash> = self
+            .definitions
+            .iter()
+            .map(|definition| definition.snapshot_asset_hash)
+            .collect();
+        if asset_map.len() != referenced_assets.len()
+            || asset_map
+                .keys()
+                .any(|asset| !referenced_assets.contains(asset))
+        {
+            return Err(ZcadError::Decode(
+                "assembly required assets do not exactly match definition snapshot roles".into(),
+            ));
+        }
+
+        let mut decoded_snapshot_total = 0u64;
+        let mut definitions = BTreeMap::new();
+        for definition in self.definitions {
+            let snapshot = asset_map
+                .get(&definition.snapshot_asset_hash)
+                .copied()
+                .ok_or_else(|| {
+                    ZcadError::Decode(format!(
+                        "definition `{}` references a missing Part snapshot",
+                        definition.name
+                    ))
+                })?;
+            let snapshot_len = snapshot.len() as u64;
+            if snapshot_len > limits.max_definition_snapshot_bytes {
+                return Err(ZcadError::LimitExceeded {
+                    what: "decoded definition snapshot",
+                    limit: limits.max_definition_snapshot_bytes,
+                    actual: snapshot_len,
+                });
+            }
+            decoded_snapshot_total = decoded_snapshot_total.checked_add(snapshot_len).ok_or(
+                ZcadError::LimitExceeded {
+                    what: "decoded definition snapshot total",
+                    limit: limits.max_definition_snapshot_total_bytes,
+                    actual: u64::MAX,
+                },
+            )?;
+            if decoded_snapshot_total > limits.max_definition_snapshot_total_bytes {
+                return Err(ZcadError::LimitExceeded {
+                    what: "decoded definition snapshot total",
+                    limit: limits.max_definition_snapshot_total_bytes,
+                    actual: decoded_snapshot_total,
+                });
+            }
+            if definitions
+                .insert(
+                    definition.model_hash,
+                    std::sync::Arc::new(AssemblyDefinition {
+                        model_hash: definition.model_hash,
+                        name: definition.name,
+                        source_basename: definition.source_basename,
+                        compact_snapshot: std::sync::Arc::new(snapshot.to_vec()),
+                    }),
+                )
+                .is_some()
+            {
+                return Err(ZcadError::Decode(
+                    "duplicate assembly definition model hash".into(),
+                ));
+            }
+        }
+
+        let mut occurrences = BTreeMap::new();
+        for occurrence in self.occurrences {
+            let id = occurrence.id;
+            if occurrences
+                .insert(
+                    id,
+                    AssemblyOccurrence {
+                        id,
+                        definition_model_hash: occurrence.definition_model_hash,
+                        name: occurrence.name,
+                        manual_placement: occurrence.manual_placement,
+                        grounded: occurrence.grounded,
+                        resolved_placement_override: None,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ZcadError::Decode(format!(
+                    "duplicate assembly occurrence id {id}"
+                )));
+            }
+        }
+        let document = AssemblyDocument {
+            definitions,
+            occurrences,
+            next_occurrence_id: self.next_occurrence_id,
+            presentation,
+            created_unix,
+            mates: None,
+        };
+        document
+            .validate_structural_contracts()
+            .map_err(|error| ZcadError::Decode(format!("invalid assembly document: {error}")))?;
+        Ok(document)
+    }
+}
+
+impl AssemblyRecipeV2 {
+    fn from_document(document: &AssemblyDocument) -> Result<(Self, RequiredAssetsV1), ZcadError> {
+        let mate_set = document.mates.clone().ok_or_else(|| {
+            ZcadError::Decode("AssemblyRecipeV2 requires an authored mate set".into())
+        })?;
+        let (v1, assets) = AssemblyRecipeV1::from_document(document)?;
+        Ok((
+            Self {
+                schema_version: ASSEMBLY_RECIPE_SCHEMA_V2,
+                definitions: v1.definitions,
+                occurrences: v1.occurrences,
+                next_occurrence_id: v1.next_occurrence_id,
+                mate_set,
+            },
+            assets,
+        ))
+    }
+
+    fn into_document(
+        self,
+        presentation: AssemblyPresentationV1,
+        created_unix: Option<u64>,
+        assets: &RequiredAssetsV1,
+        limits: &LoadLimits,
+    ) -> Result<AssemblyDocument, ZcadError> {
+        if self.schema_version != ASSEMBLY_RECIPE_SCHEMA_V2 {
+            return Err(ZcadError::Decode(format!(
+                "unsupported assembly recipe schema {}",
+                self.schema_version
+            )));
+        }
+        let mate_set = self.mate_set;
+        let mut document = AssemblyRecipeV1 {
+            schema_version: ASSEMBLY_RECIPE_SCHEMA_V1,
+            definitions: self.definitions,
+            occurrences: self.occurrences,
+            next_occurrence_id: self.next_occurrence_id,
+        }
+        .into_document(presentation, created_unix, assets, limits)?;
+        document.mates = Some(mate_set);
+        document
+            .validate_structural_contracts()
+            .map_err(|error| ZcadError::Decode(format!("invalid assembly V2 document: {error}")))?;
+        Ok(document)
+    }
+}
+
+fn validate_required_assets(assets: &RequiredAssetsV1) -> Result<(), ZcadError> {
+    if assets.schema_version != REQUIRED_ASSETS_SCHEMA {
+        return Err(ZcadError::Decode(format!(
+            "unsupported required-assets schema {}",
+            assets.schema_version
+        )));
+    }
+    let mut seen = HashSet::with_capacity(assets.blobs.len());
+    for asset in &assets.blobs {
+        if *blake3::hash(&asset.bytes).as_bytes() != asset.content_hash {
+            return Err(ZcadError::Decode(
+                "required asset content hash does not match its bytes".into(),
+            ));
+        }
+        if !seen.insert(asset.content_hash) {
+            return Err(ZcadError::Decode(
+                "duplicate required asset content hash".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +1213,8 @@ pub enum ZcadError {
     },
     /// The framing version is newer than this build can read.
     UnsupportedVersion(u16),
+    /// The header names a project kind this build does not understand.
+    UnsupportedProjectKind(u8),
     LimitExceeded {
         what: &'static str,
         limit: u64,
@@ -910,6 +1226,10 @@ pub enum ZcadError {
         second: u16,
     },
     UnknownRequiredSection(u16),
+    UnexpectedSectionForKind {
+        kind: ProjectKind,
+        section: u16,
+    },
     /// A payload failed to decode (bad CBOR, bad zstd stream, missing graph).
     Decode(String),
     Io(std::io::Error),
@@ -932,6 +1252,9 @@ impl std::fmt::Display for ZcadError {
                     "file format version {v} is newer than this build supports"
                 )
             }
+            ZcadError::UnsupportedProjectKind(kind) => {
+                write!(f, "project kind {kind} is not supported by this build")
+            }
             ZcadError::LimitExceeded {
                 what,
                 limit,
@@ -945,6 +1268,9 @@ impl std::fmt::Display for ZcadError {
             }
             ZcadError::UnknownRequiredSection(section) => {
                 write!(f, "unknown required section {section}")
+            }
+            ZcadError::UnexpectedSectionForKind { kind, section } => {
+                write!(f, "section {section} is not valid for {kind:?} projects")
             }
             ZcadError::Decode(msg) => write!(f, "could not decode file: {msg}"),
             ZcadError::Io(e) => write!(f, "I/O error: {e}"),
@@ -1135,6 +1461,12 @@ fn presentation_hash(units: Unit, hidden: &HashSet<String>) -> Result<[u8; 32], 
     let mut hidden: Vec<&str> = hidden.iter().map(String::as_str).collect();
     hidden.sort_unstable();
     Ok(*blake3::hash(&cbor_to_vec(&(units, hidden))?).as_bytes())
+}
+
+fn assembly_presentation_hash(
+    presentation: &AssemblyPresentationV1,
+) -> Result<[u8; 32], ZcadError> {
+    Ok(*blake3::hash(&cbor_to_vec(presentation)?).as_bytes())
 }
 
 #[cfg(test)]
@@ -1335,7 +1667,7 @@ pub fn write_document<W: Write + Seek>(
         options.profile,
         accelerators.large_preview_png.as_deref(),
     )?;
-    write_staged_sections(writer, options.profile, &sections)
+    write_staged_sections(writer, ProjectKind::Part, options.profile, &sections)
 }
 
 pub fn write_document_to_vec(
@@ -1345,6 +1677,41 @@ pub fn write_document_to_vec(
 ) -> Result<Vec<u8>, ZcadError> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     write_document(&mut cursor, document, options, accelerators)?;
+    Ok(cursor.into_inner())
+}
+
+pub fn write_project_document<W: Write + Seek>(
+    writer: &mut W,
+    document: &ProjectDocument,
+    options: &SaveOptions,
+    accelerators: &HydrationBundle,
+) -> Result<(), ZcadError> {
+    match document {
+        ProjectDocument::Part(document) => write_document(writer, document, options, accelerators),
+        ProjectDocument::Assembly(document) => {
+            let bbox = accelerators
+                .world_bbox
+                .or_else(|| accelerators.display_meshes.as_deref().map(meshes_bbox))
+                .unwrap_or([0.0; 6]);
+            let sections = stage_assembly_with_profile(
+                document,
+                options.profile,
+                bbox,
+                accelerators.small_preview_png.as_deref(),
+                accelerators.large_preview_png.as_deref(),
+            )?;
+            write_staged_sections(writer, ProjectKind::Assembly, options.profile, &sections)
+        }
+    }
+}
+
+pub fn write_project_document_to_vec(
+    document: &ProjectDocument,
+    options: &SaveOptions,
+    accelerators: &HydrationBundle,
+) -> Result<Vec<u8>, ZcadError> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    write_project_document(&mut cursor, document, options, accelerators)?;
     Ok(cursor.into_inner())
 }
 
@@ -1360,6 +1727,36 @@ pub fn read_document_from_slice(
     options: &LoadOptions,
 ) -> Result<LoadedDocument, ZcadError> {
     loaded_zcad_to_document(read_binary(bytes, options)?)
+}
+
+pub fn read_project_document<R: Read + Seek>(
+    reader: &mut R,
+    options: &LoadOptions,
+) -> Result<LoadedProjectDocument, ZcadError> {
+    let envelope = read_envelope(reader, options)?;
+    match envelope.project_kind {
+        ProjectKind::Part => {
+            let loaded = decode_part_envelope(envelope)?;
+            let metadata = loaded.metadata.clone();
+            let loaded = loaded_zcad_to_document(loaded)?;
+            Ok(LoadedProjectDocument {
+                document: ProjectDocument::Part(loaded.document),
+                metadata,
+                profile: loaded.profile,
+                accelerators: loaded.accelerators,
+                diagnostics: loaded.diagnostics,
+            })
+        }
+        ProjectKind::Assembly => decode_assembly_envelope(envelope, options),
+    }
+}
+
+pub fn read_project_document_from_slice(
+    bytes: &[u8],
+    options: &LoadOptions,
+) -> Result<LoadedProjectDocument, ZcadError> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    read_project_document(&mut cursor, options)
 }
 
 fn loaded_zcad_to_document(loaded: LoadedZcad) -> Result<LoadedDocument, ZcadError> {
@@ -1389,6 +1786,7 @@ fn loaded_zcad_to_document(loaded: LoadedZcad) -> Result<LoadedDocument, ZcadErr
             large_preview_png: loaded.large_preview_png,
             display_meshes: loaded.mesh_cache,
             evaluation_cache: loaded.evaluation_cache,
+            world_bbox: Some(loaded.metadata.bbox),
         },
         diagnostics,
     })
@@ -1674,11 +2072,138 @@ fn stage_zcad_with_profile(
     Ok(sections)
 }
 
+fn stage_assembly_with_profile(
+    document: &AssemblyDocument,
+    profile: SaveProfile,
+    bbox: [f32; 6],
+    small_preview_png: Option<&[u8]>,
+    large_preview_png: Option<&[u8]>,
+) -> Result<Vec<StagedSection>, ZcadError> {
+    document
+        .validate_structural_contracts()
+        .map_err(|error| ZcadError::Decode(format!("invalid assembly document: {error}")))?;
+    for definition in document.definitions.values() {
+        validate_compact_part_snapshot(
+            definition.compact_snapshot.as_slice(),
+            definition.model_hash,
+            &LoadOptions::default(),
+        )?;
+    }
+
+    let (recipe_schema, recipe_cbor, required_assets) = if document.mates.is_some() {
+        let (recipe, assets) = AssemblyRecipeV2::from_document(document)?;
+        (ASSEMBLY_RECIPE_SCHEMA_V2, cbor_to_vec(&recipe)?, assets)
+    } else {
+        let (recipe, assets) = AssemblyRecipeV1::from_document(document)?;
+        (ASSEMBLY_RECIPE_SCHEMA_V1, cbor_to_vec(&recipe)?, assets)
+    };
+    let presentation_cbor = cbor_to_vec(&document.presentation)?;
+    let metadata = ZcadMetadata {
+        format_version: CURRENT_VERSION,
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        created_unix: document.created_unix.unwrap_or(0),
+        modified_unix: 0,
+        units: document.presentation.units,
+        feature_count: u32::try_from(document.occurrences.len()).map_err(|_| {
+            ZcadError::LimitExceeded {
+                what: "assembly occurrence count",
+                limit: u32::MAX as u64,
+                actual: document.occurrences.len() as u64,
+            }
+        })?,
+        // Preview/indexing data only. It is deliberately excluded from all
+        // hashes and is never verified or used to gate load.
+        bbox,
+        profile: profile.header_tag(),
+        accelerator_budget: match profile {
+            SaveProfile::Compact => 0,
+            SaveProfile::Hydrated {
+                total_accelerator_budget,
+            } => total_accelerator_budget,
+        },
+        recipe_schema,
+        feature_payload_abi: 0,
+        required_assets_abi: REQUIRED_ASSETS_SCHEMA,
+        openrcad_cache_abi: 0,
+        tessellation_abi: 0,
+        tolerance_policy_abi: TOLERANCE_POLICY_ABI,
+        model_hash: model_hash(&recipe_cbor, &required_assets),
+        presentation_hash: assembly_presentation_hash(&document.presentation)?,
+    };
+    let metadata_cbor = cbor_to_vec(&metadata)?;
+    let recipe_stored = zstd_compress(&recipe_cbor, GRAPH_LEVEL)?;
+    let presentation_stored = zstd_compress(&presentation_cbor, GRAPH_LEVEL)?;
+    let mut sections = vec![
+        StagedSection {
+            id: SEC_METADATA,
+            flags: SECTION_REQUIRED,
+            codec: CODEC_STORE,
+            uncompressed_len: metadata_cbor.len(),
+            stored: metadata_cbor,
+        },
+        StagedSection {
+            id: SEC_ASSEMBLY_RECIPE,
+            flags: SECTION_REQUIRED,
+            codec: CODEC_ZSTD,
+            uncompressed_len: recipe_cbor.len(),
+            stored: recipe_stored,
+        },
+    ];
+    if !required_assets.blobs.is_empty() {
+        let cbor = cbor_to_vec(&required_assets)?;
+        let stored = zstd_compress(&cbor, GRAPH_LEVEL)?;
+        sections.push(StagedSection {
+            id: SEC_REQUIRED_ASSETS,
+            flags: SECTION_REQUIRED,
+            codec: CODEC_ZSTD,
+            uncompressed_len: cbor.len(),
+            stored,
+        });
+    }
+    sections.push(StagedSection {
+        id: SEC_ASSEMBLY_PRESENTATION,
+        flags: SECTION_REQUIRED,
+        codec: CODEC_ZSTD,
+        uncompressed_len: presentation_cbor.len(),
+        stored: presentation_stored,
+    });
+    if let Some(png) = small_preview_png {
+        if !png.is_empty() && png.len() <= MAX_TINY_PREVIEW_BYTES {
+            sections.push(StagedSection {
+                id: SEC_THUMBNAIL,
+                flags: SECTION_DISPOSABLE,
+                codec: CODEC_STORE,
+                uncompressed_len: png.len(),
+                stored: png.to_vec(),
+            });
+        }
+    }
+    if let (
+        SaveProfile::Hydrated {
+            total_accelerator_budget,
+        },
+        Some(png),
+    ) = (profile, large_preview_png)
+    {
+        if !png.is_empty() && png.len() as u64 <= total_accelerator_budget {
+            sections.push(StagedSection {
+                id: SEC_LARGE_PREVIEW,
+                flags: SECTION_DISPOSABLE,
+                codec: CODEC_STORE,
+                uncompressed_len: png.len(),
+                stored: png.to_vec(),
+            });
+        }
+    }
+    Ok(sections)
+}
+
 /// Write already-compressed sections directly to their destination. The
 /// section table is emitted first and payloads are streamed without assembling
 /// a second full-file buffer.
 fn write_staged_sections<W: Write + Seek>(
     writer: &mut W,
+    project_kind: ProjectKind,
     profile: SaveProfile,
     sections: &[StagedSection],
 ) -> Result<(), ZcadError> {
@@ -1702,7 +2227,7 @@ fn write_staged_sections<W: Write + Seek>(
     header.extend_from_slice(MAGIC);
     header.extend_from_slice(&CURRENT_VERSION.to_le_bytes());
     header.push(profile.header_tag());
-    header.push(0);
+    header.push(project_kind as u8);
     header.extend_from_slice(&(section_count as u16).to_le_bytes());
     header.extend_from_slice(&[0u8; 2]);
     let header_digest = blake3::hash(&header);
@@ -1745,7 +2270,7 @@ fn write_zcad_with_profile(
 ) -> Result<Vec<u8>, ZcadError> {
     let sections = stage_zcad_with_profile(doc, profile, large_preview_png)?;
     let mut cursor = std::io::Cursor::new(Vec::new());
-    write_staged_sections(&mut cursor, profile, &sections)?;
+    write_staged_sections(&mut cursor, ProjectKind::Part, profile, &sections)?;
     Ok(cursor.into_inner())
 }
 
@@ -1827,6 +2352,17 @@ pub fn write_document_file(
     })
 }
 
+pub fn write_project_document_file(
+    path: impl AsRef<Path>,
+    document: &ProjectDocument,
+    options: &SaveOptions,
+    accelerators: &HydrationBundle,
+) -> Result<(), ZcadError> {
+    write_atomic(path.as_ref(), |file| {
+        write_project_document(file, document, options, accelerators)
+    })
+}
+
 pub fn read_document_file(
     path: impl AsRef<Path>,
     options: &LoadOptions,
@@ -1834,6 +2370,33 @@ pub fn read_document_file(
     let path = path.as_ref();
     let mut file = std::fs::File::open(path).map_err(ZcadError::Io)?;
     let mut loaded = read_document(&mut file, options)?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let mismatch = match (extension.as_deref(), loaded.profile) {
+        (Some("zcad"), SaveProfile::Hydrated { .. }) => Some("Compact"),
+        (Some("zcadh"), SaveProfile::Compact) => Some("Hydrated"),
+        _ => None,
+    };
+    if let Some(expected) = mismatch {
+        loaded
+            .diagnostics
+            .push(LoadDiagnostic::ExtensionProfileMismatch {
+                expected: expected.to_owned(),
+                actual: loaded.profile,
+            });
+    }
+    Ok(loaded)
+}
+
+pub fn read_project_document_file(
+    path: impl AsRef<Path>,
+    options: &LoadOptions,
+) -> Result<LoadedProjectDocument, ZcadError> {
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path).map_err(ZcadError::Io)?;
+    let mut loaded = read_project_document(&mut file, options)?;
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1903,6 +2466,14 @@ struct SectionRef {
     uncompressed_len: usize,
 }
 
+struct LoadedEnvelope {
+    project_kind: ProjectKind,
+    profile_tag: u8,
+    sections: Vec<SectionRef>,
+    accelerator_stored_total: u64,
+    diagnostics: Vec<LoadDiagnostic>,
+}
+
 fn read_binary(bytes: &[u8], options: &LoadOptions) -> Result<LoadedZcad, ZcadError> {
     let mut cursor = std::io::Cursor::new(bytes);
     read_binary_reader(&mut cursor, options)
@@ -1929,14 +2500,26 @@ fn read_exact_or_truncated(reader: &mut impl Read, bytes: &mut [u8]) -> Result<(
     })
 }
 
-fn decoded_section_limit(id: u16, flags: u8, limits: &LoadLimits) -> u64 {
+fn decoded_section_limit(
+    project_kind: ProjectKind,
+    id: u16,
+    flags: u8,
+    limits: &LoadLimits,
+) -> u64 {
     match id {
         SEC_METADATA => limits.max_manifest_bytes,
-        SEC_GRAPH | SEC_HIDDEN_NODES => limits.max_recipe_bytes,
-        SEC_REQUIRED_ASSETS => limits.max_required_assets_bytes,
-        SEC_THUMBNAIL | SEC_MESH_CACHE | SEC_HYDRATED_CHECKPOINTS | SEC_LARGE_PREVIEW => {
-            limits.max_accelerator_bytes
+        SEC_GRAPH | SEC_HIDDEN_NODES | SEC_ASSEMBLY_RECIPE | SEC_ASSEMBLY_PRESENTATION => {
+            limits.max_recipe_bytes
         }
+        SEC_REQUIRED_ASSETS if project_kind == ProjectKind::Assembly => limits
+            .max_definition_snapshot_total_bytes
+            .saturating_add(64 * 1024 * 1024),
+        SEC_REQUIRED_ASSETS => limits.max_required_assets_bytes,
+        SEC_THUMBNAIL
+        | SEC_MESH_CACHE
+        | SEC_HYDRATED_CHECKPOINTS
+        | SEC_LARGE_PREVIEW
+        | SEC_ASSEMBLY_HYDRATION => limits.max_accelerator_bytes,
         _ if flags & SECTION_REQUIRED != 0 => limits.max_required_assets_bytes,
         _ => limits.max_accelerator_bytes,
     }
@@ -1953,13 +2536,16 @@ fn known_section(id: u16) -> bool {
             | SEC_HYDRATED_CHECKPOINTS
             | SEC_LARGE_PREVIEW
             | SEC_REQUIRED_ASSETS
+            | SEC_ASSEMBLY_RECIPE
+            | SEC_ASSEMBLY_PRESENTATION
+            | SEC_ASSEMBLY_HYDRATION
     )
 }
 
-fn read_binary_reader<R: Read + Seek>(
+fn read_envelope<R: Read + Seek>(
     reader: &mut R,
     options: &LoadOptions,
-) -> Result<LoadedZcad, ZcadError> {
+) -> Result<LoadedEnvelope, ZcadError> {
     let file_len = reader.seek(SeekFrom::End(0)).map_err(ZcadError::Io)?;
     reader.seek(SeekFrom::Start(0)).map_err(ZcadError::Io)?;
     let mut header = [0u8; HEADER_LEN];
@@ -1971,11 +2557,16 @@ fn read_binary_reader<R: Read + Seek>(
     if header[12..28] != expected_header.as_bytes()[..16] {
         return Err(ZcadError::BadChecksum { section: 0 });
     }
-    if header[7] != 0 || header[10..12] != [0, 0] || header[28..32] != [0; 4] {
+    if header[7] & !0b11 != 0 || header[10..12] != [0, 0] || header[28..32] != [0; 4] {
         return Err(ZcadError::Decode(
             "non-zero reserved container header bytes".into(),
         ));
     }
+    let project_kind = match header[7] & 0b11 {
+        0 => ProjectKind::Part,
+        1 => ProjectKind::Assembly,
+        other => return Err(ZcadError::UnsupportedProjectKind(other)),
+    };
     let format_version = le_u16(&header[4..6]);
     if format_version != CURRENT_VERSION {
         return Err(ZcadError::UnsupportedVersion(format_version));
@@ -2032,7 +2623,7 @@ fn read_binary_reader<R: Read + Seek>(
         let offset = le_u64(&entry[4..12]);
         let stored_len_u64 = le_u64(&entry[12..20]);
         let uncompressed_len_u64 = le_u64(&entry[20..28]);
-        let decoded_limit = decoded_section_limit(id, flags, &options.limits);
+        let decoded_limit = decoded_section_limit(project_kind, id, flags, &options.limits);
         if uncompressed_len_u64 > decoded_limit {
             return Err(ZcadError::LimitExceeded {
                 what: "decoded section length",
@@ -2085,7 +2676,7 @@ fn read_binary_reader<R: Read + Seek>(
         }
         if matches!(
             id,
-            SEC_MESH_CACHE | SEC_HYDRATED_CHECKPOINTS | SEC_LARGE_PREVIEW
+            SEC_MESH_CACHE | SEC_HYDRATED_CHECKPOINTS | SEC_LARGE_PREVIEW | SEC_ASSEMBLY_HYDRATION
         ) {
             accelerator_stored_total = accelerator_stored_total
                 .checked_add(stored_len_u64)
@@ -2156,6 +2747,36 @@ fn read_binary_reader<R: Read + Seek>(
         });
     }
 
+    Ok(LoadedEnvelope {
+        project_kind,
+        profile_tag,
+        sections,
+        accelerator_stored_total,
+        diagnostics,
+    })
+}
+
+fn read_binary_reader<R: Read + Seek>(
+    reader: &mut R,
+    options: &LoadOptions,
+) -> Result<LoadedZcad, ZcadError> {
+    let envelope = read_envelope(reader, options)?;
+    if envelope.project_kind != ProjectKind::Part {
+        return Err(ZcadError::Decode(
+            "expected a Part project but found an Assembly".into(),
+        ));
+    }
+    decode_part_envelope(envelope)
+}
+
+fn decode_part_envelope(envelope: LoadedEnvelope) -> Result<LoadedZcad, ZcadError> {
+    let LoadedEnvelope {
+        project_kind: _,
+        profile_tag,
+        sections,
+        accelerator_stored_total,
+        mut diagnostics,
+    } = envelope;
     // Decode each section into its slot. Unknown ids are skipped silently.
     let mut metadata = ZcadMetadata::default();
     let mut recipe: Option<DocumentRecipeV3> = None;
@@ -2231,6 +2852,12 @@ fn read_binary_reader<R: Read + Seek>(
                         reason: error.to_string(),
                     }),
                 }
+            }
+            SEC_ASSEMBLY_RECIPE | SEC_ASSEMBLY_PRESENTATION | SEC_ASSEMBLY_HYDRATION => {
+                return Err(ZcadError::UnexpectedSectionForKind {
+                    kind: ProjectKind::Part,
+                    section: s.id,
+                });
             }
             _ if s.flags & SECTION_REQUIRED != 0 => {
                 return Err(ZcadError::UnknownRequiredSection(s.id));
@@ -2397,6 +3024,263 @@ fn read_binary_reader<R: Read + Seek>(
     })
 }
 
+fn decode_assembly_envelope(
+    envelope: LoadedEnvelope,
+    options: &LoadOptions,
+) -> Result<LoadedProjectDocument, ZcadError> {
+    let LoadedEnvelope {
+        project_kind: _,
+        profile_tag,
+        sections,
+        accelerator_stored_total,
+        mut diagnostics,
+    } = envelope;
+    let mut metadata: Option<ZcadMetadata> = None;
+    let mut recipe_bytes: Option<Vec<u8>> = None;
+    let mut presentation: Option<AssemblyPresentationV1> = None;
+    let mut required_assets = RequiredAssetsV1::default();
+    let mut thumbnail_png = None;
+    let mut large_preview_png = None;
+    let mut saw_hydration = false;
+
+    for section in &sections {
+        match section.id {
+            SEC_METADATA => {
+                require_section_flag(section, SECTION_REQUIRED, "manifest")?;
+                metadata = Some(cbor_from_slice(&decode_section(section)?)?);
+            }
+            SEC_ASSEMBLY_RECIPE => {
+                require_section_flag(section, SECTION_REQUIRED, "assembly recipe")?;
+                recipe_bytes = Some(decode_section(section)?);
+            }
+            SEC_ASSEMBLY_PRESENTATION => {
+                require_section_flag(section, SECTION_REQUIRED, "assembly presentation")?;
+                presentation = Some(cbor_from_slice(&decode_section(section)?)?);
+            }
+            SEC_REQUIRED_ASSETS => {
+                require_section_flag(section, SECTION_REQUIRED, "required assets")?;
+                required_assets = cbor_from_slice(&decode_section(section)?)?;
+            }
+            SEC_THUMBNAIL => match decode_section(section) {
+                Ok(raw) => thumbnail_png = Some(raw),
+                Err(error) => diagnostics.push(LoadDiagnostic::DiscardedDisposableSection {
+                    section: section.id,
+                    reason: error.to_string(),
+                }),
+            },
+            SEC_LARGE_PREVIEW => match decode_section(section) {
+                Ok(raw) => large_preview_png = Some(raw),
+                Err(error) => diagnostics.push(LoadDiagnostic::DiscardedDisposableSection {
+                    section: section.id,
+                    reason: error.to_string(),
+                }),
+            },
+            SEC_ASSEMBLY_HYDRATION => {
+                require_section_flag(section, SECTION_DISPOSABLE, "assembly hydration")?;
+                saw_hydration = true;
+                if let Err(error) = decode_section(section) {
+                    diagnostics.push(LoadDiagnostic::DiscardedDisposableSection {
+                        section: section.id,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+            SEC_GRAPH | SEC_MESH_CACHE | SEC_HIDDEN_NODES | SEC_HYDRATED_CHECKPOINTS => {
+                return Err(ZcadError::UnexpectedSectionForKind {
+                    kind: ProjectKind::Assembly,
+                    section: section.id,
+                });
+            }
+            _ if section.flags & SECTION_REQUIRED != 0 => {
+                return Err(ZcadError::UnknownRequiredSection(section.id));
+            }
+            _ => {}
+        }
+    }
+
+    let metadata = metadata.ok_or_else(|| ZcadError::Decode("file has no manifest".into()))?;
+    if metadata.format_version != CURRENT_VERSION {
+        return Err(ZcadError::Decode(format!(
+            "manifest version {} does not match container version {CURRENT_VERSION}",
+            metadata.format_version
+        )));
+    }
+    if metadata.profile != profile_tag {
+        return Err(ZcadError::Decode(
+            "manifest profile does not match container header".into(),
+        ));
+    }
+    if !matches!(
+        metadata.recipe_schema,
+        ASSEMBLY_RECIPE_SCHEMA_V1 | ASSEMBLY_RECIPE_SCHEMA_V2
+    ) || metadata.feature_payload_abi != 0
+        || metadata.required_assets_abi != REQUIRED_ASSETS_SCHEMA
+        || metadata.tolerance_policy_abi != TOLERANCE_POLICY_ABI
+    {
+        return Err(ZcadError::Decode(format!(
+            "unsupported assembly authoritative ABI set (recipe={}, payload={}, assets={}, tolerance={})",
+            metadata.recipe_schema,
+            metadata.feature_payload_abi,
+            metadata.required_assets_abi,
+            metadata.tolerance_policy_abi
+        )));
+    }
+    let profile = SaveProfile::from_header(profile_tag, metadata.accelerator_budget)?;
+    let profile_allows_accelerators = match profile {
+        SaveProfile::Compact => false,
+        SaveProfile::Hydrated {
+            total_accelerator_budget,
+        } => accelerator_stored_total <= total_accelerator_budget,
+    };
+    if !profile_allows_accelerators {
+        let reason = match profile {
+            SaveProfile::Compact => "compact profile forbids accelerator sections".to_owned(),
+            SaveProfile::Hydrated {
+                total_accelerator_budget,
+            } => format!(
+                "accelerator sections exceed the embedded budget ({accelerator_stored_total} > {total_accelerator_budget})"
+            ),
+        };
+        if large_preview_png.take().is_some() {
+            diagnostics.push(LoadDiagnostic::DiscardedDisposableSection {
+                section: SEC_LARGE_PREVIEW,
+                reason: reason.clone(),
+            });
+        }
+        if saw_hydration {
+            diagnostics.push(LoadDiagnostic::DiscardedDisposableSection {
+                section: SEC_ASSEMBLY_HYDRATION,
+                reason,
+            });
+        }
+    }
+    if thumbnail_png
+        .as_ref()
+        .is_some_and(|preview: &Vec<u8>| preview.len() > MAX_TINY_PREVIEW_BYTES)
+    {
+        thumbnail_png = None;
+        diagnostics.push(LoadDiagnostic::DiscardedDisposableSection {
+            section: SEC_THUMBNAIL,
+            reason: "tiny preview exceeds the 32 KiB profile cap".into(),
+        });
+    }
+
+    let recipe_bytes = recipe_bytes
+        .as_deref()
+        .ok_or_else(|| ZcadError::Decode("file has no assembly recipe bytes".into()))?;
+    if metadata.model_hash != model_hash(recipe_bytes, &required_assets) {
+        return Err(ZcadError::Decode(
+            "manifest model hash does not match assembly recipe and required assets".into(),
+        ));
+    }
+    let presentation = presentation
+        .ok_or_else(|| ZcadError::Decode("file has no assembly presentation".into()))?;
+    if metadata.presentation_hash != assembly_presentation_hash(&presentation)? {
+        return Err(ZcadError::Decode(
+            "manifest presentation hash does not match assembly presentation".into(),
+        ));
+    }
+    if metadata.units != presentation.units {
+        return Err(ZcadError::Decode(
+            "manifest units do not match assembly presentation".into(),
+        ));
+    }
+    let (occurrence_count, document) = match metadata.recipe_schema {
+        ASSEMBLY_RECIPE_SCHEMA_V1 => {
+            let recipe: AssemblyRecipeV1 = cbor_from_slice(recipe_bytes)?;
+            let count = recipe.occurrences.len();
+            let document = recipe.into_document(
+                presentation,
+                (metadata.created_unix != 0).then_some(metadata.created_unix),
+                &required_assets,
+                &options.limits,
+            )?;
+            (count, document)
+        }
+        ASSEMBLY_RECIPE_SCHEMA_V2 => {
+            let recipe: AssemblyRecipeV2 = cbor_from_slice(recipe_bytes)?;
+            let count = recipe.occurrences.len();
+            let document = recipe.into_document(
+                presentation,
+                (metadata.created_unix != 0).then_some(metadata.created_unix),
+                &required_assets,
+                &options.limits,
+            )?;
+            (count, document)
+        }
+        _ => unreachable!("authoritative ABI check rejected this schema"),
+    };
+    let expected_feature_count =
+        u32::try_from(occurrence_count).map_err(|_| ZcadError::LimitExceeded {
+            what: "assembly occurrence count",
+            limit: u32::MAX as u64,
+            actual: occurrence_count as u64,
+        })?;
+    if metadata.feature_count != expected_feature_count {
+        return Err(ZcadError::Decode(
+            "manifest occurrence count does not match assembly recipe".into(),
+        ));
+    }
+    for definition in document.definitions.values() {
+        validate_compact_part_snapshot(
+            definition.compact_snapshot.as_slice(),
+            definition.model_hash,
+            options,
+        )?;
+    }
+
+    let preview_bbox = metadata.bbox;
+    Ok(LoadedProjectDocument {
+        document: ProjectDocument::Assembly(document),
+        metadata,
+        profile,
+        accelerators: HydrationBundle {
+            small_preview_png: thumbnail_png,
+            large_preview_png,
+            display_meshes: None,
+            evaluation_cache: None,
+            world_bbox: Some(preview_bbox),
+        },
+        diagnostics,
+    })
+}
+
+fn require_section_flag(section: &SectionRef, expected: u8, label: &str) -> Result<(), ZcadError> {
+    if section.flags & expected == 0 {
+        Err(ZcadError::Decode(format!(
+            "{label} has the wrong required/disposable flag"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_compact_part_snapshot(
+    bytes: &[u8],
+    expected_model_hash: ModelHash,
+    options: &LoadOptions,
+) -> Result<(), ZcadError> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let envelope = read_envelope(&mut cursor, options)?;
+    if envelope.project_kind != ProjectKind::Part {
+        return Err(ZcadError::Decode(
+            "assembly definition snapshot is not a Part project".into(),
+        ));
+    }
+    let loaded = decode_part_envelope(envelope)?;
+    if loaded.profile != SaveProfile::Compact {
+        return Err(ZcadError::Decode(
+            "assembly definition snapshot must use the Compact profile".into(),
+        ));
+    }
+    if loaded.metadata.model_hash != expected_model_hash {
+        return Err(ZcadError::Decode(
+            "definition model hash does not match its parsed Part snapshot".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_section(s: &SectionRef) -> Result<Vec<u8>, ZcadError> {
     match s.codec {
         CODEC_STORE => Ok(s.stored.clone()),
@@ -2409,6 +3293,318 @@ fn decode_section(s: &SectionRef) -> Result<Vec<u8>, ZcadError> {
 mod tests {
     use super::*;
     use crate::parametric::{FeatureNode, FeatureType};
+    use std::sync::Arc;
+
+    fn compact_part_snapshot() -> (Vec<u8>, ModelHash) {
+        let document = crate::Document::new();
+        let bytes = write_document_to_vec(
+            &document,
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        let loaded = read_binary(&bytes, &LoadOptions::default()).unwrap();
+        (bytes, loaded.metadata.model_hash)
+    }
+
+    fn populated_assembly() -> AssemblyDocument {
+        let (snapshot, model_hash) = compact_part_snapshot();
+        let mut document = AssemblyDocument::new();
+        document.definitions.insert(
+            model_hash,
+            Arc::new(AssemblyDefinition {
+                model_hash,
+                name: "Bracket".into(),
+                source_basename: Some("bracket.zcad".into()),
+                compact_snapshot: Arc::new(snapshot),
+            }),
+        );
+        document.occurrences.insert(
+            41,
+            AssemblyOccurrence {
+                id: 41,
+                definition_model_hash: model_hash,
+                name: "Bracket:1".into(),
+                manual_placement: crate::RigidPlacement::new(
+                    [12.0, -3.0, 8.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                )
+                .unwrap(),
+                grounded: true,
+                resolved_placement_override: None,
+            },
+        );
+        document.next_occurrence_id = 42;
+        document
+            .presentation
+            .hidden_bodies
+            .insert((41, "body-that-cannot-yet-resolve".into()));
+        document
+    }
+
+    fn assembly_sections(document: &AssemblyDocument) -> Vec<StagedSection> {
+        stage_assembly_with_profile(
+            document,
+            SaveProfile::Compact,
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn write_assembly_sections(sections: &[StagedSection]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        write_staged_sections(
+            &mut cursor,
+            ProjectKind::Assembly,
+            SaveProfile::Compact,
+            sections,
+        )
+        .unwrap();
+        cursor.into_inner()
+    }
+
+    fn replace_staged_raw(section: &mut StagedSection, raw: Vec<u8>) {
+        section.uncompressed_len = raw.len();
+        section.stored = match section.codec {
+            CODEC_STORE => raw,
+            CODEC_ZSTD => zstd_compress(&raw, GRAPH_LEVEL).unwrap(),
+            other => panic!("unexpected test codec {other}"),
+        };
+    }
+
+    #[test]
+    fn project_part_writer_is_byte_identical_to_part_writer() {
+        let document = crate::Document::new();
+        let part = write_document_to_vec(
+            &document,
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        let project = write_project_document_to_vec(
+            &ProjectDocument::Part(document),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        assert_eq!(part, project);
+        assert_eq!(part[7], ProjectKind::Part as u8);
+    }
+
+    #[test]
+    fn populated_assembly_round_trips_deterministically() {
+        let document = populated_assembly();
+        let first = write_project_document_to_vec(
+            &ProjectDocument::Assembly(document.clone()),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        let second = write_project_document_to_vec(
+            &ProjectDocument::Assembly(document),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first[7], ProjectKind::Assembly as u8);
+
+        let loaded = read_project_document_from_slice(&first, &LoadOptions::default()).unwrap();
+        let ProjectDocument::Assembly(loaded) = loaded.document else {
+            panic!("assembly decoded as a part");
+        };
+        assert_eq!(loaded.next_occurrence_id, 42);
+        assert!(loaded.occurrences[&41].grounded);
+        assert_eq!(
+            loaded.occurrences[&41].resolved_placement().translation(),
+            [12.0, -3.0, 8.0]
+        );
+        assert!(loaded
+            .presentation
+            .hidden_bodies
+            .contains(&(41, "body-that-cannot-yet-resolve".into())));
+    }
+
+    #[test]
+    fn assembly_v2_mates_round_trip_under_strict_recipe_schema() {
+        let mut document = populated_assembly();
+        let mut mate_set = crate::AssemblyMateSet::default();
+        mate_set.mates.insert(
+            1,
+            crate::AssemblyMate {
+                id: 1,
+                name: "Fix Bracket".into(),
+                suppressed: false,
+                first: crate::AssemblyEntityRef {
+                    occurrence_id: 41,
+                    local_body_id: "body".into(),
+                    local_selector: crate::AssemblyLocalSelector::Origin,
+                },
+                second: None,
+                kind: crate::AssemblyMateKind::Fixed,
+                sense: crate::MateSense::Aligned,
+            },
+        );
+        mate_set.next_mate_id = 2;
+        document.mates = Some(mate_set);
+        let bytes = write_project_document_to_vec(
+            &ProjectDocument::Assembly(document),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        let loaded = read_project_document_from_slice(&bytes, &LoadOptions::default()).unwrap();
+        assert_eq!(loaded.metadata.recipe_schema, ASSEMBLY_RECIPE_SCHEMA_V2);
+        let ProjectDocument::Assembly(loaded) = loaded.document else {
+            panic!("assembly decoded as a part");
+        };
+        let mates = loaded.mates.expect("V2 mate set");
+        assert_eq!(mates.next_mate_id, 2);
+        assert_eq!(mates.mates[&1].name, "Fix Bracket");
+    }
+
+    #[test]
+    fn ten_thousand_occurrence_boundary_round_trips() {
+        let (snapshot, model_hash) = compact_part_snapshot();
+        let mut document = AssemblyDocument::new();
+        document.definitions.insert(
+            model_hash,
+            Arc::new(AssemblyDefinition {
+                model_hash,
+                name: "Repeated".into(),
+                source_basename: None,
+                compact_snapshot: Arc::new(snapshot),
+            }),
+        );
+        for id in 1..=10_000 {
+            document.occurrences.insert(
+                id,
+                AssemblyOccurrence {
+                    id,
+                    definition_model_hash: model_hash,
+                    name: format!("Repeated:{id}"),
+                    manual_placement: crate::RigidPlacement::IDENTITY,
+                    grounded: false,
+                    resolved_placement_override: None,
+                },
+            );
+        }
+        document.next_occurrence_id = 10_001;
+        let bytes = write_project_document_to_vec(
+            &ProjectDocument::Assembly(document),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        let loaded = read_project_document_from_slice(&bytes, &LoadOptions::default()).unwrap();
+        let ProjectDocument::Assembly(loaded) = loaded.document else {
+            panic!("assembly decoded as a part");
+        };
+        assert_eq!(loaded.occurrences.len(), 10_000);
+        assert_eq!(loaded.next_occurrence_id, 10_001);
+    }
+
+    #[test]
+    fn assembly_decode_is_independent_of_section_table_order() {
+        let mut sections = assembly_sections(&populated_assembly());
+        sections.reverse();
+        let bytes = write_assembly_sections(&sections);
+        let loaded = read_project_document_from_slice(&bytes, &LoadOptions::default()).unwrap();
+        assert!(matches!(loaded.document, ProjectDocument::Assembly(_)));
+    }
+
+    #[test]
+    fn crafted_next_occurrence_id_cannot_reuse_an_existing_id() {
+        let mut sections = assembly_sections(&populated_assembly());
+        let recipe_index = sections
+            .iter()
+            .position(|section| section.id == SEC_ASSEMBLY_RECIPE)
+            .unwrap();
+        let recipe_raw = decode_section(&SectionRef {
+            id: sections[recipe_index].id,
+            flags: sections[recipe_index].flags,
+            codec: sections[recipe_index].codec,
+            stored: sections[recipe_index].stored.clone(),
+            uncompressed_len: sections[recipe_index].uncompressed_len,
+        })
+        .unwrap();
+        let mut recipe: AssemblyRecipeV1 = cbor_from_slice(&recipe_raw).unwrap();
+        recipe.next_occurrence_id = 41;
+        let modified_recipe = cbor_to_vec(&recipe).unwrap();
+        replace_staged_raw(&mut sections[recipe_index], modified_recipe.clone());
+
+        let assets = sections
+            .iter()
+            .find(|section| section.id == SEC_REQUIRED_ASSETS)
+            .map(|section| {
+                decode_section(&SectionRef {
+                    id: section.id,
+                    flags: section.flags,
+                    codec: section.codec,
+                    stored: section.stored.clone(),
+                    uncompressed_len: section.uncompressed_len,
+                })
+                .and_then(|raw| cbor_from_slice(&raw))
+                .unwrap()
+            })
+            .unwrap_or_default();
+        let metadata_index = sections
+            .iter()
+            .position(|section| section.id == SEC_METADATA)
+            .unwrap();
+        let mut metadata: ZcadMetadata = cbor_from_slice(&sections[metadata_index].stored).unwrap();
+        metadata.model_hash = model_hash(&modified_recipe, &assets);
+        replace_staged_raw(
+            &mut sections[metadata_index],
+            cbor_to_vec(&metadata).unwrap(),
+        );
+
+        let error = read_project_document_from_slice(
+            &write_assembly_sections(&sections),
+            &LoadOptions::default(),
+        )
+        .expect_err("reused occurrence id must be rejected");
+        assert!(
+            matches!(error, ZcadError::Decode(message) if message.contains("next occurrence id"))
+        );
+    }
+
+    #[test]
+    fn assembly_bbox_is_preview_data_and_never_gates_load() {
+        let mut sections = assembly_sections(&populated_assembly());
+        let metadata = sections
+            .iter_mut()
+            .find(|section| section.id == SEC_METADATA)
+            .unwrap();
+        let mut decoded: ZcadMetadata = cbor_from_slice(&metadata.stored).unwrap();
+        decoded.bbox = [-99_999.0; 6];
+        replace_staged_raw(metadata, cbor_to_vec(&decoded).unwrap());
+        let loaded = read_project_document_from_slice(
+            &write_assembly_sections(&sections),
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(loaded.metadata.bbox, [-99_999.0; 6]);
+    }
+
+    #[test]
+    fn future_project_kind_has_a_clear_error() {
+        let mut bytes = write_project_document_to_vec(
+            &ProjectDocument::Assembly(populated_assembly()),
+            &SaveOptions::default(),
+            &HydrationBundle::default(),
+        )
+        .unwrap();
+        bytes[7] = 2;
+        let digest = blake3::hash(&bytes[..12]);
+        bytes[12..28].copy_from_slice(&digest.as_bytes()[..16]);
+        assert!(matches!(
+            read_project_document_from_slice(&bytes, &LoadOptions::default()),
+            Err(ZcadError::UnsupportedProjectKind(2))
+        ));
+    }
 
     fn box_cbor(w: f32) -> Vec<u8> {
         let mut pg = ParametricGraph::new();

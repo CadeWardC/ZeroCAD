@@ -35,6 +35,16 @@ var<uniform> globals: Globals;
 @group(0) @binding(1)
 var face_states: texture_2d<f32>;
 
+struct Instance {
+    // Local geometry remains immutable and shared. Every occurrence supplies
+    // only this rigid world transform and its pick/highlight face-id base.
+    model: mat4x4<f32>,
+    face_base: vec4<f32>,
+};
+
+@group(1) @binding(0)
+var<uniform> instance: Instance;
+
 const HOVER_COLOR: vec3<f32> = vec3<f32>(0.35, 0.62, 1.0);
 const SELECT_COLOR: vec3<f32> = vec3<f32>(1.0, 0.78, 0.28);
 
@@ -52,10 +62,15 @@ fn vs_main(
     @location(2) face_id: f32,
 ) -> VsOut {
     var out: VsOut;
-    out.clip_pos = globals.view_proj * vec4<f32>(position, 1.0);
-    out.normal = normal;
-    out.face_id = face_id;
-    out.world_pos = position;
+    let world = instance.model * vec4<f32>(position, 1.0);
+    out.clip_pos = globals.view_proj * world;
+    out.normal = mat3x3<f32>(
+        instance.model[0].xyz,
+        instance.model[1].xyz,
+        instance.model[2].xyz,
+    ) * normal;
+    out.face_id = face_id + instance.face_base.x;
+    out.world_pos = world.xyz;
     return out;
 }
 
@@ -82,7 +97,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if state > 1.5 {
             color = mix(color, SELECT_COLOR, 0.6);
         } else if state > 0.5 {
-            color = mix(color, HOVER_COLOR, 0.45);
+            color = mix(color, HOVER_COLOR, 0.14);
         }
     }
     return vec4<f32>(color * shade, globals.color.a);
@@ -107,14 +122,16 @@ fn vs_edge(
     @location(1) b: vec3<f32>,
 ) -> EdgeOut {
     var out: EdgeOut;
-    let ca = globals.view_proj * vec4<f32>(a, 1.0);
-    let cb = globals.view_proj * vec4<f32>(b, 1.0);
+    let world_a = (instance.model * vec4<f32>(a, 1.0)).xyz;
+    let world_b = (instance.model * vec4<f32>(b, 1.0)).xyz;
+    let ca = globals.view_proj * vec4<f32>(world_a, 1.0);
+    let cb = globals.view_proj * vec4<f32>(world_b, 1.0);
     // An endpoint at/behind the projection plane can't be expanded in screen
     // space — collapse the quad to a clipped point.
     if ca.w <= 0.0 || cb.w <= 0.0 {
         out.clip_pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
         out.across_px = 0.0;
-        out.world_pos = a;
+        out.world_pos = world_a;
         return out;
     }
 
@@ -145,7 +162,7 @@ fn vs_edge(
     let z = mix(ca.z, cb.z, t);
     out.clip_pos = vec4<f32>(sp / half_px * w, z, w);
     out.across_px = s * ext;
-    out.world_pos = mix(a, b, t);
+    out.world_pos = mix(world_a, world_b, t);
     return out;
 }
 

@@ -222,6 +222,8 @@ pub(crate) struct RecentEntry {
     pub(crate) path: PathBuf,
     /// Unix seconds of the last save/open, newest first in the list.
     pub(crate) last_opened: u64,
+    #[serde(default)]
+    pub(crate) project_kind: Option<zerocad_core::ProjectKind>,
 }
 
 /// The recent-projects list, newest first. Capped so the file stays small; the
@@ -252,7 +254,7 @@ impl RecentFiles {
 
     /// Record `path` as the most-recently-used project: move it to the front
     /// (de-duplicated), stamp it now, and cap the list. Persists immediately.
-    pub(crate) fn record(&mut self, path: &Path) {
+    pub(crate) fn record(&mut self, path: &Path, project_kind: zerocad_core::ProjectKind) {
         let path = path.to_path_buf();
         self.entries.retain(|e| e.path != path);
         self.entries.insert(
@@ -260,6 +262,7 @@ impl RecentFiles {
             RecentEntry {
                 path,
                 last_opened: now_secs(),
+                project_kind: Some(project_kind),
             },
         );
         self.entries.truncate(RECENT_CAP);

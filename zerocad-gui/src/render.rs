@@ -11,12 +11,24 @@ use zerocad_core::{
 };
 
 use crate::geom2d::{draw_sketch_geometry, fill_nested_loops};
-use crate::{BodyPick, PendingVisualMode, SectionView, SharedBodyMeshes, SnapKind, ZeroCadApp};
+use crate::{
+    BodyPick, PendingVisualMode, SectionView, SharedBodyMeshes, SketchPick, SnapKind, ZeroCadApp,
+};
 
 const NORMAL_BODY_BASE: (f32, f32, f32) = (190.0, 196.0, 210.0);
 // Match the GPU renderer's warm selected-face tint: yellow body fill with the
 // stronger orange outline drawn by the selection overlay.
 const SELECTED_BODY_BASE: (f32, f32, f32) = (255.0, 199.0, 71.0);
+const HOVER_BODY_TINT: (f32, f32, f32) = (85.0, 155.0, 225.0);
+
+fn blend_base(base: (f32, f32, f32), tint: (f32, f32, f32), amount: f32) -> (f32, f32, f32) {
+    let keep = 1.0 - amount;
+    (
+        base.0 * keep + tint.0 * amount,
+        base.1 * keep + tint.1 * amount,
+        base.2 * keep + tint.2 * amount,
+    )
+}
 
 /// Weak-perspective camera distance used by every `project_3d` implementation
 /// (this file, the viewport pickers, and the GPU `build_view_proj`). One
@@ -93,6 +105,155 @@ fn draw_construction_curves(
     }
 }
 
+fn draw_hovered_solver_element(
+    painter: &egui::Painter,
+    model: &zerocad_core::sketch::SketchSolverModel,
+    hovered: zerocad_core::sketch::EntityId,
+    to_screen: &dyn Fn((f32, f32)) -> egui::Pos2,
+) {
+    use zerocad_core::sketch::SketchEntity;
+
+    let edge_stroke = egui::Stroke::new(
+        2.35,
+        egui::Color32::from_rgba_unmultiplied(65, 145, 210, 145),
+    );
+    if let Some(point) = model.points.iter().find(|point| point.id == hovered) {
+        let center = to_screen((point.pos.0 as f32, point.pos.1 as f32));
+        painter.circle_filled(
+            center,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(125, 180, 225, 90),
+        );
+        painter.circle_stroke(
+            center,
+            4.0,
+            egui::Stroke::new(
+                1.35,
+                egui::Color32::from_rgba_unmultiplied(60, 135, 195, 165),
+            ),
+        );
+        return;
+    }
+
+    let point = |id| {
+        model
+            .point(id)
+            .map(|point| (point.pos.0 as f32, point.pos.1 as f32))
+    };
+    let draw_polyline = |points: Vec<(f32, f32)>| {
+        for pair in points.windows(2) {
+            painter.line_segment([to_screen(pair[0]), to_screen(pair[1])], edge_stroke);
+        }
+    };
+    let Some(entity) = model.entities.iter().find(|entity| entity.id() == hovered) else {
+        return;
+    };
+    match entity {
+        SketchEntity::Line { p0, p1, .. } => {
+            if let (Some(a), Some(b)) = (point(*p0), point(*p1)) {
+                draw_polyline(vec![a, b]);
+            }
+        }
+        SketchEntity::Circle { center, radius, .. } => {
+            let Some(center) = point(*center) else {
+                return;
+            };
+            draw_polyline(
+                (0..=64)
+                    .map(|index| {
+                        let angle = index as f32 / 64.0 * std::f32::consts::TAU;
+                        (
+                            center.0 + *radius as f32 * angle.cos(),
+                            center.1 + *radius as f32 * angle.sin(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        SketchEntity::Arc {
+            center,
+            start,
+            end,
+            radius,
+            clockwise,
+            ..
+        } => {
+            let (Some(center), Some(start), Some(end)) =
+                (point(*center), point(*start), point(*end))
+            else {
+                return;
+            };
+            let arc = zerocad_core::sketch::Arc {
+                center,
+                radius: *radius as f32,
+                start,
+                end,
+                clockwise: *clockwise,
+            };
+            draw_polyline(crate::geom2d::sample_arc_points(&arc, 48));
+        }
+        SketchEntity::Ellipse {
+            center,
+            major_axis,
+            minor_axis,
+            start_parameter,
+            end_parameter,
+            closed,
+            ..
+        } => {
+            let Some(center) = point(*center) else {
+                return;
+            };
+            let sweep = if *closed {
+                std::f64::consts::TAU
+            } else {
+                end_parameter - start_parameter
+            };
+            draw_polyline(
+                (0..=64)
+                    .map(|index| {
+                        let parameter = start_parameter + sweep * index as f64 / 64.0;
+                        let (sin, cos) = parameter.sin_cos();
+                        (
+                            center.0 + (major_axis[0] * cos + minor_axis[0] * sin) as f32,
+                            center.1 + (major_axis[1] * cos + minor_axis[1] * sin) as f32,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        SketchEntity::Spline {
+            points,
+            kind,
+            degree,
+            knots,
+            weights,
+            closed,
+            periodic,
+            continuity,
+            trim,
+            ..
+        } => {
+            let points: Option<Vec<(f32, f32)>> = points.iter().map(|id| point(*id)).collect();
+            let Some(points) = points else {
+                return;
+            };
+            let spline = zerocad_core::Spline {
+                kind: *kind,
+                points,
+                degree: *degree,
+                knots: knots.clone(),
+                weights: weights.clone(),
+                closed: *closed,
+                periodic: *periodic,
+                continuity: *continuity,
+                trim: *trim,
+            };
+            draw_polyline(spline.sampled_points(0.01));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RenderItemContent {
     Triangle {
@@ -160,9 +321,11 @@ fn needs_cpu_occlusion(
     interacting: bool,
     plane_pick_active: bool,
     has_datum_sheets: bool,
-    whole_body_selected: bool,
+    has_depth_clipped_body_highlight: bool,
 ) -> bool {
-    !gpu_active || (!interacting && (plane_pick_active || has_datum_sheets || whole_body_selected))
+    !gpu_active
+        || (!interacting
+            && (plane_pick_active || has_datum_sheets || has_depth_clipped_body_highlight))
 }
 
 #[cfg(test)]
@@ -282,6 +445,27 @@ mod selected_material_tests {
         assert!(needs_cpu_occlusion(true, false, false, true, false));
         assert!(needs_cpu_occlusion(true, false, false, false, true));
         assert!(needs_cpu_occlusion(false, true, false, false, false));
+    }
+
+    #[test]
+    fn body_highlight_uses_the_moved_preview_geometry() {
+        let mut app = ZeroCadApp::new();
+        let mesh = MockMesh::make_box(2.0, 2.0, 2.0);
+        let original_edge_x = mesh.edge_vertices[0];
+        app.set_body_meshes(vec![("body".to_string(), mesh)]);
+        app.begin_move_body("body".to_string());
+        app.move_op.as_mut().unwrap().translation = [12.0, 3.0, -4.0];
+        app.refresh_move_preview();
+
+        let preview = app.move_preview_bodies.as_ref().unwrap();
+        let (highlight_mesh, placement) = app
+            .body_highlight_geometry("body", Some(preview))
+            .expect("preview highlight geometry");
+
+        assert!(placement.is_identity());
+        assert!((highlight_mesh.edge_vertices[0] - (original_edge_x + 12.0)).abs() < 1.0e-6);
+        let (_, committed_mesh) = app.evaluated_scene.find("body").unwrap();
+        assert!((committed_mesh.edge_vertices[0] - original_edge_x).abs() < 1.0e-6);
     }
 
     #[test]
@@ -536,6 +720,26 @@ impl ZeroCadApp {
             thread_preview_mesh: self.thread_preview_mesh(),
             body_alpha,
         }
+    }
+
+    /// Geometry used by a body selection/preselection overlay.
+    ///
+    /// Full-body previews replace the committed scene for the current frame, so
+    /// their highlights must use the same replacement mesh. Otherwise a moved
+    /// body's fill advances while its orange outline remains at the old position.
+    fn body_highlight_geometry<'a>(
+        &'a self,
+        node_id: &str,
+        preview_bodies: Option<&'a SharedBodyMeshes>,
+    ) -> Option<(&'a MockMesh, ScenePlacement)> {
+        if let Some((_, mesh)) = preview_bodies
+            .and_then(|bodies| bodies.iter().find(|(preview_id, _)| preview_id == node_id))
+        {
+            return Some((mesh, ScenePlacement::IDENTITY));
+        }
+
+        let (instance, mesh) = self.evaluated_scene.find(node_id)?;
+        Some((mesh, instance.placement()))
     }
 
     /// A high-performance, robust, and clean CPU-projected vector viewport drawing engine
@@ -1284,16 +1488,16 @@ impl ZeroCadApp {
         // so back edges x-ray through the solid. We rasterize the OPAQUE surface
         // into a coarse depth grid (section A), then in section F draw only the
         // edge spans that aren't behind a nearer face. Larger `final_z` = nearer.
-        let whole_body_selected = self
+        let has_depth_clipped_body_highlight = self
             .selected_body
             .iter()
-            .any(|(_, pick)| matches!(pick, BodyPick::Whole));
+            .any(|(_, pick)| matches!(pick, BodyPick::Whole | BodyPick::Edge(_)));
         let build_occlusion = needs_cpu_occlusion(
             gpu_active,
             interacting,
             self.plane_pick_active(),
             !datum_sheets.is_empty(),
-            whole_body_selected,
+            has_depth_clipped_body_highlight,
         );
         let (occ_cell, occ_w, occ_h) = if build_occlusion {
             let bw_full = rect.width().ceil().max(1.0) as usize;
@@ -1494,6 +1698,12 @@ impl ZeroCadApp {
                     &selected_faces,
                 ) {
                     SELECTED_BODY_BASE
+                } else if matches!(
+                    self.hovered_body_element.as_ref(),
+                    Some((node_id, BodyPick::Face(hovered_face)))
+                        if Some(node_id.as_str()) == d.node_id && *hovered_face == face_id
+                ) {
+                    blend_base(d.base, HOVER_BODY_TINT, 0.14)
                 } else {
                     d.base
                 };
@@ -1875,19 +2085,59 @@ impl ZeroCadApp {
             }
         }
 
-        // --- 5a. DRAW BODY SELECTION HIGHLIGHTS (on top of the solids) ---
-        if !self.selected_body.is_empty() {
-            let sel_edge = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 140, 0));
-            let sel_vert = egui::Color32::from_rgb(255, 140, 0);
-            for (node_id, pick) in &self.selected_body {
-                let Some((instance, mesh)) = self.evaluated_scene.find(node_id) else {
+        // --- 5a. DRAW BODY PRESELECTION + SELECTION HIGHLIGHTS ---
+        // Hover is painted first and skipped when the same element (or its whole
+        // body) is selected, so the stronger orange selected state always wins.
+        let mut body_highlights: Vec<(String, BodyPick, bool)> = Vec::new();
+        if let Some((node_id, pick)) = self.hovered_body_element.as_ref() {
+            let hover_is_visible = matches!(pick, BodyPick::Edge(_) | BodyPick::Vertex(_));
+            let hover_is_selected = self.selected_body.iter().any(|(selected_node, selected)| {
+                selected_node == node_id && (*selected == *pick || *selected == BodyPick::Whole)
+            });
+            if hover_is_visible && !hover_is_selected {
+                body_highlights.push((node_id.clone(), *pick, false));
+            }
+        }
+        body_highlights.extend(
+            self.selected_body
+                .iter()
+                .map(|(node_id, pick)| (node_id.clone(), *pick, true)),
+        );
+
+        if !body_highlights.is_empty() {
+            for (node_id, pick, is_selected) in body_highlights {
+                let edge_stroke = if is_selected {
+                    egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 140, 0))
+                } else {
+                    egui::Stroke::new(
+                        2.35,
+                        egui::Color32::from_rgba_unmultiplied(65, 145, 210, 145),
+                    )
+                };
+                let vertex_fill = if is_selected {
+                    egui::Color32::from_rgb(255, 140, 0)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(125, 180, 225, 95)
+                };
+                let vertex_stroke = if is_selected {
+                    egui::Stroke::new(1.5, egui::Color32::WHITE)
+                } else {
+                    egui::Stroke::new(
+                        1.35,
+                        egui::Color32::from_rgba_unmultiplied(60, 135, 195, 170),
+                    )
+                };
+                let vertex_radius = if is_selected { 5.0 } else { 4.25 };
+
+                let Some((mesh, placement)) =
+                    self.body_highlight_geometry(&node_id, preview_bodies.as_ref())
+                else {
                     continue;
                 };
-                let placement = instance.placement();
 
-                // Highlight one edge. Whole-body selection uses the same
-                // front-face and depth-buffer clipping as the normal hidden-line
-                // pass; explicit edge selection remains fully emphasized.
+                // Highlight one edge. Whole-body and explicit edge selections
+                // use the same front-face and depth-buffer clipping as the
+                // normal hidden-line pass, so selected rear edges never x-ray.
                 let highlight_edge = |painter: &egui::Painter, e: usize, visible_only: bool| {
                     if visible_only && mesh.edge_face_normals.len() >= (e + 1) * 6 {
                         let o = e * 6;
@@ -1922,8 +2172,10 @@ impl ZeroCadApp {
                     let a = project_3d(point_a[0], point_a[1], point_a[2]);
                     let b = project_3d(point_b[0], point_b[1], point_b[2]);
                     if !visible_only {
-                        painter
-                            .line_segment([egui::pos2(a.0, a.1), egui::pos2(b.0, b.1)], sel_edge);
+                        painter.line_segment(
+                            [egui::pos2(a.0, a.1), egui::pos2(b.0, b.1)],
+                            edge_stroke,
+                        );
                         return;
                     }
                     let len = (b.0 - a.0).hypot(b.1 - a.1);
@@ -1937,7 +2189,7 @@ impl ZeroCadApp {
                         let depth = a.2 + (b.2 - a.2) * t;
                         if occluded(x, y, depth) {
                             if let Some(start) = run_start.take() {
-                                painter.line_segment([start, last_visible], sel_edge);
+                                painter.line_segment([start, last_visible], edge_stroke);
                             }
                         } else {
                             let point = egui::pos2(x, y);
@@ -1946,11 +2198,11 @@ impl ZeroCadApp {
                         }
                     }
                     if let Some(start) = run_start {
-                        painter.line_segment([start, last_visible], sel_edge);
+                        painter.line_segment([start, last_visible], edge_stroke);
                     }
                 };
 
-                match *pick {
+                match pick {
                     BodyPick::Face(_) => {}
                     BodyPick::Edge(g) => {
                         // `g` is a topological edge group: light up every chord that
@@ -1960,12 +2212,12 @@ impl ZeroCadApp {
                         let ecount = mesh.edge_indices.len() / 2;
                         if mesh.edge_groups.is_empty() {
                             if (g as usize) < ecount {
-                                highlight_edge(&painter, g as usize, false);
+                                highlight_edge(&painter, g as usize, true);
                             }
                         } else {
                             for seg in 0..ecount {
                                 if mesh.edge_groups.get(seg).copied() == Some(g) {
-                                    highlight_edge(&painter, seg, false);
+                                    highlight_edge(&painter, seg, true);
                                 }
                             }
                         }
@@ -1979,11 +2231,11 @@ impl ZeroCadApp {
                                 mesh.edge_vertices[i + 2],
                             ]);
                             let p = project_3d(point[0], point[1], point[2]);
-                            painter.circle_filled(egui::pos2(p.0, p.1), 5.0, sel_vert);
+                            painter.circle_filled(egui::pos2(p.0, p.1), vertex_radius, vertex_fill);
                             painter.circle_stroke(
                                 egui::pos2(p.0, p.1),
-                                5.0,
-                                egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                vertex_radius,
+                                vertex_stroke,
                             );
                         }
                     }
@@ -2051,6 +2303,23 @@ impl ZeroCadApp {
                 let selected = self.selected_regions_for(&node.id);
                 let sel_edges = self.selected_edges_for(&node.id);
                 let sel_points = self.selected_sketch_points_for(&node.id);
+                let hovered = self
+                    .hovered_sketch_element
+                    .as_ref()
+                    .filter(|(sketch_id, _)| sketch_id == &node.id)
+                    .map(|(_, pick)| *pick);
+                let hovered_face = match hovered {
+                    Some(SketchPick::Face(index)) => Some(index),
+                    _ => None,
+                };
+                let hovered_edge = match hovered {
+                    Some(SketchPick::Edge(index)) => Some(index),
+                    _ => None,
+                };
+                let hovered_point = match hovered {
+                    Some(SketchPick::Point(index)) => Some(index),
+                    _ => None,
+                };
                 // Finished sketches always draw "passive": unselected faces stay
                 // faint/neutral and only picked faces/edges/points are highlighted,
                 // instead of the whole sketch lighting up.
@@ -2061,6 +2330,9 @@ impl ZeroCadApp {
                     &selected,
                     &sel_edges,
                     &sel_points,
+                    hovered_face,
+                    hovered_edge,
+                    hovered_point,
                     &to_screen,
                     false,
                 );
@@ -2090,12 +2362,18 @@ impl ZeroCadApp {
                 &self.selected_region_indices,
                 &empty_sel,
                 &empty_sel,
+                self.hovered_active_sketch_region,
+                None,
+                None,
                 &to_screen,
                 true,
             );
             if let Some(solver) = self.sketch_solver_model.as_ref() {
                 let construction = zerocad_core::sketch::bake_construction_curves(solver);
                 draw_construction_curves(&painter, &construction, &to_screen);
+                if let Some(hovered) = self.hovered_active_sketch_element {
+                    draw_hovered_solver_element(&painter, solver, hovered, &to_screen);
+                }
             }
             if !self.active_face_boundary.is_empty() {
                 let stroke = egui::Stroke::new(1.6, egui::Color32::from_rgb(150, 80, 200));

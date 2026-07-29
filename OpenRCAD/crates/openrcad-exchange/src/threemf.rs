@@ -25,6 +25,73 @@ pub fn to_3mf_bytes(objects: &[(String, &TriangleMesh)]) -> Vec<u8> {
     zip.finish()
 }
 
+/// A reusable assembly definition composed from one or more entries in the
+/// mesh-object array passed to [`to_3mf_assembly_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreeMfDefinition {
+    pub name: String,
+    pub body_object_indices: Vec<usize>,
+}
+
+/// One transformed occurrence in the 3MF build.
+///
+/// `transform` follows the 3MF row-major 3x4 attribute order:
+/// `m00 m01 m02 m10 m11 m12 m20 m21 m22 m30 m31 m32`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThreeMfBuildItem {
+    pub definition_index: usize,
+    pub transform: [f64; 12],
+}
+
+/// Write a deduplicated 3MF assembly.
+///
+/// Every input mesh is emitted exactly once. Multi-body definitions become
+/// component objects, while each build item references its definition with a
+/// rigid transform. This keeps repeated occurrences compact instead of
+/// flattening their triangles.
+pub fn to_3mf_assembly_bytes(
+    mesh_objects: &[(String, &TriangleMesh)],
+    definitions: &[ThreeMfDefinition],
+    build_items: &[ThreeMfBuildItem],
+) -> io::Result<Vec<u8>> {
+    if definitions
+        .iter()
+        .any(|definition| definition.body_object_indices.is_empty())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "3MF definitions must reference at least one mesh object",
+        ));
+    }
+    if definitions.iter().any(|definition| {
+        definition
+            .body_object_indices
+            .iter()
+            .any(|index| *index >= mesh_objects.len())
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "3MF definition references an unknown mesh object",
+        ));
+    }
+    if build_items.iter().any(|item| {
+        item.definition_index >= definitions.len()
+            || !item.transform.iter().all(|value| value.is_finite())
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "3MF build item has an invalid definition or transform",
+        ));
+    }
+
+    let model = assembly_model_xml(mesh_objects, definitions, build_items);
+    let mut zip = ZipWriter::new();
+    zip.add_file("[Content_Types].xml", CONTENT_TYPES.as_bytes());
+    zip.add_file("_rels/.rels", RELS.as_bytes());
+    zip.add_file("3D/3dmodel.model", model.as_bytes());
+    Ok(zip.finish())
+}
+
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -79,6 +146,93 @@ fn model_xml(objects: &[(String, &TriangleMesh)]) -> String {
     xml.push_str(" </resources>\n <build>\n");
     for i in 0..objects.len() {
         xml.push_str(&format!("  <item objectid=\"{}\"/>\n", i + 1));
+    }
+    xml.push_str(" </build>\n</model>\n");
+    xml
+}
+
+fn write_mesh_object(xml: &mut String, id: usize, name: &str, mesh: &TriangleMesh) {
+    xml.push_str(&format!(
+        "  <object id=\"{id}\" type=\"model\" name=\"{}\">\n   <mesh>\n    <vertices>\n",
+        xml_escape(name)
+    ));
+    for vertex in &mesh.vertices {
+        xml.push_str(&format!(
+            "     <vertex x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
+            vertex.x(),
+            vertex.y(),
+            vertex.z()
+        ));
+    }
+    xml.push_str("    </vertices>\n    <triangles>\n");
+    for triangle in &mesh.triangles {
+        xml.push_str(&format!(
+            "     <triangle v1=\"{}\" v2=\"{}\" v3=\"{}\"/>\n",
+            triangle[0], triangle[1], triangle[2]
+        ));
+    }
+    xml.push_str("    </triangles>\n   </mesh>\n  </object>\n");
+}
+
+fn assembly_model_xml(
+    mesh_objects: &[(String, &TriangleMesh)],
+    definitions: &[ThreeMfDefinition],
+    build_items: &[ThreeMfBuildItem],
+) -> String {
+    let mut xml = String::with_capacity(4096);
+    xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push('\n');
+    xml.push_str(
+        r#"<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">"#,
+    );
+    xml.push_str("\n <resources>\n");
+    for (index, (name, mesh)) in mesh_objects.iter().enumerate() {
+        write_mesh_object(&mut xml, index + 1, name, mesh);
+    }
+
+    let multi_body_count = definitions
+        .iter()
+        .filter(|definition| definition.body_object_indices.len() > 1)
+        .count();
+    let mut next_component_id = mesh_objects.len() + 1;
+    let mut definition_object_ids = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        if definition.body_object_indices.len() == 1 {
+            definition_object_ids.push(definition.body_object_indices[0] + 1);
+            continue;
+        }
+        let object_id = next_component_id;
+        next_component_id += 1;
+        definition_object_ids.push(object_id);
+        xml.push_str(&format!(
+            "  <object id=\"{object_id}\" type=\"model\" name=\"{}\">\n   <components>\n",
+            xml_escape(&definition.name)
+        ));
+        for mesh_index in &definition.body_object_indices {
+            xml.push_str(&format!(
+                "    <component objectid=\"{}\"/>\n",
+                mesh_index + 1
+            ));
+        }
+        xml.push_str("   </components>\n  </object>\n");
+    }
+    debug_assert_eq!(next_component_id, mesh_objects.len() + multi_body_count + 1);
+
+    xml.push_str(" </resources>\n <build>\n");
+    for item in build_items {
+        let transform = item
+            .transform
+            .iter()
+            .map(|value| {
+                let value = if *value == 0.0 { 0.0 } else { *value };
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        xml.push_str(&format!(
+            "  <item objectid=\"{}\" transform=\"{transform}\"/>\n",
+            definition_object_ids[item.definition_index]
+        ));
     }
     xml.push_str(" </build>\n</model>\n");
     xml
@@ -214,5 +368,37 @@ mod tests {
     fn crc32_matches_known_vector() {
         // CRC-32 of "123456789" is the classic check value 0xCBF43926.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn assembly_reuses_meshes_and_writes_transformed_build_items() {
+        let first = tri_mesh();
+        let second = tri_mesh();
+        let bytes = to_3mf_assembly_bytes(
+            &[
+                ("body-a".to_string(), &first),
+                ("body-b".to_string(), &second),
+            ],
+            &[ThreeMfDefinition {
+                name: "fixture".into(),
+                body_object_indices: vec![0, 1],
+            }],
+            &[
+                ThreeMfBuildItem {
+                    definition_index: 0,
+                    transform: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                },
+                ThreeMfBuildItem {
+                    definition_index: 0,
+                    transform: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0],
+                },
+            ],
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("<mesh>").count(), 2);
+        assert_eq!(text.matches("<component objectid=").count(), 2);
+        assert_eq!(text.matches("<item objectid=\"3\"").count(), 2);
+        assert!(text.contains("1 0 0 0 1 0 0 0 1 5 6 7"));
     }
 }

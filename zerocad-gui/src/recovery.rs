@@ -7,19 +7,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zerocad_core::{
-    read_document_file, write_document_file, Document, HydrationBundle, LoadOptions, SaveOptions,
+    read_project_document_file, write_project_document_file, HydrationBundle, LoadOptions,
+    ProjectDocument, SaveOptions,
 };
 
 const EDIT_DEBOUNCE: Duration = Duration::from_secs(5);
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTOSAVE_FILE: &str = "autosave.zcad";
 
-static PANIC_DOCUMENT: OnceLock<Mutex<Option<Document>>> = OnceLock::new();
+static PANIC_DOCUMENT: OnceLock<Mutex<Option<ProjectDocument>>> = OnceLock::new();
 static PANIC_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 enum RecoveryCommand {
-    Save(Box<Document>),
+    Save(Box<ProjectDocument>),
     Clear,
 }
 
@@ -28,7 +29,7 @@ enum RecoveryCommand {
 pub(crate) struct RecoveryManager {
     root: Option<PathBuf>,
     tx: Option<mpsc::SyncSender<RecoveryCommand>>,
-    latest: Option<Document>,
+    latest: Option<ProjectDocument>,
     dirty_since: Option<Instant>,
     last_autosave: Option<Instant>,
 }
@@ -92,7 +93,7 @@ impl RecoveryManager {
         }
     }
 
-    pub(crate) fn note_edit(&mut self, document: Document) {
+    pub(crate) fn note_edit(&mut self, document: ProjectDocument) {
         update_panic_snapshot(&document);
         self.latest = Some(document);
         self.dirty_since.get_or_insert_with(Instant::now);
@@ -121,7 +122,7 @@ impl RecoveryManager {
         }
     }
 
-    pub(crate) fn mark_saved(&mut self, document: &Document) {
+    pub(crate) fn mark_saved(&mut self, document: &ProjectDocument) {
         update_panic_snapshot(document);
         self.latest = Some(document.clone());
         self.dirty_since = None;
@@ -137,13 +138,13 @@ impl RecoveryManager {
             .is_some_and(|root| newest_recovery_path(root).is_some())
     }
 
-    pub(crate) fn load_latest(&self) -> Result<Document, String> {
+    pub(crate) fn load_latest(&self) -> Result<ProjectDocument, String> {
         let root = self
             .root
             .as_ref()
             .ok_or("recovery storage is unavailable")?;
         let path = newest_recovery_path(root).ok_or("no recovery document is available")?;
-        read_document_file(&path, &LoadOptions::default())
+        read_project_document_file(&path, &LoadOptions::default())
             .map(|loaded| loaded.document)
             .map_err(|error| format!("could not open {}: {error}", path.display()))
     }
@@ -151,9 +152,9 @@ impl RecoveryManager {
 
 fn write_recovery_document(
     path: &Path,
-    document: &Document,
+    document: &ProjectDocument,
 ) -> Result<(), zerocad_core::ZcadError> {
-    write_document_file(
+    write_project_document_file(
         path,
         document,
         &SaveOptions::default(),
@@ -194,7 +195,7 @@ fn newest_recovery_path(root: &Path) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
-fn update_panic_snapshot(document: &Document) {
+fn update_panic_snapshot(document: &ProjectDocument) {
     if let Ok(mut slot) = PANIC_DOCUMENT.get_or_init(|| Mutex::new(None)).lock() {
         *slot = Some(document.clone());
     }
@@ -342,15 +343,34 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let document = Document::new();
+        let document = ProjectDocument::Part(zerocad_core::Document::new());
         let path = root.join(AUTOSAVE_FILE);
         write_recovery_document(&path, &document).unwrap();
-        let restored = read_document_file(&path, &LoadOptions::default()).unwrap();
-        restored.document.validate_semantic_contracts().unwrap();
-        assert_eq!(
-            restored.document.graph.node_count(),
-            document.graph.node_count()
-        );
+        let restored = read_project_document_file(&path, &LoadOptions::default()).unwrap();
+        let ProjectDocument::Part(restored) = restored.document else {
+            panic!("part recovery changed project kind");
+        };
+        restored.validate_semantic_contracts().unwrap();
+        let ProjectDocument::Part(document) = document else {
+            unreachable!()
+        };
+        assert_eq!(restored.graph.node_count(), document.graph.node_count());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_preserves_assembly_project_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "zerocad-assembly-recovery-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let document = ProjectDocument::Assembly(zerocad_core::AssemblyDocument::new());
+        let path = root.join(AUTOSAVE_FILE);
+        write_recovery_document(&path, &document).unwrap();
+        let restored = read_project_document_file(&path, &LoadOptions::default()).unwrap();
+        assert!(matches!(restored.document, ProjectDocument::Assembly(_)));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -362,7 +382,7 @@ mod tests {
             std::thread::current().id()
         ));
         let mut manager = RecoveryManager::new_in(Some(root.clone()));
-        let document = Document::new();
+        let document = ProjectDocument::Part(zerocad_core::Document::new());
         manager
             .tx
             .as_ref()

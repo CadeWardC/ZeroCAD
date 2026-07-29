@@ -3,15 +3,16 @@
     windows_subsystem = "windows"
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
 use zerocad_core::{
-    detect_regions, CoordinateSystem, CornerKind, CornerMod, Dimension, Document, EdgeRef,
-    EvaluatedScene, ExtrudeMode, FeatureNode, FeatureType, LineSegment, MockMesh, Region,
-    SceneStats, SketchCurves, SketchPlane, SketchShape, Unit, Variable, Vec3,
+    detect_regions, AssemblyDocument, CoordinateSystem, CornerKind, CornerMod, Dimension, Document,
+    EdgeRef, EvaluatedScene, ExtrudeMode, FeatureNode, FeatureType, LineSegment, MockMesh,
+    ProjectDocument, ProjectKind, Region, SceneStats, SketchCurves, SketchPlane, SketchShape, Unit,
+    Variable, Vec3,
 };
 
 mod body_ops_ui;
@@ -483,6 +484,30 @@ pub enum BodyPick {
     Whole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssemblyGizmoMode {
+    Translate,
+    Rotate,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AssemblyGizmoDrag {
+    occurrence_id: zerocad_core::OccurrenceId,
+    axis: usize,
+    start_pointer: egui::Pos2,
+    screen_direction: egui::Vec2,
+    start_placement: zerocad_core::RigidPlacement,
+}
+
+/// A hover/click target on a finished sketch in Model mode. The indices use the
+/// same ordering as the sketch renderer and measurement status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SketchPick {
+    Face(usize),
+    Edge(usize),
+    Point(usize),
+}
+
 /// Browser label for one runtime body emitted by a feature. The first output
 /// keeps the feature's label; numbered `Body_N` labels continue naturally for
 /// later disconnected outputs (Body_1, Body_2, ...).
@@ -620,7 +645,7 @@ type SharedBodyMeshes = std::sync::Arc<Vec<(String, MockMesh)>>;
 
 #[derive(Debug, Clone)]
 struct UndoSnapshot {
-    document: Document,
+    project: ProjectDocument,
 }
 
 /// Authoritative state of a live sketch before one user-visible transaction.
@@ -645,18 +670,29 @@ struct PendingSave {
     dispatched: bool,
     revision: Option<u64>,
     workspace_generation: u64,
+    project_kind: ProjectKind,
 }
 
-/// The active application workspace.
-///
-/// This is intentionally separate from the future on-disk project-kind schema:
-/// it is the UI routing boundary that prevents part-only commands from reaching
-/// an assembly session while the assembly document and container milestones are
-/// still landing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectTransition {
+    NewPart,
+    NewAssembly,
+    Open(PathBuf),
+    RecoverAutosave,
+    Exit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectKind {
-    Part,
-    Assembly,
+enum ProjectTransitionPhase {
+    Confirm,
+    SaveDialog,
+    Saving,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingProjectTransition {
+    action: ProjectTransition,
+    phase: ProjectTransitionPhase,
 }
 
 struct ExportCompletion {
@@ -707,6 +743,27 @@ struct ZeroCadApp {
     /// Authoritative editable project. The runtime graph is an evaluator
     /// projection owned by this document rather than the application root.
     document: Document,
+    /// Authoritative assembly state while the assembly workspace is active.
+    /// Part-only tools remain routed to `document` until occurrence editing
+    /// completes the ProjectDocument ownership migration.
+    assembly_document: AssemblyDocument,
+    /// Disposable, one-evaluation-per-definition display geometry.
+    assembly_definition_geometry:
+        BTreeMap<zerocad_core::ModelHash, std::sync::Arc<Vec<(String, MockMesh)>>>,
+    /// Explicit scene-entity identity. Assembly picking never parses renderer
+    /// display strings to recover occurrence or body identity.
+    assembly_scene_entities: HashMap<String, (u64, String)>,
+    /// Definitions whose authoritative snapshots loaded but did not evaluate.
+    assembly_unresolved_definitions: BTreeMap<zerocad_core::ModelHash, String>,
+    selected_assembly_occurrence: Option<u64>,
+    assembly_transform_edit_active: bool,
+    assembly_interactive_target: Option<(zerocad_core::OccurrenceId, zerocad_core::RigidPlacement)>,
+    assembly_gizmo_mode: AssemblyGizmoMode,
+    assembly_gizmo_local_space: bool,
+    assembly_gizmo_drag: Option<AssemblyGizmoDrag>,
+    assembly_rename_occurrence: Option<(u64, String)>,
+    selected_assembly_mate: Option<zerocad_core::MateId>,
+    assembly_mate_statuses: BTreeMap<zerocad_core::MateId, zerocad_core::MateSolveStatus>,
     selected_node_id: Option<String>,
     /// Feature whose Properties window is open. Properties are opt-in from the
     /// document-tree context menu rather than appearing whenever a row is
@@ -763,6 +820,13 @@ struct ZeroCadApp {
     /// Monotonic committed-document revision used to avoid clearing a newer
     /// autosave when an older background Save finishes.
     document_revision: u64,
+    /// Revision most recently saved successfully for the active workspace.
+    /// Dirty state is derived exclusively from this pair.
+    saved_document_revision: u64,
+    /// Destructive project replacement waiting on Save/Discard/Cancel.
+    pending_project_transition: Option<PendingProjectTransition>,
+    /// Allows exactly the close request emitted after the unsaved-work guard.
+    allow_window_close: bool,
     /// True while a background refine is in flight (drives a "Refining…" hint).
     eval_pending: bool,
     eval_started: Option<std::time::Instant>,
@@ -942,13 +1006,19 @@ struct ZeroCadApp {
     /// when clicked, starts a sketch on that face (the same path as pre-selecting
     /// a face and pressing Draw Sketch).
     hovered_sketch_face: Option<(String, u32)>,
+    /// Preselection under the pointer in ordinary Model mode. These are
+    /// presentation-only and are recomputed every frame.
+    hovered_body_element: Option<(String, BodyPick)>,
+    hovered_sketch_element: Option<(String, SketchPick)>,
+    hovered_active_sketch_element: Option<zerocad_core::sketch::EntityId>,
+    hovered_active_sketch_region: Option<usize>,
 
     /// Faces of finished sketches the user has selected (in 3D) for extrusion,
     /// keyed by `(sketch_id, region_index)`. Selection persists until extruded
     /// or cleared, so the user can pick faces first and extrude afterwards.
     selected_faces: HashSet<(String, usize)>,
     /// Selected sketch edges, keyed by `(sketch_id, edge_index)` where the index
-    /// is `segment i` for `i < segments.len()` else `circle (i - segments.len())`.
+    /// follows segments, circles, arcs, then splines in their stored order.
     selected_edges: HashSet<(String, usize)>,
     /// Selected visible point handles of finished sketches, keyed by
     /// `(sketch_id, point_index)` using `geom2d::selectable_sketch_points`.
