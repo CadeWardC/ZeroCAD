@@ -301,3 +301,11 @@ fn guarded_kernel_workspaces_keep_release_unwinding() {
         assert!(!profile.contains("panic = \"abort\""));
     }
 }
+
+#[test]
+fn this_build_preserves_unwind_containment() {
+    assert!(
+        cfg!(panic = "unwind"),
+        "the evaluator and guarded kernel operations require panic=unwind"
+    );
+}

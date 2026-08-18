@@ -344,6 +344,18 @@ fn span_intersections<A, B>(
         (GeomCurve2d::BSpline(spline), GeomCurve2d::Line(line)) => {
             swap_intersections(line_spline(line, spline, second, first, options))
         }
+        // `conic_conic` only requires its *second* argument to be a conic — it
+        // root-finds the conic's implicit function along the first curve — so a
+        // spline against a circle or ellipse reuses it verbatim.
+        (GeomCurve2d::BSpline(_), GeomCurve2d::Circle(_) | GeomCurve2d::Ellipse(_)) => {
+            conic_conic(first, second, options)
+        }
+        (GeomCurve2d::Circle(_) | GeomCurve2d::Ellipse(_), GeomCurve2d::BSpline(_)) => {
+            swap_intersections(conic_conic(second, first, options))
+        }
+        (GeomCurve2d::BSpline(a), GeomCurve2d::BSpline(b)) => {
+            spline_spline(a, b, first, second, options)
+        }
         (GeomCurve2d::BSpline(_), _) | (_, GeomCurve2d::BSpline(_)) => return Err(()),
         _ => return Err(()),
     };
@@ -612,6 +624,245 @@ fn conic_conic<A, B>(
             })
         })
         .collect()
+}
+
+/// Intersect two B-spline spans.
+///
+/// Neither side has a closed-form implicit test, so this follows the kernel's
+/// adaptive-subdivision-with-interval-bounding rule in two stages:
+///
+/// 1. **Reject on the control-polygon box.** A B-spline lies inside the convex
+///    hull of its poles, so a pole-box miss proves the spans are disjoint
+///    without evaluating either curve. Glyph outlines are hundreds of spans of
+///    which only neighbours are ever close, so nearly every pair exits here.
+/// 2. **Bracket, then polish.** Surviving pairs are sampled into chords; only
+///    chord pairs whose boxes overlap seed a damped Newton solve of
+///    `F(u, v) = C1(u) − C2(v) = 0`, clamped to both spans.
+///
+/// Endpoint contact — the dominant case, since consecutive Bézier segments in a
+/// contour share a point exactly — seeds at the shared vertex where the
+/// residual is already zero, so it converges immediately instead of relying on
+/// the Jacobian being well conditioned there.
+fn spline_spline<A, B>(
+    first_curve: &openrcad_geom2d::BSplineCurve2d,
+    second_curve: &openrcad_geom2d::BSplineCurve2d,
+    first: &CurveSpan<A>,
+    second: &CurveSpan<B>,
+    options: ArrangementOptions,
+) -> Vec<Intersection> {
+    let tolerance = options.tolerance;
+    let first_box = pole_box(first_curve);
+    let second_box = pole_box(second_curve);
+    if !boxes_overlap(first_box, second_box, tolerance) {
+        return Vec::new();
+    }
+
+    // The chord pass only has to isolate candidates, not resolve them, so it is
+    // deliberately coarser than the scalar root finder's subdivision count —
+    // the Newton polish supplies the accuracy.
+    let chords = (options.root_subdivisions / 8).clamp(8, 128);
+    let first_samples = sample_span(first, chords);
+    let second_samples = sample_span(second, chords);
+
+    let mut hits = Vec::new();
+    for first_chord in first_samples.windows(2) {
+        let (start_parameter, start_point) = first_chord[0];
+        let (end_parameter, end_point) = first_chord[1];
+        let first_chord_box = chord_box(start_point, end_point);
+        for second_chord in second_samples.windows(2) {
+            let (other_start_parameter, other_start_point) = second_chord[0];
+            let (other_end_parameter, other_end_point) = second_chord[1];
+            let second_chord_box = chord_box(other_start_point, other_end_point);
+            if !boxes_overlap(first_chord_box, second_chord_box, tolerance) {
+                continue;
+            }
+            let (along_first, along_second) = closest_chord_parameters(
+                start_point,
+                end_point,
+                other_start_point,
+                other_end_point,
+            );
+            let seed_first = start_parameter + (end_parameter - start_parameter) * along_first;
+            let seed_second = other_start_parameter
+                + (other_end_parameter - other_start_parameter) * along_second;
+            if let Some(hit) = refine_curve_pair(first, second, seed_first, seed_second, tolerance)
+            {
+                hits.push(hit);
+            }
+        }
+    }
+    hits
+}
+
+/// Axis-aligned box of a B-spline's control polygon. The curve is contained in
+/// the convex hull of its poles, so this bounds every sub-span of it too.
+fn pole_box(spline: &openrcad_geom2d::BSplineCurve2d) -> (f64, f64, f64, f64) {
+    let mut bounds = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for pole in spline.poles() {
+        bounds.0 = bounds.0.min(pole.x());
+        bounds.1 = bounds.1.min(pole.y());
+        bounds.2 = bounds.2.max(pole.x());
+        bounds.3 = bounds.3.max(pole.y());
+    }
+    bounds
+}
+
+fn chord_box(start: Pnt2d, end: Pnt2d) -> (f64, f64, f64, f64) {
+    (
+        start.x().min(end.x()),
+        start.y().min(end.y()),
+        start.x().max(end.x()),
+        start.y().max(end.y()),
+    )
+}
+
+fn boxes_overlap(first: (f64, f64, f64, f64), second: (f64, f64, f64, f64), pad: f64) -> bool {
+    first.0 - pad <= second.2 + pad
+        && second.0 - pad <= first.2 + pad
+        && first.1 - pad <= second.3 + pad
+        && second.1 - pad <= first.3 + pad
+}
+
+fn sample_span<P>(span: &CurveSpan<P>, chords: usize) -> Vec<(f64, Pnt2d)> {
+    (0..=chords)
+        .map(|index| {
+            let parameter = span.first + (span.last - span.first) * index as f64 / chords as f64;
+            (parameter, span.curve.point(parameter))
+        })
+        .collect()
+}
+
+/// Parameters of the closest approach between two chords, clamped to both. When
+/// the chords genuinely cross this is their intersection; when they merely pass
+/// near one another it is still the best available Newton seed.
+fn closest_chord_parameters(
+    first_start: Pnt2d,
+    first_end: Pnt2d,
+    second_start: Pnt2d,
+    second_end: Pnt2d,
+) -> (f64, f64) {
+    let first_direction = (
+        first_end.x() - first_start.x(),
+        first_end.y() - first_start.y(),
+    );
+    let second_direction = (
+        second_end.x() - second_start.x(),
+        second_end.y() - second_start.y(),
+    );
+    let offset = (
+        first_start.x() - second_start.x(),
+        first_start.y() - second_start.y(),
+    );
+    let first_length =
+        first_direction.0 * first_direction.0 + first_direction.1 * first_direction.1;
+    let projection =
+        first_direction.0 * second_direction.0 + first_direction.1 * second_direction.1;
+    let second_length =
+        second_direction.0 * second_direction.0 + second_direction.1 * second_direction.1;
+    let first_offset = first_direction.0 * offset.0 + first_direction.1 * offset.1;
+    let second_offset = second_direction.0 * offset.0 + second_direction.1 * offset.1;
+
+    let denominator = first_length * second_length - projection * projection;
+    let along_first = if denominator.abs() > 1.0e-18 {
+        ((projection * second_offset - second_length * first_offset) / denominator).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let along_second = if second_length > 1.0e-18 {
+        ((projection * along_first + second_offset) / second_length).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (along_first, along_second)
+}
+
+/// Damped Newton on `F(u, v) = C1(u) − C2(v)`, clamped inside both spans.
+///
+/// Derivatives are central differences: `Curve2d` exposes evaluation but no
+/// analytic derivative, and the seed is already close enough that the extra
+/// digits an analytic Jacobian would buy do not change the converged root.
+fn refine_curve_pair<A, B>(
+    first: &CurveSpan<A>,
+    second: &CurveSpan<B>,
+    seed_first: f64,
+    seed_second: f64,
+    tolerance: f64,
+) -> Option<Intersection> {
+    let first_low = first.first.min(first.last);
+    let first_high = first.first.max(first.last);
+    let second_low = second.first.min(second.last);
+    let second_high = second.first.max(second.last);
+    let first_step = ((first_high - first_low) * 1.0e-6).max(1.0e-12);
+    let second_step = ((second_high - second_low) * 1.0e-6).max(1.0e-12);
+    // One Newton step may not leave the span; a runaway step would otherwise
+    // land on an unrelated lobe of a wavy spline and converge to a root that
+    // is not in this pair of chords at all.
+    let first_limit = (first_high - first_low) * 0.25;
+    let second_limit = (second_high - second_low) * 0.25;
+
+    let mut parameter_first = seed_first.clamp(first_low, first_high);
+    let mut parameter_second = seed_second.clamp(second_low, second_high);
+    let mut residual = f64::MAX;
+
+    for _ in 0..48 {
+        let point_first = first.curve.point(parameter_first);
+        let point_second = second.curve.point(parameter_second);
+        let gap_x = point_first.x() - point_second.x();
+        let gap_y = point_first.y() - point_second.y();
+        if !gap_x.is_finite() || !gap_y.is_finite() {
+            return None;
+        }
+        residual = gap_x.hypot(gap_y);
+        if residual <= tolerance {
+            break;
+        }
+
+        let tangent_first = span_tangent(first, parameter_first, first_step, first_low, first_high);
+        let tangent_second = span_tangent(
+            second,
+            parameter_second,
+            second_step,
+            second_low,
+            second_high,
+        );
+        let determinant = tangent_second.0 * tangent_first.1 - tangent_first.0 * tangent_second.1;
+        if determinant.abs() <= 1.0e-18 {
+            // Parallel tangents: tangential contact or a genuinely degenerate
+            // seed. Either way Newton has nothing to descend, so stop and let
+            // the residual test below decide whether this is a real touch.
+            break;
+        }
+        let delta_first = (gap_x * tangent_second.1 - tangent_second.0 * gap_y) / determinant;
+        let delta_second = (gap_x * tangent_first.1 - tangent_first.0 * gap_y) / determinant;
+
+        parameter_first = (parameter_first + delta_first.clamp(-first_limit, first_limit))
+            .clamp(first_low, first_high);
+        parameter_second = (parameter_second + delta_second.clamp(-second_limit, second_limit))
+            .clamp(second_low, second_high);
+    }
+
+    (residual <= tolerance).then_some(Intersection {
+        first: parameter_first,
+        second: parameter_second,
+    })
+}
+
+fn span_tangent<P>(
+    span: &CurveSpan<P>,
+    parameter: f64,
+    step: f64,
+    low: f64,
+    high: f64,
+) -> (f64, f64) {
+    let back = (parameter - step).max(low);
+    let forward = (parameter + step).min(high);
+    let width = forward - back;
+    if width <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let start = span.curve.point(back);
+    let end = span.curve.point(forward);
+    ((end.x() - start.x()) / width, (end.y() - start.y()) / width)
 }
 
 fn line_spline<A, B>(
@@ -1289,7 +1540,8 @@ mod tests {
 
     fn line(id: u32, start: (f64, f64), end: (f64, f64)) -> CurveSpan<u32> {
         let length = (end.0 - start.0).hypot(end.1 - start.1);
-        let direction = Dir2d::new((end.0 - start.0) / length, (end.1 - start.1) / length);
+        let direction = Dir2d::try_new((end.0 - start.0) / length, (end.1 - start.1) / length)
+            .expect("test line is non-degenerate");
         CurveSpan::new(
             GeomCurve2d::line(Line2d::from_point_dir(
                 Pnt2d::new(start.0, start.1),
@@ -1556,27 +1808,123 @@ mod tests {
         assert!(result.points.len() >= 2);
     }
 
-    #[test]
-    fn unsupported_nurbs_pair_is_typed() {
-        let spline = BSplineCurve2d::new(
+    /// One quadratic Bézier span — the exact shape a glyph segment converts to.
+    fn bezier(provenance: u32, poles: [(f64, f64); 3]) -> CurveSpan<u32> {
+        let curve = BSplineCurve2d::new(
             2,
-            vec![
-                Pnt2d::new(-2.0, 0.0),
-                Pnt2d::new(0.0, 3.0),
-                Pnt2d::new(2.0, 0.0),
-            ],
+            poles
+                .iter()
+                .map(|(x, y)| Pnt2d::new(*x, *y))
+                .collect::<Vec<_>>(),
             None,
             vec![0.0, 1.0],
             vec![3, 3],
         );
-        let spline = CurveSpan::new(GeomCurve2d::bspline(spline), 0.0, 1.0, 7_u32);
-        let error = arrange_curve_spans(&[spline, circle(8, 2.0)], ArrangementOptions::default())
-            .unwrap_err();
+        CurveSpan::new(GeomCurve2d::bspline(curve), 0.0, 1.0, provenance)
+    }
+
+    #[test]
+    fn spline_against_conic_arranges_instead_of_rejecting() {
+        // Both spline endpoints sit exactly on the circle, so the pair splits
+        // into two closed regions. This used to return `UnsupportedPair`.
+        let spline = bezier(7, [(-2.0, 0.0), (0.0, 3.0), (2.0, 0.0)]);
+        let arrangement =
+            arrange_curve_spans(&[spline, circle(8, 2.0)], ArrangementOptions::default())
+                .expect("spline against a circle now arranges");
+        assert_eq!(arrangement.regions.len(), 2);
+        assert!(arrangement
+            .regions
+            .iter()
+            .all(|region| region.area > 0.0 && region.holes.is_empty()));
+    }
+
+    #[test]
+    fn crossing_splines_intersect_at_the_expected_point() {
+        // Two arcs bulging toward one another must cross once, near x = 0.
+        let rising = bezier(1, [(-2.0, -1.0), (0.0, 2.0), (2.0, -1.0)]);
+        let falling = bezier(2, [(-2.0, 1.0), (0.0, -2.0), (2.0, 1.0)]);
+        let result =
+            intersect_curve_spans(&rising, &falling, ArrangementOptions::default()).unwrap();
+        assert_eq!(result.points.len(), 2, "the two arcs cross twice");
+        for hit in &result.points {
+            let a = rising.curve.point(hit.first_parameter);
+            let b = falling.curve.point(hit.second_parameter);
+            assert!(
+                a.distance(&b) <= ArrangementOptions::default().tolerance,
+                "reported parameters must land on the same point"
+            );
+        }
+    }
+
+    #[test]
+    fn disjoint_splines_report_no_intersections() {
+        let low = bezier(1, [(-2.0, 0.0), (0.0, 1.0), (2.0, 0.0)]);
+        let high = bezier(2, [(-2.0, 40.0), (0.0, 41.0), (2.0, 40.0)]);
+        let result = intersect_curve_spans(&low, &high, ArrangementOptions::default()).unwrap();
+        assert!(result.points.is_empty());
+    }
+
+    #[test]
+    fn spline_chain_sharing_endpoints_closes_a_region() {
+        // The shape of every glyph contour: open Bézier segments meeting end to
+        // end. The arrangement has to find those shared endpoints through
+        // spline-spline intersection or the loop never closes.
+        let top = bezier(1, [(-2.0, 0.0), (0.0, 3.0), (2.0, 0.0)]);
+        let bottom = bezier(2, [(2.0, 0.0), (0.0, -3.0), (-2.0, 0.0)]);
+        let arrangement = arrange_curve_spans(&[top, bottom], ArrangementOptions::default())
+            .expect("lens closes");
+        assert_eq!(arrangement.regions.len(), 1);
+        assert!(arrangement.regions[0].area > 0.0);
+        assert!(arrangement.regions[0].holes.is_empty());
+    }
+
+    #[test]
+    fn nested_spline_loops_arrange_as_a_region_with_a_hole() {
+        // A glyph counter: an inner closed contour inside an outer one. The
+        // inner loop must become a hole, not a second filled region.
+        let outer_top = bezier(1, [(-4.0, 0.0), (0.0, 6.0), (4.0, 0.0)]);
+        let outer_bottom = bezier(2, [(4.0, 0.0), (0.0, -6.0), (-4.0, 0.0)]);
+        let inner_top = bezier(3, [(-2.0, 0.0), (0.0, 3.0), (2.0, 0.0)]);
+        let inner_bottom = bezier(4, [(2.0, 0.0), (0.0, -3.0), (-2.0, 0.0)]);
+        let arrangement = arrange_curve_spans(
+            &[outer_top, outer_bottom, inner_top, inner_bottom],
+            ArrangementOptions::default(),
+        )
+        .expect("nested lenses arrange");
+        assert!(
+            arrangement
+                .regions
+                .iter()
+                .any(|region| region.holes.len() == 1),
+            "the inner contour must arrange as a hole"
+        );
+    }
+
+    #[test]
+    fn remaining_curve_families_are_still_typed_rejections() {
+        // Parabola/hyperbola pairs have no intersector yet; the arrangement
+        // must keep saying so explicitly rather than silently returning no hits.
+        let spline = bezier(7, [(-2.0, 0.0), (0.0, 3.0), (2.0, 0.0)]);
+        let parabola = CurveSpan::new(
+            GeomCurve2d::Parabola(openrcad_geom2d::Parabola2d::new(
+                openrcad_foundation::Ax22d::new(
+                    Pnt2d::new(0.0, 0.0),
+                    openrcad_foundation::Dir2d::try_new(1.0, 0.0)
+                        .expect("unit x is a valid direction"),
+                ),
+                1.0,
+            )),
+            -1.0,
+            1.0,
+            9_u32,
+        );
+        let error =
+            arrange_curve_spans(&[spline, parabola], ArrangementOptions::default()).unwrap_err();
         assert!(matches!(
             error,
             ArrangementError::UnsupportedPair {
                 first_kind: CurveKind2d::BSpline,
-                second_kind: CurveKind2d::Circle,
+                second_kind: CurveKind2d::Parabola,
                 ..
             }
         ));

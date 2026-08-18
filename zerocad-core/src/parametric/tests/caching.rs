@@ -152,6 +152,56 @@ fn eval_cache_key_changes_when_edge_mod_selection_changes() {
 }
 
 #[test]
+fn edge_blend_hash_covers_corner_mode_and_complete_selection() {
+    use std::hash::Hasher;
+
+    let edge = |name: &str, x: f32| EdgeRef {
+        p0: [x, 0.0, 0.0],
+        p1: [x, 0.0, 10.0],
+        n1: [1.0, 0.0, 0.0],
+        n2: [0.0, 1.0, 0.0],
+        curve: None,
+        topology: Some(TopologyEdgeRef {
+            edge_id: Some(name.into()),
+            ..Default::default()
+        }),
+    };
+    let make = |edges, corner_mode| FeatureType::EdgeBlend {
+        target: "box_1".into(),
+        edges: canonicalize_edge_refs(edges),
+        dist: 2.0,
+        dist_expr: None,
+        kind: crate::sketch::CornerKind::Fillet,
+        corner_mode,
+    };
+    let hash = |feature: &FeatureType| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        fold_feature(&mut hasher, feature);
+        hasher.finish()
+    };
+    let first = edge("edge:a", 0.0);
+    let second = edge("edge:b", 10.0);
+    let auto = make(vec![first.clone(), second.clone()], EdgeCornerMode::Auto);
+    let miter = make(vec![first.clone(), second.clone()], EdgeCornerMode::Miter);
+    let changed_selection = make(vec![first.clone()], EdgeCornerMode::Auto);
+    let reordered = make(vec![second, first], EdgeCornerMode::Auto);
+    let mut changed_distance = auto.clone();
+    let mut changed_kind = auto.clone();
+    if let FeatureType::EdgeBlend { dist, .. } = &mut changed_distance {
+        *dist = 3.0;
+    }
+    if let FeatureType::EdgeBlend { kind, .. } = &mut changed_kind {
+        *kind = crate::sketch::CornerKind::Chamfer;
+    }
+
+    assert_ne!(hash(&auto), hash(&miter));
+    assert_ne!(hash(&auto), hash(&changed_selection));
+    assert_ne!(hash(&auto), hash(&changed_distance));
+    assert_ne!(hash(&auto), hash(&changed_kind));
+    assert_eq!(hash(&auto), hash(&reordered));
+}
+
+#[test]
 fn checkpoints_share_unchanged_pristine_meshes() {
     let mut graph = ParametricGraph::new();
     for i in 1..=8 {

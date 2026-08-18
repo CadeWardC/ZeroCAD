@@ -109,6 +109,106 @@ pub(crate) fn apply_edge_mod(
     }
 }
 
+/// Apply one explicitly selected edge network as an all-or-nothing feature.
+#[allow(clippy::too_many_arguments)] // evaluator boundary mirrors persisted feature fields
+pub(crate) fn apply_edge_blend(
+    blend_id: &str,
+    target: &str,
+    edges: &[EdgeRef],
+    dist: f32,
+    kind: crate::sketch::CornerKind,
+    corner_mode: EdgeCornerMode,
+    live: &mut [LiveBody],
+    warnings: &mut Vec<String>,
+) {
+    let label = match kind {
+        crate::sketch::CornerKind::Fillet => "Fillet",
+        crate::sketch::CornerKind::Chamfer => "Chamfer",
+    };
+    let Some(body) = live.iter_mut().find(|body| body.id == target) else {
+        warnings.push(format!(
+            "{label} '{blend_id}': its target body no longer exists, so the body was left unchanged."
+        ));
+        return;
+    };
+    if edges.is_empty() {
+        warnings.push(format!(
+            "{label} '{blend_id}': no edges are selected, so the body was left unchanged."
+        ));
+        return;
+    }
+
+    let mut resolved = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let candidate = match resolve_edge_ref_by_topology(body, edge) {
+            Some(edge) => edge,
+            None if edge
+                .topology
+                .as_ref()
+                .and_then(|topology| topology.edge_id.as_deref())
+                .is_some() =>
+            {
+                warnings.push(format!(
+                    "{label} '{blend_id}': a named selected edge no longer resolves, so the complete network was left unchanged."
+                ));
+                return;
+            }
+            None => edge.clone(),
+        };
+        if let Err(reason) = edge_mod_preflight(body, &candidate, dist) {
+            warnings.push(format!(
+                "{label} '{blend_id}': {reason}, so the complete network was left unchanged."
+            ));
+            return;
+        }
+        resolved.push(candidate);
+    }
+    resolved = canonicalize_edge_refs(resolved);
+
+    let reference_mesh = body
+        .pristine
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| edge_mod_reference_mesh(body));
+    let diagnostic_checkpoint = crate::mock_kernel::diagnostic_checkpoint();
+    let mut candidate_parts = Vec::with_capacity(body.parts.len());
+    let mut applied = false;
+    let mut failures = Vec::new();
+    for (part_index, part) in body.parts.iter().enumerate() {
+        match crate::mock_kernel::blend_edge_network(part, &resolved, dist, kind, corner_mode) {
+            Ok(outcome) => {
+                applied = true;
+                candidate_parts.push(outcome.solid);
+            }
+            Err(error) => {
+                candidate_parts.push(part.clone());
+                failures.push(format!("part {part_index}: {error}"));
+            }
+        }
+    }
+    if !applied {
+        crate::mock_kernel::restore_diagnostic_checkpoint(diagnostic_checkpoint);
+        warnings.push(format!(
+            "{label} '{blend_id}': the atomic edge network failed ({}), so the body was left unchanged.",
+            failures.join("; ")
+        ));
+        return;
+    }
+
+    body.parts = candidate_parts;
+    body.pristine = Some(std::sync::Arc::new(named_edge_mod_result_mesh(
+        &reference_mesh,
+        &body.parts,
+        &body.id,
+        blend_id,
+        match kind {
+            crate::sketch::CornerKind::Fillet => "fillet",
+            crate::sketch::CornerKind::Chamfer => "chamfer",
+        },
+    )));
+    body.sketch_source = None;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AllEdgeResolutionError {
     NoEligibleEdges,

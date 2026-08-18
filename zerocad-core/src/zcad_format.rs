@@ -87,7 +87,7 @@ const SEC_ASSEMBLY_RECIPE: u16 = 9;
 const SEC_ASSEMBLY_PRESENTATION: u16 = 10;
 const SEC_ASSEMBLY_HYDRATION: u16 = 11;
 const HYDRATED_CACHE_SCHEMA: u16 = 3;
-const OPENRCAD_CACHE_ABI: u16 = 2;
+const OPENRCAD_CACHE_ABI: u16 = 3;
 const MESH_CACHE_ABI: u16 = 3;
 pub const DEFAULT_HYDRATED_CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
@@ -3812,6 +3812,128 @@ mod tests {
             }
         ));
         assert_eq!(FeatureRegistry::get("part.box").unwrap().payload_version, 1);
+    }
+
+    #[test]
+    fn legacy_registry_rejects_edge_blend_instead_of_skipping_it() {
+        let mut graph = ParametricGraph::new();
+        graph.add_feature(FeatureNode {
+            id: "edgeblend_1".into(),
+            name: "Fillet".into(),
+            feature: FeatureType::EdgeBlend {
+                target: "box_1".into(),
+                edges: vec![crate::parametric::EdgeRef {
+                    p0: [0.0, 0.0, 0.0],
+                    p1: [1.0, 0.0, 0.0],
+                    n1: [0.0, 1.0, 0.0],
+                    n2: [0.0, 0.0, 1.0],
+                    curve: None,
+                    topology: None,
+                }],
+                dist: 0.25,
+                dist_expr: None,
+                kind: crate::sketch::CornerKind::Fillet,
+                corner_mode: crate::parametric::EdgeCornerMode::Auto,
+            },
+        });
+        let (recipe, assets) = DocumentRecipeV3::from_graph_with_assets(&graph);
+        let error = recipe
+            .into_graph_with_assets_and_registry(&assets, |kind| {
+                (kind != "part.edge_blend")
+                    .then(|| crate::document::FeatureRegistry::get(kind))
+                    .flatten()
+            })
+            .expect_err("an older registry must reject the complete recipe");
+        assert!(error
+            .to_string()
+            .contains("unknown feature kind 'part.edge_blend'"));
+    }
+
+    #[test]
+    fn hydrated_edge_blend_preserves_local_tolerances_and_strict_tessellation() {
+        let mut graph = ParametricGraph::new();
+        graph.add_feature(FeatureNode {
+            id: "box_1".into(),
+            name: "Box".into(),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
+        });
+        graph.add_feature(FeatureNode {
+            id: "edgeblend_2".into(),
+            name: "Edge Blend".into(),
+            feature: FeatureType::EdgeBlend {
+                target: "box_1".into(),
+                edges: crate::canonicalize_edge_refs(vec![crate::EdgeRef {
+                    p0: [0.0, 0.0, 0.0],
+                    p1: [10.0, 0.0, 0.0],
+                    n1: [0.0, 0.0, -1.0],
+                    n2: [0.0, -1.0, 0.0],
+                    curve: None,
+                    topology: None,
+                }]),
+                dist: 1.0,
+                dist_expr: None,
+                kind: crate::CornerKind::Fillet,
+                corner_mode: crate::EdgeCornerMode::Auto,
+            },
+        });
+        graph.add_dependency("box_1", "edgeblend_2");
+        let (bodies, warnings) = graph
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .expect("edge blend fixture");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let snapshot = graph.evaluation_cache_snapshot();
+        let tolerances = |snapshot: &crate::EvaluationCacheSnapshot| {
+            snapshot
+                .cache
+                .checkpoints
+                .iter()
+                .flatten()
+                .flat_map(|checkpoint| &checkpoint.live)
+                .flat_map(|body| &body.parts)
+                .flat_map(|part| part.edges())
+                .map(|edge| edge.tolerance().to_bits())
+                .collect::<Vec<_>>()
+        };
+        let expected_tolerances = tolerances(&snapshot);
+        assert!(!expected_tolerances.is_empty());
+
+        let document = crate::Document::from_graph(graph, crate::Unit::Millimeter);
+        let accelerators = HydrationBundle {
+            display_meshes: Some(bodies),
+            evaluation_cache: Some(snapshot),
+            world_bbox: Some([0.0, 0.0, 0.0, 10.0, 10.0, 10.0]),
+            ..HydrationBundle::default()
+        };
+        let options = SaveOptions {
+            profile: SaveProfile::Hydrated {
+                total_accelerator_budget: 128 * 1024 * 1024,
+            },
+        };
+        let bytes = write_document_to_vec(&document, &options, &accelerators)
+            .expect("hydrated edge blend write");
+        let loaded = read_document_from_slice(&bytes, &LoadOptions::default())
+            .expect("hydrated edge blend read");
+        let restored = loaded
+            .accelerators
+            .evaluation_cache
+            .expect("hydrated checkpoint must survive ABI checks");
+        assert_eq!(tolerances(&restored), expected_tolerances);
+        for checkpoint in restored.cache.checkpoints.iter().flatten() {
+            for body in &checkpoint.live {
+                for part in &body.parts {
+                    part.validate_strict_with_policy(
+                        &openrcad::foundation::TolerancePolicy::STANDARD,
+                    )
+                    .expect("restored B-Rep must validate strictly");
+                    crate::mock_kernel::MockMesh::try_from_solid(part)
+                        .expect("restored B-Rep must tessellate strictly");
+                }
+            }
+        }
     }
 
     #[test]

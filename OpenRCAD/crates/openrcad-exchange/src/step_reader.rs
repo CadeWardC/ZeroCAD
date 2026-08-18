@@ -580,7 +580,7 @@ fn parse_dir2d(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<Dir2d, St
                 .ok_or_else(|| format!("invalid X coordinate in 2D direction #{id}"))?;
             let y = step_number(&coordinates[1])
                 .ok_or_else(|| format!("invalid Y coordinate in 2D direction #{id}"))?;
-            Ok(Dir2d::new(x, y))
+            Dir2d::try_new(x, y).ok_or_else(|| format!("near-zero 2D DIRECTION #{id}"))
         }
         _ => Err(format!("expected 2D DIRECTION at #{id}")),
     }

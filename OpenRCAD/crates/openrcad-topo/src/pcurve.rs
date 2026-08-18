@@ -174,7 +174,7 @@ impl PcurveData {
                 (
                     GeomCurve2d::line(openrcad_geom2d::Line2d::from_point_dir(
                         map_point(line.location()),
-                        openrcad_foundation::Dir2d::new(dx, dy),
+                        openrcad_foundation::Dir2d::try_new(dx, dy)?,
                     )),
                     parameter_scale,
                 )
@@ -327,7 +327,7 @@ mod tests {
         let source = PcurveData::new(
             GeomCurve2d::line(Line2d::from_point_dir(
                 Pnt2d::new(2.0, 3.0),
-                Dir2d::new(1.0, 1.0),
+                Dir2d::try_new(1.0, 1.0).expect("constant direction is non-zero"),
             )),
             -1.0,
             2.0,

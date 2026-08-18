@@ -9,12 +9,25 @@ pub(crate) fn with_kernel_cancellation<R>(
     cancellation: crate::EvaluationCancellation,
     f: impl FnOnce() -> R,
 ) -> R {
+    struct Restore(Option<crate::EvaluationCancellation>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE_CANCELLATION.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
     ACTIVE_CANCELLATION.with(|slot| {
         let previous = slot.replace(Some(cancellation));
-        let result = f();
-        slot.replace(previous);
-        result
+        let _restore = Restore(previous);
+        f()
     })
+}
+
+pub(crate) fn clear_kernel_cancellation() {
+    ACTIVE_CANCELLATION.with(|slot| {
+        slot.replace(None);
+    });
 }
 
 fn active_cancellation() -> Option<crate::EvaluationCancellation> {
@@ -85,6 +98,13 @@ pub fn difference(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
             .map_err(|error| log::warn!("boolean difference failed: {error}"))
             .ok()
     })
+}
+
+pub(crate) fn difference_diagnostic(
+    a: &KernelSolid,
+    b: &KernelSolid,
+) -> Result<KernelSolid, String> {
+    quiet_panic(|| checked_boolean(a, b, BooleanOp::Cut))
 }
 
 /// Boolean union with the kernel's exact face history (see

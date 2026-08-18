@@ -17,11 +17,15 @@ zstd.workspace = true
 blake3.workspace = true
 sha2.workspace = true
 nalgebra.workspace = true
+ttf-parser.workspace = true
+rustybuzz.workspace = true
+fontdb.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.6"
 tempfile = "3"
+epaint_default_fonts.workspace = true
 
 [[bench]]
 name = "modeling_pipeline"

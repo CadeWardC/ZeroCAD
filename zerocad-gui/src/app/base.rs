@@ -153,6 +153,7 @@ impl ZeroCadApp {
             extrude_depth: 25.0,
             extrude_mode: ExtrudeMode::NewBody,
             extrude_op: None,
+            extrude_profile_pick_active: false,
             revolve_op: None,
             pattern_op: None,
             hole_op: None,

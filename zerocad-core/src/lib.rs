@@ -16,6 +16,7 @@ pub mod parametric;
 pub mod release;
 pub mod sketch;
 pub mod stl;
+pub mod text;
 pub mod units;
 pub mod zcad_format;
 
@@ -87,19 +88,19 @@ pub use expr::eval;
 pub use geometry::{CoordinateSystem, SketchPlane, Vec3};
 pub use mock_kernel::MockMesh;
 pub use parametric::{
-    body_output_id, boolean_region_plan, complete_selected_circles, drafted_region_solid,
-    edge_wedge_is_concave_mesh, AllEdgeSelector, AllEdgeSelectorError, AxisBase, BodyInspection,
-    BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef, DatumValue, DiagnosticCode,
-    DiagnosticParameterValue, DiagnosticSeverity, EdgeInspection, EdgePairInspection, EdgeRef,
-    EvaluationCacheSnapshot, EvaluationCancellation, EvaluationDiagnostic, EvaluationError,
-    EvaluationOutput, EvaluationQuality, EvaluationTimings, EvaluationTrace, ExtrudeMode,
-    FaceInspection, FeatureNode, FeatureTiming, FeatureType, HoleApplication, HoleFit, HoleKind,
-    HoleManufacturingMetadata, HoleStandardPreset, InterferencePair, LegacyReferenceBackfills,
-    LoftSurfaceMode, ParametricGraph, PatternKind, PlaneBase, PristineMeshReuse,
-    ResolvedStandardGeometry, StandardReference, StandardsDataPack, StandardsFamily, SweepGuide,
-    TopologyEdgeRef, TopologyVertexRef, Variable, VariableDiagnostic, VariableResolution,
-    VertexRef, HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS, STANDARDS_LIBRARY_ID,
-    STANDARDS_LIBRARY_VERSION,
+    body_output_id, boolean_region_plan, canonicalize_edge_refs, complete_selected_circles,
+    drafted_region_solid, edge_wedge_is_concave_mesh, AllEdgeSelector, AllEdgeSelectorError,
+    AxisBase, BodyInspection, BooleanRegionPlan, DatumAxisDef, DatumPlaneDef, DatumPointDef,
+    DatumValue, DiagnosticCode, DiagnosticParameterValue, DiagnosticSeverity, EdgeCornerMode,
+    EdgeInspection, EdgePairInspection, EdgeRef, EvaluationCacheSnapshot, EvaluationCancellation,
+    EvaluationDiagnostic, EvaluationError, EvaluationOutput, EvaluationQuality, EvaluationTimings,
+    EvaluationTrace, ExtrudeMode, FaceInspection, FeatureNode, FeatureTiming, FeatureType,
+    HoleApplication, HoleFit, HoleKind, HoleManufacturingMetadata, HoleStandardPreset,
+    InterferencePair, LegacyReferenceBackfills, LoftSurfaceMode, ParametricGraph, PatternKind,
+    PlaneBase, PristineMeshReuse, ResolvedStandardGeometry, StandardReference, StandardsDataPack,
+    StandardsFamily, SweepGuide, TopologyEdgeRef, TopologyVertexRef, Variable, VariableDiagnostic,
+    VariableResolution, VertexRef, HOLE_STANDARD_PRESETS, STANDARDS_DATA_PACKS,
+    STANDARDS_LIBRARY_ID, STANDARDS_LIBRARY_VERSION,
 };
 pub use release::{
     validate_compatibility_exception_ledger, validate_phase7_exception_ledger,

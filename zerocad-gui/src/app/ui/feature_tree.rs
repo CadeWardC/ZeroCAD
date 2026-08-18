@@ -345,7 +345,7 @@ impl ZeroCadApp {
                                     variables: Vec::new(),
                                 },
                             });
-                            self.selected_node_id = Some(id);
+                            self.open_feature_properties(&id);
                         }
                         if let Some(set_id) = id_to_add_var {
                             self.push_undo();
@@ -492,14 +492,7 @@ impl ZeroCadApp {
                 self.rename_buffer = name.to_owned();
                 self.rename_focus_pending = true;
             } else if response.clicked() {
-                self.selected_node_id = Some(owner_id.clone());
-                if is_live_body {
-                    self.selected_faces.clear();
-                    self.selected_edges.clear();
-                    self.selected_sketch_points.clear();
-                    self.selected_body.clear();
-                    self.selected_body.insert((id.to_owned(), BodyPick::Whole));
-                }
+                self.select_feature_tree_entry(&owner_id, id, is_var_set, is_live_body);
             }
 
             response.context_menu(|ui| {
@@ -574,10 +567,55 @@ impl ZeroCadApp {
         });
         action
     }
+
+    fn select_feature_tree_entry(
+        &mut self,
+        owner_id: &str,
+        displayed_id: &str,
+        is_var_set: bool,
+        is_live_body: bool,
+    ) {
+        self.selected_node_id = Some(owner_id.to_owned());
+        if is_var_set {
+            self.open_feature_properties(owner_id);
+        } else if is_live_body {
+            self.selected_faces.clear();
+            self.selected_edges.clear();
+            self.selected_sketch_points.clear();
+            self.selected_body.clear();
+            self.selected_body
+                .insert((displayed_id.to_owned(), BodyPick::Whole));
+        }
+    }
 }
 
 fn section_label(name: &str, count: usize) -> egui::RichText {
     egui::RichText::new(format!("{name} ({count})"))
         .font(egui::FontId::proportional(12.5))
         .strong()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selecting_a_variable_set_opens_its_properties() {
+        let mut app = ZeroCadApp::new();
+        app.document.add_feature(FeatureNode {
+            id: "varset_test".into(),
+            name: "Variables".into(),
+            feature: FeatureType::VariableSet {
+                variables: Vec::new(),
+            },
+        });
+
+        app.select_feature_tree_entry("varset_test", "varset_test", true, false);
+
+        assert_eq!(app.selected_node_id.as_deref(), Some("varset_test"));
+        assert_eq!(
+            app.feature_properties_dialog.as_deref(),
+            Some("varset_test")
+        );
+    }
 }

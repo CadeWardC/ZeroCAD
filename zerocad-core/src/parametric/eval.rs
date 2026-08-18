@@ -1671,6 +1671,9 @@ impl ParametricGraph {
                             crate::document::FeatureEvaluatorKind::EdgeMod => {
                                 self.evaluate_edge_mod_candidate(idx, context)
                             }
+                            crate::document::FeatureEvaluatorKind::EdgeBlend => {
+                                self.evaluate_edge_blend_candidate(idx, context)
+                            }
                             _ => self.evaluate_direct_or_body_candidate(idx, evaluator, context),
                         };
                         result.and_then(|result| {
@@ -2482,6 +2485,30 @@ impl ParametricGraph {
         Ok(result)
     }
 
+    fn evaluate_edge_blend_candidate(
+        &self,
+        idx: NodeIndex,
+        context: FeatureEvalContext<'_>,
+    ) -> Result<FeatureEvalResult, String> {
+        if !matches!(context.feature.feature, FeatureType::EdgeBlend { .. }) {
+            return Err(format!(
+                "registry evaluator EdgeBlend cannot invoke feature kind '{}'",
+                context.feature.feature.kind_id()
+            ));
+        }
+        let mut result = self.evaluate_direct_or_body_candidate(
+            idx,
+            crate::document::FeatureEvaluatorKind::EdgeBlend,
+            context,
+        )?;
+        result.validation_evidence.family = CandidateValidationFamily::EdgeModification {
+            candidate_validation: true,
+            recut_guards: true,
+            atomic_fallback: true,
+        };
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn invoke_registered_feature(
         &self,
@@ -2953,6 +2980,42 @@ impl ParametricGraph {
                 };
                 apply_edge_mod(&node.id, target, edge, eff_dist, *kind, live, warnings);
             }
+            crate::document::FeatureEvaluatorKind::EdgeBlend => {
+                let FeatureType::EdgeBlend {
+                    target,
+                    edges,
+                    dist,
+                    dist_expr,
+                    kind,
+                    corner_mode,
+                } = &node.feature
+                else {
+                    return Err(payload_mismatch());
+                };
+                let eff_dist = match dist_expr.as_ref() {
+                    Some(expression) => match crate::expr::eval(expression, vars) {
+                        Ok(value) => value as f32,
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Edge blend '{}': distance expression \"{}\" no longer evaluates; using last value {:.3}.",
+                                node.id, expression, dist
+                            ));
+                            *dist
+                        }
+                    },
+                    None => *dist,
+                };
+                apply_edge_blend(
+                    &node.id,
+                    target,
+                    edges,
+                    eff_dist,
+                    *kind,
+                    *corner_mode,
+                    live,
+                    warnings,
+                );
+            }
             crate::document::FeatureEvaluatorKind::Infrastructure
             | crate::document::FeatureEvaluatorKind::Sketch
             | crate::document::FeatureEvaluatorKind::Datum => {
@@ -3295,6 +3358,7 @@ impl ParametricGraph {
                     | FeatureType::Cylinder { .. }
                     | FeatureType::Extrude { .. }
                     | FeatureType::EdgeMod { .. }
+                    | FeatureType::EdgeBlend { .. }
                     | FeatureType::Import { .. }
                     | FeatureType::ImportStl { .. }
                     | FeatureType::Revolve { .. }
@@ -4738,7 +4802,7 @@ fn feature_expression_references(feature: &FeatureType) -> Vec<String> {
             collect_expression_references(depth_expr, &mut names);
             collect_expression_references(draft_angle_expr, &mut names);
         }
-        FeatureType::EdgeMod { dist_expr, .. } => {
+        FeatureType::EdgeMod { dist_expr, .. } | FeatureType::EdgeBlend { dist_expr, .. } => {
             collect_expression_references(dist_expr, &mut names)
         }
         FeatureType::VariableSet { variables } => {
@@ -4884,7 +4948,9 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
             rename_expression(depth_expr, old, new);
             rename_expression(draft_angle_expr, old, new);
         }
-        FeatureType::EdgeMod { dist_expr, .. } => rename_expression(dist_expr, old, new),
+        FeatureType::EdgeMod { dist_expr, .. } | FeatureType::EdgeBlend { dist_expr, .. } => {
+            rename_expression(dist_expr, old, new)
+        }
         FeatureType::VariableSet { variables } => {
             for variable in variables {
                 rename_expression(&mut variable.expression, old, new);

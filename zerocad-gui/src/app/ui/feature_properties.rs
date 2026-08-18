@@ -274,6 +274,7 @@ impl ZeroCadApp {
         };
 
         let mut open = true;
+        let screen = ctx.screen_rect();
         egui::Window::new(format!("Properties — {feature_name}"))
             .id(egui::Id::new("feature_properties_dialog"))
             .open(&mut open)
@@ -281,6 +282,10 @@ impl ZeroCadApp {
             .resizable(true)
             .default_width(360.0)
             .default_height(540.0)
+            .default_pos(egui::pos2(
+                (screen.right() - 380.0).max(screen.left() + 12.0),
+                screen.top() + 92.0,
+            ))
             .min_width(300.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -1669,6 +1674,93 @@ impl ZeroCadApp {
                                         egui::RichText::new(
                                             "Edge captured in 3D; edits re-cut the body.",
                                         )
+                                        .size(10.5)
+                                        .color(pal.text_faint),
+                                    );
+                                }
+                                FeatureType::EdgeBlend {
+                                    edges,
+                                    dist,
+                                    dist_expr,
+                                    kind,
+                                    corner_mode,
+                                    ..
+                                } => {
+                                    let noun = match kind {
+                                        CornerKind::Fillet => "Fillet radius:",
+                                        CornerKind::Chamfer => "Chamfer distance:",
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(noun).size(12.0));
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(dist, 0.2..=40.0)
+                                                    .suffix(current_unit.suffix()),
+                                            )
+                                            .changed()
+                                        {
+                                            *dist_expr = None;
+                                            modified = true;
+                                        }
+                                    });
+                                    expression_editor(
+                                        ui,
+                                        dist_expr,
+                                        &var_map,
+                                        "expression, e.g. fillet_r",
+                                        current_unit.suffix(),
+                                        &mut modified,
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Type:");
+                                        for (candidate, label) in [
+                                            (CornerKind::Fillet, "Fillet"),
+                                            (CornerKind::Chamfer, "Chamfer"),
+                                        ] {
+                                            if ui.selectable_label(*kind == candidate, label).clicked()
+                                                && *kind != candidate
+                                            {
+                                                *kind = candidate;
+                                                if candidate == CornerKind::Chamfer
+                                                    && *corner_mode
+                                                        == zerocad_core::EdgeCornerMode::RollingBall
+                                                {
+                                                    *corner_mode = zerocad_core::EdgeCornerMode::Auto;
+                                                }
+                                                modified = true;
+                                            }
+                                        }
+                                    });
+                                    if edges.len() > 1 {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Corners:");
+                                            let mut modes = vec![
+                                                (zerocad_core::EdgeCornerMode::Auto, "Auto"),
+                                                (zerocad_core::EdgeCornerMode::Miter, "Miter"),
+                                            ];
+                                            if *kind == CornerKind::Fillet {
+                                                modes.push((
+                                                    zerocad_core::EdgeCornerMode::RollingBall,
+                                                    "Rolling",
+                                                ));
+                                            }
+                                            for (mode, label) in modes {
+                                                if ui
+                                                    .selectable_label(*corner_mode == mode, label)
+                                                    .clicked()
+                                                    && *corner_mode != mode
+                                                {
+                                                    *corner_mode = mode;
+                                                    modified = true;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} selected edge(s), evaluated atomically.",
+                                            edges.len()
+                                        ))
                                         .size(10.5)
                                         .color(pal.text_faint),
                                     );

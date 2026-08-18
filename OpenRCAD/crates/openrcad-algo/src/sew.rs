@@ -640,6 +640,42 @@ fn sew_impl(faces: &[Face], policy: &TolerancePolicy) -> Shell {
         e_data.end = v_map[&e_data.end];
     }
 
+    // Vertex welding can collapse a short boolean-intersection sliver to one
+    // representative point. Keeping its now-zero coedge corrupts Euler counts
+    // and leaves a microscopic UV loop discontinuity at otherwise-valid miter
+    // seams. Remove only edges whose complete analytic span (endpoints and
+    // midpoint) is within their certified local/global linear tolerance.
+    let collapsed: HashSet<EdgeId> = brep
+        .edges
+        .iter()
+        .filter_map(|(edge_id, edge)| {
+            let start = brep.vertices[edge.start].point;
+            let end = brep.vertices[edge.end].point;
+            let chord = start.distance(&end);
+            let span = edge.curve.as_ref().map_or(chord, |curve| {
+                let midpoint = curve.point(0.5 * (edge.first + edge.last));
+                chord
+                    .max(start.distance(&midpoint))
+                    .max(end.distance(&midpoint))
+            });
+            (span <= edge.tolerance.max(policy.linear)).then_some(edge_id)
+        })
+        .collect();
+    if !collapsed.is_empty() {
+        // The merged arenas can contain orphan source loops in addition to the
+        // active face loops. They must not retain references to an edge removed
+        // from the shared arena because the later orientation remap scans every
+        // loop before unreachable topology is compacted.
+        for (_, loop_data) in &mut brep.loops {
+            loop_data
+                .edges
+                .retain(|coedge| !collapsed.contains(&coedge.id));
+        }
+        for edge_id in collapsed {
+            brep.edges.remove(edge_id);
+        }
+    }
+
     // 4. Count edge occurrences across loops to identify free boundary edges.
     let mut edge_counts = HashMap::new();
     for &loop_id in &active_loops {

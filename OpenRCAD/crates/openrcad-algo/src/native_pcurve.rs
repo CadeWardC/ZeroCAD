@@ -17,9 +17,20 @@ pub(crate) fn uv_line(start: Pnt2d, end: Pnt2d, periodicity: SurfacePeriodicity)
     let delta_x = end.x() - start.x();
     let delta_y = end.y() - start.y();
     let length = delta_x.hypot(delta_y);
-    let direction = Dir2d::try_new(delta_x, delta_y).unwrap_or_else(Dir2d::dx);
+    let curve = Dir2d::try_new(delta_x, delta_y).map_or_else(
+        || {
+            GeomCurve2d::bspline(BSplineCurve2d::new(
+                1,
+                vec![start, start],
+                None,
+                vec![0.0, 1.0],
+                vec![2, 2],
+            ))
+        },
+        |direction| GeomCurve2d::line(Line2d::from_point_dir(start, direction)),
+    );
     PcurveData::new(
-        GeomCurve2d::line(Line2d::from_point_dir(start, direction)),
+        curve,
         0.0,
         length.max(openrcad_foundation::tolerance::CONFUSION),
     )
@@ -111,7 +122,7 @@ fn planar_edge_pcurve(plane: &Plane, edge: &Edge) -> PcurveData {
         )
     };
     let project_direction = |direction: openrcad_foundation::Dir| {
-        Dir2d::new(
+        Dir2d::try_new(
             direction.dot(&plane.position().x_direction()),
             direction.dot(&plane.position().y_direction()),
         )
@@ -119,32 +130,45 @@ fn planar_edge_pcurve(plane: &Plane, edge: &Edge) -> PcurveData {
 
     match edge.curve() {
         Some(GeomCurve::Circle(circle)) => {
-            let frame = Ax22d::new_axes(
-                project_point(circle.center()),
+            match (
                 project_direction(circle.position().x_direction()),
                 project_direction(circle.position().y_direction()),
-            );
-            PcurveData::new(
-                GeomCurve2d::circle(Circle2d::new(frame, circle.radius())),
-                edge.first(),
-                edge.last(),
-            )
+            ) {
+                (Some(x), Some(y)) => PcurveData::new(
+                    GeomCurve2d::circle(Circle2d::new(
+                        Ax22d::new_axes(project_point(circle.center()), x, y),
+                        circle.radius(),
+                    )),
+                    edge.first(),
+                    edge.last(),
+                ),
+                _ => uv_line(
+                    project_point(edge.start().point()),
+                    project_point(edge.end().point()),
+                    SurfacePeriodicity::NONE,
+                ),
+            }
         }
         Some(GeomCurve::Ellipse(ellipse)) => {
-            let frame = Ax22d::new_axes(
-                project_point(ellipse.center()),
+            match (
                 project_direction(ellipse.position().x_direction()),
                 project_direction(ellipse.position().y_direction()),
-            );
-            PcurveData::new(
-                GeomCurve2d::ellipse(Ellipse2d::new(
-                    frame,
-                    ellipse.major_radius(),
-                    ellipse.minor_radius(),
-                )),
-                edge.first(),
-                edge.last(),
-            )
+            ) {
+                (Some(x), Some(y)) => PcurveData::new(
+                    GeomCurve2d::ellipse(Ellipse2d::new(
+                        Ax22d::new_axes(project_point(ellipse.center()), x, y),
+                        ellipse.major_radius(),
+                        ellipse.minor_radius(),
+                    )),
+                    edge.first(),
+                    edge.last(),
+                ),
+                _ => uv_line(
+                    project_point(edge.start().point()),
+                    project_point(edge.end().point()),
+                    SurfacePeriodicity::NONE,
+                ),
+            }
         }
         Some(GeomCurve::BSpline(curve)) => {
             let poles = curve.poles().iter().copied().map(project_point).collect();

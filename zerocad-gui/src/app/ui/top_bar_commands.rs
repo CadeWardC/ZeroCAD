@@ -185,6 +185,7 @@ impl ZeroCadApp {
                 .on_hover_text("Select faces, edges, bodies, and features")
                 .clicked()
             {
+                self.extrude_profile_pick_active = false;
                 self.status_msg = "Selection tool active.".to_string();
             }
         }
@@ -389,6 +390,7 @@ impl ZeroCadApp {
                 egui::Stroke::new(1.0, self.pal().border),
             );
             if draw_btn.on_hover_text("Enter sketch mode — sketches on the selected body face if one is selected, else pick an origin plane").clicked() {
+                        self.extrude_profile_pick_active = false;
                         // Context-aware: if exactly one body FACE is selected,
                         // sketch directly on it; otherwise open the plane picker.
                         let face_sel = if self.selected_body.len() == 1 {
@@ -480,17 +482,42 @@ impl ZeroCadApp {
                     self.begin_extrude_on_body_face(node, fid);
                 }
             } else {
-                // Inert (no selection): same fill on hover so it reads disabled.
-                icons::Icon::Extrude
-                    .labeled_button(
-                        ui,
-                        "Extrude",
-                        self.pal().surface_subtle,
-                        self.pal().surface_subtle,
-                        self.pal().text_faint,
-                        egui::Stroke::new(1.0, self.pal().border),
-                    )
-                    .on_hover_text("Select one or more 3D faces first");
+                // Command-first workflow: Extrude remains available with no
+                // selection and waits for the user to click a sketch profile.
+                let armed = self.extrude_profile_pick_active;
+                let extrude_btn = icons::Icon::Extrude.labeled_button(
+                    ui,
+                    if armed { "Pick Profile" } else { "Extrude" },
+                    if armed {
+                        self.pal().accent_soft
+                    } else {
+                        self.pal().surface_subtle
+                    },
+                    self.pal().accent_soft,
+                    if armed {
+                        self.pal().accent
+                    } else {
+                        self.pal().text_strong
+                    },
+                    egui::Stroke::new(
+                        1.0,
+                        if armed {
+                            self.pal().accent
+                        } else {
+                            self.pal().border
+                        },
+                    ),
+                );
+                if extrude_btn
+                    .on_hover_text(if armed {
+                        "Click to cancel profile selection"
+                    } else {
+                        "Start Extrude, then click a closed sketch profile"
+                    })
+                    .clicked()
+                {
+                    self.toggle_extrude_profile_pick();
+                }
             }
 
             // REVOLVE: same sketch-face selection as Extrude, spun about an axis.

@@ -5,10 +5,10 @@
 //! feature kind's payload version and adds an explicit decoder.
 
 use crate::parametric::{
-    AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DraftNeutral, EdgeRef, ExtrudeMode,
-    FaceRef, FeaturePatternComputeMode, FeaturePatternExtentPolicy, FeaturePatternKind,
-    FeatureType, HoleKind, HoleManufacturingMetadata, LoftSurfaceMode, PatternKind, PlaneBase,
-    StandardReference, SweepGuide, Variable,
+    AxisBase, DatumAxisDef, DatumPlaneDef, DatumPointDef, DraftNeutral, EdgeCornerMode, EdgeRef,
+    ExtrudeMode, FaceRef, FeaturePatternComputeMode, FeaturePatternExtentPolicy,
+    FeaturePatternKind, FeatureType, HoleKind, HoleManufacturingMetadata, LoftSurfaceMode,
+    PatternKind, PlaneBase, StandardReference, SweepGuide, Variable,
 };
 use crate::sketch::{
     CornerKind, CornerMod, EntityId, SketchMirror, SketchShape, SketchSolverModel,
@@ -134,6 +134,21 @@ pub(crate) fn encode(feature: &FeatureType) -> NumericFeatureFields {
             // numeric slot reserved so v5 payload numbering remains stable.
             put(&mut fields, 4, &());
             put(&mut fields, 5, kind);
+        }
+        FeatureType::EdgeBlend {
+            target,
+            edges,
+            dist,
+            dist_expr,
+            kind,
+            corner_mode,
+        } => {
+            put(&mut fields, 0, target);
+            put(&mut fields, 1, edges);
+            put(&mut fields, 2, dist);
+            put(&mut fields, 3, dist_expr);
+            put(&mut fields, 4, kind);
+            put(&mut fields, 5, corner_mode);
         }
         FeatureType::VariableSet { variables } => put(&mut fields, 0, variables),
         FeatureType::Import { .. } => {}
@@ -587,6 +602,14 @@ fn decode_v1(kind: &str, mut fields: NumericFeatureFields) -> Result<FeatureType
                 })?;
                 take::<CornerKind>(&mut fields, 5, "kind")?
             },
+        },
+        "part.edge_blend" => FeatureType::EdgeBlend {
+            target: take(&mut fields, 0, "target")?,
+            edges: take::<Vec<EdgeRef>>(&mut fields, 1, "edges")?,
+            dist: take(&mut fields, 2, "distance")?,
+            dist_expr: take(&mut fields, 3, "distance expression")?,
+            kind: take::<CornerKind>(&mut fields, 4, "kind")?,
+            corner_mode: take::<EdgeCornerMode>(&mut fields, 5, "corner mode")?,
         },
         "document.variables" => FeatureType::VariableSet {
             variables: take::<Vec<Variable>>(&mut fields, 0, "variables")?,

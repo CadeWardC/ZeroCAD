@@ -2264,6 +2264,13 @@ impl ZeroCadApp {
             if self.hidden_nodes.contains(&node.id) {
                 continue; // hidden sketch — don't draw
             }
+            // While editing an existing sketch, the live sketch renderer below
+            // owns its display. Drawing the committed copy on the same plane as
+            // the editable copy caused doubled lines/fills and z-fighting over
+            // bodies that intersect the origin plane.
+            if self.editing_sketch_id.as_deref() == Some(node.id.as_str()) {
+                continue;
+            }
             if active_extrude_sources.contains(&node.id) {
                 continue;
             }

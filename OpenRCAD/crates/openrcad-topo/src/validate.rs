@@ -321,8 +321,19 @@ fn validate_uv_loop(
         .ok_or(ValidationError::DanglingLoop(loop_id))?;
     let mut vertices = Vec::<Pnt2d>::with_capacity(wire.edges.len() + 2);
     let mut first_periodicity = None;
+    let mut first_edge_tolerance = None;
+    let mut previous_edge_tolerance = None;
 
     for coedge in &wire.edges {
+        let edge_tolerance = brep
+            .edges
+            .get(coedge.id)
+            .ok_or(ValidationError::DanglingEdge {
+                loop_id,
+                edge: coedge.id,
+            })?
+            .tolerance;
+        first_edge_tolerance.get_or_insert(edge_tolerance);
         let pcurve_id = coedge.pcurve.ok_or(ValidationError::MissingPcurve {
             face: face_id,
             loop_id,
@@ -354,18 +365,31 @@ fn validate_uv_loop(
                 let lifted_gap = surface
                     .point(previous.x(), previous.y())
                     .distance(&surface.point(start.x(), start.y()));
-                if lifted_gap > policy.linear * 16.0 {
+                let lifted_tolerance = policy
+                    .linear
+                    .mul_add(16.0, 0.0)
+                    .max(edge_tolerance)
+                    .max(previous_edge_tolerance.unwrap_or(policy.linear));
+                if lifted_gap > lifted_tolerance {
                     return Err(ValidationError::UvLoopNotContiguous { loop_id, gap });
                 }
-                // A surface singularity (for example a cone apex or sphere
-                // pole) can collapse a finite UV connector to one 3D point.
-                // Keep that connector explicit for the self-intersection pass.
-                vertices.push(start);
+                if lifted_tolerance > policy.linear * 16.0 {
+                    // Operation-generated neighbours carry a certified 3D
+                    // residual. Treat their smaller endpoint discrepancy as
+                    // round-trip noise for loop topology; adding an artificial
+                    // UV connector can cross the true miter segment.
+                } else {
+                    // A surface singularity (for example a cone apex or sphere
+                    // pole) can collapse a finite UV connector to one 3D point.
+                    // Keep that connector explicit for the self-intersection pass.
+                    vertices.push(start);
+                }
             }
         } else {
             vertices.push(start);
         }
         vertices.push(end);
+        previous_edge_tolerance = Some(edge_tolerance);
     }
 
     let Some(&last) = vertices.last() else {
@@ -382,15 +406,24 @@ fn validate_uv_loop(
         let lifted_gap = surface
             .point(last.x(), last.y())
             .distance(&surface.point(closed.x(), closed.y()));
-        if lifted_gap > policy.linear * 16.0 {
+        let lifted_tolerance = (policy.linear * 16.0)
+            .max(first_edge_tolerance.unwrap_or(policy.linear))
+            .max(previous_edge_tolerance.unwrap_or(policy.linear));
+        if lifted_gap > lifted_tolerance {
             return Err(ValidationError::UvLoopNotContiguous {
                 loop_id,
                 gap: closure_gap,
             });
         }
-        // A singular surface point can require an explicit finite connector in
-        // UV even though both ends lift to the same 3D pole/apex.
-        vertices.push(closed);
+        if lifted_tolerance > policy.linear * 16.0 {
+            if let Some(last) = vertices.last_mut() {
+                *last = closed;
+            }
+        } else {
+            // A singular surface point can require an explicit finite connector
+            // in UV even though both ends lift to the same 3D pole/apex.
+            vertices.push(closed);
+        }
     } else if let Some(last) = vertices.last_mut() {
         // Snap numerical round-trip noise onto the first point's unwrapped
         // periodic branch. Appending another nearly-zero closure segment would
@@ -1020,7 +1053,8 @@ mod tests {
             let pcurve = PcurveData::new(
                 GeomCurve2d::line(Line2d::from_point_dir(
                     Pnt2d::new(start.x(), start.y() + offset_y),
-                    Dir2d::new(dx / length, dy / length),
+                    Dir2d::try_new(dx / length, dy / length)
+                        .expect("validation fixture edge is non-degenerate"),
                 )),
                 0.0,
                 length,

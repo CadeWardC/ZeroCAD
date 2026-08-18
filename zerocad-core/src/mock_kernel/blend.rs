@@ -1,5 +1,265 @@
 use super::*;
 
+/// Apply a persisted edge network through one canonical OpenRCAD operation.
+/// No intermediate solid escapes this boundary.
+pub(crate) fn blend_edge_network(
+    solid: &KernelSolid,
+    edges: &[crate::parametric::EdgeRef],
+    value: f32,
+    kind: crate::sketch::CornerKind,
+    corner_mode: crate::parametric::EdgeCornerMode,
+) -> Result<KernelOutcome, String> {
+    if edges.is_empty() {
+        return Err("edge blend selection is empty".into());
+    }
+
+    let mut kernel_edges = Vec::new();
+    for edge in edges {
+        if let Some(hint @ EdgeCurveHint::Circle { .. }) = edge.curve.as_ref() {
+            let chain = circle_edge_requests(solid, hint).ok_or_else(|| {
+                "selected circular edge could not be matched to the body topology".to_string()
+            })?;
+            kernel_edges.extend(chain);
+        } else {
+            kernel_edges.push(Edge::between_points(
+                snap_point_to_topology(solid, edge.p0),
+                snap_point_to_topology(solid, edge.p1),
+            ));
+        }
+    }
+
+    let request = openrcad::algo::BlendNetworkRequest {
+        edges: kernel_edges,
+        kind: match kind {
+            crate::sketch::CornerKind::Fillet => openrcad::algo::BlendKind::Fillet,
+            crate::sketch::CornerKind::Chamfer => openrcad::algo::BlendKind::Chamfer,
+        },
+        value: value as f64,
+        curve_hint: edges
+            .iter()
+            .all(|edge| matches!(edge.curve, Some(EdgeCurveHint::Circle { .. })))
+            .then_some(openrcad::algo::BlendCurveHint::Circle),
+        corner_mode: match corner_mode {
+            crate::parametric::EdgeCornerMode::Auto => openrcad::algo::BlendCornerMode::Auto,
+            crate::parametric::EdgeCornerMode::Miter => openrcad::algo::BlendCornerMode::Miter,
+            crate::parametric::EdgeCornerMode::RollingBall => {
+                openrcad::algo::BlendCornerMode::RollingBall
+            }
+            crate::parametric::EdgeCornerMode::Setback => openrcad::algo::BlendCornerMode::Setback,
+        },
+    };
+    let native = consume_operation(
+        "edge blend network",
+        openrcad::algo::blend_edge_network_operation_with_policy(
+            solid,
+            &request,
+            &TolerancePolicy::STANDARD,
+        ),
+    );
+    match native {
+        Ok(outcome) => Ok(outcome),
+        Err(native_error)
+            if kind == crate::sketch::CornerKind::Fillet
+                && matches!(
+                    corner_mode,
+                    crate::parametric::EdgeCornerMode::Auto
+                        | crate::parametric::EdgeCornerMode::Miter
+                )
+                && edges.len() > 1
+                && edges.iter().all(|edge| edge.curve.is_none())
+                && edges
+                    .iter()
+                    .all(|edge| !edge_wedge_is_concave(solid, edge.p0, edge.p1)) =>
+        {
+            fillet_straight_edge_network_with_cutters(solid, edges, value).map_err(|fallback| {
+                format!("native failed: {native_error}; simultaneous cutter failed: {fallback}")
+            })
+        }
+        Err(native_error)
+            if kind == crate::sketch::CornerKind::Chamfer
+                && matches!(
+                    corner_mode,
+                    crate::parametric::EdgeCornerMode::Auto
+                        | crate::parametric::EdgeCornerMode::Miter
+                )
+                && edges.iter().all(|edge| edge.curve.is_none()) =>
+        {
+            chamfer_straight_edge_network_with_cutters(solid, edges, value).map_err(|fallback| {
+                format!("native failed: {native_error}; simultaneous cutter failed: {fallback}")
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Boolean recut for a degree-two network of straight, orthogonal material
+/// edges. Each exact circular crescent is generated from the original support
+/// planes and extended through both selected endpoints. Applying all cutters to
+/// a scratch solid lets adjacent cylindrical surfaces intersect and trim to one
+/// shared miter seam; no intermediate body is exposed to the feature graph.
+fn fillet_straight_edge_network_with_cutters(
+    solid: &KernelSolid,
+    edges: &[crate::parametric::EdgeRef],
+    radius: f32,
+) -> Result<KernelOutcome, String> {
+    let policy = &TolerancePolicy::STANDARD;
+    let mut combined_cutter: Option<KernelSolid> = None;
+    for edge in edges {
+        let p0 = Pnt::new(edge.p0[0] as f64, edge.p0[1] as f64, edge.p0[2] as f64);
+        let p1 = Pnt::new(edge.p1[0] as f64, edge.p1[1] as f64, edge.p1[2] as f64);
+        let tangent_dir = (p1 - p0)
+            .normalized()
+            .ok_or_else(|| "selected fillet edge is degenerate".to_string())?;
+        let tangent = GeomVec::from_dir(tangent_dir);
+        let n1 = GeomVec::new(edge.n1[0] as f64, edge.n1[1] as f64, edge.n1[2] as f64)
+            .normalized()
+            .ok_or_else(|| "first adjacent face normal is degenerate".to_string())?;
+        let n2 = GeomVec::new(edge.n2[0] as f64, edge.n2[1] as f64, edge.n2[2] as f64)
+            .normalized()
+            .ok_or_else(|| "second adjacent face normal is degenerate".to_string())?;
+        let n1 = GeomVec::from_dir(n1);
+        let n2 = GeomVec::from_dir(n2);
+        if n1.dot(&n2).abs() > 1.0e-6 {
+            return Err("circular-crescent fallback requires orthogonal support planes".into());
+        }
+
+        // The two contact directions lie in their respective supporting faces
+        // and point into the material wedge removed by a convex fillet.
+        let contact_1 = (n2 * -1.0 + n1 * n1.dot(&n2))
+            .normalized()
+            .ok_or_else(|| "adjacent faces do not define a fillet wedge".to_string())?;
+        let contact_2 = (n1 * -1.0 + n2 * n1.dot(&n2))
+            .normalized()
+            .ok_or_else(|| "adjacent faces do not define a fillet wedge".to_string())?;
+        let contact_1 = GeomVec::from_dir(contact_1);
+        let contact_2 = GeomVec::from_dir(contact_2);
+        let r = radius as f64;
+        let grow = (r * 0.05).max(0.2);
+        let start = p0 - tangent * grow;
+        let sweep = tangent * (p0.distance(&p1) + 2.0 * grow);
+        let center = start + (contact_1 + contact_2) * r;
+        // Build the cutter as an oversized rectangular prism minus the exact
+        // tangent cylinder. Unlike a crescent profile, none of the tool's
+        // planar faces are coincident with the body's supporting faces; only
+        // the desired analytic cylinder meets them tangentially. This avoids a
+        // boolean free edge at the two contact rails.
+        let margin = grow;
+        let a = start - contact_1 * margin - contact_2 * margin;
+        let b = start + contact_1 * (r + margin) - contact_2 * margin;
+        let c = start + contact_1 * (r + margin) + contact_2 * (r + margin);
+        let d = start - contact_1 * margin + contact_2 * (r + margin);
+        let profile = Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                start,
+                tangent_dir,
+            ))),
+            Wire::from_edges([
+                Edge::between_points(a, b),
+                Edge::between_points(b, c),
+                Edge::between_points(c, d),
+                Edge::between_points(d, a),
+            ]),
+        );
+        let envelope = consume_operation(
+            "fillet network cutter envelope",
+            openrcad::algo::prism_operation_with_policy(&profile, sweep, policy),
+        )?
+        .solid;
+        let cylinder = consume_operation(
+            "fillet network cutter cylinder",
+            openrcad::primitives::make_cylinder_operation_with_policy(
+                &Ax2::new(center - tangent * margin, tangent_dir),
+                r,
+                sweep.magnitude() + 2.0 * margin,
+                policy,
+            ),
+        )?
+        .solid;
+        let cutter = difference_diagnostic(&envelope, &cylinder)
+            .map_err(|error| format!("could not hollow the fillet cutter: {error}"))?;
+        combined_cutter = Some(match combined_cutter.take() {
+            None => cutter,
+            Some(existing) => union_diagnostic(&existing, &cutter)
+                .map_err(|error| format!("could not join fillet network cutters: {error}"))?,
+        });
+    }
+    let cutter = combined_cutter.ok_or_else(|| "fillet network has no cutters".to_string())?;
+    let current = difference_diagnostic(solid, &cutter)
+        .map_err(|error| format!("could not apply the fillet network cutter: {error}"))?;
+    consume_local_unary_operation("fillet edge network", solid, current, policy)
+}
+
+fn chamfer_straight_edge_network_with_cutters(
+    solid: &KernelSolid,
+    edges: &[crate::parametric::EdgeRef],
+    distance: f32,
+) -> Result<KernelOutcome, String> {
+    let policy = &TolerancePolicy::STANDARD;
+    let mut combined_cutter: Option<KernelSolid> = None;
+    for edge in edges {
+        let p0 = Pnt::new(edge.p0[0] as f64, edge.p0[1] as f64, edge.p0[2] as f64);
+        let p1 = Pnt::new(edge.p1[0] as f64, edge.p1[1] as f64, edge.p1[2] as f64);
+        let tangent = (p1 - p0)
+            .normalized()
+            .ok_or_else(|| "selected chamfer edge is degenerate".to_string())?;
+        let n1 = GeomVec::new(edge.n1[0] as f64, edge.n1[1] as f64, edge.n1[2] as f64)
+            .normalized()
+            .ok_or_else(|| "first adjacent face normal is degenerate".to_string())?;
+        let n2 = GeomVec::new(edge.n2[0] as f64, edge.n2[1] as f64, edge.n2[2] as f64)
+            .normalized()
+            .ok_or_else(|| "second adjacent face normal is degenerate".to_string())?;
+        let n1 = GeomVec::from_dir(n1);
+        let n2 = GeomVec::from_dir(n2);
+        let along_face_1 = (n2 * -1.0 + n1 * n1.dot(&n2))
+            .normalized()
+            .ok_or_else(|| "adjacent faces do not define a chamfer wedge".to_string())?;
+        let along_face_2 = (n1 * -1.0 + n2 * n1.dot(&n2))
+            .normalized()
+            .ok_or_else(|| "adjacent faces do not define a chamfer wedge".to_string())?;
+        let offset_1 = GeomVec::from_dir(along_face_1) * distance as f64;
+        let offset_2 = GeomVec::from_dir(along_face_2) * distance as f64;
+        let tangent = GeomVec::from_dir(tangent);
+        let grow = (distance as f64 * 0.05).max(0.2);
+        let start = p0 - tangent * grow;
+        let end = p1 + tangent * grow;
+        let margin = grow;
+        let rings = vec![
+            vec![
+                start
+                    - GeomVec::from_dir(along_face_1) * margin
+                    - GeomVec::from_dir(along_face_2) * margin,
+                start + offset_1 + GeomVec::from_dir(along_face_1) * margin
+                    - GeomVec::from_dir(along_face_2) * margin,
+                start - GeomVec::from_dir(along_face_1) * margin
+                    + offset_2
+                    + GeomVec::from_dir(along_face_2) * margin,
+            ],
+            vec![
+                end - GeomVec::from_dir(along_face_1) * margin
+                    - GeomVec::from_dir(along_face_2) * margin,
+                end + offset_1 + GeomVec::from_dir(along_face_1) * margin
+                    - GeomVec::from_dir(along_face_2) * margin,
+                end - GeomVec::from_dir(along_face_1) * margin
+                    + offset_2
+                    + GeomVec::from_dir(along_face_2) * margin,
+            ],
+        ];
+        let cutter = consume_operation(
+            "chamfer network cutter",
+            openrcad::algo::skin_polygon_rings_operation_with_policy(&rings, policy),
+        )?
+        .solid;
+        combined_cutter = Some(match combined_cutter.take() {
+            None => cutter,
+            Some(existing) => union_diagnostic(&existing, &cutter)
+                .map_err(|error| format!("could not join chamfer network cutters: {error}"))?,
+        });
+    }
+    let cutter = combined_cutter.ok_or_else(|| "chamfer network has no cutters".to_string())?;
+    let current = difference_diagnostic(solid, &cutter)?;
+    consume_local_unary_operation("chamfer edge network", solid, current, policy)
+}
+
 /// Fillet every topological edge of one connected solid as a single validated
 /// kernel operation. The returned value does not escape the canonical outcome
 /// boundary unless representation validation and topology-history coverage are

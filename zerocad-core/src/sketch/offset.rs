@@ -80,7 +80,8 @@ fn entity_span(
             Ok(CurveSpan::new(
                 GeomCurve2d::line(Line2d::from_point_dir(
                     Pnt2d::new(f64::from(start.0), f64::from(start.1)),
-                    Dir2d::new(dx / length, dy / length),
+                    Dir2d::try_new(dx / length, dy / length)
+                        .ok_or(SketchOffsetError::Kernel(OffsetError::Collapse { span: 0 }))?,
                 )),
                 0.0,
                 length,

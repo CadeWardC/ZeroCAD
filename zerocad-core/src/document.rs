@@ -792,6 +792,7 @@ pub(crate) fn body_for_feature(id: &str, feature: &FeatureType) -> Option<BodyId
             ExtrudeMode::Join | ExtrudeMode::Cut => target.as_deref().map(BodyId::from),
         },
         FeatureType::EdgeMod { target, .. }
+        | FeatureType::EdgeBlend { target, .. }
         | FeatureType::Shell { target, .. }
         | FeatureType::Hole { target, .. }
         | FeatureType::Thread { target, .. } => Some(BodyId::from(target.as_str())),
@@ -832,6 +833,7 @@ pub(crate) fn feature_inputs_for_runtime(
 fn intrinsic_inputs(feature: &FeatureType) -> Vec<FeatureInput> {
     let mut inputs = match feature {
         FeatureType::EdgeMod { target, .. }
+        | FeatureType::EdgeBlend { target, .. }
         | FeatureType::Shell { target, .. }
         | FeatureType::Hole { target, .. }
         | FeatureType::Thread { target, .. } => {
@@ -1064,6 +1066,7 @@ pub enum FeatureEvaluatorKind {
     Cylinder,
     Extrude,
     EdgeMod,
+    EdgeBlend,
     Import,
     Revolve,
     Loft,
@@ -1139,6 +1142,12 @@ impl FeatureRegistry {
             "part.edge_mod",
             "Fillet / Chamfer",
             FeatureEvaluatorKind::EdgeMod,
+            FeatureEditorGroup::Modify,
+        ),
+        registration(
+            "part.edge_blend",
+            "Edge Blend",
+            FeatureEvaluatorKind::EdgeBlend,
             FeatureEditorGroup::Modify,
         ),
         registration(
@@ -1368,6 +1377,7 @@ impl FeatureType {
             FeatureType::Sketch { .. } => "sketch.sketch",
             FeatureType::Extrude { .. } => "part.extrude",
             FeatureType::EdgeMod { .. } => "part.edge_mod",
+            FeatureType::EdgeBlend { .. } => "part.edge_blend",
             FeatureType::VariableSet { .. } => "document.variables",
             FeatureType::Import { .. } => "exchange.step_import",
             FeatureType::Revolve { .. } => "part.revolve",

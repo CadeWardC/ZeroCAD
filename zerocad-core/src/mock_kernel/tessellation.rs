@@ -40,6 +40,10 @@ pub(crate) fn active_tess_budget() -> (f64, f64) {
         .unwrap_or((TESS_TOL, TESS_ANGLE))
 }
 
+pub(crate) fn clear_preview_tess_override() {
+    PREVIEW_TESS.with(|budget| budget.set(None));
+}
+
 /// Run `f` with the coarse preview tessellation budget active on this thread,
 /// restoring the previous budget afterward (even on panic). Every body meshed
 /// while it runs uses [`TESS_TOL_PREVIEW`]/[`TESS_ANGLE_PREVIEW`].

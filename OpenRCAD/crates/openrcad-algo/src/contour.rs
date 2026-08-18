@@ -53,6 +53,26 @@ pub enum BlendCurveHint {
     Circle,
 }
 
+/// Corner construction requested for a complete selected-edge network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlendCornerMode {
+    #[default]
+    Auto,
+    Miter,
+    RollingBall,
+    Setback,
+}
+
+/// One atomic selected-edge blend request.
+#[derive(Clone, Debug)]
+pub struct BlendNetworkRequest {
+    pub edges: Vec<Edge>,
+    pub kind: BlendKind,
+    pub value: f64,
+    pub curve_hint: Option<BlendCurveHint>,
+    pub corner_mode: BlendCornerMode,
+}
+
 /// A logical selected-edge contour.
 #[derive(Clone, Debug)]
 pub struct BlendContour {
@@ -94,6 +114,11 @@ pub enum BlendContourError {
     Fillet(RollingBallError),
     /// Chamfer failed.
     Chamfer(ChamferError),
+    /// The requested corner construction is incompatible with the selection.
+    IncompatibleCornerMode(&'static str),
+    /// The public mode is preserved for persistence but not implemented by the
+    /// current analytic network solver.
+    UnsupportedCornerMode(&'static str),
 }
 
 impl fmt::Display for BlendContourError {
@@ -105,8 +130,98 @@ impl fmt::Display for BlendContourError {
             }
             Self::Fillet(err) => write!(f, "{err}"),
             Self::Chamfer(err) => write!(f, "{err}"),
+            Self::IncompatibleCornerMode(reason) => {
+                write!(f, "blend contour: incompatible corner mode ({reason})")
+            }
+            Self::UnsupportedCornerMode(mode) => {
+                write!(
+                    f,
+                    "blend contour: {mode} corners are not supported for this network"
+                )
+            }
         }
     }
+}
+
+/// Apply a selected edge network as one immutable candidate.
+pub fn apply_blend_network_with_policy(
+    solid: &Solid,
+    request: &BlendNetworkRequest,
+    policy: &TolerancePolicy,
+) -> Result<Solid, BlendContourError> {
+    if request.edges.is_empty() {
+        return Err(BlendContourError::EmptyContour);
+    }
+    let selected_max_degree = selected_vertex_max_degree(&request.edges, policy.sewing);
+    match request.corner_mode {
+        BlendCornerMode::Auto => {}
+        BlendCornerMode::Miter => {
+            if selected_max_degree > 2 {
+                return Err(BlendContourError::IncompatibleCornerMode(
+                    "miter requires selected vertex degree at most two",
+                ));
+            }
+        }
+        BlendCornerMode::RollingBall => {
+            if request.kind != BlendKind::Fillet {
+                return Err(BlendContourError::IncompatibleCornerMode(
+                    "rolling-ball corners are fillet-only",
+                ));
+            }
+            if request.edges.len() < 3
+                || !selected_edges_share_vertex(&request.edges, policy.sewing)
+            {
+                return Err(BlendContourError::IncompatibleCornerMode(
+                    "rolling-ball requires a complete vertex of at least three edges",
+                ));
+            }
+        }
+        BlendCornerMode::Setback => {
+            return Err(BlendContourError::UnsupportedCornerMode("setback"));
+        }
+    }
+    apply_blend_contour_with_policy(
+        solid,
+        &BlendContour::constant(
+            request.edges.clone(),
+            request.kind,
+            request.value,
+            request.curve_hint,
+        ),
+        policy,
+    )
+}
+
+fn selected_edges_share_vertex(edges: &[Edge], tolerance: f64) -> bool {
+    [edges[0].source().point(), edges[0].target().point()]
+        .into_iter()
+        .any(|candidate| {
+            edges.iter().all(|edge| {
+                edge.source().point().distance(&candidate) <= tolerance
+                    || edge.target().point().distance(&candidate) <= tolerance
+            })
+        })
+}
+
+fn selected_vertex_max_degree(edges: &[Edge], tolerance: f64) -> usize {
+    let mut vertices: Vec<(openrcad_foundation::Pnt, usize)> = Vec::new();
+    for edge in edges {
+        for point in [edge.source().point(), edge.target().point()] {
+            if let Some((_, degree)) = vertices
+                .iter_mut()
+                .find(|(candidate, _)| candidate.distance(&point) <= tolerance)
+            {
+                *degree += 1;
+            } else {
+                vertices.push((point, 1));
+            }
+        }
+    }
+    vertices
+        .into_iter()
+        .map(|(_, degree)| degree)
+        .max()
+        .unwrap_or(0)
 }
 
 impl std::error::Error for BlendContourError {}

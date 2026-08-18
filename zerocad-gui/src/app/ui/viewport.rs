@@ -1245,6 +1245,9 @@ impl ZeroCadApp {
                                             "Click Extrude to build the selected sketch profiles."
                                                 .to_string()
                                         };
+                                        if self.extrude_profile_pick_active {
+                                            self.begin_extrude_from_selection();
+                                        }
                                     }
                                 } else {
                                     // No sketch hit — try body picking instead. The face

@@ -888,15 +888,16 @@ fn edge_from_curve(curve: BSplineCurve) -> Edge {
     Edge::new(Some(GeomCurve::bspline(curve)), first, last, start, end)
 }
 
-fn uv_line(start: Pnt2d, end: Pnt2d) -> PcurveData {
+fn uv_line(start: Pnt2d, end: Pnt2d) -> Result<PcurveData, SmoothLoftError> {
     let delta = end - start;
     let length = delta.magnitude();
-    let direction = Dir2d::new(delta.x() / length, delta.y() / length);
-    PcurveData::new(
+    let direction = Dir2d::try_new(delta.x() / length, delta.y() / length)
+        .ok_or(SmoothLoftError::SingularInterpolation)?;
+    Ok(PcurveData::new(
         GeomCurve2d::line(Line2d::from_point_dir(start, direction)),
         0.0,
         length,
-    )
+    ))
 }
 
 fn surface_face(surface: BSplineSurface) -> Result<Face, SmoothLoftError> {
@@ -951,10 +952,10 @@ fn surface_face(surface: BSplineSurface) -> Result<Face, SmoothLoftError> {
         GeomSurface::bspline(surface),
         wire,
         vec![
-            uv_line(Pnt2d::new(0.0, 0.0), Pnt2d::new(1.0, 0.0)),
-            uv_line(Pnt2d::new(1.0, 0.0), Pnt2d::new(1.0, 1.0)),
-            uv_line(Pnt2d::new(0.0, 1.0), Pnt2d::new(1.0, 1.0)),
-            uv_line(Pnt2d::new(0.0, 0.0), Pnt2d::new(0.0, 1.0)),
+            uv_line(Pnt2d::new(0.0, 0.0), Pnt2d::new(1.0, 0.0))?,
+            uv_line(Pnt2d::new(1.0, 0.0), Pnt2d::new(1.0, 1.0))?,
+            uv_line(Pnt2d::new(0.0, 1.0), Pnt2d::new(1.0, 1.0))?,
+            uv_line(Pnt2d::new(0.0, 0.0), Pnt2d::new(0.0, 1.0))?,
         ],
     )
     .map_err(|error| SmoothLoftError::FaceBuild(error.to_string()))

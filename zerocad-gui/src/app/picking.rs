@@ -484,7 +484,14 @@ impl ZeroCadApp {
             .document
             .graph
             .node_indices()
-            .filter(|&i| matches!(self.document.graph[i].feature, FeatureType::EdgeMod { kind: k, .. } if k == kind))
+            .filter(|&i| {
+                matches!(
+                    self.document.graph[i].feature,
+                    FeatureType::EdgeMod { kind: k, .. }
+                        | FeatureType::EdgeBlend { kind: k, .. }
+                        if k == kind
+                )
+            })
             .count()
             + 1;
         format!("{}_{}", prefix, n)

@@ -21,8 +21,8 @@ use zerocad_core::{Document, FeatureNode, FeatureState, FeatureType, ParametricG
 fn feature_payload_corpus() -> Vec<FeatureType> {
     use zerocad_core::mock_kernel::EdgeCurveHint;
     use zerocad_core::{
-        AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeRef,
-        ExtrudeMode, HoleKind, PatternKind, PlaneBase, SketchCurves, Variable,
+        AxisBase, CoordinateSystem, DatumAxisDef, DatumPlaneDef, DatumPointDef, EdgeCornerMode,
+        EdgeRef, ExtrudeMode, HoleKind, PatternKind, PlaneBase, SketchCurves, Variable,
     };
 
     let face = FaceRef {
@@ -80,6 +80,21 @@ fn feature_payload_corpus() -> Vec<FeatureType> {
             dist: 0.2,
             dist_expr: Some("0.1*2".into()),
             kind: zerocad_core::CornerKind::Chamfer,
+        },
+        FeatureType::EdgeBlend {
+            target: "missing_body".into(),
+            edges: vec![EdgeRef {
+                p0: [0.0, 0.0, 0.0],
+                p1: [1.0, 0.0, 0.0],
+                n1: [0.0, 1.0, 0.0],
+                n2: [0.0, 0.0, 1.0],
+                curve: Some(EdgeCurveHint::Line),
+                topology: None,
+            }],
+            dist: 0.2,
+            dist_expr: Some("0.1*2".into()),
+            kind: zerocad_core::CornerKind::Fillet,
+            corner_mode: EdgeCornerMode::Miter,
         },
         FeatureType::VariableSet {
             variables: vec![Variable::new("width", Unit::Millimeter)],

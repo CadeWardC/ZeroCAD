@@ -1802,7 +1802,9 @@ pub fn detect_regions_analytic(curves: &SketchCurves) -> Result<Vec<Region>, Ana
         if length <= tolerance {
             continue;
         }
-        let direction = Dir2d::new(dx / length, dy / length);
+        let Some(direction) = Dir2d::try_new(dx / length, dy / length) else {
+            continue;
+        };
         spans.push(CurveSpan::new(
             GeomCurve2d::line(Line2d::from_point_dir(
                 Pnt2d::new(f64::from(segment.a.0), f64::from(segment.a.1)),

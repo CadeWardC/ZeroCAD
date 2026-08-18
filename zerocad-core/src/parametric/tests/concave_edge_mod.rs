@@ -186,6 +186,237 @@ fn pocket_top_rim_edge_ref() -> EdgeRef {
     }
 }
 
+fn pocket_top_rim_edge_refs() -> Vec<EdgeRef> {
+    vec![
+        pocket_top_rim_edge_ref(),
+        EdgeRef {
+            p0: [15.0, 5.0, 10.0],
+            p1: [15.0, 15.0, 10.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [-1.0, 0.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+        EdgeRef {
+            p0: [15.0, 15.0, 10.0],
+            p1: [5.0, 15.0, 10.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, -1.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+        EdgeRef {
+            p0: [5.0, 15.0, 10.0],
+            p1: [5.0, 5.0, 10.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [1.0, 0.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+    ]
+}
+
+fn add_atomic_pocket_rim_blend(g: &mut ParametricGraph, kind: crate::sketch::CornerKind) {
+    g.add_feature(FeatureNode {
+        id: "edgeblend_5".to_string(),
+        name: "Pocket rim blend".to_string(),
+        feature: FeatureType::EdgeBlend {
+            target: "extrude_2".to_string(),
+            edges: canonicalize_edge_refs(pocket_top_rim_edge_refs()),
+            dist: 1.0,
+            dist_expr: None,
+            kind,
+            corner_mode: EdgeCornerMode::Miter,
+        },
+    });
+    g.add_dependency("extrude_4", "edgeblend_5");
+}
+
+#[test]
+fn complete_inner_pocket_rim_chamfer_is_one_atomic_miter_network() {
+    let kind = crate::sketch::CornerKind::Chamfer;
+    let mut graph = pocketed_block_graph();
+    add_atomic_pocket_rim_blend(&mut graph, kind);
+
+    let (live, warnings) = graph
+        .build_live(&HashSet::new(), false)
+        .expect("inner pocket edge network must evaluate");
+    assert!(warnings.is_empty(), "{kind:?}: {warnings:?}");
+    assert_eq!(live.len(), 1, "{kind:?}: network must retain one body");
+    assert_eq!(live[0].parts.len(), 1, "{kind:?}: expected one solid");
+    let solid = &live[0].parts[0];
+    assert!(
+        solid.is_watertight() && solid.health_report().is_healthy(),
+        "{kind:?}: resulting solid must be healthy"
+    );
+    let mesh = MockMesh::from_solid(solid);
+    let (cracks, nonmanifold, _inward) = mesh_stats(&mesh);
+    assert_eq!(cracks, 0, "{kind:?}: display mesh must be crack-free");
+    assert_eq!(
+        nonmanifold, 0,
+        "{kind:?}: display mesh must remain manifold"
+    );
+}
+
+/// Screenshot regression: an extruded rectangular frame whose four inner top
+/// edges are selected as one blend network. The UI displays metres, so its
+/// `0.05 m` entry reaches the graph as 50 mm.
+fn assert_rectangular_frame_inner_rim_accepts_fifty_millimeter_blend(
+    kind: crate::sketch::CornerKind,
+) {
+    let mut curves = rect_sketch((-200.0, -150.0), (200.0, 150.0));
+    curves.extend_curves(&rect_sketch((-125.0, -75.0), (125.0, 75.0)));
+    let regions = detect_regions(&curves);
+    let frame_region = regions
+        .iter()
+        .position(|region| region.contains((162.5, 0.0)))
+        .expect("rectangular frame material region");
+
+    let mut graph = ParametricGraph::new();
+    add_sketch(&mut graph, "sketch_1", curves);
+    graph.add_feature(FeatureNode {
+        id: "extrude_2".into(),
+        name: "Extrude".into(),
+        feature: FeatureType::Extrude {
+            target: None,
+            depth: 100.0,
+            region_indices: vec![frame_region],
+            mode: ExtrudeMode::NewBody,
+            depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
+        },
+    });
+    graph.add_dependency("sketch_1", "extrude_2");
+    let (plain, warnings) = graph
+        .build_live(&HashSet::new(), false)
+        .expect("plain rectangular frame evaluates");
+    assert!(warnings.is_empty(), "plain frame warnings: {warnings:?}");
+    let plain_volume = MockMesh::from_solid(&plain[0].parts[0])
+        .mass_properties()
+        .expect("plain frame mass properties")
+        .volume;
+
+    let edges = vec![
+        EdgeRef {
+            p0: [-125.0, -75.0, 100.0],
+            p1: [125.0, -75.0, 100.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, 1.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+        EdgeRef {
+            p0: [125.0, -75.0, 100.0],
+            p1: [125.0, 75.0, 100.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [-1.0, 0.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+        EdgeRef {
+            p0: [125.0, 75.0, 100.0],
+            p1: [-125.0, 75.0, 100.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [0.0, -1.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+        EdgeRef {
+            p0: [-125.0, 75.0, 100.0],
+            p1: [-125.0, -75.0, 100.0],
+            n1: [0.0, 0.0, 1.0],
+            n2: [1.0, 0.0, 0.0],
+            curve: None,
+            topology: None,
+        },
+    ];
+    let feature_id = match kind {
+        crate::sketch::CornerKind::Fillet => "edgeblend_spec_4",
+        crate::sketch::CornerKind::Chamfer => "edgeblend_spec_5",
+    };
+    graph.add_feature(FeatureNode {
+        id: feature_id.into(),
+        name: format!("Inner rim {kind:?}"),
+        feature: FeatureType::EdgeBlend {
+            target: "extrude_2".into(),
+            edges: canonicalize_edge_refs(edges),
+            dist: 50.0,
+            dist_expr: None,
+            kind,
+            corner_mode: EdgeCornerMode::Miter,
+        },
+    });
+    graph.add_dependency("extrude_2", feature_id);
+
+    let (live, warnings) = graph
+        .build_live(&HashSet::new(), false)
+        .expect("rectangular frame edge blend evaluates");
+    assert!(
+        warnings.is_empty(),
+        "0.05 m {kind:?} must commit: {warnings:?}"
+    );
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].parts.len(), 1);
+    let solid = &live[0].parts[0];
+    assert!(solid.is_watertight() && solid.health_report().is_healthy());
+    let mesh = MockMesh::from_solid(solid);
+    let blended_volume = mesh
+        .mass_properties()
+        .expect("blended frame mass properties")
+        .volume;
+    assert!(
+        blended_volume < plain_volume - 1.0,
+        "{kind:?} must remove material: {blended_volume} vs {plain_volume}"
+    );
+    let (cracks, nonmanifold, _inward) = mesh_stats(&mesh);
+    assert_eq!(cracks, 0, "display mesh must be crack-free");
+    assert_eq!(nonmanifold, 0, "display mesh must remain manifold");
+}
+
+#[test]
+fn rectangular_frame_inner_rim_accepts_fifty_millimeter_chamfer() {
+    assert_rectangular_frame_inner_rim_accepts_fifty_millimeter_blend(
+        crate::sketch::CornerKind::Chamfer,
+    );
+}
+
+#[test]
+fn rectangular_frame_inner_rim_accepts_fifty_millimeter_fillet() {
+    assert_rectangular_frame_inner_rim_accepts_fifty_millimeter_blend(
+        crate::sketch::CornerKind::Fillet,
+    );
+}
+
+#[test]
+fn single_inner_pocket_edge_uses_the_atomic_feature_path() {
+    for kind in [
+        crate::sketch::CornerKind::Fillet,
+        crate::sketch::CornerKind::Chamfer,
+    ] {
+        let mut graph = pocketed_block_graph();
+        graph.add_feature(FeatureNode {
+            id: "edgeblend_5".to_string(),
+            name: "Inner edge blend".to_string(),
+            feature: FeatureType::EdgeBlend {
+                target: "extrude_2".to_string(),
+                edges: vec![pocket_vertical_edge_ref()],
+                dist: 1.0,
+                dist_expr: None,
+                kind,
+                corner_mode: EdgeCornerMode::Auto,
+            },
+        });
+        graph.add_dependency("extrude_4", "edgeblend_5");
+        let (live, warnings) = graph
+            .build_live(&HashSet::new(), false)
+            .expect("single inner edge must evaluate");
+        assert!(warnings.is_empty(), "{kind:?}: {warnings:?}");
+        let solid = &live[0].parts[0];
+        assert!(solid.is_watertight() && solid.health_report().is_healthy());
+    }
+}
+
 fn add_chained_pocket_fillets(g: &mut ParametricGraph, vertical_first: bool) {
     let edges = if vertical_first {
         [pocket_vertical_edge_ref(), pocket_top_rim_edge_ref()]

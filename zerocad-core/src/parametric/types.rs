@@ -150,6 +150,39 @@ pub struct EdgeRef {
     pub topology: Option<TopologyEdgeRef>,
 }
 
+/// How the vertices shared by several selected blend edges are resolved.
+///
+/// The mode belongs to the whole feature so replay, preview and evaluation all
+/// make the same corner decision.  The kernel may reject a mode that is not
+/// meaningful for the selected topology; it must never silently substitute a
+/// different mode.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum EdgeCornerMode {
+    /// Select the compatible construction from the complete edge network.
+    #[default]
+    Auto,
+    /// Trim adjacent degree-two blend bands to their common seam.
+    Miter,
+    /// Use a rolling-ball vertex solution. Fillet-only.
+    RollingBall,
+    /// Use a setback corner patch for a complete selected vertex.
+    Setback,
+}
+
+/// Return one byte-stable edge set for persistence and cache identity.
+///
+/// Topology names normally provide the distinguishing bytes; the complete
+/// serialized fallback keeps legacy geometric references deterministic too.
+pub fn canonicalize_edge_refs(mut edges: Vec<EdgeRef>) -> Vec<EdgeRef> {
+    let encoded =
+        |edge: &EdgeRef| serde_json::to_vec(edge).expect("EdgeRef must remain serializable");
+    edges.sort_by_cached_key(encoded);
+    edges.dedup_by(|left, right| encoded(left) == encoded(right));
+    edges
+}
+
 /// Reserved string encoding for a strict whole-solid edge selection.
 ///
 /// `EdgeMod` deliberately remains a single-edge-shaped persisted feature for
@@ -740,6 +773,27 @@ pub enum FeatureType {
         dist_expr: Option<String>,
         /// Whether to round (Fillet) or bevel (Chamfer) the edge.
         kind: crate::sketch::CornerKind,
+    },
+    /// Atomically round or bevel a complete, explicitly selected edge network.
+    ///
+    /// Unlike legacy [`Self::EdgeMod`], all edges are resolved against the same
+    /// input body and the resulting solid is committed only after every band,
+    /// corner and pcurve passes strict validation.
+    EdgeBlend {
+        /// Node id of the body being modified.
+        target: String,
+        /// Canonically ordered, non-empty selected edge set.
+        edges: Vec<EdgeRef>,
+        /// Fillet radius / chamfer setback, in base units (mm).
+        dist: f32,
+        /// Optional expression driving `dist`.
+        #[serde(default)]
+        dist_expr: Option<String>,
+        /// Whether to round or bevel the network.
+        kind: crate::sketch::CornerKind,
+        /// One corner construction policy for the complete operation.
+        #[serde(default)]
+        corner_mode: EdgeCornerMode,
     },
     /// A named collection of parametric variables. Carries no geometry — it's a
     /// container the user fills with dimensioned values for later reference.

@@ -67,6 +67,14 @@ pub use types::*;
 #[allow(unused_imports)]
 pub(crate) use wireframe::*;
 
+/// Clear evaluator thread-local integration state after an unwound kernel call.
+/// Request-owned solids and graph caches are dropped by the worker separately.
+pub fn reset_evaluator_thread_state() {
+    clear_kernel_cancellation();
+    reset_diagnostics();
+    clear_preview_tess_override();
+}
+
 #[cfg(test)]
 mod wireframe_tests {
     use super::*;
@@ -172,6 +180,117 @@ mod wireframe_tests {
                 .filter(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
                 .count()
                 >= 8
+        );
+    }
+
+    /// Glyph outlines are chains of OPEN Bézier segments meeting end to end, so
+    /// sketch text depends on a closed loop assembled from open control-point
+    /// splines reaching the B-Rep as real B-spline edges. If the analytic path
+    /// ever drops that provenance the loop falls back to sampled chords and
+    /// every letter extrudes as a faceted prism.
+    #[test]
+    fn analytic_open_spline_chain_reaches_brep_as_bspline_edges() {
+        let mut curves = crate::sketch::SketchCurves::new();
+        curves.add_line((0.0, 0.0), (10.0, 0.0));
+        curves.add_spline(crate::sketch::Spline {
+            kind: crate::sketch::SplineKind::ControlPoint,
+            points: vec![(10.0, 0.0), (14.0, 3.0), (14.0, 7.0), (10.0, 10.0)],
+            degree: 3,
+            knots: Vec::new(),
+            weights: Vec::new(),
+            closed: false,
+            periodic: false,
+            continuity: crate::sketch::SplineContinuity::default(),
+            trim: None,
+        });
+        curves.add_line((10.0, 10.0), (0.0, 10.0));
+        curves.add_line((0.0, 10.0), (0.0, 0.0));
+
+        let region = crate::sketch::detect_regions_analytic(&curves)
+            .expect("open-spline chain arranges")
+            .into_iter()
+            .next()
+            .expect("bulged rectangle region");
+
+        let solid = extruded_sketch_region_solid(&region, 4.0, &CoordinateSystem::XY, &[])
+            .expect("analytic spline prism");
+
+        assert!(
+            solid
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.curve(), Some(GeomCurve::BSpline(_)))),
+            "the spline span must survive as a B-spline edge, not sampled chords"
+        );
+    }
+
+    fn swept_volume(region: &crate::sketch::Region, depth: f32) -> f64 {
+        let solid =
+            extruded_sketch_region_solid(region, depth, &CoordinateSystem::XY, &[]).expect("prism");
+        assert!(solid.is_watertight(), "swept solid must be watertight");
+        crate::parametric::solid_volume(&solid).expect("closed solid")
+    }
+
+    fn circle_region(radius: f32) -> crate::sketch::Region {
+        let mut curves = crate::sketch::SketchCurves::new();
+        curves.add_circle((0.0, 0.0), radius);
+        crate::sketch::detect_regions_analytic(&curves)
+            .expect("circle arrangement")
+            .into_iter()
+            .next()
+            .expect("disc region")
+    }
+
+    /// KNOWN BUG - a circular prism's cylindrical walls face inward.
+    ///
+    /// Per-face divergence contributions for an r=8, h=4 disc prism:
+    ///   cap z=0   Plane    Forward     0.00
+    ///   cap z=4   Plane    Forward  +266.36
+    ///   4x wall   Cylinder Reversed -133.53 each
+    /// The wall magnitudes are right (534 against an expected 536) but their
+    /// sign is inverted, so the solid's signed volume is -267.76; the reported
+    /// 267.76 is only its absolute value.
+    ///
+    /// This is the cap-orientation bug repeated on the laterals: `sew` resolves
+    /// a winding/normal conflict by flipping the face's orientation flag, which
+    /// leaves an inward *effective* normal that watertight and health checks
+    /// cannot see. The cap case was fixed by reversing the loop winding
+    /// (`reversed_wire`); the cylindrical laterals never got the same treatment.
+    ///
+    /// Nothing to do with sketch text - it affects every curved extrusion, and
+    /// therefore every mass property, volume readout and STL export over one.
+    /// It survives because watertight, health and closed-mesh checks all pass
+    /// and shading uses per-vertex normals rather than winding.
+
+    #[test]
+    fn circular_prism_encloses_its_full_volume() {
+        let volume = swept_volume(&circle_region(8.0), 4.0);
+        let expected = std::f64::consts::PI * 64.0 * 4.0;
+        assert!(
+            (volume - expected).abs() <= expected * 0.02,
+            "disc prism should enclose {expected:.2} mm3, got {volume:.2}"
+        );
+    }
+
+    /// Follows from the same defect; kept because a holed profile is the shape
+    /// text emboss actually produces, so it must be re-checked after the fix.
+    #[test]
+    fn annulus_prism_volume_excludes_the_inner_wire() {
+        let mut curves = crate::sketch::SketchCurves::new();
+        curves.add_circle((0.0, 0.0), 8.0);
+        curves.add_circle((0.0, 0.0), 3.0);
+        let annulus = crate::sketch::detect_regions_analytic(&curves)
+            .expect("nested circles")
+            .into_iter()
+            .find(|region| !region.holes.is_empty())
+            .expect("annular region");
+        assert!((annulus.area - std::f32::consts::PI * 55.0).abs() < 0.01);
+
+        let volume = swept_volume(&annulus, 4.0);
+        let expected = std::f64::consts::PI * 55.0 * 4.0;
+        assert!(
+            (volume - expected).abs() <= expected * 0.02,
+            "annulus prism should enclose {expected:.2} mm3, got {volume:.2}"
         );
     }
 

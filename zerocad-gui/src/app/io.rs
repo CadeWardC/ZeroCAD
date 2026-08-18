@@ -64,6 +64,7 @@ impl ZeroCadApp {
         self.selected_sketch_points.clear();
         self.selected_body.clear();
         self.extrude_op = None;
+        self.extrude_profile_pick_active = false;
         self.edge_mod_op = None;
         self.move_op = None;
         self.combine_op = None;
@@ -263,6 +264,7 @@ impl ZeroCadApp {
         self.scale_body_op = None;
         self.move_preview_bodies = None;
         self.extrude_op = None;
+        self.extrude_profile_pick_active = false;
         self.revolve_op = None;
         self.pattern_op = None;
         self.hole_op = None;
@@ -1613,6 +1615,7 @@ impl ZeroCadApp {
         self.selected_sketch_points.clear();
         self.selected_body.clear();
         self.extrude_op = None;
+        self.extrude_profile_pick_active = false;
         self.edge_mod_op = None;
         self.body_clipboard = None;
         self.move_op = None;

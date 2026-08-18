@@ -158,6 +158,7 @@ fn evaluator_family_dependency_matrix_is_explicit() {
         Family::Cylinder,
         Family::Extrude,
         Family::EdgeMod,
+        Family::EdgeBlend,
         Family::Import,
         Family::Revolve,
         Family::Loft,

@@ -3,7 +3,7 @@
   "fixtures": [
     {
       "file": "shell-on-fillet-band.zcad",
-      "sha256": "8792a5802ac1c1f3f149bf74ddfe3c2f09a2a6df8ee30c89991cab795d24d272",
+      "sha256": "8c545a6af23db1e136e9a1ded6433fb785305596955068d475bcba775a965239",
       "expected_resolution": "resolved",
       "body_count": 1,
       "required_features": [
@@ -19,7 +19,7 @@
     },
     {
       "file": "fillet-overflow.zcad",
-      "sha256": "00ba27989cfb909484751e2ac494b205e178d3451827157dee1613d208f0d065",
+      "sha256": "ba2e660ee2e0e08efb8a268960a5fca3010a07703d30b1497bf0f555e34aa702",
       "expected_resolution": "resolved",
       "body_count": 1,
       "required_features": [
@@ -34,7 +34,7 @@
     },
     {
       "file": "shell-concave-l-prism.zcad",
-      "sha256": "c59ff93d36165f8e692878872186e85f7b43d2bf0223a64c92485fee73757281",
+      "sha256": "ba8827f49e45bc86a81b7ccc6c44a72dd5e2f3931f79b4136441edb6974e6c45",
       "expected_resolution": "resolved",
       "body_count": 1,
       "required_features": [
@@ -49,7 +49,7 @@
     },
     {
       "file": "smooth-loft-analytic.zcad",
-      "sha256": "ef6b95de96b4ec682b2985ba724c282829bc22b650ca91389101456d3f1a5bb9",
+      "sha256": "aab3eb1636a033a7cb3bbb588ae549ffd4b57132a915a5e43cdd45f975086efa",
       "expected_resolution": "resolved",
       "body_count": 1,
       "required_features": [

@@ -69,8 +69,9 @@ pub use boolean::{
 };
 pub mod contour;
 pub use contour::{
-    apply_blend_contour, apply_blend_contour_with_policy, BlendContour, BlendContourError,
-    BlendCurveHint, BlendKind, BlendLaw,
+    apply_blend_contour, apply_blend_contour_with_policy, apply_blend_network_with_policy,
+    BlendContour, BlendContourError, BlendCornerMode, BlendCurveHint, BlendKind, BlendLaw,
+    BlendNetworkRequest,
 };
 pub mod corner_network;
 pub use corner_network::{
@@ -309,7 +310,7 @@ fn finish_unary_operation(
         .validate()
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
     let (value, reconstructed) = value
-        .repair_pcurves(policy)
+        .repair_operation_pcurves(policy)
         .map_err(|error| ModelingOperationError::PcurveBuild(error.to_string()))?;
     let (value, mut recovery) = normalize_operation_result(value, policy);
     let validation = openrcad_topo::ValidationReport::for_solid(&value, policy);
@@ -340,7 +341,7 @@ fn finish_generated_operation(
         .validate()
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
     let (value, reconstructed) = value
-        .repair_pcurves(policy)
+        .repair_operation_pcurves(policy)
         .map_err(|error| ModelingOperationError::PcurveBuild(error.to_string()))?;
     let (value, mut recovery) = normalize_operation_result(value, policy);
     let validation = openrcad_topo::ValidationReport::for_solid(&value, policy);
@@ -462,6 +463,17 @@ pub fn blend_contour_operation_with_policy(
     policy: &openrcad_foundation::TolerancePolicy,
 ) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
     let value = apply_blend_contour_with_policy(solid, contour, policy)
+        .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+    finish_unary_operation(solid, value, policy)
+}
+
+/// Canonical atomic operation result for a selected edge network.
+pub fn blend_edge_network_operation_with_policy(
+    solid: &Solid,
+    request: &BlendNetworkRequest,
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<openrcad_topo::OperationResult<Solid>, ModelingOperationError> {
+    let value = apply_blend_network_with_policy(solid, request, policy)
         .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
     finish_unary_operation(solid, value, policy)
 }

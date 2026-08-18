@@ -92,6 +92,11 @@ impl ZeroCadApp {
     }
 
     pub(crate) fn handle_3d_escape(&mut self, ctx: &egui::Context) {
+        if self.extrude_profile_pick_active && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.extrude_profile_pick_active = false;
+            self.status_msg = "Extrude profile selection cancelled.".to_string();
+            return;
+        }
         if self.draft_op.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.draft_op = None;
             self.status_msg = "Draft cancelled.".to_string();

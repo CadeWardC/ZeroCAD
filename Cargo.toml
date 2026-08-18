@@ -50,3 +50,15 @@ blake3 = "1.5"
 sha2 = "0.10"
 nalgebra = "0.33"
 png = "0.17"
+# Sketch text. `ttf-parser` is already in the graph via `ab_glyph`, so pinning the
+# same minor keeps one copy compiled. `rustybuzz` supplies GPOS kerning and
+# ligatures (most modern fonts ship no legacy `kern` table); `fontdb` enumerates
+# installed families. `memmap` is deliberately off — outlines are read once at
+# authoring time and baked, so holding a mapping over a file the user may delete
+# buys nothing and risks a SIGBUS.
+ttf-parser = "0.25"
+rustybuzz = "0.20"
+fontdb = { version = "0.24", default-features = false, features = ["fs", "fontconfig", "std"] }
+# Test-only font bytes. Already in the graph via egui/epaint, so the fixture font
+# costs no vendored binary and no extra licence file in the repository.
+epaint_default_fonts = "0.29"

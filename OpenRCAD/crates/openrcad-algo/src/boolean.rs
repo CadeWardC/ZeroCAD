@@ -1475,7 +1475,7 @@ fn repair_boolean_output(
     policy: &TolerancePolicy,
 ) -> Result<(Solid, usize), BooleanError> {
     let (solid, reconstructed) = solid
-        .repair_pcurves(policy)
+        .repair_operation_pcurves(policy)
         .map_err(BooleanError::PcurveBuild)?;
     let solid = validate_output(solid, policy)?;
     Ok((solid, reconstructed))

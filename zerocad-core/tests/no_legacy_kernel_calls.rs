@@ -55,6 +55,39 @@ fn production_code_does_not_add_legacy_kernel_calls() {
     );
 }
 
+#[test]
+fn evaluator_reachable_code_uses_fallible_dir2d_construction() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("core crate must live in the workspace");
+    let roots = [
+        workspace.join("zerocad-core/src"),
+        workspace.join("OpenRCAD/crates"),
+    ];
+    let mut violations = Vec::new();
+    for root in roots {
+        let mut files = Vec::new();
+        collect_rust_files(&root, &mut files);
+        for file in files {
+            let normalized = file.to_string_lossy().replace('\\', "/");
+            if normalized.ends_with("openrcad-foundation/src/dir.rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&file).expect("Rust source must be readable");
+            for (line_index, line) in text.lines().enumerate() {
+                if line.contains("Dir2d::new(") {
+                    violations.push(format!("{normalized}:{}", line_index + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "computed 2D directions must use Dir2d::try_new and propagate degeneracy:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root).expect("source directory must be readable") {
         let path = entry.expect("directory entry must be readable").path();

@@ -48,6 +48,7 @@ impl ZeroCadApp {
     /// animate to look straight at the plane, switch to orthographic, and clear
     /// any in-progress sketch. `now` is the current input time (for the anim).
     pub(crate) fn begin_sketch_on(&mut self, cs: CoordinateSystem, now: f64) {
+        self.extrude_profile_pick_active = false;
         self.pre_sketch_pitch = self.camera_pitch;
         self.pre_sketch_yaw = self.camera_yaw;
         self.pre_sketch_perspective = self.is_perspective;

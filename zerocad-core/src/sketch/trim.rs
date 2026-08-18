@@ -210,7 +210,8 @@ impl Primitive {
                 Ok(CurveSpan::new(
                     GeomCurve2d::line(Line2d::from_point_dir(
                         Pnt2d::new(start.0, start.1),
-                        Dir2d::new(dx / length, dy / length),
+                        Dir2d::try_new(dx / length, dy / length)
+                            .ok_or(TrimError::InvalidGeometry { id })?,
                     )),
                     0.0,
                     length,

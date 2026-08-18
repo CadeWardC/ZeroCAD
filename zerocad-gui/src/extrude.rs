@@ -80,6 +80,18 @@ mod preview_tests {
             assert!(seams.is_empty(), "{mode:?} preview seams: {seams:#?}");
         }
     }
+
+    #[test]
+    fn command_first_extrude_toggles_profile_pick_mode() {
+        let mut app = ZeroCadApp::new();
+
+        app.toggle_extrude_profile_pick();
+        assert!(app.extrude_profile_pick_active);
+        assert!(app.status_msg.contains("click a closed sketch profile"));
+
+        app.toggle_extrude_profile_pick();
+        assert!(!app.extrude_profile_pick_active);
+    }
 }
 
 /// Faces from one sketch that participate in an extrude, plus the geometry
@@ -570,14 +582,13 @@ impl ZeroCadApp {
         // Set when the autocomplete swallows an Enter (to accept a suggestion),
         // so we don't also treat that Enter as "commit the extrude".
         let mut suppress_commit = false;
+        let mut finish_clicked = false;
 
         let pos = self
             .extrude_dim_pos
             .unwrap_or_else(|| ctx.screen_rect().center());
 
-        // Fusion-style floating value field: just the editable distance, a unit
-        // suffix, and a "⋮" affordance. Commit/cancel live on the right panel
-        // and on Enter/Esc; this box only edits the value.
+        // Fusion-style floating value field with an immediate check control.
         egui::Area::new(egui::Id::new("extrude_inline"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
@@ -656,13 +667,20 @@ impl ZeroCadApp {
                                 );
                             }
 
-                            // Vertical "more" affordance, like the Fusion field.
+                            // Finish directly from the compact viewport control.
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("⋮")
-                                    .color(egui::Color32::from_rgb(150, 150, 150))
-                                    .size(14.0),
-                            );
+                            if crate::icons::Icon::Check
+                                .icon_button(
+                                    ui,
+                                    egui::Color32::from_rgb(16, 185, 129),
+                                    egui::Color32::from_rgb(5, 150, 105),
+                                    egui::Color32::WHITE,
+                                )
+                                .on_hover_text("Finish extrude")
+                                .clicked()
+                            {
+                                finish_clicked = true;
+                            }
                         });
 
                         // Operation mode: New Body / Join / Cut — a compact
@@ -762,7 +780,7 @@ impl ZeroCadApp {
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         self.autocomplete = ac;
 
-        if enter && !suppress_commit {
+        if finish_clicked || (enter && !suppress_commit) {
             self.commit_extrude_op();
         } else if escape {
             self.cancel_extrude_op();
@@ -981,6 +999,8 @@ impl ZeroCadApp {
             return;
         }
 
+        self.extrude_profile_pick_active = false;
+
         let depth = self.extrude_depth.max(1.0);
         // A sketch on a body face defaults to a direction-driven Join/Cut; a
         // sketch on an origin plane defaults to a new body. The user can still
@@ -1017,6 +1037,7 @@ impl ZeroCadApp {
         if self.extrude_op.is_some() {
             return;
         }
+        self.extrude_profile_pick_active = false;
         if !self.face_is_planar(&node, fid) {
             self.status_msg =
                 "Extrude needs a flat body face — curved faces aren't supported yet.".to_string();
@@ -1122,6 +1143,17 @@ impl ZeroCadApp {
         }
         let faces: Vec<(String, usize)> = self.selected_faces.iter().cloned().collect();
         self.begin_extrude_op(faces);
+    }
+
+    /// Toggle command-first Extrude. While armed, the next clicked closed
+    /// sketch profile is selected and immediately opens the live Extrude tool.
+    pub(crate) fn toggle_extrude_profile_pick(&mut self) {
+        self.extrude_profile_pick_active = !self.extrude_profile_pick_active;
+        self.status_msg = if self.extrude_profile_pick_active {
+            "Extrude: click a closed sketch profile in the viewport.".to_string()
+        } else {
+            "Extrude profile selection cancelled.".to_string()
+        };
     }
 
     /// Start an extrude from every face of one sketch (property-panel shortcut).
@@ -1256,6 +1288,7 @@ impl ZeroCadApp {
     /// Discard the in-progress extrude, keeping the face selection.
     pub(crate) fn cancel_extrude_op(&mut self) {
         self.extrude_op = None;
+        self.extrude_profile_pick_active = false;
         self.clear_extrude_preview_eval();
         self.status_msg = "Extrude cancelled.".to_string();
     }

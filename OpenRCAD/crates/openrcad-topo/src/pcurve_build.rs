@@ -83,6 +83,23 @@ impl Solid {
             .map(|(solid, rebuilt, _, _)| (solid, rebuilt))
     }
 
+    /// Rebuild operation-created pcurves and certify any small approximation
+    /// residual on the generated edge itself.
+    ///
+    /// Modeling intersections are permitted to be approximate up to the
+    /// document's intersection budget.  Keeping that measured residual on the
+    /// edge is both stricter and more stable than globally weakening pcurve
+    /// validation: unrelated exact edges continue to use
+    /// `pcurve_consistency`, while validation and tessellation can replay the
+    /// certified local bound from the B-Rep.
+    pub fn repair_operation_pcurves(
+        &self,
+        policy: &TolerancePolicy,
+    ) -> Result<(Self, usize), PcurveBuildError> {
+        self.complete_pcurves_impl(policy, true, Some(policy.intersection))
+            .map(|(solid, rebuilt, _, _)| (solid, rebuilt))
+    }
+
     /// Explicit legacy-import adapter. Missing/stale pcurves are rebuilt and
     /// approximate imported edges may have their tolerance promoted, never
     /// beyond `policy.snap_max`. The returned counts make both repairs visible
@@ -835,7 +852,7 @@ fn exact_planar_pcurve(brep: &BRep, surface: &GeomSurface, edge: &EdgeData) -> O
         )
     };
     let direction = |dir: openrcad_foundation::Dir| {
-        Dir2d::new(
+        Dir2d::try_new(
             dir.dot(&plane.position().x_direction()),
             dir.dot(&plane.position().y_direction()),
         )
@@ -882,31 +899,31 @@ fn exact_planar_pcurve(brep: &BRep, surface: &GeomSurface, edge: &EdgeData) -> O
         ));
     }
     match curve {
-        GeomCurve::Circle(circle) => Some(PcurveData::new(
-            GeomCurve2d::circle(Circle2d::new(
-                Ax22d::new_axes(
-                    project(circle.center()),
-                    direction(circle.position().x_direction()),
-                    direction(circle.position().y_direction()),
-                ),
-                circle.radius(),
-            )),
-            edge.first,
-            edge.last,
-        )),
-        GeomCurve::Ellipse(ellipse) => Some(PcurveData::new(
-            GeomCurve2d::ellipse(Ellipse2d::new(
-                Ax22d::new_axes(
-                    project(ellipse.center()),
-                    direction(ellipse.position().x_direction()),
-                    direction(ellipse.position().y_direction()),
-                ),
-                ellipse.major_radius(),
-                ellipse.minor_radius(),
-            )),
-            edge.first,
-            edge.last,
-        )),
+        GeomCurve::Circle(circle) => {
+            let x = direction(circle.position().x_direction())?;
+            let y = direction(circle.position().y_direction())?;
+            Some(PcurveData::new(
+                GeomCurve2d::circle(Circle2d::new(
+                    Ax22d::new_axes(project(circle.center()), x, y),
+                    circle.radius(),
+                )),
+                edge.first,
+                edge.last,
+            ))
+        }
+        GeomCurve::Ellipse(ellipse) => {
+            let x = direction(ellipse.position().x_direction())?;
+            let y = direction(ellipse.position().y_direction())?;
+            Some(PcurveData::new(
+                GeomCurve2d::ellipse(Ellipse2d::new(
+                    Ax22d::new_axes(project(ellipse.center()), x, y),
+                    ellipse.major_radius(),
+                    ellipse.minor_radius(),
+                )),
+                edge.first,
+                edge.last,
+            ))
+        }
         GeomCurve::BSpline(curve) => {
             let poles = curve.poles().iter().copied().map(project).collect();
             Some(PcurveData::new(

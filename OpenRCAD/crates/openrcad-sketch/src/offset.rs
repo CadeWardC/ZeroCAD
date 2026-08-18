@@ -275,7 +275,8 @@ fn offset_span<P: Clone>(
                 start.x() - dy / length * distance,
                 start.y() + dx / length * distance,
             );
-            let direction = Dir2d::new(dx / length, dy / length);
+            let direction = Dir2d::try_new(dx / length, dy / length)
+                .ok_or(OffsetError::Collapse { span: index })?;
             Ok(CurveSpan::new(
                 GeomCurve2d::line(Line2d::from_point_dir(shifted, direction)),
                 0.0,
@@ -517,7 +518,7 @@ mod tests {
         CurveSpan::new(
             GeomCurve2d::line(Line2d::from_point_dir(
                 Pnt2d::new(start.0, start.1),
-                Dir2d::new(dx / length, dy / length),
+                Dir2d::try_new(dx / length, dy / length).expect("test line is non-degenerate"),
             )),
             0.0,
             length,

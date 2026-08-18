@@ -8,26 +8,34 @@
 
 use eframe::egui;
 use zerocad_core::mock_kernel::EdgeCurveHint;
-use zerocad_core::{AllEdgeSelector, CornerKind, EdgeRef, FeatureNode, FeatureType, MockMesh};
+use zerocad_core::{
+    canonicalize_edge_refs, AllEdgeSelector, CornerKind, EdgeCornerMode, EdgeRef, FeatureNode,
+    FeatureType, MockMesh,
+};
 
 use crate::{PendingCommitVisual, PendingVisualMode, SharedBodyMeshes, ZeroCadApp};
 
+#[cfg(test)]
 const EDGE_MOD_PREVIEW_FILLET_SEGS: usize = 8;
 /// How many recently-solved sizes to keep so scrubbing back to one is instant.
 const EDGE_MOD_ARC_LRU_CAP: usize = 8;
 
+#[cfg(test)]
 fn v_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
+#[cfg(test)]
 fn v_scale(v: [f32; 3], s: f32) -> [f32; 3] {
     [v[0] * s, v[1] * s, v[2] * s]
 }
 
+#[cfg(test)]
 fn v_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+#[cfg(test)]
 fn v_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -36,20 +44,24 @@ fn v_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+#[cfg(test)]
 fn v_len(v: [f32; 3]) -> f32 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
+#[cfg(test)]
 fn v_norm(v: [f32; 3]) -> Option<[f32; 3]> {
     let len = v_len(v);
     (len > 1.0e-6).then(|| v_scale(v, 1.0 / len))
 }
 
+#[cfg(test)]
 fn push_preview_vertex(mesh: &mut MockMesh, p: [f32; 3], n: [f32; 3]) {
     mesh.vertices
         .extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
 }
 
+#[cfg(test)]
 fn push_preview_edge(mesh: &mut MockMesh, a: [f32; 3], b: [f32; 3]) {
     let i = (mesh.edge_vertices.len() / 3) as u32;
     mesh.edge_vertices
@@ -57,6 +69,7 @@ fn push_preview_edge(mesh: &mut MockMesh, a: [f32; 3], b: [f32; 3]) {
     mesh.edge_indices.extend_from_slice(&[i, i + 1]);
 }
 
+#[cfg(test)]
 fn edge_mod_edge_preview_mesh(
     edge: &EdgeRef,
     dist: f32,
@@ -165,6 +178,7 @@ fn edge_mod_edge_preview_mesh(
 /// AROUND the selected rim arc instead of along a straight edge, so a bite arc
 /// or a cylinder/bored-hole rim gets the same immediate visual feedback while
 /// the size is being edited.
+#[cfg(test)]
 fn edge_mod_circular_edge_preview_mesh(
     edge: &EdgeRef,
     dist: f32,
@@ -356,10 +370,8 @@ fn edge_mod_circular_edge_preview_mesh(
 /// A live, uncommitted 3D edge fillet/chamfer. Holds the captured edge geometry
 /// and the editable size; the viewport shows the resulting body in real time.
 ///
-/// One op can round/bevel **several** selected edges at once (Fusion's multi-edge
-/// fillet). Explicit selections remain a chain of single-edge `EdgeMod`
-/// features; whole-body commands use one exact selector and one atomic kernel
-/// operation. The inline size box and drag handle anchor on the first edge.
+/// One op can round/bevel **several** selected edges at once. Every selection is
+/// persisted and evaluated as one atomic `EdgeBlend` network.
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeModOp {
     /// Node id of the body being modified.
@@ -371,12 +383,10 @@ pub(crate) struct EdgeModOp {
     /// simultaneous contour, so the propagated neighbours are not separate
     /// history features.
     pub(crate) display_edges: Vec<EdgeRef>,
-    /// Whether each edge is concave (inner-corner, ADDS material), one entry per
-    /// edge, captured at selection time from the body mesh. Drives the preview
-    /// ribbon to the correct (outward) side; convex edges stay `false`.
-    pub(crate) concave: Vec<bool>,
     /// Fillet (round) or Chamfer (bevel).
     pub(crate) kind: CornerKind,
+    /// One corner construction policy for the complete network.
+    pub(crate) corner_mode: EdgeCornerMode,
     /// Resolved size in base units (mm), kept in sync with `dist_text`.
     pub(crate) dist: f32,
     /// Editable text buffer for the inline size box (a number or a variable
@@ -384,9 +394,6 @@ pub(crate) struct EdgeModOp {
     pub(crate) dist_text: String,
     /// True until the inline box has grabbed keyboard focus once.
     pub(crate) focus_request: bool,
-    /// Whole-body convenience command: commit only after the complete exact
-    /// preview resolves without a single blocker.
-    pub(crate) strict_all_edges: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,27 +468,10 @@ impl EdgeModOp {
         &self.edges[0]
     }
 
-    /// Produce the existing `EdgeMod` payload shape used for persistence.
-    /// Strict whole-body mode records its exact durable-name set in one
-    /// selector-backed edge, so replay remains an atomic operation.
+    /// Produce the canonical edge set used by persistence and evaluation.
     fn persisted_edges(&self) -> Option<Vec<EdgeRef>> {
-        if !self.strict_all_edges {
-            return Some(self.edges.clone());
-        }
-        let names = self.edges.iter().map(|edge| {
-            let topology = edge.topology.as_ref()?;
-            AllEdgeSelector::durable_edge_key(
-                topology.edge_id.as_deref(),
-                &topology.adjacent_face_ids,
-            )
-        });
-        let selector = AllEdgeSelector::new(names.collect::<Option<Vec<_>>>()?)
-            .ok()?
-            .encode()
-            .ok()?;
-        let mut edge = self.primary().clone();
-        edge.topology.as_mut()?.edge_id = Some(selector);
-        Some(vec![edge])
+        let edges = canonicalize_edge_refs(self.edges.clone());
+        (!edges.is_empty()).then_some(edges)
     }
 
     /// World-space midpoint of the primary edge — the anchor for the inline box.
@@ -494,18 +484,11 @@ impl EdgeModOp {
         ]
     }
 
-    /// Cheap immediate visual feedback for selected straight edges. The exact
-    /// committed B-Rep still comes from the worker-computed edge-mod graph.
+    /// Do not manufacture ribbon geometry while the exact worker result is
+    /// pending. Selection highlighting remains visible in the viewport, and a
+    /// successful preview is always the same atomic B-Rep that can be committed.
     pub(crate) fn immediate_preview_mesh(&self) -> MockMesh {
-        let mut mesh = MockMesh::empty();
-        for (i, edge) in self.display_edges.iter().enumerate() {
-            let concave = self.concave.get(i).copied().unwrap_or(false);
-            if let Some(edge_mesh) = edge_mod_edge_preview_mesh(edge, self.dist, self.kind, concave)
-            {
-                mesh.append(edge_mesh);
-            }
-        }
-        mesh
+        MockMesh::empty()
     }
 }
 
@@ -725,12 +708,11 @@ mod tests {
             target: "body".to_string(),
             edges: vec![edge.clone()],
             display_edges: vec![edge],
-            concave: vec![false],
             kind,
+            corner_mode: EdgeCornerMode::Auto,
             dist,
             dist_text: format!("{dist:.2}"),
             focus_request: false,
-            strict_all_edges: false,
         }
     }
 
@@ -841,24 +823,14 @@ mod tests {
             target: "box_1".to_string(),
             display_edges: edges.clone(),
             edges,
-            concave: vec![false, false],
             kind: CornerKind::Chamfer,
+            corner_mode: EdgeCornerMode::Auto,
             dist: 0.4,
             dist_text: "0.4".to_string(),
             focus_request: false,
-            strict_all_edges: true,
         };
-        let persisted = op.persisted_edges().expect("face-pair selector");
-        let selector = AllEdgeSelector::decode(
-            persisted[0]
-                .topology
-                .as_ref()
-                .and_then(|topology| topology.edge_id.as_deref())
-                .expect("selector edge id"),
-        )
-        .expect("selector prefix")
-        .expect("selector payload");
-        assert_eq!(selector.edge_names.len(), 2);
+        let persisted = op.persisted_edges().expect("canonical edge set");
+        assert_eq!(persisted.len(), 2);
     }
 
     #[test]
@@ -877,29 +849,26 @@ mod tests {
             edge_id: Some("entity:2:edge".to_string()),
             ..Default::default()
         });
+        let expected = canonicalize_edge_refs(vec![first.clone(), second.clone()]);
         let op = EdgeModOp {
             target: "body".to_string(),
             edges: vec![first, second],
             display_edges: Vec::new(),
-            concave: Vec::new(),
             kind: CornerKind::Fillet,
+            corner_mode: EdgeCornerMode::Auto,
             dist: 0.4,
             dist_text: "0.4".to_string(),
             focus_request: false,
-            strict_all_edges: true,
         };
 
-        let persisted = op.persisted_edges().expect("selector payload");
-        assert_eq!(persisted.len(), 1);
-        let edge_id = persisted[0]
-            .topology
-            .as_ref()
-            .and_then(|topology| topology.edge_id.as_deref())
-            .expect("selector id");
-        let selector = AllEdgeSelector::decode(edge_id)
-            .expect("reserved selector")
-            .expect("valid selector");
-        assert_eq!(selector.edge_names, ["entity:2:edge", "entity:9:edge"]);
+        let persisted = op.persisted_edges().expect("canonical edge set");
+        assert_eq!(persisted, expected);
+        let mut names = persisted
+            .iter()
+            .filter_map(|edge| edge.topology.as_ref()?.edge_id.as_deref())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["entity:2:edge", "entity:9:edge"]);
     }
 
     /// A concave bite arc on a body's top face (z = 10): rim circle about +Z,
@@ -1039,20 +1008,6 @@ mod tests {
         assert!(closed.indices.len() > open.indices.len());
     }
 
-    fn y_z_bounds(mesh: &MockMesh) -> (f32, f32, f32, f32) {
-        let mut min_y = f32::INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        let mut min_z = f32::INFINITY;
-        let mut max_z = f32::NEG_INFINITY;
-        for v in mesh.vertices.chunks_exact(6) {
-            min_y = min_y.min(v[1]);
-            max_y = max_y.max(v[1]);
-            min_z = min_z.min(v[2]);
-            max_z = max_z.max(v[2]);
-        }
-        (min_y, max_y, min_z, max_z)
-    }
-
     /// A concave (inner pocket corner) edge at (5,5), z 4..10, with outward wall
     /// normals +x/+y. The blend ADDS material in the corner void, so the preview
     /// ribbon must sit on the +x/+y side (into the pocket), the mirror of a
@@ -1154,62 +1109,15 @@ mod tests {
     }
 
     #[test]
-    fn immediate_edge_mod_preview_mesh_is_bounded_and_kind_specific() {
-        let fillet = test_op(CornerKind::Fillet, 3.0).immediate_preview_mesh();
-        let chamfer = test_op(CornerKind::Chamfer, 3.0).immediate_preview_mesh();
-        assert!(
-            !fillet.vertices.is_empty(),
-            "fillet overlay should be available immediately"
-        );
-        assert!(
-            !chamfer.vertices.is_empty(),
-            "chamfer overlay should be available immediately"
-        );
-        assert!(
-            fillet.indices.len() > chamfer.indices.len(),
-            "fillet overlay should be faceted while chamfer is one bevel strip"
-        );
-        assert_eq!(
-            fillet.edge_indices.len() / 2,
-            EDGE_MOD_PREVIEW_FILLET_SEGS * 2 + 2,
-            "fillet overlay should draw tangent/end edges, not every internal rail"
-        );
-        assert_eq!(
-            chamfer.edge_indices.len() / 2,
-            4,
-            "chamfer overlay should draw the two bevel rails and two end edges"
-        );
-
-        for (label, mesh) in [("fillet", &fillet), ("chamfer", &chamfer)] {
-            let (min_y, max_y, min_z, max_z) = y_z_bounds(mesh);
-            assert!(
-                min_y >= -1.0e-4,
-                "{label} preview dipped outside front face"
-            );
-            assert!(
-                max_y <= 3.0 + 1.0e-4,
-                "{label} preview exceeded selected distance"
-            );
-            assert!(
-                min_z >= 12.0 - 1.0e-4,
-                "{label} preview cut deeper than selected distance"
-            );
-            assert!(
-                max_z <= 15.0 + 1.0e-4,
-                "{label} preview rose above top face"
-            );
-        }
-
-        let larger = test_op(CornerKind::Fillet, 5.0).immediate_preview_mesh();
-        let (_min_y, max_y, min_z, _max_z) = y_z_bounds(&larger);
-        assert!(
-            max_y > 4.9,
-            "larger radius should visibly widen the overlay"
-        );
-        assert!(
-            min_z < 10.1,
-            "larger radius should visibly deepen the overlay"
-        );
+    fn immediate_edge_mod_preview_waits_for_exact_geometry() {
+        assert!(test_op(CornerKind::Fillet, 3.0)
+            .immediate_preview_mesh()
+            .vertices
+            .is_empty());
+        assert!(test_op(CornerKind::Chamfer, 3.0)
+            .immediate_preview_mesh()
+            .vertices
+            .is_empty());
     }
 }
 
@@ -1249,37 +1157,17 @@ impl ZeroCadApp {
             self.status_msg = "Those edges have no usable geometry to fillet/chamfer.".to_string();
             return;
         }
-        // Classify each edge's wedge from the body's display mesh so the preview
-        // ribbon draws on the correct side (concave edges add material outward).
-        let body_mesh = self
-            .body_meshes
-            .iter()
-            .find(|(id, _)| *id == node_id)
-            .map(|(_, mesh)| mesh);
-        let concave: Vec<bool> = display_edges
-            .iter()
-            .map(|edge| {
-                body_mesh
-                    .and_then(|mesh| {
-                        zerocad_core::edge_wedge_is_concave_mesh(
-                            mesh, edge.p0, edge.p1, edge.n1, edge.n2,
-                        )
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
         let text = self.edge_mod_dist_text.clone();
         let dist = self.eval_dim(&text).unwrap_or(3.0).max(0.2);
         self.edge_mod_op = Some(EdgeModOp {
             target: node_id,
             edges,
             display_edges,
-            concave,
             kind,
+            corner_mode: EdgeCornerMode::Auto,
             dist,
             dist_text: text,
             focus_request: true,
-            strict_all_edges: false,
         });
         // Start each edit with a clean speculative edge-mod slate so a stale
         // precompute from a previous edit can't be mistaken for this one.
@@ -1332,25 +1220,17 @@ impl ZeroCadApp {
                 return;
             }
         };
-        let concave = edges
-            .iter()
-            .map(|edge| {
-                zerocad_core::edge_wedge_is_concave_mesh(mesh, edge.p0, edge.p1, edge.n1, edge.n2)
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
         let text = self.edge_mod_dist_text.clone();
         let dist = self.eval_dim(&text).unwrap_or(3.0).max(0.2);
         self.edge_mod_op = Some(EdgeModOp {
             target: node_id,
             display_edges: edges.clone(),
             edges,
-            concave,
             kind,
+            corner_mode: EdgeCornerMode::Auto,
             dist,
             dist_text: text,
             focus_request: true,
-            strict_all_edges: true,
         });
         self.clear_edge_mod_speculation();
         let count = self
@@ -1452,12 +1332,17 @@ impl ZeroCadApp {
     fn edge_mod_arc_key(op: &EdgeModOp, hidden_nodes: &std::collections::HashSet<String>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        ((op.dist.max(0.2) / 0.01).round() as i64).hash(&mut h);
-        (op.kind as u8).hash(&mut h);
-        op.strict_all_edges.hash(&mut h);
-        op.target.hash(&mut h);
-        for edge in &op.display_edges {
-            Self::hash_edge_ref(&mut h, edge);
+        if let Some(edges) = op.persisted_edges() {
+            serde_json::to_vec(&FeatureType::EdgeBlend {
+                target: op.target.clone(),
+                edges,
+                dist: op.dist.max(0.2),
+                dist_expr: None,
+                kind: op.kind,
+                corner_mode: op.corner_mode,
+            })
+            .expect("EdgeBlend preview identity must serialize")
+            .hash(&mut h);
         }
         let mut hidden: Vec<&String> = hidden_nodes.iter().collect();
         hidden.sort();
@@ -1480,23 +1365,20 @@ impl ZeroCadApp {
         let Some(edges) = op.persisted_edges() else {
             return false;
         };
-        let mut prev = op.target.clone();
-        for (i, edge) in edges.into_iter().enumerate() {
-            let id = format!("edgemod_{tag}_{}", self.id_counter + i);
-            graph.add_feature(FeatureNode {
-                id: id.clone(),
-                name: format!("{tag} edge mod {i}"),
-                feature: FeatureType::EdgeMod {
-                    target: op.target.clone(),
-                    edge,
-                    dist,
-                    dist_expr: None,
-                    kind: op.kind,
-                },
-            });
-            graph.add_dependency(&prev, &id);
-            prev = id;
-        }
+        let id = format!("edgeblend_{tag}_{}", self.id_counter);
+        graph.add_feature(FeatureNode {
+            id: id.clone(),
+            name: format!("{tag} edge blend"),
+            feature: FeatureType::EdgeBlend {
+                target: op.target.clone(),
+                edges,
+                dist,
+                dist_expr: None,
+                kind: op.kind,
+                corner_mode: op.corner_mode,
+            },
+        });
+        graph.add_dependency(&op.target, &id);
         true
     }
 
@@ -1682,14 +1564,10 @@ impl ZeroCadApp {
         }
     }
 
-    /// Commit the live edge mod into history as a real `EdgeMod` feature, binding
+    /// Commit the live edge mod into history as one atomic `EdgeBlend`, binding
     /// the size to a variable expression when the text references one.
     pub(crate) fn commit_edge_mod(&mut self) {
-        if let Some(operation) = self
-            .edge_mod_op
-            .as_ref()
-            .filter(|operation| operation.strict_all_edges)
-        {
+        if let Some(operation) = self.edge_mod_op.as_ref() {
             let key = Self::edge_mod_arc_key(operation, &self.hidden_nodes);
             let exact = self
                 .edge_mod_arc_cache
@@ -1702,7 +1580,7 @@ impl ZeroCadApp {
                 });
             let Some((_, _, warnings)) = exact else {
                 self.status_msg =
-                    "Still checking every edge; wait for the exact preview before committing."
+                    "Still checking the edge network; wait for the exact preview before committing."
                         .to_string();
                 return;
             };
@@ -1711,7 +1589,7 @@ impl ZeroCadApp {
                     CornerKind::Fillet => "Fillet",
                     CornerKind::Chamfer => "Chamfer",
                 };
-                self.status_msg = format!("All-edge {noun} rejected atomically. {}", warnings[0]);
+                self.status_msg = format!("{noun} network rejected atomically. {}", warnings[0]);
                 return;
             }
         }
@@ -1752,29 +1630,24 @@ impl ZeroCadApp {
         } else {
             None
         };
-        // Explicit selection keeps one feature per edge. Strict whole-body mode
-        // contributes exactly one selector-backed feature, preventing partial
-        // history on rebuild or reload.
+        // Every explicit selection contributes exactly one atomic feature.
         let dist = op.dist.max(0.2);
         let edge_count = op.display_edges.len();
-        let mut prev = op.target.clone();
-        for edge in persisted_edges {
-            let id = format!("edgemod_{}", self.next_id());
-            let name = self.next_edge_mod_name(op.kind);
-            self.document.add_feature(FeatureNode {
-                id: id.clone(),
-                name,
-                feature: FeatureType::EdgeMod {
-                    target: op.target.clone(),
-                    edge,
-                    dist,
-                    dist_expr: dist_expr.clone(),
-                    kind: op.kind,
-                },
-            });
-            self.document.add_dependency(&prev, &id);
-            prev = id;
-        }
+        let id = format!("edgeblend_{}", self.next_id());
+        let name = self.next_edge_mod_name(op.kind);
+        self.document.add_feature(FeatureNode {
+            id: id.clone(),
+            name,
+            feature: FeatureType::EdgeBlend {
+                target: op.target.clone(),
+                edges: persisted_edges,
+                dist,
+                dist_expr,
+                kind: op.kind,
+                corner_mode: op.corner_mode,
+            },
+        });
+        self.document.add_dependency(&op.target, &id);
         // Remember the size for the next edge.
         self.edge_mod_dist_text = op.dist_text;
         self.selected_body.clear();
@@ -1958,9 +1831,35 @@ impl ZeroCadApp {
                                     );
                                     if btn.clicked() {
                                         op.kind = kind;
+                                        if kind == CornerKind::Chamfer
+                                            && op.corner_mode == EdgeCornerMode::RollingBall
+                                        {
+                                            op.corner_mode = EdgeCornerMode::Auto;
+                                        }
                                     }
                                 }
                             });
+                            if op.edges.len() > 1 {
+                                ui.add_space(3.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(3.0, 0.0);
+                                    let mut modes = vec![
+                                        (EdgeCornerMode::Auto, "Auto"),
+                                        (EdgeCornerMode::Miter, "Miter"),
+                                    ];
+                                    if op.kind == CornerKind::Fillet {
+                                        modes.push((EdgeCornerMode::RollingBall, "Rolling"));
+                                    }
+                                    for (mode, label) in modes {
+                                        if ui
+                                            .selectable_label(op.corner_mode == mode, label)
+                                            .clicked()
+                                        {
+                                            op.corner_mode = mode;
+                                        }
+                                    }
+                                });
+                            }
                         }
 
                         // OK / Cancel.

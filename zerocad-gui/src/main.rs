@@ -1046,6 +1046,8 @@ struct ZeroCadApp {
     extrude_mode: ExtrudeMode,
     /// Active (uncommitted) extrude operation with its live preview, if any.
     extrude_op: Option<ExtrudeOp>,
+    /// Command-first Extrude workflow: wait for the next sketch profile click.
+    extrude_profile_pick_active: bool,
     /// The in-progress Revolve tool (axis/angle/mode dialog), `None` when idle.
     revolve_op: Option<RevolveOp>,
     /// The in-progress Pattern/Mirror tool dialog, `None` when idle.

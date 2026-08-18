@@ -93,7 +93,7 @@ pub(crate) fn consume_local_unary_operation(
     policy: &openrcad::foundation::TolerancePolicy,
 ) -> Result<KernelOutcome, String> {
     let (value, reconstructed) = value
-        .repair_pcurves(policy)
+        .repair_operation_pcurves(policy)
         .map_err(|error| format!("{operation}: pcurve construction failed: {error}"))?;
     let validation = openrcad::topo::ValidationReport::for_solid(&value, policy);
     let mut recovery = openrcad::topo::RecoveryReport::default();

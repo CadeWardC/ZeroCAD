@@ -12,7 +12,8 @@ use crate::rolling_ball::{
     adjacent_faces, endpoint_cap_faces, farthest_endpoint, is_concave_cut_cylinder,
     line_meets_cylinder, nearest_endpoint, orient_edge_between,
     planar_edge_material_wedge_is_concave, planar_outward_normal_checked, polyline_edge,
-    relocate_edge, same_face, trim_face_along_spine, trim_face_at_corner, RollingBallError,
+    relocate_edge, same_face, trim_face_along_multiple_spines, trim_face_along_spine,
+    trim_face_at_corner, RollingBallError,
 };
 use crate::sew::sew_shell_with_policy as sew_with_policy;
 
@@ -177,12 +178,207 @@ pub fn chamfer_edges_with_policy(
         return Ok(solid.clone());
     }
 
+    let relocated = edges
+        .iter()
+        .map(|edge| relocate_edge(solid, edge).ok_or(ChamferError::SpineNotOnFace))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(ordered) = order_closed_edge_loop(&relocated, policy.sewing) {
+        if let Ok(result) = chamfer_closed_planar_edge_loop(solid, &ordered, distance, policy) {
+            return Ok(result);
+        }
+    }
+
     let mut current = solid.clone();
-    for edge in edges {
+    for edge in &relocated {
         let target = relocate_edge(&current, edge).ok_or(ChamferError::SpineNotOnFace)?;
         current = chamfer_planar_edge(&current, &target, distance, policy)?;
     }
     Ok(current)
+}
+
+/// Order a degree-two edge contour and orient every edge head-to-tail.  A
+/// closed rim has no endpoint caps; it must be rebuilt as one network rather
+/// than as a sequence of independently capped edge edits.
+fn order_closed_edge_loop(edges: &[Edge], tolerance: f64) -> Option<Vec<Edge>> {
+    if edges.len() < 3 {
+        return None;
+    }
+    let mut used = vec![false; edges.len()];
+    let mut ordered = vec![edges[0].clone()];
+    used[0] = true;
+    let first = ordered[0].source().point();
+    let mut end = ordered[0].target().point();
+    while ordered.len() < edges.len() {
+        let (index, next) = edges
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !used[*index])
+            .find_map(|(index, edge)| {
+                if edge.source().point().distance(&end) <= tolerance {
+                    Some((index, edge.clone()))
+                } else if edge.target().point().distance(&end) <= tolerance {
+                    Some((index, edge.reversed()))
+                } else {
+                    None
+                }
+            })?;
+        used[index] = true;
+        end = next.target().point();
+        ordered.push(next);
+    }
+    (end.distance(&first) <= tolerance).then_some(ordered)
+}
+
+fn contact_line_intersection(first: &Edge, second: &Edge, tolerance: f64) -> Option<Pnt> {
+    let p = first.source().point();
+    let q = second.source().point();
+    let r = first.target().point() - p;
+    let s = second.target().point() - q;
+    let a = r.dot(&r);
+    let b = r.dot(&s);
+    let c = s.dot(&s);
+    let d = r.dot(&(p - q));
+    let e = s.dot(&(p - q));
+    let denominator = a * c - b * b;
+    if denominator.abs() <= 1.0e-12 * a.max(1.0) * c.max(1.0) {
+        return None;
+    }
+    let first_parameter = (b * e - c * d) / denominator;
+    let second_parameter = (a * e - b * d) / denominator;
+    let on_first = p + r * first_parameter;
+    let on_second = q + s * second_parameter;
+    if on_first.distance(&on_second) > tolerance * 10.0 {
+        return None;
+    }
+    Some(Pnt::new(
+        0.5 * (on_first.x() + on_second.x()),
+        0.5 * (on_first.y() + on_second.y()),
+        0.5 * (on_first.z() + on_second.z()),
+    ))
+}
+
+/// Simultaneously chamfer a closed planar edge loop.  Every selected edge is
+/// solved against the original solid, the common support contact is extended
+/// to the adjacent contact-line intersection, and all affected support faces
+/// are trimmed once before the shell is sewn.  This creates the miter seams
+/// directly and avoids invalid temporary endpoint caps or overlapping cutters.
+fn chamfer_closed_planar_edge_loop(
+    solid: &Solid,
+    edges: &[Edge],
+    distance: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, ChamferError> {
+    let first_adjacent = adjacent_faces(solid, &edges[0]);
+    let shared_face = first_adjacent
+        .into_iter()
+        .find(|candidate| {
+            edges.iter().all(|edge| {
+                adjacent_faces(solid, edge)
+                    .iter()
+                    .any(|face| face.id() == candidate.id())
+            })
+        })
+        .ok_or(ChamferError::UnsupportedTrimTopology)?;
+
+    let mut blends = edges
+        .iter()
+        .map(|edge| chamfer_planar_blend(solid, edge, distance))
+        .collect::<Result<Vec<_>, _>>()?;
+    let shared_is_a = blends
+        .iter()
+        .map(|blend| {
+            if blend.face_a.id() == shared_face.id() {
+                Ok(true)
+            } else if blend.face_b.id() == shared_face.id() {
+                Ok(false)
+            } else {
+                Err(ChamferError::UnsupportedTrimTopology)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let top_contact = |index: usize| {
+        if shared_is_a[index] {
+            &blends[index].contact_a
+        } else {
+            &blends[index].contact_b
+        }
+    };
+    let mut miter_vertices = Vec::with_capacity(edges.len());
+    for index in 0..edges.len() {
+        let previous = (index + edges.len() - 1) % edges.len();
+        miter_vertices.push(
+            contact_line_intersection(top_contact(previous), top_contact(index), policy.sewing)
+                .ok_or(ChamferError::UnsupportedTrimTopology)?,
+        );
+    }
+
+    let mut replacements: HashMap<FaceId, (Face, Vec<(Edge, Edge)>)> = HashMap::new();
+    for index in 0..blends.len() {
+        let start = miter_vertices[index];
+        let end = miter_vertices[(index + 1) % blends.len()];
+        let top = Edge::between_points(start, end);
+        if shared_is_a[index] {
+            blends[index].contact_a = top;
+        } else {
+            blends[index].contact_b = top;
+        }
+
+        let contact_a_start =
+            nearest_endpoint(&blends[index].contact_a, edges[index].source().point());
+        let contact_a_end =
+            nearest_endpoint(&blends[index].contact_a, edges[index].target().point());
+        let contact_b_start =
+            nearest_endpoint(&blends[index].contact_b, edges[index].source().point());
+        let contact_b_end =
+            nearest_endpoint(&blends[index].contact_b, edges[index].target().point());
+        blends[index].start_edge = Edge::between_points(contact_b_start, contact_a_start);
+        blends[index].end_edge = Edge::between_points(contact_a_end, contact_b_end);
+        blends[index].chamfer_face = chamfer_face_from_edges(
+            &blends[index].contact_a,
+            &blends[index].contact_b,
+            &blends[index].start_edge,
+            &blends[index].end_edge,
+        )?;
+
+        for (face, contact) in [
+            (&blends[index].face_a, &blends[index].contact_a),
+            (&blends[index].face_b, &blends[index].contact_b),
+        ] {
+            replacements
+                .entry(face.id())
+                .or_insert_with(|| (face.clone(), Vec::new()))
+                .1
+                .push((edges[index].clone(), contact.clone()));
+        }
+    }
+
+    let mut trimmed = HashMap::new();
+    for (id, (face, face_replacements)) in replacements {
+        let next = trim_face_along_multiple_spines(&face, &face_replacements)
+            .map_err(ChamferError::from)?;
+        trimmed.insert(id, next);
+    }
+    let mut faces = Vec::new();
+    for face in solid.shell().faces() {
+        if !trimmed.contains_key(&face.id()) {
+            faces.push(face);
+        }
+    }
+    faces.extend(trimmed.into_values());
+    faces.extend(blends.into_iter().map(|blend| blend.chamfer_face));
+
+    let result =
+        Solid::new(sew_with_policy(&faces, policy).map_err(ChamferError::InvalidTolerancePolicy)?);
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
+    if merged.is_watertight() && merged.health_report().is_healthy() {
+        Ok(merged)
+    } else if result.is_watertight() && result.health_report().is_healthy() {
+        Ok(result)
+    } else {
+        Err(ChamferError::InvalidTopology)
+    }
 }
 
 #[derive(Clone)]

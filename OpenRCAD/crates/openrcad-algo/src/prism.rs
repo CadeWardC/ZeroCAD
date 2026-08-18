@@ -113,12 +113,22 @@ fn build_prism(
 
     faces.extend(cap_faces(face, &translation, sweep_points_along_normal)?);
 
-    for wire in face.wires() {
+    // Outer and inner walls need OPPOSITE effective normals: an outer wall faces
+    // away from its own axis, a hole's wall faces toward it, into the void. Both
+    // are "outward" with respect to the material, so the two cases cannot share
+    // one reconciliation rule.
+    for edge in outer.edges() {
+        if edge.length() <= tolerance::CONFUSION {
+            continue;
+        }
+        faces.push(lateral_face(&edge, &translation, vector, false)?);
+    }
+    for wire in face.inner_wires() {
         for edge in wire.edges() {
             if edge.length() <= tolerance::CONFUSION {
                 continue;
             }
-            faces.push(lateral_face(&edge, &translation, vector)?);
+            faces.push(lateral_face(&edge, &translation, vector, true)?);
         }
     }
 
@@ -180,7 +190,12 @@ pub fn sweep_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
     prism_operation(face, vector).map(|result| result.value)
 }
 
-fn lateral_face(edge: &Edge, translation: &Trsf, vector: GeomVec) -> Result<Face, SweepError> {
+fn lateral_face(
+    edge: &Edge,
+    translation: &Trsf,
+    vector: GeomVec,
+    bounds_a_hole: bool,
+) -> Result<Face, SweepError> {
     let p0 = edge.source().point();
     let p1 = edge.target().point();
     let q0 = translation.transform_point(&p0);
@@ -194,35 +209,63 @@ fn lateral_face(edge: &Edge, translation: &Trsf, vector: GeomVec) -> Result<Face
         Edge::between_points(q1, p1),
     ];
     let surface = lateral_surface(edge, p1, p0, vector, translation);
+
+    // Reconcile the wall's intrinsic normal with the material side.
+    //
+    // `cap_faces` branches on whether the sweep runs along the profile normal;
+    // the laterals had no equivalent, so a sweep in the +normal direction left
+    // walls whose effective normal pointed INWARD. Watertight, health and
+    // closed-mesh checks all pass on such a solid — only its signed volume
+    // shows it, and mass properties normalize that sign away.
+    //
+    // The wire is reversed rather than the surface: flipping a cylinder's axis
+    // does not survive `sew`, which re-canonicalizes it straight back.
+    let mid_base = edge.curve().map_or_else(
+        || p0 + (p1 - p0) * 0.5,
+        |curve| curve.point(edge.first() + (edge.last() - edge.first()) * 0.5),
+    );
+    let center = mid_base + vector * 0.5;
+    let agrees = crate::revolve::loop_agrees_with_surface(
+        &Wire::from_edges(edges.clone()),
+        &surface,
+        center,
+    );
+    // A hole's wall wants the inverse: material lies outside that cylinder, so
+    // its face must look toward the axis.
+    let mut reverse_loop = if bounds_a_hole { agrees } else { !agrees };
+    if matches!(&surface, GeomSurface::Ruled(_)) {
+        reverse_loop = false;
+    }
+    let edges: Vec<Edge> = if reverse_loop {
+        edges
+            .into_iter()
+            .rev()
+            .map(|edge| edge.reversed())
+            .collect()
+    } else {
+        edges.to_vec()
+    };
+
     let pcurves = if matches!(&surface, GeomSurface::Ruled(_)) {
-        vec![
-            uv_line(
-                Pnt2d::new(edge.first(), 0.0),
-                Pnt2d::new(edge.last(), 0.0),
-                SurfacePeriodicity::NONE,
-            ),
-            uv_line(
-                Pnt2d::new(edge.first(), 0.0),
-                Pnt2d::new(edge.first(), 1.0),
-                SurfacePeriodicity::NONE,
-            ),
-            uv_line(
-                Pnt2d::new(edge.first(), 1.0),
-                Pnt2d::new(edge.last(), 1.0),
-                SurfacePeriodicity::NONE,
-            ),
-            uv_line(
-                Pnt2d::new(edge.last(), 1.0),
-                Pnt2d::new(edge.last(), 0.0),
-                SurfacePeriodicity::NONE,
-            ),
-        ]
+        // A ruled lateral's pcurves are the four known coordinate lines of its
+        // (u = profile parameter, v = sweep fraction) rectangle.
+        let corners = [
+            (Pnt2d::new(edge.first(), 0.0), Pnt2d::new(edge.last(), 0.0)),
+            (Pnt2d::new(edge.first(), 0.0), Pnt2d::new(edge.first(), 1.0)),
+            (Pnt2d::new(edge.first(), 1.0), Pnt2d::new(edge.last(), 1.0)),
+            (Pnt2d::new(edge.last(), 1.0), Pnt2d::new(edge.last(), 0.0)),
+        ];
+        corners
+            .into_iter()
+            .map(|(from, to)| uv_line(from, to, SurfacePeriodicity::NONE))
+            .collect()
     } else {
         edges
             .iter()
             .map(|edge| analytic_line_pcurve(&surface, edge))
             .collect()
     };
+
     Face::with_pcurves(surface, Wire::from_edges(edges), pcurves).map_err(SweepError::FaceBuild)
 }
 
@@ -527,6 +570,75 @@ mod tests {
         assert_eq!(solid.face_count(), 10);
         assert!(solid.is_watertight());
         assert!(solid.health_report().is_healthy());
+    }
+
+    /// Signed volume straight off the tessellation. Deliberately NOT absolute:
+    /// mass properties and every downstream helper normalize the sign, which is
+    /// exactly what let inward-facing laterals go unnoticed.
+    fn signed_volume(solid: &Solid) -> f64 {
+        let mesh = openrcad_mesh::tessellate(solid, 0.02, 0.2);
+        let mut six = 0.0;
+        for [a, b, c] in &mesh.triangles {
+            let (p, q, r) = (
+                mesh.vertices[*a as usize],
+                mesh.vertices[*b as usize],
+                mesh.vertices[*c as usize],
+            );
+            six += p.x() * (q.y() * r.z() - q.z() * r.y())
+                - p.y() * (q.x() * r.z() - q.z() * r.x())
+                + p.z() * (q.x() * r.y() - q.y() * r.x());
+        }
+        six / 6.0
+    }
+
+    fn disc_face(radius: f64) -> Face {
+        let circle = Circle::new(Ax3::new(Pnt::origin(), Dir::dz()), radius);
+        let edges: Vec<Edge> = [0.0, TAU / 3.0, 2.0 * TAU / 3.0, TAU]
+            .windows(2)
+            .map(|w| {
+                Edge::new(
+                    Some(GeomCurve::circle(circle)),
+                    w[0],
+                    w[1],
+                    Vertex::new(circle.point(w[0])),
+                    Vertex::new(circle.point(w[1])),
+                )
+            })
+            .collect();
+        Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                Dir::dz(),
+            ))),
+            Wire::from_edges(edges),
+        )
+    }
+
+    /// Cylindrical laterals must face outward, so a swept disc encloses a
+    /// POSITIVE signed volume. Watertight and health checks pass either way —
+    /// they cannot see an inverted effective normal.
+    #[test]
+    fn cylindrical_laterals_face_outward_for_a_positive_sweep() {
+        let solid = prism(&disc_face(2.0), GeomVec::new(0.0, 0.0, 5.0)).unwrap();
+        let expected = core::f64::consts::PI * 4.0 * 5.0;
+        let volume = signed_volume(&solid);
+        assert!(
+            (volume - expected).abs() <= expected * 0.02,
+            "swept disc should enclose +{expected:.2}, got {volume:.2}"
+        );
+    }
+
+    /// Same solid swept the other way: the body sits below z=0 but its volume is
+    /// still positive, so the sign test is about orientation, not sweep direction.
+    #[test]
+    fn cylindrical_laterals_face_outward_for_a_negative_sweep() {
+        let solid = prism(&disc_face(2.0), GeomVec::new(0.0, 0.0, -5.0)).unwrap();
+        let expected = core::f64::consts::PI * 4.0 * 5.0;
+        let volume = signed_volume(&solid);
+        assert!(
+            (volume - expected).abs() <= expected * 0.02,
+            "reverse-swept disc should enclose +{expected:.2}, got {volume:.2}"
+        );
     }
 
     #[test]

@@ -903,8 +903,9 @@ fn fillet_planar_edge_inner(
     let start = edge.source().point();
     let end = edge.target().point();
 
-    let start_caps = endpoint_cap_faces(solid, start, &blend.face_a, &blend.face_b);
-    let end_caps = endpoint_cap_faces(solid, end, &blend.face_a, &blend.face_b);
+    let start_caps =
+        endpoint_cap_faces_for_fillet(solid, start, &blend.face_a, &blend.face_b, radius);
+    let end_caps = endpoint_cap_faces_for_fillet(solid, end, &blend.face_a, &blend.face_b, radius);
     let cut_guards = cut_cylinder_guards(solid, &blend, start, &start_caps, end, &end_caps);
 
     let mut faces = Vec::new();
@@ -1288,20 +1289,12 @@ fn complete_blend_candidate_pcurves(
     candidate: &Solid,
     policy: &TolerancePolicy,
 ) -> Result<Solid, RollingBallError> {
-    let completed = candidate
-        .complete_missing_pcurves(policy)
-        .map(|(solid, _)| solid)
-        .map_err(|error| RollingBallError::CandidateValidation {
-            stage: "blend candidate pcurve construction",
-            reason: error.to_string(),
-        })?;
     // Sewing canonicalizes coincident 3D vertices. At very small scales and
     // large translations that rebase can move an endpoint by a few ulps after
-    // its native pcurve was constructed. Revalidate and, where necessary,
-    // rebuild against the sewn topology so UV loops share the same endpoint
-    // branch without relaxing the document policy.
-    completed
-        .repair_pcurves(policy)
+    // its native pcurve was constructed. Rebuild against the sewn topology and
+    // retain the measured residual as a bounded local edge tolerance.
+    candidate
+        .repair_operation_pcurves(policy)
         .map(|(solid, _)| solid)
         .map_err(|error| RollingBallError::CandidateValidation {
             stage: "blend candidate pcurve rebinding",
@@ -1325,12 +1318,12 @@ fn solid_surface_intrudes_into_cut_once(
     // Attach and validate operation-created candidate pcurves before entering
     // the strict tessellator. Failure is surfaced to the evaluator instead of
     // silently dropping the blend candidate.
-    let (candidate, _) = candidate.repair_pcurves(policy).map_err(|error| {
-        RollingBallError::CandidateValidation {
+    let (candidate, _) = candidate
+        .repair_operation_pcurves(policy)
+        .map_err(|error| RollingBallError::CandidateValidation {
             stage: "cut-intrusion pcurve repair",
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     let mesh =
         tessellate_checked_with_policy_and_cancel(&candidate, 0.05, 0.5, policy, &NeverCancelled)
             .map_err(|error| RollingBallError::CandidateValidation {
@@ -5104,6 +5097,256 @@ pub fn fillet_edges(solid: &Solid, edges: &[Edge], radius: f64) -> Result<Solid,
     fillet_edges_with_policy(solid, edges, radius, &TolerancePolicy::STANDARD)
 }
 
+/// Order a degree-two edge contour and orient every edge head-to-tail. A
+/// closed rim has no endpoint caps, so its bands must be rebuilt together
+/// instead of leaving each sequential edit to cap a corner independently.
+fn order_closed_fillet_edge_loop(edges: &[Edge], tolerance: f64) -> Option<Vec<Edge>> {
+    if edges.len() < 3 {
+        return None;
+    }
+    let mut used = vec![false; edges.len()];
+    let mut ordered = vec![edges[0].clone()];
+    used[0] = true;
+    let first = ordered[0].source().point();
+    let mut end = ordered[0].target().point();
+    while ordered.len() < edges.len() {
+        let (index, next) = edges
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !used[*index])
+            .find_map(|(index, edge)| {
+                if edge.source().point().distance(&end) <= tolerance {
+                    Some((index, edge.clone()))
+                } else if edge.target().point().distance(&end) <= tolerance {
+                    Some((index, edge.reversed()))
+                } else {
+                    None
+                }
+            })?;
+        used[index] = true;
+        end = next.target().point();
+        ordered.push(next);
+    }
+    (end.distance(&first) <= tolerance).then_some(ordered)
+}
+
+/// Intersect the infinite support lines of two straight contact edges. The
+/// midpoint is returned so tiny independent-solve drift is removed before the
+/// two adjacent bands are sewn.
+fn closed_loop_line_intersection(first: &Edge, second: &Edge, tolerance: f64) -> Option<Pnt> {
+    let p = first.source().point();
+    let q = second.source().point();
+    let r = first.target().point() - p;
+    let s = second.target().point() - q;
+    let a = r.dot(&r);
+    let b = r.dot(&s);
+    let c = s.dot(&s);
+    let d = r.dot(&(p - q));
+    let e = s.dot(&(p - q));
+    let denominator = a * c - b * b;
+    if denominator.abs() <= 1.0e-12 * a.max(1.0) * c.max(1.0) {
+        return None;
+    }
+    let first_parameter = (b * e - c * d) / denominator;
+    let second_parameter = (a * e - b * d) / denominator;
+    let on_first = p + r * first_parameter;
+    let on_second = q + s * second_parameter;
+    if on_first.distance(&on_second) > tolerance * 10.0 {
+        return None;
+    }
+    Some(Pnt::new(
+        0.5 * (on_first.x() + on_second.x()),
+        0.5 * (on_first.y() + on_second.y()),
+        0.5 * (on_first.z() + on_second.z()),
+    ))
+}
+
+/// Simultaneously fillet a closed planar edge loop whose bands meet in
+/// equal-radius perpendicular miters. Every band is solved against the
+/// original solid, its shared-support and side contacts are extended to their
+/// neighboring intersections, and the intersecting cylinders receive one
+/// shared quarter-ellipse seam at each corner. All support faces are then
+/// trimmed once, avoiding the invalid temporary caps produced by sequential
+/// edits around a through-hole rim.
+fn fillet_closed_planar_edge_loop_with_policy(
+    solid: &Solid,
+    edges: &[Edge],
+    radius: f64,
+    policy: &TolerancePolicy,
+) -> Result<Solid, RollingBallError> {
+    let mut blends = edges
+        .iter()
+        .map(|edge| rolling_ball_fillet_edge_with_policy(solid, edge, radius, policy))
+        .collect::<Result<Vec<_>, _>>()?;
+    if blends.iter().any(|blend| blend.concave) {
+        return Err(RollingBallError::UnsupportedTrimTopology);
+    }
+
+    let shared_face_id = [blends[0].face_a.id(), blends[0].face_b.id()]
+        .into_iter()
+        .find(|candidate| {
+            blends
+                .iter()
+                .all(|blend| blend.face_a.id() == *candidate || blend.face_b.id() == *candidate)
+        })
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+    let shared_is_a = blends
+        .iter()
+        .map(|blend| {
+            if blend.face_a.id() == shared_face_id {
+                Ok(true)
+            } else if blend.face_b.id() == shared_face_id {
+                Ok(false)
+            } else {
+                Err(RollingBallError::UnsupportedTrimTopology)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let shared_contact = |index: usize| {
+        if shared_is_a[index] {
+            &blends[index].contact_a
+        } else {
+            &blends[index].contact_b
+        }
+    };
+    let side_contact = |index: usize| {
+        if shared_is_a[index] {
+            &blends[index].contact_b
+        } else {
+            &blends[index].contact_a
+        }
+    };
+
+    let mut shared_vertices = Vec::with_capacity(edges.len());
+    let mut side_vertices = Vec::with_capacity(edges.len());
+    let mut centers = Vec::with_capacity(edges.len());
+    for index in 0..edges.len() {
+        let previous = (index + edges.len() - 1) % edges.len();
+        shared_vertices.push(
+            closed_loop_line_intersection(
+                shared_contact(previous),
+                shared_contact(index),
+                policy.sewing,
+            )
+            .ok_or(RollingBallError::UnsupportedTrimTopology)?,
+        );
+        side_vertices.push(
+            closed_loop_line_intersection(
+                side_contact(previous),
+                side_contact(index),
+                policy.sewing,
+            )
+            .ok_or(RollingBallError::UnsupportedTrimTopology)?,
+        );
+        centers.push(
+            closed_loop_line_intersection(
+                &blends[previous].centerline,
+                &blends[index].centerline,
+                policy.sewing,
+            )
+            .ok_or(RollingBallError::UnsupportedTrimTopology)?,
+        );
+    }
+
+    let geometry_tolerance = 5.0 * corner_tol(radius);
+    let expected_side_distance = radius * core::f64::consts::SQRT_2;
+    let mut seams = Vec::with_capacity(edges.len());
+    for index in 0..edges.len() {
+        if (centers[index].distance(&shared_vertices[index]) - radius).abs() > geometry_tolerance
+            || (centers[index].distance(&side_vertices[index]) - expected_side_distance).abs()
+                > geometry_tolerance
+        {
+            return Err(RollingBallError::UnsupportedTrimTopology);
+        }
+        seams.push(
+            miter_seam_edge(
+                centers[index],
+                side_vertices[index],
+                shared_vertices[index],
+                radius,
+            )
+            .ok_or(RollingBallError::UnsupportedTrimTopology)?,
+        );
+    }
+
+    let mut replacements: std::collections::HashMap<FaceId, (Face, Vec<(Edge, Edge)>)> =
+        std::collections::HashMap::new();
+    for index in 0..blends.len() {
+        let next = (index + 1) % blends.len();
+        let shared = Edge::between_points(shared_vertices[index], shared_vertices[next]);
+        let side = Edge::between_points(side_vertices[index], side_vertices[next]);
+        if shared_is_a[index] {
+            blends[index].contact_a = shared;
+            blends[index].contact_b = side;
+        } else {
+            blends[index].contact_a = side;
+            blends[index].contact_b = shared;
+        }
+
+        blends[index].start_arc = orient_edge_between(
+            &seams[index],
+            blends[index].contact_b.source().point(),
+            blends[index].contact_a.source().point(),
+        );
+        blends[index].end_arc = orient_edge_between(
+            &seams[next],
+            blends[index].contact_a.target().point(),
+            blends[index].contact_b.target().point(),
+        );
+        blends[index].blend_face = Face::new(
+            blends[index].blend_face.surface().cloned(),
+            Wire::from_edges([
+                blends[index].contact_a.clone(),
+                blends[index].end_arc.clone(),
+                blends[index].contact_b.clone().reversed(),
+                blends[index].start_arc.clone(),
+            ]),
+        );
+
+        for (face, contact) in [
+            (&blends[index].face_a, &blends[index].contact_a),
+            (&blends[index].face_b, &blends[index].contact_b),
+        ] {
+            replacements
+                .entry(face.id())
+                .or_insert_with(|| (face.clone(), Vec::new()))
+                .1
+                .push((edges[index].clone(), contact.clone()));
+        }
+    }
+
+    let mut trimmed = std::collections::HashMap::new();
+    for (id, (face, face_replacements)) in replacements {
+        trimmed.insert(
+            id,
+            trim_face_along_multiple_spines(&face, &face_replacements)?,
+        );
+    }
+    let mut faces = Vec::new();
+    for face in solid.shell().faces() {
+        if !trimmed.contains_key(&face.id()) {
+            faces.push(face);
+        }
+    }
+    faces.extend(trimmed.into_values());
+    faces.extend(blends.into_iter().map(|blend| blend.blend_face));
+
+    let result = Solid::new(
+        sew_with_policy(&faces, policy).map_err(RollingBallError::InvalidTolerancePolicy)?,
+    );
+    let result = complete_blend_candidate_pcurves(&result, policy)?;
+    let merged =
+        crate::merge::merge_cocylindrical_faces(&crate::merge::merge_coplanar_faces(&result));
+    if let Some(accepted) = accept_subtractive_blend_result(&merged, &[], policy)? {
+        return Ok(accepted);
+    }
+    if let Some(accepted) = accept_subtractive_blend_result(&result, &[], policy)? {
+        return Ok(accepted);
+    }
+    Err(RollingBallError::InvalidTopology)
+}
+
 /// Fillet several selected edges using one document tolerance policy.
 pub fn fillet_edges_with_policy(
     solid: &Solid,
@@ -5120,6 +5363,13 @@ pub fn fillet_edges_with_policy(
             relocate_edge_with_policy(solid, edge, policy).ok_or(RollingBallError::SpineNotOnFace)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(ordered) = order_closed_fillet_edge_loop(&relocated, policy.sewing) {
+        if let Ok(result) =
+            fillet_closed_planar_edge_loop_with_policy(solid, &ordered, radius, policy)
+        {
+            return Ok(result);
+        }
+    }
     if relocated.len() >= CornerNetworkPlan::MIN_VERIFIED_VALENCE {
         let tolerance =
             ToleranceContext::derive(policy, &[solid.bounding_box()], Some(radius), 1.0)
@@ -5505,7 +5755,7 @@ pub fn chamfer_tangent_edge_chain_with_policy(
     }
 }
 
-fn trim_face_along_multiple_spines(
+pub(crate) fn trim_face_along_multiple_spines(
     face: &Face,
     replacements: &[(Edge, Edge)],
 ) -> Result<Face, RollingBallError> {
@@ -7829,11 +8079,72 @@ pub(crate) fn endpoint_cap_faces(
         .collect()
 }
 
+fn endpoint_cap_faces_for_fillet(
+    solid: &Solid,
+    point: Pnt,
+    face_a: &Face,
+    face_b: &Face,
+    radius: f64,
+) -> Vec<Face> {
+    let exact = endpoint_cap_faces(solid, point, face_a, face_b);
+    if !exact.is_empty() {
+        return exact;
+    }
+    let tolerance = corner_tol(radius);
+    solid
+        .shell()
+        .faces()
+        .into_iter()
+        .filter(|face| {
+            if same_face(face, face_a) || same_face(face, face_b) {
+                return false;
+            }
+            let Some(GeomSurface::Cylinder(cylinder)) = face.surface() else {
+                return false;
+            };
+            if (cylinder.radius() - radius).abs() > tolerance {
+                return false;
+            }
+            // A previous equal-radius band has consumed the sharp vertex, so
+            // its end wire is exactly one radius away. Treat that analytic band
+            // as the incident cap consumed by the two-band miter builder. This
+            // is not a relaxed topology match: both radius identity and local
+            // endpoint distance must certify the relationship.
+            face.wires().into_iter().any(|wire| {
+                wire.edges().into_iter().any(|edge| {
+                    edge.source().point().distance(&point) <= radius + tolerance
+                        || edge.target().point().distance(&point) <= radius + tolerance
+                })
+            })
+        })
+        .collect()
+}
+
 fn face_contains_point(face: &Face, point: Pnt) -> bool {
     face.wires().into_iter().any(|wire| {
         wire.edges().into_iter().any(|edge| {
-            edge.source().point().distance(&point) <= 10.0 * tolerance::CONFUSION
-                || edge.target().point().distance(&point) <= 10.0 * tolerance::CONFUSION
+            let source = edge.source().point();
+            let target = edge.target().point();
+            let tol = 10.0 * tolerance::CONFUSION;
+            if source.distance(&point) <= tol || target.distance(&point) <= tol {
+                return true;
+            }
+            // Boolean imprints may leave a selected vertex in the interior of
+            // a longer, collinear cap edge. Endpoint-only incidence then
+            // reports no cap and makes a complete degree-two blend loop look
+            // like a partial corner selection. Recognize that T-junction
+            // representation without broadening the geometric tolerance.
+            let chord = target - source;
+            let length_squared = chord.magnitude_squared();
+            if length_squared <= tol * tol {
+                return false;
+            }
+            let parameter = (point - source).dot(&chord) / length_squared;
+            if parameter < 0.0 || parameter > 1.0 {
+                return false;
+            }
+            let projection = source + chord * parameter;
+            projection.distance(&point) <= tol
         })
     })
 }
@@ -8291,7 +8602,7 @@ fn trim_outer_wire_along_spine_segments_clamped(
         .ok_or(RollingBallError::UnsupportedTrimTopology)?
         .edges();
     let n = edges.len();
-    if n < 3 || spine_edges.is_empty() || spine_edges.len() >= n {
+    if n < 3 || spine_edges.is_empty() {
         return Err(RollingBallError::UnsupportedTrimTopology);
     }
 
@@ -8307,6 +8618,14 @@ fn trim_outer_wire_along_spine_segments_clamped(
         .collect();
     if selected.is_empty() {
         return Err(RollingBallError::SpineNotOnFace);
+    }
+    // `spine_edges` describes the complete multi-face contour. Only the subset
+    // found on this support face determines whether its boundary is fully
+    // selected. Annular extrusions have four rim fragments and four separate
+    // cylindrical support patches, so comparing the global count with this
+    // face's four edges incorrectly rejected each valid one-edge trim.
+    if selected.len() >= n {
+        return Err(RollingBallError::UnsupportedTrimTopology);
     }
 
     let run_start = selected
