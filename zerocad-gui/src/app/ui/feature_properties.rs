@@ -1350,9 +1350,24 @@ impl ZeroCadApp {
                                         .size(11.5)
                                         .weak(),
                                     );
-                                    let regions = detect_regions(&eff);
+                                    let regions = ZeroCadApp::cached_regions_in(
+                                        &self.finished_sketch_regions,
+                                        selected_id,
+                                        &eff,
+                                        shapes.iter().any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
+                                        |regions| zerocad_core::text::sketch_region_ink_mask(
+                                            curves,
+                                            shapes,
+                                            corner_mods,
+                                            mirrors,
+                                            solver.as_ref(),
+                                            &var_map,
+                                            regions,
+                                        ),
+                                    );
+                                    let inked_faces = regions.ink_mask.iter().filter(|ink| **ink).count();
                                     ui.label(
-                                        egui::RichText::new(format!("Faces: {}", regions.len()))
+                                        egui::RichText::new(format!("Faces: {inked_faces}"))
                                             .size(11.5)
                                             .weak(),
                                     );
@@ -1372,7 +1387,7 @@ impl ZeroCadApp {
                                     }
                                     ui.add_space(8.0);
 
-                                    let has_faces = !regions.is_empty();
+                                    let has_faces = inked_faces > 0;
                                     let extrude_btn = icons::Icon::Extrude.labeled_button(
                                         ui,
                                         "Extrude whole Sketch",

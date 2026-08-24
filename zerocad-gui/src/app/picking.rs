@@ -607,8 +607,9 @@ impl ZeroCadApp {
             else {
                 continue;
             };
+            let stored_curves = curves;
             let curves = zerocad_core::effective_curves_solved(
-                curves,
+                stored_curves,
                 shapes,
                 corner_mods,
                 mirrors,
@@ -709,7 +710,33 @@ impl ZeroCadApp {
             if let Some(boundary) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
                 region_curves.extend_curves(boundary);
             }
-            for (region_index, region) in detect_regions(&region_curves).iter().enumerate() {
+            let cached_regions = self.cached_finished_regions(
+                node.id.as_str(),
+                &region_curves,
+                shapes
+                    .iter()
+                    .any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
+                |regions| {
+                    zerocad_core::text::sketch_region_ink_mask(
+                        stored_curves,
+                        shapes,
+                        corner_mods,
+                        mirrors,
+                        solver.as_ref(),
+                        &variables,
+                        regions,
+                    )
+                },
+            );
+            for (region_index, region) in cached_regions.regions.iter().enumerate() {
+                if !cached_regions
+                    .ink_mask
+                    .get(region_index)
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
                 let screen_boundary: Vec<_> =
                     region.boundary.iter().copied().map(to_screen).collect();
                 if screen_boundary.len() < 3

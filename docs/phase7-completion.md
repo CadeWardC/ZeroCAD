@@ -59,7 +59,7 @@ check for the absolute Part Design 1.0 limits and external evidence. Copy
 evidence, then run:
 
 ```text
-cargo run --release -p zerocad-core --example phase7_release_gate -- target/phase7-release-evidence.json
+cargo run --release -p zerocad-core --example release_evidence_check -- target/phase7-release-evidence.json
 ```
 
 The command reports every failure in one run. It requires a signed artifact, an

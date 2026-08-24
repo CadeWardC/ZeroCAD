@@ -59,6 +59,37 @@ they are not active vNext release gates.
   runs, and any future performance evidence claim must first record a
   reference run under the documented conditions.
 
+### Implementation status - 2026-08-24
+
+Recorded after the fact; these deliveries sit outside the wave plan above and
+are tracked here so the roadmap remains the single capability record.
+
+- **Assemblies** (committed 2026-07-27/28: `8732ba80`, `2dcc5b2b`, `2f74d0aa`):
+  part-vs-assembly `.zcad` projects (`ProjectKind`), referenced definitions and
+  occurrence trees bounded at 2,048 definitions / 10,000 occurrences, the
+  Assembly V2 mate-authoring schema (coincident / signed-distance / angle
+  mates), the deterministic V2 mate solver, a transactional command layer
+  (`AssemblyDocument::prepare_command` → `AssemblyChangeSet` exact
+  invalidation), the GUI assembly panel, and the
+  `assembly_release_evidence_check` / `assembly_v2_release_evidence_check`
+  gates.
+- **Alpha tags published 2026-07-28**: `v0.1.0-alpha`, `v0.2.0-alpha`, and
+  `v0.5.0-alpha` (on post-assembly commits). These are alpha convenience tags;
+  the superseded Part Design 1.0 candidate itself remains untagged, and
+  published history remains unrewritten.
+- **Sketch text and blend expansion** (committed 2026-08-18: `3391d19a`):
+  `SketchShape::Text` with font-fingerprinted baked glyph outlines, the
+  non-zero-winding ink-mask region classification, concave-analytic blend
+  expansion in the kernel, and OpenRCAD contour/rolling-ball/prism winding
+  hardening.
+- **In the working tree (not yet committed)**: OBJ export (`meshes_to_obj`)
+  and the reworked Import…/Export… submenus; the redesigned save and
+  unsaved-changes modal dialogs; exact prismatic-profile cut/join fast paths
+  and the 256-edge sampled-prism budget for glyph-heavy sketches; incremental
+  GPU instance uploads in the embedded render core; GUI wiring of every
+  assembly edit through the transactional command layer. Update this entry
+  when that work lands.
+
 ## Delivery principles
 
 - Preserve `.zcad` v5 framing and serialized identifier strings.
@@ -103,6 +134,8 @@ flowchart LR
     S2 --> S3["Shell: torus and fillet bands"]
     W --> G["Guide rail and smooth Loft"]
     S3 --> X["Advanced corner and concave-offset topology"]
+    AS["Assemblies V1/V2 - delivered post-Wave 5, outside the wave plan"]
+    TX["Sketch text - delivered post-Wave 5, outside the wave plan"]
 ```
 
 ## Gate 0 - Close and record the baseline

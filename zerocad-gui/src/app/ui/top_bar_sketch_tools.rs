@@ -218,6 +218,27 @@ impl ZeroCadApp {
                             }
                         }
 
+                        // Shaped text: opens a dialog (string, font, size,
+                        // placement) and commits baked glyph outlines as one
+                        // Text shape. Not a click-driven draw tool.
+                        {
+                            let btn = draw_tool_btn(
+                                ui,
+                                self.text_dialog.is_some(),
+                                "Text",
+                                None,
+                            );
+                            if btn
+                                .on_hover_text(
+                                    "Add text — shaped with an installed font, baked into the sketch",
+                                )
+                                .clicked()
+                            {
+                                self.open_text_dialog();
+                                log::info!("Opened the sketch Text dialog");
+                            }
+                        }
+
                         // Associative analytic offset. Source selection happens
                         // in the viewport; a click away from the selected chain
                         // supplies the creation-side seed and distance.

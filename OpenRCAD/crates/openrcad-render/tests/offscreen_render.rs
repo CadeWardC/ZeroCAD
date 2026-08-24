@@ -415,8 +415,9 @@ fn shared_geometry_instances_have_distinct_transforms_and_pick_ids() {
         model[3][0] = x;
         model
     };
-    core.set_instances(
+    core.set_instances_incremental(
         &device,
+        &queue,
         &[
             MeshInstance {
                 geometry_index: 0,
@@ -430,6 +431,56 @@ fn shared_geometry_instances_have_distinct_transforms_and_pick_ids() {
             },
         ],
     );
+    let grown_capacity = core.instance_buffer_capacity_bytes();
+    assert!(core.last_instance_update().buffer_reallocated);
+    core.set_instances_incremental(
+        &device,
+        &queue,
+        &[
+            MeshInstance {
+                geometry_index: 0,
+                model: translated(-0.5),
+                face_id_base: 3,
+            },
+            MeshInstance {
+                geometry_index: 0,
+                model: translated(0.5),
+                face_id_base: 20,
+            },
+        ],
+    );
+    assert_eq!(
+        core.instance_buffer_capacity_bytes(),
+        grown_capacity,
+        "an unchanged instance count must reuse its GPU allocation"
+    );
+    assert_eq!(
+        core.last_instance_update().records_written,
+        0,
+        "identical occurrence data must not write the GPU buffer"
+    );
+    core.set_instances_incremental(
+        &device,
+        &queue,
+        &[
+            MeshInstance {
+                geometry_index: 0,
+                model: translated(-0.5),
+                face_id_base: 3,
+            },
+            MeshInstance {
+                geometry_index: 0,
+                model: translated(0.45),
+                face_id_base: 20,
+            },
+        ],
+    );
+    assert_eq!(
+        core.last_instance_update().records_written,
+        1,
+        "moving one occurrence must write exactly one instance record"
+    );
+    assert!(!core.last_instance_update().buffer_reallocated);
     let pick = PickTarget::new(&device, SIZE, SIZE);
     let globals = SceneGlobals {
         view_proj: identity(),

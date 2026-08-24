@@ -42,6 +42,7 @@ mod settings;
 mod shell_ui;
 mod shortcuts;
 mod sketch_ui;
+mod text_ui;
 mod theme;
 mod thread_ui;
 mod thumbnail;
@@ -157,6 +158,15 @@ fn main() -> eframe::Result<()> {
 
 /// A drawing tool *mode*. Each toolbar button (a [`ToolFamily`]) exposes one or
 /// more of these via its flyout; the first listed is that button's default.
+/// Cached, shareable arrangement result for one finished sketch.
+#[derive(Clone)]
+pub(crate) struct FinishedSketchRegions {
+    pub(crate) hash: u64,
+    pub(crate) regions: std::sync::Arc<Vec<zerocad_core::Region>>,
+    pub(crate) ink_mask: std::sync::Arc<Vec<bool>>,
+    pub(crate) fill: std::sync::Arc<Vec<Vec<[(f32, f32); 3]>>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SketchTool {
     Line,
@@ -459,7 +469,10 @@ fn sketch_variable_dims(shapes: &[SketchShape]) -> Vec<String> {
             } => vec![length, angle_deg],
             SketchShape::RegularPolygon { diameter, .. } => vec![diameter],
             SketchShape::Slot { width, .. } => vec![width],
-            SketchShape::Spline { .. } | SketchShape::Imported { .. } | SketchShape::Raw { .. } => {
+            SketchShape::Spline { .. }
+            | SketchShape::Imported { .. }
+            | SketchShape::Raw { .. }
+            | SketchShape::Text { .. } => {
                 vec![]
             }
         };
@@ -721,6 +734,14 @@ struct PendingMirrorJoinFeedback {
     source_body_id: String,
 }
 
+/// Source sketches awaiting the authoritative result of a just-committed
+/// Extrude. They stay visible while evaluation runs and are hidden only after
+/// every new feature consuming that sketch reports `Resolved`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingExtrudeVisibility {
+    feature_sketches: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MirrorJoinOutcome {
     Evaluating,
@@ -740,6 +761,7 @@ struct ZeroCadApp {
     /// A just-created Mirror+Join whose actual joined/separate outcome is
     /// waiting on the committed evaluator. This is UI-only derived state.
     pending_mirror_join_feedback: Option<PendingMirrorJoinFeedback>,
+    pending_extrude_visibility: Option<PendingExtrudeVisibility>,
     /// Authoritative editable project. The runtime graph is an evaluator
     /// projection owned by this document rather than the application root.
     document: Document,
@@ -897,6 +919,32 @@ struct ZeroCadApp {
     /// shape, capturing any variable-bound dimensions. Persisted on the node at
     /// Finish Sketch so dimensions keep following their variables.
     sketch_shapes: Vec<SketchShape>,
+    /// Content hash of the curves the current `detected_regions` were computed
+    /// from; unchanged content skips the analytic arrangement on rebuild.
+    sketch_regions_fingerprint: Option<u64>,
+    /// Set when a drag frame skipped the region arrangement under throttle;
+    /// the update loop settles it as soon as the pointer is released.
+    sketch_regions_dirty: bool,
+    /// When the active sketch's arrangement last actually ran.
+    last_region_recompute: Option<std::time::Instant>,
+    /// Region + fill-triangle cache for FINISHED sketches, keyed by node id
+    /// and validated by a content hash of the resolved curves. Without it the
+    /// renderer re-ran the O(n²) analytic arrangement for every visible
+    /// finished sketch on every repaint — ~35 ms per word of text, at frame
+    /// rate, forever. RefCell because the render path holds an immutable
+    /// borrow of the document graph while drawing (single-threaded UI).
+    finished_sketch_regions:
+        std::cell::RefCell<std::collections::HashMap<String, FinishedSketchRegions>>,
+    /// Per-region fill triangles in sketch (u, v), rebuilt with the regions.
+    /// The renderer re-projects these per frame instead of ear-clipping dense
+    /// glyph boundaries at display rate.
+    sketch_region_fill_cache: Vec<Vec<[(f32, f32); 3]>>,
+    /// Typography-aware material decision aligned with `detected_regions`.
+    /// Counter faces remain in the arrangement for stable indices but are not
+    /// rendered, picked, previewed, or extruded as material.
+    sketch_region_ink_mask: Vec<bool>,
+    /// Sketch Text dialog state; `Some` while the window is open.
+    text_dialog: Option<text_ui::TextDialogState>,
     /// Fillet/chamfer modifiers applied to corners of the in-progress sketch.
     sketch_corner_mods: Vec<CornerMod>,
     /// Associative mirror operations of the in-progress sketch (see

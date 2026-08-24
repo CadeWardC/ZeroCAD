@@ -17,14 +17,18 @@ kernel whose entire stack you own and can fix.
 
 > **Status:** pre-alpha, but end-to-end across the main layers. Foundation,
 > geometry, topology, primitives, the intersection engine + BVH, booleans,
-> tessellation, sewing, STEP/STL exchange, an interactive wgpu viewer, and a
-> parametric document layer (`.zcad`) are implemented and tested. Booleans are
+> tessellation, sewing, STEP/STL/3MF exchange, solids of revolution and
+> skin/loft sweeps, plane splitting and solid healing, an interactive wgpu
+> viewer (also embeddable into host apps such as ZeroCAD), and a parametric
+> document layer (`.zcad`) are implemented and tested. Booleans are
 > watertight **and** health-validated across the everyday cases — thin plates,
 > off-axis bodies, coplanar joins, through/blind cylinder cuts and bosses — with
 > coplanar faces merged back to clean topology. Whole-solid Shell retains its
 > box/cylinder fast paths and also handles verified plane/cylinder/cone/sphere
 > networks plus regular torus fillet bands; per-edge rolling-ball fillets work
-> on arbitrary edges, including boolean results. This
+> on arbitrary edges — including boolean results and curved–curved face
+> adjacency — with equal-radius corner networks solved exactly for valences
+> 3–6. This
 > README is the architectural map; for the browsable version see [`index.html`](index.html).
 > For the current status and verification notes, see [`status.html`](status.html).
 
@@ -52,7 +56,7 @@ battle-tested. OpenRCAD adopts that architecture, because the *shape* of OCCT is
 the thing worth copying, and re-implements each layer in safe Rust.
 
 OpenRCAD contains **no OCCT or truck source**. Both are design references only
-(see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)).
+(see the parent repo's [`THIRD_PARTY_NOTICES/`](../THIRD_PARTY_NOTICES/) directory).
 
 ---
 
@@ -62,14 +66,14 @@ OpenRCAD contains **no OCCT or truck source**. Both are design references only
 |---|---|---|
 | Foundation — `TKernel`, `TKMath`, `gp`, `Precision`, `Bnd` | [`openrcad-foundation`](crates/openrcad-foundation) | ✅ math, transforms, bnd boxes, interval arithmetic, exact predicates + tested |
 | Modeling Data — 2D geometry (`TKG2d`) | [`openrcad-geom2d`](crates/openrcad-geom2d) | ✅ lines, conics, NURBS + tested |
-| Modeling Data — 3D geometry (`TKG3d`, `TKGeomBase`) | [`openrcad-geom`](crates/openrcad-geom) | ✅ plane/cyl/cone/sphere/torus, NURBS with exact rational second derivatives, Gregory/offset/ruled + tested |
+| Modeling Data — 3D geometry (`TKG3d`, `TKGeomBase`) | [`openrcad-geom`](crates/openrcad-geom) | ✅ plane/cyl/cone/sphere/torus, helix, NURBS with exact rational second derivatives, Gregory/offset/ruled + tested |
 | Modeling Data — topology / B-Rep (`TKBRep`) | [`openrcad-topo`](crates/openrcad-topo) | ✅ arena B-Rep, per-entity tolerance, validate/manifold/watertight checks + tested |
 | Modeling Algorithms — primitives (`TKPrim`) | [`openrcad-primitives`](crates/openrcad-primitives) | ✅ box, cylinder, cone, sphere, wedge + tested |
-| Modeling Algorithms (`TKBool`, `TKGeomAlgo`, `TKFillet`, …) | [`openrcad-algo`](crates/openrcad-algo) | ✅ intersection engine, SAH BVH, Euler ops, booleans (coplanar/collinear merge → clean topology), sew, `prism`/sweep, per-edge rolling-ball fillet/chamfer on arbitrary edges + an `apply_blend_contour` façade; 🟡 verified analytic Shell matrix through regular torus fillet bands |
+| Modeling Algorithms (`TKBool`, `TKGeomAlgo`, `TKFillet`, …) | [`openrcad-algo`](crates/openrcad-algo) | ✅ intersection engine, SAH BVH, Euler ops, booleans (coplanar/collinear merge → clean topology), sew, `prism`/sweep + `revolve`, skin/loft skinning, plane split, heal, per-edge rolling-ball fillet/chamfer on arbitrary edges (incl. curved–curved adjacency and exact corner networks), an `apply_blend_contour` façade, and the `*_operation*` / `*_with_policy` / `*_with_cancel` contract layer returning `OperationResult` diagnostics; 🟡 verified analytic Shell matrix through regular torus fillet bands |
 | Meshing / tessellation (`TKMesh`) | [`openrcad-mesh`](crates/openrcad-mesh) | ✅ adaptive parallel tessellation, GPU buffers + tested |
-| Data Exchange (`TKSTEP`, `TKSTL`, …) | [`openrcad-exchange`](crates/openrcad-exchange) | ✅ STEP read/write, STL write + tested |
-| Visualization (`TKV3d`, `TKOpenGl`) | [`openrcad-render`](crates/openrcad-render) | 🟡 interactive wgpu viewer: orbit/pan/zoom, MSAA, edge wireframe, click-select (not in facade) |
-| 2D sketches / profiles | [`openrcad-sketch`](crates/openrcad-sketch) | ✅ rectangles, circles, lines → closed profiles + tested |
+| Data Exchange (`TKSTEP`, `TKSTL`, …) | [`openrcad-exchange`](crates/openrcad-exchange) | ✅ STEP read/write, STL write, 3MF write (incl. assemblies) + tested |
+| Visualization (`TKV3d`, `TKOpenGl`) | [`openrcad-render`](crates/openrcad-render) | 🟡 interactive wgpu viewer: orbit/pan/zoom, MSAA, edge wireframe, click-select; plus an embeddable `RenderCore` for host apps (not in facade) |
+| 2D sketches / profiles | [`openrcad-sketch`](crates/openrcad-sketch) | ✅ rectangles, circles, lines → closed profiles; analytic planar `arrangement` (DCEL faces) and analytic `offset` + tested |
 | Parametric document history (`.zcad`) | [`openrcad-document`](crates/openrcad-document) | ✅ sketches + features + recompute, serde document format + tested |
 | truck interop | [`openrcad-truck-compat`](crates/openrcad-truck-compat) | 🟡 bidirectional `truck_topology` conversion |
 | (facade) | [`openrcad`](src/lib.rs) | ✅ re-exports the kernel layers |
@@ -105,27 +109,29 @@ OpenRCAD/
 │   └── openrcad-truck-compat/  # truck_topology interop   (separate crate)
 ├── index.html          # browsable docs (open in a browser)
 ├── architecture.html, crates.html, getting-started.html, status.html
-├── INTEGRATION.md
+├── tests/              # cross-cutting facade gate (strict_representation_gate.rs)
+├── INTEGRATION.md      # host-application integration guide (ZeroCAD)
+├── KERNEL_HARDENING_PLAN.md / CLAUDE.md   # hardening checklist / agent notes
 └── docs.css            # shared stylesheet for the docs pages
 ```
 
 The dependency DAG is strictly layered and points one way (the kernel core; the
 viewer and truck-compat sit outside the facade so GPU/interop deps never reach a
-core crate):
+core crate). Internal dependencies, per each crate's `Cargo.toml`:
 
 ```
-                       openrcad  (facade, re-exports the kernel)
-                           │
-        ┌──────────────────┼───────────────┬──────────────┐
-   openrcad-primitives  openrcad-exchange  mesh          algo
-        │                   │               │             │
-        └──────► openrcad-topo ◄────────────┴─────────────┘
-                       │        ◄── openrcad-geom, openrcad-geom2d
-                       │
-                openrcad-foundation   (no internal deps — the `gp` layer)
-
-   openrcad-document ──► openrcad-algo + openrcad-sketch   (parametric layer)
-   openrcad-render   ──► openrcad-mesh + openrcad-topo      (viewer, + wgpu/winit)
+openrcad-foundation    (no internal deps — the `gp` layer)
+openrcad-geom2d        → foundation
+openrcad-geom          → foundation
+openrcad-topo          → foundation, geom, geom2d
+openrcad-sketch        → foundation, geom2d
+openrcad-primitives    → foundation, geom, geom2d, topo
+openrcad-mesh          → foundation, geom, geom2d, topo, primitives
+openrcad-algo          → foundation, geom, geom2d, topo, primitives, mesh
+openrcad-exchange      → foundation, geom, geom2d, topo, primitives, mesh
+openrcad-document      → foundation, topo, primitives, sketch, algo
+openrcad-render        → foundation, topo, primitives, mesh      (outside the facade)
+openrcad-truck-compat  → foundation, geom, topo                  (outside the facade)
 ```
 
 ---
@@ -139,13 +145,9 @@ cargo build --workspace      # build everything
 cargo test --workspace       # run the full suite
 ```
 
-Or use the aliases in [`.cargo/config.toml`](.cargo/config.toml):
-
-```bash
-cargo t        # == cargo test --workspace
-cargo bx       # == cargo build -p openrcad-primitives
-cargo ck       # == cargo clippy --workspace --all-targets
-```
+This workspace ships no `.cargo/config.toml` of its own; note that when you
+build from inside the parent ZeroCAD checkout, the parent repo's
+`.cargo/config.toml` applies and caps concurrent jobs at two.
 
 [rustup]: https://rustup.rs
 
@@ -203,7 +205,7 @@ and composition is `scale = s1·s2`, `matrix = M1·M2`, `loc = s1·(M1·l2) + l1
 ### Honest scope limits
 The higher layers are real but not yet fully general.
 
-- **Whole-solid blends** retain optimized box/cylinder builders at any position/orientation. General Shell additionally supports the published plane/cylinder/cone/sphere matrix and regular torus fillet bands bounded by planes/cylinders; unsupported cone/torus, torus/torus, sphere/torus, concave, or ambiguous networks reject with `BlendError`. The **per-edge** rolling-ball fillet (`fillet_edges`) works on arbitrary planar/analytic edges, including boolean results. Complete equal-radius convex planar corner selections from valence three through six are solved simultaneously with an exact spherical patch and verified across scale/rotation/far-origin sweeps. Exact contact-curve overflow is verified for convex straight all-planar prisms, including one or multiple successive planar faces; curved successors, non-prismatic sources, concave corners, and profile-consuming radii reject explicitly. Partial, higher-valence, mixed-radius, and non-planar corner networks also reject explicitly. General curved-support overflow and concave-offset self-intersection resolution are not yet implemented.
+- **Whole-solid blends** retain optimized box/cylinder builders at any position/orientation. General Shell additionally supports the published plane/cylinder/cone/sphere matrix and regular torus fillet bands bounded by planes/cylinders; unsupported cone/torus, torus/torus, sphere/torus, concave, or ambiguous networks reject with `BlendError`. The **per-edge** rolling-ball fillet (`fillet_edges`) works on arbitrary planar/analytic edges, including boolean results. Complete equal-radius convex planar corner selections from valence three through six are solved simultaneously with an exact spherical patch and verified across scale/rotation/far-origin sweeps. Exact contact-curve overflow is verified for convex straight all-planar prisms, including one or multiple successive planar faces; curved successors, non-prismatic sources, concave corners, and profile-consuming radii reject explicitly. Partial, higher-valence, mixed-radius, and non-planar corner networks also reject explicitly. General curved-support overflow rejects explicitly. Concave offsets are accepted when self-intersection evidence is verified — `certify_concave_shell_with_policy` returns a `ConcaveShellCertificate` with wall-thickness evidence — while branching and NURBS-backed concave cases reject explicitly.
 - **Booleans** are watertight and **health-validated** (`is_healthy()` — contiguous loops, no degenerate edges, manifold) across through-cuts, face-flush and corner-overlap unions, blind pockets, enclosed voids, partial and rotated cuts, and through/blind cylinder cuts and bosses — all locked in by [`robustness.rs`](crates/openrcad-algo/tests/robustness.rs) and the `repro_*` suites (no `#[ignore]`d boolean goal-tests remain). Coplanar adjacent faces are merged back to clean topology (a 2-box union is a 6-face box). The remaining edge case: a cut that *severs* a body is returned as one solid (Euler=4) rather than split into separate bodies — `boolean_bodies` (or `Solid::split_disconnected`) recovers one `Solid` per connected component.
 
 Where a path is not yet implemented the code returns an explicit error rather than silently producing garbage, and modeling results can be self-checked with `Solid::is_watertight()` / `Solid::validate()`.
@@ -226,6 +228,7 @@ Where a path is not yet implemented the code returns an explicit error rather th
 3. **Phase 3: Booleans, Euler Operators & Primitives** — *Status: **Complete***. Euler operators (`MEV`, `MEF`, `KEV`, `KEF`); fuse/cut/common with BVH-pruned classification; box, cylinder, cone, sphere, wedge. Results verified watertight *and* healthy (loop re-threading in `sew`), with coplanar/collinear merge for clean topology and a coplanar circular-hole imprint that closes cylinder boss unions. Partial-imprint cases are resolved; the only open item is splitting a severed cut into separate bodies.
 4. **Phase 4: Tessellation, Sewing & Data Exchange** — *Status: **Complete***. Parallel meshing (`tessellate`) with chord/angular tolerances, topology sewing (`sew`), STEP read/write and STL write. Plus an interactive wgpu viewer (`openrcad-render`).
 5. **Phase 5: Advanced Blending & Offset** — *Status: **In Progress***. `RuledSurface`, `GregorySurface`, `OffsetSurface`, and `ToroidalSurface` landed in `openrcad-geom`. Fillet and chamfer retain their box/cylinder fast paths; Shell also covers verified mixed plane/cylinder/cone/sphere networks and regular torus fillet bands with complete pcurves/history. The per-edge rolling-ball blends (`fillet_edges` / `chamfer_edges`, plus the thin `apply_blend_contour` façade that treats a co-circular run of edges as one logical contour) handle arbitrary planar/analytic edges, including boolean results, and reject an over-large radius rather than emitting a degenerate solid. Equal-radius convex planar corner networks are verified for consecutive valences three through six. Exact contact curves continue across successive planar faces on convex straight all-planar prisms; general curved-support overflow and self-intersection resolution for concave offsets remain.
+6. **Operation contracts & expanded modeling** — *Status: **implemented; hardening continues*** (see [`KERNEL_HARDENING_PLAN.md`](KERNEL_HARDENING_PLAN.md)). The classic wrappers (`boolean`, `boolean_checked`, `fillet`, `chamfer`, `shell_solid`, `prism`, `tessellate`, `read_step`, `sew`) are now `#[deprecated]` in favor of `*_operation` / `*_with_policy` / `*_with_cancel` entry points that return `OperationResult` with typed `Diagnostic`s instead of panicking or discarding metadata; explicit `TolerancePolicy`/`ToleranceContext` plumbing replaced ambient tolerances. This wave also landed solids of revolution (`revolve*`), skin/loft sweeps (`skin*`, `smooth_skin*`, incl. smooth analytic lofts), plane splitting, solid healing, the `SolidExt` fluent façade and `openrcad::prelude`, helix curves, sketch `arrangement`/`offset`, curved–curved rolling-ball support, tangent-edge-chain blends, and 3MF export including assembly models.
 
 Beyond the kernel: `openrcad-sketch` (2D profiles) and `openrcad-document` (parametric history + the `.zcad` document format) provide a Fusion/FreeCAD-style modeling spine on top of the kernel.
 
@@ -233,9 +236,10 @@ Beyond the kernel: `openrcad-sketch` (2D profiles) and `openrcad-document` (para
 
 ## Contributing & license
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build/test/style conventions.
-CI (GitHub Actions) builds and tests the workspace on Ubuntu and Windows on
-every push and PR, with `rustfmt` and `clippy` as gates.
+Build/test/style conventions live in the parent repository's
+[`CONTRIBUTING.md`](../CONTRIBUTING.md). CI (GitHub Actions, defined in the
+parent ZeroCAD repo) builds and tests this workspace on Ubuntu, Windows, and
+macOS on every push and PR, with `rustfmt` and `clippy` as gates.
 
 OpenRCAD is licensed under either of [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE) at your option. Unless you state otherwise, any

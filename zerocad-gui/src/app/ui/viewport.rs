@@ -469,6 +469,47 @@ impl ZeroCadApp {
                         // (so press-drag-release begins the shape); the shape is only
                         // finalized on the next click — never on the drag itself.
                         let begin_draw = response.drag_started_by(egui::PointerButton::Primary);
+                        // Sketch-text placement: while the Text panel is open
+                        // the preview follows the cursor until a click pins it;
+                        // any later click moves it again. Runs before every
+                        // other sketch interaction and, while active, owns the
+                        // pointer (the gates below check `text_dialog`).
+                        if self.is_sketch_mode
+                            && self.text_dialog.is_some()
+                            && !self.camera_anim_active
+                        {
+                            let scale =
+                                rect.width().min(rect.height()) / (self.camera_zoom * 5.0);
+                            if let Some(position) = response
+                                .interact_pointer_pos()
+                                .filter(|_| response.clicked())
+                            {
+                                let raw = self
+                                    .screen_to_sketch(position, rect, &self.active_sketch_cs);
+                                let snapped = self.snap_sketch_point(raw, scale, ctrl);
+                                if let Some(state) = self.text_dialog.as_mut() {
+                                    state.origin = snapped;
+                                    state.pinned = true;
+                                }
+                            } else if let Some(position) = response.hover_pos() {
+                                let follow = self
+                                    .text_dialog
+                                    .as_ref()
+                                    .is_some_and(|state| !state.pinned);
+                                if follow {
+                                    let raw = self.screen_to_sketch(
+                                        position,
+                                        rect,
+                                        &self.active_sketch_cs,
+                                    );
+                                    let snapped = self.snap_sketch_point(raw, scale, ctrl);
+                                    if let Some(state) = self.text_dialog.as_mut() {
+                                        state.origin = snapped;
+                                    }
+                                }
+                            }
+                        }
+
                         if self.is_sketch_mode
                             && self.active_tool == Some(SketchTool::Offset)
                             && response.clicked()
@@ -663,6 +704,7 @@ impl ZeroCadApp {
                         // rebuild happens once, at Finish Sketch.
                         if self.is_sketch_mode
                             && self.active_tool.is_none()
+                            && self.text_dialog.is_none()
                             && self.sketch_solver_model.is_none()
                             && (response.clicked()
                                 || response.drag_started_by(egui::PointerButton::Primary))
@@ -675,6 +717,7 @@ impl ZeroCadApp {
 
                         if self.is_sketch_mode
                             && self.active_tool.is_none()
+                            && self.text_dialog.is_none()
                             && self.sketch_solver_model.is_some()
                             && !self.camera_anim_active
                         {
@@ -725,6 +768,12 @@ impl ZeroCadApp {
                                             .detected_regions
                                             .iter()
                                             .enumerate()
+                                            .filter(|(index, _)| {
+                                                self.sketch_region_ink_mask
+                                                    .get(*index)
+                                                    .copied()
+                                                    .unwrap_or(true)
+                                            })
                                             .filter(|(_, region)| region.contains(local))
                                             .min_by(|(_, first), (_, second)| {
                                                 first
@@ -804,6 +853,12 @@ impl ZeroCadApp {
                                             self.detected_regions
                                                 .iter()
                                                 .enumerate()
+                                                .filter(|(index, _)| {
+                                                    self.sketch_region_ink_mask
+                                                        .get(*index)
+                                                        .copied()
+                                                        .unwrap_or(true)
+                                                })
                                                 .filter(|(_, region)| region.contains(local))
                                                 .min_by(|(_, a), (_, b)| {
                                                     a.area
@@ -1012,8 +1067,9 @@ impl ZeroCadApp {
                                     }
                                     if let FeatureType::Sketch { cs, curves, shapes, corner_mods, mirrors, solver, .. } = &node.feature {
                                         let cs = *cs;
+                                        let stored_curves = curves;
                                         // Pick against the variable-resolved geometry.
-                                        let eff = zerocad_core::effective_curves_solved(curves, shapes, corner_mods, mirrors, solver.as_ref(), &var_map);
+                                        let eff = zerocad_core::effective_curves_solved(stored_curves, shapes, corner_mods, mirrors, solver.as_ref(), &var_map);
                                         let curves = &eff;
                                         let to_scr = |u: f32, v: f32| -> egui::Pos2 {
                                             let w = cs.unproject(u, v);
@@ -1142,7 +1198,32 @@ impl ZeroCadApp {
                                         {
                                             region_curves.extend_curves(b);
                                         }
-                                        for (ri, region) in detect_regions(&region_curves).iter().enumerate() {
+                                        let cached_regions = self
+                                            .cached_finished_regions(
+                                                node.id.as_str(),
+                                                &region_curves,
+                                                shapes.iter().any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
+                                                |regions| zerocad_core::text::sketch_region_ink_mask(
+                                                    stored_curves,
+                                                    shapes,
+                                                    corner_mods,
+                                                    mirrors,
+                                                    solver.as_ref(),
+                                                    &var_map,
+                                                    regions,
+                                                ),
+                                            );
+                                        for (ri, region) in
+                                            cached_regions.regions.iter().enumerate()
+                                        {
+                                            if !cached_regions
+                                                .ink_mask
+                                                .get(ri)
+                                                .copied()
+                                                .unwrap_or(true)
+                                            {
+                                                continue;
+                                            }
                                             let screen = project_loop(&region.boundary);
                                             if screen.len() < 3 {
                                                 continue;

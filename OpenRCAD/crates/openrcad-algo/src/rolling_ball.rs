@@ -490,12 +490,15 @@ fn fillet_planar_overflow_with_policy(
         }
         .into());
     }
-    let candidate =
-        crate::prism::prism_operation_with_policy(&profile, spine_vector, &tolerance.policy)
-            .map_err(|error| FilletOverflowError::RebuildFailed {
-                reason: error.to_string(),
-            })?
-            .value;
+    let candidate = crate::prism::prism_operation_with_policy_unreconciled(
+        &profile,
+        spine_vector,
+        &tolerance.policy,
+    )
+    .map_err(|error| FilletOverflowError::RebuildFailed {
+        reason: error.to_string(),
+    })?
+    .value;
     // The ordinary prism path assumes that a circular profile keeps the circle
     // interior. Overflow clipping keeps the opposite side of its analytic arc,
     // so the requested cylinder's material orientation is the inverse. Its
@@ -8802,8 +8805,16 @@ fn splice_arc_at_wire_corner(
 
     let prev = &edges[prev_idx];
     let next = &edges[next_idx];
-    let da_prev = point_segment_distance(contact_a, prev.source().point(), prev.target().point());
-    let db_prev = point_segment_distance(contact_b, prev.source().point(), prev.target().point());
+    // Pair each contact with the edge whose CARRIER it lies on, not with the
+    // nearer chord. `shorten_edge_keep_curve` keeps the edge's curve, so a
+    // contact anchored to an edge whose carrier it does not lie on produces a
+    // param/vertex-inconsistent arc (stored end vertex off the stored curve —
+    // the pcurve rebinder then rejects the whole blend). Chord distance picked
+    // exactly that wrong pairing once lateral wires could arrive reversed: a
+    // runout contact 0.5 below the rim sits closer to the rim arc's chord than
+    // the rim contact itself does.
+    let da_prev = point_on_edge_score(prev, contact_a);
+    let db_prev = point_on_edge_score(prev, contact_b);
     let (prev_contact, next_contact) = if da_prev <= db_prev {
         (contact_a, contact_b)
     } else {

@@ -68,6 +68,10 @@ impl std::error::Error for ArrangementError {}
 pub struct ArrangementLoop<P> {
     pub spans: Vec<CurveSpan<P>>,
     pub signed_area: f64,
+    /// Tolerance used to merge this loop's incident span endpoints into DCEL
+    /// vertices. Consumers that reconstruct topology from the analytic spans
+    /// must use this value instead of guessing a new, loop-local tolerance.
+    pub junction_tolerance: f64,
 }
 
 impl<P> ArrangementLoop<P> {
@@ -240,6 +244,7 @@ pub fn arrange_curve_spans<P: Clone>(
             loops.push(ArrangementLoop {
                 spans: cycle_spans,
                 signed_area,
+                junction_tolerance: options.tolerance,
             });
         }
     }
@@ -359,7 +364,47 @@ fn span_intersections<A, B>(
         (GeomCurve2d::BSpline(_), _) | (_, GeomCurve2d::BSpline(_)) => return Err(()),
         _ => return Err(()),
     };
-    Ok(deduplicate_intersections(raw, options.tolerance))
+    let snapped = raw
+        .into_iter()
+        .map(|intersection| {
+            snap_intersection_to_shared_endpoint(first, second, intersection, options.tolerance)
+        })
+        .collect();
+    Ok(deduplicate_intersections(snapped, options.tolerance))
+}
+
+/// Collapse a numerically isolated near-root onto an endpoint the two source
+/// spans already share. Root isolation deliberately accepts residuals within
+/// the model tolerance; immediately beside an exact endpoint this can report a
+/// second, slightly interior "intersection" on the next subdivision sample.
+/// Splitting both curves there creates a microscopic there-and-back face and a
+/// non-manifold prism edge. Two hits within two tolerance envelopes of the same
+/// shared endpoint are topologically indistinguishable, so retain the exact
+/// endpoint and let normal intersection de-duplication remove the duplicate.
+fn snap_intersection_to_shared_endpoint<A, B>(
+    first: &CurveSpan<A>,
+    second: &CurveSpan<B>,
+    mut intersection: Intersection,
+    tolerance: f64,
+) -> Intersection {
+    let first_hit = first.curve.point(intersection.first);
+    let second_hit = second.curve.point(intersection.second);
+    let snap_limit = tolerance * 2.0;
+    for first_parameter in [first.first, first.last] {
+        let first_endpoint = first.curve.point(first_parameter);
+        for second_parameter in [second.first, second.last] {
+            let second_endpoint = second.curve.point(second_parameter);
+            if first_endpoint.distance(&second_endpoint) <= tolerance
+                && first_hit.distance(&first_endpoint) <= snap_limit
+                && second_hit.distance(&second_endpoint) <= snap_limit
+            {
+                intersection.first = first_parameter;
+                intersection.second = second_parameter;
+                return intersection;
+            }
+        }
+    }
+    intersection
 }
 
 fn spans_are_coincident<A, B>(
@@ -1836,6 +1881,36 @@ mod tests {
             .regions
             .iter()
             .all(|region| region.area > 0.0 && region.holes.is_empty()));
+    }
+
+    #[test]
+    fn near_root_next_to_shared_glyph_endpoint_collapses_to_that_endpoint() {
+        // Reduced from the reflected Arial `r`: the vertical stem ends exactly
+        // where this quadratic shoulder begins. The root isolator also accepts
+        // a sample ~3e-5 into the curve because it remains within the linear
+        // tolerance of the stem. That is one fuzzy representation of the same
+        // endpoint, not a second crossing and not a microscopic face.
+        let stem = line(1, (0.0, -0.786_132_812_5), (0.0, 0.0));
+        let shoulder = bezier(
+            2,
+            [
+                (0.0, 0.0),
+                (0.302_734_375, -0.551_757_812_5),
+                (0.559_082_031_25, -0.727_539_062_5),
+            ],
+        );
+        let options = ArrangementOptions {
+            tolerance: 2.861_022_949_218_75e-5,
+            root_subdivisions: 256,
+        };
+        let result = intersect_curve_spans(&stem, &shoulder, options).expect("supported pair");
+        assert_eq!(
+            result.points.len(),
+            1,
+            "one shared endpoint must not become a zero-area sliver"
+        );
+        assert!((result.points[0].first_parameter - stem.last).abs() < 1.0e-12);
+        assert!((result.points[0].second_parameter - shoulder.first).abs() < 1.0e-12);
     }
 
     #[test]

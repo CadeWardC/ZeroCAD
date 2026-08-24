@@ -40,14 +40,16 @@ cargo fmt --all
 cargo clippy --workspace
 ```
 
-CI treats `cargo fmt --all -- --check` as a required gate. Clippy remains
-advisory because there are still useful but non-blocking suggestions in the
-geometry-heavy code. Don't reformat unrelated code in a feature PR — keep diffs
+CI treats `cargo fmt --all -- --check` and clippy as required gates (the
+"Clippy (release gate)" job runs clippy on `zerocad-core` and the OpenRCAD
+workspace; legacy lints are annotated deliberately in source rather than
+ignored). Don't reformat unrelated code in a feature PR — keep diffs
 focused.
 
-The hard CI gates are **format + build + test** (Windows full workspace, Linux
-core). A change that doesn't compile, breaks a test, or fails rustfmt will be
-flagged.
+The hard CI gates are **format + build + test + clippy**: the full workspace on
+Windows, the core engine on Linux and macOS, promoted boolean-regression
+replays, and the OpenRCAD workspace on all three OSes. A change that doesn't
+compile, breaks a test, fails rustfmt, or trips clippy will be flagged.
 
 ## Adding a feature
 

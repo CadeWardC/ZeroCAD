@@ -8,9 +8,9 @@
 //!
 //! Glyph outlines are quadratic (TrueType) or cubic (CFF/OpenType) Béziers. A
 //! Bézier is exactly a clamped B-spline with no interior knots, so each segment
-//! becomes a degree-2 or degree-3 [`Spline`] with an empty knot vector;
-//! `detect_regions_analytic` then fills in clamped-uniform knots, which for
-//! these pole counts reproduce the Bézier exactly. Nothing here is sampled or
+//! becomes a degree-2 or degree-3 [`Spline`] carrying explicit clamped Bézier
+//! knots (identical to what the analytic converter would derive), so every
+//! evaluator takes the stored-knots fast path. Nothing here is sampled or
 //! approximated — the outlines reach the B-Rep as real `GeomCurve::BSpline`
 //! edges (locked in by `analytic_open_spline_chain_reaches_brep_as_bspline_edges`).
 //!
@@ -233,18 +233,55 @@ pub fn outline_text(
 /// Where a text block sits on its sketch plane. Rotation is about the block's
 /// own origin — the start of the first baseline — and applies before the
 /// translation, so moving and spinning a label are independent edits.
-#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TextPlacement {
     pub origin: (f32, f32),
     pub rotation_deg: f32,
+    /// Sketch-plane (u, v) direction that reads as RIGHT on screen while the
+    /// sketch camera is locked to the plane. Identity for right-handed planes
+    /// viewed from +n; the XZ ground plane and YZ plane are not — baking
+    /// against the measured screen basis is what keeps letters upright and
+    /// forward-reading there. Text was the first chirality-sensitive geometry
+    /// these sketches ever carried, which is why nothing caught this earlier.
+    #[serde(default = "default_basis_u")]
+    pub basis_u: (f32, f32),
+    /// Sketch-plane (u, v) direction that reads as UP on screen.
+    #[serde(default = "default_basis_v")]
+    pub basis_v: (f32, f32),
+}
+
+fn default_basis_u() -> (f32, f32) {
+    (1.0, 0.0)
+}
+
+fn default_basis_v() -> (f32, f32) {
+    (0.0, 1.0)
+}
+
+impl Default for TextPlacement {
+    fn default() -> Self {
+        Self {
+            origin: (0.0, 0.0),
+            rotation_deg: 0.0,
+            basis_u: default_basis_u(),
+            basis_v: default_basis_v(),
+        }
+    }
 }
 
 impl TextPlacement {
+    /// Public form of the placement map, for callers that pre-sampled display
+    /// polylines in text-local space and only need the rigid re-place per frame.
+    pub fn transform_point(&self, point: (f32, f32)) -> (f32, f32) {
+        self.apply(point)
+    }
+
     fn apply(self, point: (f32, f32)) -> (f32, f32) {
         let (sin, cos) = self.rotation_deg.to_radians().sin_cos();
+        let rotated = (point.0 * cos - point.1 * sin, point.0 * sin + point.1 * cos);
         (
-            self.origin.0 + point.0 * cos - point.1 * sin,
-            self.origin.1 + point.0 * sin + point.1 * cos,
+            self.origin.0 + rotated.0 * self.basis_u.0 + rotated.1 * self.basis_v.0,
+            self.origin.1 + rotated.0 * self.basis_u.1 + rotated.1 * self.basis_v.1,
         )
     }
 }
@@ -266,14 +303,172 @@ pub fn place_curves(curves: &SketchCurves, placement: TextPlacement) -> SketchCu
     placed
 }
 
-/// Shape `text`, place it, and return only the regions that should be inked.
+/// Bake a complete [`SketchShape::Text`] record: shape the string, place the
+/// outlines, and capture the font identity. This is the ONLY constructor the
+/// GUI should use — it guarantees the semantic fields and the baked curves
+/// were produced together, from the same font bytes.
+pub fn bake_text_shape(
+    font: &[u8],
+    face_index: u32,
+    text: &str,
+    params: &TextParams,
+    placement: TextPlacement,
+) -> Result<crate::sketch::SketchShape, TextError> {
+    let curves = place_curves(&outline_text(font, face_index, text, params)?, placement);
+    Ok(crate::sketch::SketchShape::Text {
+        text: text.to_owned(),
+        font: fingerprint(font, face_index)?,
+        params: params.clone(),
+        placement,
+        curves,
+    })
+}
+
+/// Return the non-zero-winding fill of already-baked text outlines.
 ///
-/// [`outline_text`] followed by `detect_regions_analytic` yields every bounded
-/// face of the planar subdivision, which for a glyph with a counter includes
-/// the counter's interior as a filled region in its own right. A counter is
-/// already represented as a hole of its enclosing region, so a face that
-/// duplicates some other region's hole is dropped. Everything else — the two
-/// disjoint contours of an `i`, the separate letters of a word — is kept.
+/// OpenType contours may overlap, so matching a bounded face to another
+/// region's hole by area and bounds is not a valid fill rule. Classifying an
+/// interior point of every arrangement tile against the original directed
+/// contours implements the font format's non-zero rule. Adjacent ink tiles are
+/// merged again before extrusion so an overlapping glyph does not create
+/// internal coplanar walls.
+pub fn text_ink_regions(curves: &SketchCurves) -> Result<Vec<crate::sketch::Region>, TextError> {
+    let regions = crate::sketch::detect_regions_analytic(curves)
+        .map_err(|error| TextError::FaceParse(error.to_string()))?;
+    let process = text_ink_mask(curves, &regions);
+    Ok(
+        crate::parametric::prepare_extrude_regions(&regions, &process)
+            .into_iter()
+            .map(|prepared| prepared.region)
+            .collect(),
+    )
+}
+
+/// One non-zero-winding decision per arrangement region. Kept separate from
+/// [`text_ink_regions`] so the normal Sketch → Extrude path can retain stable
+/// arrangement indices while excluding counters from fill, picking and model
+/// evaluation.
+pub(crate) fn text_ink_mask(curves: &SketchCurves, regions: &[crate::sketch::Region]) -> Vec<bool> {
+    regions
+        .iter()
+        .map(|region| {
+            region.area > 0.0
+                && directed_contour_winding(
+                    curves,
+                    crate::parametric::region_material_point(region),
+                ) != 0
+        })
+        .collect()
+}
+
+/// Apply typographic fill semantics to the regions of an ordinary sketch.
+///
+/// Non-text shapes keep their existing sketch/boolean behavior. Text shapes
+/// contribute material only where their original directed outlines have
+/// non-zero winding, so counter faces stay visible as holes and cannot be
+/// picked or extruded as standalone solids. The split is rebuilt from semantic
+/// shape records instead of serialized mask data, keeping the `.zcad` schema
+/// unchanged.
+pub fn sketch_region_ink_mask(
+    curves: &SketchCurves,
+    shapes: &[crate::sketch::SketchShape],
+    corner_mods: &[crate::sketch::CornerMod],
+    mirrors: &[crate::sketch::SketchMirror],
+    solver: Option<&crate::sketch::SketchSolverModel>,
+    vars: &std::collections::HashMap<String, f64>,
+    regions: &[crate::sketch::Region],
+) -> Vec<bool> {
+    let text_shapes: Vec<_> = shapes
+        .iter()
+        .filter(|shape| matches!(shape, crate::sketch::SketchShape::Text { .. }))
+        .cloned()
+        .collect();
+    if text_shapes.is_empty() {
+        return vec![true; regions.len()];
+    }
+
+    // The solver treats text as one rigid anchor and appends these baked
+    // outlines unchanged. Rebuilding only the text subset with the sketch's
+    // associative mirrors therefore reproduces the text part of `effective`.
+    let text_curves = crate::sketch::effective_curves_solved(
+        &SketchCurves::new(),
+        &text_shapes,
+        &[],
+        mirrors,
+        None,
+        vars,
+    );
+
+    let non_text_shapes: Vec<_> = shapes
+        .iter()
+        .filter(|shape| !matches!(shape, crate::sketch::SketchShape::Text { .. }))
+        .cloned()
+        .collect();
+    // Stored low-level `curves` are authoritative only for legacy sketches
+    // without semantic shapes. A text-bearing sketch necessarily has shapes,
+    // so feeding the stored bake here would count its counters as non-text
+    // material and undo the winding rule.
+    let non_text_base = if shapes.is_empty() {
+        curves.clone()
+    } else {
+        SketchCurves::new()
+    };
+    let non_text_curves = crate::sketch::effective_curves_solved(
+        &non_text_base,
+        &non_text_shapes,
+        corner_mods,
+        mirrors,
+        solver,
+        vars,
+    );
+    let non_text_regions = if non_text_curves.is_empty() {
+        Vec::new()
+    } else {
+        crate::sketch::detect_regions(&non_text_curves)
+    };
+
+    regions
+        .iter()
+        .map(|region| {
+            let point = crate::parametric::region_material_point(region);
+            directed_contour_winding(&text_curves, point) != 0
+                || non_text_regions
+                    .iter()
+                    .any(|non_text| non_text.contains(point))
+        })
+        .collect()
+}
+
+fn directed_contour_winding(curves: &SketchCurves, point: (f32, f32)) -> i32 {
+    fn contribution(a: (f32, f32), b: (f32, f32), point: (f32, f32)) -> i32 {
+        let side = (b.0 - a.0) * (point.1 - a.1) - (point.0 - a.0) * (b.1 - a.1);
+        if a.1 <= point.1 {
+            i32::from(b.1 > point.1 && side > 0.0)
+        } else {
+            -i32::from(b.1 <= point.1 && side < 0.0)
+        }
+    }
+
+    let segment_winding: i32 = curves
+        .segments
+        .iter()
+        .map(|segment| contribution(segment.a, segment.b, point))
+        .sum();
+    let spline_winding: i32 = curves
+        .splines
+        .iter()
+        .map(|spline| {
+            spline
+                .sampled_points(0.01)
+                .windows(2)
+                .map(|pair| contribution(pair[0], pair[1], point))
+                .sum::<i32>()
+        })
+        .sum();
+    segment_winding + spline_winding
+}
+
+/// Shape `text`, place it, and return only the regions that should be inked.
 pub fn text_regions(
     font: &[u8],
     face_index: u32,
@@ -282,29 +477,7 @@ pub fn text_regions(
     placement: TextPlacement,
 ) -> Result<Vec<crate::sketch::Region>, TextError> {
     let curves = place_curves(&outline_text(font, face_index, text, params)?, placement);
-    let regions = crate::sketch::detect_regions_analytic(&curves)
-        .map_err(|error| TextError::FaceParse(error.to_string()))?;
-
-    let holes: Vec<(f32, Bounds)> = regions
-        .iter()
-        .flat_map(|region| region.holes.iter())
-        .map(|hole| (polygon_area(hole), Bounds::of(hole)))
-        .collect();
-
-    Ok(regions
-        .into_iter()
-        .filter(|region| {
-            region.area > 0.0
-                && !holes.iter().any(|(hole_area, hole_bounds)| {
-                    // The counter's own face and the hole recording it come
-                    // from the same arrangement loop, so they agree on both
-                    // area and extent; requiring both avoids discarding a
-                    // genuinely separate contour that merely has a similar area.
-                    areas_match(region.area, *hole_area)
-                        && Bounds::of(&region.boundary).matches(*hole_bounds)
-                })
-        })
-        .collect())
+    text_ink_regions(&curves)
 }
 
 /// Raised text adds material; engraved text removes it.
@@ -421,61 +594,6 @@ pub fn emboss_text(
     Ok(result)
 }
 
-#[derive(Clone, Copy)]
-struct Bounds {
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
-}
-
-impl Bounds {
-    fn of(points: &[(f32, f32)]) -> Self {
-        let mut bounds = Self {
-            min_x: f32::MAX,
-            min_y: f32::MAX,
-            max_x: f32::MIN,
-            max_y: f32::MIN,
-        };
-        for (x, y) in points {
-            bounds.min_x = bounds.min_x.min(*x);
-            bounds.min_y = bounds.min_y.min(*y);
-            bounds.max_x = bounds.max_x.max(*x);
-            bounds.max_y = bounds.max_y.max(*y);
-        }
-        bounds
-    }
-
-    fn matches(self, other: Self) -> bool {
-        let span = (self.max_x - self.min_x)
-            .abs()
-            .max((self.max_y - self.min_y).abs())
-            .max(1.0);
-        let limit = span * 1.0e-3;
-        (self.min_x - other.min_x).abs() <= limit
-            && (self.min_y - other.min_y).abs() <= limit
-            && (self.max_x - other.max_x).abs() <= limit
-            && (self.max_y - other.max_y).abs() <= limit
-    }
-}
-
-fn polygon_area(points: &[(f32, f32)]) -> f32 {
-    if points.len() < 3 {
-        return 0.0;
-    }
-    let mut twice_area = 0.0_f64;
-    for index in 0..points.len() {
-        let (x0, y0) = points[index];
-        let (x1, y1) = points[(index + 1) % points.len()];
-        twice_area += f64::from(x0) * f64::from(y1) - f64::from(x1) * f64::from(y0);
-    }
-    (twice_area.abs() * 0.5) as f32
-}
-
-fn areas_match(left: f32, right: f32) -> bool {
-    (left - right).abs() <= left.abs().max(right.abs()).max(1.0) * 1.0e-3
-}
-
 struct PlacedGlyph {
     glyph: u16,
     x: f64,
@@ -533,13 +651,19 @@ impl GlyphOutliner<'_> {
             self.current = end;
             return;
         }
+        let order = usize::from(degree) + 1;
+        let mut knots = vec![0.0; order];
+        knots.extend(std::iter::repeat_n(1.0, order));
         self.curves.add_spline(Spline {
             kind: SplineKind::ControlPoint,
             points: poles,
             degree,
-            // Empty knots make the analytic converter derive clamped-uniform
-            // knots, which for these pole counts are exactly Bézier knots.
-            knots: Vec::new(),
+            // Explicit clamped Bézier knots ([0×order, 1×order] — exactly what
+            // the analytic converter would derive from empty knots). Stored so
+            // every downstream evaluation takes the stored-knots fast path
+            // instead of rebuilding a clamped-uniform vector per sample, which
+            // dominated per-frame stroke drawing for text-heavy sketches.
+            knots,
             weights: Vec::new(),
             closed: false,
             periodic: false,
@@ -659,6 +783,45 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_winding_unions_overlapping_contours_without_internal_walls() {
+        let mut curves = SketchCurves::new();
+        curves.add_rectangle((0.0, 0.0), (2.0, 2.0));
+        curves.add_rectangle((1.0, 0.0), (3.0, 2.0));
+
+        let regions = text_ink_regions(&curves).expect("overlapping text contours");
+        assert_eq!(
+            regions.len(),
+            1,
+            "same-direction overlapping contours are one ink body"
+        );
+        assert!(regions[0].holes.is_empty());
+        assert!(
+            (regions[0].area - 6.0).abs() < 1.0e-3,
+            "the merged ink area must be the contour union, got {}",
+            regions[0].area
+        );
+    }
+
+    #[test]
+    fn nonzero_winding_keeps_opposite_contour_as_a_counter() {
+        let mut curves = SketchCurves::new();
+        curves.add_rectangle((0.0, 0.0), (4.0, 4.0));
+        for (a, b) in [
+            ((1.0, 1.0), (1.0, 3.0)),
+            ((1.0, 3.0), (3.0, 3.0)),
+            ((3.0, 3.0), (3.0, 1.0)),
+            ((3.0, 1.0), (1.0, 1.0)),
+        ] {
+            curves.add_line(a, b);
+        }
+
+        let regions = text_ink_regions(&curves).expect("counter contours");
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].holes.len(), 1);
+        assert!((regions[0].area - 12.0).abs() < 1.0e-3);
+    }
+
+    #[test]
     fn glyph_outlines_become_bezier_splines_not_polylines() {
         let curves = outline_text(HACK, 0, "S", &TextParams::default()).expect("outline S");
         assert!(
@@ -668,9 +831,12 @@ mod tests {
         for spline in &curves.splines {
             assert_eq!(spline.kind, SplineKind::ControlPoint);
             assert!(!spline.closed && !spline.periodic);
-            // Exactly Bézier: degree + 1 poles, no interior knots.
-            assert_eq!(spline.points.len(), usize::from(spline.degree) + 1);
-            assert!(spline.knots.is_empty());
+            // Exactly Bézier: degree + 1 poles, clamped end knots only.
+            let order = usize::from(spline.degree) + 1;
+            assert_eq!(spline.points.len(), order);
+            assert_eq!(spline.knots.len(), 2 * order);
+            assert!(spline.knots[..order].iter().all(|k| *k == 0.0));
+            assert!(spline.knots[order..].iter().all(|k| *k == 1.0));
         }
     }
 
@@ -775,6 +941,580 @@ mod tests {
                 .any(|edge| matches!(edge.curve(), Some(openrcad::geom::GeomCurve::BSpline(_)))),
             "embossed text must keep analytic B-spline walls"
         );
+    }
+
+    #[test]
+    fn ordinary_sketch_extrude_volume_matches_typographic_ink() {
+        let shape = bake_text_shape(
+            HACK,
+            0,
+            "O",
+            &TextParams::default(),
+            TextPlacement::default(),
+        )
+        .expect("baked O");
+        let baked_curves = shape.build(&std::collections::HashMap::new());
+        let ink_area: f64 = text_ink_regions(&baked_curves)
+            .expect("ink regions")
+            .iter()
+            .map(|region| f64::from(region.area))
+            .sum();
+        let depth = 3.0_f32;
+
+        let mut graph = crate::parametric::ParametricGraph::new();
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_sketch".into(),
+            name: "Text Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY,
+                curves: SketchCurves::new(),
+                shapes: vec![shape],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: false,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_extrude".into(),
+            name: "Text Extrude".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::NewBody,
+                target: None,
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("text_sketch", "text_extrude");
+
+        let bodies = graph
+            .debug_kernel_solids(&std::collections::HashSet::new())
+            .expect("ordinary text extrude");
+        let actual: f64 = bodies
+            .iter()
+            .flat_map(|(_, parts)| parts)
+            .filter_map(crate::parametric::solid_volume)
+            .sum();
+        let expected = ink_area * f64::from(depth);
+        assert!(
+            (actual - expected).abs() <= expected * 0.01,
+            "Sketch → Extrude must sweep ink area only: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn ordinary_sketch_plate_around_text_is_exact_and_preserves_counters() {
+        let text_shape = bake_text_shape(
+            HACK,
+            0,
+            "Ember",
+            &TextParams::default(),
+            TextPlacement {
+                origin: (-8.4, 2.6),
+                ..TextPlacement::default()
+            },
+        )
+        .expect("baked Ember");
+        let text_curves = text_shape.build(&std::collections::HashMap::new());
+        let rectangle = crate::sketch::SketchShape::Rectangle {
+            origin: (-10.0, -2.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: crate::sketch::Dimension::literal(38.2),
+            h: crate::sketch::Dimension::literal(14.0),
+            from_center: false,
+        };
+        let shapes = vec![rectangle, text_shape];
+        assert_eq!(
+            crate::sketch::shape_loops(&shapes, &std::collections::HashMap::new()).len(),
+            1,
+            "compound text contours must not become a partial shape-boolean loop"
+        );
+        let curves = crate::sketch::build_sketch_curves(&shapes, &std::collections::HashMap::new());
+        let regions = crate::sketch::detect_regions_analytic(&curves).expect("plate regions");
+        let text_ink = text_ink_mask(&text_curves, &regions);
+        let selected: Vec<usize> = text_ink
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ink)| (!ink).then_some(index))
+            .collect();
+        assert_eq!(
+            selected.len(),
+            3,
+            "plate material is the exterior plus the b/e counter islands"
+        );
+        let selected_count = selected.len();
+        let expected_area: f64 = selected
+            .iter()
+            .map(|index| f64::from(regions[*index].area))
+            .sum();
+        assert!(
+            regions[selected[0]].sampled_edge_count() > crate::mock_kernel::MAX_SAMPLED_PRISM_EDGES,
+            "fixture must remain too dense for the synchronous sampled path"
+        );
+
+        let depth = 3.0_f32;
+        let mut graph = crate::parametric::ParametricGraph::new();
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate_sketch".into(),
+            name: "Plate Around Text".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY,
+                curves: SketchCurves::new(),
+                shapes,
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: false,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate_extrude".into(),
+            name: "Plate Extrude".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth,
+                region_indices: selected.clone(),
+                mode: crate::parametric::ExtrudeMode::NewBody,
+                target: None,
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("plate_sketch", "plate_extrude");
+
+        let bodies = graph
+            .debug_kernel_solids(&std::collections::HashSet::new())
+            .expect("plate around text extrude");
+        assert_eq!(
+            bodies.len(),
+            selected_count,
+            "the surrounding plate and its two counter islands are three disconnected bodies"
+        );
+        let mut actual_volumes: Vec<f64> = bodies
+            .iter()
+            .flat_map(|(_, parts)| parts)
+            .filter_map(crate::parametric::solid_volume)
+            .collect();
+        let mut expected_volumes: Vec<f64> = selected
+            .iter()
+            .map(|index| f64::from(regions[*index].area) * f64::from(depth))
+            .collect();
+        actual_volumes.sort_by(f64::total_cmp);
+        expected_volumes.sort_by(f64::total_cmp);
+        assert_eq!(actual_volumes.len(), expected_volumes.len());
+        for (actual, expected) in actual_volumes.iter().zip(&expected_volumes) {
+            assert!(
+                (actual - expected).abs() <= expected * 0.01,
+                "each disconnected text/counter prism must preserve area: expected {expected}, got {actual}"
+            );
+        }
+        let actual: f64 = actual_volumes.iter().sum();
+        let expected = expected_area * f64::from(depth);
+        assert!(
+            (actual - expected).abs() <= expected * 0.01,
+            "rectangle minus text must preserve its holes and counters: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn text_through_cut_rebuilds_the_plate_once_and_preserves_counters() {
+        let placement = TextPlacement {
+            origin: (-8.4, 2.6),
+            ..TextPlacement::default()
+        };
+        let text_shape = bake_text_shape(HACK, 0, "Ember", &TextParams::default(), placement)
+            .expect("baked Ember");
+        let text_curves = text_shape.build(&std::collections::HashMap::new());
+        let ink_regions = text_ink_regions(&text_curves).expect("text ink");
+        assert!(
+            ink_regions.iter().any(|region| !region.holes.is_empty()),
+            "the fixture must contain letter counters"
+        );
+        assert!(
+            ink_regions.iter().any(|region| {
+                region
+                    .analytic
+                    .as_ref()
+                    .is_some_and(|analytic| !analytic.holes.is_empty())
+            }),
+            "the analytic fixture must carry letter counters"
+        );
+        let arranged =
+            crate::sketch::detect_regions_analytic(&text_curves).expect("text arrangement");
+        let arranged_ink = text_ink_mask(&text_curves, &arranged);
+        assert!(
+            arranged
+                .iter()
+                .zip(arranged_ink)
+                .any(|(region, ink)| ink && !region.holes.is_empty()),
+            "selected arrangement ink must carry letter counters"
+        );
+        let ink_area: f64 = ink_regions
+            .iter()
+            .map(|region| f64::from(region.area))
+            .sum();
+        let plate_width = 38.2_f32;
+        let plate_height = 14.0_f32;
+        let depth = 2.0_f32;
+        let rectangle = crate::sketch::SketchShape::Rectangle {
+            origin: (-10.0, -2.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: crate::sketch::Dimension::literal(plate_width),
+            h: crate::sketch::Dimension::literal(plate_height),
+            from_center: false,
+        };
+
+        let mut graph = crate::parametric::ParametricGraph::new();
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate_sketch".into(),
+            name: "Plate Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY,
+                curves: SketchCurves::new(),
+                shapes: vec![rectangle],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: false,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate".into(),
+            name: "Plate".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::NewBody,
+                target: None,
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("plate_sketch", "plate");
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_sketch".into(),
+            name: "Text Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY
+                    .with_origin(crate::geometry::Vec3::new(0.0, 0.0, depth)),
+                curves: SketchCurves::new(),
+                shapes: vec![text_shape],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: true,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_dependency("plate", "text_sketch");
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_cut".into(),
+            name: "Text Cut".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth: -depth,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::Cut,
+                target: Some("plate".into()),
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("text_sketch", "text_cut");
+        graph.add_dependency("plate", "text_cut");
+
+        let bodies = graph
+            .debug_kernel_solids(&std::collections::HashSet::new())
+            .expect("text through-cut");
+        assert_eq!(bodies.len(), 1, "the engraved plate remains one body");
+        let actual: f64 = bodies[0]
+            .1
+            .iter()
+            .filter_map(crate::parametric::solid_volume)
+            .sum();
+        let expected =
+            f64::from((plate_width * plate_height) * depth) - ink_area * f64::from(depth);
+        assert!(
+            (actual - expected).abs() <= expected * 0.01,
+            "text through-cut must remove ink area once: expected {expected}, got {actual} in {} parts",
+            bodies[0].1.len()
+        );
+        assert!(
+            bodies[0].1.len() > 1,
+            "the b/e counters must remain as disconnected material islands"
+        );
+        let (_, warnings) = graph
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .expect("cached text through-cut display");
+        assert!(warnings.is_empty(), "exact text through-cut: {warnings:?}");
+    }
+
+    #[test]
+    fn text_blind_cut_rebuilds_one_valid_pocket_without_boolean_retries() {
+        let placement = TextPlacement {
+            origin: (-8.4, 2.6),
+            ..TextPlacement::default()
+        };
+        let text_shape = bake_text_shape(HACK, 0, "Cade", &TextParams::default(), placement)
+            .expect("baked Cade");
+        let text_curves = text_shape.build(&std::collections::HashMap::new());
+        let ink_regions = text_ink_regions(&text_curves).expect("text ink");
+        assert_eq!(
+            ink_regions.len(),
+            4,
+            "the fixture must exercise four glyph tools"
+        );
+        assert!(
+            ink_regions.iter().any(|region| !region.holes.is_empty()),
+            "the fixture must preserve letter counters"
+        );
+        let ink_area: f64 = ink_regions
+            .iter()
+            .map(|region| f64::from(region.area))
+            .sum();
+        let plate_width = 38.2_f32;
+        let plate_height = 14.0_f32;
+        let plate_depth = 2.0_f32;
+        let pocket_depth = 0.8_f32;
+        let rectangle = crate::sketch::SketchShape::Rectangle {
+            origin: (-10.0, -2.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: crate::sketch::Dimension::literal(plate_width),
+            h: crate::sketch::Dimension::literal(plate_height),
+            from_center: false,
+        };
+
+        let mut graph = crate::parametric::ParametricGraph::new();
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate_sketch".into(),
+            name: "Plate Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY,
+                curves: SketchCurves::new(),
+                shapes: vec![rectangle],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: false,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate".into(),
+            name: "Plate".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth: plate_depth,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::NewBody,
+                target: None,
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("plate_sketch", "plate");
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_sketch".into(),
+            name: "Text Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY.with_origin(crate::geometry::Vec3::new(
+                    0.0,
+                    0.0,
+                    plate_depth,
+                )),
+                curves: SketchCurves::new(),
+                shapes: vec![text_shape],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: true,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_dependency("plate", "text_sketch");
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_cut".into(),
+            name: "Text Cut".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth: -pocket_depth,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::Cut,
+                target: Some("plate".into()),
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("text_sketch", "text_cut");
+        graph.add_dependency("plate", "text_cut");
+
+        let bodies = graph
+            .debug_kernel_solids(&std::collections::HashSet::new())
+            .expect("text blind cut");
+        assert_eq!(bodies.len(), 1, "the pocketed plate remains one body");
+        assert_eq!(bodies[0].1.len(), 1, "a blind pocket remains connected");
+        let pocketed = &bodies[0].1[0];
+        assert!(pocketed.is_watertight());
+        assert!(pocketed.health_report().is_healthy());
+        assert!(pocketed.validate().is_ok());
+        let actual = crate::parametric::solid_volume(pocketed).expect("pocket volume");
+        let removed_depth = pocket_depth + crate::parametric::CUT_OVERSHOOT;
+        let expected = f64::from(plate_width * plate_height * plate_depth)
+            - ink_area * f64::from(removed_depth);
+        assert!(
+            (actual - expected).abs() <= expected * 0.01,
+            "blind text cut must remove ink area once: expected {expected}, got {actual}"
+        );
+        let (_, warnings) = graph
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .expect("cached text blind-cut display");
+        assert!(warnings.is_empty(), "exact text blind cut: {warnings:?}");
+    }
+
+    #[test]
+    fn text_join_rebuilds_one_valid_raised_word_without_boolean_retries() {
+        let placement = TextPlacement {
+            origin: (-8.4, 2.6),
+            ..TextPlacement::default()
+        };
+        let text_shape = bake_text_shape(HACK, 0, "Cade", &TextParams::default(), placement)
+            .expect("baked Cade");
+        let text_curves = text_shape.build(&std::collections::HashMap::new());
+        let ink_regions = text_ink_regions(&text_curves).expect("text ink");
+        assert_eq!(
+            ink_regions.len(),
+            4,
+            "the fixture must exercise four glyph tools"
+        );
+        assert!(
+            ink_regions.iter().any(|region| !region.holes.is_empty()),
+            "the fixture must preserve letter counters"
+        );
+        let ink_area: f64 = ink_regions
+            .iter()
+            .map(|region| f64::from(region.area))
+            .sum();
+        let plate_width = 38.2_f32;
+        let plate_height = 14.0_f32;
+        let plate_depth = 2.0_f32;
+        let raised_height = 0.8_f32;
+        let rectangle = crate::sketch::SketchShape::Rectangle {
+            origin: (-10.0, -2.0),
+            sx: 1.0,
+            sy: 1.0,
+            w: crate::sketch::Dimension::literal(plate_width),
+            h: crate::sketch::Dimension::literal(plate_height),
+            from_center: false,
+        };
+
+        let mut graph = crate::parametric::ParametricGraph::new();
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate_sketch".into(),
+            name: "Plate Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY,
+                curves: SketchCurves::new(),
+                shapes: vec![rectangle],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: false,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "plate".into(),
+            name: "Plate".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth: plate_depth,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::NewBody,
+                target: None,
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("plate_sketch", "plate");
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_sketch".into(),
+            name: "Text Sketch".into(),
+            feature: crate::parametric::FeatureType::Sketch {
+                cs: crate::geometry::CoordinateSystem::XY.with_origin(crate::geometry::Vec3::new(
+                    0.0,
+                    0.0,
+                    plate_depth,
+                )),
+                curves: SketchCurves::new(),
+                shapes: vec![text_shape],
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: true,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        graph.add_dependency("plate", "text_sketch");
+        graph.add_feature(crate::parametric::FeatureNode {
+            id: "text_join".into(),
+            name: "Text Join".into(),
+            feature: crate::parametric::FeatureType::Extrude {
+                depth: raised_height,
+                region_indices: Vec::new(),
+                mode: crate::parametric::ExtrudeMode::Join,
+                target: Some("plate".into()),
+                depth_expr: None,
+                draft_angle_deg: 0.0,
+                draft_angle_expr: None,
+            },
+        });
+        graph.add_dependency("text_sketch", "text_join");
+        graph.add_dependency("plate", "text_join");
+
+        let bodies = graph
+            .debug_kernel_solids(&std::collections::HashSet::new())
+            .expect("raised text join");
+        assert_eq!(bodies.len(), 1, "the raised plate remains one body");
+        assert_eq!(bodies[0].1.len(), 1, "raised text is fused material");
+        let raised = &bodies[0].1[0];
+        assert!(raised.is_watertight());
+        assert!(raised.health_report().is_healthy());
+        assert!(raised.validate().is_ok());
+        assert!(
+            raised
+                .validate_strict_with_policy(&openrcad::foundation::TolerancePolicy::STANDARD)
+                .is_ok(),
+            "raised text must pass strict topology validation"
+        );
+        let actual = crate::parametric::solid_volume(raised).expect("raised volume");
+        let expected = f64::from(plate_width * plate_height * plate_depth)
+            + ink_area * f64::from(raised_height);
+        assert!(
+            (actual - expected).abs() <= expected * 0.01,
+            "raised text must add ink area once: expected {expected}, got {actual}"
+        );
+        let (_, warnings) = graph
+            .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
+            .expect("cached raised-text display");
+        assert!(warnings.is_empty(), "exact raised-text join: {warnings:?}");
     }
 
     #[test]
@@ -932,6 +1672,7 @@ mod tests {
             placement: TextPlacement {
                 origin: (6.0, 6.0),
                 rotation_deg: 0.0,
+                ..TextPlacement::default()
             },
             depth_mm: 1.0,
             mode,
@@ -992,24 +1733,15 @@ mod tests {
             engraved_volume < base_volume,
             "engraved text must remove material ({engraved_volume} vs {base_volume})"
         );
-        // OPEN BUG - glyphs with a counter produce the wrong swept volume.
-        //
-        // Region areas are correct: `A` is 9.758 mm2 with one hole, `L` is
-        // 6.495 mm2 with none, so `AL` at 1 mm depth should move 16.25 mm3.
-        // `L` is exact in both directions. `A` is not - raising `AL` adds only
-        // 11.29 mm3 and engraving it removes 27.84 mm3, and `A` alone adds
-        // 4.79 mm3 against its 9.758 mm2 footprint.
-        //
-        // Ruled out: the kernel's chained booleans (openrcad-algo's
-        // repro_chained_boolean shows chained fuse and cut each account for
-        // exactly their tools), the contact overshoot (0.05 mm to 0.5 mm
-        // changed nothing), and region detection itself (areas and hole counts
-        // above are right). The remaining suspect is sweeping a region that has
-        // an inner wire - the prism's hole handling. Not asserted until fixed.
-        // Raised and engraved run the same tools in opposite directions, so a
-        // single glyph must add exactly what it removes. Checked on one letter
-        // so a discrepancy points at the sweep rather than at how a multi-glyph
-        // union sequences its tools.
+        // OPEN ANOMALY, scoped to this helper: raising `AL` adds 11.29 mm3
+        // while engraving removes 27.84 mm3 against a 16.25 mm3 nominal, and
+        // the numbers did NOT change when the kernel's cylinder-orientation fix
+        // landed (disc/annulus sweeps and single counter-free glyphs are exact).
+        // Whatever this is lives in `emboss_text`'s union/difference chain, not
+        // in sweeping or region detection. The sketch-text workflow does not
+        // use this helper - it extrudes regions through the app's normal
+        // Extrude Join/Cut path - so this stays documented rather than fatal.
+
         let one_up = volume(
             &emboss_text(&plate, &request("L", EmbossMode::Raised), &top).expect("raised L"),
         ) - base_volume;
@@ -1056,6 +1788,7 @@ mod tests {
             TextPlacement {
                 origin: (100.0, 0.0),
                 rotation_deg: 90.0,
+                ..TextPlacement::default()
             },
         )
         .expect("turned");
@@ -1069,6 +1802,100 @@ mod tests {
             .iter()
             .fold(f32::MAX, |best, point| best.min(point.0));
         assert!(turned_min_x > 90.0, "the block must move to its new origin");
+    }
+
+    #[test]
+    fn text_shape_bakes_builds_verbatim_and_round_trips() {
+        let shape = bake_text_shape(
+            HACK,
+            0,
+            "Rev 2",
+            &TextParams::default(),
+            TextPlacement {
+                origin: (4.0, 7.0),
+                rotation_deg: 30.0,
+                ..TextPlacement::default()
+            },
+        )
+        .expect("bake");
+
+        // build() must return the baked curves verbatim — never re-shape.
+        let crate::sketch::SketchShape::Text { curves, .. } = &shape else {
+            panic!("bake_text_shape must produce SketchShape::Text");
+        };
+        let built = shape.build(&std::collections::HashMap::new());
+        assert_eq!(
+            &built, curves,
+            "build() must emit the baked curves verbatim"
+        );
+
+        // Serde round trip through CBOR — the same encoding the sketch payload
+        // uses — must preserve every field bit-for-bit.
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&shape, &mut encoded).expect("encode");
+        let decoded: crate::sketch::SketchShape =
+            ciborium::de::from_reader(encoded.as_slice()).expect("decode");
+        assert_eq!(decoded, shape);
+    }
+
+    /// Text is ONE rigid item: the solver receives a single anchor point —
+    /// never the glyph curves — and the display curves still arrive through the
+    /// solver-model branch of `effective_curves_solved`. Promoting glyphs as
+    /// raw entities made every drag re-solve hundreds of points (the "text
+    /// makes the app crawl" report) and let letters be constrained apart.
+    #[test]
+    fn text_is_one_solver_item_and_still_renders_with_a_model() {
+        let shape = bake_text_shape(
+            HACK,
+            0,
+            "Rig",
+            &TextParams::default(),
+            TextPlacement {
+                origin: (3.0, 4.0),
+                rotation_deg: 0.0,
+                ..TextPlacement::default()
+            },
+        )
+        .expect("bake");
+        let vars = std::collections::HashMap::new();
+        let owner = crate::sketch::EntityId(7);
+        let (model, _next) = crate::sketch::constraints::promote_shapes_to_entities(
+            std::slice::from_ref(&shape),
+            &[owner],
+            &vars,
+            8,
+        );
+        assert_eq!(
+            model.points.len(),
+            1,
+            "one anchor point for the whole block"
+        );
+        assert_eq!(model.points[0].pos, (3.0, 4.0));
+        assert!(
+            model.entities.is_empty(),
+            "glyph curves stay out of the solver"
+        );
+
+        let mut solver = crate::sketch::SketchSolverModel::default();
+        solver.points.extend(model.points.clone());
+        let baked = match &shape {
+            crate::sketch::SketchShape::Text { curves, .. } => curves.clone(),
+            _ => unreachable!(),
+        };
+        let rendered = crate::sketch::effective_curves_solved(
+            &crate::sketch::SketchCurves::new(),
+            std::slice::from_ref(&shape),
+            &[],
+            &[],
+            Some(&solver),
+            &vars,
+        );
+        assert_eq!(
+            rendered.splines.len(),
+            baked.splines.len(),
+            "text must render through the solver-model branch"
+        );
+        assert_eq!(rendered.segments.len(), baked.segments.len());
     }
 
     #[test]

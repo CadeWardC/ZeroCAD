@@ -220,6 +220,32 @@ impl ZeroCadApp {
         }
     }
 
+    fn settle_pending_extrude_visibility(
+        &mut self,
+        statuses: &[zerocad_core::parametric::FeatureStatus],
+    ) -> bool {
+        let Some(pending) = self.pending_extrude_visibility.take() else {
+            return false;
+        };
+        let failed_sketches = failed_pending_extrude_sketches(&pending, statuses);
+        for (_, sketch_id) in &pending.feature_sketches {
+            if !failed_sketches.contains(sketch_id) {
+                self.hidden_nodes.insert(sketch_id.clone());
+            }
+        }
+        !failed_sketches.is_empty()
+    }
+
+    fn restore_all_pending_extrude_sketches(&mut self) -> bool {
+        let Some(pending) = self.pending_extrude_visibility.take() else {
+            return false;
+        };
+        for (_, sketch_id) in &pending.feature_sketches {
+            self.hidden_nodes.remove(sketch_id);
+        }
+        !pending.feature_sketches.is_empty()
+    }
+
     /// Apply an evaluation result to the displayed model + status line.
     pub(crate) fn apply_eval_result(
         &mut self,
@@ -379,6 +405,8 @@ impl ZeroCadApp {
                                 .map(|r| (s.feature_id.to_string(), r.to_string()))
                         })
                         .collect();
+                    let restored_failed_extrude =
+                        self.settle_pending_extrude_visibility(&output.statuses);
                     self.datum_values = output.datums.clone();
                     let warnings = output.rendered_warnings();
                     self.document
@@ -389,11 +417,18 @@ impl ZeroCadApp {
                         .document
                         .apply_face_reattach_updates(output.face_reattach);
                     self.apply_eval_result(output.bodies, warnings, face_reattached);
+                    if restored_failed_extrude {
+                        self.status_msg = "Extrude could not be built. The source sketch was restored; see the reported issue.".to_string();
+                    }
                     self.finish_pending_mirror_join_feedback();
                 }
                 Err(err) => {
+                    let restored_failed_extrude = self.restore_all_pending_extrude_sketches();
                     self.error_msg = Some(err.to_string());
-                    self.status_msg = if self.pending_mirror_join_feedback.take().is_some() {
+                    self.status_msg = if restored_failed_extrude {
+                        "Error: Extrude evaluation failed. The source sketch was restored."
+                            .to_string()
+                    } else if self.pending_mirror_join_feedback.take().is_some() {
                         "Error: Mirror evaluation failed.".to_string()
                     } else {
                         "Error: Model evaluation failed.".to_string()
@@ -402,6 +437,26 @@ impl ZeroCadApp {
             }
         }
     }
+}
+
+fn failed_pending_extrude_sketches(
+    pending: &PendingExtrudeVisibility,
+    statuses: &[zerocad_core::parametric::FeatureStatus],
+) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (feature_id, sketch_id) in &pending.feature_sketches {
+        let resolved = statuses.iter().any(|status| {
+            status.feature_id.as_str() == feature_id
+                && matches!(
+                    status.state,
+                    zerocad_core::parametric::ResolutionState::Resolved
+                )
+        });
+        if !resolved && !failed.contains(sketch_id) {
+            failed.push(sketch_id.clone());
+        }
+    }
+    failed
 }
 
 fn classify_mirror_join_outcome(
@@ -491,6 +546,35 @@ mod tests {
         assert_eq!(
             classify_mirror_join_outcome(false, Some("missing plane".to_string()), false, true),
             MirrorJoinOutcome::Unresolved("missing plane".to_string())
+        );
+    }
+
+    #[test]
+    fn unresolved_extrude_restores_only_its_source_sketch() {
+        let pending = PendingExtrudeVisibility {
+            feature_sketches: vec![
+                ("extrude_ok".to_string(), "sketch_ok".to_string()),
+                ("extrude_bad".to_string(), "sketch_bad".to_string()),
+            ],
+        };
+        let statuses = vec![
+            zerocad_core::parametric::FeatureStatus {
+                feature_id: "extrude_ok".into(),
+                feature_name: "Extrude 1".to_string(),
+                state: zerocad_core::parametric::ResolutionState::Resolved,
+            },
+            zerocad_core::parametric::FeatureStatus {
+                feature_id: "extrude_bad".into(),
+                feature_name: "Extrude 2".to_string(),
+                state: zerocad_core::parametric::ResolutionState::Unresolved(
+                    "invalid shell".to_string(),
+                ),
+            },
+        ];
+
+        assert_eq!(
+            failed_pending_extrude_sketches(&pending, &statuses),
+            vec!["sketch_bad".to_string()]
         );
     }
 }

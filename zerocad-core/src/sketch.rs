@@ -261,7 +261,10 @@ impl Spline {
         sampled
     }
 
-    fn evaluate(&self, t: f32) -> Option<(f32, f32)> {
+    /// Point on the spline at normalized parameter `t` in [0, 1], if the
+    /// control data is well-formed. Public for lightweight display sampling
+    /// (e.g. the sketch-text preview).
+    pub fn evaluate(&self, t: f32) -> Option<(f32, f32)> {
         match self.kind {
             SplineKind::ControlPoint => self.evaluate_control_point(t),
             SplineKind::FitPoint => self.evaluate_fit_point(t),
@@ -892,6 +895,19 @@ pub enum SketchShape {
     /// Pre-built geometry with no variable bindings (3-point rect/circle,
     /// ellipses). Stored as-is and emitted verbatim.
     Raw { curves: SketchCurves },
+    /// Shaped text. `curves` are the BAKED glyph outlines — authoritative
+    /// forever: they are never re-shaped on load, so a document renders
+    /// identically on a machine without the font. The semantic fields exist so
+    /// an edit session with a matching installed font (verified through the
+    /// fingerprint's content hash, never the family name) can re-shape and
+    /// re-bake; without it the shape is displayed read-only.
+    Text {
+        text: String,
+        font: crate::text::FontFingerprint,
+        params: crate::text::TextParams,
+        placement: crate::text::TextPlacement,
+        curves: SketchCurves,
+    },
 }
 
 impl SketchShape {
@@ -1005,6 +1021,9 @@ impl SketchShape {
             SketchShape::Spline { spline } => c.add_spline(spline.clone()),
             SketchShape::Imported { curves, .. } => c = curves.clone(),
             SketchShape::Raw { curves } => c = curves.clone(),
+            // Baked text is authoritative: never re-shaped here, even when the
+            // font is installed — a font update must not silently move geometry.
+            SketchShape::Text { curves, .. } => c = curves.clone(),
         }
         c
     }
@@ -1211,6 +1230,14 @@ pub fn effective_curves_solved_checked(
                 .into_iter()
                 .map(|(id, error)| (id, SketchOffsetError::Pattern(error))),
         );
+        // Text shapes are rigid one-item blocks: the solver model holds only
+        // their anchor point (see `promote_shapes_to_entities`), so their baked
+        // outlines are appended here from the authoritative shape records.
+        for shape in shapes {
+            if let SketchShape::Text { curves, .. } = shape {
+                c.extend_curves(curves);
+            }
+        }
         apply_mirrors(&mut c, mirrors);
         return (c, failures);
     }
@@ -1426,6 +1453,14 @@ pub struct Region {
 }
 
 impl Region {
+    /// Number of straight boundary chords needed by the legacy sampled prism
+    /// builder. Analytic consumers should prefer [`Self::analytic`]; this count
+    /// is used to keep compatibility/display fallbacks within an interactive
+    /// complexity budget.
+    pub fn sampled_edge_count(&self) -> usize {
+        self.boundary.len() + self.holes.iter().map(Vec::len).sum::<usize>()
+    }
+
     /// True if `p` is inside this face: within the outer boundary and not in
     /// any hole.
     pub fn contains(&self, p: (f32, f32)) -> bool {
@@ -2473,6 +2508,16 @@ pub struct ShapeLoop {
 pub fn shape_loops(shapes: &[SketchShape], vars: &HashMap<String, f64>) -> Vec<ShapeLoop> {
     let mut out = Vec::new();
     for shape in shapes {
+        // Text is a compound non-zero-winding shape with many independent
+        // contours. `segments_to_loop` can only recover one closed outline;
+        // feeding the first line-only glyph contour into the shape-boolean
+        // planner misclassifies the rest of the word as ordinary rectangle
+        // material. Typography is classified separately by
+        // `sketch_region_ink_mask`, so it must not masquerade as one primitive
+        // boolean loop here.
+        if matches!(shape, SketchShape::Text { .. }) {
+            continue;
+        }
         let curves = shape.build(vars);
         for c in &curves.circles {
             if c.radius > 0.0 {

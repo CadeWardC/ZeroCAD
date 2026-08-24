@@ -1993,6 +1993,10 @@ pub(crate) struct SketchEval {
     /// the live face and re-splits regions when the two differ.
     pub(crate) face_boundary: Option<SketchCurves>,
     pub(crate) regions: Vec<Region>,
+    /// Typography-aware material mask aligned with `regions`. Non-text
+    /// sketches contain only `true`; text counters and other zero-winding
+    /// arrangement faces are `false` without changing durable region indices.
+    pub(crate) ink_mask: Vec<bool>,
     pub(crate) provenance: Vec<RegionProvenance>,
     /// Full closed outlines of the drawn shapes (before region-splitting), used
     /// to combine overlapping shapes as a boolean at extrude time. Empty for

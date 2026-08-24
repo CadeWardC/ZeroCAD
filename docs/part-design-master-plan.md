@@ -348,7 +348,8 @@ extending the exact Phase 5 direct-edit set:
   recipe, so it reports the original delta while rejecting any additional
   greater-than-10% regression instead of granting an open-ended waiver.
 
-Gate: `zerocad-core/tests/phase6_gate.rs`, the complete workspace suites, strict
+Gate: `zerocad-core/tests/step_interchange_gate.rs` (the cross-cutting Phase 6
+interchange gate), the complete workspace suites, strict
 STEP tests, frozen corpus, format-era relative comparison, seven-sample startup
 profile on the settled release artifact, formatting, checks, and all-target
 clippy pass. The measured record, including the non-passing freshly linked first

@@ -871,16 +871,119 @@ impl ZeroCadApp {
     /// reference curves — appended AFTER the drawn curves, the same merge
     /// order the evaluator and every committed-sketch region site use, so the
     /// region indices seen live match the ones an extrude will store.
+    /// Regions (and cached fill triangles) for a FINISHED sketch's resolved
+    /// curves. Validated by content hash, so any geometry change recomputes;
+    /// unchanged sketches never re-run the arrangement. `&self` on purpose —
+    /// callers hold graph borrows — hence the RefCell.
+    pub(crate) fn cached_finished_regions<F>(
+        &self,
+        node_id: &str,
+        curves: &SketchCurves,
+        has_text: bool,
+        ink_masker: F,
+    ) -> FinishedSketchRegions
+    where
+        F: FnOnce(&[zerocad_core::Region]) -> Vec<bool>,
+    {
+        Self::cached_regions_in(
+            &self.finished_sketch_regions,
+            node_id,
+            curves,
+            has_text,
+            ink_masker,
+        )
+    }
+
+    /// Field-disjoint form for call sites that hold a `&mut` borrow of another
+    /// part of the app (e.g. the properties panel editing the graph node).
+    pub(crate) fn cached_regions_in<F>(
+        cache: &std::cell::RefCell<std::collections::HashMap<String, FinishedSketchRegions>>,
+        node_id: &str,
+        curves: &SketchCurves,
+        has_text: bool,
+        ink_masker: F,
+    ) -> FinishedSketchRegions
+    where
+        F: FnOnce(&[zerocad_core::Region]) -> Vec<bool>,
+    {
+        let hash = curves_content_hash(curves) ^ if has_text { 0x7e57_f111_u64 } else { 0 };
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.get(node_id) {
+            if entry.hash == hash {
+                return entry.clone();
+            }
+        }
+        let regions = detect_regions(curves);
+        let mut ink_mask = ink_masker(&regions);
+        if ink_mask.len() != regions.len() {
+            ink_mask = vec![true; regions.len()];
+        }
+        let fill = regions
+            .iter()
+            .zip(&ink_mask)
+            .map(|(region, ink)| {
+                ink.then(|| crate::geom2d::triangulate_region_fill(region))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let entry = FinishedSketchRegions {
+            hash,
+            regions: std::sync::Arc::new(regions),
+            ink_mask: std::sync::Arc::new(ink_mask),
+            fill: std::sync::Arc::new(fill),
+        };
+        // Deleted sketches would otherwise pin their arrangement forever.
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(node_id.to_owned(), entry.clone());
+        entry
+    }
+
     pub(crate) fn recompute_sketch_regions(&mut self) {
         let mut curves = self.sketch_curves.clone();
         curves.extend_curves(&self.active_face_boundary);
+        // Region detection over a text-bearing sketch is the most expensive
+        // step of a rebuild (the analytic arrangement intersects every span
+        // pair). Many rebuild callers fire on interactions that didn't change
+        // geometry, so unchanged content skips the arrangement entirely.
+        let fingerprint = curves_content_hash(&curves);
+        if self.sketch_regions_fingerprint == Some(fingerprint) {
+            return;
+        }
         self.detected_regions = detect_regions(&curves);
+        let vars = self.document.variable_map();
+        let mut mods = self.sketch_corner_mods.clone();
+        mods.extend(self.pending_corner_mods());
+        self.sketch_region_ink_mask = zerocad_core::text::sketch_region_ink_mask(
+            &SketchCurves::new(),
+            &self.sketch_shapes,
+            &mods,
+            &self.sketch_mirrors,
+            self.sketch_solver_model.as_ref(),
+            &vars,
+            &self.detected_regions,
+        );
+        self.sketch_region_fill_cache = self
+            .detected_regions
+            .iter()
+            .zip(&self.sketch_region_ink_mask)
+            .map(|(region, ink)| {
+                ink.then(|| crate::geom2d::triangulate_region_fill(region))
+                    .unwrap_or_default()
+            })
+            .collect();
+        self.sketch_regions_fingerprint = Some(fingerprint);
+        self.last_region_recompute = Some(std::time::Instant::now());
+        self.sketch_regions_dirty = false;
         let n = self.detected_regions.len();
-        self.selected_region_indices.retain(|i| *i < n);
+        self.selected_region_indices
+            .retain(|i| *i < n && self.sketch_region_ink_mask.get(*i).copied().unwrap_or(true));
     }
 
     /// Reset everything related to the in-progress sketch.
     pub(crate) fn reset_sketch_state(&mut self) {
+        self.sketch_regions_fingerprint = None;
         self.sketch_curves = SketchCurves::new();
         self.active_face_boundary = SketchCurves::new();
         self.sketch_shapes.clear();
@@ -889,6 +992,7 @@ impl ZeroCadApp {
         self.working_sketch_undo.clear();
         self.pending_corners.clear();
         self.detected_regions.clear();
+        self.sketch_region_ink_mask.clear();
         self.selected_region_indices.clear();
         self.editing_sketch_id = None;
         self.sketch_solver_model = None;
@@ -947,7 +1051,33 @@ impl ZeroCadApp {
                 self.sketch_conflict_constraint = report.conflicting;
             }
         }
-        self.rebuild_active_sketch_curves();
+        self.rebuild_active_sketch_curves_throttled();
+    }
+
+    /// Drag-frame variant: dragged geometry must redraw every frame, but the
+    /// O(n²) region arrangement may lag a beat — skip it while a recompute ran
+    /// in the last ~100 ms and mark the state dirty; the update loop settles it
+    /// on pointer release (covering drag-end AND cancel paths).
+    pub(crate) fn rebuild_active_sketch_curves_throttled(&mut self) {
+        let vars = self.document.variable_map();
+        let mut mods = self.sketch_corner_mods.clone();
+        mods.extend(self.pending_corner_mods());
+        self.sketch_curves = zerocad_core::effective_curves_solved(
+            &SketchCurves::new(),
+            &self.sketch_shapes,
+            &mods,
+            &self.sketch_mirrors,
+            self.sketch_solver_model.as_ref(),
+            &vars,
+        );
+        let throttled = self
+            .last_region_recompute
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(100));
+        if throttled {
+            self.sketch_regions_dirty = true;
+        } else {
+            self.recompute_sketch_regions();
+        }
     }
 
     /// Build the current radius/setback `Dimension` from the toolbar text (a
@@ -1289,4 +1419,73 @@ mod working_sketch_undo_tests {
         }
         assert_eq!(app.working_sketch_undo.len(), 50);
     }
+
+    #[test]
+    fn finished_sketch_region_cache_reuses_arrangement_and_fill() {
+        let app = ZeroCadApp::new();
+        let mut curves = SketchCurves::new();
+        curves.add_rectangle((0.0, 0.0), (4.0, 3.0));
+
+        let first = app.cached_finished_regions("sketch_cache_test", &curves, false, |regions| {
+            vec![true; regions.len()]
+        });
+        let second = app.cached_finished_regions("sketch_cache_test", &curves, false, |_| {
+            panic!("an unchanged finished sketch must not recompute its arrangement or fill")
+        });
+
+        assert!(std::sync::Arc::ptr_eq(&first.regions, &second.regions));
+        assert!(std::sync::Arc::ptr_eq(&first.fill, &second.fill));
+        assert!(std::sync::Arc::ptr_eq(&first.ink_mask, &second.ink_mask));
+    }
+}
+
+/// Cheap structural hash of sketch curves: counts plus raw coordinate bits.
+/// Replaces a Debug-format string hash that allocated megabytes per rebuild
+/// once glyph outlines were in the sketch.
+pub(crate) fn curves_content_hash(curves: &SketchCurves) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let f = |h: &mut std::collections::hash_map::DefaultHasher, v: f32| v.to_bits().hash(h);
+    curves.segments.len().hash(&mut h);
+    for s in &curves.segments {
+        f(&mut h, s.a.0);
+        f(&mut h, s.a.1);
+        f(&mut h, s.b.0);
+        f(&mut h, s.b.1);
+    }
+    curves.circles.len().hash(&mut h);
+    for c in &curves.circles {
+        f(&mut h, c.center.0);
+        f(&mut h, c.center.1);
+        f(&mut h, c.radius);
+    }
+    curves.arcs.len().hash(&mut h);
+    for a in &curves.arcs {
+        f(&mut h, a.center.0);
+        f(&mut h, a.center.1);
+        f(&mut h, a.radius);
+        f(&mut h, a.start.0);
+        f(&mut h, a.start.1);
+        f(&mut h, a.end.0);
+        f(&mut h, a.end.1);
+        a.clockwise.hash(&mut h);
+    }
+    curves.splines.len().hash(&mut h);
+    for sp in &curves.splines {
+        sp.points.len().hash(&mut h);
+        for p in &sp.points {
+            f(&mut h, p.0);
+            f(&mut h, p.1);
+        }
+        sp.degree.hash(&mut h);
+        for k in &sp.knots {
+            f(&mut h, *k);
+        }
+        for w in &sp.weights {
+            f(&mut h, *w);
+        }
+        sp.closed.hash(&mut h);
+        sp.periodic.hash(&mut h);
+    }
+    h.finish()
 }

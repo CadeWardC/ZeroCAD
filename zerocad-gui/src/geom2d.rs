@@ -6,6 +6,29 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui;
 use zerocad_core::{sketch::Arc, Region, SketchCurves};
 
+/// Triangulate one region's fill in sketch (u, v) space, holes preserved.
+///
+/// Ear-clipping dense glyph boundaries EVERY FRAME inside `draw_sketch_geometry`
+/// was the text-sketch lag: ~10 regions per word, each a few hundred sampled
+/// points, re-bridged and re-clipped at display rate. The triangulation only
+/// depends on the region, and the sketch view's projection is affine, so the
+/// (u, v) triangles stay valid on screen — recompute them only when the
+/// regions change and merely re-project per frame.
+pub(crate) fn triangulate_region_fill(region: &Region) -> Vec<[(f32, f32); 3]> {
+    let as_pos = |points: &[(f32, f32)]| -> Vec<egui::Pos2> {
+        points.iter().map(|p| egui::pos2(p.0, p.1)).collect()
+    };
+    let mut loops = Vec::with_capacity(1 + region.holes.len());
+    loops.push(as_pos(&region.boundary));
+    for hole in &region.holes {
+        loops.push(as_pos(hole));
+    }
+    triangulate_nested_loops(&loops)
+        .into_iter()
+        .map(|t| [(t[0].x, t[0].y), (t[1].x, t[1].y), (t[2].x, t[2].y)])
+        .collect()
+}
+
 /// Draw a sketch's faces, curves, and vertex dots using a caller supplied
 /// 2D→screen projection. Shared by the active sketch, finished 2D objects, and
 /// the face picker.
@@ -20,6 +43,8 @@ pub(crate) fn draw_sketch_geometry(
     painter: &egui::Painter,
     curves: &SketchCurves,
     regions: &[Region],
+    fill_cache: Option<&[Vec<[(f32, f32); 3]>]>,
+    ink_mask: Option<&[bool]>,
     selected: &HashSet<usize>,
     selected_edges: &HashSet<usize>,
     selected_points: &HashSet<usize>,
@@ -33,6 +58,9 @@ pub(crate) fn draw_sketch_geometry(
     // intersect) must be triangulated — `convex_polygon` fans from one vertex
     // and produces the stray-triangle artifacts otherwise.
     for (i, region) in regions.iter().enumerate() {
+        if ink_mask.is_some_and(|mask| !mask.get(i).copied().unwrap_or(true)) {
+            continue;
+        }
         let is_sel = selected.contains(&i);
         let (fill, border) = if is_sel {
             (
@@ -67,7 +95,20 @@ pub(crate) fn draw_sketch_geometry(
             .map(|h| h.iter().map(|&p| to_screen(p)).collect())
             .collect();
 
-        fill_polygon_with_holes(painter, &outer, &holes, fill);
+        match fill_cache.filter(|cache| cache.len() == regions.len()) {
+            Some(cache) => {
+                let mut mesh = egui::Mesh::default();
+                for triangle in &cache[i] {
+                    let base = mesh.vertices.len() as u32;
+                    for vertex in triangle {
+                        mesh.colored_vertex(to_screen(*vertex), fill);
+                    }
+                    mesh.add_triangle(base, base + 1, base + 2);
+                }
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            None => fill_polygon_with_holes(painter, &outer, &holes, fill),
+        }
 
         // Borders: outer loop plus each hole loop.
         let draw_loop = |loop_pts: &[egui::Pos2]| {

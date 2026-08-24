@@ -16,6 +16,66 @@ enum FaceMateMode {
 }
 
 impl ZeroCadApp {
+    fn push_replaced_assembly_undo(&mut self, previous: zerocad_core::AssemblyDocument) {
+        if self.undo_stack.len() >= 50 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(UndoSnapshot {
+            project: zerocad_core::ProjectDocument::Assembly(previous.into_authoritative()),
+        });
+        self.redo_stack.clear();
+    }
+
+    fn finish_replaced_assembly_commit(
+        &mut self,
+        previous: zerocad_core::AssemblyDocument,
+        rebuild_scene: bool,
+    ) {
+        self.push_replaced_assembly_undo(previous);
+        self.document_revision = self.document_revision.wrapping_add(1);
+        self.recovery.note_edit(self.current_project_snapshot());
+        if rebuild_scene {
+            self.rebuild_assembly_scene();
+        }
+    }
+
+    fn commit_candidate_assembly_document(
+        &mut self,
+        candidate: zerocad_core::AssemblyDocument,
+        rebuild_scene: bool,
+    ) {
+        let previous = std::mem::replace(&mut self.assembly_document, candidate);
+        self.finish_replaced_assembly_commit(previous, rebuild_scene);
+    }
+
+    fn commit_new_assembly_mate(
+        &mut self,
+        mate: zerocad_core::AssemblyMate,
+        context: &zerocad_core::MateSolveContext,
+    ) -> Result<zerocad_core::MateSolveResult, String> {
+        let (candidate, solution) = zerocad_core::assembly_solver::prepare_mate_addition(
+            &self.assembly_document,
+            mate,
+            context,
+        )?;
+        self.assembly_mate_statuses = solution.statuses.clone();
+        self.commit_candidate_assembly_document(candidate, true);
+        Ok(solution)
+    }
+
+    fn commit_prepared_assembly_command(
+        &mut self,
+        prepared: zerocad_core::assembly::PreparedAssemblyCommand,
+        rebuild_scene: bool,
+    ) -> zerocad_core::assembly::AssemblyChangeSet {
+        if prepared.changes().is_empty() {
+            return zerocad_core::assembly::AssemblyChangeSet::default();
+        }
+        let (changes, previous) = prepared.commit(&mut self.assembly_document);
+        self.finish_replaced_assembly_commit(previous, rebuild_scene);
+        changes
+    }
+
     pub(crate) fn insert_part_into_assembly(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Insert Part into Assembly")
@@ -46,28 +106,25 @@ impl ZeroCadApp {
             }
         };
         let geometry = prepared.display_bodies.clone();
-        self.push_undo();
-        let result = match zerocad_core::insert_prepared_occurrence(
-            &mut self.assembly_document,
+        let (candidate, result) = match zerocad_core::assembly_ops::prepare_occurrence_insertion(
+            &self.assembly_document,
             prepared,
             zerocad_core::RigidPlacement::IDENTITY,
             false,
         ) {
             Ok(result) => result,
             Err(error) => {
-                self.undo_stack.pop();
                 self.status_msg = format!("Insert failed: {error}");
                 self.error_msg = Some(self.status_msg.clone());
                 return;
             }
         };
 
+        self.commit_candidate_assembly_document(candidate, false);
         self.assembly_definition_geometry
             .entry(result.definition_model_hash)
             .or_insert(geometry);
         self.selected_assembly_occurrence = Some(result.occurrence_id);
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
         self.rebuild_assembly_scene();
         self.error_msg = None;
         self.status_msg = if result.diagnostics.is_empty() {
@@ -137,20 +194,19 @@ impl ZeroCadApp {
             vec![selected_id]
         };
 
-        self.push_undo();
-        let result = match zerocad_core::replace_occurrences_with_prepared(
-            &mut self.assembly_document,
+        let (candidate, result) = match zerocad_core::assembly_ops::prepare_occurrence_replacement(
+            &self.assembly_document,
             &ids,
             prepared,
         ) {
             Ok(result) => result,
             Err(error) => {
-                self.undo_stack.pop();
                 self.status_msg = format!("Replace failed: {error}");
                 self.error_msg = Some(self.status_msg.clone());
                 return;
             }
         };
+        self.commit_candidate_assembly_document(candidate, false);
         for hash in &result.pruned_definition_hashes {
             self.assembly_definition_geometry.remove(hash);
             self.assembly_unresolved_definitions.remove(hash);
@@ -168,8 +224,6 @@ impl ZeroCadApp {
             }
             self.assembly_mate_statuses = solution.statuses;
         }
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
         self.rebuild_assembly_scene();
         self.error_msg = None;
         self.status_msg = if result.diagnostics.is_empty() {
@@ -817,9 +871,8 @@ impl ZeroCadApp {
                 sense: zerocad_core::MateSense::AntiAligned,
             };
             let context = self.assembly_mate_context();
-            self.push_undo();
-            match zerocad_core::apply_ephemeral_mate_target_transactionally(
-                &mut self.assembly_document,
+            match zerocad_core::assembly_solver::prepare_ephemeral_mate_target(
+                &self.assembly_document,
                 moving.0,
                 temporary_mate,
                 &context,
@@ -828,16 +881,13 @@ impl ZeroCadApp {
                     second: Some(moving_frame),
                 },
             ) {
-                Ok(solution) => {
+                Ok((candidate, solution)) => {
                     self.assembly_mate_statuses = solution.statuses;
-                    self.document_revision = self.document_revision.wrapping_add(1);
-                    self.recovery.note_edit(self.current_project_snapshot());
-                    self.rebuild_assembly_scene();
+                    self.commit_candidate_assembly_document(candidate, true);
                     self.status_msg =
                         "Aligned the solver-controlled component without creating a mate.".into();
                 }
                 Err(error) => {
-                    self.undo_stack.pop();
                     self.status_msg =
                         format!("Align Faces conflicts with the active mate system: {error}");
                 }
@@ -851,17 +901,18 @@ impl ZeroCadApp {
                 return;
             }
         };
-        self.push_undo();
-        let occurrence = self
-            .assembly_document
-            .occurrences
-            .get_mut(&moving.0)
-            .expect("selected moving occurrence still exists");
-        occurrence.manual_placement = placement;
-        occurrence.resolved_placement_override = None;
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
+        let command = zerocad_core::assembly::AssemblyCommand::SetOccurrencePlacement {
+            occurrence_id: moving.0,
+            placement,
+        };
+        let prepared = match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_msg = format!("Align Faces failed: {error}");
+                return;
+            }
+        };
+        self.commit_prepared_assembly_command(prepared, true);
         self.status_msg = format!("Aligned component {} to component {}.", moving.0, target.0);
     }
 
@@ -1011,17 +1062,11 @@ impl ZeroCadApp {
             // Selected face normals oppose when the two outward surfaces meet.
             sense: zerocad_core::MateSense::AntiAligned,
         };
-        self.push_undo();
-        match zerocad_core::add_mate_transactionally(&mut self.assembly_document, mate, &context) {
-            Ok(solution) => {
-                self.assembly_mate_statuses = solution.statuses;
-                self.document_revision = self.document_revision.wrapping_add(1);
-                self.recovery.note_edit(self.current_project_snapshot());
-                self.rebuild_assembly_scene();
+        match self.commit_new_assembly_mate(mate, &context) {
+            Ok(_) => {
                 self.status_msg = format!("Created mate {next_id}.");
             }
             Err(error) => {
-                self.undo_stack.pop();
                 self.status_msg = format!("Mate rejected: {error}");
             }
         }
@@ -1077,17 +1122,11 @@ impl ZeroCadApp {
             kind: zerocad_core::AssemblyMateKind::Concentric,
             sense: zerocad_core::MateSense::Aligned,
         };
-        self.push_undo();
-        match zerocad_core::add_mate_transactionally(&mut self.assembly_document, mate, &context) {
-            Ok(solution) => {
-                self.assembly_mate_statuses = solution.statuses;
-                self.document_revision = self.document_revision.wrapping_add(1);
-                self.recovery.note_edit(self.current_project_snapshot());
-                self.rebuild_assembly_scene();
+        match self.commit_new_assembly_mate(mate, &context) {
+            Ok(_) => {
                 self.status_msg = format!("Created concentric mate {next_id}.");
             }
             Err(error) => {
-                self.undo_stack.pop();
                 self.status_msg = format!("Mate rejected: {error}");
             }
         }
@@ -1127,72 +1166,82 @@ impl ZeroCadApp {
             sense: zerocad_core::MateSense::Aligned,
         };
         let context = self.assembly_mate_context();
-        self.push_undo();
-        match zerocad_core::add_mate_transactionally(&mut self.assembly_document, mate, &context) {
-            Ok(solution) => {
-                self.assembly_mate_statuses = solution.statuses;
-                self.document_revision = self.document_revision.wrapping_add(1);
-                self.recovery.note_edit(self.current_project_snapshot());
-                self.rebuild_assembly_scene();
+        match self.commit_new_assembly_mate(mate, &context) {
+            Ok(_) => {
                 self.status_msg = format!("Fixed component {occurrence_id}.");
             }
             Err(error) => {
-                self.undo_stack.pop();
                 self.status_msg = format!("Mate rejected: {error}");
             }
         }
     }
 
     fn edit_assembly_mate(&mut self, mate_id: u64, action: MateEditAction) {
-        let context = self.assembly_mate_context();
-        let mut candidate = self.assembly_document.clone_authoritative();
-        let Some(mate_set) = candidate.mates.as_mut() else {
-            return;
-        };
-        match action {
-            MateEditAction::Delete => {
-                mate_set.mates.remove(&mate_id);
-            }
+        let edit = match action {
+            MateEditAction::Delete => zerocad_core::assembly::AssemblyMateEdit::Delete,
             MateEditAction::SetSuppressed(suppressed) => {
-                if let Some(mate) = mate_set.mates.get_mut(&mate_id) {
-                    mate.suppressed = suppressed;
-                }
+                zerocad_core::assembly::AssemblyMateEdit::SetSuppressed(suppressed)
             }
-            MateEditAction::FlipSense => {
-                if let Some(mate) = mate_set.mates.get_mut(&mate_id) {
-                    mate.sense = match mate.sense {
-                        zerocad_core::MateSense::Aligned => zerocad_core::MateSense::AntiAligned,
-                        zerocad_core::MateSense::AntiAligned => zerocad_core::MateSense::Aligned,
-                    };
-                }
-            }
+            MateEditAction::FlipSense => zerocad_core::assembly::AssemblyMateEdit::FlipSense,
             MateEditAction::SetParameter(value) => {
-                if let Some(mate) = mate_set.mates.get_mut(&mate_id) {
-                    match &mut mate.kind {
-                        zerocad_core::AssemblyMateKind::SignedDistance { millimeters } => {
-                            *millimeters = value;
-                        }
-                        zerocad_core::AssemblyMateKind::Angle { radians } => {
-                            *radians = value.to_radians();
-                        }
-                        _ => return,
+                let Some(mate) = self
+                    .assembly_document
+                    .mates
+                    .as_ref()
+                    .and_then(|mate_set| mate_set.mates.get(&mate_id))
+                else {
+                    self.status_msg = format!("Mate {mate_id} does not exist.");
+                    return;
+                };
+                match mate.kind {
+                    zerocad_core::AssemblyMateKind::SignedDistance { .. } => {
+                        zerocad_core::assembly::AssemblyMateEdit::SetDistanceMillimeters(value)
                     }
+                    zerocad_core::AssemblyMateKind::Angle { .. } => {
+                        zerocad_core::assembly::AssemblyMateEdit::SetAngleRadians(
+                            value.to_radians(),
+                        )
+                    }
+                    _ => return,
                 }
             }
-        }
-        let solution = zerocad_core::solve_assembly_mates_committed(&candidate, &context);
-        if !solution.converged {
-            self.status_msg =
-                "Mate edit was rejected because the remaining system did not solve.".into();
+        };
+        let command = zerocad_core::assembly::AssemblyCommand::EditMate { mate_id, edit };
+        let prepared = match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_msg = format!("Mate edit failed: {error}");
+                return;
+            }
+        };
+        if prepared.changes().is_empty() {
             return;
         }
-        let _ = zerocad_core::apply_mate_solution(&mut candidate, &solution);
-        self.push_undo();
-        self.assembly_document = candidate;
+        let context = self.assembly_mate_context();
+        let finalized = prepared.finalize(|candidate| -> Result<_, String> {
+            let solution = zerocad_core::solve_assembly_mates_committed(candidate, &context);
+            if !solution.converged {
+                return Err(solution
+                    .diagnostics
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "the edited mate system did not solve".into()));
+            }
+            zerocad_core::apply_mate_solution(candidate, &solution)?;
+            Ok(solution)
+        });
+        let (prepared, solution) = match finalized {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_msg = format!("Mate edit was rejected: {error}");
+                return;
+            }
+        };
         self.assembly_mate_statuses = solution.statuses;
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
+        self.commit_prepared_assembly_command(prepared, true);
+        if matches!(action, MateEditAction::Delete) {
+            self.selected_assembly_mate = None;
+        }
     }
 
     fn repair_assembly_mate_from_selected_faces(&mut self, mate_id: u64) {
@@ -1221,20 +1270,6 @@ impl ZeroCadApp {
             self.status_msg = "Repair entities must belong to different components.".into();
             return;
         }
-        let mut candidate = self.assembly_document.clone_authoritative();
-        let Some(mate) = candidate
-            .mates
-            .as_mut()
-            .and_then(|mate_set| mate_set.mates.get_mut(&mate_id))
-        else {
-            return;
-        };
-        if matches!(mate.kind, zerocad_core::AssemblyMateKind::Fixed) {
-            self.status_msg = "A fixed mate has no second selector to repair.".into();
-            return;
-        }
-        mate.first = first;
-        mate.second = Some(second);
         let mut context = self.assembly_mate_context();
         context.frames.insert(
             mate_id,
@@ -1243,37 +1278,55 @@ impl ZeroCadApp {
                 second: Some(second_frame),
             },
         );
-        let solution = zerocad_core::solve_assembly_mates_committed(&candidate, &context);
-        if !solution.converged {
-            self.status_msg = "The repaired selectors conflict with the active mate system.".into();
+        let command = zerocad_core::assembly::AssemblyCommand::EditMate {
+            mate_id,
+            edit: zerocad_core::assembly::AssemblyMateEdit::RepairEntities { first, second },
+        };
+        let prepared = match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_msg = format!("Mate repair failed: {error}");
+                return;
+            }
+        };
+        if prepared.changes().is_empty() {
             return;
         }
-        let _ = zerocad_core::apply_mate_solution(&mut candidate, &solution);
-        self.push_undo();
-        self.assembly_document = candidate;
+        let finalized = prepared.finalize(|candidate| -> Result<_, String> {
+            let solution = zerocad_core::solve_assembly_mates_committed(candidate, &context);
+            if !solution.converged {
+                return Err(solution
+                    .diagnostics
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "the repaired mate system did not solve".into()));
+            }
+            zerocad_core::apply_mate_solution(candidate, &solution)?;
+            Ok(solution)
+        });
+        let (prepared, solution) = match finalized {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_msg = format!("Mate repair was rejected: {error}");
+                return;
+            }
+        };
         self.assembly_mate_statuses = solution.statuses;
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
+        self.commit_prepared_assembly_command(prepared, true);
         self.status_msg = format!("Repaired mate {mate_id}.");
     }
 
     fn set_assembly_occurrence_visible(&mut self, occurrence_id: u64, visible: bool) {
-        self.push_undo();
-        if visible {
-            self.assembly_document
-                .presentation
-                .hidden_occurrences
-                .remove(&occurrence_id);
-        } else {
-            self.assembly_document
-                .presentation
-                .hidden_occurrences
-                .insert(occurrence_id);
+        let command = zerocad_core::assembly::AssemblyCommand::SetOccurrenceVisible {
+            occurrence_id,
+            visible,
+        };
+        match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => {
+                self.commit_prepared_assembly_command(prepared, true);
+            }
+            Err(error) => self.status_msg = format!("Visibility change failed: {error}"),
         }
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
     }
 
     fn set_assembly_body_visible(
@@ -1282,88 +1335,74 @@ impl ZeroCadApp {
         local_body_id: String,
         visible: bool,
     ) {
-        self.push_undo();
-        let selector = (occurrence_id, local_body_id);
-        if visible {
-            self.assembly_document
-                .presentation
-                .hidden_bodies
-                .remove(&selector);
-        } else {
-            self.assembly_document
-                .presentation
-                .hidden_bodies
-                .insert(selector);
+        let command = zerocad_core::assembly::AssemblyCommand::SetBodyVisible {
+            occurrence_id,
+            local_body_id,
+            visible,
+        };
+        match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => {
+                self.commit_prepared_assembly_command(prepared, true);
+            }
+            Err(error) => self.status_msg = format!("Body visibility change failed: {error}"),
         }
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
     }
 
     fn set_assembly_occurrence_grounded(&mut self, occurrence_id: u64, grounded: bool) {
-        let should_change = self
-            .assembly_document
-            .occurrences
-            .get(&occurrence_id)
-            .is_some_and(|occurrence| occurrence.grounded != grounded);
-        if !should_change {
-            return;
-        }
-        let mut candidate = self.assembly_document.clone_authoritative();
-        let Some(occurrence) = candidate.occurrences.get_mut(&occurrence_id) else {
-            return;
+        let command = zerocad_core::assembly::AssemblyCommand::SetOccurrenceGrounded {
+            occurrence_id,
+            grounded,
         };
-        occurrence.grounded = grounded;
-        if candidate.mates.is_some() {
-            let context = self.assembly_mate_context();
-            let solution = zerocad_core::solve_assembly_mates_committed(&candidate, &context);
-            if !solution.converged {
-                self.status_msg = "Grounding change conflicts with the active mate system.".into();
+        let prepared = match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_msg = format!("Grounding change failed: {error}");
                 return;
             }
-            let _ = zerocad_core::apply_mate_solution(&mut candidate, &solution);
-            self.assembly_mate_statuses = solution.statuses;
+        };
+        if prepared.changes().is_empty() {
+            return;
         }
-        self.push_undo();
-        self.assembly_document = candidate;
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
+
+        if prepared.document().mates.is_some() {
+            let context = self.assembly_mate_context();
+            let finalized = prepared.finalize(|candidate| {
+                let solution = zerocad_core::solve_assembly_mates_committed(candidate, &context);
+                if !solution.converged {
+                    return Err(
+                        "the active mate system conflicts with this grounding change".to_owned(),
+                    );
+                }
+                zerocad_core::apply_mate_solution(candidate, &solution)
+                    .map_err(|error| error.to_string())?;
+                Ok(solution)
+            });
+            let (prepared, solution) = match finalized {
+                Ok(result) => result,
+                Err(error) => {
+                    self.status_msg = format!("Grounding change failed: {error}");
+                    return;
+                }
+            };
+            self.assembly_mate_statuses = solution.statuses.clone();
+            self.commit_prepared_assembly_command(prepared, true);
+        } else {
+            self.commit_prepared_assembly_command(prepared, true);
+        }
     }
 
     fn commit_assembly_occurrence_rename(&mut self, occurrence_id: u64, name: String) {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
-            self.status_msg = "Component name cannot be empty.".into();
-            return;
+        let command = zerocad_core::assembly::AssemblyCommand::RenameOccurrence {
+            occurrence_id,
+            name,
+        };
+        match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => {
+                self.commit_prepared_assembly_command(prepared, false);
+                self.assembly_rename_occurrence = None;
+            }
+            Err(error) => self.status_msg = format!("Rename failed: {error}"),
         }
-        if self
-            .assembly_document
-            .occurrences
-            .values()
-            .any(|occurrence| {
-                occurrence.id != occurrence_id && occurrence.name.eq_ignore_ascii_case(&name)
-            })
-        {
-            self.status_msg = format!("A component named `{name}` already exists.");
-            return;
-        }
-        let unchanged = self
-            .assembly_document
-            .occurrences
-            .get(&occurrence_id)
-            .is_none_or(|occurrence| occurrence.name == name);
-        if unchanged {
-            self.assembly_rename_occurrence = None;
-            return;
-        }
-        self.push_undo();
-        if let Some(occurrence) = self.assembly_document.occurrences.get_mut(&occurrence_id) {
-            occurrence.name = name;
-        }
-        self.assembly_rename_occurrence = None;
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
     }
 
     fn set_assembly_occurrence_transform(
@@ -1421,7 +1460,9 @@ impl ZeroCadApp {
             return;
         }
         if !self.assembly_transform_edit_active {
-            self.push_undo();
+            if !solver_controlled {
+                self.push_undo();
+            }
             self.assembly_transform_edit_active = true;
         }
         if solver_controlled {
@@ -1466,20 +1507,18 @@ impl ZeroCadApp {
             return;
         };
         let context = self.assembly_mate_context();
-        match zerocad_core::apply_pose_target_transactionally(
-            &mut self.assembly_document,
+        match zerocad_core::assembly_solver::prepare_pose_target(
+            &self.assembly_document,
             occurrence_id,
             target,
             &context,
         ) {
-            Ok(solution) => {
+            Ok((candidate, solution)) => {
                 self.assembly_mate_statuses = solution.statuses;
-                self.document_revision = self.document_revision.wrapping_add(1);
-                self.recovery.note_edit(self.current_project_snapshot());
+                self.commit_candidate_assembly_document(candidate, false);
                 self.status_msg = "Moved solver-constrained component.".into();
             }
             Err(error) => {
-                self.undo_stack.pop();
                 self.solve_loaded_assembly_mates();
                 self.status_msg = format!(
                     "Placement target conflicts with active mates; the component was restored: {error}"
@@ -1493,117 +1532,62 @@ impl ZeroCadApp {
         let Some(source_id) = self.selected_assembly_occurrence else {
             return;
         };
-        let Some(source) = self.assembly_document.occurrences.get(&source_id).cloned() else {
+        let command = zerocad_core::assembly::AssemblyCommand::DuplicateOccurrence {
+            occurrence_id: source_id,
+        };
+        let prepared = match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_msg = format!("Duplicate failed: {error}");
+                return;
+            }
+        };
+        let Some(new_id) = prepared.changes().added_occurrences.iter().next().copied() else {
             return;
         };
-        if self.assembly_document.occurrences.len() >= 10_000 {
-            self.status_msg = "Assembly occurrence limit reached.".into();
-            return;
-        }
-        let new_id = self.assembly_document.next_occurrence_id;
-        let Some(next_id) = new_id.checked_add(1) else {
-            self.status_msg = "Assembly occurrence id space is exhausted.".into();
-            return;
-        };
-        let definition_name = self.assembly_document.definitions[&source.definition_model_hash]
-            .name
-            .clone();
-        self.push_undo();
-        self.assembly_document.occurrences.insert(
-            new_id,
-            zerocad_core::AssemblyOccurrence {
-                id: new_id,
-                definition_model_hash: source.definition_model_hash,
-                name: format!("{definition_name}:{new_id}"),
-                manual_placement: source.manual_placement,
-                grounded: false,
-                resolved_placement_override: None,
-            },
-        );
-        self.assembly_document.next_occurrence_id = next_id;
-        if self
-            .assembly_document
-            .presentation
-            .hidden_occurrences
-            .contains(&source_id)
-        {
-            self.assembly_document
-                .presentation
-                .hidden_occurrences
-                .insert(new_id);
-        }
-        let hidden_source_bodies: Vec<String> = self
-            .assembly_document
-            .presentation
-            .hidden_bodies
-            .iter()
-            .filter(|(id, _)| *id == source_id)
-            .map(|(_, body_id)| body_id.clone())
-            .collect();
-        self.assembly_document.presentation.hidden_bodies.extend(
-            hidden_source_bodies
-                .into_iter()
-                .map(|body_id| (new_id, body_id)),
-        );
+        self.commit_prepared_assembly_command(prepared, true);
         self.selected_assembly_occurrence = Some(new_id);
-        self.document_revision = self.document_revision.wrapping_add(1);
-        self.recovery.note_edit(self.current_project_snapshot());
-        self.rebuild_assembly_scene();
     }
 
     fn delete_selected_assembly_occurrence(&mut self) {
         let Some(occurrence_id) = self.selected_assembly_occurrence else {
             return;
         };
-        let Some(occurrence) = self
-            .assembly_document
-            .occurrences
-            .get(&occurrence_id)
-            .cloned()
-        else {
-            return;
-        };
-        self.push_undo();
-        self.assembly_document.occurrences.remove(&occurrence_id);
-        self.assembly_document
-            .presentation
-            .hidden_occurrences
-            .remove(&occurrence_id);
-        self.assembly_document
-            .presentation
-            .hidden_bodies
-            .retain(|(id, _)| *id != occurrence_id);
-        if let Some(mate_set) = self.assembly_document.mates.as_mut() {
-            mate_set.mates.retain(|_, mate| {
-                mate.first.occurrence_id != occurrence_id
-                    && mate
-                        .second
-                        .as_ref()
-                        .is_none_or(|entity| entity.occurrence_id != occurrence_id)
-            });
-        }
-        let definition_still_used = self
-            .assembly_document
-            .occurrences
-            .values()
-            .any(|remaining| remaining.definition_model_hash == occurrence.definition_model_hash);
-        if !definition_still_used {
-            self.assembly_document
-                .definitions
-                .remove(&occurrence.definition_model_hash);
-            self.assembly_definition_geometry
-                .remove(&occurrence.definition_model_hash);
-            self.assembly_unresolved_definitions
-                .remove(&occurrence.definition_model_hash);
-        }
-        if self.assembly_document.mates.is_some() {
-            let context = self.assembly_mate_context();
-            let solution =
-                zerocad_core::solve_assembly_mates_committed(&self.assembly_document, &context);
-            if solution.converged {
-                let _ = zerocad_core::apply_mate_solution(&mut self.assembly_document, &solution);
-                self.assembly_mate_statuses = solution.statuses;
+        let command = zerocad_core::assembly::AssemblyCommand::DeleteOccurrence { occurrence_id };
+        let prepared = match self.assembly_document.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_msg = format!("Delete failed: {error}");
+                return;
             }
+        };
+        let context = self.assembly_mate_context();
+        let finalized = prepared.finalize(|candidate| -> Result<_, String> {
+            if candidate.mates.is_none() {
+                return Ok(None);
+            }
+            let solution = zerocad_core::solve_assembly_mates_committed(candidate, &context);
+            if solution.converged {
+                zerocad_core::apply_mate_solution(candidate, &solution)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(Some(solution))
+        });
+        let (prepared, solution) = match finalized {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_msg = format!("Delete failed: {error}");
+                return;
+            }
+        };
+        let (changes, previous) = prepared.commit(&mut self.assembly_document);
+        self.push_replaced_assembly_undo(previous);
+        for hash in &changes.removed_definitions {
+            self.assembly_definition_geometry.remove(hash);
+            self.assembly_unresolved_definitions.remove(hash);
+        }
+        if let Some(solution) = solution.filter(|solution| solution.converged) {
+            self.assembly_mate_statuses = solution.statuses;
         }
         // Never auto-ground another occurrence. Future solver state must not
         // move merely because a grounded component was deleted.
@@ -2432,4 +2416,86 @@ fn normalize3(vector: [f64; 3]) -> Option<[f64; 3]> {
 
 fn dot3(first: [f64; 3], second: [f64; 3]) -> f64 {
     first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn assembly_app() -> ZeroCadApp {
+        let mut app = ZeroCadApp::new();
+        app.project_kind = zerocad_core::ProjectKind::Assembly;
+        let hash = [31; 32];
+        let mut document = zerocad_core::AssemblyDocument::new();
+        document.definitions.insert(
+            hash,
+            Arc::new(zerocad_core::AssemblyDefinition {
+                model_hash: hash,
+                name: "Bracket".into(),
+                source_basename: None,
+                compact_snapshot: Arc::new(vec![1]),
+            }),
+        );
+        for id in 1..=2 {
+            document.occurrences.insert(
+                id,
+                zerocad_core::AssemblyOccurrence {
+                    id,
+                    definition_model_hash: hash,
+                    name: format!("Bracket:{id}"),
+                    manual_placement: zerocad_core::RigidPlacement::IDENTITY,
+                    grounded: false,
+                    resolved_placement_override: None,
+                },
+            );
+        }
+        document.next_occurrence_id = 3;
+        app.assembly_document = document;
+        app
+    }
+
+    #[test]
+    fn staged_rename_pushes_undo_only_after_validation() {
+        let mut app = assembly_app();
+        let revision = app.document_revision;
+        app.commit_assembly_occurrence_rename(1, "Mounting Bracket".into());
+
+        assert_eq!(
+            app.assembly_document.occurrences[&1].name,
+            "Mounting Bracket"
+        );
+        assert_eq!(app.undo_stack.len(), 1);
+        assert_eq!(app.document_revision, revision.wrapping_add(1));
+
+        app.undo();
+        assert_eq!(app.assembly_document.occurrences[&1].name, "Bracket:1");
+        app.redo();
+        assert_eq!(
+            app.assembly_document.occurrences[&1].name,
+            "Mounting Bracket"
+        );
+    }
+
+    #[test]
+    fn failed_or_unchanged_commands_do_not_create_history() {
+        let mut app = assembly_app();
+        let original = app.assembly_document.clone();
+        let revision = app.document_revision;
+
+        app.commit_assembly_occurrence_rename(1, "Bracket:2".into());
+        assert_eq!(app.assembly_document, original);
+        assert!(app.undo_stack.is_empty());
+        assert_eq!(app.document_revision, revision);
+
+        app.set_assembly_occurrence_visible(1, true);
+        assert_eq!(app.assembly_document, original);
+        assert!(app.undo_stack.is_empty());
+        assert_eq!(app.document_revision, revision);
+
+        app.edit_assembly_mate(99, MateEditAction::Delete);
+        assert_eq!(app.assembly_document, original);
+        assert!(app.undo_stack.is_empty());
+        assert_eq!(app.document_revision, revision);
+    }
 }

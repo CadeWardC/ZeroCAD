@@ -41,8 +41,8 @@ pub fn cylinder_solid(r: f32, h: f32) -> Option<KernelSolid> {
 /// laterals; co-circular runs (a drawn circle, a sketch-fillet arc) are rebuilt
 /// into true circular-arc edges by [`loop_to_wire`] so they sweep to *smooth*
 /// cylindrical walls instead of a fan of facets. Holed profiles try the holed
-/// plane first and fall back to the outer boundary alone if the kernel can't
-/// attach it.
+/// plane without ever discarding its inner wires. A failed holed extrusion is
+/// unresolved geometry; filling the holes would silently change the model.
 ///
 /// OpenRCAD's boolean engine resolves native cylinder cuts/joins/bosses
 /// watertight (see the kernel's `repro_cylinder` tests), so feeding it smooth
@@ -82,23 +82,15 @@ pub fn extruded_region_solid_with_arcs(
             return Some(solid);
         }
     }
-    build_extrusion_solid_arcs(points, holes, depth as f64, cs, true, arc_circles).or_else(|| {
-        // Last resort: retry without inner wires. This can only be reached
-        // when the holed build failed, and it trades the holes for a solid —
-        // acceptable for noise-level phantom holes, but a REAL hole silently
-        // becoming filled material is exactly the class of quiet wrongness the
-        // extrude diagnostics exist to prevent. Say so.
-        if !holes.is_empty() {
-            log::warn!(
-                "extrusion fell back to building without its {} inner wire(s); \
-                 holes are missing from the resulting solid",
-                holes.len()
-            );
-        }
-        build_extrusion_solid_arcs(points, &[], depth as f64, cs, true, arc_circles)
-    })
+    build_extrusion_solid_arcs(points, holes, depth as f64, cs, true, arc_circles)
 }
 
+/// The sampled compatibility builder creates one lateral B-Rep face per
+/// boundary chord. Above this limit a failed analytic glyph would turn into
+/// hundreds or thousands of faces and can monopolize prism sewing/validation
+/// for tens of seconds. Legacy sketches without analytic provenance retain
+/// their historical path; this gate applies only after an exact analytic build
+/// was attempted and rejected.
 /// Extrude a detected sketch region from its exact arrangement when available.
 /// Documents loaded from older payloads and unsupported analytic curve pairs
 /// continue through the established sampled/arc-refit compatibility path.
@@ -108,13 +100,58 @@ pub fn extruded_sketch_region_solid(
     cs: &crate::geometry::CoordinateSystem,
     arc_circles: &[((f32, f32), f32)],
 ) -> Option<KernelSolid> {
-    region
-        .analytic
-        .as_ref()
-        .and_then(|analytic| build_analytic_extrusion_solid(analytic, f64::from(depth), cs))
-        .or_else(|| {
-            extruded_region_solid_with_arcs(&region.boundary, &region.holes, depth, cs, arc_circles)
-        })
+    if let Some(analytic) = region.analytic.as_ref() {
+        if let Some(solid) = build_analytic_extrusion_solid(analytic, f64::from(depth), cs) {
+            return Some(solid);
+        }
+        let sampled_edges = region.sampled_edge_count();
+        if sampled_edges > MAX_SAMPLED_PRISM_EDGES {
+            log::warn!(
+                "analytic sketch extrusion failed; sampled fallback skipped because its \
+                 {sampled_edges} boundary edges exceed the safety limit of \
+                 {MAX_SAMPLED_PRISM_EDGES}; the feature remains unresolved"
+            );
+            return None;
+        }
+    }
+    extruded_region_solid_with_arcs(&region.boundary, &region.holes, depth, cs, arc_circles)
+}
+
+#[cfg(test)]
+mod extrusion_safety_tests {
+    use super::*;
+
+    #[test]
+    fn failed_holed_profile_never_retries_as_filled_material() {
+        let outer = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+        assert!(
+            extruded_region_solid(&outer, &[], 2.0, &crate::geometry::CoordinateSystem::XY)
+                .is_some(),
+            "the outer profile alone is intentionally valid for this regression"
+        );
+
+        // A coincident inner wire is invalid. The old `.or_else` path silently
+        // dropped this hole and returned the valid filled square above, changing
+        // the user's model. Invalid holed topology must remain unresolved.
+        assert!(
+            extruded_region_solid(
+                &outer,
+                std::slice::from_ref(&outer),
+                2.0,
+                &crate::geometry::CoordinateSystem::XY,
+            )
+            .is_none(),
+            "a failed holed profile must not be retried with its holes removed"
+        );
+    }
+
+    #[test]
+    fn analytic_fallback_budget_is_below_dense_glyph_profiles() {
+        // The Segoe UI '2' regression sampled to 725 straight edges. Keep a
+        // structural assertion here so a future limit increase cannot quietly
+        // re-enable the multi-second sampled prism path for dense glyphs.
+        const { assert!(MAX_SAMPLED_PRISM_EDGES < 725) };
+    }
 }
 
 /// Find the kernel faces of `solid` geometrically matching a captured face
@@ -4346,6 +4383,15 @@ pub fn extruded_region_display_mesh(
     // clean rim wireframes.
     if holes.is_empty() && circle_profile(points).is_some() {
         return MockMesh::make_extruded_sketch(points, holes, depth, cs);
+    }
+
+    let sampled_edges = points.len() + holes.iter().map(Vec::len).sum::<usize>();
+    if sampled_edges > MAX_SAMPLED_PRISM_EDGES {
+        log::warn!(
+            "synchronous sampled display prism skipped because its {sampled_edges} boundary \
+             edges exceed the safety limit of {MAX_SAMPLED_PRISM_EDGES}"
+        );
+        return MockMesh::empty();
     }
 
     if let Some(solid) = rect_minus_circle_region_solid(points, holes, depth, cs) {

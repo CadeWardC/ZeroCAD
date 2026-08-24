@@ -1,5 +1,11 @@
 use super::*;
 
+/// Maximum number of lateral faces a synchronous sampled compatibility prism
+/// may create. Dense analytic profiles (especially text) must stay on their
+/// exact curve path or move to background evaluation; one face per display
+/// chord can otherwise block the UI for tens of seconds.
+pub(crate) const MAX_SAMPLED_PRISM_EDGES: usize = 256;
+
 /// Tessellation chordal tolerance (in model units / mm). 0.05mm produces a
 /// smooth cylinder without explosive triangle counts. Will become a user-facing
 /// setting in a later phase.
@@ -439,7 +445,7 @@ pub(crate) fn analytic_loop_to_wire<P>(
     sketch_loop: &openrcad::sketch::ArrangementLoop<P>,
     cs: &crate::geometry::CoordinateSystem,
 ) -> Option<Wire> {
-    use openrcad::geom2d::{CurveSpan, GeomCurve2d};
+    use openrcad::geom2d::{Curve2d, CurveSpan, GeomCurve2d};
 
     fn point_on_plane(
         point: openrcad::foundation::Pnt2d,
@@ -527,34 +533,69 @@ pub(crate) fn analytic_loop_to_wire<P>(
     // exactly consistent with the vertices; curved edges keep their analytic
     // curve and only the vertex moves, which stays within per-entity tolerance.
     //
-    // Welding is only legitimate for noise, so it is BOUNDED: the limit is the
-    // f32 representation floor at this loop's own coordinate magnitude (the
-    // same scale-derived formula the sketch layer uses to decide when two
-    // points are the same point). Consecutive spans of an arrangement loop
-    // share a DCEL vertex, so in a well-formed loop the disagreement is far
-    // below that. If it ever is not, the loop carries a REAL gap rather than
-    // quantization noise, and closing it would silently deform the model — so
-    // bail to the sampled builder instead, which is what `None` selects.
-    let count = sketch_loop.spans.len();
-    let scale = sketch_loop
-        .spans
-        .iter()
-        .flat_map(|span| {
-            let (start, end) = (span.start(), span.end());
-            [
-                start.x().abs(),
-                start.y().abs(),
-                end.x().abs(),
-                end.y().abs(),
-            ]
-        })
-        .fold(0.0_f64, f64::max);
-    let weld_limit = (scale * f64::from(f32::EPSILON) * 8.0).max(f64::EPSILON * 64.0);
+    // Welding is only legitimate for noise, so it is BOUNDED by the tolerance
+    // that actually built the arrangement. Recomputing that tolerance from an
+    // individual glyph loop is incorrect: a small counter can belong to a much
+    // larger sketch whose f32 precision budget was necessarily larger. Both
+    // endpoint evaluations were assigned to one DCEL vertex within the stored
+    // tolerance; their pairwise disagreement can therefore be at most two such
+    // envelopes. Anything beyond that is inconsistent topology, so bail to the
+    // sampled builder instead of silently closing it.
+    let weld_limit = sketch_loop.junction_tolerance * 2.0;
+    if !weld_limit.is_finite() || weld_limit <= 0.0 {
+        return None;
+    }
+
+    // OpenType contours may overlap and the arrangement can expose the overlap
+    // seam as two immediately adjacent spans traversing the exact same locus in
+    // opposite directions. That out-and-back spur encloses no area, but keeping
+    // both coedges makes its swept connector belong to four faces. Cancel only
+    // true geometric retraces: matching endpoints alone is insufficient because
+    // two distinct arcs with common endpoints can bound a legitimate lens.
+    let spans_cancel = |first: &CurveSpan<P>, second: &CurveSpan<P>| {
+        let endpoints_match = first.start().distance(&second.end()) <= weld_limit
+            && first.end().distance(&second.start()) <= weld_limit;
+        endpoints_match
+            && (0..=4).all(|sample| {
+                let fraction = f64::from(sample) / 4.0;
+                let first_parameter = first.first + (first.last - first.first) * fraction;
+                let second_parameter = second.last + (second.first - second.last) * fraction;
+                first
+                    .curve
+                    .point(first_parameter)
+                    .distance(&second.curve.point(second_parameter))
+                    <= weld_limit
+            })
+    };
+    let mut spans: Vec<&CurveSpan<P>> = Vec::with_capacity(sketch_loop.spans.len());
+    for span in &sketch_loop.spans {
+        if spans
+            .last()
+            .is_some_and(|previous| spans_cancel(previous, span))
+        {
+            spans.pop();
+        } else {
+            spans.push(span);
+        }
+    }
+    while spans.len() >= 2
+        && spans_cancel(
+            spans.last().expect("two spans checked"),
+            spans.first().expect("two spans checked"),
+        )
+    {
+        spans.pop();
+        spans.remove(0);
+    }
+    let count = spans.len();
+    if count < 2 {
+        return None;
+    }
 
     let mut junctions = Vec::with_capacity(count);
     for index in 0..count {
-        let previous_end = point_on_plane(sketch_loop.spans[(index + count - 1) % count].end(), cs);
-        let start = point_on_plane(sketch_loop.spans[index].start(), cs);
+        let previous_end = point_on_plane(spans[(index + count - 1) % count].end(), cs);
+        let start = point_on_plane(spans[index].start(), cs);
         if previous_end.distance(&start) > weld_limit {
             log::warn!(
                 "analytic sketch loop junction {index} disagrees by {:e} (limit {weld_limit:e}); \
@@ -571,23 +612,218 @@ pub(crate) fn analytic_loop_to_wire<P>(
     }
 
     let mut edges = Vec::with_capacity(count);
-    for (index, span) in sketch_loop.spans.iter().enumerate() {
+    for (index, span) in spans.into_iter().enumerate() {
         let start = junctions[index];
         let end = junctions[(index + 1) % count];
         let edge = if matches!(span.curve, GeomCurve2d::Line(_)) {
             Edge::between_points(start, end)
         } else {
-            Edge::new(
-                Some(lift_curve(span, cs)?),
+            let curve = lift_curve(span, cs)?;
+            let endpoint_residual = curve
+                .point(span.first)
+                .distance(&start)
+                .max(curve.point(span.last).distance(&end));
+            Edge::new_with_tolerance(
+                Some(curve),
                 span.first,
                 span.last,
                 Vertex::new(start),
                 Vertex::new(end),
+                endpoint_residual.max(openrcad::foundation::tolerance::CONFUSION),
             )
         };
         edges.push(edge);
     }
     (edges.len() >= 2).then(|| Wire::from_edges(edges))
+}
+
+#[cfg(test)]
+mod analytic_loop_tests {
+    use super::*;
+    use openrcad::foundation::{Dir2d, Pnt2d};
+    use openrcad::geom2d::{CurveSpan, GeomCurve2d, Line2d};
+
+    fn line_span(origin: Pnt2d, direction: Dir2d, length: f64) -> CurveSpan<()> {
+        CurveSpan::new(
+            GeomCurve2d::line(Line2d::from_point_dir(origin, direction)),
+            0.0,
+            length,
+            (),
+        )
+    }
+
+    fn rectangle_loop(x0: f64, y0: f64, x1: f64, y1: f64) -> openrcad::sketch::ArrangementLoop<()> {
+        openrcad::sketch::ArrangementLoop {
+            spans: vec![
+                line_span(Pnt2d::new(x0, y0), Dir2d::dx(), x1 - x0),
+                line_span(Pnt2d::new(x1, y0), Dir2d::dy(), y1 - y0),
+                line_span(
+                    Pnt2d::new(x1, y1),
+                    Dir2d::try_new(-1.0, 0.0).expect("constant direction is non-zero"),
+                    x1 - x0,
+                ),
+                line_span(
+                    Pnt2d::new(x0, y1),
+                    Dir2d::try_new(0.0, -1.0).expect("constant direction is non-zero"),
+                    y1 - y0,
+                ),
+            ],
+            signed_area: (x1 - x0) * (y1 - y0),
+            junction_tolerance: f64::EPSILON * 64.0,
+        }
+    }
+
+    #[test]
+    fn analytic_loop_weld_accepts_compounded_f32_endpoint_noise() {
+        // This reproduces the reported Arial text failure: the 38.2 mm enclosing
+        // sketch arranged at about 2.689e-5, while the old extrusion code
+        // guessed a smaller 1.488e-5 limit from the glyph loop and rejected the
+        // shared vertex at a 2.348e-5 disagreement.
+        let delta = 2.347_908_593_008_075_6e-5;
+        let loop_ = openrcad::sketch::ArrangementLoop {
+            spans: vec![
+                line_span(Pnt2d::origin(), Dir2d::dx(), 16.0),
+                line_span(Pnt2d::new(16.0, delta), Dir2d::dy(), 10.0),
+                line_span(
+                    Pnt2d::new(16.0, 10.0),
+                    Dir2d::try_new(-1.0, 0.0).expect("constant direction is non-zero"),
+                    16.0,
+                ),
+                line_span(
+                    Pnt2d::new(0.0, 10.0),
+                    Dir2d::try_new(0.0, -1.0).expect("constant direction is non-zero"),
+                    10.0,
+                ),
+            ],
+            signed_area: 160.0,
+            junction_tolerance: 2.689_361_572_265_625e-5,
+        };
+
+        let wire = analytic_loop_to_wire(&loop_, &crate::geometry::CoordinateSystem::XY)
+            .expect("topologically shared noisy junctions should weld");
+        assert_eq!(wire.edges().len(), 4);
+        assert!(wire.is_closed());
+    }
+
+    #[test]
+    fn analytic_compound_prism_regularizes_mixed_text_voids() {
+        // OpenType explicitly permits overlapping contours. After those
+        // contours are classified as voids in a selected "around the text"
+        // face, feeding both loops directly to one prism can give one swept
+        // connector four face uses. The exact fallback must regularize their
+        // union instead of dropping into a chord-per-face sampled extrusion.
+        let region = openrcad::sketch::ArrangementRegion {
+            outer: rectangle_loop(0.0, 0.0, 10.0, 10.0),
+            holes: vec![
+                rectangle_loop(2.0, 2.0, 6.0, 6.0),
+                rectangle_loop(4.0, 4.0, 8.0, 8.0),
+                rectangle_loop(1.0, 7.0, 2.0, 8.0),
+            ],
+            area: 71.0,
+        };
+
+        let solid =
+            build_analytic_extrusion_solid(&region, 2.0, &crate::geometry::CoordinateSystem::XY)
+                .expect("overlapping analytic voids should be regularized exactly");
+        let mesh = MockMesh::try_from_solid(&solid).expect("regularized solid should tessellate");
+        let volume = mesh
+            .mass_properties()
+            .expect("regularized solid should enclose volume")
+            .volume;
+        assert!(
+            (volume - 142.0).abs() < 1.0e-3,
+            "expected (100 - union(16, 16) - 1) * 2 = 142, got {volume}"
+        );
+    }
+}
+
+fn prism_single_analytic_wire(
+    plane: &GeomSurface,
+    wire: Wire,
+    sweep: GeomVec,
+    operation: &str,
+) -> Result<KernelSolid, String> {
+    let face = Face::new(Some(plane.clone()), wire);
+    consume_operation(
+        operation,
+        openrcad::algo::prism::prism_operation(&face, sweep),
+    )
+    .map(|outcome| outcome.solid)
+}
+
+/// Recover an analytic compound face that the one-shot prism cannot represent
+/// manifoldly. Font outlines are allowed to overlap, so two selected void
+/// contours can share swept connector topology; a compound prism then gives
+/// that connector four face uses. Sweeping each exact wire independently and
+/// subtracting the void solids computes the regularized set difference without
+/// replacing curves with hundreds of sampled line faces.
+fn build_regularized_analytic_extrusion(
+    plane: &GeomSurface,
+    outer: Wire,
+    inners: Vec<Wire>,
+    sweep: GeomVec,
+) -> Result<KernelSolid, String> {
+    let outer_solid =
+        prism_single_analytic_wire(plane, outer, sweep, "analytic sketch outer prism")?;
+    let mut cutters = Vec::with_capacity(inners.len());
+    for (index, inner) in inners.into_iter().enumerate() {
+        let cutter = prism_single_analytic_wire(plane, inner, sweep, "analytic sketch void prism")?;
+        cutters.push((index, cutter));
+    }
+
+    // Unite every cutter pair the kernel can combine. Intersecting/touching
+    // cutters therefore become one regular volume before cutting the outer
+    // prism, while disjoint cutters remain separate if the kernel declines to
+    // fuse disconnected volumes. A new cutter can bridge multiple existing
+    // groups, so keep merging until it has been tested against every group.
+    let mut cutter_groups: Vec<KernelSolid> = Vec::new();
+    for (_, cutter) in cutters {
+        let mut merged = cutter;
+        let mut group_index = 0;
+        while group_index < cutter_groups.len() {
+            match union_diagnostic(&merged, &cutter_groups[group_index]) {
+                Ok(union) => {
+                    merged = union;
+                    cutter_groups.swap_remove(group_index);
+                }
+                Err(_) => group_index += 1,
+            }
+        }
+        cutter_groups.push(merged);
+    }
+
+    let mut solid = outer_solid;
+    for (index, cutter) in cutter_groups.into_iter().enumerate() {
+        solid = difference_diagnostic(&solid, &cutter).map_err(|error| {
+            format!(
+                "analytic sketch void group {} could not be subtracted during exact regularization: {error}",
+                index + 1
+            )
+        })?;
+    }
+    Ok(solid)
+}
+
+fn analytic_void_boundaries_intersect<P>(holes: &[openrcad::sketch::ArrangementLoop<P>]) -> bool {
+    for first_index in 0..holes.len() {
+        for second in &holes[first_index + 1..] {
+            for first_span in &holes[first_index].spans {
+                for second_span in &second.spans {
+                    if openrcad::sketch::intersect_curve_spans(
+                        first_span,
+                        second_span,
+                        openrcad::sketch::ArrangementOptions::default(),
+                    )
+                    .is_ok_and(|intersections| {
+                        intersections.coincident || !intersections.points.is_empty()
+                    }) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Sweep a provenance-bearing analytic region. This is deliberately separate
@@ -620,25 +856,71 @@ pub(crate) fn build_analytic_extrusion_solid<P>(
     let normal = newell_normal(&outer_points)?;
     let plane = GeomSurface::plane(Plane::from_point_normal(outer_points[0], normal));
     let face = if inners.is_empty() {
-        Face::new(Some(plane), outer)
+        Face::new(Some(plane.clone()), outer.clone())
     } else {
-        Face::with_wires(Some(plane), Some(outer), inners, Orientation::Forward)
+        Face::with_wires(
+            Some(plane.clone()),
+            Some(outer.clone()),
+            inners.clone(),
+            Orientation::Forward,
+        )
     };
     let sweep = GeomVec::new(
         f64::from(cs.n.x) * depth,
         f64::from(cs.n.y) * depth,
         f64::from(cs.n.z) * depth,
     );
-    consume_operation(
+    if analytic_void_boundaries_intersect(&region.holes) {
+        log::debug!(
+            "analytic sketch void boundaries overlap; using exact outer-minus-void regularization"
+        );
+        return build_regularized_analytic_extrusion(&plane, outer, inners, sweep)
+            .map_err(|error| log::warn!("analytic sketch exact regularization failed: {error}"))
+            .ok();
+    }
+    let direct = consume_operation(
         "analytic sketch prism extrusion",
         openrcad::algo::prism::prism_operation(&face, sweep),
-    )
-    // The caller treats `None` as "try the next builder", so the kernel's
-    // reason must not vanish with it — log it, or a failed face is
-    // undiagnosable (a region that silently drops out of an extrude).
-    .map_err(|error| log::warn!("{error}"))
-    .ok()
-    .map(|outcome| outcome.solid)
+    );
+    match direct {
+        Ok(outcome) => Some(outcome.solid),
+        Err(direct_error) if !inners.is_empty() => {
+            log::warn!(
+                "{direct_error}; retrying as exact outer-minus-void solids to regularize shared text contours"
+            );
+            build_regularized_analytic_extrusion(&plane, outer, inners, sweep)
+                .map_err(|fallback_error| {
+                    log::warn!(
+                        "analytic sketch exact regularization failed after the compound prism was rejected: {fallback_error}"
+                    )
+                })
+                .ok()
+        }
+        Err(error) => {
+            // The caller treats `None` as "try the next builder", so the
+            // kernel's reason must not vanish with it — log it, or a failed
+            // face is undiagnosable (a region that silently drops out).
+            log::warn!("{error}");
+            None
+        }
+    }
+}
+
+/// Lift a runtime analytic sketch region onto a modeling plane without first
+/// sweeping it into a solid. Profile-based operations use this to combine many
+/// text contours before paying for one final prism construction.
+pub(crate) fn analytic_region_wires(
+    region: &crate::sketch::Region,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<(Wire, Vec<Wire>)> {
+    let analytic = region.analytic.as_ref()?;
+    let outer = analytic_loop_to_wire(&analytic.outer, cs)?;
+    let inners = analytic
+        .holes
+        .iter()
+        .map(|hole| analytic_loop_to_wire(hole, cs))
+        .collect::<Option<Vec<_>>>()?;
+    Some((outer, inners))
 }
 
 pub(crate) fn build_extrusion_solid(

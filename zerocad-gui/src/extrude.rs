@@ -8,9 +8,115 @@ use zerocad_core::{
     detect_regions, CoordinateSystem, ExtrudeMode, FeatureNode, FeatureType, MockMesh, Region,
 };
 
-use crate::{PendingCommitVisual, PendingVisualMode, SharedBodyMeshes, ZeroCadApp};
+use crate::{
+    PendingCommitVisual, PendingExtrudeVisibility, PendingVisualMode, SharedBodyMeshes, ZeroCadApp,
+};
 
 const EXTRUDE_PREVIEW_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Keep the UI-thread ghost below the same one-lateral-face-per-chord budget as
+/// the core sampled prism fallback. Larger analytic profiles are evaluated by
+/// the existing background worker instead.
+const MAX_SYNCHRONOUS_PREVIEW_EDGES: usize = 256;
+
+/// Build a display-only extrude ghost directly from the already-sampled region.
+/// This deliberately does not create B-Rep topology: dense text can contain more
+/// than a thousand display chords, and one kernel face per chord is precisely
+/// the expensive compatibility path the safety limit prevents. The exact body
+/// still comes from the background evaluator; this mesh only keeps push/pull
+/// feedback immediate while that result is pending.
+fn lightweight_extrude_ghost(region: &Region, depth: f32, cs: &CoordinateSystem) -> MockMesh {
+    let mut mesh = MockMesh::empty();
+    if region.boundary.len() < 3 || depth.abs() < f32::EPSILON {
+        return mesh;
+    }
+
+    let sweep = cs.n.mul(depth);
+    let sweep_sign = depth.signum();
+    let bottom_normal = cs.n.mul(-sweep_sign);
+    let top_normal = cs.n.mul(sweep_sign);
+
+    let push_triangle =
+        |mesh: &mut MockMesh, mut points: [zerocad_core::Vec3; 3], normal, face_id| {
+            let geometric = points[1].sub(points[0]).cross(points[2].sub(points[0]));
+            if geometric.dot(normal) < 0.0 {
+                points.swap(1, 2);
+            }
+            let base = (mesh.vertices.len() / 6) as u32;
+            for point in points {
+                mesh.vertices
+                    .extend_from_slice(&[point.x, point.y, point.z, normal.x, normal.y, normal.z]);
+            }
+            mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+            mesh.face_ids.push(face_id);
+        };
+
+    for triangle in crate::geom2d::triangulate_region_fill(region) {
+        let bottom = triangle.map(|(u, v)| cs.unproject(u, v));
+        let top = bottom.map(|point| point.add(sweep));
+        push_triangle(&mut mesh, bottom, bottom_normal, 0);
+        push_triangle(&mut mesh, top, top_normal, 1);
+    }
+
+    let signed_area = |points: &[(f32, f32)]| {
+        points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+            .map(|(&(ax, ay), &(bx, by))| ax * by - bx * ay)
+            .sum::<f32>()
+            * 0.5
+    };
+    let mut face_id = 2_u32;
+    for (loop_points, is_hole) in std::iter::once((&region.boundary, false))
+        .chain(region.holes.iter().map(|hole| (hole, true)))
+    {
+        let area_sign = if signed_area(loop_points) < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let material_outward = area_sign * if is_hole { -1.0 } else { 1.0 };
+        for (&a, &b) in loop_points
+            .iter()
+            .zip(loop_points.iter().cycle().skip(1))
+            .take(loop_points.len())
+        {
+            let a_bottom = cs.unproject(a.0, a.1);
+            let b_bottom = cs.unproject(b.0, b.1);
+            if a_bottom.sub(b_bottom).length() <= f32::EPSILON {
+                continue;
+            }
+            let a_top = a_bottom.add(sweep);
+            let b_top = b_bottom.add(sweep);
+            let wall_normal =
+                cs.u.mul(b.1 - a.1)
+                    .sub(cs.v.mul(b.0 - a.0))
+                    .mul(material_outward)
+                    .normalize();
+            push_triangle(&mut mesh, [a_bottom, b_bottom, b_top], wall_normal, face_id);
+            push_triangle(&mut mesh, [a_bottom, b_top, a_top], wall_normal, face_id);
+            face_id += 1;
+        }
+
+        // Two clean profile rings communicate depth without drawing one
+        // vertical wire for every sampled glyph chord.
+        for (&a, &b) in loop_points
+            .iter()
+            .zip(loop_points.iter().cycle().skip(1))
+            .take(loop_points.len())
+        {
+            for offset in [zerocad_core::Vec3::ZERO, sweep] {
+                let start = cs.unproject(a.0, a.1).add(offset);
+                let end = cs.unproject(b.0, b.1).add(offset);
+                let base = (mesh.edge_vertices.len() / 3) as u32;
+                mesh.edge_vertices
+                    .extend_from_slice(&[start.x, start.y, start.z, end.x, end.y, end.z]);
+                mesh.edge_indices.extend_from_slice(&[base, base + 1]);
+            }
+        }
+    }
+    mesh
+}
 
 /// The default extrude mode for a freshly started op: a sketch on a body face
 /// pulled **outward** (depth ≥ 0, along the outward face normal) adds material
@@ -49,6 +155,7 @@ mod preview_tests {
                     cs: CoordinateSystem::XY,
                     indices: (0..regions.len()).collect(),
                     regions: regions.clone(),
+                    ink_mask: vec![true; regions.len()],
                     loops: Vec::new(),
                     circles: vec![circle],
                     draft_supported: false,
@@ -92,6 +199,52 @@ mod preview_tests {
         app.toggle_extrude_profile_pick();
         assert!(!app.extrude_profile_pick_active);
     }
+
+    #[test]
+    fn dense_holed_profile_requires_background_preview() {
+        let dense_hole: Vec<(f32, f32)> = (0..300)
+            .map(|index| {
+                let angle = index as f32 / 300.0 * std::f32::consts::TAU;
+                (angle.cos(), angle.sin())
+            })
+            .collect();
+        let region = Region {
+            boundary: vec![(-2.0, -2.0), (2.0, -2.0), (2.0, 2.0), (-2.0, 2.0)],
+            holes: vec![dense_hole],
+            area: 16.0 - std::f32::consts::PI,
+            analytic: None,
+        };
+        let op = ExtrudeOp {
+            targets: vec![ExtrudeTarget {
+                sketch_id: "text_plate".into(),
+                cs: CoordinateSystem::XY,
+                regions: vec![region],
+                indices: vec![0],
+                ink_mask: vec![true],
+                loops: Vec::new(),
+                circles: Vec::new(),
+                draft_supported: false,
+                on_face: false,
+            }],
+            depth: 3.0,
+            depth_text: "3".into(),
+            draft_angle_deg: 0.0,
+            draft_angle_text: "0".into(),
+            focus_request: false,
+            mode: ExtrudeMode::NewBody,
+            on_face: false,
+            mode_user_set: false,
+            pending_face_sketch: None,
+        };
+
+        assert!(op.requires_background_preview());
+        let parts = op.preview_part_meshes(3.0);
+        assert_eq!(parts.len(), 1);
+        assert!(
+            !parts[0].2.indices.is_empty(),
+            "dense profiles need an immediate lightweight ghost while the exact worker runs"
+        );
+    }
 }
 
 /// Faces from one sketch that participate in an extrude, plus the geometry
@@ -102,6 +255,8 @@ pub(crate) struct ExtrudeTarget {
     pub(crate) cs: CoordinateSystem,
     pub(crate) regions: Vec<Region>,
     pub(crate) indices: Vec<usize>,
+    /// Typography-aware material decision aligned with `regions`.
+    pub(crate) ink_mask: Vec<bool>,
     /// The sketch's shape outlines, so the ghost can resolve overlapping-shapes-
     /// as-boolean exactly like the evaluator (dropping the tool-lens region of a
     /// circle-in-rectangle so it reads as a hole). Empty for a direct face
@@ -164,6 +319,22 @@ pub(crate) struct ExtrudeOp {
 }
 
 impl ExtrudeOp {
+    /// True when building the warm ghost would synchronously create too many
+    /// sampled lateral faces. The exact evaluator is already asynchronous, so
+    /// routing these profiles there keeps the window responsive and preserves
+    /// analytic text curves instead of flattening them into display chords.
+    pub(crate) fn requires_background_preview(&self) -> bool {
+        self.targets.iter().any(|target| {
+            let plan =
+                zerocad_core::boolean_region_plan(&target.loops, &target.regions, &target.indices);
+            target.regions.iter().enumerate().any(|(index, region)| {
+                plan.process.get(index).copied().unwrap_or(false)
+                    && target.ink_mask.get(index).copied().unwrap_or(true)
+                    && region.sampled_edge_count() > MAX_SYNCHRONOUS_PREVIEW_EDGES
+            })
+        })
+    }
+
     /// Build the per-target ghost meshes at `depth`, each paired with its
     /// extrusion plane origin and axis so a cached build can later be rescaled
     /// along the axis instead of re-tessellated (curved profiles run the
@@ -182,13 +353,21 @@ impl ExtrudeOp {
             // circle-in-rectangle), so the annulus — which already carries that
             // disc as a hole — renders as a clean prism-with-hole.
             let plan = zerocad_core::boolean_region_plan(&t.loops, &t.regions, &t.indices);
+            let process: Vec<bool> = plan
+                .process
+                .iter()
+                .enumerate()
+                .map(|(index, selected)| {
+                    *selected && t.ink_mask.get(index).copied().unwrap_or(true)
+                })
+                .collect();
             let mut mesh = MockMesh::empty();
             if self.draft_angle_deg.abs() > f32::EPSILON {
                 if !t.draft_supported {
                     return Vec::new();
                 }
                 for (region_index, region) in t.regions.iter().enumerate() {
-                    if !plan.process.get(region_index).copied().unwrap_or(false) {
+                    if !process.get(region_index).copied().unwrap_or(false) {
                         continue;
                     }
                     let Ok(solid) = zerocad_core::drafted_region_solid(
@@ -207,7 +386,7 @@ impl ExtrudeOp {
                 continue;
             }
             let complete_circles =
-                zerocad_core::complete_selected_circles(&t.circles, &t.regions, &plan.process);
+                zerocad_core::complete_selected_circles(&t.circles, &t.regions, &process);
             let mut collapsed_regions = HashSet::new();
             for (circle, indices) in complete_circles {
                 let boundary: Vec<(f32, f32)> = (0..zerocad_core::CIRCLE_SEGS)
@@ -232,15 +411,20 @@ impl ExtrudeOp {
                 if collapsed_regions.contains(&ri) {
                     continue;
                 }
-                if !plan.process.get(ri).copied().unwrap_or(false) {
+                if !process.get(ri).copied().unwrap_or(false) {
                     continue;
                 }
-                mesh.append(zerocad_core::mock_kernel::extruded_region_display_mesh(
-                    &r.boundary,
-                    &r.holes,
-                    depth,
-                    &t.cs,
-                ));
+                let region_mesh = if r.sampled_edge_count() > MAX_SYNCHRONOUS_PREVIEW_EDGES {
+                    lightweight_extrude_ghost(r, depth, &t.cs)
+                } else {
+                    zerocad_core::mock_kernel::extruded_region_display_mesh(
+                        &r.boundary,
+                        &r.holes,
+                        depth,
+                        &t.cs,
+                    )
+                };
+                mesh.append(region_mesh);
             }
             // The true extrusion axis is u×v (cs.n can be flipped on
             // left-handed planes); its sign doesn't matter for rescaling.
@@ -858,6 +1042,7 @@ impl ZeroCadApp {
     ) -> Option<(
         CoordinateSystem,
         Vec<Region>,
+        Vec<bool>,
         bool,
         Vec<zerocad_core::ShapeLoop>,
         Vec<zerocad_core::Circle>,
@@ -903,9 +1088,20 @@ impl ZeroCadApp {
                     let circles = eff.circles.clone();
                     let draft_supported =
                         eff.circles.is_empty() && eff.arcs.is_empty() && eff.splines.is_empty();
+                    let regions = detect_regions(&eff);
+                    let ink_mask = zerocad_core::text::sketch_region_ink_mask(
+                        curves,
+                        shapes,
+                        corner_mods,
+                        mirrors,
+                        solver.as_ref(),
+                        &var_map,
+                        &regions,
+                    );
                     return Some((
                         *cs,
-                        detect_regions(&eff),
+                        regions,
+                        ink_mask,
                         *on_face,
                         loops,
                         circles,
@@ -975,15 +1171,16 @@ impl ZeroCadApp {
         for (sid, mut idxs) in by_sketch {
             idxs.sort();
             idxs.dedup();
-            if let Some((cs, regions, on_face, loops, circles, draft_supported)) =
+            if let Some((cs, regions, ink_mask, on_face, loops, circles, draft_supported)) =
                 self.lookup_sketch(&sid)
             {
-                idxs.retain(|&i| i < regions.len());
+                idxs.retain(|&i| i < regions.len() && ink_mask.get(i).copied().unwrap_or(true));
                 if !idxs.is_empty() {
                     targets.push(ExtrudeTarget {
                         sketch_id: sid,
                         cs,
                         regions,
+                        ink_mask,
                         indices: idxs,
                         on_face,
                         loops,
@@ -1097,6 +1294,7 @@ impl ZeroCadApp {
             targets: vec![ExtrudeTarget {
                 sketch_id: sketch_id.clone(),
                 cs,
+                ink_mask: vec![true; regions.len()],
                 regions,
                 indices,
                 on_face: true,
@@ -1158,9 +1356,9 @@ impl ZeroCadApp {
 
     /// Start an extrude from every face of one sketch (property-panel shortcut).
     pub(crate) fn begin_extrude_whole_sketch(&mut self, sketch_id: &str) {
-        let regions = self
+        let (regions, ink_mask) = self
             .lookup_sketch(sketch_id)
-            .map(|(_, r, _, _, _, _)| r)
+            .map(|(_, regions, ink_mask, _, _, _, _)| (regions, ink_mask))
             .unwrap_or_default();
         if regions.is_empty() {
             self.status_msg =
@@ -1168,6 +1366,7 @@ impl ZeroCadApp {
             return;
         }
         let faces: Vec<(String, usize)> = (0..regions.len())
+            .filter(|index| ink_mask.get(*index).copied().unwrap_or(true))
             .map(|i| (sketch_id.to_string(), i))
             .collect();
         self.begin_extrude_op(faces);
@@ -1242,6 +1441,7 @@ impl ZeroCadApp {
 
         let mut last_id = None;
         let mut count = 0;
+        let mut feature_sketches = Vec::new();
         for t in &op.targets {
             if let Some(id) = self.build_extrude_body(
                 &t.sketch_id,
@@ -1252,13 +1452,13 @@ impl ZeroCadApp {
                 op.draft_angle_deg,
                 draft_angle_expr.clone(),
             ) {
+                feature_sketches.push((id.clone(), t.sketch_id.clone()));
                 last_id = Some(id);
                 count += 1;
-                // The source sketch is consumed into the body — hide it (like
-                // Fusion). The user can unhide it from the browser.
-                self.hidden_nodes.insert(t.sketch_id.clone());
             }
         }
+        self.pending_extrude_visibility =
+            (!feature_sketches.is_empty()).then_some(PendingExtrudeVisibility { feature_sketches });
 
         self.selected_faces.clear();
         if let Some(id) = last_id {
@@ -1268,19 +1468,13 @@ impl ZeroCadApp {
         self.spawn_refine_eval();
         self.status_msg = match op.mode {
             ExtrudeMode::NewBody => {
-                format!("Extruded {} new body(ies). Source sketch hidden.", count)
+                format!("Building {} new body(ies)…", count)
             }
             ExtrudeMode::Join => {
-                format!(
-                    "Joined {} extrude(s) into the model. Source sketch hidden.",
-                    count
-                )
+                format!("Building {} joined extrude(s)…", count)
             }
             ExtrudeMode::Cut => {
-                format!(
-                    "Cut {} profile(s) out of the model. Source sketch hidden.",
-                    count
-                )
+                format!("Building {} extruded cut(s)…", count)
             }
         };
     }

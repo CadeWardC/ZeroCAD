@@ -471,10 +471,14 @@ pub(crate) fn apply_exact_face_extrude(
                 vec![CutTool {
                     smooth: None,
                     exact: Some(exact),
+                    exact_source: None,
                     expanded,
+                    expanded_source: None,
                     smooth_rev: None,
                     exact_rev,
+                    exact_rev_source: None,
                     expanded_rev,
+                    expanded_rev_source: None,
                     circle: None,
                 }],
                 Some(&resolved.body_id),
@@ -532,6 +536,12 @@ fn line_loop(
     Ok(openrcad::sketch::ArrangementLoop {
         spans,
         signed_area: signed_area(points),
+        junction_tolerance: points
+            .iter()
+            .flat_map(|(x, y)| [f64::from(*x).abs(), f64::from(*y).abs()])
+            .fold(0.0_f64, f64::max)
+            .mul_add(f64::from(f32::EPSILON) * 8.0, 0.0)
+            .max(f64::EPSILON * 64.0),
     })
 }
 
@@ -2325,7 +2335,11 @@ fn merge_analytic_regions(
         if spans.len() < 2 || signed_area.abs() <= tolerance * tolerance {
             return None;
         }
-        loops.push(openrcad::sketch::ArrangementLoop { spans, signed_area });
+        loops.push(openrcad::sketch::ArrangementLoop {
+            spans,
+            signed_area,
+            junction_tolerance: tolerance,
+        });
     }
     if used.iter().any(|used| !used) || loops.is_empty() {
         return None;

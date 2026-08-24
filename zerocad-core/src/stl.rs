@@ -459,6 +459,75 @@ pub fn write_binary_stl<'a, W: Write>(
     w.write_all(&meshes_to_binary_stl(meshes))
 }
 
+/// Build a Z-up Wavefront OBJ from named Y-up ZeroCAD meshes. Each non-empty
+/// mesh becomes a separate OBJ object, while vertex indices remain global as
+/// required by the format. OBJ does not declare units, so a header comment
+/// records ZeroCAD's millimetre interchange convention.
+pub fn meshes_to_obj<'a>(meshes: impl IntoIterator<Item = (&'a str, &'a MockMesh)>) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("# ZeroCAD OBJ export\n# Units: millimeters\n");
+    let mut vertex_offset = 1usize;
+
+    for (object_index, (name, mesh)) in meshes.into_iter().enumerate() {
+        let vertex_count = mesh.vertices.chunks_exact(6).len();
+        let has_valid_face = mesh.indices.chunks_exact(3).any(|face| {
+            let [a, b, c] = [face[0] as usize, face[1] as usize, face[2] as usize];
+            a < vertex_count && b < vertex_count && c < vertex_count && a != b && b != c && a != c
+        });
+        if vertex_count == 0 || !has_valid_face {
+            continue;
+        }
+
+        let sanitized_name: String = name
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        let sanitized_name = sanitized_name.trim();
+        let object_name = if sanitized_name.is_empty() {
+            format!("Body {}", object_index + 1)
+        } else {
+            sanitized_name.to_string()
+        };
+        writeln!(&mut out, "\no {object_name}").expect("writing OBJ text to String cannot fail");
+
+        for vertex in mesh.vertices.chunks_exact(6) {
+            let [x, y, z] = y_up_to_z_up([vertex[0], vertex[1], vertex[2]]);
+            writeln!(&mut out, "v {x} {y} {z}").expect("writing OBJ text to String cannot fail");
+        }
+
+        for face in mesh.indices.chunks_exact(3) {
+            let [a, b, c] = [face[0] as usize, face[1] as usize, face[2] as usize];
+            if a >= vertex_count
+                || b >= vertex_count
+                || c >= vertex_count
+                || a == b
+                || b == c
+                || a == c
+            {
+                continue;
+            }
+            writeln!(
+                &mut out,
+                "f {} {} {}",
+                vertex_offset + a,
+                vertex_offset + b,
+                vertex_offset + c
+            )
+            .expect("writing OBJ text to String cannot fail");
+        }
+        vertex_offset += vertex_count;
+    }
+
+    out.into_bytes()
+}
+
 /// Build a Z-up 3MF package from named Y-up ZeroCAD meshes — one 3MF `<object>`
 /// per mesh, so multi-body designs stay separate parts in the slicer (unlike
 /// STL's single merged soup). Vertices are welded by quantized position, as 3MF
@@ -847,6 +916,30 @@ mod tests {
                 .any(|window| window == expected),
             "stored 3MF model XML should contain the converted vertex"
         );
+    }
+
+    #[test]
+    fn obj_export_writes_named_z_up_objects() {
+        let mesh = axis_triangle();
+        let bytes = meshes_to_obj(std::iter::once(("Axis Body", &mesh)));
+        let obj = String::from_utf8(bytes).expect("OBJ is UTF-8 text");
+
+        assert!(obj.contains("# Units: millimeters\n"));
+        assert!(obj.contains("o Axis Body\n"));
+        assert!(obj.contains("v 1 -3 2\n"));
+        assert!(obj.contains("f 1 2 3\n"));
+    }
+
+    #[test]
+    fn obj_export_offsets_faces_between_bodies() {
+        let meshes = [axis_triangle(), axis_triangle()];
+        let bytes = meshes_to_obj([("First", &meshes[0]), ("Second", &meshes[1])]);
+        let obj = String::from_utf8(bytes).expect("OBJ is UTF-8 text");
+
+        assert!(obj.contains("o First\n"));
+        assert!(obj.contains("f 1 2 3\n"));
+        assert!(obj.contains("o Second\n"));
+        assert!(obj.contains("f 4 5 6\n"));
     }
 
     #[test]

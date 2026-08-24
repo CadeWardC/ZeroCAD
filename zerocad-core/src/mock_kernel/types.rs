@@ -438,10 +438,21 @@ impl MockMesh {
             None
         };
 
+        let sampled_edges = points.len() + holes.iter().map(Vec::len).sum::<usize>();
+        if circle.is_none() && sampled_edges > MAX_SAMPLED_PRISM_EDGES {
+            log::warn!(
+                "sampled sketch display prism skipped because its {sampled_edges} boundary \
+                 edges exceed the safety limit of {MAX_SAMPLED_PRISM_EDGES}"
+            );
+            return Self::empty();
+        }
+
         let solid = match circle {
             Some((cu, cv, r)) => oriented_cylinder_solid(cs, cu, cv, r, depth),
-            None => build_extrusion_solid(points, holes, depth as f64, cs, false)
-                .or_else(|| build_extrusion_solid(points, &[], depth as f64, cs, false)),
+            // A failed holed display prism must remain empty. Retrying without
+            // inner wires both changes the model and repeats the expensive
+            // topology build that made dense text previews appear to crash.
+            None => build_extrusion_solid(points, holes, depth as f64, cs, false),
         };
         let solid = match solid {
             Some(s) => s,

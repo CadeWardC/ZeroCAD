@@ -28,9 +28,9 @@ impl ZeroCadApp {
                     left[0].horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
                         self.draw_wordmark(ui);
-                        self.draw_top_bar_file_menu(ui, ctx);
 
                         if !self.onboarding_visible {
+                            self.draw_top_bar_file_menu(ui, ctx);
                             ui.separator();
 
                             if icons::Icon::Save

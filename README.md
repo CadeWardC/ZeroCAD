@@ -1,9 +1,14 @@
 # ZeroCAD
 
-A parametric 3D CAD application written in Rust. Sketch 2D profiles on planes,
-extrude them into solids, and combine solids with boolean join/cut — all driven
-by an editable feature history, and all built on **[OpenRCAD](OpenRCAD/)**, an
-in-tree pure-Rust B-Rep geometry kernel.
+A parametric 3D CAD application written in Rust. Sketch 2D profiles on planes —
+with expression-driven dimensions, a constraint solver, and font-shaped text —
+and turn them into solids with extrude, revolve, loft, and sweep. Modify with
+fillets/chamfers, shells, draft, holes, threads, and patterns; combine bodies
+with join/cut/intersect/split; edit faces directly; and assemble parts into a
+mated, deterministically-solved assembly. All of it is driven by an editable
+feature history, and all built on **[OpenRCAD](OpenRCAD/)**, an in-tree
+pure-Rust B-Rep geometry kernel. Imports: STEP, STL, DXF. Exports: STL, 3MF,
+OBJ.
 
 This document is the architectural map. It exists so that a new contributor —
 human or agent — does not have to reconstruct the non-obvious design decisions
@@ -29,39 +34,67 @@ baseline while preserving the earlier release evidence as history.
 ZeroCAD/
 ├── zerocad-core/        # Pure geometry + parametric engine. No UI, no GPU.
 │   ├── geometry.rs      # Vec3, CoordinateSystem (project/unproject a plane).
-│   ├── sketch.rs        # 2D curves + detect_regions() (planar arrangement).
+│   ├── sketch.rs + sketch/   # 2D curves + detect_regions() (planar arrangement);
+│   │                    #   sketch/ adds the constraint model (constraints.rs),
+│   │                    #   the solver (solve.rs), offsets, patterns, trim,
+│   │                    #   and face projection.
+│   ├── text.rs          # Sketch text: font discovery, shaping, glyph outlines
+│   │                    #   baked into the sketch (see Text section).
+│   ├── dxf.rs           # Planar ASCII DXF → sketch import.
 │   ├── expr.rs          # Recursive-descent expression evaluator (shared with the UI).
 │   ├── units.rs         # mm / inch / meter conversions (base unit = mm).
-│   ├── stl.rs           # Validated ASCII/binary STL mesh import and binary export.
+│   ├── stl.rs           # Validated ASCII/binary STL import and binary export;
+│   │                    #   also OBJ (meshes_to_obj) and 3MF (meshes_to_3mf).
+│   ├── assembly*.rs     # Assembly documents: occurrence trees, the mate-authoring
+│   │                    #   schema (assembly_mates.rs), transactional commands
+│   │                    #   (assembly_ops.rs), and the deterministic V2 mate
+│   │                    #   solver (assembly_solver.rs); plus release-evidence
+│   │                    #   gates (assembly_release*.rs).
+│   ├── evaluated_scene.rs   # Render-ready scene snapshot shared with the GUI.
 │   ├── document.rs      # Semantic bodies, timelines, inputs, selectors, feature registry.
 │   ├── feature_dto.rs   # Stable numeric-field persistence DTOs for every feature kind.
 │   ├── zcad_format.rs   # The binary `.zcad` document container (read/write).
-│   ├── parametric/      # Feature graph, evaluator, extrude/join/cut/edge-mod logic.
+│   ├── parametric/      # Feature graph, evaluator, per-operation logic.
 │   │   ├── types.rs     # FeatureType/FeatureNode, ParametricGraph, EdgeRef/FaceRef,
 │   │   │                #   FeatureStatus, the eval/region caches.
-│   │   ├── eval.rs      # Orchestrates evaluation + the incremental checkpoint cache.
+│   │   ├── eval.rs      # Orchestrates evaluation + the incremental checkpoint cache;
+│   │   │                #   also owns revolve/loft/sweep/hole/thread/pattern apply_*.
 │   │   ├── extrude.rs   # Extrude → tool solids → dispatch to a mode; LiveBody.
-│   │   ├── join.rs / cut.rs   # The boolean assemblers + coplanarity fallbacks.
-│   │   └── edge_mod.rs  # 3D fillet/chamfer: native rolling-ball + reattachment.
+│   │   ├── join.rs / cut.rs   # The boolean assemblers + coplanarity fallbacks
+│   │   │                #   + the exact prismatic-profile fast paths.
+│   │   ├── edge_mod.rs  # 3D fillet/chamfer: native rolling-ball + reattachment.
+│   │   └── …            # body_ops, datum, direct_edit, draft, inspection,
+│   │                    #   standards (hole/thread), topo_name, diagnostics,
+│   │                    #   recovery_certificate, tests/.
 │   └── mock_kernel/     # Thin façade over the OpenRCAD B-Rep kernel + tessellation.
-│       ├── primitives.rs / boolean.rs / blend.rs / edge_ops.rs
+│       ├── primitives.rs / boolean.rs / blend.rs
 │       ├── tessellation.rs / mesh_topology.rs / wireframe.rs / arc_display.rs
 │       ├── history.rs   # Face naming + boolean face history + part identity.
 │       └── types.rs     # MockMesh + selectable edge/face metadata.
 └── zerocad-gui/         # egui/eframe + wgpu front end.
     ├── main.rs          # The ZeroCadApp state struct + process entrypoint.
-    ├── render.rs        # CPU-projected viewport (painter's algorithm + HLR).
+    ├── gpu_viewport.rs  # The default viewport: embeds openrcad-render into eframe.
+    ├── render.rs        # CPU-projected viewport fallback (painter's algorithm + HLR).
     ├── extrude.rs / edgemod.rs   # The Extrude and Edge-Mod tools (+ live preview).
+    ├── text_ui.rs       # The sketch Text tool dialog (font, size, placement).
     ├── sketch_ui.rs / expr.rs / geom2d.rs   # Dimension dialogs, autocomplete, 2D helpers.
+    ├── *_ui.rs          # Per-feature panels: revolve, loft/sweep, shell, draft,
+    │                    #   hole, thread, pattern, move, combine, body ops,
+    │                    #   direct edit, inspection, parameters, DXF import.
+    ├── evaluation_worker.rs / document_worker.rs   # Background evaluation + file IO.
+    ├── recovery.rs / bug_report.rs   # Autosave recovery; offline bug-report bundles.
     ├── icons.rs / theme.rs / settings.rs / shortcuts.rs / thumbnail.rs
     └── app/             # ZeroCadApp methods, split by concern.
         ├── base.rs      # Constructor / initial state.
         ├── update.rs    # eframe::App::update — the per-frame orchestrator.
         ├── eval.rs      # Shortcut dispatch + reevaluate_geometry.
-        ├── editing.rs / sketch.rs / picking.rs / io.rs   # Sketch camera, region
-        │                #   detection, hit-testing, and .zcad/STL file I/O.
+        ├── editing.rs / sketch.rs / picking.rs / io.rs / datum.rs   # Sketch camera,
+        │                #   region detection, hit-testing, all file IO
+        │                #   (.zcad/STEP/STL/DXF; STL/3MF/OBJ export), datums.
         └── ui/          # egui panels: viewport, top_bar*, feature_tree,
-                         #   feature_properties, extrude_panel, status_bar, …
+                         #   feature_properties, extrude_panel, status_bar,
+                         #   assembly (occurrences + mates), constraints_panel,
+                         #   inspector, settings_window, …
 ```
 
 `zerocad-core` knows nothing about the GUI. The GUI mutates a
@@ -104,7 +137,7 @@ After collecting signed-package, alpha, and reference-hardware measurements,
 validate them with:
 
 ```text
-cargo run --release -p zerocad-core --example phase7_release_gate -- target/phase7-release-evidence.json
+cargo run --release -p zerocad-core --example release_evidence_check -- target/phase7-release-evidence.json
 ```
 
 ## Keyboard shortcuts
@@ -122,8 +155,8 @@ ZeroCAD's solids are built by **[OpenRCAD](OpenRCAD/README.md)**, a pure-Rust
 B-Rep CAD kernel that lives in this tree as its own cargo workspace and is
 consumed only through the `openrcad` façade crate. It provides points/vectors,
 NURBS curves and surfaces, arena B-Rep topology, primitive builders (`make_box`,
-`make_cylinder`, …), BVH-accelerated booleans (`boolean_checked`), rolling-ball
-fillets (`fillet_edges`), and parallel tessellation (`tessellate`).
+`make_cylinder`, …), BVH-accelerated booleans (`boolean_operation*`), rolling-ball
+fillets (`fillet_edges`), and parallel tessellation (`tessellate_checked*`).
 
 `zerocad-core::mock_kernel` is a thin façade over that kernel. The `MockMesh`
 name and field layout are preserved from ZeroCAD's earlier (pre-OpenRCAD)
@@ -160,9 +193,13 @@ into small pieces — extend the matching piece, don't grow one function:
 | `sketch_region_cache` / `cached_regions` | Region detection, memoized (see [Region cache](#caches--region-detection-and-incremental-evaluation)). |
 | `body_nodes_in_creation_order` | The solid-producing nodes, sorted by creation key. |
 | `apply_extrude` | One Extrude node → tool solids → dispatch to a mode. |
-| `apply_join` / `apply_cut` | The boolean assemblers (free functions in `join.rs` / `cut.rs`). |
+| `apply_revolve` / `apply_loft` / `apply_sweep` | Profile → solid of revolution, skinned lofts, and sweep paths (in `eval.rs`). |
+| `apply_join` / `apply_cut` | The boolean assemblers (free functions in `join.rs` / `cut.rs`), including the exact prismatic-profile fast paths for multi-profile sketches and text. |
 | `apply_edge_mod` | One EdgeMod node → native rolling-ball fillet/chamfer, reattaching its edge. |
 | `apply_shell` | One Shell node → atomic analytic offset, trim/pcurve validation, and named-face propagation. |
+| `apply_hole` / `apply_thread` | Standards-library holes (counterbore/countersink/tap) and thread features (`parametric/standards.rs`). |
+| `apply_pattern` / `apply_feature_pattern` | Sketch-region and whole-feature rectangular/circular patterns. |
+| body ops (`body_ops.rs`) | Body-level join/cut/intersect/split/scale/transform on selected bodies. |
 | `tessellate_bodies` | `LiveBody` list → `(id, MockMesh)` list. |
 
 `evaluate_bodies()` is a thin wrapper that drops the warnings; tests and the
@@ -193,7 +230,7 @@ preview path use it.
 These are the decisions that look wrong until you hit the bug they prevent.
 
 ### Always go through the guarded boolean wrappers
-OpenRCAD's `boolean_checked` returns a `Result` and can *reject* a configuration
+OpenRCAD's `boolean_operation*` returns a `Result` and can *reject* a configuration
 it cannot resolve watertightly (and, defensively, its own catch-unwind guards a
 panic in the solver). **Never call `openrcad::algo::boolean*` directly.** Use
 `mock_kernel::union` / `difference`, which wrap it in `quiet_panic()` (silences
@@ -417,19 +454,26 @@ wrapper that resolves the record so preview and committed geometry share one pat
 ## Sketch tools — modes, flyouts, and the multi-click state machine
 
 `SketchTool` enumerates every drawing *mode*; each toolbar button is a
-`ToolFamily` (Line / Rectangle / Circle / Corner) whose flyout lists its modes
-(first = default). Re-clicking an already-armed Rectangle/Circle/Corner button —
-or right-clicking it — opens the flyout (`egui::popup_below_widget`).
+`ToolFamily` (Line / Spline / Rectangle / Circle / Polygon / Slot / Offset /
+Trim / Dimension / Mirror / Corner) whose flyout lists its modes (first =
+default). Re-clicking an already-armed multi-mode button — or right-clicking
+it — opens the flyout (`egui::popup_below_widget`).
 
 - **Rectangle**: corner-to-corner (default), center, 3-point (rotated).
 - **Circle**: center (default), 3-point, **ellipse**, 3-point ellipse.
+- **Spline**: control-point / fit-point. **Polygon**: inscribed /
+  circumscribed. **Slot**: 3-point slot. **Mirror**: associative mirror.
+- **Offset** / **Trim** / **Dimension**: single-click tools — offset a chain,
+  trim to intersections, place a dimension constraint.
 - **Corner**: Fillet (default) / Chamfer — one button, like the 3D edge tool.
+- **Text**: opens the sketch-text dialog (see [Sketch text](#sketch-text)).
 
-**Input.** `SketchTool::point_count()` is 2 or 3. The viewport click handler pushes
+**Input.** `SketchTool::point_count()` is 1, 2, or 3. The viewport click handler pushes
 each snapped click into `sketch_points`; the shape finalizes on the click that
 completes the count. 2-point tools open the inline dimension dialog on the first
 click; 3-point tools draw by clicking with a live preview (Escape aborts a
-half-placed shape).
+half-placed shape). The single-click tools (offset/trim/dimension, and the
+corner tools) act immediately on the clicked geometry.
 
 **One geometry source.** `ZeroCadApp::shape_from_points(last)` builds the
 in-progress shape as a fresh `SketchCurves` from the placed points plus the cursor
@@ -476,6 +520,34 @@ rotated/centered rectangles are plain line segments.
   also runs in sketch mode when no drawing tool is armed — the **Select**
   toolbar button (or Esc) enters that state. The drawing handler only runs when a
   tool is armed, so the two never conflict.
+
+## Sketch text
+
+The **Text** toolbar button (sketch mode) opens the text dialog
+(`zerocad-gui/src/text_ui.rs`): multiline text, a system-font picker, size (mm),
+tracking, line spacing, alignment, origin, and rotation, with a cursor-following
+preview you click to pin. Committing bakes the shaped glyph outlines into the
+sketch as a `SketchShape::Text` (`zerocad_core::text::bake_text_shape`).
+
+- **Baked curves are authoritative.** Glyph outlines are shaped with the
+  installed font (fontdb + rustybuzz + ttf-parser) and stored in the document,
+  so it renders identically on a machine without the font. The font is recorded
+  by content fingerprint (never family name); re-editing with a matching font
+  re-shapes the text, otherwise the baked curves are kept.
+- **Ink regions, not glyph soup.** Regions are classified by a non-zero-winding
+  **ink mask** (`text::text_ink_regions`): overlapping contours union without
+  internal walls, counters stay holes. Non-ink regions are not rendered,
+  picked, or extruded. Tangent-continuous glyph walls tessellate into one
+  selectable face (no visible per-letter seams).
+- **Exact text solids.** Engraving (cut) and raised (join) text use the
+  prismatic-profile fast paths: a through cut of many glyph profiles combines
+  all tools in 2D and rebuilds the body once (`try_prismatic_profile_cut`);
+  raised text on a cap sews as one shell (`try_prismatic_profile_join`).
+- **Bounded cost.** Synchronous sampled prisms stop at
+  `MAX_SAMPLED_PRISM_EDGES` (256) so glyph-heavy sketches never stall the UI
+  thread; heavier previews route to the background evaluator, and finished
+  sketch regions are content-hash cached. The constraint solver treats text as
+  a single rigid anchor point, never glyph endpoints.
 
 ## 3D edge fillet & chamfer
 
@@ -549,6 +621,30 @@ normal) → **Join**; pushed **inward** (depth < 0) → **Cut**. The default
 re-evaluates live as the user drags the depth, until they click a mode button,
 which sets `mode_user_set` and freezes their choice.
 
+## Assemblies
+
+A `.zcad` project is either a **Part** or an **Assembly** (`ProjectKind`). An
+assembly holds **definitions** (referenced part documents) and an **occurrence
+tree** of placed instances (transforms, visibility, grounding), bounded by
+`MAX_ASSEMBLY_DEFINITIONS = 2,048` and `MAX_ASSEMBLY_OCCURRENCES = 10,000`.
+Occurrences are mated — coincident, signed-distance, and angle mates on
+faces/planes (`assembly_mates.rs`) — and the deterministic **Assembly V2
+solver** (`assembly_solver.rs`) places free occurrences by propagating through
+the mate graph with bounded iterations, so a solve is stable across rebuilds
+and platforms.
+
+All edits are **transactional**. The GUI stages an `AssemblyCommand` (insert,
+replace, duplicate, delete, rename, visibility, grounding, placement, mate
+edit) via `AssemblyDocument::prepare_command`, which validates against a clone;
+`finalize()` runs the extra fallible phases (e.g. the mate solve) against the
+candidate, and `commit()` applies it. The returned `AssemblyChangeSet`
+describes exactly what changed — occurrences added/removed/modified, mates
+touched, whether placements or only presentation moved — so undo is pushed
+only after an edit validates, and geometry caches are pruned by the change set
+rather than rebuilt wholesale. `File → New Assembly` starts one; the assembly
+panel edits occurrences and mates, and the solver-controlled drag path
+deliberately does not push per-drag undo snapshots.
+
 ---
 
 ## Rendering (`render.rs`)
@@ -614,24 +710,37 @@ and embedded in the file's thumbnail section.
 
 - `zerocad-core/src/*` inline `#[cfg(test)]` modules — `sketch::tests` covers
   `detect_regions`; `mock_kernel` covers wireframe grouping and arc
-  reconstruction; `parametric::tests` covers the boolean modes, warnings, the
-  caches, edge mods, and the reattachment matrix.
-- `zerocad-core/tests/realistic_modes.rs` — the regression suite. Tests assert
-  geometry actually changed (e.g. a cut adds hole-wall triangles), not just
-  counts. This is the executable spec; add to it when you add a feature.
+  reconstruction; `parametric::tests` (29 modules under `parametric/tests/`)
+  covers the boolean modes, warnings, the caches, edge mods, revolve/loft/sweep,
+  holes/threads, patterns, draft, datums, body ops, imports, and the
+  reattachment matrix.
+- `zerocad-core/tests/` — 48 integration test files. `realistic_modes.rs` is
+  the regression suite: tests assert geometry actually changed (e.g. a cut
+  adds hole-wall triangles), not just counts. This is the executable spec; add
+  to it when you add a feature.
+- Cross-cutting gates: `step_interchange_gate.rs` (strict STEP interchange),
+  `native_operation_gate.rs`, `no_legacy_kernel_calls.rs`,
+  `release_stability_gate.rs`, `standards_inspection_gate.rs`,
+  `semantic_golden_manifest.rs`, `construction_equivalence_matrix.rs`,
+  `frozen_perf_corpora.rs`.
 - Targeted repro suites: `repro_fillet_then_cut.rs`, `repro_fillet_then_fillet.rs`,
-  `repro_cutout_fillet_mesh.rs`, `repro_miter_render.rs`, `smooth_cylinder.rs`,
-  `sketch_fillet_extrude.rs`, `primitive_equals_extrude.rs`, plus
-  `bool_matrix.rs`, `cylinder_tests.rs`, `parametric_tests.rs`.
+  `repro_cutout_fillet_mesh.rs`, `repro_miter_render.rs`, `repro_mirror_join_face_history.rs`,
+  `smooth_cylinder.rs`, `sketch_fillet_extrude.rs`, `primitive_equals_extrude.rs`, plus
+  `bool_matrix.rs`, `cylinder_tests.rs`, `parametric_tests.rs`, `boolean_replay.rs`.
 - `tests/serialization.rs` and `tests/zcad_format.rs` — `.zcad` binary
   round-trip for every feature kind, byte determinism, save-profile enforcement,
   streaming, atomic replacement, bounded malformed-input handling, and
   independent optional-cache corruption recovery.
   `stl::tests` covers binary STL export.
+- Release evidence is deliberately separate: the `zerocad-core/examples/`
+  validators (`release_evidence_check.rs`, `assembly_release_evidence_check.rs`,
+  `assembly_v2_release_evidence_check.rs`) verify collected measurements.
 
 `benches/modeling_pipeline.rs` tracks cold, warm, and hydrated-open long-history
 evaluation with Criterion. `tests/property_geometry.rs` generates bounded mechanical through-hole
-cases and asserts healthy, watertight, finite, repeatable results.
+cases and asserts healthy, watertight, finite, repeatable results. The `fuzz/`
+workspace (CI: `boolean-fuzz.yml`) fuzzes the boolean safety contract on a
+pinned nightly.
 
 ---
 
@@ -639,9 +748,10 @@ cases and asserts healthy, watertight, finite, repeatable results.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/style conventions and
 [AGENTS.md](AGENTS.md) for a navigation map of the source. CI (GitHub Actions)
-builds and tests the full workspace on Windows and the core engine on Linux on
-every push and PR, with `cargo fmt --all -- --check` as a required gate and
-clippy advisory.
+builds and tests the full workspace on Windows and the core engine on Linux
+and macOS, promotes boolean-regression replays, runs the OpenRCAD workspace on
+all three OSes, and enforces `cargo fmt --all -- --check` and clippy as
+required gates.
 
 ZeroCAD is licensed under either of [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE) at your option. Unless you state otherwise, any

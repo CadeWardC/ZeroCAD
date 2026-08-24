@@ -1,7 +1,8 @@
 # Phase 6 completion record
 
 Phase 6 closes the scheduled exchange, architecture, representation, rendering,
-and profiling work behind `zerocad-core/tests/phase6_gate.rs` and the complete
+and profiling work behind `zerocad-core/tests/step_interchange_gate.rs` (the
+cross-cutting Phase 6 gate) and the complete
 ZeroCAD/OpenRCAD workspace suites. This record distinguishes shipped behavior
 from the narrow topology-surgery exceptions owned by Phase 7.
 

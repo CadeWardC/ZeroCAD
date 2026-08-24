@@ -125,6 +125,13 @@ impl MeshInstance {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstanceUpdateStats {
+    pub records_written: usize,
+    pub bytes_written: u64,
+    pub buffer_reallocated: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GpuMeshInstance {
     geometry_index: usize,
@@ -440,8 +447,11 @@ pub struct RenderCore {
     instance_buffer: wgpu::Buffer,
     instance_bind_group: wgpu::BindGroup,
     instance_stride: u32,
+    instance_buffer_capacity_bytes: u64,
     identity_instance_offset: u32,
     instances: Vec<GpuMeshInstance>,
+    instance_records: Vec<MeshInstance>,
+    last_instance_update: InstanceUpdateStats,
     /// One texel per face id, holding its [`FaceHighlight`] state. Laid out in
     /// rows of [`FACE_STATE_ROW`] texels (`texel(i) = (i % row, i / row)`).
     face_state_tex: wgpu::Texture,
@@ -539,7 +549,7 @@ impl RenderCore {
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("openrcad-render instances"),
             contents: &identity_data,
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let instance_bind_group =
             make_instance_bind_group(device, &instance_bind_group_layout, &instance_buffer);
@@ -770,8 +780,11 @@ impl RenderCore {
             instance_buffer,
             instance_bind_group,
             instance_stride,
+            instance_buffer_capacity_bytes: identity_data.len() as u64,
             identity_instance_offset: 0,
             instances: Vec::new(),
+            instance_records: Vec::new(),
+            last_instance_update: InstanceUpdateStats::default(),
             face_state_tex,
             face_state_view,
             face_state_capacity,
@@ -813,6 +826,20 @@ impl RenderCore {
     /// editing one body of a large assembly stops costing a whole-scene
     /// re-upload. A NEW slot must come with `Some(mesh)`.
     pub fn update_bodies(&mut self, device: &wgpu::Device, updates: &[Option<&GpuMesh>]) {
+        self.update_bodies_preserving_instances(device, updates);
+        let identities: Vec<MeshInstance> =
+            (0..self.bodies.len()).map(MeshInstance::identity).collect();
+        self.set_instances(device, &identities);
+    }
+
+    /// Update geometry slots without disturbing the occurrence buffer. Hosts
+    /// with an explicit instanced scene use this to prevent a placement-only
+    /// epoch from rebuilding the instance allocation as identity records.
+    pub fn update_bodies_preserving_instances(
+        &mut self,
+        device: &wgpu::Device,
+        updates: &[Option<&GpuMesh>],
+    ) {
         self.bodies.truncate(updates.len());
         for (slot, update) in updates.iter().enumerate() {
             match (update, slot < self.bodies.len()) {
@@ -827,9 +854,6 @@ impl RenderCore {
                 }
             }
         }
-        let identities: Vec<MeshInstance> =
-            (0..self.bodies.len()).map(MeshInstance::identity).collect();
-        self.set_instances(device, &identities);
     }
 
     /// Replace only the occurrence records. Geometry uploads are untouched.
@@ -838,8 +862,116 @@ impl RenderCore {
     /// selects its transform by offset. Invalid geometry indices are ignored in
     /// release builds and asserted in debug builds.
     pub fn set_instances(&mut self, device: &wgpu::Device, instances: &[MeshInstance]) {
+        let (packed, gpu_instances, instance_records, identity_offset) =
+            self.pack_instances(instances);
+        self.identity_instance_offset = identity_offset;
+        self.instance_buffer_capacity_bytes = packed.len() as u64;
+        self.instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("openrcad-render instances"),
+            contents: &packed,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        self.instance_bind_group = make_instance_bind_group(
+            device,
+            &self.instance_bind_group_layout,
+            &self.instance_buffer,
+        );
+        self.instances = gpu_instances;
+        self.instance_records = instance_records;
+        self.last_instance_update = InstanceUpdateStats {
+            records_written: self.instances.len() + 1,
+            bytes_written: packed.len() as u64,
+            buffer_reallocated: true,
+        };
+    }
+
+    /// Replace occurrence records while retaining the existing GPU buffer and
+    /// bind group whenever its geometrically grown capacity is sufficient.
+    pub fn set_instances_incremental(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[MeshInstance],
+    ) {
+        let (packed, gpu_instances, instance_records, identity_offset) =
+            self.pack_instances(instances);
+        let required_bytes = packed.len() as u64;
+        let same_layout = required_bytes <= self.instance_buffer_capacity_bytes
+            && identity_offset == self.identity_instance_offset
+            && instance_records.len() == self.instance_records.len();
+        if same_layout {
+            let mut records_written = 0usize;
+            for (slot, (previous, next)) in self
+                .instance_records
+                .iter()
+                .zip(&instance_records)
+                .enumerate()
+            {
+                if previous == next {
+                    continue;
+                }
+                let bytes =
+                    pack_instance(next.model, next.face_id_base, self.instance_stride as usize);
+                queue.write_buffer(
+                    &self.instance_buffer,
+                    slot as u64 * self.instance_stride as u64,
+                    &bytes,
+                );
+                records_written += 1;
+            }
+            self.instances = gpu_instances;
+            self.instance_records = instance_records;
+            self.last_instance_update = InstanceUpdateStats {
+                records_written,
+                bytes_written: records_written as u64 * self.instance_stride as u64,
+                buffer_reallocated: false,
+            };
+            return;
+        }
+
+        let mut buffer_reallocated = false;
+        if required_bytes > self.instance_buffer_capacity_bytes {
+            let capacity = required_bytes.next_power_of_two();
+            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("openrcad-render instances"),
+                size: capacity,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_bind_group = make_instance_bind_group(
+                device,
+                &self.instance_bind_group_layout,
+                &self.instance_buffer,
+            );
+            self.instance_buffer_capacity_bytes = capacity;
+            buffer_reallocated = true;
+        }
+        queue.write_buffer(&self.instance_buffer, 0, &packed);
+        self.identity_instance_offset = identity_offset;
+        self.instances = gpu_instances;
+        self.instance_records = instance_records;
+        self.last_instance_update = InstanceUpdateStats {
+            records_written: self.instances.len() + 1,
+            bytes_written: required_bytes,
+            buffer_reallocated,
+        };
+    }
+
+    pub fn instance_buffer_capacity_bytes(&self) -> u64 {
+        self.instance_buffer_capacity_bytes
+    }
+
+    pub fn last_instance_update(&self) -> InstanceUpdateStats {
+        self.last_instance_update
+    }
+
+    fn pack_instances(
+        &self,
+        instances: &[MeshInstance],
+    ) -> (Vec<u8>, Vec<GpuMeshInstance>, Vec<MeshInstance>, u32) {
         let mut packed = Vec::with_capacity((instances.len() + 1) * self.instance_stride as usize);
         let mut gpu_instances = Vec::with_capacity(instances.len());
+        let mut instance_records = Vec::with_capacity(instances.len());
         for instance in instances {
             if instance.geometry_index >= self.bodies.len() {
                 debug_assert!(
@@ -859,30 +991,22 @@ impl RenderCore {
                 geometry_index: instance.geometry_index,
                 uniform_offset: offset,
             });
+            instance_records.push(*instance);
         }
-        self.identity_instance_offset = packed.len() as u32;
+        let identity_offset = packed.len() as u32;
         packed.extend_from_slice(&pack_instance(
             identity4(),
             0,
             self.instance_stride as usize,
         ));
-        self.instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("openrcad-render instances"),
-            contents: &packed,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        self.instance_bind_group = make_instance_bind_group(
-            device,
-            &self.instance_bind_group_layout,
-            &self.instance_buffer,
-        );
-        self.instances = gpu_instances;
+        (packed, gpu_instances, instance_records, identity_offset)
     }
 
     /// Drop any uploaded geometry (renders an empty scene).
     pub fn clear_mesh(&mut self) {
         self.bodies.clear();
         self.instances.clear();
+        self.instance_records.clear();
     }
 
     /// Replace all auxiliary layers (live-preview ghosts / tool volumes). Each

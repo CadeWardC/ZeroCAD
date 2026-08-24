@@ -23,9 +23,12 @@ impl eframe::App for ZeroCadApp {
         self.poll_document_worker();
         self.recovery.tick();
         self.tick_speculative_edge_mod(ctx);
-        // While the Welcome modal is up the workspace is inert, so its hotkeys
-        // are suppressed (the modal reads Esc itself).
-        if !self.onboarding_visible && self.pending_project_transition.is_none() {
+        // Modal surfaces own keyboard input while they are open, so workspace
+        // shortcuts cannot trigger commands behind them.
+        if !self.onboarding_visible
+            && self.pending_project_transition.is_none()
+            && self.save_dialog.is_none()
+        {
             self.handle_shortcuts(ctx);
         }
 
@@ -44,6 +47,14 @@ impl eframe::App for ZeroCadApp {
         self.draw_top_bar(ctx);
 
         self.show_parameters_dialog(ctx);
+        self.show_text_dialog(ctx);
+
+        // Settle a throttled drag: the final arrangement always runs once the
+        // pointer is up, so region fills never stay stale after a drag or a
+        // cancelled drag.
+        if self.sketch_regions_dirty && !ctx.input(|i| i.pointer.any_down()) {
+            self.recompute_sketch_regions();
+        }
         self.show_inspection_dialog(ctx);
 
         if self.onboarding_visible {

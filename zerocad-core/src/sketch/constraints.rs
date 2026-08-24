@@ -712,6 +712,18 @@ pub fn promote_shapes_to_entities(
             | SketchShape::Spline { .. }
             | SketchShape::Imported { .. }
             | SketchShape::Raw { .. } => promote_raw(&built, owner, &mut ids, &mut model),
+            // Text is ONE rigid item, the way Fusion treats sketch text: the
+            // solver holds a single anchor point at the placement origin, never
+            // the glyph curves. Promoting hundreds of glyph endpoints made the
+            // solver-and-rebuild loop crawl, and let individual letter curves be
+            // constrained apart — both wrong. Display curves for text are
+            // appended from the shape record in `effective_curves_solved`.
+            SketchShape::Text { placement, .. } => {
+                model.points.push(SketchPoint {
+                    id: owner,
+                    pos: (placement.origin.0 as f64, placement.origin.1 as f64),
+                });
+            }
         }
     }
     let next = ids.next_value();

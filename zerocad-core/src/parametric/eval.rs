@@ -3265,6 +3265,15 @@ impl ParametricGraph {
                         None => self.cached_regions(&effective),
                     }
                 };
+                let ink_mask = crate::text::sketch_region_ink_mask(
+                    curves,
+                    shapes,
+                    corner_mods,
+                    mirrors,
+                    solver.as_ref(),
+                    vars,
+                    &regions,
+                );
                 let provenance = build_region_provenance(&effective, shapes, entity_ids, &regions);
                 let mut durable_entity_ids =
                     crate::sketch::effective_shape_ids(shapes.len(), entity_ids);
@@ -3309,6 +3318,7 @@ impl ParametricGraph {
                     SketchEval {
                         cs: *cs,
                         regions,
+                        ink_mask,
                         provenance,
                         curves: effective,
                         entity_curves,
@@ -3810,7 +3820,7 @@ impl ParametricGraph {
         // moved outline and the stored indices stay in the space they were
         // detected in. Only genuinely unnamed legacy references may fall back
         // to the stored snapshot.
-        let mut refreshed: Option<(Vec<Region>, Vec<usize>)> = None;
+        let mut refreshed: Option<(Vec<Region>, Vec<usize>, Vec<bool>)> = None;
         let fresh_face_boundary =
             attached_face.and_then(|face_ref| rederive_face_boundary(face_ref, live, cs));
         if attached_face.is_some_and(face_ref_is_named) && fresh_face_boundary.is_none() {
@@ -3859,6 +3869,25 @@ impl ParametricGraph {
                 // instead and fail loud above.
                 let selection_survives = region_indices.is_empty() || !remapped.is_empty();
                 if !fresh_regions.is_empty() && selection_survives {
+                    let fresh_ink_mask = match &self.graph[parent_idx].feature {
+                        FeatureType::Sketch {
+                            curves,
+                            shapes,
+                            corner_mods,
+                            mirrors,
+                            solver,
+                            ..
+                        } => crate::text::sketch_region_ink_mask(
+                            curves,
+                            shapes,
+                            corner_mods,
+                            mirrors,
+                            solver.as_ref(),
+                            &self.variable_map(),
+                            &fresh_regions,
+                        ),
+                        _ => vec![true; fresh_regions.len()],
+                    };
                     let mut pending = self.pending_face_reattach.borrow_mut();
                     pending
                         .boundaries
@@ -3869,14 +3898,19 @@ impl ParametricGraph {
                             .region_indices
                             .insert(node_id.into(), remapped.clone());
                     }
-                    refreshed = Some((fresh_regions, remapped));
+                    refreshed = Some((fresh_regions, remapped, fresh_ink_mask));
                 }
             }
         }
-        let (regions_owned, indices_owned): (Vec<Region>, Vec<usize>) = match refreshed {
-            Some((r, i)) => (r, i),
-            None => (sketch.regions.clone(), region_indices.to_vec()),
-        };
+        let (regions_owned, indices_owned, ink_mask_owned): (Vec<Region>, Vec<usize>, Vec<bool>) =
+            match refreshed {
+                Some((r, i, mask)) => (r, i, mask),
+                None => (
+                    sketch.regions.clone(),
+                    region_indices.to_vec(),
+                    sketch.ink_mask.clone(),
+                ),
+            };
         let regions = &regions_owned;
         let region_indices: &[usize] = &indices_owned;
         if regions.is_empty() {
@@ -3901,7 +3935,10 @@ impl ParametricGraph {
         let loops = &sketch.shape_loops;
         let plan = crate::parametric::extrude::boolean_region_plan(loops, regions, region_indices);
         let region_is_boolean = plan.is_boolean;
-        let process_region = plan.process;
+        let mut process_region = plan.process;
+        for (index, process) in process_region.iter_mut().enumerate() {
+            *process &= ink_mask_owned.get(index).copied().unwrap_or(true);
+        }
         let has_draft = draft_angle_deg.abs() > f32::EPSILON;
         if !draft_angle_deg.is_finite() || draft_angle_deg.abs() >= 89.0 {
             diagnostics.push(Self::extrude_draft_diagnostic(
@@ -4013,6 +4050,11 @@ impl ParametricGraph {
         let mut newbody_tools: Vec<KernelSolid> = Vec::new();
         let mut cut_tools: Vec<CutTool> = Vec::new();
         let mut join_tools: Vec<JoinTool> = Vec::new();
+        // Part keys aligned with `sketch_source.regions`, captured while the
+        // tools are BUILT. The NewBody output filter used to rebuild a full
+        // prism per region per output body just to recompute these — O(R^2)
+        // prism constructions for R disjoint letters of extruded text.
+        let mut region_source_keys: Vec<Option<[i64; 6]>> = Vec::new();
         let mut sketch_source = SketchExtrudeSource {
             regions: Vec::new(),
         };
@@ -4066,6 +4108,7 @@ impl ParametricGraph {
                     .iter()
                     .any(|index| region_is_boolean[*index]);
                 newbody_tools.push(region_part.clone());
+                region_source_keys.push(Some(crate::mock_kernel::part_key(&region_part)));
                 sketch_source.regions.push(SketchExtrudeRegionSource {
                     boundary: region.boundary.clone(),
                     holes: region.holes.clone(),
@@ -4189,12 +4232,13 @@ impl ParametricGraph {
                                 &cut_cs,
                             );
                             let grown = grow_loop(&boundary, true);
-                            let expanded = crate::mock_kernel::extruded_region_solid(
-                                &grown,
-                                &[],
-                                cut_depth,
-                                &cut_cs,
-                            );
+                            let expanded = None;
+                            let expanded_source = Some(ExpandedCutSource {
+                                boundary: grown.clone(),
+                                holes: Vec::new(),
+                                cs: cut_cs,
+                                depth: cut_depth,
+                            });
                             let (rev_cs, rev_depth) = directional_cut(cs, -depth);
                             let smooth_rev = crate::mock_kernel::circular_cylinder_tool(
                                 &boundary,
@@ -4208,19 +4252,24 @@ impl ParametricGraph {
                                 rev_depth,
                                 &rev_cs,
                             );
-                            let expanded_rev = crate::mock_kernel::extruded_region_solid(
-                                &grown,
-                                &[],
-                                rev_depth,
-                                &rev_cs,
-                            );
+                            let expanded_rev = None;
+                            let expanded_rev_source = Some(ExpandedCutSource {
+                                boundary: grown,
+                                holes: Vec::new(),
+                                cs: rev_cs,
+                                depth: rev_depth,
+                            });
                             cut_tools.push(CutTool {
                                 smooth,
                                 exact,
+                                exact_source: None,
                                 expanded,
+                                expanded_source,
                                 smooth_rev,
                                 exact_rev,
+                                exact_rev_source: None,
                                 expanded_rev,
+                                expanded_rev_source,
                                 circle: Some(circle),
                             });
                         }
@@ -4330,6 +4379,8 @@ impl ParametricGraph {
                             rect_circle: canonical_rect_circle,
                             analytic: region.analytic.clone(),
                         };
+                        region_source_keys
+                            .push(region_part.as_ref().map(crate::mock_kernel::part_key));
                         sketch_source.regions.push(region_source);
                     }
                     let mut region_mesh = match (has_draft, region_part.as_ref()) {
@@ -4397,52 +4448,66 @@ impl ParametricGraph {
                     // `directional_cut` solves only for the end caps.
                     let (cut_cs, cut_depth) = directional_cut(cs, depth);
                     let smooth = cyl_tool(region, &cut_cs, cut_depth);
-                    let exact = match region_solid(region, &cut_cs, cut_depth) {
-                        Ok(solid) => solid,
-                        Err(error) => {
-                            diagnostics.push(Self::extrude_draft_diagnostic(
-                                node_id,
-                                &error,
-                                depth,
-                                draft_angle_deg,
-                            ));
-                            return;
-                        }
+                    let (exact, exact_source) = if has_draft {
+                        let exact = match region_solid(region, &cut_cs, cut_depth) {
+                            Ok(solid) => solid,
+                            Err(error) => {
+                                diagnostics.push(Self::extrude_draft_diagnostic(
+                                    node_id,
+                                    &error,
+                                    depth,
+                                    draft_angle_deg,
+                                ));
+                                return;
+                            }
+                        };
+                        (exact, None)
+                    } else {
+                        (
+                            None,
+                            Some(ExactCutSource {
+                                region: region.clone(),
+                                cs: cut_cs,
+                                depth: cut_depth,
+                                arc_circles: arc_circles.clone(),
+                            }),
+                        )
                     };
                     let grown_boundary = grow_loop(&region.boundary, true);
                     let grown_holes: Vec<Vec<(f32, f32)>> =
                         region.holes.iter().map(|h| grow_loop(h, false)).collect();
-                    let expanded =
-                        match loop_solid(&grown_boundary, &grown_holes, &cut_cs, cut_depth) {
-                            Ok(solid) => solid,
-                            Err(error) => {
-                                diagnostics.push(Self::extrude_draft_diagnostic(
-                                    node_id,
-                                    &error,
-                                    depth,
-                                    draft_angle_deg,
-                                ));
-                                return;
-                            }
-                        };
+                    let (expanded, expanded_source) = if has_draft {
+                        let expanded =
+                            match loop_solid(&grown_boundary, &grown_holes, &cut_cs, cut_depth) {
+                                Ok(solid) => solid,
+                                Err(error) => {
+                                    diagnostics.push(Self::extrude_draft_diagnostic(
+                                        node_id,
+                                        &error,
+                                        depth,
+                                        draft_angle_deg,
+                                    ));
+                                    return;
+                                }
+                            };
+                        (expanded, None)
+                    } else {
+                        (
+                            None,
+                            Some(ExpandedCutSource {
+                                boundary: grown_boundary.clone(),
+                                holes: grown_holes.clone(),
+                                cs: cut_cs,
+                                depth: cut_depth,
+                            }),
+                        )
+                    };
                     // The same tool swept the other way, for the fall-back when the
                     // drawn direction misses the body (see `CutTool`).
                     let (rev_cs, rev_depth) = directional_cut(cs, -depth);
                     let smooth_rev = cyl_tool(region, &rev_cs, rev_depth);
-                    let exact_rev = match region_solid(region, &rev_cs, rev_depth) {
-                        Ok(solid) => solid,
-                        Err(error) => {
-                            diagnostics.push(Self::extrude_draft_diagnostic(
-                                node_id,
-                                &error,
-                                depth,
-                                draft_angle_deg,
-                            ));
-                            return;
-                        }
-                    };
-                    let expanded_rev =
-                        match loop_solid(&grown_boundary, &grown_holes, &rev_cs, rev_depth) {
+                    let (exact_rev, exact_rev_source) = if has_draft {
+                        let exact_rev = match region_solid(region, &rev_cs, rev_depth) {
                             Ok(solid) => solid,
                             Err(error) => {
                                 diagnostics.push(Self::extrude_draft_diagnostic(
@@ -4454,7 +4519,50 @@ impl ParametricGraph {
                                 return;
                             }
                         };
-                    if smooth.is_some() || exact.is_some() || expanded.is_some() {
+                        (exact_rev, None)
+                    } else {
+                        (
+                            None,
+                            Some(ExactCutSource {
+                                region: region.clone(),
+                                cs: rev_cs,
+                                depth: rev_depth,
+                                arc_circles: arc_circles.clone(),
+                            }),
+                        )
+                    };
+                    let (expanded_rev, expanded_rev_source) = if has_draft {
+                        let expanded_rev =
+                            match loop_solid(&grown_boundary, &grown_holes, &rev_cs, rev_depth) {
+                                Ok(solid) => solid,
+                                Err(error) => {
+                                    diagnostics.push(Self::extrude_draft_diagnostic(
+                                        node_id,
+                                        &error,
+                                        depth,
+                                        draft_angle_deg,
+                                    ));
+                                    return;
+                                }
+                            };
+                        (expanded_rev, None)
+                    } else {
+                        (
+                            None,
+                            Some(ExpandedCutSource {
+                                boundary: grown_boundary,
+                                holes: grown_holes,
+                                cs: rev_cs,
+                                depth: rev_depth,
+                            }),
+                        )
+                    };
+                    if smooth.is_some()
+                        || exact.is_some()
+                        || exact_source.is_some()
+                        || expanded.is_some()
+                        || expanded_source.is_some()
+                    {
                         let circle = if sketch.curves.segments.is_empty()
                             && sketch.curves.circles.len() == 1
                             && region.holes.is_empty()
@@ -4466,10 +4574,14 @@ impl ParametricGraph {
                         cut_tools.push(CutTool {
                             smooth,
                             exact,
+                            exact_source,
                             expanded,
+                            expanded_source,
                             smooth_rev,
                             exact_rev,
+                            exact_rev_source,
                             expanded_rev,
+                            expanded_rev_source,
                             circle,
                         });
                     } else {
@@ -4533,7 +4645,18 @@ impl ParametricGraph {
         match mode {
             ExtrudeMode::NewBody => {
                 let before_fuse = newbody_tools.len();
-                if newbody_has_boolean || before_fuse > 1 {
+                // Zero-draft profiles have already been partitioned by
+                // `prepare_extrude_regions`: tiles sharing a full sketch edge
+                // were rebuilt as one analytic outline, while the remaining
+                // tools are provably separate 2D material. In particular, the
+                // counter islands selected with a plate around text have AABBs
+                // nested inside the plate but do not touch it. Sending those
+                // dense B-spline prisms through a 3D union can monopolize the
+                // evaluator for tens of seconds. The legacy 3D sewing fallback
+                // remains for drafted profiles, which cannot use the planar
+                // preparation path.
+                let needs_legacy_3d_grouping = has_draft;
+                if needs_legacy_3d_grouping && (newbody_has_boolean || before_fuse > 1) {
                     // Disjoint lumps remain separate; adjacent/touching sketch
                     // regions are offered to the union builder so their shared
                     // boundary becomes internal topology.
@@ -4556,7 +4679,16 @@ impl ParametricGraph {
                     })
                     .collect();
                 newbody_tools.sort_by_key(crate::mock_kernel::part_key);
-                let mut body_groups = connected_material_groups(newbody_tools);
+                let mut body_groups = if needs_legacy_3d_grouping {
+                    connected_material_groups(newbody_tools)
+                } else {
+                    // Planar preparation already established connectivity, so
+                    // every remaining solid is one independently selectable
+                    // body. Avoid a second mesh-based contact test: coplanar cap
+                    // triangles can make nested, separated profiles appear to
+                    // touch even though their 2D material does not.
+                    newbody_tools.into_iter().map(|part| vec![part]).collect()
+                };
                 body_groups.sort_by_key(|group| {
                     group
                         .iter()
@@ -4566,7 +4698,8 @@ impl ParametricGraph {
                 });
                 if body_groups.len() == 1 {
                     let parts = body_groups.pop().expect("one connected body group");
-                    let fused_brep = before_fuse > 1 && parts.len() == 1;
+                    let fused_brep =
+                        needs_legacy_3d_grouping && before_fuse > 1 && parts.len() == 1;
                     if parts.len() > 1 {
                         newbody_mesh.suppress_duplicate_edge_groups();
                     }
@@ -4596,7 +4729,14 @@ impl ParametricGraph {
                         let part_source_regions: Vec<SketchExtrudeRegionSource> = sketch_source
                             .regions
                             .iter()
-                            .filter(|source| {
+                            .enumerate()
+                            .filter(|(index, source)| {
+                                // Captured at build time from the SAME solid the
+                                // rebuild below would deterministically recreate.
+                                if let Some(key) = region_source_keys.get(*index).copied().flatten()
+                                {
+                                    return part_keys.contains(&key);
+                                }
                                 let source_solid = source
                                     .rect_circle
                                     .as_ref()
@@ -4613,7 +4753,7 @@ impl ParametricGraph {
                                     part_keys.contains(&crate::mock_kernel::part_key(source_part))
                                 })
                             })
-                            .cloned()
+                            .map(|(_, source)| source.clone())
                             .collect();
 
                         // Preserve the per-region pristine mesh whenever this
@@ -4765,7 +4905,8 @@ fn feature_expression_references(feature: &FeatureType) -> Vec<String> {
                     }
                     crate::sketch::SketchShape::Spline { .. }
                     | crate::sketch::SketchShape::Imported { .. }
-                    | crate::sketch::SketchShape::Raw { .. } => {}
+                    | crate::sketch::SketchShape::Raw { .. }
+                    | crate::sketch::SketchShape::Text { .. } => {}
                 }
             }
             for corner in corner_mods {
@@ -4911,7 +5052,8 @@ fn rename_feature_expressions(feature: &mut FeatureType, old: &str, new: &str) {
                     }
                     crate::sketch::SketchShape::Spline { .. }
                     | crate::sketch::SketchShape::Imported { .. }
-                    | crate::sketch::SketchShape::Raw { .. } => {}
+                    | crate::sketch::SketchShape::Raw { .. }
+                    | crate::sketch::SketchShape::Text { .. } => {}
                 }
             }
             for corner in corner_mods {

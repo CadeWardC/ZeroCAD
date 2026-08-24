@@ -201,9 +201,13 @@ pub fn mesh_face_boundary_2d(
 /// (union-find over shared boundary spans) — never by plane identity alone.
 /// Two disjoint coplanar faces (the two top lands of a U-shaped part) are
 /// distinct design faces and must keep separate ids; a revolve cap's wedges
-/// share their radial seam edges, so they merge. Curved surfaces keep the
-/// identity-only rule: a boolean can fragment one cylinder wall into
-/// non-adjacent pieces that must still read as one surface.
+/// share their radial seam edges, so they merge. Analytic curved surfaces keep
+/// the identity-only rule: a boolean can fragment one cylinder wall into
+/// non-adjacent pieces that must still read as one surface. Adjacent ruled
+/// surfaces are grouped only across a shared ruling when their curved rails are
+/// tangent-continuous. This lets consecutive glyph Bezier spans read and select
+/// as one curved wall without merging a curve into a straight wall or hiding a
+/// real corner.
 pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
     // Quantized surface identity. Cylinder: (axis-foot xyz, axis-dir xyz,
     // radius, 0). Torus: (centre xyz, axis-dir xyz, major radius, minor
@@ -319,6 +323,8 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
         Analytic(SurfSig),
         /// Plane: group only with coplanar edge-adjacent neighbours.
         Planar(SurfSig),
+        /// Swept curved rail: group only with tangent edge-adjacent neighbours.
+        Ruled,
         /// Ungroupable: a fresh, unshareable id.
         Other,
     }
@@ -330,12 +336,14 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
             Some(GeomSurface::Torus(t)) => Kind::Analytic(torus_sig(t)),
             Some(GeomSurface::Cone(c)) => cone_sig(c).map_or(Kind::Other, Kind::Analytic),
             Some(GeomSurface::Plane(p)) => Kind::Planar(plane_sig(p)),
+            Some(GeomSurface::Ruled(_)) => Kind::Ruled,
             _ => Kind::Other,
         })
         .collect();
 
-    // Union-find over planar faces, joined when two faces are coplanar AND
-    // share a boundary span. Spans match geometrically (quantized endpoints +
+    // Union-find over adjacency-sensitive faces. Planes join when coplanar;
+    // ruled surfaces join only at a shared sweep-direction edge where their
+    // rails meet tangentially. Spans match geometrically (quantized endpoints +
     // curve midpoint), not by EdgeId — sew usually unifies coincident edges but
     // adjacent faces may still hold independent copies. The midpoint keeps a
     // straight chord from ever matching an arc between the same endpoints.
@@ -348,40 +356,165 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
         i
     }
     let qp = |p: &Pnt| (q(p.x()), q(p.y()), q(p.z()));
-    let mut edge_owners: HashMap<(QPnt, QPnt, QPnt), Vec<usize>> = HashMap::new();
-    for (fi, face) in faces.iter().enumerate() {
-        if !matches!(kinds[fi], Kind::Planar(_)) {
-            continue;
+    let edge_key = |edge: &Edge| {
+        let a = edge.source().point();
+        let b = edge.target().point();
+        let (qa, qb) = (qp(&a), qp(&b));
+        if qa == qb {
+            return None;
         }
-        for wire in face.wires() {
-            for edge in wire.edges() {
-                let a = edge.source().point();
-                let b = edge.target().point();
-                let (qa, qb) = (qp(&a), qp(&b));
-                if qa == qb {
-                    continue; // degenerate span — never adjacency evidence
+        let mid = edge
+            .curve()
+            .map(|c| c.point(0.5 * (edge.first() + edge.last())))
+            .unwrap_or_else(|| {
+                Pnt::new(
+                    0.5 * (a.x() + b.x()),
+                    0.5 * (a.y() + b.y()),
+                    0.5 * (a.z() + b.z()),
+                )
+            });
+        let (lo, hi) = if qa <= qb { (qa, qb) } else { (qb, qa) };
+        Some((lo, hi, qp(&mid)))
+    };
+    #[derive(Clone, Copy)]
+    struct SmoothRuledBoundary {
+        normal: [f64; 3],
+        inward_tangent: [f64; 3],
+    }
+    #[derive(Clone, Copy)]
+    struct EdgeOwner {
+        face: usize,
+        ruled: Option<SmoothRuledBoundary>,
+    }
+    let unit = |vector: GeomVec| {
+        vector
+            .normalized()
+            .map(|direction| [direction.x(), direction.y(), direction.z()])
+    };
+    let mut edge_owners: HashMap<(QPnt, QPnt, QPnt), Vec<EdgeOwner>> = HashMap::new();
+    for (fi, face) in faces.iter().enumerate() {
+        match (&kinds[fi], face.surface()) {
+            (Kind::Planar(_), _) => {
+                for wire in face.wires() {
+                    for edge in wire.edges() {
+                        if let Some(key) = edge_key(&edge) {
+                            edge_owners.entry(key).or_default().push(EdgeOwner {
+                                face: fi,
+                                ruled: None,
+                            });
+                        }
+                    }
                 }
-                let mid = edge
-                    .curve()
-                    .map(|c| c.point(0.5 * (edge.first() + edge.last())))
-                    .unwrap_or_else(|| {
-                        Pnt::new(
-                            0.5 * (a.x() + b.x()),
-                            0.5 * (a.y() + b.y()),
-                            0.5 * (a.z() + b.z()),
-                        )
-                    });
-                let (lo, hi) = if qa <= qb { (qa, qb) } else { (qb, qa) };
-                edge_owners.entry((lo, hi, qp(&mid))).or_default().push(fi);
             }
+            (Kind::Ruled, Some(GeomSurface::Ruled(ruled))) => {
+                // A prism's lateral ruled patch has two pcurve edges at constant
+                // U, spanning V=0..1. Those are its sweep-direction boundaries.
+                // Evaluate the surface tangent plane there and orient dU toward
+                // the patch interior; two genuinely smooth neighbouring spans
+                // have equal tangent planes and opposing inward dU directions.
+                for wire in face.wires() {
+                    struct Candidate {
+                        key: (QPnt, QPnt, QPnt),
+                        u: f64,
+                        normal: [f64; 3],
+                        tangent: [f64; 3],
+                    }
+                    let edges = wire.edges();
+                    let mut candidates = Vec::new();
+                    for (edge_index, edge) in edges.iter().enumerate() {
+                        let Some(key) = edge_key(edge) else {
+                            continue;
+                        };
+                        let Some(pcurve) = wire.pcurve(edge_index) else {
+                            continue;
+                        };
+                        let uv0 = pcurve.point_at_fraction(0.0);
+                        let uv1 = pcurve.point_at_fraction(1.0);
+                        let u_scale = 1.0 + uv0.x().abs().max(uv1.x().abs());
+                        if (uv1.x() - uv0.x()).abs() > 1.0e-8 * u_scale
+                            || (uv1.y() - uv0.y()).abs() < 0.5
+                        {
+                            continue;
+                        }
+                        let u = 0.5 * (uv0.x() + uv1.x());
+                        let v = 0.5 * (uv0.y() + uv1.y());
+                        let (_, du, dv) = ruled.d1(u, v);
+                        let Some(normal) = unit(du.cross(&dv)) else {
+                            continue;
+                        };
+                        let Some(tangent) = unit(du) else {
+                            continue;
+                        };
+                        candidates.push(Candidate {
+                            key,
+                            u,
+                            normal,
+                            tangent,
+                        });
+                    }
+                    for (candidate_index, candidate) in candidates.iter().enumerate() {
+                        let Some(other) = candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| *index != candidate_index)
+                            .max_by(|(_, left), (_, right)| {
+                                (left.u - candidate.u)
+                                    .abs()
+                                    .total_cmp(&(right.u - candidate.u).abs())
+                            })
+                            .map(|(_, other)| other)
+                        else {
+                            continue;
+                        };
+                        let inward_sign = (other.u - candidate.u).signum();
+                        if inward_sign == 0.0 {
+                            continue;
+                        }
+                        let inward_tangent = [
+                            candidate.tangent[0] * inward_sign,
+                            candidate.tangent[1] * inward_sign,
+                            candidate.tangent[2] * inward_sign,
+                        ];
+                        edge_owners
+                            .entry(candidate.key)
+                            .or_default()
+                            .push(EdgeOwner {
+                                face: fi,
+                                ruled: Some(SmoothRuledBoundary {
+                                    normal: candidate.normal,
+                                    inward_tangent,
+                                }),
+                            });
+                    }
+                }
+            }
+            _ => {}
         }
     }
     for owners in edge_owners.values() {
-        for (k, &i) in owners.iter().enumerate() {
-            for &j in &owners[k + 1..] {
-                if let (Kind::Planar(si), Kind::Planar(sj)) = (&kinds[i], &kinds[j]) {
-                    if si == sj {
-                        let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+        for (k, &left) in owners.iter().enumerate() {
+            for &right in &owners[k + 1..] {
+                let (i, j) = (left.face, right.face);
+                let joins = if let (Kind::Planar(si), Kind::Planar(sj)) = (&kinds[i], &kinds[j]) {
+                    si == sj
+                } else if matches!((&kinds[i], &kinds[j]), (Kind::Ruled, Kind::Ruled)) {
+                    left.ruled.zip(right.ruled).is_some_and(|(a, b)| {
+                        let normal_dot = a.normal[0] * b.normal[0]
+                            + a.normal[1] * b.normal[1]
+                            + a.normal[2] * b.normal[2];
+                        let inward_dot = a.inward_tangent[0] * b.inward_tangent[0]
+                            + a.inward_tangent[1] * b.inward_tangent[1]
+                            + a.inward_tangent[2] * b.inward_tangent[2];
+                        // About 2.6 degrees of angular slack covers f32-derived
+                        // glyph control points while preserving intentional kinks.
+                        normal_dot.abs() >= 0.999 && inward_dot <= -0.999
+                    })
+                } else {
+                    false
+                };
+                if joins {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
                         parent[rj] = ri;
                     }
                 }
@@ -391,7 +524,7 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
 
     let mut groups = Vec::with_capacity(faces.len());
     let mut seen: HashMap<SurfSig, u32> = HashMap::new();
-    let mut planar_roots: HashMap<usize, u32> = HashMap::new();
+    let mut adjacent_roots: HashMap<usize, u32> = HashMap::new();
     let mut next = 0u32;
     for fi in 0..faces.len() {
         let mut fresh = || {
@@ -401,9 +534,9 @@ pub(crate) fn cylinder_surface_groups(solid: &KernelSolid) -> Vec<u32> {
         };
         let id = match &kinds[fi] {
             Kind::Analytic(sig) => *seen.entry(*sig).or_insert_with(fresh),
-            Kind::Planar(_) => {
+            Kind::Planar(_) | Kind::Ruled => {
                 let root = find(&mut parent, fi);
-                *planar_roots.entry(root).or_insert_with(fresh)
+                *adjacent_roots.entry(root).or_insert_with(fresh)
             }
             Kind::Other => fresh(),
         };
@@ -1330,6 +1463,102 @@ mod surface_group_tests {
         assert_ne!(
             tip_ids[0], tip_ids[1],
             "disjoint coplanar faces must not share a group"
+        );
+    }
+
+    fn quadratic_edge(poles: [Pnt; 3]) -> Edge {
+        let curve = BSplineCurve::new(2, poles.to_vec(), None, vec![0.0, 1.0], vec![3, 3]);
+        Edge::new(
+            Some(GeomCurve::bspline(curve)),
+            0.0,
+            1.0,
+            Vertex::new(poles[0]),
+            Vertex::new(poles[2]),
+        )
+    }
+
+    fn two_curve_prism(second_control: Pnt) -> KernelSolid {
+        let start = Pnt::new(0.0, 0.0, 0.0);
+        let curve_start = Pnt::new(2.0, 0.0, 0.0);
+        let join = Pnt::new(3.0, 1.0, 0.0);
+        let curve_end = Pnt::new(2.0, 2.0, 0.0);
+        let upper_left = Pnt::new(0.0, 2.0, 0.0);
+        let face = Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                start,
+                Dir::dz(),
+            ))),
+            Wire::from_edges([
+                Edge::between_points(start, curve_start),
+                quadratic_edge([curve_start, Pnt::new(3.0, 0.0, 0.0), join]),
+                quadratic_edge([join, second_control, curve_end]),
+                Edge::between_points(curve_end, upper_left),
+                Edge::between_points(upper_left, start),
+            ]),
+        );
+        openrcad::algo::prism::prism_operation(&face, GeomVec::new(0.0, 0.0, 2.0))
+            .expect("curved profile prism")
+            .value
+    }
+
+    #[test]
+    fn tangent_curved_prism_spans_select_as_one_face_without_a_vertical_seam() {
+        let solid = two_curve_prism(Pnt::new(3.0, 2.0, 0.0));
+        let faces = solid.shell().faces();
+        let groups = cylinder_surface_groups(&solid);
+        let ruled: Vec<usize> = faces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, face)| {
+                matches!(face.surface(), Some(GeomSurface::Ruled(_))).then_some(index)
+            })
+            .collect();
+        assert_eq!(ruled.len(), 2, "fixture must produce two curved wall spans");
+        assert_eq!(
+            groups[ruled[0]], groups[ruled[1]],
+            "tangent-connected Bezier walls must share one selectable face"
+        );
+
+        let mesh = MockMesh::from_solid(&solid);
+        let has_join_seam = mesh.edge_indices.chunks_exact(2).any(|segment| {
+            let point = |index: u32| {
+                let base = index as usize * 3;
+                [
+                    mesh.edge_vertices[base],
+                    mesh.edge_vertices[base + 1],
+                    mesh.edge_vertices[base + 2],
+                ]
+            };
+            let a = point(segment[0]);
+            let b = point(segment[1]);
+            (a[0] - 3.0).abs() < 1.0e-4
+                && (a[1] - 1.0).abs() < 1.0e-4
+                && (b[0] - 3.0).abs() < 1.0e-4
+                && (b[1] - 1.0).abs() < 1.0e-4
+                && (a[2] - b[2]).abs() > 1.0
+        });
+        assert!(
+            !has_join_seam,
+            "the internal Bezier-span ruling must not be drawn/selectable"
+        );
+    }
+
+    #[test]
+    fn sharp_curved_prism_spans_remain_separate_faces() {
+        let solid = two_curve_prism(Pnt::new(2.0, 1.2, 0.0));
+        let faces = solid.shell().faces();
+        let groups = cylinder_surface_groups(&solid);
+        let ruled: Vec<usize> = faces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, face)| {
+                matches!(face.surface(), Some(GeomSurface::Ruled(_))).then_some(index)
+            })
+            .collect();
+        assert_eq!(ruled.len(), 2);
+        assert_ne!(
+            groups[ruled[0]], groups[ruled[1]],
+            "a real corner between curved spans must remain a selectable edge"
         );
     }
 }

@@ -37,7 +37,13 @@ pub fn components_form_connected_material(parts: &[KernelSolid]) -> bool {
     }
 
     let vertices: Vec<_> = parts.iter().map(KernelSolid::vertices).collect();
-    let meshes: Vec<_> = parts.iter().map(MockMesh::from_solid).collect();
+    // Tessellation is by far the dominant cost here and most pairs are decided
+    // by the AABB gate or the exact-vertex test — a text extrude's letters are
+    // R disjoint parts probed pairwise, so eager meshing was O(R) tessellations
+    // before a single comparison ran. Mesh lazily, at most once per part.
+    let meshes: Vec<std::cell::OnceCell<MockMesh>> =
+        parts.iter().map(|_| std::cell::OnceCell::new()).collect();
+    let mesh = |index: usize| meshes[index].get_or_init(|| MockMesh::from_solid(&parts[index]));
     let vertex_near_surface = |vertex_mesh: &MockMesh, surface_mesh: &MockMesh| {
         vertex_mesh.vertices.chunks_exact(6).any(|vertex| {
             let point = [vertex[0], vertex[1], vertex[2]];
@@ -69,8 +75,8 @@ pub fn components_form_connected_material(parts: &[KernelSolid]) -> bool {
                 vertices[b]
                     .iter()
                     .any(|vb| va.point().distance(&vb.point()) <= 1.0e-4)
-            }) || vertex_near_surface(&meshes[a], &meshes[b])
-                || vertex_near_surface(&meshes[b], &meshes[a]))
+            }) || vertex_near_surface(mesh(a), mesh(b))
+                || vertex_near_surface(mesh(b), mesh(a)))
     };
 
     let mut reached = vec![false; parts.len()];

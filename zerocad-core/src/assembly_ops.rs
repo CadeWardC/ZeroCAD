@@ -365,6 +365,18 @@ pub fn insert_prepared_occurrence(
     })
 }
 
+/// Prepare an insertion without mutating the live assembly.
+pub fn prepare_occurrence_insertion(
+    assembly: &AssemblyDocument,
+    prepared: PreparedPartDefinition,
+    placement: RigidPlacement,
+    grounded: bool,
+) -> Result<(AssemblyDocument, InsertOccurrenceResult), AssemblyOperationError> {
+    let mut candidate = assembly.clone();
+    let result = insert_prepared_occurrence(&mut candidate, prepared, placement, grounded)?;
+    Ok((candidate, result))
+}
+
 pub fn insert_part_snapshot(
     assembly: &mut AssemblyDocument,
     source_bytes: &[u8],
@@ -381,14 +393,14 @@ pub fn insert_part_snapshot(
 ///
 /// Preparing and evaluating the candidate is intentionally separate. This
 /// function performs every fallible check against an Arc-cheap authoritative
-/// clone, then swaps that clone into place as one transaction. Occurrence
-/// identity, authored names, placements, grounding, and visibility selectors
-/// therefore survive replacement unchanged.
-pub fn replace_occurrences_with_prepared(
-    assembly: &mut AssemblyDocument,
+/// clone and returns that candidate without touching the live document.
+/// Occurrence identity, authored names, placements, grounding, and visibility
+/// selectors therefore survive replacement unchanged.
+pub fn prepare_occurrence_replacement(
+    assembly: &AssemblyDocument,
     occurrence_ids: &[u64],
     prepared: PreparedPartDefinition,
-) -> Result<ReplaceOccurrencesResult, AssemblyOperationError> {
+) -> Result<(AssemblyDocument, ReplaceOccurrencesResult), AssemblyOperationError> {
     assembly
         .validate_structural_contracts()
         .map_err(|error| AssemblyOperationError::InvalidAssembly(error.to_string()))?;
@@ -463,15 +475,25 @@ pub fn replace_occurrences_with_prepared(
         .validate_structural_contracts()
         .map_err(|error| AssemblyOperationError::InvalidAssembly(error.to_string()))?;
 
-    *assembly = candidate;
-    Ok(ReplaceOccurrencesResult {
+    let result = ReplaceOccurrencesResult {
         replaced_occurrence_ids: selected,
         definition_model_hash: prepared.model_hash,
         definition_created,
         pruned_definition_hashes,
         display_bodies: prepared.display_bodies,
         diagnostics: prepared.diagnostics,
-    })
+    };
+    Ok((candidate, result))
+}
+
+pub fn replace_occurrences_with_prepared(
+    assembly: &mut AssemblyDocument,
+    occurrence_ids: &[u64],
+    prepared: PreparedPartDefinition,
+) -> Result<ReplaceOccurrencesResult, AssemblyOperationError> {
+    let (candidate, result) = prepare_occurrence_replacement(assembly, occurrence_ids, prepared)?;
+    *assembly = candidate;
+    Ok(result)
 }
 
 fn unique_definition_name(assembly: &AssemblyDocument, suggested: &str) -> String {
@@ -670,6 +692,21 @@ mod tests {
         assert_eq!(assembly.occurrences.len(), 2);
         assert_eq!(assembly.occurrences[&1].name, "Bracket:1");
         assert_eq!(assembly.occurrences[&2].name, "Bracket:2");
+    }
+
+    #[test]
+    fn prepared_insertion_does_not_mutate_the_live_assembly() {
+        let bytes = box_part_bytes(None);
+        let prepared =
+            prepare_part_definition(&bytes, Some("Bracket.zcad"), &LoadOptions::default()).unwrap();
+        let assembly = AssemblyDocument::new();
+        let before = assembly.clone();
+        let (candidate, result) =
+            prepare_occurrence_insertion(&assembly, prepared, RigidPlacement::IDENTITY, false)
+                .unwrap();
+        assert_eq!(assembly, before);
+        assert_eq!(result.occurrence_id, 1);
+        assert_eq!(candidate.occurrences.len(), 1);
     }
 
     #[test]

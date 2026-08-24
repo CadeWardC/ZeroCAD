@@ -78,45 +78,64 @@ impl ZeroCadApp {
                 if self.project_kind == ProjectKind::Part {
                     ui.separator();
 
-                    if icons::Icon::Download
-                        .menu_button(ui, "Import STEP")
-                        .clicked()
-                    {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.import_step();
-                    }
+                    let import_menu_id = ui.make_persistent_id("file_import_format_menu");
+                    let import_button = icons::Icon::Download.menu_button(ui, "Import…");
+                    let mut import_menu = egui::menu::BarState::load(ui.ctx(), import_menu_id);
+                    let _ = import_menu.bar_menu(&import_button, |ui| {
+                        ui.set_min_width(200.0);
 
-                    if icons::Icon::Download
-                        .menu_button(ui, "Import STL")
-                        .clicked()
-                    {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.import_stl();
-                    }
+                        if icons::Icon::Download
+                            .menu_button(ui, "STEP model")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.import_step();
+                        }
 
-                    if icons::Icon::Download
-                        .menu_button(ui, "Import DXF to Sketch")
-                        .clicked()
-                    {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.import_dxf();
-                    }
+                        if icons::Icon::Download.menu_button(ui, "STL mesh").clicked() {
+                            ui.close_menu();
+                            self.import_stl();
+                        }
 
-                    if icons::Icon::Download
-                        .menu_button_hint(ui, "Export STL", &hint(self, ShortcutAction::ExportStl))
-                        .clicked()
-                    {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.export_stl();
-                    }
+                        if icons::Icon::Download
+                            .menu_button(ui, "DXF to Sketch")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.import_dxf();
+                        }
+                    });
+                    import_menu.store(ui.ctx(), import_menu_id);
 
-                    if icons::Icon::Download
-                        .menu_button(ui, "Export 3MF")
-                        .clicked()
-                    {
-                        ui.memory_mut(|mem| mem.close_popup());
-                        self.export_3mf();
-                    }
+                    let export_menu_id = ui.make_persistent_id("file_export_format_menu");
+                    let export_button = icons::Icon::Download.menu_button(ui, "Export…");
+                    let mut export_menu = egui::menu::BarState::load(ui.ctx(), export_menu_id);
+                    let _ = export_menu.bar_menu(&export_button, |ui| {
+                        ui.set_min_width(200.0);
+
+                        if icons::Icon::Download
+                            .menu_button_hint(
+                                ui,
+                                "STL mesh",
+                                &hint(self, ShortcutAction::ExportStl),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.export_stl();
+                        }
+
+                        if icons::Icon::Download.menu_button(ui, "3MF model").clicked() {
+                            ui.close_menu();
+                            self.export_3mf();
+                        }
+
+                        if icons::Icon::Download.menu_button(ui, "OBJ mesh").clicked() {
+                            ui.close_menu();
+                            self.export_obj();
+                        }
+                    });
+                    export_menu.store(ui.ctx(), export_menu_id);
 
                     ui.separator();
 

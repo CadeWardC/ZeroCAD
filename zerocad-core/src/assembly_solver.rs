@@ -248,11 +248,11 @@ pub fn apply_mate_solution(
 }
 
 /// Add one authored mate and solve it as an atomic document transaction.
-pub fn add_mate_transactionally(
-    assembly: &mut AssemblyDocument,
+pub fn prepare_mate_addition(
+    assembly: &AssemblyDocument,
     mut mate: AssemblyMate,
     context: &MateSolveContext,
-) -> Result<MateSolveResult, String> {
+) -> Result<(AssemblyDocument, MateSolveResult), String> {
     let mut candidate = assembly.clone_authoritative();
     let mate_set = candidate.mates.get_or_insert_with(Default::default);
     let id = mate_set.next_mate_id;
@@ -283,6 +283,16 @@ pub fn add_mate_transactionally(
             .unwrap_or_else(|| "mate system did not converge".into()));
     }
     apply_mate_solution(&mut candidate, &solution)?;
+    Ok((candidate, solution))
+}
+
+/// Add one authored mate and solve it as an atomic document transaction.
+pub fn add_mate_transactionally(
+    assembly: &mut AssemblyDocument,
+    mate: AssemblyMate,
+    context: &MateSolveContext,
+) -> Result<MateSolveResult, String> {
+    let (candidate, solution) = prepare_mate_addition(assembly, mate, context)?;
     *assembly = candidate;
     Ok(solution)
 }
@@ -290,12 +300,12 @@ pub fn add_mate_transactionally(
 /// Commit an interactive full-pose target without retaining the temporary
 /// constraint. The requested target becomes the authored manual-pose
 /// preference, then the persistent mate system is solved again.
-pub fn apply_pose_target_transactionally(
-    assembly: &mut AssemblyDocument,
+pub fn prepare_pose_target(
+    assembly: &AssemblyDocument,
     occurrence_id: OccurrenceId,
     target: RigidPlacement,
     context: &MateSolveContext,
-) -> Result<MateSolveResult, String> {
+) -> Result<(AssemblyDocument, MateSolveResult), String> {
     if !assembly.occurrences.contains_key(&occurrence_id) {
         return Err(format!("occurrence {occurrence_id} does not exist"));
     }
@@ -333,19 +343,29 @@ pub fn apply_pose_target_transactionally(
             }));
     }
     apply_mate_solution(&mut candidate, &persistent_solution)?;
+    Ok((candidate, persistent_solution))
+}
+
+pub fn apply_pose_target_transactionally(
+    assembly: &mut AssemblyDocument,
+    occurrence_id: OccurrenceId,
+    target: RigidPlacement,
+    context: &MateSolveContext,
+) -> Result<MateSolveResult, String> {
+    let (candidate, solution) = prepare_pose_target(assembly, occurrence_id, target, context)?;
     *assembly = candidate;
-    Ok(persistent_solution)
+    Ok(solution)
 }
 
 /// Apply a one-shot face target alongside persistent mates, then discard the
 /// temporary mate and retain only the resulting manual-pose preference.
-pub fn apply_ephemeral_mate_target_transactionally(
-    assembly: &mut AssemblyDocument,
+pub fn prepare_ephemeral_mate_target(
+    assembly: &AssemblyDocument,
     controlled_occurrence_id: OccurrenceId,
     mut temporary_mate: AssemblyMate,
     context: &MateSolveContext,
     frames: ResolvedMateFrames,
-) -> Result<MateSolveResult, String> {
+) -> Result<(AssemblyDocument, MateSolveResult), String> {
     if !assembly.occurrences.contains_key(&controlled_occurrence_id) {
         return Err(format!(
             "occurrence {controlled_occurrence_id} does not exist"
@@ -397,8 +417,25 @@ pub fn apply_ephemeral_mate_target_transactionally(
             .unwrap_or_else(|| "persistent mate system did not converge after alignment".into()));
     }
     apply_mate_solution(&mut candidate, &persistent_solution)?;
+    Ok((candidate, persistent_solution))
+}
+
+pub fn apply_ephemeral_mate_target_transactionally(
+    assembly: &mut AssemblyDocument,
+    controlled_occurrence_id: OccurrenceId,
+    temporary_mate: AssemblyMate,
+    context: &MateSolveContext,
+    frames: ResolvedMateFrames,
+) -> Result<MateSolveResult, String> {
+    let (candidate, solution) = prepare_ephemeral_mate_target(
+        assembly,
+        controlled_occurrence_id,
+        temporary_mate,
+        context,
+        frames,
+    )?;
     *assembly = candidate;
-    Ok(persistent_solution)
+    Ok(solution)
 }
 
 fn mate_is_resolved(mate: &AssemblyMate, context: &MateSolveContext) -> bool {
@@ -1646,6 +1683,16 @@ mod tests {
         );
         context.assembly_diagonal_mm = 20.0;
         let target = RigidPlacement::new([0.0, 0.0, 12.0], [1.0, 0.0, 0.0, 0.0]).unwrap();
+        let before = assembly.clone();
+        let (prepared, prepared_solution) =
+            prepare_pose_target(&assembly, 2, target, &context).unwrap();
+        assert!(prepared_solution.converged);
+        assert_eq!(
+            assembly, before,
+            "preparing a pose target must not commit it"
+        );
+        assert_eq!(prepared.occurrences[&2].manual_placement, target);
+
         let solution =
             apply_pose_target_transactionally(&mut assembly, 2, target, &context).unwrap();
         assert!(solution.converged);

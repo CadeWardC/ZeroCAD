@@ -118,8 +118,8 @@ pub use sketch::{
     SketchShape, Spline, SplineContinuity, SplineKind,
 };
 pub use stl::{
-    assembly_to_3mf, assembly_to_binary_stl, meshes_to_3mf, meshes_to_binary_stl, read_stl_mesh,
-    write_binary_stl, AssemblyMeshExportError, StlImportError, StlValidationReport,
+    assembly_to_3mf, assembly_to_binary_stl, meshes_to_3mf, meshes_to_binary_stl, meshes_to_obj,
+    read_stl_mesh, write_binary_stl, AssemblyMeshExportError, StlImportError, StlValidationReport,
     ValidatedMeshBody,
 };
 pub use units::{Parameter, Unit};

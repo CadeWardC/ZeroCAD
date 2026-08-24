@@ -1,5 +1,52 @@
 use crate::*;
 
+const SAVE_DIALOG_BACKDROP_ID: &str = "save_dialog_backdrop";
+const SAVE_DIALOG_WINDOW_ID: &str = "save_dialog_window";
+const SAVE_DIALOG_CONTENT_WIDTH: f32 = 520.0;
+const SAVE_DIALOG_DESTINATION_WIDTH: f32 = SAVE_DIALOG_CONTENT_WIDTH - 24.0;
+const UNSAVED_CHANGES_BACKDROP_ID: &str = "unsaved_changes_backdrop";
+const UNSAVED_CHANGES_WINDOW_ID: &str = "unsaved_changes_window";
+
+fn save_project_title_error(title: &str) -> Option<&'static str> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Some("Enter a project name.");
+    }
+    if trimmed != title {
+        return Some("The project name cannot begin or end with a space.");
+    }
+    if matches!(trimmed, "." | "..") {
+        return Some("Choose a more descriptive project name.");
+    }
+    if trimmed.ends_with('.') {
+        return Some("The project name cannot end with a period.");
+    }
+    if trimmed
+        .chars()
+        .any(|character| character.is_control() || r#"<>:"/\|?*"#.contains(character))
+    {
+        return Some("The project name contains a character that cannot be used in a file name.");
+    }
+    None
+}
+
+fn save_dialog_should_close(
+    backdrop_clicked: bool,
+    escape_pressed: bool,
+    window_open: bool,
+) -> bool {
+    backdrop_clicked || escape_pressed || !window_open
+}
+
+fn unsaved_changes_should_cancel(
+    phase: ProjectTransitionPhase,
+    backdrop_clicked: bool,
+    escape_pressed: bool,
+    window_open: bool,
+) -> bool {
+    phase == ProjectTransitionPhase::Confirm && (backdrop_clicked || escape_pressed || !window_open)
+}
+
 /// One undo/redo entry: the parametric history plus the visibility set. The
 /// visibility set has to travel with the graph — an extrude auto-hides its
 /// sketch, so undoing the extrude must also reveal the sketch again.
@@ -247,6 +294,7 @@ impl ZeroCadApp {
         self.feature_properties_dialog = None;
         self.pending_visual = None;
         self.pending_mirror_join_feedback = None;
+        self.pending_extrude_visibility = None;
         self.reset_sketch_state();
         self.is_sketch_mode = false;
         self.is_plane_selection_mode = false;
@@ -331,10 +379,19 @@ impl ZeroCadApp {
 
     /// Execute the save using the current save-dialog parameters.
     pub(crate) fn do_save(&mut self) {
-        let state = match self.save_dialog.take() {
+        let Some(current_state) = self.save_dialog.as_ref() else {
+            return;
+        };
+        if let Some(error) = save_project_title_error(&current_state.project_title) {
+            self.status_msg = error.to_string();
+            return;
+        }
+
+        let mut state = match self.save_dialog.take() {
             Some(s) => s,
             None => return,
         };
+        state.project_title = state.project_title.trim().to_string();
 
         let ext = state.save_format.extension();
         let file_name = format!("{}.{ext}", state.project_title);
@@ -539,74 +596,187 @@ impl ZeroCadApp {
 
     /// Render the in-app save dialog as a centered modal overlay.
     pub(crate) fn show_save_dialog(&mut self, ctx: &egui::Context) {
-        let is_open = self.save_dialog.is_some();
-        if !is_open {
+        if self.save_dialog.is_none() {
             return;
         }
 
-        // Semi-transparent backdrop.
-        egui::Area::new(egui::Id::new("save_dialog_backdrop"))
+        let pal = self.pal();
+        let recent_folders = self.recent_files.recent_folders();
+        let window_title = match self.project_kind {
+            ProjectKind::Part => "Save design",
+            ProjectKind::Assembly => "Save assembly",
+        };
+        let backdrop_id = egui::Id::new(SAVE_DIALOG_BACKDROP_ID);
+        let window_id = egui::Id::new(SAVE_DIALOG_WINDOW_ID);
+        let backdrop_layer = egui::LayerId::new(egui::Order::Foreground, backdrop_id);
+        let window_layer = egui::LayerId::new(egui::Order::Foreground, window_id);
+
+        // Treat the backdrop and window as one modal stack. Moving the backdrop
+        // to the top dims every floating workspace panel; marking the window as
+        // its sublayer keeps it above the clickable backdrop even after the
+        // backdrop itself is clicked.
+        ctx.set_sublayer(backdrop_layer, window_layer);
+        ctx.move_to_top(backdrop_layer);
+        let backdrop_response = egui::Area::new(backdrop_id)
+            .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
                 ui.painter()
-                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
-                // Consume clicks on the backdrop so they don't fall through.
-                ui.allocate_rect(screen, egui::Sense::click());
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(145));
+                ui.allocate_rect(screen, egui::Sense::click()).clicked()
             });
+        let backdrop_clicked = backdrop_response.response.clicked() || backdrop_response.inner;
+
+        let escape_pressed =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
         let mut close = false;
         let mut do_save = false;
+        let mut window_open = true;
 
-        egui::Window::new("Save Design")
+        egui::Window::new(window_title)
+            .id(window_id)
+            .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
-            .min_width(420.0)
+            .movable(false)
+            .default_width(SAVE_DIALOG_CONTENT_WIDTH)
+            .min_width(SAVE_DIALOG_CONTENT_WIDTH)
+            .max_width(SAVE_DIALOG_CONTENT_WIDTH)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(pal.surface)
+                    .stroke(egui::Stroke::new(1.0, pal.border))
+                    .rounding(12.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 10.0),
+                        blur: 28.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(48),
+                    })
+                    .inner_margin(egui::Margin::symmetric(20.0, 18.0)),
+            )
             .show(ctx, |ui| {
+                // Keep every full-width control tied to this fixed content
+                // column. Deriving their widths from `available_width()` can
+                // create an egui feedback loop where a framed child makes the
+                // auto-sized window a little wider on every repaint.
+                ui.set_width(SAVE_DIALOG_CONTENT_WIDTH);
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 let state = self.save_dialog.as_mut().unwrap();
 
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::hover());
+                    ui.painter().rect_filled(icon_rect, 10.0, pal.accent_soft);
+                    icons::Icon::Save.draw(
+                        ui.painter(),
+                        icon_rect.shrink2(egui::vec2(11.0, 11.0)),
+                        pal.accent,
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Save an editable ZeroCAD project")
+                                .strong()
+                                .size(16.0)
+                                .color(pal.text_strong),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Choose a project name, file type, and destination folder.",
+                            )
+                            .size(12.0)
+                            .color(pal.text_muted),
+                        );
+                    });
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
                 ui.add_space(4.0);
 
-                // --- Project Title ---
-                ui.horizontal(|ui| {
-                    ui.label("Project Title:");
-                    ui.text_edit_singleline(&mut state.project_title);
-                });
-
-                ui.add_space(6.0);
-
-                // --- File Format ---
-                ui.horizontal(|ui| {
-                    ui.label("File Format:");
-                    egui::ComboBox::from_id_salt("save_format")
-                        .selected_text(state.save_format.label())
-                        .show_ui(ui, |ui: &mut egui::Ui| {
-                            ui.selectable_value(
-                                &mut state.save_format,
-                                SaveFormat::ZcadLightweight,
-                                SaveFormat::ZcadLightweight.label(),
-                            );
-                            ui.selectable_value(
-                                &mut state.save_format,
-                                SaveFormat::ZcadFull,
-                                SaveFormat::ZcadFull.label(),
-                            );
-                        });
-                });
-
-                ui.add_space(6.0);
-
-                // --- Save Location ---
-                ui.horizontal(|ui| {
-                    ui.label("Save to:");
-                    let display = state.save_dir.display().to_string();
-                    ui.add(
-                        egui::TextEdit::singleline(&mut display.clone())
-                            .desired_width(260.0)
-                            .interactive(false),
+                ui.label(
+                    egui::RichText::new("PROJECT NAME")
+                        .strong()
+                        .size(10.5)
+                        .color(pal.text_muted),
+                );
+                ui.add_sized(
+                    [SAVE_DIALOG_CONTENT_WIDTH, 34.0],
+                    egui::TextEdit::singleline(&mut state.project_title)
+                        .hint_text("e.g. Motor Bracket"),
+                );
+                let title_error = save_project_title_error(&state.project_title);
+                if let Some(error) = title_error {
+                    ui.label(egui::RichText::new(error).size(11.0).color(pal.danger));
+                } else {
+                    ui.label(
+                        egui::RichText::new("The file extension is added automatically.")
+                            .size(11.0)
+                            .color(pal.text_faint),
                     );
-                    if ui.button("Browse…").clicked() {
+                }
+
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("FILE TYPE")
+                        .strong()
+                        .size(10.5)
+                        .color(pal.text_muted),
+                );
+                egui::ComboBox::from_id_salt("save_format")
+                    .width(SAVE_DIALOG_CONTENT_WIDTH)
+                    .selected_text(state.save_format.label())
+                    .show_ui(ui, |ui: &mut egui::Ui| {
+                        ui.selectable_value(
+                            &mut state.save_format,
+                            SaveFormat::ZcadLightweight,
+                            SaveFormat::ZcadLightweight.label(),
+                        );
+                        ui.selectable_value(
+                            &mut state.save_format,
+                            SaveFormat::ZcadFull,
+                            SaveFormat::ZcadFull.label(),
+                        );
+                    });
+                let format_description = match state.save_format {
+                    SaveFormat::ZcadLightweight => {
+                        "Recommended for everyday work — compact, portable, and fully editable."
+                    }
+                    SaveFormat::ZcadFull => {
+                        "Includes rebuild caches for faster reopening, with a larger file size."
+                    }
+                };
+                ui.label(
+                    egui::RichText::new(format_description)
+                        .size(11.0)
+                        .color(pal.text_faint),
+                );
+
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("LOCATION")
+                        .strong()
+                        .size(10.5)
+                        .color(pal.text_muted),
+                );
+                ui.horizontal(|ui| {
+                    let mut display = state.save_dir.display().to_string();
+                    let browse_width = 112.0;
+                    let path_width =
+                        (SAVE_DIALOG_CONTENT_WIDTH - browse_width - ui.spacing().item_spacing.x)
+                            .max(220.0);
+                    ui.add_sized(
+                        [path_width, 34.0],
+                        egui::TextEdit::singleline(&mut display).interactive(false),
+                    );
+                    if ui
+                        .add_sized([browse_width, 34.0], egui::Button::new("Choose folder…"))
+                        .clicked()
+                    {
                         if let Some(dir) = rfd::FileDialog::new()
                             .set_title("Choose save folder")
                             .set_directory(&state.save_dir)
@@ -617,51 +787,111 @@ impl ZeroCadApp {
                     }
                 });
 
-                ui.add_space(6.0);
-
-                // --- Recent Folders ---
-                let folders = self.recent_files.recent_folders();
-                if !folders.is_empty() {
-                    ui.label("Recent Folders:");
-                    let state = self.save_dialog.as_mut().unwrap();
-                    egui::ScrollArea::vertical()
-                        .max_height(100.0)
-                        .show(ui, |ui| {
-                            for folder in &folders {
-                                let label = folder.display().to_string();
-                                let selected = *folder == state.save_dir;
-                                if ui.selectable_label(selected, &label).clicked() {
-                                    state.save_dir = folder.clone();
-                                }
-                            }
-                        });
-                    ui.add_space(6.0);
+                if !recent_folders.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("RECENT FOLDERS")
+                            .strong()
+                            .size(10.5)
+                            .color(pal.text_muted),
+                    );
+                    for folder in recent_folders.iter().take(3) {
+                        let label = folder.display().to_string();
+                        let selected = *folder == state.save_dir;
+                        let button = egui::Button::new(
+                            egui::RichText::new(&label).size(11.5).color(if selected {
+                                pal.accent
+                            } else {
+                                pal.text_body
+                            }),
+                        )
+                        .fill(if selected {
+                            pal.accent_soft
+                        } else {
+                            pal.surface_subtle
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if selected { pal.accent } else { pal.border },
+                        ));
+                        if ui
+                            .add_sized([SAVE_DIALOG_CONTENT_WIDTH, 30.0], button)
+                            .on_hover_text(&label)
+                            .clicked()
+                        {
+                            state.save_dir = folder.clone();
+                        }
+                    }
                 }
 
-                // --- Full path preview ---
-                let state = self.save_dialog.as_ref().unwrap();
                 let full_path = state.save_dir.join(format!(
                     "{}.{}",
                     state.project_title,
                     state.save_format.extension()
                 ));
-                ui.horizontal(|ui| {
-                    ui.label("File:");
-                    ui.monospace(full_path.display().to_string());
-                });
+                let full_path_label = full_path.display().to_string();
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(pal.surface_subtle)
+                    .stroke(egui::Stroke::new(1.0, pal.border))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(SAVE_DIALOG_DESTINATION_WIDTH);
+                        ui.label(
+                            egui::RichText::new("DESTINATION")
+                                .strong()
+                                .size(9.5)
+                                .color(pal.text_muted),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&full_path_label)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(pal.text_body),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&full_path_label);
+                    });
 
-                ui.add_space(8.0);
-
-                // --- Buttons ---
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let primary_text = if self.dark_mode {
+                        egui::Color32::from_rgb(15, 23, 42)
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    let save_button =
+                        egui::Button::new(egui::RichText::new("Save").strong().color(primary_text))
+                            .fill(pal.accent)
+                            .stroke(egui::Stroke::NONE);
+                    if ui
+                        .add_enabled_ui(title_error.is_none(), |ui| {
+                            ui.add_sized([104.0, 34.0], save_button)
+                        })
+                        .inner
+                        .clicked()
+                    {
                         do_save = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui
+                        .add_sized([88.0, 34.0], egui::Button::new("Cancel"))
+                        .clicked()
+                    {
                         close = true;
                     }
                 });
             });
+
+        // Reassert after both areas have been registered this frame. This is
+        // what prevents a click on the backdrop from promoting it over the
+        // window on the following frame.
+        ctx.set_sublayer(backdrop_layer, window_layer);
+        close |= save_dialog_should_close(backdrop_clicked, escape_pressed, window_open);
 
         if do_save {
             self.do_save();
@@ -1494,47 +1724,75 @@ impl ZeroCadApp {
             ProjectTransition::Exit => "exit ZeroCAD".to_owned(),
         };
 
-        egui::Area::new(egui::Id::new("unsaved_changes_backdrop"))
+        let backdrop_id = egui::Id::new(UNSAVED_CHANGES_BACKDROP_ID);
+        let window_id = egui::Id::new(UNSAVED_CHANGES_WINDOW_ID);
+        let backdrop_layer = egui::LayerId::new(egui::Order::Foreground, backdrop_id);
+        let window_layer = egui::LayerId::new(egui::Order::Foreground, window_id);
+
+        // Keep the confirmation above its backdrop even after the backdrop is
+        // clicked. Without an explicit layer relationship, egui promotes the
+        // backdrop and can leave the dialog dimmed and unreachable.
+        ctx.set_sublayer(backdrop_layer, window_layer);
+        ctx.move_to_top(backdrop_layer);
+        let backdrop_response = egui::Area::new(backdrop_id)
+            .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
                 ui.painter()
                     .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
-                ui.allocate_rect(screen, egui::Sense::click());
+                ui.allocate_rect(screen, egui::Sense::click()).clicked()
             });
+        let backdrop_clicked = backdrop_response.response.clicked() || backdrop_response.inner;
+        let escape_pressed = phase == ProjectTransitionPhase::Confirm
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
         let mut save = false;
         let mut discard = false;
         let mut cancel = false;
-        egui::Window::new("Unsaved changes")
+        let mut window_open = true;
+        let window = egui::Window::new("Unsaved changes")
+            .id(window_id)
+            .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .resizable(false)
-            .min_width(420.0)
-            .show(ctx, |ui| {
-                if phase == ProjectTransitionPhase::Saving {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Saving the current project…");
-                    });
-                    return;
-                }
-                ui.label(format!(
-                    "Save changes to the current project before you {destination}?"
-                ));
-                ui.add_space(12.0);
+            .min_width(420.0);
+        let window = if phase == ProjectTransitionPhase::Confirm {
+            window.open(&mut window_open)
+        } else {
+            window
+        };
+        window.show(ctx, |ui| {
+            if phase == ProjectTransitionPhase::Saving {
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save = true;
-                    }
-                    if ui.button("Discard").clicked() {
-                        discard = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
+                    ui.spinner();
+                    ui.label("Saving the current project…");
                 });
+                return;
+            }
+            ui.label(format!(
+                "Save changes to the current project before you {destination}?"
+            ));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    save = true;
+                }
+                if ui.button("Discard").clicked() {
+                    discard = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
             });
+        });
+
+        // Reassert after both areas are registered so a backdrop interaction
+        // cannot reorder it above the confirmation on the following frame.
+        ctx.set_sublayer(backdrop_layer, window_layer);
+        cancel |=
+            unsaved_changes_should_cancel(phase, backdrop_clicked, escape_pressed, window_open);
 
         if save {
             self.open_save_dialog();
@@ -1808,6 +2066,66 @@ impl ZeroCadApp {
         });
     }
 
+    /// Prompt for a path and write the current bodies as named objects in one
+    /// Wavefront OBJ mesh. Like STL and 3MF, OBJ is a lossy export and does not
+    /// replace the editable `.zcad` document.
+    pub(crate) fn export_obj(&mut self) {
+        if self.body_meshes.is_empty() {
+            self.status_msg = "Nothing to export — the model has no solid bodies.".to_string();
+            return;
+        }
+        if self.eval_pending {
+            self.status_msg = "Export waits for the current model update to finish.".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export OBJ")
+            .add_filter("Wavefront OBJ", &["obj"])
+            .save_file()
+        else {
+            return;
+        };
+        let names: Vec<(String, usize)> = self
+            .body_meshes
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                let name = self
+                    .document
+                    .graph
+                    .node_indices()
+                    .find(|&n| self.document.graph[n].id == *id)
+                    .map(|n| self.document.graph[n].name.clone())
+                    .unwrap_or_else(|| id.clone());
+                (name, i)
+            })
+            .collect();
+        let bodies = self.body_meshes.clone();
+        let body_count = bodies.len();
+        let completions = self.export_completions.clone();
+        let repaint = self.egui_ctx.clone();
+        self.status_msg = "Exporting OBJ…".to_string();
+        std::thread::spawn(move || {
+            let bytes = zerocad_core::meshes_to_obj(
+                names.iter().map(|(name, i)| (name.as_str(), &bodies[*i].1)),
+            );
+            let (message, error) = match std::fs::write(&path, bytes) {
+                Ok(()) => (
+                    format!("Exported {body_count} bodies to {}", path.display()),
+                    false,
+                ),
+                Err(error) => (format!("OBJ export failed: {error}"), true),
+            };
+            completions
+                .lock()
+                .expect("export queue poisoned")
+                .push(ExportCompletion { message, error });
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+    }
+
     /// Prompt for a STEP file and add it to the design as an Import feature
     /// (undoable). The file's text is embedded in the feature so the `.zcad`
     /// stays self-contained; evaluation parses it into a body like any other
@@ -1935,6 +2253,184 @@ impl ZeroCadApp {
         self.hidden_nodes.remove(del_id);
         self.reevaluate_geometry();
         true
+    }
+}
+
+#[cfg(test)]
+mod save_dialog_tests {
+    use super::*;
+
+    #[test]
+    fn project_title_validation_prevents_invalid_file_names() {
+        assert_eq!(save_project_title_error(""), Some("Enter a project name."));
+        assert!(save_project_title_error(" trailing ").is_some());
+        assert!(save_project_title_error("bad/name").is_some());
+        assert!(save_project_title_error("bad.").is_some());
+        assert_eq!(save_project_title_error("Motor Bracket 01"), None);
+    }
+
+    #[test]
+    fn every_standard_modal_dismissal_closes_the_save_dialog() {
+        assert!(save_dialog_should_close(true, false, true));
+        assert!(save_dialog_should_close(false, true, true));
+        assert!(save_dialog_should_close(false, false, false));
+        assert!(!save_dialog_should_close(false, false, true));
+    }
+
+    #[test]
+    fn clicking_the_modal_backdrop_cancels_the_live_dialog() {
+        let mut app = ZeroCadApp::new();
+        app.open_save_dialog();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+
+        let mut first_frame = egui::RawInput::default();
+        first_frame.screen_rect = Some(screen);
+        let _ = ctx.run(first_frame, |ctx| app.show_save_dialog(ctx));
+
+        let mut press = egui::RawInput::default();
+        press.screen_rect = Some(screen);
+        press.events.extend([
+            egui::Event::PointerMoved(egui::pos2(8.0, 8.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(8.0, 8.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = ctx.run(press, |ctx| app.show_save_dialog(ctx));
+
+        let mut release = egui::RawInput::default();
+        release.screen_rect = Some(screen);
+        release.events.extend([
+            egui::Event::PointerMoved(egui::pos2(8.0, 8.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(8.0, 8.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = ctx.run(release, |ctx| app.show_save_dialog(ctx));
+
+        assert!(app.save_dialog.is_none());
+    }
+
+    #[test]
+    fn pointer_movement_does_not_expand_the_save_dialog() {
+        let mut app = ZeroCadApp::new();
+        app.open_save_dialog();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 850.0));
+
+        let render_at = |ctx: &egui::Context, app: &mut ZeroCadApp, pointer: egui::Pos2| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen);
+            input.events.push(egui::Event::PointerMoved(pointer));
+            let _ = ctx.run(input, |ctx| app.show_save_dialog(ctx));
+            ctx.memory(|memory| {
+                memory
+                    .area_rect(egui::Id::new(SAVE_DIALOG_WINDOW_ID))
+                    .expect("save dialog should have a persisted area")
+                    .width()
+            })
+        };
+
+        // Allow the auto-sized window to settle before checking subsequent
+        // pointer-triggered frames.
+        let _ = render_at(&ctx, &mut app, egui::pos2(20.0, 20.0));
+        let expected_width = render_at(&ctx, &mut app, egui::pos2(40.0, 40.0));
+
+        for pointer in [
+            egui::pos2(100.0, 120.0),
+            egui::pos2(300.0, 220.0),
+            egui::pos2(550.0, 425.0),
+            egui::pos2(800.0, 650.0),
+            egui::pos2(1050.0, 800.0),
+        ] {
+            let width = render_at(&ctx, &mut app, pointer);
+            assert!(
+                (width - expected_width).abs() < 0.01,
+                "save dialog grew from {expected_width} to {width} after pointer movement"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod unsaved_changes_dialog_tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_dismissals_cancel_but_an_active_save_cannot_be_dismissed() {
+        assert!(unsaved_changes_should_cancel(
+            ProjectTransitionPhase::Confirm,
+            true,
+            false,
+            true,
+        ));
+        assert!(unsaved_changes_should_cancel(
+            ProjectTransitionPhase::Confirm,
+            false,
+            true,
+            true,
+        ));
+        assert!(unsaved_changes_should_cancel(
+            ProjectTransitionPhase::Confirm,
+            false,
+            false,
+            false,
+        ));
+        assert!(!unsaved_changes_should_cancel(
+            ProjectTransitionPhase::Saving,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn clicking_the_backdrop_cancels_the_live_exit_confirmation() {
+        let mut app = ZeroCadApp::new();
+        app.document_revision = 1;
+        app.saved_document_revision = 0;
+        app.request_window_close();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+
+        let mut first_frame = egui::RawInput::default();
+        first_frame.screen_rect = Some(screen);
+        let _ = ctx.run(first_frame, |ctx| app.show_unsaved_changes_dialog(ctx));
+
+        let mut press = egui::RawInput::default();
+        press.screen_rect = Some(screen);
+        press.events.extend([
+            egui::Event::PointerMoved(egui::pos2(8.0, 8.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(8.0, 8.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = ctx.run(press, |ctx| app.show_unsaved_changes_dialog(ctx));
+
+        let mut release = egui::RawInput::default();
+        release.screen_rect = Some(screen);
+        release.events.extend([
+            egui::Event::PointerMoved(egui::pos2(8.0, 8.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(8.0, 8.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = ctx.run(release, |ctx| app.show_unsaved_changes_dialog(ctx));
+
+        assert!(app.pending_project_transition.is_none());
+        assert!(!app.allow_window_close);
     }
 }
 

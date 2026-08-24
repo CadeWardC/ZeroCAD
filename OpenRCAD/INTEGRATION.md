@@ -7,7 +7,7 @@ exchange. It is written to be copy-paste practical; for the conceptual *why*, se
 
 > **Status note.** OpenRCAD is pre-alpha. The foundation, geometry, topology,
 > primitives, intersection engine + BVH, booleans, tessellation, sewing, and
-> STEP/STL layers are real and tested, plus an interactive viewer
+> STEP/STL/3MF layers are real and tested, plus an interactive viewer
 > (`openrcad-render`) and a parametric document layer (`openrcad-document`). The
 > primitive fillet/chamfer fast paths handle a single **box** or
 > **cylinder** primitive at **any orientation**. Shell additionally handles the
@@ -16,9 +16,17 @@ exchange. It is written to be copy-paste practical; for the conceptual *why*, se
 > adapters preserve those fast paths and extend to arbitrary solids whenever
 > every edge passes the selected-edge machinery; otherwise they return the
 > complete typed blocker set atomically. The per-edge rolling-ball fillet
-> (`fillet_edges`) works on arbitrary edges including boolean results. Booleans are watertight **and**
+> (`fillet_edges`) works on arbitrary edges including boolean results and
+> curved–curved face adjacency. Booleans are watertight **and**
 > health-validated across the everyday cases (partial-imprint, coplanar joins,
 > cylinder cuts and bosses). See [Limitations](#limitations).
+>
+> **API generation note.** The classic wrappers (`boolean`, `boolean_checked`,
+> `fillet`, `chamfer`, `shell_solid`, `prism`, `tessellate`, `read_step`, `sew`)
+> are `#[deprecated]`: `boolean` discards metadata **and panics on failure**.
+> New code should use the `*_operation` / `*_with_policy` / `*_with_cancel`
+> entry points shown below — they return `OperationResult<T>` (value + topology
+> history + diagnostics + recovery/validation reports) and never panic.
 
 ---
 
@@ -35,11 +43,12 @@ openrcad = { version = "0.1" }
 ```
 
 ```rust
-use openrcad::foundation::{Pnt, Dir, Vec as GeomVec, Ax1, Ax2, Ax3, Trsf};
+use openrcad::foundation::{Pnt, Dir, Vec as GeomVec, Ax1, Ax2, Ax3, Trsf, TolerancePolicy};
 use openrcad::primitives::{make_box, make_cylinder, make_cone, make_sphere};
-use openrcad::algo::{boolean, fillet, chamfer, shell_solid, BooleanOp, BlendError};
-use openrcad::mesh::tessellate;
-use openrcad::exchange::{write_step, read_step, write_stl_ascii, write_stl_binary};
+use openrcad::algo::{boolean_operation, fillet_with_policy, chamfer_with_policy,
+                     shell_solid_with_policy, BooleanOp, BlendError};
+use openrcad::mesh::tessellate_checked;
+use openrcad::exchange::{write_step, read_step_operation, write_stl_ascii, write_stl_binary};
 ```
 
 Want a thinner build? Depend on individual crates (`openrcad-foundation`,
@@ -62,7 +71,9 @@ natively and to `wasm32`.
 | `GeomCurve`, `GeomSurface` | `geom` | Owned curve/surface enums stored *by value* in topology. |
 | `Solid`, `Shell`, `Face`, `Edge`, `Vertex` | `topo` | The B-Rep entities. |
 | `BooleanOp` | `algo` | `Fuse` \| `Cut` \| `Common`. |
-| `BlendError` | `algo` | Error from `fillet`/`chamfer`/`shell_solid`. |
+| `OperationResult<T>` | `topo` | Value + topology history + diagnostics + recovery/validation reports — what every `*_operation` entry point returns (`.value` holds the `T`). |
+| `TolerancePolicy` | `foundation` | Explicit tolerance set (start from `TolerancePolicy::STANDARD`); threaded through every `*_with_policy` call. |
+| `BlendError` | `algo` | Error from `fillet_with_policy`/`chamfer_with_policy`/`shell_solid_with_policy`. |
 | `TriangleMesh` | `mesh` | Tessellation output. |
 
 Every one of these is `Clone + Serialize + Deserialize` (see [§8](#8-persist-a-model-with-serde)).
@@ -115,12 +126,22 @@ Transforms compose; `transform_point(P) = scale·(matrix·P) + loc`.
 ## 5. Boolean operations
 
 ```rust
-use openrcad::algo::{boolean, BooleanOp};
+use openrcad::algo::{boolean_operation, BooleanOp};
 
-let union     = boolean(&a, &b, BooleanOp::Fuse);   // A ∪ B
-let common    = boolean(&a, &b, BooleanOp::Common); // A ∩ B
-let difference = boolean(&a, &b, BooleanOp::Cut);   // A − B
+let union     = boolean_operation(&a, &b, BooleanOp::Fuse)?.value;   // A ∪ B
+let common    = boolean_operation(&a, &b, BooleanOp::Common)?.value; // A ∩ B
+let difference = boolean_operation(&a, &b, BooleanOp::Cut)?.value;   // A − B
 ```
+
+Every modeling entry point follows one **operation contract**: the
+`*_operation` forms return `Result<OperationResult<T>, TypedError>`, where
+`OperationResult<T>` carries the `.value` plus a topology `history`, typed
+`diagnostics`, a `recovery` report, and a `validation` report. The
+`*_with_policy` variants take an explicit `&TolerancePolicy` (start from
+`TolerancePolicy::STANDARD`), and the `*_with_cancel` variants additionally
+accept a cancellation token for cooperative cancellation in interactive hosts.
+The legacy wrappers (`boolean`, `boolean_checked`, …) are `#[deprecated]` —
+`boolean` in particular **panics on failure**; don't use it in new code.
 
 Booleans run over a BVH-accelerated intersection engine (with closed-form
 line/circle intersection fast paths) and tolerant, ray-cast face classification,
@@ -131,7 +152,7 @@ straight back into more operations.
 two-manifold solid — check it directly:
 
 ```rust
-let cut = boolean(&a, &b, BooleanOp::Cut);
+let cut = boolean_operation(&a, &b, BooleanOp::Cut)?.value;
 assert!(cut.is_watertight());          // every edge shared by exactly two faces
 assert!(cut.validate().is_ok());       // every boundary loop is closed + contiguous
 let m = cut.manifold_report();         // { total_edges, free_edges, nonmanifold_edges }
@@ -148,22 +169,25 @@ topology (see [Limitations](#limitations)).
 
 ## 6. Fillet, chamfer, and shell
 
-These return `Result<Solid, BlendError>`. Handle both error cases:
+These return `Result<Solid, BlendError>` and take an explicit tolerance
+policy. Handle both error cases:
 
 ```rust
-use openrcad::algo::{fillet, chamfer, shell_solid, BlendError};
+use openrcad::algo::{fillet_with_policy, chamfer_with_policy, shell_solid_with_policy, BlendError};
+use openrcad::foundation::TolerancePolicy;
 
 let cyl = make_cylinder(&Ax2::new(Pnt::origin(), Dir::dz()), 5.0, 12.0);
+let policy = TolerancePolicy::STANDARD;
 
 // Roll a 0.8 fillet along both circular rims (torus rolling-ball surfaces).
-match fillet(&cyl, 0.8) {
-    Ok(rounded)                                  => use_it(rounded),
-    Err(BlendError::UnsupportedShape)            => { /* not a box/cylinder primitive */ }
+match fillet_with_policy(&cyl, 0.8, &policy) {
+    Ok(rounded)                                    => use_it(rounded),
+    Err(BlendError::UnsupportedShape)              => { /* not a box/cylinder primitive */ }
     Err(BlendError::ParameterTooLarge { max, .. }) => { /* radius too big; `max` fits */ }
 }
 
 // Chamfer: a 45° conical frustum on each cylinder rim.
-let beveled = chamfer(&cyl, 0.8)?;
+let beveled = chamfer_with_policy(&cyl, 0.8, &policy)?;
 
 // Shell: hollow to a wall thickness, leaving chosen faces open.
 let top = cyl.shell().faces()
@@ -171,7 +195,7 @@ let top = cyl.shell().faces()
     .find(|f| matches!(f.surface(),
         Some(openrcad::geom::GeomSurface::Plane(p)) if p.normal().z() > 0.9))
     .unwrap();
-let cup = shell_solid(&cyl, 0.3, &[top])?;   // open-topped tube
+let cup = shell_solid_with_policy(&cyl, 0.3, &[top], &policy)?;   // open-topped tube
 ```
 
 `?` works anywhere your function returns `Result<_, BlendError>` (it implements
@@ -182,9 +206,9 @@ the result satisfies the Euler characteristic `V − E + F = 2`.
 
 | Operation | On a box | On a cylinder |
 |---|---|---|
-| `fillet` | cylindrical edge faces + spherical octant corners | torus faces on both rims |
-| `chamfer` | ruled bevel faces + triangular corners | 45° conical frustums |
-| `shell_solid` | offset-surface cavity + planar rims | offset-surface cavity + planar rims |
+| `fillet_with_policy` | cylindrical edge faces + spherical octant corners | torus faces on both rims |
+| `chamfer_with_policy` | ruled bevel faces + triangular corners | 45° conical frustums |
+| `shell_solid_with_policy` | offset-surface cavity + planar rims | offset-surface cavity + planar rims |
 
 General Shell candidates use checked material-outward normals, exact analytic
 support intersections, construction-time pcurves, and shared-edge
@@ -203,9 +227,9 @@ arbitrary NURBS Shell are explicit rejections, not approximate topology.
 
 The primitive whole-solid builders above recognise only a box or cylinder. To
 blend selected edges of an **arbitrary** solid — including a boolean result —
-use the per-edge rolling-ball API. It handles planar–planar, planar–cylindrical, and
-planar–analytic edge adjacency, and rejects an over-large radius with a typed
-error rather than emitting a degenerate solid.
+use the per-edge rolling-ball API. It handles planar–planar, planar–cylindrical,
+planar–analytic, and curved–curved edge adjacency, and rejects an over-large
+radius with a typed error rather than emitting a degenerate solid.
 
 ```rust
 use openrcad::algo::{fillet_edges, chamfer_edges};
@@ -228,13 +252,16 @@ let contour = BlendContour {
     edges,                                // ordered edges forming the contour
     kind: BlendKind::Fillet,              // or BlendKind::Chamfer
     law: BlendLaw::Constant(2.0),         // Variable laws are not implemented yet
-    hint: Some(BlendCurveHint::Circle),   // co-circular → one logical arc contour
+    curve_hint: Some(BlendCurveHint::Circle), // co-circular → one logical arc contour
 };
 let blended = apply_blend_contour(&solid, &contour)?; // -> Result<Solid, BlendContourError>
 ```
 
 `BlendContourError` distinguishes an empty contour, an unsupported variable law,
-and an underlying fillet/chamfer failure.
+an incompatible corner construction, and an underlying fillet/chamfer failure.
+For a **network** of contours that must blend together (with corner modes
+`BlendCornerMode::{Auto, Miter, RollingBall, Setback}`), use
+`apply_blend_network_with_policy`.
 
 ### Strict all-edge convenience
 
@@ -257,29 +284,35 @@ failure, `AllEdgeBlendError::BlockingEdges` carries the deterministic source
 edges and typed reasons found by diagnostic replay. The input solid is immutable
 and no partly blended candidate is returned.
 
-### Sweep a profile into a solid (`prism`)
+### Sweep a profile into a solid (`prism_operation`, `revolve_operation`)
 
-`prism(&face, vector)` extrudes a planar face along a vector into a solid;
-`sweep_prism` is the lower-level form. Straight profile edges become planar
-laterals, axially-aligned circular arcs become cylindrical laterals, and other
-curves become ruled laterals. It reports `SweepError::{DegenerateVector,
-MissingOuterWire, OpenWire}`.
+`prism_operation(&face, vector)` extrudes a planar face along a vector into a
+solid (`prism` is the deprecated plain-`Solid` form; `sweep_prism` is the
+lower-level form). Straight profile edges become planar laterals, axially-aligned
+circular arcs become cylindrical laterals, and other curves become ruled
+laterals. It reports `SweepError::{DegenerateVector, MissingOuterWire, OpenWire}`.
 
 ```rust
-use openrcad::{algo::prism, foundation::Vec as GeomVec};
+use openrcad::algo::prism_operation;
+use openrcad::foundation::Vec as GeomVec;
 
-let solid = prism(&profile_face, &GeomVec::new(0.0, 0.0, 10.0))?;
+let solid = prism_operation(&profile_face, GeomVec::new(0.0, 0.0, 10.0))?.value;
 ```
+
+The companion `revolve_operation*` builds solids of revolution from a profile
+face and an axis, and the `skin*` / `smooth_skin*` family lofts section loops
+into solids (including an exact analytic smooth-loft mode).
 
 ---
 
 ## 7. Tessellate for rendering
 
 ```rust
-use openrcad::mesh::tessellate;
+use openrcad::mesh::tessellate_checked;
 
 // chordal error (max sag), angular error (radians).
-let mesh = tessellate(&part, 0.05, 0.5);
+// Checked tessellation validates the result instead of trusting it.
+let mesh = tessellate_checked(&part, 0.05, 0.5)?;
 
 println!("{} verts, {} tris", mesh.vertex_count(), mesh.triangle_count());
 
@@ -327,18 +360,21 @@ This is the basis for storing an entire model as a single document blob (use
 ## 9. Read and write files
 
 ```rust
-use openrcad::exchange::{write_step, read_step, write_stl_ascii, write_stl_binary};
+use openrcad::exchange::{write_step, read_step_operation, write_stl_ascii, write_stl_binary};
 use std::fs::File;
 
 // STEP (AP242 B-Rep) — round-trips solids, including toroidal surfaces.
 write_step(&part, "part.step")?;
-let reloaded = read_step("part.step")?;
+let reloaded = read_step_operation("part.step")?.value; // + validation/diagnostics
 
 // STL — write a tessellated mesh.
-let mesh = tessellate(&part, 0.05, 0.5);
+let mesh = tessellate_checked(&part, 0.05, 0.5)?;
 let mut f = File::create("part.stl")?;
 write_stl_binary(&mesh, &mut f)?;
 // or: write_stl_ascii(&mesh, "part", &mut f)?;
+
+// 3MF — zipped mesh packages, including multi-definition assembly models
+// (write_3mf / to_3mf_bytes / to_3mf_assembly_bytes).
 ```
 
 ---
@@ -357,11 +393,11 @@ the result back as a serde blob with zero pointer fix-ups.
 
 Know these before you wire OpenRCAD into a production path:
 
-- **Whole-solid Fillet/Chamfer fast paths are box/cylinder-only.** `fillet` and
-  `chamfer` detect a single box or cylinder primitive (at **any
+- **Whole-solid Fillet/Chamfer fast paths are box/cylinder-only.** `fillet_with_policy` and
+  `chamfer_with_policy` detect a single box or cylinder primitive (at **any
   position/orientation** — the frame is recovered from geometry) and construct the
   result directly. The strict all-edge adapters extend beyond those primitives
-  only when every edge passes. `shell_solid` has a wider verified analytic
+  only when every edge passes. `shell_solid_with_policy` has a wider verified analytic
   network, including topology-preserving concave planar sources with exact
   envelope evidence.
   The **per-edge** `fillet_edges` (rolling ball) does handle arbitrary
@@ -383,12 +419,11 @@ Know these before you wire OpenRCAD into a production path:
   partial-imprint goal-tests now pass and are un-`#[ignore]`d in
   `crates/openrcad-algo/tests/robustness.rs`). The remaining edge case: a cut that
   *severs* a body is returned as a single solid (Euler=4) rather than split into
-  separate bodies — call `boolean_bodies` / `boolean_checked_bodies`, or
-  `Solid::split_disconnected()` on the result, to get one `Solid` per connected
-  component.
+  separate bodies — call `Solid::split_disconnected()` on the result to get one
+  `Solid` per connected component.
 - **Intersection subdivision** can be deep on tangential NURBS configurations;
   prefer analytic primitives (line/circle pairs take a closed-form fast path).
-- **STL is write-only**; STEP is read + write.
+- **STL and 3MF are write-only**; STEP is read + write.
 
 When in doubt, call `solid.is_watertight()` and `solid.validate()` on results in
 your own tests — together they are the cheapest catch for a malformed solid.
@@ -405,21 +440,25 @@ make_cone(&ax2, r_bottom, r_top, height) -> Solid
 make_sphere(&center, radius) -> Solid
 make_wedge(dx, dy, dz, ltx) -> Solid
 
-// Algorithms
-boolean(&object, &tool, BooleanOp::{Fuse|Cut|Common}) -> Solid
-boolean_bodies(&object, &tool, BooleanOp) -> Vec<Solid>   // one per connected component
-fillet(&solid, radius) -> Result<Solid, BlendError>        // whole box/cylinder
-chamfer(&solid, distance) -> Result<Solid, BlendError>     // whole box/cylinder
-shell_solid(&solid, thickness, &open_faces) -> Result<Solid, BlendError>
+// Algorithms — prefer the *_operation / *_with_policy / *_with_cancel forms;
+// the bare legacy names (boolean, fillet, chamfer, shell_solid, prism,
+// tessellate, read_step, sew) are #[deprecated].
+boolean_operation(&object, &tool, BooleanOp::{Fuse|Cut|Common})
+    -> Result<OperationResult<Solid>, BooleanError>
+fillet_with_policy(&solid, radius, &policy) -> Result<Solid, BlendError>   // whole box/cylinder
+chamfer_with_policy(&solid, distance, &policy) -> Result<Solid, BlendError>
+shell_solid_with_policy(&solid, thickness, &open_faces, &policy) -> Result<Solid, BlendError>
 fillet_edges(&solid, &edges, radius) -> Result<Solid, RollingBallError>   // any solid
 chamfer_edges(&solid, &edges, distance) -> Result<Solid, ChamferError>    // any solid
 apply_blend_contour(&solid, &BlendContour) -> Result<Solid, BlendContourError>
-prism(&face, &vector) -> Result<Solid, SweepError>         // extrude a profile
+prism_operation(&face, vector) -> Result<OperationResult<Solid>, SweepError> // extrude a profile
+revolve_operation(&face, …) -> Result<OperationResult<Solid>, _>            // solid of revolution
 
 // Mesh & exchange
-tessellate(&solid, chord_err, angle_err) -> TriangleMesh
+tessellate_checked(&solid, chord_err, angle_err) -> Result<TriangleMesh, TessellationError>
 write_step(&solid, path) -> io::Result<()>
-read_step(path) -> io::Result<Solid>
+read_step_operation(path) -> Result<OperationResult<Solid>, StepImportError>
 write_stl_ascii(&mesh, name, &mut writer) -> io::Result<()>
 write_stl_binary(&mesh, &mut writer) -> io::Result<()>
+write_3mf / to_3mf_bytes / to_3mf_assembly_bytes                          // 3MF export
 ```

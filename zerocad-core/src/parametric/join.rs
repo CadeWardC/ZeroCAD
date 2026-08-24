@@ -1,4 +1,6 @@
 use super::*;
+use openrcad::foundation::{Trsf, Vec as GeomVec};
+use openrcad::topo::{Face, Wire};
 
 /// Combine finished bodies into one persistent body. Every source is validated
 /// before anything is consumed, so a dangling history reference leaves the
@@ -228,6 +230,28 @@ pub(crate) fn apply_join(
     _draft: bool,
     warnings: &mut Vec<String>,
 ) {
+    // A boss drawn on the cap of a sketch prism is a sectional profile
+    // operation. Rebuild the body and every selected profile in one sewn shell
+    // before asking the general 3-D Boolean solver to fuse one region at a
+    // time. Text is the important case: a word contains several disjoint,
+    // spline-bounded regions whose coplanar base faces make repeated Boolean
+    // unions both slow and fragile.
+    for body in live.iter_mut() {
+        if boolean_target.is_some_and(|target| target != body.id) {
+            continue;
+        }
+        if let Some(rebuilt) = try_prismatic_profile_join(body, &tools) {
+            let named = body
+                .pristine
+                .as_ref()
+                .map(|mesh| crate::mock_kernel::propagate_face_names(mesh, &rebuilt, &body.id));
+            body.parts = vec![rebuilt];
+            body.pristine = named.map(std::sync::Arc::new);
+            body.sketch_source = None;
+            return;
+        }
+    }
+
     // Join is a feature-level transaction. Every region must fuse successfully;
     // otherwise none of them are committed. This prevents a visually plausible
     // but topologically false body containing overlapping, unfused solids.
@@ -635,7 +659,7 @@ fn loop_area(points: &[(f32, f32)]) -> f32 {
         * 0.5
 }
 
-fn source_region(source: &SketchExtrudeRegionSource) -> Option<crate::sketch::Region> {
+pub(crate) fn source_region(source: &SketchExtrudeRegionSource) -> Option<crate::sketch::Region> {
     let analytic = source.analytic.clone()?;
     let area =
         loop_area(&source.boundary) - source.holes.iter().map(|hole| loop_area(hole)).sum::<f32>();
@@ -678,6 +702,190 @@ fn face_on_section(
             );
             (relative.dot(cs.n) - height).abs() <= tolerance
         })
+}
+
+/// Exact fast path for one or more profiles raised from the far cap of a simple
+/// sketch prism. The original cap is replaced by its exposed area, each counter
+/// becomes an exposed island, and the tool side/top faces are sewn to that
+/// section once. This is the 3-D boundary of the exact 2-D profile union, so it
+/// avoids a separate coplanar Boolean for every letter without weakening Join's
+/// one-connected-valid-solid contract.
+fn try_prismatic_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<KernelSolid> {
+    const SECTION_TOLERANCE: f32 = 1.0e-4;
+
+    let [body_part] = body.parts.as_slice() else {
+        return None;
+    };
+    let [body_source] = body.sketch_source.as_ref()?.regions.as_slice() else {
+        return None;
+    };
+    if tools.is_empty()
+        || !body_source.depth.is_finite()
+        || body_source.depth.abs() <= SECTION_TOLERANCE
+    {
+        return None;
+    }
+    let body_region = source_region(body_source)?;
+    let transition_height = body_source.depth;
+    let (body_cap, cap_height) = body_part
+        .shell()
+        .faces()
+        .iter()
+        .filter_map(|face| {
+            planar_section_height(face, &body_source.cs).map(|height| (face.clone(), height))
+        })
+        .min_by(|(_, left), (_, right)| {
+            (left - transition_height)
+                .abs()
+                .total_cmp(&(right - transition_height).abs())
+        })?;
+    if (cap_height - transition_height).abs() > SECTION_TOLERANCE {
+        return None;
+    }
+    let surface = body_cap.surface().cloned()?;
+    let body_outer = body_cap.outer_wire()?;
+    let outer_sign = wire_signed_area(&body_outer, &body_source.cs).signum();
+    if outer_sign == 0.0 {
+        return None;
+    }
+
+    let body_sign = body_source.depth.signum();
+    let mut common_rise = None;
+    let mut transition_holes: Vec<Wire> = body_cap.inner_wires();
+    let mut transition_islands = Vec::new();
+    let mut tool_solids = Vec::with_capacity(tools.len());
+
+    for tool in tools {
+        let source = tool.profile.as_ref()?;
+        if source.region.analytic.is_none()
+            || !source.depth.is_finite()
+            || source.depth.abs() <= SECTION_TOLERANCE
+            || source.cs.n.dot(body_source.cs.n).abs() < 0.9999
+        {
+            return None;
+        }
+        let start_height = source
+            .cs
+            .origin
+            .sub(body_source.cs.origin)
+            .dot(body_source.cs.n);
+        let rise = source.cs.n.mul(source.depth).dot(body_source.cs.n);
+        if (start_height - transition_height).abs() > SECTION_TOLERANCE
+            || rise * body_sign <= SECTION_TOLERANCE
+            || common_rise.is_some_and(|previous: f32| (previous - rise).abs() > SECTION_TOLERANCE)
+        {
+            return None;
+        }
+        common_rise = Some(rise);
+
+        let (tool_outer, tool_inners) =
+            crate::mock_kernel::analytic_region_wires(&source.region, &source.cs)?;
+        if !wire_lies_in_region(&tool_outer, &body_region, &body_source.cs) {
+            return None;
+        }
+        let shift = body_source.cs.n.mul(cap_height - start_height);
+        let transform = Trsf::translation(GeomVec::new(
+            f64::from(shift.x),
+            f64::from(shift.y),
+            f64::from(shift.z),
+        ));
+        let base_outer = orient_wire_like(
+            tool_outer.transformed(&transform),
+            outer_sign,
+            true,
+            &body_source.cs,
+        );
+        let base_inners: Vec<Wire> = tool_inners
+            .into_iter()
+            .map(|counter| {
+                orient_wire_like(
+                    counter.transformed(&transform),
+                    outer_sign,
+                    true,
+                    &body_source.cs,
+                )
+            })
+            .collect();
+        transition_holes.push(base_outer);
+        transition_islands.extend(base_inners);
+        tool_solids.push(tool.exact.as_ref().or(tool.smooth.as_ref())?.clone());
+    }
+
+    let on_transition = |face: &Face| {
+        planar_section_height(face, &body_source.cs)
+            .is_some_and(|height| (height - cap_height).abs() <= SECTION_TOLERANCE)
+    };
+    let mut faces: Vec<Face> = body_part
+        .shell()
+        .faces()
+        .iter()
+        .filter(|face| face.id() != body_cap.id())
+        .cloned()
+        .collect();
+    for tool in &tool_solids {
+        faces.extend(
+            tool.shell()
+                .faces()
+                .iter()
+                .filter(|face| !on_transition(face))
+                .cloned(),
+        );
+    }
+    let transition_profile = Face::with_wires(
+        Some(surface.clone()),
+        Some(body_outer),
+        transition_holes,
+        body_cap.orientation(),
+    );
+    let inward = body_source.cs.n.mul(-body_sign);
+    let inward_sweep = GeomVec::new(
+        f64::from(inward.x),
+        f64::from(inward.y),
+        f64::from(inward.z),
+    );
+    let transition_cap = openrcad::algo::prism::prism_operation(&transition_profile, inward_sweep)
+        .ok()?
+        .value
+        .shell()
+        .faces()
+        .iter()
+        .find(|face| on_transition(face))?
+        .clone();
+    faces.push(transition_cap);
+    for island in transition_islands {
+        let island_profile = Face::with_wires(
+            Some(surface.clone()),
+            Some(island),
+            Vec::new(),
+            body_cap.orientation(),
+        );
+        let island_cap = openrcad::algo::prism::prism_operation(&island_profile, inward_sweep)
+            .ok()?
+            .value
+            .shell()
+            .faces()
+            .iter()
+            .find(|face| on_transition(face))?
+            .clone();
+        faces.push(island_cap);
+    }
+
+    let shell =
+        openrcad::algo::sew_with_policy(&faces, &openrcad::foundation::TolerancePolicy::STANDARD)
+            .ok()?
+            .value;
+    let rebuilt = KernelSolid::new(shell);
+    (rebuilt.is_watertight()
+        && rebuilt.health_report().is_healthy()
+        && rebuilt.validate().is_ok()
+        && rebuilt
+            .validate_strict_with_policy(&openrcad::foundation::TolerancePolicy::STANDARD)
+            .is_ok()
+        && rebuilt.split_disconnected().len() <= 1
+        && tool_solids
+            .iter()
+            .all(|tool| valid_union_result(body_part, tool, &rebuilt)))
+    .then_some(rebuilt)
 }
 
 /// Exact fallback for two compatible sketch prisms that share a full profile

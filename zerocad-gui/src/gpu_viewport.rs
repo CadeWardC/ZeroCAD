@@ -315,7 +315,7 @@ impl GpuViewport {
             }
             if let Some(core) = self.core.as_mut() {
                 let refs: Vec<Option<&GpuMesh>> = rebuilt.iter().map(Option::as_ref).collect();
-                core.update_bodies(&device, &refs);
+                core.update_bodies_preserving_instances(&device, &refs);
             }
 
             let mut new_cache = Vec::<BodyCache>::with_capacity(scene.instances().len());
@@ -343,7 +343,7 @@ impl GpuViewport {
                 });
             }
             if let Some(core) = self.core.as_mut() {
-                core.set_instances(&device, &gpu_instances);
+                core.set_instances_incremental(&device, &queue, &gpu_instances);
             }
 
             self.face_map.clear();

@@ -8,11 +8,18 @@ the public OpenRCAD kernel.
 
 ## Current Contract
 
-- Low-level experiments can still call `openrcad_algo::boolean`.
-- Application code should prefer `openrcad_algo::boolean_checked` or the
+- The legacy wrappers (`openrcad_algo::boolean`, `boolean_checked`, `fillet`,
+  `chamfer`, `shell_solid`, `prism`, `tessellate`, `read_step`, `sew`) are
+  `#[deprecated]`. `boolean` discards metadata and **panics on failure** —
+  low-level experiments included.
+- Application code should use the `*_operation` / `*_with_policy` /
+  `*_with_cancel` entry points returning `OperationResult<T>` (value + topology
+  history + diagnostics + recovery/validation reports), or the
   `openrcad-document` feature APIs.
 - `Document` recompute only caches healthy, watertight solids.
-- Failed document features are rolled back, leaving prior feature results intact.
+- `Document::recompute` clears all feature results and repopulates them in
+  timeline order; a failing feature (and everything after it) is left without a
+  cached result, and the prior on-disk document is never poisoned.
 
 ## Priority 1: Boolean Robustness
 
@@ -52,9 +59,13 @@ No common boolean should return `Ok` with invalid or non-watertight topology.
 
 Goal: applications should not need to wrap OpenRCAD in panic recovery.
 
-1. Keep extending checked APIs around modeling operations.
+1. ✅ Keep extending checked APIs around modeling operations — landed as the
+   `OperationResult<T>` contract (`*_operation` / `*_with_policy` /
+   `*_with_cancel` across boolean, blends, prism/revolve, skinning, tessellation,
+   and STEP import), with typed `Diagnostic`s and explicit `TolerancePolicy`.
 2. Convert non-test algorithm `unwrap`/`expect` sites into structured errors.
-3. Add `TessellationError` and checked mesh export paths.
+3. ✅ Add `TessellationError` and checked mesh export paths — the
+   `tessellate_checked[_with_policy[_with_cancel]]` family in `openrcad-mesh`.
 4. Add `IntersectionError` where intersection failure is expected input behavior.
 5. Preserve raw/internal helpers only where tests and benchmarks need them.
 
@@ -75,7 +86,9 @@ Goal: build a public reliability story stronger than Truck's.
 2. Add randomized primitive combinations with health gates.
 3. Add application-generated regression models as downstream users find them.
 4. Store small STEP regression files for import/export failures.
-5. Promote `examples/bench_kernel.rs` to Criterion when timing stability matters.
+5. ✅ Perf coverage lives in `crates/openrcad-algo/tests/perf_tessellate.rs`
+   (the old `examples/bench_kernel.rs` no longer exists); promote to Criterion
+   when timing stability matters.
 
 Acceptance: every fixed bug has a named regression test.
 
@@ -90,11 +103,20 @@ Goal: move beyond whole-box and whole-cylinder special cases.
    selectable full-span edge). Over-large radius is rejected, not silently broken.
 3. ✅ Constant-radius rolling-ball fillet on analytic surfaces (planar–planar,
    planar–cylindrical, planar–analytic).
-4. ⬜ Three-valent corner patches.
-5. ⬜ N-valent/Gregory corner handling.
-6. 🟡 Self-intersection / non-closing detection — the per-edge fillet now returns
-   an error instead of a degenerate solid; concave-offset self-intersection
-   resolution is still open.
+4. ✅ Three-valent corner patches — and beyond: `corner_network.rs` solves
+   complete equal-radius convex planar corner selections of valence three
+   through six simultaneously with an exact common rolling-sphere patch
+   (`MIN_VERIFIED_VALENCE = 3`, `MAX_VERIFIED_VALENCE = 6`), wired into
+   `fillet_edges` via `RollingBallError::CornerNetwork` and verified across
+   scale/rotation/far-origin sweeps.
+5. 🟡 N-valent/Gregory corner handling — corner networks cover valences 3–6
+   exactly (see above); general Gregory-patch corners for higher valences or
+   mixed-radius/non-planar networks remain open and reject explicitly.
+6. 🟡 Self-intersection / non-closing detection — the per-edge fillet returns
+   an error instead of a degenerate solid; concave offsets with verified
+   self-intersection and wall-thickness evidence are accepted
+   (`certify_concave_shell_with_policy` → `ConcaveShellCertificate`), while
+   branching and NURBS-backed concave cases still reject explicitly.
 
 Acceptance: applications can fillet/chamfer selected edges of ordinary
 mechanical parts without first converting them to special primitive cases.
@@ -105,7 +127,9 @@ Goal: preserve enough CAD intent for real application workflows.
 
 1. STEP units.
 2. STEP names and product labels.
-3. STEP assemblies.
+3. STEP assemblies. (3MF already exports multi-definition assembly models —
+   `to_3mf_assembly_bytes` — for applications that need an assembly interchange
+   today.)
 4. STEP colors/materials.
 5. Round-trip boolean and blend results.
 6. Keep `.zcad` as a richer native parametric recipe format for applications
@@ -118,7 +142,8 @@ hierarchy or basic metadata.
 
 Goal: make failures understandable inside any CAD application.
 
-1. Selection highlighting.
+1. ✅ Selection highlighting — click-to-select with a shader face highlight
+   (`openrcad-render` scene + `pick.rs` CPU ray-cast picking).
 2. Face/edge/vertex pick modes.
 3. Free-edge and non-manifold overlays.
 4. Face-normal and bad-loop overlays.

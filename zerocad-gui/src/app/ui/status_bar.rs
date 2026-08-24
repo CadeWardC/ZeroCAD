@@ -179,6 +179,12 @@ impl ZeroCadApp {
             let regions: Vec<_> = self
                 .selected_region_indices
                 .iter()
+                .filter(|index| {
+                    self.sketch_region_ink_mask
+                        .get(**index)
+                        .copied()
+                        .unwrap_or(true)
+                })
                 .filter_map(|index| self.detected_regions.get(*index))
                 .collect();
             if regions.is_empty() {
@@ -292,10 +298,29 @@ impl ZeroCadApp {
             if let Some(boundary) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
                 region_curves.extend_curves(boundary);
             }
-            let regions = detect_regions(&region_curves);
+            let regions = self.cached_finished_regions(
+                node.id.as_str(),
+                &region_curves,
+                shapes
+                    .iter()
+                    .any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
+                |regions| {
+                    zerocad_core::text::sketch_region_ink_mask(
+                        curves,
+                        shapes,
+                        corner_mods,
+                        mirrors,
+                        solver.as_ref(),
+                        &variables,
+                        regions,
+                    )
+                },
+            );
             for region_index in selected_indices {
-                if let Some(region) = regions.get(region_index) {
-                    measurements.add_region(region);
+                if regions.ink_mask.get(region_index).copied().unwrap_or(true) {
+                    if let Some(region) = regions.regions.get(region_index) {
+                        measurements.add_region(region);
+                    }
                 }
             }
         }

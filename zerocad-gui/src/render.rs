@@ -6,8 +6,7 @@ use std::collections::HashSet;
 
 use eframe::egui;
 use zerocad_core::{
-    detect_regions, CoordinateSystem, ExtrudeMode, FeatureType, MockMesh, ScenePlacement,
-    SketchPlane,
+    CoordinateSystem, ExtrudeMode, FeatureType, MockMesh, ScenePlacement, SketchPlane,
 };
 
 use crate::geom2d::{draw_sketch_geometry, fill_nested_loops};
@@ -631,9 +630,20 @@ impl ZeroCadApp {
         let newbody_overlap = !edge_mod_active
             && preview_mode == Some(ExtrudeMode::NewBody)
             && self.op_has_crossing_shapes();
+        // Dense text plates are also exact-only previews. Their sampled ghost
+        // makes one lateral face per display chord and previously blocked the
+        // UI thread for tens of seconds. The same evaluator used for boolean
+        // previews builds the analytic result off-thread instead.
+        let newbody_dense_profile = !edge_mod_active
+            && preview_mode == Some(ExtrudeMode::NewBody)
+            && self
+                .extrude_op
+                .as_ref()
+                .is_some_and(crate::extrude::ExtrudeOp::requires_background_preview);
         let needs_exact_extrude = !edge_mod_active
             && (matches!(preview_mode, Some(ExtrudeMode::Join | ExtrudeMode::Cut))
-                || newbody_overlap);
+                || newbody_overlap
+                || newbody_dense_profile);
         // The cache may return the last completed body while the worker evaluates
         // the current input. Do not put that stale opaque body into an additive
         // frame: it visibly trails the current lightweight tool as a second solid.
@@ -2305,8 +2315,23 @@ impl ZeroCadApp {
                 if let Some(b) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
                     eff.extend_curves(b);
                 }
-                let curves = &eff;
-                let regions = detect_regions(curves);
+                let resolved_curves = &eff;
+                let has_text = shapes
+                    .iter()
+                    .any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. }));
+                let cached =
+                    self.cached_finished_regions(&node.id, resolved_curves, has_text, |regions| {
+                        zerocad_core::text::sketch_region_ink_mask(
+                            curves,
+                            shapes,
+                            corner_mods,
+                            mirrors,
+                            solver.as_ref(),
+                            &var_map,
+                            regions,
+                        )
+                    });
+                let regions = cached.regions.as_slice();
                 let selected = self.selected_regions_for(&node.id);
                 let sel_edges = self.selected_edges_for(&node.id);
                 let sel_points = self.selected_sketch_points_for(&node.id);
@@ -2332,8 +2357,10 @@ impl ZeroCadApp {
                 // instead of the whole sketch lighting up.
                 draw_sketch_geometry(
                     &painter,
-                    curves,
-                    &regions,
+                    resolved_curves,
+                    regions,
+                    Some(cached.fill.as_slice()),
+                    Some(cached.ink_mask.as_slice()),
                     &selected,
                     &sel_edges,
                     &sel_points,
@@ -2366,6 +2393,8 @@ impl ZeroCadApp {
                 &painter,
                 &self.sketch_curves,
                 &self.detected_regions,
+                Some(&self.sketch_region_fill_cache),
+                Some(&self.sketch_region_ink_mask),
                 &self.selected_region_indices,
                 &empty_sel,
                 &empty_sel,
@@ -2375,6 +2404,7 @@ impl ZeroCadApp {
                 &to_screen,
                 true,
             );
+            self.draw_text_preview(&painter, &to_screen);
             if let Some(solver) = self.sketch_solver_model.as_ref() {
                 let construction = zerocad_core::sketch::bake_construction_curves(solver);
                 draw_construction_curves(&painter, &construction, &to_screen);
