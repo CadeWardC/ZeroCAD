@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
         run: cargo build --workspace --locked
@@ -43,6 +45,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       - name: Test zerocad-core
         run: cargo test -p zerocad-core --locked
@@ -63,6 +67,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: OpenRCAD -> target
@@ -77,6 +83,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.0
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
@@ -94,6 +101,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy warning regression gate (both workspaces)

@@ -1,0 +1,5 @@
+# Match the compiler and Clippy used to qualify the release and warning baseline.
+[toolchain]
+channel = "1.94.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
