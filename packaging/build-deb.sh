@@ -40,7 +40,7 @@ Maintainer: ZeroCAD contributors <noreply@github.com>
 Section: graphics
 Priority: optional
 Installed-Size: $(du -sk "$pkg/usr" | cut -f1)
-Depends: $deps, libvulkan1, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2
+Depends: $deps, libvulkan1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2
 Recommends: mesa-vulkan-drivers
 Homepage: https://github.com/CadeWardC/ZeroCAD
 Description: Parametric CAD modeling application
