@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tag="${1:?usage: build-deb.sh vVERSION [output-directory]}"
 version="${tag#v}"
-version="${version/-/~}"
+version="${version/-/\~}"
 dpkg --validate-version "$version"
 arch="$(dpkg --print-architecture)"
 out="${2:-$root/dist}"

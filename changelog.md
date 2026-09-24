@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.6-alpha.1 — 2026-09-23
+## 0.7.6-alpha.2 — 2026-09-23
 
 - Pin release builds and warning checks to the validated Rust 1.94.0 toolchain.
 - Add a Debian/Ubuntu amd64 package with the existing ZeroCAD application icon
