@@ -72,11 +72,14 @@ jobs:
         run: |
           $dir = "ZeroCAD-${{ github.ref_name }}-windows-x86_64"
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          Copy-Item "$dir/ZeroCAD.exe" "ZeroCAD-${{ github.ref_name }}-windows-x86_64.exe"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
-          path: ZeroCAD-${{ github.ref_name }}-windows-x86_64.zip
+          path: |
+            ZeroCAD-${{ github.ref_name }}-windows-x86_64.zip
+            ZeroCAD-${{ github.ref_name }}-windows-x86_64.exe
           if-no-files-found: error
 
   linux:

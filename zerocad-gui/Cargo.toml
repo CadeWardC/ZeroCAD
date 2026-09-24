@@ -1,6 +1,6 @@
 [package]
 name = "zerocad-gui"
-version = "0.7.6-alpha.2"
+version = "0.7.6-alpha.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "egui/eframe desktop front end for the ZeroCAD parametric CAD application."
@@ -24,3 +24,6 @@ env_logger.workspace = true
 rfd.workspace = true
 # Encodes/decodes the preview thumbnail embedded inside a `.zcad` file.
 png.workspace = true
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.31"

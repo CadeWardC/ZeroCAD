@@ -120,8 +120,17 @@ fn main() -> eframe::Result<()> {
 
     let run = |supported_backends: wgpu::Backends| -> eframe::Result<()> {
         let app_settings = app_settings.clone();
+        let (width, height, rgba) =
+            thumbnail::decode_png(include_bytes!("../../packaging/icon.png"))
+                .expect("the embedded ZeroCAD icon is an RGBA8 PNG");
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
+                .with_app_id("ZeroCAD")
+                .with_icon(egui::IconData {
+                    rgba,
+                    width: width as u32,
+                    height: height as u32,
+                })
                 .with_title("ZeroCAD - 3D Parametric CAD Designer")
                 .with_inner_size([1200.0, 800.0])
                 .with_min_inner_size([960.0, 640.0]),

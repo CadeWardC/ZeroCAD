@@ -11,10 +11,16 @@ pure-Rust B-Rep geometry kernel. Imports: STEP, STL, DXF. Exports: STEP (part B-
 OpenCASCADE is used only by optional independent verification tools; it is not
 a build, runtime, or release-package dependency.
 
+## Downloads
+
+Windows users can download the standalone `.exe` or the ZIP from
+[GitHub releases](https://github.com/CadeWardC/ZeroCAD/releases). The executable
+includes the ZeroCAD icon and runs without an installer.
+
 ## Debian / Ubuntu installation
 
 Download the amd64 `.deb` from the [GitHub releases](https://github.com/CadeWardC/ZeroCAD/releases)
-and install it with `sudo apt install ./zerocad_0.7.6~alpha.2_amd64.deb`.
+and install it with `sudo apt install ./zerocad_0.7.6~alpha.3_amd64.deb`.
 The package targets Ubuntu 22.04 or newer, includes the ZeroCAD icon, and adds
 ZeroCAD to the application menu. You can also launch it with `zerocad`.
 This is an alpha release; see [the repair and validation report](break-test/review/2026-09-17-repairs.md)
@@ -22,7 +28,7 @@ for tested behavior and remaining limitations.
 
 To package a Linux build locally, install `dpkg-dev`, `librsvg2-bin` and
 `desktop-file-utils`, build with `cargo build --release -p zerocad-gui --locked`,
-then run `bash packaging/build-deb.sh v0.7.6-alpha.2`. The package is written to
+then run `bash packaging/build-deb.sh v0.7.6-alpha.3`. The package is written to
 `dist/`; runtime library dependencies are calculated from the built binary.
 
 This document is the architectural map. It exists so that a new contributor —

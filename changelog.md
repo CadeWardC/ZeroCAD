@@ -1,7 +1,9 @@
 # Changelog
 
-## 0.7.6-alpha.2 — 2026-09-23
+## 0.7.6-alpha.3 — 2026-09-23
 
+- Publish a standalone Windows executable with the ZeroCAD icon embedded.
+- Use the same icon for the running application window.
 - Pin release builds and warning checks to the validated Rust 1.94.0 toolchain.
 - Add a Debian/Ubuntu amd64 package with the existing ZeroCAD application icon
   and application-menu launcher.

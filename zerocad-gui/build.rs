@@ -1,6 +1,15 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=../packaging/icon.ico");
+    #[cfg(windows)]
+    winresource::WindowsResource::new()
+        .set_icon("../packaging/icon.ico")
+        .set("ProductName", "ZeroCAD")
+        .set("FileDescription", "ZeroCAD parametric CAD")
+        .compile()
+        .expect("compile the ZeroCAD Windows icon resource");
+
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-env-changed=ZEROCAD_GIT_HASH");
     if std::env::var_os("ZEROCAD_GIT_HASH").is_some() {
