@@ -1,4 +1,4 @@
-use crate::BooleanOp;
+use crate::{BandTopologyError, BooleanOp, GeometryWorkBudget};
 use core::f64::consts::TAU;
 use openrcad_foundation::{
     CancellationProbe, NeverCancelled, ToleranceContext, TolerancePolicy, TolerancePolicyError,
@@ -141,6 +141,8 @@ pub enum BooleanInput {
 /// Structured boolean failure for applications that need recoverable modeling.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BooleanError {
+    /// Intersection could not be completed; no candidate may be committed.
+    Intersection(BandTopologyError),
     /// The supplied document tolerance policy is not usable.
     InvalidTolerancePolicy(TolerancePolicyError),
     /// A face-local pcurve could not be constructed consistently.
@@ -187,6 +189,7 @@ pub enum BooleanError {
 impl core::fmt::Display for BooleanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Intersection(error) => write!(f, "boolean intersection failed: {error}"),
             Self::InvalidTolerancePolicy(error) => {
                 write!(f, "invalid boolean tolerance policy: {error}")
             }
@@ -221,6 +224,20 @@ impl core::fmt::Display for BooleanError {
 }
 
 impl std::error::Error for BooleanError {}
+impl From<openrcad_foundation::Cancelled> for BooleanError {
+    fn from(_: openrcad_foundation::Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+impl From<BandTopologyError> for BooleanError {
+    fn from(error: BandTopologyError) -> Self {
+        if error == BandTopologyError::Cancelled {
+            Self::Cancelled
+        } else {
+            Self::Intersection(error)
+        }
+    }
+}
 
 /// Apply `op` and reject invalid inputs, panics, or unhealthy/non-watertight
 /// outputs. This is the preferred entry point for CAD applications, where a
@@ -286,6 +303,30 @@ pub fn boolean_operation_with_classes_policy_and_cancel(
     policy: &TolerancePolicy,
     cancel: &dyn CancellationProbe,
 ) -> Result<OperationResult<Solid>, BooleanError> {
+    boolean_operation_with_classes_policy_and_cancel_and_budget(
+        object,
+        tool,
+        op,
+        obj_classes,
+        tool_classes,
+        policy,
+        cancel,
+        &mut GeometryWorkBudget::intersection_default(),
+    )
+}
+
+/// Canonical Boolean with a caller-owned deterministic intersection budget.
+#[allow(clippy::too_many_arguments)]
+pub fn boolean_operation_with_classes_policy_and_cancel_and_budget(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+    budget: &mut GeometryWorkBudget,
+) -> Result<OperationResult<Solid>, BooleanError> {
     policy
         .validate()
         .map_err(BooleanError::InvalidTolerancePolicy)?;
@@ -305,14 +346,14 @@ pub fn boolean_operation_with_classes_policy_and_cancel(
             BooleanOptions {
                 obj_classes,
                 tool_classes,
+                budget,
                 want_history: true,
                 policy,
                 cancel,
             },
         )
     }))
-    .map_err(|_| BooleanError::Panicked)?
-    .map_err(|_| BooleanError::Cancelled)?;
+    .map_err(|_| BooleanError::Panicked)??;
     cancel
         .check_cancelled()
         .map_err(|_| BooleanError::Cancelled)?;
@@ -382,6 +423,30 @@ pub fn boolean_bodies_operation_with_classes_policy_and_cancel(
     policy: &TolerancePolicy,
     cancel: &dyn CancellationProbe,
 ) -> Result<OperationResult<BooleanBodies>, BooleanError> {
+    boolean_bodies_operation_with_classes_policy_and_cancel_and_budget(
+        object,
+        tool,
+        op,
+        obj_classes,
+        tool_classes,
+        policy,
+        cancel,
+        &mut GeometryWorkBudget::intersection_default(),
+    )
+}
+
+/// Canonical Boolean with a caller-owned deterministic intersection budget.
+#[allow(clippy::too_many_arguments)]
+pub fn boolean_bodies_operation_with_classes_policy_and_cancel_and_budget(
+    object: &Solid,
+    tool: &Solid,
+    op: BooleanOp,
+    obj_classes: Option<&[Option<u64>]>,
+    tool_classes: Option<&[Option<u64>]>,
+    policy: &TolerancePolicy,
+    cancel: &dyn CancellationProbe,
+    budget: &mut GeometryWorkBudget,
+) -> Result<OperationResult<BooleanBodies>, BooleanError> {
     policy
         .validate()
         .map_err(BooleanError::InvalidTolerancePolicy)?;
@@ -401,14 +466,14 @@ pub fn boolean_bodies_operation_with_classes_policy_and_cancel(
             BooleanOptions {
                 obj_classes,
                 tool_classes,
+                budget,
                 want_history: true,
                 policy,
                 cancel,
             },
         )
     }))
-    .map_err(|_| BooleanError::Panicked)?
-    .map_err(|_| BooleanError::Cancelled)?;
+    .map_err(|_| BooleanError::Panicked)??;
     cancel
         .check_cancelled()
         .map_err(|_| BooleanError::Cancelled)?;
@@ -581,14 +646,14 @@ pub fn boolean_checked_with_policy_and_cancel(
             BooleanOptions {
                 obj_classes: None,
                 tool_classes: None,
+                budget: &mut GeometryWorkBudget::intersection_default(),
                 want_history: false,
                 policy,
                 cancel,
             },
         )
     }))
-    .map_err(|_| BooleanError::Panicked)?
-    .map_err(|_| BooleanError::Cancelled)?
+    .map_err(|_| BooleanError::Panicked)??
     .0;
     cancel
         .check_cancelled()
@@ -653,14 +718,14 @@ pub fn boolean_checked_bodies_with_policy(
             BooleanOptions {
                 obj_classes: None,
                 tool_classes: None,
+                budget: &mut GeometryWorkBudget::intersection_default(),
                 want_history: false,
                 policy,
                 cancel: &NeverCancelled,
             },
         )
     }))
-    .map_err(|_| BooleanError::Panicked)?
-    .expect("NeverCancelled cannot cancel")
+    .map_err(|_| BooleanError::Panicked)??
     .0;
     // A valid multi-body result is intentionally disconnected before it is
     // split, so the single-solid strict gate must be applied to each component,
@@ -684,6 +749,7 @@ pub fn boolean(object: &Solid, tool: &Solid, op: BooleanOp) -> Solid {
 }
 
 struct BooleanOptions<'a> {
+    budget: &'a mut GeometryWorkBudget,
     obj_classes: Option<&'a [Option<u64>]>,
     tool_classes: Option<&'a [Option<u64>]>,
     want_history: bool,
@@ -696,8 +762,9 @@ fn boolean_impl(
     tool: &Solid,
     op: BooleanOp,
     options: BooleanOptions<'_>,
-) -> Result<(Solid, Option<BooleanFaceHistory>, RecoveryReport), openrcad_foundation::Cancelled> {
+) -> Result<(Solid, Option<BooleanFaceHistory>, RecoveryReport), BooleanError> {
     let BooleanOptions {
+        budget,
         obj_classes,
         tool_classes,
         want_history,
@@ -917,7 +984,9 @@ fn boolean_impl(
             }
         } else {
             // Intersecting surfaces: split each face along the trimmed intersection curves
-            let curves = crate::intersect::surface_surface_curves(&f_obj, &f_tool, tol);
+            let curves = crate::intersect::surface_surface_curves_with_budget_and_cancel(
+                &f_obj, &f_tool, tol, budget, cancel,
+            )?;
             for (curve, first, last) in curves {
                 let sub = obj_sub.get_mut(&f_obj_id).unwrap();
                 split_tracked(

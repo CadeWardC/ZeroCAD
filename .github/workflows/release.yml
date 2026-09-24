@@ -1,7 +1,7 @@
 name: Release
 
 # Builds ZeroCAD release packages for Windows (.zip), Linux (.AppImage +
-# .tar.gz), and macOS (.dmg with a real .app bundle) whenever a version tag
+# .tar.gz + .deb), and macOS (.dmg with a real .app bundle) whenever a version tag
 # (v0.1.0, v1.0.0-alpha.1, ...) is pushed, then publishes them as a draft
 # GitHub Release for review before going public.
 #
@@ -20,6 +20,10 @@ permissions:
   contents: write
 
 jobs:
+  validation:
+    name: Validate tagged source
+    uses: ./.github/workflows/ci.yml
+
   windows:
     name: Build (windows-x86_64)
     runs-on: windows-latest
@@ -89,10 +93,29 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev librsvg2-bin
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev librsvg2-bin \
+            dpkg-dev desktop-file-utils xvfb mesa-vulkan-drivers
 
       - name: Build release binary
         run: cargo build --release -p zerocad-gui --locked
+
+      - name: Build Debian package
+        run: bash packaging/build-deb.sh "$GITHUB_REF_NAME" .
+
+      - name: Install and smoke-test Debian package
+        run: |
+          sudo apt-get install -y ./zerocad_*.deb
+          test -x /usr/bin/ZeroCAD
+          test -L /usr/bin/zerocad
+          test -s /usr/share/icons/hicolor/256x256/apps/zerocad.png
+          desktop-file-validate /usr/share/applications/ZeroCAD.desktop
+          set +e
+          timeout 20s xvfb-run -a /usr/bin/ZeroCAD > deb-smoke.log 2>&1
+          status=$?
+          set -e
+          cat deb-smoke.log
+          # A running interactive window is terminated by timeout.
+          test "$status" -eq 124
 
       - name: Build AppImage
         run: |
@@ -122,6 +145,7 @@ jobs:
           path: |
             ZeroCAD-${{ github.ref_name }}-linux-x86_64.AppImage
             ZeroCAD-${{ github.ref_name }}-linux-x86_64.tar.gz
+            zerocad_*.deb
           if-no-files-found: error
 
   macos:
@@ -214,7 +238,7 @@ jobs:
 
   release:
     name: Publish draft release
-    needs: [windows, linux, macos]
+    needs: [validation, windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -226,5 +250,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: artifacts/*

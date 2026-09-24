@@ -1,0 +1,41 @@
+{
+  "occurrence_count": 1000,
+  "qualification": "local CPU observations only; source fingerprint and convergence must be checked; not V1 frame evidence",
+  "samples_ms": [
+    5.9783,
+    6.015000000000001,
+    5.9731000000000005,
+    5.988099999999999,
+    5.945200000000001,
+    6.2221,
+    5.7542,
+    5.7856000000000005,
+    5.8428,
+    6.1992,
+    5.739,
+    5.75,
+    5.7875000000000005,
+    5.822,
+    5.7019,
+    5.6974,
+    5.724,
+    5.6754,
+    5.6781999999999995,
+    5.679,
+    5.6682,
+    5.5953,
+    5.6168,
+    5.6496,
+    5.7721,
+    5.6665,
+    5.671200000000001,
+    6.1989,
+    5.6244,
+    5.7148,
+    6.0870999999999995
+  ],
+  "scope": "in-memory decode, definition hydration and CPU placement conversion; excludes file IO, mate solve, GPU and presentation",
+  "validator_failures": [
+    "calibration case 'four_plate_calibration' requires committing a calibrated translation tolerance"
+  ]
+}

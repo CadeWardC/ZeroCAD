@@ -1,0 +1,104 @@
+Gnuplot not found, using plotters backend
+Benchmarking mechanical_parts_v1/patterned_plate/cold
+Benchmarking mechanical_parts_v1/patterned_plate/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/patterned_plate/cold: Collecting 10 samples in estimated 2.2909 s (30 iterations)
+Benchmarking mechanical_parts_v1/patterned_plate/cold: Analyzing
+mechanical_parts_v1/patterned_plate/cold
+                        time:   [67.567 ms 69.218 ms 70.768 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/patterned_plate/cached
+Benchmarking mechanical_parts_v1/patterned_plate/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/patterned_plate/cached: Collecting 10 samples in estimated 2.0025 s (30k iterations)
+Benchmarking mechanical_parts_v1/patterned_plate/cached: Analyzing
+mechanical_parts_v1/patterned_plate/cached
+                        time:   [62.909 µs 63.852 µs 65.077 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit: Collecting 10 samples in estimated 2.0981 s (1100 iterations)
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit: Analyzing
+mechanical_parts_v1/patterned_plate/trailing_edit
+                        time:   [1.9223 ms 2.2582 ms 2.5460 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/open_enclosure/cold
+Benchmarking mechanical_parts_v1/open_enclosure/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/open_enclosure/cold: Collecting 10 samples in estimated 2.1765 s (330 iterations)
+Benchmarking mechanical_parts_v1/open_enclosure/cold: Analyzing
+mechanical_parts_v1/open_enclosure/cold
+                        time:   [5.8650 ms 6.3099 ms 6.7735 ms]
+Benchmarking mechanical_parts_v1/open_enclosure/cached
+Benchmarking mechanical_parts_v1/open_enclosure/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/open_enclosure/cached: Collecting 10 samples in estimated 2.0011 s (60k iterations)
+Benchmarking mechanical_parts_v1/open_enclosure/cached: Analyzing
+mechanical_parts_v1/open_enclosure/cached
+                        time:   [29.087 µs 29.980 µs 30.546 µs]
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit: Collecting 10 samples in estimated 2.0209 s (4235 iterations)
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit: Analyzing
+mechanical_parts_v1/open_enclosure/trailing_edit
+                        time:   [455.31 µs 473.69 µs 496.56 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/filleted_block/cold
+Benchmarking mechanical_parts_v1/filleted_block/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/filleted_block/cold: Collecting 10 samples in estimated 2.1201 s (440 iterations)
+Benchmarking mechanical_parts_v1/filleted_block/cold: Analyzing
+mechanical_parts_v1/filleted_block/cold
+                        time:   [4.5681 ms 4.9867 ms 5.4275 ms]
+Benchmarking mechanical_parts_v1/filleted_block/cached
+Benchmarking mechanical_parts_v1/filleted_block/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/filleted_block/cached: Collecting 10 samples in estimated 2.0004 s (104k iterations)
+Benchmarking mechanical_parts_v1/filleted_block/cached: Analyzing
+mechanical_parts_v1/filleted_block/cached
+                        time:   [18.806 µs 19.846 µs 20.824 µs]
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit: Collecting 10 samples in estimated 2.0059 s (7590 iterations)
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit: Analyzing
+mechanical_parts_v1/filleted_block/trailing_edit
+                        time:   [289.02 µs 319.99 µs 343.16 µs]
+Benchmarking mechanical_parts_v1/engraved_plate/cold
+Benchmarking mechanical_parts_v1/engraved_plate/cold: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 3.6s.
+Benchmarking mechanical_parts_v1/engraved_plate/cold: Collecting 10 samples in estimated 3.6281 s (10 iterations)
+Benchmarking mechanical_parts_v1/engraved_plate/cold: Analyzing
+mechanical_parts_v1/engraved_plate/cold
+                        time:   [277.58 ms 292.52 ms 309.80 ms]
+Benchmarking mechanical_parts_v1/engraved_plate/cached
+Benchmarking mechanical_parts_v1/engraved_plate/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/engraved_plate/cached: Collecting 10 samples in estimated 2.1338 s (440 iterations)
+Benchmarking mechanical_parts_v1/engraved_plate/cached: Analyzing
+mechanical_parts_v1/engraved_plate/cached
+                        time:   [4.8170 ms 5.1987 ms 5.4905 ms]
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit: Collecting 10 samples in estimated 3.0529 s (20 iterations)
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit: Analyzing
+mechanical_parts_v1/engraved_plate/trailing_edit
+                        time:   [138.56 ms 144.99 ms 152.63 ms]
+Benchmarking mechanical_parts_v1/curved_step_import/cold
+Benchmarking mechanical_parts_v1/curved_step_import/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/curved_step_import/cold: Collecting 10 samples in estimated 2.4289 s (275 iterations)
+Benchmarking mechanical_parts_v1/curved_step_import/cold: Analyzing
+mechanical_parts_v1/curved_step_import/cold
+                        time:   [7.9786 ms 8.3189 ms 8.7832 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/curved_step_import/cached
+Benchmarking mechanical_parts_v1/curved_step_import/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/curved_step_import/cached: Collecting 10 samples in estimated 2.0009 s (104k iterations)
+Benchmarking mechanical_parts_v1/curved_step_import/cached: Analyzing
+mechanical_parts_v1/curved_step_import/cached
+                        time:   [18.589 µs 19.735 µs 20.935 µs]
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit: Collecting 10 samples in estimated 2.0093 s (9680 iterations)
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit: Analyzing
+mechanical_parts_v1/curved_step_import/trailing_edit
+                        time:   [200.87 µs 211.13 µs 227.42 µs]

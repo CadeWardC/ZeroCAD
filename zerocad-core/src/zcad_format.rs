@@ -87,8 +87,10 @@ const SEC_ASSEMBLY_RECIPE: u16 = 9;
 const SEC_ASSEMBLY_PRESENTATION: u16 = 10;
 const SEC_ASSEMBLY_HYDRATION: u16 = 11;
 const HYDRATED_CACHE_SCHEMA: u16 = 3;
-const OPENRCAD_CACHE_ABI: u16 = 3;
-const MESH_CACHE_ABI: u16 = 3;
+// Rebuild derived geometry after face-bounded Boolean intersections, atomic
+// multi-profile cuts and closed-spine miter corrections. Recipe schema unchanged.
+const OPENRCAD_CACHE_ABI: u16 = 11;
+const MESH_CACHE_ABI: u16 = 11;
 pub const DEFAULT_HYDRATED_CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3642,6 +3644,69 @@ mod tests {
             !mesh_cache_fresh(stale, &g),
             "mismatched hash → cache discarded"
         );
+    }
+
+    #[test]
+    fn pre_cavity_fix_cache_abis_discard_accelerators_and_rebuild_recipe() {
+        let mut graph = ParametricGraph::new();
+        graph.add_feature(FeatureNode {
+            id: "box".into(),
+            name: "Box".into(),
+            feature: FeatureType::Box {
+                w: 10.0,
+                h: 10.0,
+                d: 10.0,
+            },
+        });
+        let meshes = graph.evaluate_bodies(&HashSet::new()).unwrap();
+        let checkpoints = graph.evaluation_cache_snapshot();
+        let profile = SaveProfile::Hydrated {
+            total_accelerator_budget: 128 * 1024 * 1024,
+        };
+        let mut sections = stage_zcad_with_profile(
+            &ZcadDocument {
+                graph: &graph,
+                thumbnail_png: None,
+                mesh_cache: Some(&meshes),
+                units: Unit::Millimeter,
+                bbox: [0.0; 6],
+                created_unix: None,
+                hidden_nodes: HashSet::new(),
+                evaluation_cache: Some(&checkpoints),
+                hydrated_cache_limit: None,
+            },
+            profile,
+            None,
+        )
+        .unwrap();
+        let metadata = sections
+            .iter_mut()
+            .find(|section| section.id == SEC_METADATA)
+            .unwrap();
+        let mut decoded: ZcadMetadata = cbor_from_slice(&metadata.stored).unwrap();
+        decoded.openrcad_cache_abi = 3;
+        decoded.tessellation_abi = 3;
+        replace_staged_raw(metadata, cbor_to_vec(&decoded).unwrap());
+        let mut file = std::io::Cursor::new(Vec::new());
+        write_staged_sections(&mut file, ProjectKind::Part, profile, &sections).unwrap();
+        let loaded = read_document_from_slice(file.get_ref(), &LoadOptions::default()).unwrap();
+        assert!(loaded.accelerators.display_meshes.is_none());
+        assert!(loaded.accelerators.evaluation_cache.is_none());
+        for expected in [SEC_MESH_CACHE, SEC_HYDRATED_CHECKPOINTS] {
+            assert!(
+                loaded
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| matches!(diagnostic,
+                        LoadDiagnostic::DiscardedDisposableSection { section, reason }
+                            if *section == expected && reason.contains("ABI mismatch")
+                    )),
+                "{:?}",
+                loaded.diagnostics
+            );
+        }
+        let rebuilt = loaded.document.evaluate_bodies(&HashSet::new()).unwrap();
+        assert!((rebuilt[0].1.mass_properties().unwrap().volume - 1000.0).abs() < 1e-6);
     }
 
     #[test]

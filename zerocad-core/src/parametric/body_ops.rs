@@ -359,6 +359,22 @@ pub(crate) fn apply_body_scale(
             (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh))
         })
     };
+    // Validate the staged display geometry before consuming the source. A
+    // finite f64 transform can overflow normals/vertices in the f32 renderer.
+    let display_valid = if let Some(mesh) = &pristine {
+        mesh.vertices.iter().all(|value| value.is_finite())
+    } else {
+        parts.iter().all(|part| {
+            crate::mock_kernel::try_display_mesh_from_part(part)
+                .is_some_and(|mesh| mesh.vertices.iter().all(|value| value.is_finite()))
+        })
+    };
+    if !display_valid {
+        warnings.push(format!(
+            "Scale body '{node_id}': result exceeds the finite display range; the source body was left unchanged."
+        ));
+        return;
+    }
     live.remove(source_index);
     apply_new(
         live,

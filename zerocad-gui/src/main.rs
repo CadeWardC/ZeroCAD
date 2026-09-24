@@ -711,6 +711,7 @@ struct PendingProjectTransition {
 struct ExportCompletion {
     message: String,
     error: bool,
+    revision: Option<(u64, u64)>,
 }
 
 pub(crate) enum PendingVisualMode {

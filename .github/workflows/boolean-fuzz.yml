@@ -18,12 +18,60 @@ jobs:
           workspaces: fuzz -> target
       - name: Install cargo-fuzz
         run: cargo +nightly-2026-07-01 install cargo-fuzz --locked
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: boolean-corpus-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: boolean-corpus-${{ runner.os }}-
       - name: Compile fuzz targets
         working-directory: fuzz
         run: cargo +nightly-2026-07-01 fuzz build
       - name: Safety target
         working-directory: fuzz
-        run: cargo +nightly-2026-07-01 fuzz run boolean_safety -- -max_total_time=300
+        shell: bash
+        run: cargo +nightly-2026-07-01 fuzz run boolean_safety -- -max_total_time=300 2>&1 | tee safety.log
       - name: Resolvable target
+        if: ${{ !cancelled() }}
         working-directory: fuzz
-        run: cargo +nightly-2026-07-01 fuzz run boolean_resolvable -- -max_total_time=300
+        shell: bash
+        run: cargo +nightly-2026-07-01 fuzz run boolean_resolvable -- -max_total_time=300 2>&1 | tee resolvable.log
+      - name: Preserve reproducers and evolved seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boolean-fuzz-${{ github.run_id }}
+          path: |
+            fuzz/artifacts
+            fuzz/corpus
+            fuzz/*.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  occt-differential:
+    name: Independent canonical-case comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install cadquery-ocp==7.8.1.1.post1
+      - run: cargo build --locked -p zerocad-core --example boolean_observation
+      # OCP is test tooling only; it is never linked or packaged with ZeroCAD.
+      - run: python tools/boolean_occt_replay.py --rust-executable target/debug/examples/boolean_observation --output target/occt-differential.json
+      - name: Generate interchange fixtures
+        env:
+          ZEROCAD_INTERCHANGE_EVIDENCE_DIR: ${{ github.workspace }}/target/interchange
+        run: cargo test --locked -p zerocad-core --test mechanical_workflows --test step_export
+      - run: python tools/verify_step_exports.py target/interchange --output target/step-interchange-observations.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: occt-differential-${{ github.run_id }}
+          path: |
+            target/occt-differential.json
+            target/step-interchange-observations.json
+            target/interchange

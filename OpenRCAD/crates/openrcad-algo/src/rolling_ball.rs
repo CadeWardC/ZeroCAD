@@ -1552,6 +1552,40 @@ fn merged_coplanar_cap(caps: &[Face]) -> Option<Face> {
         .collect();
     let majority_agrees = 2 * agrees_with_first.iter().filter(|&&a| a).count() >= caps.len();
 
+    merged_cap_boundary(caps, &agrees_with_first, majority_agrees)
+}
+
+/// Boolean seams can split a single boss wall at the prism's top plane and
+/// angular seam. Cancel only shared boundaries of the same oriented cylinder;
+/// distinct supports still require the general corner-network construction.
+fn merged_cylindrical_cap(caps: &[Face]) -> Option<Face> {
+    if caps.len() < 2 {
+        return None;
+    }
+    let Some(GeomSurface::Cylinder(first)) = caps[0].surface() else {
+        return None;
+    };
+    for cap in caps {
+        let Some(GeomSurface::Cylinder(cylinder)) = cap.surface() else {
+            return None;
+        };
+        if !cylinders_same_surface(first, cylinder)
+            || cap.orientation() != caps[0].orientation()
+            || !cap.inner_wires().is_empty()
+        {
+            return None;
+        }
+    }
+    merged_cap_boundary(caps, &vec![true; caps.len()], true)
+}
+
+fn merged_cap_boundary(
+    caps: &[Face],
+    agrees_with_first: &[bool],
+    majority_agrees: bool,
+) -> Option<Face> {
+    let tol = 10.0 * tolerance::CONFUSION;
+
     let mut pool: Vec<Edge> = Vec::new();
     let mut pool_cap: Vec<usize> = Vec::new();
     for (ci, cap) in caps.iter().enumerate() {
@@ -1561,20 +1595,47 @@ fn merged_coplanar_cap(caps: &[Face]) -> Option<Face> {
     }
     // Cancel the shared seam edges (each appears once per abutting face).
     let mut removed = vec![false; pool.len()];
+    let mut adjacent = vec![Vec::new(); caps.len()];
     for i in 0..pool.len() {
         if removed[i] {
             continue;
         }
         for j in (i + 1)..pool.len() {
-            if removed[j] {
+            if removed[j] || pool_cap[i] == pool_cap[j] {
                 continue;
             }
-            if same_undirected_edge(&pool[i], &pool[j]) {
+            let midpoint = |edge: &Edge| {
+                edge.curve()
+                    .map(|curve| curve.point((edge.first() + edge.last()) * 0.5))
+                    .unwrap_or_else(|| {
+                        edge.start().point() + (edge.end().point() - edge.start().point()) * 0.5
+                    })
+            };
+            if same_undirected_edge(&pool[i], &pool[j])
+                && midpoint(&pool[i]).distance(&midpoint(&pool[j])) <= tol
+            {
                 removed[i] = true;
                 removed[j] = true;
+                adjacent[pool_cap[i]].push(pool_cap[j]);
+                adjacent[pool_cap[j]].push(pool_cap[i]);
                 break;
             }
         }
+    }
+    // Sharing only a vertex does not make one face: concatenating such loops
+    // would construct a self-touching boundary. Every patch must connect to
+    // the union through a cancelled seam.
+    let mut connected = vec![false; caps.len()];
+    let mut pending = vec![0];
+    while let Some(index) = pending.pop() {
+        if connected[index] {
+            continue;
+        }
+        connected[index] = true;
+        pending.extend(adjacent[index].iter().copied());
+    }
+    if connected.iter().any(|&connected| !connected) {
+        return None;
     }
     let mut pool: Vec<(Edge, usize)> = pool
         .into_iter()
@@ -2376,8 +2437,9 @@ fn wall_is_tangent_to_selected_side(
     Ok(face_contains_point(cap, corner))
 }
 
-/// Trim the new blend flush against a concave cut cylinder it runs into at
-/// `corner`, leaving the cut a clean full-height vertical cylinder.
+/// Trim the new blend flush against a cylindrical wall at `corner`. Supports
+/// a concave cut face or connected, consistently oriented patches of one boss
+/// cylinder; artificial seams between those patches are removed first.
 ///
 /// The fillet's quarter-circle end cap (which lies on the *blend* cylinder, not
 /// the cut) is replaced by the true blend ∩ cut intersection curve. The blend's
@@ -2386,7 +2448,7 @@ fn wall_is_tangent_to_selected_side(
 /// boundary stays on the cylinder and the seam is watertight by construction.
 /// Mutates `blend` (extended contacts + rebuilt blend face) so the later spine
 /// trims pick up the extension, mirroring [`try_corner_miter`]. Returns
-/// `Ok(false)` before a concave cut cylinder is recognized. Once one is
+/// `Ok(false)` before a supported cylindrical wall is recognized. Once one is
 /// recognized, failures are reported as clean errors instead of falling back to a
 /// flat endpoint cap that cannot share a valid edge with the cut wall.
 #[allow(clippy::too_many_arguments)]
@@ -2399,13 +2461,20 @@ fn try_corner_cut(
     faces: &mut Vec<Face>,
     skipped: &mut std::collections::HashSet<FaceId>,
 ) -> Result<bool, RollingBallError> {
-    if caps.len() != 1 {
-        return Ok(false);
-    }
-    let cap = &caps[0];
-    if !is_concave_cut_cylinder(solid, cap) {
-        return Ok(false);
-    }
+    let merged;
+    let cap = if caps.len() == 1 {
+        let cap = &caps[0];
+        if !is_concave_cut_cylinder(solid, cap) {
+            return Ok(false);
+        }
+        cap
+    } else {
+        let Some(cap) = merged_cylindrical_cap(caps) else {
+            return Ok(false);
+        };
+        merged = cap;
+        &merged
+    };
     let cut_cyl = match cap.surface() {
         Some(GeomSurface::Cylinder(c)) => *c,
         _ => return Err(RollingBallError::UnsupportedTrimTopology),
@@ -2482,7 +2551,7 @@ fn try_corner_cut(
         blend.start_arc = trim;
     }
     faces.push(trimmed_cap);
-    skipped.insert(cap.id());
+    skipped.extend(caps.iter().map(|cap| cap.id()));
     Ok(true)
 }
 
@@ -9173,6 +9242,39 @@ mod tests {
     use openrcad_foundation::Pnt;
     use openrcad_geom::Plane;
     use openrcad_primitives::make_box;
+
+    #[test]
+    fn cylindrical_cap_merge_requires_a_shared_seam_on_one_oriented_support() {
+        let patches = |z, radius| {
+            openrcad_primitives::make_cylinder_operation(
+                &Ax2::new(Pnt::new(0.0, 0.0, z), Dir::dz()),
+                radius,
+                2.0,
+            )
+            .unwrap()
+            .value
+            .faces()
+            .into_iter()
+            .filter(|f| matches!(f.surface(), Some(GeomSurface::Cylinder(_))))
+            .collect::<Vec<_>>()
+        };
+        let bottom = patches(0.0, 2.0);
+        let top = patches(2.0, 2.0);
+        let merged = merged_cylindrical_cap(&[bottom[0].clone(), top[0].clone()])
+            .expect("shared circular seam");
+        assert_eq!(merged.outer_wire().unwrap().edges().len(), 6);
+        assert!(
+            merged_cylindrical_cap(&[bottom[0].clone(), top[1].clone()]).is_none(),
+            "point-only contact is not a face union"
+        );
+        assert!(
+            merged_cylindrical_cap(&[bottom[0].clone(), patches(3.0, 2.0)[0].clone()]).is_none()
+        );
+        assert!(
+            merged_cylindrical_cap(&[bottom[0].clone(), patches(2.0, 2.5)[0].clone()]).is_none()
+        );
+        assert!(merged_cylindrical_cap(&[bottom[0].clone(), top[0].reversed()]).is_none());
+    }
 
     #[test]
     fn ordered_clamp_accepts_reversed_surface_bounds() {

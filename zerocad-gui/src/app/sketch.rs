@@ -942,7 +942,7 @@ impl ZeroCadApp {
 
     pub(crate) fn recompute_sketch_regions(&mut self) {
         let mut curves = self.sketch_curves.clone();
-        curves.extend_curves(&self.active_face_boundary);
+        curves.extend_face_boundary(&self.active_face_boundary);
         // Region detection over a text-bearing sketch is the most expensive
         // step of a rebuild (the analytic arrangement intersects every span
         // pair). Many rebuild callers fire on interactions that didn't change

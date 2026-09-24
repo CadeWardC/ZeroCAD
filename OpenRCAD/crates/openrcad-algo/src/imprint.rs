@@ -504,10 +504,35 @@ fn cut_hole(
         })
         .collect();
 
-    let inner_edges: Vec<_> = arc_ids
+    // The intersection curve's parameter direction is independent of this
+    // face's surface orientation. Its disk must have the same winding as the
+    // source face, with the hole wound oppositely. Always reversing the disk
+    // leaves an inverted patch when an outward cut merely touches its support.
+    let mut signed_area = 0.0;
+    for index in 0..32 {
+        let (u0, v0) = uv_of(
+            &surface,
+            &curve.point(cmin + (cmax - cmin) * index as f64 / 32.0),
+        );
+        let (u1, v1) = uv_of(
+            &surface,
+            &curve.point(cmin + (cmax - cmin) * (index + 1) as f64 / 32.0),
+        );
+        signed_area += u0 * v1 - u1 * v0;
+    }
+    // Raw loops follow the surface; FaceData::orientation is applied later
+    // to both the inherited face and its disk, not to either loop here.
+    let disk_forward = matches!(surface, openrcad_geom::GeomSurface::Plane(_)) && signed_area > 0.0;
+    let mut inner_edges: Vec<_> = arc_ids
         .iter()
         .map(|&id| OrientedEdge::new(id, Orientation::Forward))
         .collect();
+    if disk_forward {
+        inner_edges.reverse();
+        for edge in &mut inner_edges {
+            edge.orientation = Orientation::Reversed;
+        }
+    }
     let disk_edges: Vec<_> = inner_edges
         .iter()
         .rev()

@@ -1076,7 +1076,7 @@ impl ZeroCadApp {
                     // then the projected face boundary (sketch-on-face), so
                     // the region indices agree with what eval will build.
                     if let Some(b) = self.document.sketch_face_boundaries.get(sketch_id) {
-                        eff.extend_curves(b);
+                        eff.extend_face_boundary(b);
                     }
                     // Shape outlines (skipped when the sketch uses corner-mods,
                     // which take the legacy per-region path and are never boolean).

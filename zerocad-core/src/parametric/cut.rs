@@ -263,7 +263,7 @@ fn solids_overlap_with_volume(a: &KernelSolid, b: &KernelSolid) -> bool {
         crate::mock_kernel::solid_aabb(a),
         crate::mock_kernel::solid_aabb(b),
     ) else {
-        return false;
+        return true; // Unknown enclosure cannot prove a miss.
     };
     (0..3).all(|axis| ahi[axis].min(bhi[axis]) - alo[axis].max(blo[axis]) > 1.0e-5)
 }
@@ -280,18 +280,13 @@ pub(crate) fn recut_debug(message: impl AsRef<str>) {
 
 /// A cut tool that sweeps in the **drawn direction** (the sign of `depth`):
 /// a negative depth cuts *into* the body the sketch sits on, a positive depth
-/// sweeps *outward* from the sketch face. The tool starts one `CUT_OVERSHOOT`
-/// behind the sketch plane and runs `|depth| + 2·CUT_OVERSHOOT` along the sweep
-/// direction, so both end caps clear the body's faces — the near cap clears the
-/// face the sketch sits on, and the far cap clears the back face when the cut
-/// punches clean through. Returns `(start_plane, signed_sweep_depth)`.
+/// sweeps *outward* from the sketch face. Keep both caps at the requested
+/// positions: extending behind the plane scars the supporting face when the
+/// intended cut crosses a gap to another wall, and extending the far cap
+/// changes blind-pocket depth. Preserve the supplied normal as well (origin
+/// planes can be left-handed). Returns `(start_plane, signed_sweep_depth)`.
 pub(crate) fn directional_cut(cs: &CoordinateSystem, depth: f32) -> (CoordinateSystem, f32) {
-    let sign = if depth < 0.0 { -1.0 } else { 1.0 };
-    let start = cs.origin.add(cs.n.mul(-sign * CUT_OVERSHOOT));
-    (
-        CoordinateSystem::new(start, cs.u, cs.v),
-        depth + sign * 2.0 * CUT_OVERSHOOT,
-    )
+    (*cs, depth)
 }
 
 /// Subtract one direction's tool variants from `part`, trying smooth → exact →
@@ -322,6 +317,37 @@ pub(crate) fn cut_part_one_dir(
     let overlaps = pbb.is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, tbb, 0.05));
     if !overlaps {
         return None;
+    }
+    // A tangent or separated exact tool has no material to remove. Do not let
+    // a recovery tool (or retessellation noise) turn that miss into a cut.
+    let exact_bounds = smooth
+        .as_ref()
+        .or(exact.as_ref())
+        .and_then(crate::mock_kernel::solid_aabb)
+        .or_else(|| exact_source.as_ref().and_then(ExactCutSource::aabb));
+    if let (Some(source), Some(tool)) = (pbb, exact_bounds.as_ref()) {
+        if (0..3).any(|i| {
+            let lo = source.0[i].max(tool.0[i]);
+            let hi = source.1[i].min(tool.1[i]);
+            let overlap = hi - lo;
+            // Use local intersection coordinates and the smaller operand's
+            // extent: retain cast uncertainty at a zero-coordinate contact,
+            // without letting a distant tool end inflate it beyond the part.
+            let local_extent = (source.1[i] - source.0[i]).min(tool.1[i] - tool.0[i]);
+            let scale = lo.abs().max(hi.abs()).max(local_extent);
+            overlap <= 4.0 * f32::EPSILON * scale
+        }) {
+            return None;
+        }
+    }
+    if let Some(candidate) = exact_source
+        .as_ref()
+        .and_then(|source| super::cap_pocket::cut(part, source))
+    {
+        return Some(CutOutcome {
+            parts: vec![candidate],
+            trace: None,
+        });
     }
     let changed_difference = |label: &str,
                               tool: &KernelSolid,
@@ -374,6 +400,12 @@ pub(crate) fn cut_part_one_dir(
     {
         return Some(outcome);
     }
+    if let Some(outcome) = exact.as_ref().and_then(|tool| {
+        let extended = externally_extended_box_tool(part, tool)?;
+        changed_difference("external-only box", &extended, Some(tool))
+    }) {
+        return Some(outcome);
+    }
     if expanded.is_none() {
         *expanded = expanded_source.as_ref().and_then(ExpandedCutSource::build);
     }
@@ -385,6 +417,97 @@ pub(crate) fn cut_part_one_dir(
     }
     recut_debug("all cut variants failed or missed");
     None
+}
+
+/// Extend rectangular cutter faces only into space proven outside the source.
+/// Unlike uniform tool growth, this leaves the cutter/source intersection
+/// exactly unchanged: each added slab lies outside the source's enclosing box.
+fn externally_extended_box_tool(part: &KernelSolid, tool: &KernelSolid) -> Option<KernelSolid> {
+    // Vertex bounds are exact for the six rectangular planar faces verified
+    // below; using interval-rounded edge bounds would obscure exact contact.
+    let (a, b) = tool.bounding_box().corners()?;
+    let mut lo = [a.x(), a.y(), a.z()];
+    let mut hi = [b.x(), b.y(), b.z()];
+    let faces = tool.faces();
+    if faces.len() != 6 || tool.vertices().len() != 8 {
+        return None;
+    }
+    let mut sides = HashSet::new();
+    for face in faces {
+        let GeomSurface::Plane(plane) = face.surface()? else {
+            return None;
+        };
+        if !face.inner_wires().is_empty() {
+            return None;
+        }
+        let wire = face.outer_wire()?;
+        if wire.edges().len() != 4 {
+            return None;
+        }
+        let normal = plane.normal();
+        let normal = [normal.x(), normal.y(), normal.z()];
+        let axis = (0..3).find(|&i| normal[i].abs() == 1.0)?;
+        let mut side = None;
+        for edge in wire.edges() {
+            if !matches!(edge.curve(), Some(GeomCurve::Line(_))) {
+                return None;
+            }
+            for p in [edge.start().point(), edge.end().point()] {
+                let p = [p.x(), p.y(), p.z()];
+                if !(0..3).all(|i| p[i] == lo[i] || p[i] == hi[i]) {
+                    return None;
+                }
+                let current = p[axis] == hi[axis];
+                if side.is_some_and(|s| s != current) {
+                    return None;
+                }
+                side = Some(current);
+            }
+        }
+        sides.insert((axis, side?));
+    }
+    if sides.len() != 6 {
+        return None;
+    }
+    let planar_polygon = part.faces().iter().all(|f| {
+        matches!(f.surface(), Some(GeomSurface::Plane(_)))
+            && f.wires().iter().all(|w| {
+                w.edges()
+                    .iter()
+                    .all(|e| matches!(e.curve(), Some(GeomCurve::Line(_))))
+            })
+    });
+    let source_box = if planar_polygon {
+        part.bounding_box()
+    } else {
+        part.try_conservative_bounding_box()?
+    };
+    let (a, b) = source_box.corners()?;
+    let body_lo = [a.x(), a.y(), a.z()];
+    let body_hi = [b.x(), b.y(), b.z()];
+    let margin = (0..3).map(|i| body_hi[i] - body_lo[i]).fold(1.0, f64::max) * 0.01;
+    let mut changed = false;
+    for i in 0..3 {
+        if lo[i] <= body_lo[i] {
+            lo[i] -= margin;
+            changed = true;
+        }
+        if hi[i] >= body_hi[i] {
+            hi[i] += margin;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    openrcad::primitives::make_box_operation(
+        &openrcad::foundation::Pnt::new(lo[0], lo[1], lo[2]),
+        hi[0] - lo[0],
+        hi[1] - lo[1],
+        hi[2] - lo[2],
+    )
+    .ok()
+    .map(|result| result.value)
 }
 
 fn cut_parts_changed(original: &KernelSolid, parts: &[KernelSolid]) -> bool {
@@ -758,6 +881,70 @@ fn try_prismatic_profile_cut(body: &LiveBody, tools: &mut [CutTool]) -> Option<V
         floor_profiles.push((base_outer, base_inners));
     }
 
+    // A glyph inside another glyph's counter (for example the dot in Hack's
+    // zero) cuts the counter island, not the outer plate. Assign each cutout
+    // to the smallest enclosing material island before constructing faces.
+    let polygon = |wire: &Wire| {
+        let mut points = Vec::new();
+        for edge in wire.edges() {
+            let curve = edge.curve()?;
+            let mut parameters = openrcad::mesh::triangulate::discretize_edge_curve(
+                curve,
+                edge.first(),
+                edge.last(),
+                1e-5,
+            );
+            if edge.orientation() == Orientation::Reversed {
+                parameters.reverse();
+            }
+            parameters.pop();
+            points.extend(parameters.into_iter().map(|t| {
+                let p = curve.point(t);
+                let d = p - openrcad::foundation::Pnt::new(
+                    f64::from(body_source.cs.origin.x),
+                    f64::from(body_source.cs.origin.y),
+                    f64::from(body_source.cs.origin.z),
+                );
+                let u = body_source.cs.u;
+                let v = body_source.cs.v;
+                (
+                    d.x() * f64::from(u.x) + d.y() * f64::from(u.y) + d.z() * f64::from(u.z),
+                    d.x() * f64::from(v.x) + d.y() * f64::from(v.y) + d.z() * f64::from(v.z),
+                )
+            }));
+        }
+        Some(points)
+    };
+    let island_polygons = islands.iter().map(&polygon).collect::<Option<Vec<_>>>()?;
+    let areas: Vec<_> = islands
+        .iter()
+        .map(|wire| wire_signed_area(wire, &body_source.cs).abs())
+        .collect();
+    let mut island_holes = vec![Vec::new(); islands.len()];
+    let mut plate_holes = Vec::new();
+    for hole in main_holes {
+        let points = polygon(&hole)?;
+        let mut owner = None;
+        for (index, boundary) in island_polygons.iter().enumerate() {
+            let inside = points
+                .iter()
+                .filter(|&&p| openrcad::topo::containment::point_in_polygon_2d(p, boundary))
+                .count();
+            if inside != 0 && inside != points.len() {
+                return None;
+            }
+            if inside != 0 && owner.is_none_or(|previous| areas[index] < areas[previous]) {
+                owner = Some(index);
+            }
+        }
+        if let Some(index) = owner {
+            island_holes[index].push(hole);
+        } else {
+            plate_holes.push(hole);
+        }
+    }
+    let main_holes = plate_holes;
+
     let cut_range = common_cut_range?;
     let surface = body_cap.surface().cloned()?;
     const SECTION_TOLERANCE: f32 = 1.0e-4;
@@ -806,11 +993,11 @@ fn try_prismatic_profile_cut(body: &LiveBody, tools: &mut [CutTool]) -> Option<V
             }
         };
         let mut upper_islands = Vec::new();
-        for island in &islands {
+        for (island, holes) in islands.iter().zip(&island_holes) {
             let island_face = Face::with_wires(
                 Some(surface.clone()),
                 Some(island.clone()),
-                Vec::new(),
+                holes.clone(),
                 body_cap.orientation(),
             );
             upper_islands.push(
@@ -953,11 +1140,11 @@ fn try_prismatic_profile_cut(body: &LiveBody, tools: &mut [CutTool]) -> Option<V
         .ok()?
         .value;
     let mut parts = vec![main];
-    for island in islands {
+    for (island, holes) in islands.into_iter().zip(island_holes) {
         let island_face = Face::with_wires(
             Some(surface.clone()),
             Some(island),
-            Vec::new(),
+            holes,
             body_cap.orientation(),
         );
         parts.push(
@@ -986,29 +1173,64 @@ pub(crate) fn apply_cut(
     _draft: bool,
     warnings: &mut Vec<String>,
 ) {
-    // A word cut through a simple sketch prism is a planar profile operation,
-    // not five unrelated 3-D intersection problems. Resolve all such tools in
-    // one exact prism rebuild before entering the per-tool boolean fallback.
+    // Parallel sketch-prism cuts share one exact sectional reconstruction,
+    // including tools crossing outer edges and existing hole rims. Keep the
+    // contained multi-profile path as a fallback for unsupported curve families.
+    let original = live.to_vec();
     let mut rebuilt_bodies = HashSet::new();
-    if tools.len() > 1 {
+    if !tools.is_empty() {
         for body in live.iter_mut() {
             if boolean_target.is_some_and(|target| target != body.id) {
                 continue;
             }
+            // Keep the native circular-tool path for an untouched box. It
+            // preserves the same cylindrical patches used by later blends;
+            // sectional reconstruction is needed for compound profiles and
+            // accumulated joins/cuts, not this single primitive operation.
+            if tools.len() == 1
+                && tools[0].smooth.is_some()
+                && body.sketch_source.as_ref().is_some_and(|source| {
+                    source.joined_prisms.is_empty()
+                        && source.regions.len() == 1
+                        && source.regions[0].analytic.is_none()
+                        && source.regions[0].boundary.len() == 4
+                        && source.regions[0].holes.is_empty()
+                })
+            {
+                continue;
+            }
             let before_parts = body.parts.clone();
             let before_pristine = body.pristine.clone();
-            let Some(parts) = try_prismatic_profile_cut(body, &mut tools) else {
+            let Some((parts, source)) = super::profile_cut::try_profile_cut(body, &tools)
+                .map(|(parts, source)| (parts, Some(source)))
+                .or_else(|| {
+                    (tools.len() > 1)
+                        .then(|| try_prismatic_profile_cut(body, &mut tools))
+                        .flatten()
+                        .map(|parts| (parts, None))
+                })
+            else {
                 continue;
             };
-            body.pristine = propagate_cut_face_names(
+            body.pristine = propagate_profile_cut_face_names(
                 &before_parts,
                 before_pristine.as_deref(),
                 &parts,
                 &body.id,
+                extrude_id,
+                &tools,
             )
+            .or_else(|| {
+                propagate_cut_face_names(
+                    &before_parts,
+                    before_pristine.as_deref(),
+                    &parts,
+                    &body.id,
+                )
+            })
             .map(std::sync::Arc::new);
             body.parts = parts;
-            body.sketch_source = None;
+            body.sketch_source = source;
             rebuilt_bodies.insert(body.id.clone());
         }
     }
@@ -1058,20 +1280,32 @@ pub(crate) fn apply_cut(
                             .is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, t, 0.05))
                     })
                 };
-                // How much of this part the tool's AABB encloses, per direction.
-                // The drawn direction's `CUT_OVERSHOOT` dips ~0.1mm past the sketch
-                // plane, so a cut aimed *away* from the body still nicks a sliver and
-                // would count as "done"; ordering by overlap volume instead sends the
-                // cut the way the body actually lies (a deep pocket beats a sliver).
+                // Prefer the requested direction even when more material lies
+                // behind the sketch. Keep the legacy reverse fallback for a
+                // direction with no positive bounding-box overlap.
                 let overlap_vol = |tbb: Option<&([f32; 3], [f32; 3])>| -> f32 {
                     match (pbb.as_ref(), tbb) {
                         (Some(p), Some(t)) => (0..3)
-                            .map(|i| (p.1[i].min(t.1[i]) - p.0[i].max(t.0[i])).max(0.0))
+                            .map(|i| {
+                                let lo = p.0[i].max(t.0[i]);
+                                let hi = p.1[i].min(t.1[i]);
+                                let overlap = hi - lo;
+                                // Direction preference is a contact decision, not
+                                // broad-phase rejection. Ignore only cast uncertainty.
+                                let local_extent = (p.1[i] - p.0[i]).min(t.1[i] - t.0[i]);
+                                let scale = lo.abs().max(hi.abs()).max(local_extent);
+                                if overlap <= 4.0 * f32::EPSILON * scale {
+                                    0.0
+                                } else {
+                                    overlap
+                                }
+                            })
                             .product(),
                         _ => 0.0,
                     }
                 };
-                let reverse_first = overlap_vol(rev_bb.as_ref()) > overlap_vol(fwd_bb.as_ref());
+                let reverse_first =
+                    overlap_vol(fwd_bb.as_ref()) == 0.0 && overlap_vol(rev_bb.as_ref()) > 0.0;
                 let mut cut_direction = |reverse: bool| {
                     if reverse {
                         cut_part_one_dir(
@@ -1099,8 +1333,11 @@ pub(crate) fn apply_cut(
                         )
                     }
                 };
-                let cut_parts =
-                    cut_direction(reverse_first).or_else(|| cut_direction(!reverse_first));
+                // Solver failure does not authorize cutting the opposite side
+                // of the sketch. Reverse only for a demonstrated requested-side
+                // miss; a flush reverse cap can otherwise masquerade as a cut
+                // merely because its tessellation changes.
+                let cut_parts = cut_direction(reverse_first);
                 match cut_parts {
                     Some(outcome) => {
                         changed = true;
@@ -1158,13 +1395,98 @@ pub(crate) fn apply_cut(
             }
         }
         if failed_on_overlap {
+            live.clone_from_slice(&original);
             warnings.push(format!(
-                "Cut '{extrude_id}': the solver couldn't subtract the tool from a \
-                 body it overlaps, so that material was left intact. Try nudging \
-                 the sketch off the coplanar face."
+                "Cut '{extrude_id}': the overlapping cut could not produce a valid \
+                 solid. The original material was preserved; this boundary \
+                 configuration needs a geometry repair."
             ));
+            return;
         }
     }
+}
+
+/// Section reconstruction has no boolean split history. Attribute only unique
+/// analytic supports, so generated walls retain their tool names without
+/// guessing between repeated coplanar source faces.
+fn propagate_profile_cut_face_names(
+    before: &[KernelSolid],
+    input_mesh: Option<&MockMesh>,
+    after: &[KernelSolid],
+    body_id: &str,
+    feature_id: &str,
+    tools: &[CutTool],
+) -> Option<MockMesh> {
+    use openrcad::algo::{BooleanFaceHistory, BooleanFaceSource};
+    let [input] = before else { return None };
+    let input_mesh = input_mesh?;
+    let input_names = crate::mock_kernel::input_shell_face_names(input_mesh, input);
+    let sources: Vec<_> = tools
+        .iter()
+        .map(|tool| {
+            tool.exact
+                .clone()
+                .or_else(|| tool.exact_source.as_ref().and_then(ExactCutSource::build))
+        })
+        .collect::<Option<_>>()?;
+    let mut mesh = MockMesh::empty();
+    for part in after {
+        let object_supports = crate::mock_kernel::match_result_faces_to_source(input, part);
+        let mut history = BooleanFaceHistory {
+            face_source: crate::mock_kernel::match_result_faces_to_named_source(
+                input,
+                part,
+                &input_names,
+            )
+            .into_iter()
+            .map(|index| index.map(BooleanFaceSource::Object))
+            .collect(),
+        };
+        let mut candidates = vec![Vec::new(); part.face_count()];
+        let mut offset = 0;
+        for tool in &sources {
+            for (face, source) in crate::mock_kernel::match_result_faces_to_source(tool, part)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(source) = source {
+                    candidates[face].push(offset + source);
+                }
+            }
+            offset += tool.face_count();
+        }
+        for ((source, candidates), object_support) in history
+            .face_source
+            .iter_mut()
+            .zip(candidates)
+            .zip(object_supports)
+        {
+            if source.is_none() && object_support.is_none() {
+                if let [index] = candidates.as_slice() {
+                    *source = Some(BooleanFaceSource::Tool(*index));
+                }
+            }
+        }
+        mesh.append(crate::mock_kernel::propagate_face_names_via_history(
+            input_mesh,
+            &input_names,
+            part,
+            &history,
+            body_id,
+            &format!("cut:{feature_id}"),
+        ));
+    }
+    // Sectional reconstruction can introduce walls without a unique source
+    // support match. They still need valid identities for downstream editing.
+    super::eval::stamp_generated_face_refs(&mut mesh, feature_id, "cut");
+    for face in &mut mesh.face_refs {
+        if let Some(topology) = &mut face.topology {
+            topology.body_id = Some(body_id.to_string());
+        }
+    }
+    crate::mock_kernel::stamp_body_face_components(&mut mesh, body_id, after);
+    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+    Some(mesh)
 }
 
 /// Build a name-propagated pristine mesh for a cut result, or `None` to fall back
@@ -1221,6 +1543,7 @@ mod through_cut_tests {
             parts: vec![plate],
             pristine: None,
             sketch_source: Some(SketchExtrudeSource {
+                joined_prisms: Vec::new(),
                 regions: vec![SketchExtrudeRegionSource {
                     boundary: plate_region.boundary.clone(),
                     holes: plate_region.holes.clone(),
@@ -1292,6 +1615,7 @@ mod through_cut_tests {
             parts: vec![plate],
             pristine: None,
             sketch_source: Some(SketchExtrudeSource {
+                joined_prisms: Vec::new(),
                 regions: vec![SketchExtrudeRegionSource {
                     boundary: plate_region.boundary.clone(),
                     holes: plate_region.holes.clone(),
@@ -1339,7 +1663,7 @@ mod through_cut_tests {
         assert!(rebuilt[0].health_report().is_healthy());
         assert!(rebuilt[0].validate().is_ok());
         let actual = solid_volume(&rebuilt[0]).expect("blind pocket volume");
-        let removed_depth = nominal_pocket_depth.abs() + CUT_OVERSHOOT;
+        let removed_depth = nominal_pocket_depth.abs();
         let expected =
             f64::from(plate_region.area * depth - (ring.area + disc.area) * removed_depth);
         assert!(

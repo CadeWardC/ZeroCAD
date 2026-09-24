@@ -569,6 +569,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "break-test"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "epaint_default_fonts",
+ "openrcad",
+ "tempfile",
+ "zerocad-core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5071,7 +5082,7 @@ dependencies = [
 
 [[package]]
 name = "zerocad-core"
-version = "0.7.5"
+version = "0.7.6-alpha"
 dependencies = [
  "blake3",
  "ciborium",
@@ -5094,7 +5105,7 @@ dependencies = [
 
 [[package]]
 name = "zerocad-gui"
-version = "0.7.5"
+version = "0.7.6-alpha"
 dependencies = [
  "eframe",
  "egui-wgpu",

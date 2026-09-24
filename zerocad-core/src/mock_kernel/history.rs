@@ -184,6 +184,44 @@ pub fn match_result_faces_to_source(
         .collect()
 }
 
+/// Multiple native patches may represent one named cylindrical wall. They are
+/// unambiguous when every patch on the support carries the same durable owner.
+pub(crate) fn match_result_faces_to_named_source(
+    source: &KernelSolid,
+    result: &KernelSolid,
+    names: &[Option<String>],
+) -> Vec<Option<usize>> {
+    let signatures: Vec<_> = source
+        .shell()
+        .faces()
+        .iter()
+        .map(|f| surface_sig(f.surface()))
+        .collect();
+    result
+        .shell()
+        .faces()
+        .iter()
+        .map(|face| {
+            let signature = surface_sig(face.surface())?;
+            let candidates: Vec<_> = signatures
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.as_ref() == Some(&signature))
+                .map(|(i, _)| i)
+                .collect();
+            let first = *candidates.first()?;
+            if candidates.len() == 1 {
+                return Some(first);
+            }
+            let owner = names.get(first)?.as_ref()?;
+            candidates
+                .iter()
+                .all(|&i| names.get(i).and_then(Option::as_ref) == Some(owner))
+                .then_some(first)
+        })
+        .collect()
+}
+
 /// Tessellate `result_solid` and carry each named face of `input_mesh` onto the
 /// result face that continues it — the propagation that lets a captured face
 /// survive a boolean.
@@ -365,7 +403,7 @@ pub(crate) fn point_triangle_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: 
 /// the group's name. Faces the matcher can't attribute stay `None`.
 pub fn input_shell_face_names(input_mesh: &MockMesh, solid: &KernelSolid) -> Vec<Option<String>> {
     let mesh = MockMesh::from_solid(solid);
-    let by_canonical: std::collections::HashMap<u32, Option<String>> = mesh
+    let mut by_canonical: std::collections::HashMap<u32, Option<String>> = mesh
         .face_refs
         .iter()
         .map(|fr| {
@@ -375,6 +413,67 @@ pub fn input_shell_face_names(input_mesh: &MockMesh, solid: &KernelSolid) -> Vec
             )
         })
         .collect();
+    // A cylinder's average normal is zero, so the planar matcher cannot
+    // recover its owner. Match the named face's complete sampled support to
+    // the native wall before handing ownership to the exact boolean history.
+    // Coaxial walls share centroids; radius and trimmed axial span distinguish
+    // them. Ambiguous owners remain unnamed.
+    for (indices, info) in super::cylindrical_wall_groups(solid) {
+        let tolerance = 1e-4 * info.radius.max(1.0);
+        let names: std::collections::HashSet<String> = input_mesh
+            .face_refs
+            .iter()
+            .filter_map(|face| {
+                let topology = face.topology.as_ref()?;
+                if !topology
+                    .surface_kind
+                    .as_deref()
+                    .is_none_or(|kind| kind.eq_ignore_ascii_case("cylinder"))
+                {
+                    return None;
+                }
+                let name = topology.face_id.as_ref()?;
+                let mut seen = false;
+                let mut axial_lo = f32::INFINITY;
+                let mut axial_hi = f32::NEG_INFINITY;
+                for (triangle, id) in input_mesh.indices.chunks_exact(3).zip(&input_mesh.face_ids) {
+                    if *id != face.face_id {
+                        continue;
+                    }
+                    for index in triangle {
+                        seen = true;
+                        let offset = *index as usize * 6;
+                        let delta: [f32; 3] = std::array::from_fn(|i| {
+                            input_mesh.vertices[offset + i] - info.origin[i]
+                        });
+                        let axial: f32 = (0..3).map(|i| delta[i] * info.dir[i]).sum();
+                        axial_lo = axial_lo.min(axial);
+                        axial_hi = axial_hi.max(axial);
+                        let radial = (0..3)
+                            .map(|i| (delta[i] - axial * info.dir[i]).powi(2))
+                            .sum::<f32>()
+                            .sqrt();
+                        if (radial - info.radius).abs() > tolerance
+                            || axial < info.axial_min - tolerance
+                            || axial > info.axial_max + tolerance
+                        {
+                            return None;
+                        }
+                    }
+                }
+                (seen
+                    && axial_hi - axial_lo > tolerance
+                    && (axial_lo - info.axial_min).abs() <= tolerance
+                    && (axial_hi - info.axial_max).abs() <= tolerance)
+                    .then(|| name.clone())
+            })
+            .collect();
+        if names.len() == 1 {
+            if let Some(index) = indices.first() {
+                by_canonical.insert(*index as u32, names.into_iter().next());
+            }
+        }
+    }
     let groups = crate::mock_kernel::cylinder_surface_groups(solid);
     let mut canonical: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for (fi, &g) in groups.iter().enumerate() {
@@ -454,17 +553,43 @@ pub fn propagate_face_names_via_history(
                     matching_input_face_name(input_mesh, face_ref.centroid, face_ref.normal)
                 });
             if let Some(name) = name {
+                // Selection needs the actual supporting surface even when a
+                // curved face's averaged display normal is nonzero.
+                let surface_kind = component_faces
+                    .get(face_ref.face_id as usize)
+                    .and_then(|face| face.surface())
+                    .map(|surface| {
+                        match surface {
+                            GeomSurface::Plane(_) => "plane",
+                            GeomSurface::Cylinder(_) => "cylinder",
+                            GeomSurface::Cone(_) => "cone",
+                            GeomSurface::Sphere(_) => "sphere",
+                            GeomSurface::Torus(_) => "torus",
+                            GeomSurface::BSpline(_) => "bspline",
+                            GeomSurface::Gregory(_) => "gregory",
+                            GeomSurface::Offset(_) => "offset",
+                            GeomSurface::Ruled(_) => "ruled",
+                        }
+                        .to_string()
+                    });
+                let inherited_producer = input_mesh.face_refs.iter().find_map(|face| {
+                    let topology = face.topology.as_ref()?;
+                    (topology.face_id.as_deref() == Some(name.as_str()))
+                        .then(|| topology.producer_feature_id.clone())
+                        .flatten()
+                });
                 face_ref.topology = Some(MeshTopologyFaceRef {
                     body_id: Some(body_id.to_string()),
                     component_id: None,
                     topology_version: Some(0),
                     face_id: Some(name.clone()),
-                    surface_kind: None,
-                    producer_feature_id: current_feature_context(),
+                    surface_kind,
+                    producer_feature_id: inherited_producer.or_else(current_feature_context),
                     source_entity_id: Some(name),
                 });
             }
         }
+        super::edge_identity::populate_cylinder_plane_edge_names(&mut component_mesh, &component);
         mesh.append(component_mesh);
     }
     populate_edge_adjacent_face_names(&mut mesh);
@@ -606,8 +731,9 @@ mod tests {
     fn union_maps_each_outer_face_to_its_source_solid() {
         // obj box [0,10]^3 ; tool box translated +5 in X -> [5,15]x[0,10]x[0,10].
         // Union is one [0,15] box. The x=0 face comes from obj, x=15 from tool.
-        let obj = box_solid(10.0, 10.0, 10.0);
+        let obj = box_solid(10.0, 10.0, 10.0).expect("valid box");
         let tool = box_solid(10.0, 10.0, 10.0)
+            .expect("valid box")
             .transformed(&Trsf::translation(GeomVec::new(5.0, 0.0, 0.0)));
         let result = union(&obj, &tool).expect("axis-aligned box union should succeed");
         let hist = boolean_face_history(&obj, &tool, &result);
@@ -637,9 +763,10 @@ mod tests {
         // A 4x4 square pillar punched clean through the box in Z leaves 4 hole
         // walls, each on one of the tool's side planes -> Tool. The box's own outer
         // faces (possibly split) trace to the Object.
-        let obj = box_solid(10.0, 10.0, 10.0);
-        let tool =
-            box_solid(4.0, 4.0, 12.0).transformed(&Trsf::translation(GeomVec::new(3.0, 3.0, -1.0)));
+        let obj = box_solid(10.0, 10.0, 10.0).expect("valid box");
+        let tool = box_solid(4.0, 4.0, 12.0)
+            .expect("valid box")
+            .transformed(&Trsf::translation(GeomVec::new(3.0, 3.0, -1.0)));
         let result = difference(&obj, &tool).expect("through-pocket difference should succeed");
         let hist = boolean_face_history(&obj, &tool, &result);
 
@@ -714,8 +841,9 @@ mod tests {
     #[test]
     fn severing_cut_yields_deterministic_ordered_parts() {
         // A slot x[9,11] slicing fully through a bar severs it into two lumps.
-        let obj = box_solid(20.0, 10.0, 10.0);
+        let obj = box_solid(20.0, 10.0, 10.0).expect("valid box");
         let tool = box_solid(2.0, 12.0, 12.0)
+            .expect("valid box")
             .transformed(&Trsf::translation(GeomVec::new(9.0, -1.0, -1.0)));
         let parts = difference_bodies(&obj, &tool).expect("slot cut should succeed");
         assert_eq!(parts.len(), 2, "the slot must sever the bar into two lumps");

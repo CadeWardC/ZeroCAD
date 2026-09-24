@@ -505,7 +505,7 @@ fn fillet_preview_drag_is_responsive() {
 fn cut_scenario(
     name: &str,
     second_cut: impl FnOnce(&mut ParametricGraph),
-) -> (usize, Vec<String>, f32) {
+) -> (usize, Vec<String>, f64) {
     let mut g = ParametricGraph::new();
     add_sketch(
         &mut g,
@@ -525,18 +525,21 @@ fn cut_scenario(
     g.add_dependency("extrude_2", "extrude_4");
     second_cut(&mut g);
     let (bodies, warnings) = g.evaluate_bodies_with_warnings(&HashSet::new()).unwrap();
-    let vlen = bodies.first().map(|b| b.1.vertices.len()).unwrap_or(0);
+    let volume = bodies
+        .iter()
+        .map(|(_, mesh)| mesh.mass_properties().expect("closed cut body").volume)
+        .sum();
     println!(
         "CUT[{name}]: bodies={}, warnings={warnings:?}",
         bodies.len()
     );
-    (bodies.len(), warnings, vlen as f32)
+    (bodies.len(), warnings, volume)
 }
 
 #[test]
 fn second_cut_scenarios() {
     // A) Second cut: another pocket, far corner (the known-good baseline).
-    let (_, w_a, _) = cut_scenario("far-corner", |g| {
+    let (_, w_a, v_a) = cut_scenario("far-corner", |g| {
         add_sketch(
             g,
             "s5",
@@ -548,7 +551,7 @@ fn second_cut_scenarios() {
     });
 
     // B) Second cut: a through-hole this time.
-    let (_, w_b, _) = cut_scenario("through-hole", |g| {
+    let (_, w_b, v_b) = cut_scenario("through-hole", |g| {
         add_sketch(
             g,
             "s5",
@@ -561,7 +564,7 @@ fn second_cut_scenarios() {
 
     // C) Second cut whose profile reaches the BODY EDGE (tool side wall coplanar
     //    with the body's side face — the classic coplanar cut-killer).
-    let (_, w_c, _) = cut_scenario("edge-coplanar", |g| {
+    let (_, w_c, v_c) = cut_scenario("edge-coplanar", |g| {
         add_sketch(
             g,
             "s5",
@@ -573,7 +576,7 @@ fn second_cut_scenarios() {
     });
 
     // D) Second cut at the SAME footprint as the first but deeper.
-    let (_, w_d, _) = cut_scenario("same-spot-deeper", |g| {
+    let (_, w_d, v_d) = cut_scenario("same-spot-deeper", |g| {
         add_sketch(
             g,
             "s5",
@@ -584,6 +587,17 @@ fn second_cut_scenarios() {
         g.add_dependency("extrude_4", "extrude_6");
     });
 
+    for (actual, expected) in [
+        (v_a, 17424.0),
+        (v_b, 17172.0),
+        (v_c, 16912.0),
+        (v_d, 17496.0),
+    ] {
+        assert!(
+            (actual - expected).abs() < 0.1,
+            "second cut must remove the requested material: {actual} vs {expected}"
+        );
+    }
     let mut failures = vec![];
     for (n, w) in [
         ("far-corner", &w_a),

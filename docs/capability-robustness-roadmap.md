@@ -82,13 +82,13 @@ are tracked here so the roadmap remains the single capability record.
   non-zero-winding ink-mask region classification, concave-analytic blend
   expansion in the kernel, and OpenRCAD contour/rolling-ball/prism winding
   hardening.
-- **In the working tree (not yet committed)**: OBJ export (`meshes_to_obj`)
+- **Present in the audited `9b1290f1` source (2026-09-04)**: OBJ export (`meshes_to_obj`)
   and the reworked Import…/Export… submenus; the redesigned save and
   unsaved-changes modal dialogs; exact prismatic-profile cut/join fast paths
   and the 256-edge sampled-prism budget for glyph-heavy sketches; incremental
   GPU instance uploads in the embedded render core; GUI wiring of every
-  assembly edit through the transactional command layer. Update this entry
-  when that work lands.
+  assembly edit through the transactional command layer. This source status
+  does not by itself establish release qualification.
 
 ## Delivery principles
 

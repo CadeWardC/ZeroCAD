@@ -177,6 +177,9 @@ fn joined_source_pattern_graph(with_witness: bool) -> ParametricGraph {
     add_cut_extrude_source(&mut graph, "join_source");
     if with_witness {
         add_box_named(&mut graph, "witness", 2.0, 2.0, 2.0);
+        // This fixture deliberately needs a checkpoint after the source.
+        // Independent nodes have no guaranteed order in a topological sort.
+        graph.add_dependency("join_source", "witness");
     }
     add_linear_pattern_for(
         &mut graph,
@@ -189,6 +192,9 @@ fn joined_source_pattern_graph(with_witness: bool) -> ParametricGraph {
         FeaturePatternExtentPolicy::SourceExtent,
         true,
     );
+    if with_witness {
+        graph.add_dependency("witness", "feature_pattern");
+    }
     graph
 }
 

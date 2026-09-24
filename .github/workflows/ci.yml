@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main, openrcad]
   pull_request:
@@ -95,8 +96,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (core)
-        run: cargo clippy -p zerocad-core --all-targets
-      - name: clippy (OpenRCAD workspace)
-        working-directory: OpenRCAD
-        run: cargo clippy --workspace --all-targets
+      - name: Clippy warning regression gate (both workspaces)
+        run: |
+          python3 -m unittest discover -s scripts/tests
+          python3 scripts/check-clippy.py

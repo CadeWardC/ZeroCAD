@@ -1,0 +1,173 @@
+{
+  "capturedAt": "2026-09-11T15:03:18.9404279-05:00",
+  "head": "9b1290f14f25daa188fb6e8bcd62a5664fcdd9a0",
+  "compiler": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "note": "Captured during review; working tree was dirty and tests were added concurrently. This is not an immutable pre-run snapshot.",
+  "files": [
+    {
+      "path": "break-test/FINDINGS.md",
+      "sha256": "93B4A2CCA4CBF0010A713FC372C4CF0B6EE8CDD3880826271CE6A3B0CD17BA1F",
+      "lastWriteTime": "2026-09-11T14:47:15.7301097-05:00"
+    },
+    {
+      "path": "break-test/README.md",
+      "sha256": "A06F238C4EF4E6C7272816251F900BF80F0EE3D6787E342F78AA38C4F7E1194B",
+      "lastWriteTime": "2026-09-11T14:47:20.7826518-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/eval.rs",
+      "sha256": "D3879A839CC6CF29D7E2DE3C11EAC24A59401AD603D0692D2D7BDF69FFECC986",
+      "lastWriteTime": "2026-09-09T22:29:29.7619899-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/cut.rs",
+      "sha256": "19F33217569E7E08B13010B9D259B75F355189842156D846C392074E64E4C685",
+      "lastWriteTime": "2026-09-09T22:33:50.2460558-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/join.rs",
+      "sha256": "E18607D87A5E8DBD7849918D27EF53A4929D8FD16B77AF8311F7EE716A610777",
+      "lastWriteTime": "2026-09-09T22:18:20.9893685-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/direct_edit.rs",
+      "sha256": "A021D8D840140CFFEB74E834EFA3B3F57A4361B0F4AB4B549484FC422728F2D0",
+      "lastWriteTime": "2026-07-18T14:15:08.8722411-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/inspection.rs",
+      "sha256": "DC63B2523BA8F41A71ABF77149252B1F9284FCFE14AD86784A14C7C177E40D0E",
+      "lastWriteTime": "2026-07-20T18:20:38.7096516-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/edge_mod.rs",
+      "sha256": "0724C6C4813868108ABAAC7E8E42DE6D3E8837E121BA6EADAFF64BF749AD1715",
+      "lastWriteTime": "2026-09-07T15:10:48.0861149-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/diagnostics.rs",
+      "sha256": "3C228789BF3C3EDBA2DF1932A0149916731957ABC406E29AD0765B4D5A796393",
+      "lastWriteTime": "2026-09-07T15:08:47.8299065-05:00"
+    },
+    {
+      "path": "zerocad-core/src/parametric/types.rs",
+      "sha256": "DCF5F0DDDA88BFD74C8A5F9A368C3C26C06BFA81ACA950543B49E6B85BB35C29",
+      "lastWriteTime": "2026-08-20T11:22:55.7386765-05:00"
+    },
+    {
+      "path": "zerocad-core/src/document.rs",
+      "sha256": "EACB4AB440FD08E08725AA76D4A35546F849493A74F36E304FB172C81C37C938",
+      "lastWriteTime": "2026-08-06T11:00:30.0910929-05:00"
+    },
+    {
+      "path": "zerocad-core/src/mock_kernel/primitives.rs",
+      "sha256": "4B67005E4A89C8E5964497A1CC9760D6D1E21FF5002D8DAB79D1B600C504DDE3",
+      "lastWriteTime": "2026-08-22T13:33:45.0682308-05:00"
+    },
+    {
+      "path": "zerocad-core/src/mock_kernel/geom_utils.rs",
+      "sha256": "C30787794DE35BD79CA47F1FEFB398621E7BE834C0B8640D8EED405759FB2BF4",
+      "lastWriteTime": "2026-08-19T17:20:18.4937113-05:00"
+    },
+    {
+      "path": "zerocad-core/src/mock_kernel/blend.rs",
+      "sha256": "B4D7B0553B2E9BE3A2D59EF2DE67491B19296EB1E5C27356CD97F7A412C2FD78",
+      "lastWriteTime": "2026-08-11T15:59:38.3546847-05:00"
+    },
+    {
+      "path": "zerocad-core/src/mock_kernel/boolean.rs",
+      "sha256": "79DFEE5F50384C97964F94043AFFF1ED7FF3FFF51EE6BF8B10F5C95F73FCF78C",
+      "lastWriteTime": "2026-09-07T14:40:54.1094721-05:00"
+    },
+    {
+      "path": "OpenRCAD/crates/openrcad-topo/src/arena.rs",
+      "sha256": "54F5B2037584235AF4C98A268E9BEA10CA1202BB50C340DBDB391FD045D12174",
+      "lastWriteTime": "2026-07-20T17:40:39.5005681-05:00"
+    },
+    {
+      "path": "OpenRCAD/crates/openrcad-topo/src/solid.rs",
+      "sha256": "4DC14B016AA13150136369F7BA69CC51837BFE664F8C2211ACBA48E68F365CD9",
+      "lastWriteTime": "2026-09-04T17:09:12.7107264-05:00"
+    },
+    {
+      "path": "break-test/tests\\complex_extrusions.rs",
+      "sha256": "EDAD44F83419F0B5F5E8D6E3568E7AAF67E0E8D0ED896AC44E037991BBC898F7",
+      "lastWriteTime": "2026-09-10T21:10:03.3501381-05:00"
+    },
+    {
+      "path": "break-test/tests\\body_booleans_stress.rs",
+      "sha256": "ACF528EEF3DA5BD9678B017901F41B84003D1A3A1B72AE44CB12B16A45B3DD5D",
+      "lastWriteTime": "2026-09-11T14:27:36.4415925-05:00"
+    },
+    {
+      "path": "break-test/tests\\edge_blend_break.rs",
+      "sha256": "B08F6744710C378E9210E9FF1AD837691C476F0A30F8146028970D60522251C4",
+      "lastWriteTime": "2026-09-10T16:15:27.2375631-05:00"
+    },
+    {
+      "path": "break-test/tests\\degenerate_params.rs",
+      "sha256": "79D37CC556A6F0FF2CA847798DB03491CD155C596C118C665B38F9887A838D5F",
+      "lastWriteTime": "2026-09-10T15:59:30.7325090-05:00"
+    },
+    {
+      "path": "break-test/tests\\complex_parts.rs",
+      "sha256": "691103FAEF45E59054E22C60D9A4BF0C7BE9F36508AA5F968B6834FAB1752F20",
+      "lastWriteTime": "2026-09-10T15:59:30.7132565-05:00"
+    },
+    {
+      "path": "break-test/tests\\extrude_on_faces.rs",
+      "sha256": "9644539AF5FB0CD6D9A0184B18623E0815EF7BA632D218A60E63E6FE0CEADE51",
+      "lastWriteTime": "2026-09-10T16:15:27.2375631-05:00"
+    },
+    {
+      "path": "break-test/tests\\feature_edge_cases.rs",
+      "sha256": "28200375C427C992310EAC4532ACA6B07DB006196B39590F8BB76F91B2A8F0E8",
+      "lastWriteTime": "2026-09-10T15:59:30.7384074-05:00"
+    },
+    {
+      "path": "break-test/tests\\join_cut_stress.rs",
+      "sha256": "082A8CAA1AA26359C5D88B4C0EFBA1A34A806A6E9CB8C162F703C11CF3E7204E",
+      "lastWriteTime": "2026-09-11T14:27:36.4802914-05:00"
+    },
+    {
+      "path": "break-test/tests\\torture_sweeps_holes.rs",
+      "sha256": "C18A664B84A5E73EF4DAFEC3EFF8BAE532C884226B070F758704C336FFF3608F",
+      "lastWriteTime": "2026-09-10T22:31:30.6803181-05:00"
+    },
+    {
+      "path": "break-test/tests\\torture_features.rs",
+      "sha256": "78C22C9A307272147F5593DFFD40F14871DCC8A7804826300B256E34AF998787",
+      "lastWriteTime": "2026-09-10T22:31:30.6664968-05:00"
+    },
+    {
+      "path": "break-test/tests\\thread_torture.rs",
+      "sha256": "624C4BC8881E921824FAA94C3C187EDA6F27BA6066404AB963E28D3241F8F826",
+      "lastWriteTime": "2026-09-11T14:27:36.4904304-05:00"
+    },
+    {
+      "path": "break-test/tests\\tangency_sweeps.rs",
+      "sha256": "1AD34FF30B5D3EA2191B6FA180C5943C3B844E375DAD2A4689F862241F06DCB8",
+      "lastWriteTime": "2026-09-10T15:59:30.7420049-05:00"
+    },
+    {
+      "path": "break-test/tests\\sketch_expr_torture.rs",
+      "sha256": "97B0EB2B1FF82D9F63B1C3899A046272992D8EFF14213C99CD0FD11A6C850DD1",
+      "lastWriteTime": "2026-09-11T14:55:00.8755273-05:00"
+    },
+    {
+      "path": "break-test/tests\\multi_sketch_extrude.rs",
+      "sha256": "5EEE74F706FC3972719456E26FBC9AB5A214ED0C3BD35A02485E00962C331281",
+      "lastWriteTime": "2026-09-11T14:47:20.9818959-05:00"
+    },
+    {
+      "path": "break-test/tests\\misc_torture.rs",
+      "sha256": "91D75E09740EE0B540A05D1622ED304694AD7776B4F447BCACF6FD18DB40B809",
+      "lastWriteTime": "2026-09-11T14:59:01.4555878-05:00"
+    },
+    {
+      "path": "break-test/tests\\common\\mod.rs",
+      "sha256": "70B4E9E1B8A07A5B8266EC4DA4BE64A4837FD84E7E962C5CDEACEF76D62AAC91",
+      "lastWriteTime": "2026-09-10T15:59:30.7132565-05:00"
+    }
+  ]
+}

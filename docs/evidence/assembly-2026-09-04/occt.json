@@ -1,0 +1,79 @@
+{
+  "occt_version": "7.8.1.1",
+  "tolerances": {
+    "volume_relative": 0.01,
+    "volume_absolute_mm3": 1e-06
+  },
+  "exports": [
+    {
+      "file": "assembly.step",
+      "sha256": "703a230d856d2affc2aa66bcb5692c14617689c9d8d2b9beef894ad1fcea5d1f",
+      "passed": true,
+      "valid": true,
+      "body_count": 3,
+      "centers_mm": [
+        [
+          5.0,
+          4.0,
+          1.0
+        ],
+        [
+          26.0,
+          25.0,
+          6.0
+        ],
+        [
+          5.0,
+          4.0,
+          25.0
+        ]
+      ],
+      "volume_mm3": 479.99999999999994,
+      "expected": {
+        "volume": 480.0,
+        "body_count": 3,
+        "centers": [
+          [
+            5.0,
+            4.0,
+            1.0
+          ],
+          [
+            26.0,
+            25.0,
+            6.0
+          ],
+          [
+            5.0,
+            4.0,
+            25.0
+          ]
+        ]
+      }
+    },
+    {
+      "file": "multi.step",
+      "sha256": "ad68550c429e352ab90d7f9fa1092ddbb175611e65239b1260e774403d5c5976",
+      "passed": true,
+      "valid": true,
+      "body_count": 2,
+      "centers_mm": [
+        [
+          5.000000000000001,
+          4.0,
+          3.0
+        ],
+        [
+          1.0000000000000002,
+          1.5,
+          2.0
+        ]
+      ],
+      "volume_mm3": 504.0,
+      "expected": {
+        "volume": 504.0,
+        "body_count": 2
+      }
+    }
+  ]
+}

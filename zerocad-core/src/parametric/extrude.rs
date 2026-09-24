@@ -1546,6 +1546,12 @@ pub(crate) struct ThreadParameters {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SketchExtrudeSource {
     pub(crate) regions: Vec<SketchExtrudeRegionSource>,
+    /// Exact union operands retained only after a validated sectional Join.
+    /// `regions` stays empty for these compound bodies: its entries otherwise
+    /// correspond to individual parts and are consumed by prism-only edits.
+    /// Discarded together with sketch_source after any other geometry change.
+    #[serde(skip)]
+    pub(crate) joined_prisms: Vec<SketchExtrudeRegionSource>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2263,8 +2269,10 @@ fn merge_analytic_regions(
             vertices.len() - 1
         }
     };
-    let mut unmatched: std::collections::HashMap<(usize, usize), Vec<AnalyticBoundarySpan>> =
-        std::collections::HashMap::new();
+    // Traversal order determines loop starts and downstream triangulation.
+    // Hash iteration made identical cold evaluations produce different meshes.
+    let mut unmatched: std::collections::BTreeMap<(usize, usize), Vec<AnalyticBoundarySpan>> =
+        std::collections::BTreeMap::new();
     for region in analytic_regions {
         for loop_ in std::iter::once(&region.outer).chain(region.holes.iter()) {
             for span in &loop_.spans {
@@ -2511,10 +2519,10 @@ pub(crate) fn prepare_extrude_regions(
 
         let mut positions: std::collections::HashMap<RegionVertexKey, ([f64; 2], usize)> =
             std::collections::HashMap::new();
-        let mut unmatched: std::collections::HashMap<
+        let mut unmatched: std::collections::BTreeMap<
             (RegionVertexKey, RegionVertexKey),
             Vec<RegionBoundaryEdge>,
-        > = std::collections::HashMap::new();
+        > = std::collections::BTreeMap::new();
         for &region_index in &source_indices {
             for loop_ in region_loops(&regions[region_index]) {
                 for (a, b) in loop_

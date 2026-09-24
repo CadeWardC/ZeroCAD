@@ -75,6 +75,14 @@ impl ZeroCadApp {
                     self.open_design();
                 }
 
+                if self.project_kind == ProjectKind::Assembly
+                    && icons::Icon::Download
+                        .menu_button(ui, "Export STEP assembly…")
+                        .clicked()
+                {
+                    ui.close_menu();
+                    self.export_step();
+                }
                 if self.project_kind == ProjectKind::Part {
                     ui.separator();
 
@@ -112,6 +120,14 @@ impl ZeroCadApp {
                     let mut export_menu = egui::menu::BarState::load(ui.ctx(), export_menu_id);
                     let _ = export_menu.bar_menu(&export_button, |ui| {
                         ui.set_min_width(200.0);
+
+                        if icons::Icon::Download
+                            .menu_button(ui, "STEP model")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.export_step();
+                        }
 
                         if icons::Icon::Download
                             .menu_button_hint(

@@ -538,8 +538,18 @@ impl ZeroCadApp {
             std::mem::take(&mut *queue)
         };
         if let Some(done) = completions.into_iter().last() {
-            self.status_msg = done.message.clone();
-            self.error_msg = done.error.then_some(done.message);
+            let message = if done.revision.is_some_and(|(generation, revision)| {
+                generation != self.workspace_generation || revision != self.document_revision
+            }) {
+                format!(
+                    "{} (earlier project state; current edits are not included)",
+                    done.message
+                )
+            } else {
+                done.message
+            };
+            self.status_msg = message.clone();
+            self.error_msg = done.error.then_some(message);
         }
     }
 
@@ -1960,6 +1970,77 @@ impl ZeroCadApp {
         self.onboarding_visible = false;
     }
 
+    pub(crate) fn export_step(&mut self) {
+        if self.project_kind == ProjectKind::Assembly
+            && self.assembly_mate_statuses.values().any(|status| {
+                matches!(
+                    status,
+                    zerocad_core::MateSolveStatus::Unresolved
+                        | zerocad_core::MateSolveStatus::Conflicting
+                )
+            })
+        {
+            self.status_msg =
+                "Resolve or suppress broken assembly mates before STEP export.".into();
+            return;
+        }
+        if self.eval_pending {
+            self.status_msg = "Export waits for the current model update to finish.".into();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export STEP")
+            .add_filter("STEP model", &["step", "stp"])
+            .save_file()
+        else {
+            return;
+        };
+        let document = self.document.clone_authoritative();
+        let assembly =
+            (self.project_kind == ProjectKind::Assembly).then(|| self.assembly_document.clone());
+        let hidden = self.hidden_nodes.clone();
+        let revision = (self.workspace_generation, self.document_revision);
+        let completions = self.export_completions.clone();
+        let repaint = self.egui_ctx.clone();
+        self.status_msg = "Exporting STEP…".into();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(assembly) = &assembly {
+                    zerocad_core::step_export::write_assembly_step(assembly, &path)
+                } else {
+                    zerocad_core::step_export::write_document_step(&document, &hidden, &path)
+                }
+            }))
+            .unwrap_or_else(|_| Err("STEP export failed during model evaluation".into()));
+            let (message, error) = match result {
+                Ok(count) => (
+                    format!(
+                        "Exported {count} STEP {} to {}",
+                        if assembly.is_some() {
+                            "components"
+                        } else {
+                            "bodies"
+                        },
+                        path.display()
+                    ),
+                    false,
+                ),
+                Err(error) => (format!("STEP export failed: {error}"), true),
+            };
+            completions
+                .lock()
+                .expect("export queue poisoned")
+                .push(ExportCompletion {
+                    message,
+                    error,
+                    revision: Some(revision),
+                });
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+    }
+
     /// Prompt for a path and write all current bodies as one binary STL mesh.
     /// STL is a triangle soup (no history/units), so this is export-only — the
     /// editable document stays the `.zcad` JSON.
@@ -1997,7 +2078,11 @@ impl ZeroCadApp {
             completions
                 .lock()
                 .expect("export queue poisoned")
-                .push(ExportCompletion { message, error });
+                .push(ExportCompletion {
+                    message,
+                    error,
+                    revision: None,
+                });
             if let Some(ctx) = repaint {
                 ctx.request_repaint();
             }
@@ -2059,7 +2144,11 @@ impl ZeroCadApp {
             completions
                 .lock()
                 .expect("export queue poisoned")
-                .push(ExportCompletion { message, error });
+                .push(ExportCompletion {
+                    message,
+                    error,
+                    revision: None,
+                });
             if let Some(ctx) = repaint {
                 ctx.request_repaint();
             }
@@ -2119,7 +2208,11 @@ impl ZeroCadApp {
             completions
                 .lock()
                 .expect("export queue poisoned")
-                .push(ExportCompletion { message, error });
+                .push(ExportCompletion {
+                    message,
+                    error,
+                    revision: None,
+                });
             if let Some(ctx) = repaint {
                 ctx.request_repaint();
             }

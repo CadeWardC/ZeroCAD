@@ -49,12 +49,13 @@ pub(crate) fn apply_body_join(
     }
 
     let mut parts: Vec<KernelSolid> = Vec::new();
+    let mut failures = Vec::new();
     for part in incoming {
         let mut candidate = Some(part);
         let mut index = 0;
         while index < parts.len() {
             let current = candidate.as_ref().expect("join candidate missing");
-            if let Some(unioned) = try_body_union(&parts[index], current) {
+            if let Some(unioned) = try_body_union(&parts[index], current, &mut failures) {
                 parts[index] = unioned;
                 candidate = None;
                 // The new union can bridge another retained part. Pull it out
@@ -62,7 +63,7 @@ pub(crate) fn apply_body_join(
                 let mut merged = parts.remove(index);
                 let mut other = 0;
                 while other < parts.len() {
-                    if let Some(unioned) = try_body_union(&merged, &parts[other]) {
+                    if let Some(unioned) = try_body_union(&merged, &parts[other], &mut failures) {
                         merged = unioned;
                         parts.remove(other);
                         other = 0;
@@ -81,9 +82,13 @@ pub(crate) fn apply_body_join(
     }
 
     if parts.len() > 1 {
+        let detail = failures.first().map_or_else(
+            || "The selected bodies must touch or overlap across a face or by volume.".to_string(),
+            |reason| format!("The kernel rejected the fuse: {reason}."),
+        );
         warnings.push(format!(
-            "Body join '{node_id}': the selected bodies must touch or overlap; \
-             both original bodies were left unchanged."
+            "Body join '{node_id}': could not produce one valid fused solid. {detail} \
+             All original bodies were left unchanged."
         ));
         return;
     }
@@ -109,13 +114,25 @@ pub(crate) fn apply_body_join(
 /// Attempt a material-preserving union. The AABB gate avoids asking the kernel
 /// to fuse clearly disjoint solids, and the containment check rejects the same
 /// degenerate boolean result guarded against by sketch-based Join.
-fn try_body_union(a: &KernelSolid, b: &KernelSolid) -> Option<KernelSolid> {
+fn try_body_union(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    failures: &mut Vec<String>,
+) -> Option<KernelSolid> {
     let abb = crate::mock_kernel::solid_aabb(a)?;
     let bbb = crate::mock_kernel::solid_aabb(b)?;
     if !crate::mock_kernel::aabbs_overlap(&abb, &bbb, 0.05) {
         return None;
     }
-    let unioned = crate::mock_kernel::union(a, b)?;
+    let unioned = match crate::mock_kernel::union_diagnostic(a, b) {
+        Ok(solid) => solid,
+        Err(reason) => {
+            if failures.is_empty() {
+                failures.push(reason);
+            }
+            return None;
+        }
+    };
     let ubb = crate::mock_kernel::solid_aabb(&unioned)?;
     let connected = unioned.split_disconnected().len() <= 1;
     (crate::mock_kernel::aabb_contains(&ubb, &abb, 0.05)
@@ -240,14 +257,16 @@ pub(crate) fn apply_join(
         if boolean_target.is_some_and(|target| target != body.id) {
             continue;
         }
-        if let Some(rebuilt) = try_prismatic_profile_join(body, &tools) {
+        if let Some(rebuilt) = try_prismatic_profile_join(body, &tools)
+            .or_else(|| super::profile_join::try_profile_join(body, &tools))
+        {
             let named = body
                 .pristine
                 .as_ref()
-                .map(|mesh| crate::mock_kernel::propagate_face_names(mesh, &rebuilt, &body.id));
+                .map(|mesh| name_join_result(mesh, &rebuilt, &body.id, extrude_id));
             body.parts = vec![rebuilt];
             body.pristine = named.map(std::sync::Arc::new);
-            body.sketch_source = None;
+            body.sketch_source = super::profile_join::joined_source(body, &tools);
             return;
         }
     }
@@ -559,6 +578,27 @@ fn solids_share_face_area(first: &KernelSolid, second: &KernelSolid) -> bool {
     false
 }
 
+/// Preserve inherited face identities and name faces created by a join.
+fn name_join_result(
+    input: &MockMesh,
+    solid: &KernelSolid,
+    body_id: &str,
+    feature_id: &str,
+) -> MockMesh {
+    let mut mesh = crate::mock_kernel::propagate_face_names(input, solid, body_id);
+    // Sectional reconstruction has no Boolean face history. Preserve matched
+    // input names and give every newly generated face a valid selectable owner.
+    super::eval::stamp_generated_face_refs(&mut mesh, feature_id, "join");
+    for face in &mut mesh.face_refs {
+        if let Some(topology) = &mut face.topology {
+            topology.body_id = Some(body_id.to_string());
+        }
+    }
+    crate::mock_kernel::stamp_body_face_components(&mut mesh, body_id, std::slice::from_ref(solid));
+    crate::mock_kernel::populate_edge_adjacent_face_names(&mut mesh);
+    mesh
+}
+
 /// Transactionally union one Join tool into a non-threaded body. All tool
 /// variants are tried against a clone; no body state changes until a validated,
 /// connected union exists. If the tool bridges multiple body components, the
@@ -578,7 +618,7 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
     if let Some(rebuilt) = try_prismatic_boundary_join(body, tool) {
         let named = input_mesh
             .as_ref()
-            .map(|mesh| crate::mock_kernel::propagate_face_names(mesh, &rebuilt, &body.id));
+            .map(|mesh| name_join_result(mesh, &rebuilt, &body.id, extrude_id));
         body.parts = vec![rebuilt];
         body.pristine = named.map(std::sync::Arc::new);
         body.sketch_source = None;
@@ -631,9 +671,7 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
                     &format!("join:{extrude_id}"),
                 ))
             }
-            (_, _, Some(mesh), [part]) => Some(crate::mock_kernel::propagate_face_names(
-                mesh, part, &body.id,
-            )),
+            (_, _, Some(mesh), [part]) => Some(name_join_result(mesh, part, &body.id, extrude_id)),
             _ => None,
         };
 
@@ -660,7 +698,27 @@ fn loop_area(points: &[(f32, f32)]) -> f32 {
 }
 
 pub(crate) fn source_region(source: &SketchExtrudeRegionSource) -> Option<crate::sketch::Region> {
-    let analytic = source.analytic.clone()?;
+    let analytic = source.analytic.clone().or_else(|| {
+        // Primitive boxes predate analytic sketch provenance. Recover their
+        // exact four line spans so multi-profile cuts use the same sectional
+        // operation as a sketched rectangle, rather than sequential booleans.
+        if source.boundary.len() != 4 || !source.holes.is_empty() {
+            return None;
+        }
+        let mut curves = crate::sketch::SketchCurves::new();
+        for (a, b) in source
+            .boundary
+            .iter()
+            .zip(source.boundary.iter().cycle().skip(1))
+            .take(4)
+        {
+            curves.add_line(*a, *b);
+        }
+        crate::sketch::detect_regions(&curves)
+            .into_iter()
+            .next()?
+            .analytic
+    })?;
     let area =
         loop_area(&source.boundary) - source.holes.iter().map(|hole| loop_area(hole)).sum::<f32>();
     (area > 0.0).then_some(crate::sketch::Region {
@@ -1031,7 +1089,7 @@ fn union_variant_into_parts(
             }
             (unioned, Some(history))
         } else {
-            let Some(unioned) = try_body_union(&source_parts[start], tool) else {
+            let Some(unioned) = try_body_union(&source_parts[start], tool, &mut Vec::new()) else {
                 continue;
             };
             (unioned, None)
@@ -1045,7 +1103,7 @@ fn union_variant_into_parts(
             .collect();
         let mut index = 0;
         while index < remaining.len() {
-            if let Some(unioned) = try_body_union(&merged, &remaining[index]) {
+            if let Some(unioned) = try_body_union(&merged, &remaining[index], &mut Vec::new()) {
                 merged = unioned;
                 remaining.remove(index);
                 index = 0;

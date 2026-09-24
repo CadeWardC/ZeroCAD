@@ -1,13 +1,19 @@
 use super::*;
 
 /// Axis-aligned box solid, one corner at the origin, opposite at (w, h, d).
-pub fn box_solid(w: f32, h: f32, d: f32) -> KernelSolid {
+///
+/// Returns `None` when the kernel cannot build a valid solid for the given
+/// dimensions. Positive-but-sub-tolerance extents quantize to coincident
+/// points in the kernel's tolerance model, producing zero-length edges and a
+/// non-watertight shell — callers must report that as an invalid parameter,
+/// never unwrap it (the catalog-A sub-tolerance regression).
+pub fn box_solid(w: f32, h: f32, d: f32) -> Option<KernelSolid> {
     consume_operation(
         "box primitive",
         openrcad::primitives::make_box_operation(&Pnt::origin(), w as f64, h as f64, d as f64),
     )
-    .expect("positive box dimensions must produce a valid solid")
-    .solid
+    .ok()
+    .map(|outcome| outcome.solid)
 }
 
 /// Boolean-ready solid for a cylinder primitive: a **true smooth cylinder**
@@ -1440,7 +1446,15 @@ pub fn swept_solid_with_guide(
         } else {
             path[m - 1]
         };
-        b.sub(a).normalize()
+        if closed {
+            path[i]
+                .sub(a)
+                .normalize()
+                .add(b.sub(path[i]).normalize())
+                .normalize()
+        } else {
+            b.sub(a).normalize()
+        }
     };
 
     // Initial frame perpendicular to t0. Preserve the profile's drawn "right"
@@ -1503,7 +1517,6 @@ pub fn swept_solid_with_guide(
             .collect(),
     };
     let initial_r = r;
-    let initial_s = s;
     let mut frames = Vec::with_capacity(m);
     frames.push((r, s, t));
     let reflection_threshold = linear_tolerance * linear_tolerance;
@@ -1626,12 +1639,32 @@ pub fn swept_solid_with_guide(
                 (base_right, base_up, 1.0)
             };
         previous_right = Some(right);
-        sections.push(section_at(path[index], right.mul(scale), up.mul(scale)));
+        // A closed polygonal spine meets at miter planes. A circular section
+        // in that oblique plane otherwise shrinks the perpendicular leg area
+        // by cos(half-turn), losing 29% of a square-loop sweep's material.
+        let miter = |axis: Vec3| {
+            if !closed {
+                return axis;
+            }
+            let incoming = path[index].sub(path[(index + m - 1) % m]).normalize();
+            let outgoing = path[(index + 1) % m].sub(path[index]).normalize();
+            let bend = outgoing.sub(incoming).normalize();
+            let cosine = incoming.dot(frame_t).abs();
+            if cosine <= context.policy.angular as f32 {
+                return axis;
+            }
+            axis.add(bend.mul(axis.dot(bend) * (1.0 / cosine - 1.0)))
+        };
+        sections.push(section_at(
+            path[index],
+            miter(right).mul(scale),
+            miter(up).mul(scale),
+        ));
     }
     if closed {
         // Exact duplicate, not a separately recomputed frame: ordered skinning
         // connects the last unique path section to this seam and emits no caps.
-        sections.push(section_at(path[0], initial_r, initial_s));
+        sections.push(sections[0].clone());
     }
 
     match consume_operation(
@@ -3050,7 +3083,10 @@ fn thread_runout_faces(
                 }
             }
         }
-        cuts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // `total_cmp` (not `partial_cmp().unwrap()`): a non-finite seam/window
+        // angle reaching this sort must degrade to a rejected construction,
+        // never panic the evaluator (A5 regression).
+        cuts.sort_by(|a, b| a.total_cmp(b));
         cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
 
         let mut arcs: Vec<Edge> = Vec::with_capacity(cuts.len() - 1);
@@ -3658,6 +3694,21 @@ pub fn threaded_replace_cylinder_wall_with_policy(
     flip: bool,
     policy: &TolerancePolicy,
 ) -> Option<KernelSolid> {
+    threaded_replace_selected_cylinder_wall_with_policy(
+        part, info, spec, length, flip, policy, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn threaded_replace_selected_cylinder_wall_with_policy(
+    part: &KernelSolid,
+    info: &CylinderFaceInfo,
+    spec: &ThreadSpec,
+    length: Option<f64>,
+    flip: bool,
+    policy: &TolerancePolicy,
+    selected_faces: Option<&[usize]>,
+) -> Option<KernelSolid> {
     policy.validate().ok()?;
     let want_dir = GeomVec::new(info.dir[0] as f64, info.dir[1] as f64, info.dir[2] as f64);
     let want_r = info.radius as f64;
@@ -3672,7 +3723,7 @@ pub fn threaded_replace_cylinder_wall_with_policy(
     let mut wall_old: Vec<Face> = Vec::new();
     let mut keep: Vec<Face> = Vec::new();
     let mut axis_exact: Option<(Pnt, GeomVec, f64)> = None;
-    for face in part.shell().faces() {
+    for (face_index, face) in part.shell().faces().iter().enumerate() {
         let is_wall = match face.surface() {
             Some(GeomSurface::Cylinder(cyl)) => {
                 let pos = cyl.position();
@@ -3684,7 +3735,11 @@ pub fn threaded_replace_cylinder_wall_with_policy(
                 let along = rel.dot(&want_dir) / want_dir.dot(&want_dir).max(1e-12);
                 let radial = rel - want_dir * along;
                 let axis_ok = radial.magnitude() <= 1e-3 * want_r.max(1.0);
-                if parallel && r_ok && axis_ok {
+                if parallel
+                    && r_ok
+                    && axis_ok
+                    && selected_faces.is_none_or(|indices| indices.contains(&face_index))
+                {
                     if axis_exact.is_none() {
                         let dir = if d.dot(&want_dir) >= 0.0 { d } else { d * -1.0 };
                         axis_exact = Some((pos.location(), dir, cyl.radius()));

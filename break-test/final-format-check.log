@@ -1,0 +1,45 @@
+Diff in \\?\C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-core\src\parametric\eval.rs:1578:
+         ) = {
+             let cache = self.eval_cache.borrow();
+             let cps = &cache.checkpoints;
+-            let matched =
+-                (0..keys.len().min(cps.len())).rev().find(|&i| {
+-                    cps[i].as_ref().is_some_and(|cp| {
+-                        cp.key == keys[i]
+-                            && cp.live.iter().all(|body| {
+-                                // Serialized caches omit analytic arrangements.
+-                                // They can display a finished result, but a new
+-                                // modeling operation needs the retained sources.
+-                                body.sketch_source.as_ref().is_none_or(|source| {
+-                                    (!source.regions.is_empty() || !source.joined_prisms.is_empty())
+-                                        && source.regions.iter().chain(&source.joined_prisms).all(
+-                                            |region| {
+-                                                region.analytic.is_some()
+-                                                    || super::join::source_region(region).is_some()
+-                                            },
+-                                        )
+-                                })
++            let matched = (0..keys.len().min(cps.len())).rev().find(|&i| {
++                cps[i].as_ref().is_some_and(|cp| {
++                    cp.key == keys[i]
++                        && cp.live.iter().all(|body| {
++                            // Serialized caches omit analytic arrangements.
++                            // They can display a finished result, but a new
++                            // modeling operation needs the retained sources.
++                            body.sketch_source.as_ref().is_none_or(|source| {
++                                (!source.regions.is_empty() || !source.joined_prisms.is_empty())
++                                    && source.regions.iter().chain(&source.joined_prisms).all(
++                                        |region| {
++                                            region.analytic.is_some()
++                                                || super::join::source_region(region).is_some()
++                                        },
++                                    )
+                             })
+-                    })
+-                });
++                        })
++                })
++            });
+             if let Some(last) = matched {
+                 let cp = cps[last].as_ref().expect("matched checkpoint missing");
+                 let mut retained = vec![None; keys.len()];

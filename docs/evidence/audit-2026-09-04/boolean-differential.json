@@ -1,0 +1,127 @@
+{
+  "occt_version": "7.8.1.1",
+  "tolerances": {
+    "volume_area_relative": 0.01,
+    "volume_area_absolute": 1e-06,
+    "centroid_absolute_mm": 0.01,
+    "centroid_relative": 0.001
+  },
+  "cases": [
+    {
+      "case": "history_through_cut.json",
+      "identity": "1081af76f9bca9e430da9adf9ae0d3a97dc7524e241ec28c2c8340d1b9886788",
+      "passed": true,
+      "openrcad": {
+        "error": null,
+        "identity": "1081af76f9bca9e430da9adf9ae0d3a97dc7524e241ec28c2c8340d1b9886788",
+        "observation": {
+          "body_count": 1,
+          "centroid": [
+            5.999999999999994,
+            5.999999999999991,
+            3.999999999999993
+          ],
+          "surface_area": 747.3982208041274,
+          "volume": 1051.540793502501
+        }
+      },
+      "occt": {
+        "body_count": 1,
+        "volume": 1051.4690350851267,
+        "surface_area": 747.3982236861551,
+        "centroid": [
+          5.999999999999999,
+          6.0,
+          4.0
+        ]
+      }
+    },
+    {
+      "case": "imported_round_union.json",
+      "identity": "388e77c6513c68a1db3be1e1375d964bde0dab44838726fb2276255d61613868",
+      "passed": true,
+      "openrcad": {
+        "error": null,
+        "identity": "388e77c6513c68a1db3be1e1375d964bde0dab44838726fb2276255d61613868",
+        "observation": {
+          "body_count": 1,
+          "centroid": [
+            1.508587283184916e-05,
+            -3.9090223936680794e-07,
+            5.369022643710137
+          ],
+          "surface_area": 352.1309296691573,
+          "volume": 534.6845190187555
+        }
+      },
+      "occt": {
+        "body_count": 1,
+        "volume": 536.1651462126579,
+        "surface_area": 351.85837720205683,
+        "centroid": [
+          -6.096063139471742e-16,
+          7.25971203228265e-17,
+          5.375000000000002
+        ]
+      }
+    },
+    {
+      "case": "mixed_rotated_intersection.json",
+      "identity": "91e8df45d4b1d2073ac35e5791abe4ace8d182f39550122508e9dd625ef0ca89",
+      "passed": true,
+      "openrcad": {
+        "error": null,
+        "identity": "91e8df45d4b1d2073ac35e5791abe4ace8d182f39550122508e9dd625ef0ca89",
+        "observation": {
+          "body_count": 1,
+          "centroid": [
+            5.736496512381979,
+            7.011270155727529,
+            5.000000000000003
+          ],
+          "surface_area": 320.514172857324,
+          "volume": 386.74280953372744
+        }
+      },
+      "occt": {
+        "body_count": 1,
+        "volume": 386.7428095337277,
+        "surface_area": 320.51417285732407,
+        "centroid": [
+          5.736496512381977,
+          7.011270155727528,
+          5.0
+        ]
+      }
+    },
+    {
+      "case": "primitive_box_union.json",
+      "identity": "7b116ae6171ec832efdf7e1a6ca8a465fc8e2350ed8a8e651fd6dcb01fbced0f",
+      "passed": true,
+      "openrcad": {
+        "error": null,
+        "identity": "7b116ae6171ec832efdf7e1a6ca8a465fc8e2350ed8a8e651fd6dcb01fbced0f",
+        "observation": {
+          "body_count": 1,
+          "centroid": [
+            7.5,
+            5.0,
+            5.0
+          ],
+          "surface_area": 800.0,
+          "volume": 1500.0
+        }
+      },
+      "occt": {
+        "body_count": 1,
+        "volume": 1499.9999999999993,
+        "surface_area": 799.9999999999999,
+        "centroid": [
+          7.5000000000000036,
+          5.0000000000000036,
+          5.000000000000003
+        ]
+      }
+    }
+  ]
+}

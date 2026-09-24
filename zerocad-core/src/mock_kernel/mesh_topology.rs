@@ -1,5 +1,68 @@
 use super::*;
 
+/// Project an exact planar B-Rep boundary. Circular rims stay circular instead
+/// of becoming a second, slightly different polygon in downstream sketches.
+/// Return None for unsupported curve families so callers retain their fallback.
+pub fn kernel_face_boundary_2d(
+    face: &Face,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<crate::sketch::SketchCurves> {
+    if !matches!(face.surface(), Some(GeomSurface::Plane(_))) {
+        return None;
+    }
+    let mut out = crate::sketch::SketchCurves::new();
+    let project = |p: Pnt| {
+        let d = p - Pnt::new(
+            f64::from(cs.origin.x),
+            f64::from(cs.origin.y),
+            f64::from(cs.origin.z),
+        );
+        let dot = |v: Vec3| {
+            (d.x() * f64::from(v.x) + d.y() * f64::from(v.y) + d.z() * f64::from(v.z)) as f32
+        };
+        (dot(cs.u), dot(cs.v))
+    };
+    for wire in face.wires() {
+        for edge in wire.edges() {
+            match edge.curve() {
+                Some(GeomCurve::Circle(circle)) => {
+                    let axis = circle.position().direction();
+                    let uv_normal = cs.u.cross(cs.v);
+                    let alignment = axis.x() * f64::from(uv_normal.x)
+                        + axis.y() * f64::from(uv_normal.y)
+                        + axis.z() * f64::from(uv_normal.z);
+                    if alignment.abs() < 0.99999 {
+                        return None;
+                    }
+                    let (first, last) = if edge.orientation() == Orientation::Reversed {
+                        (edge.last(), edge.first())
+                    } else {
+                        (edge.first(), edge.last())
+                    };
+                    let center = project(circle.center());
+                    let radius = circle.radius() as f32;
+                    if (last - first).abs() >= std::f64::consts::TAU - 1.0e-6 {
+                        out.add_circle(center, radius);
+                    } else {
+                        out.arcs.push(crate::sketch::Arc {
+                            center,
+                            radius,
+                            start: project(circle.point(first)),
+                            end: project(circle.point(last)),
+                            clockwise: (last - first) * alignment < 0.,
+                        });
+                    }
+                }
+                Some(GeomCurve::Line(_)) | None => {
+                    out.add_line(project(edge.start().point()), project(edge.end().point()))
+                }
+                _ => return None,
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// The boundary loops of one mesh face (`fid` in [`MockMesh::face_ids`]) — its
 /// outer wire plus any hole rims — projected into `cs`'s 2D plane as line
 /// segments, ready to join a sketch's region detection as reference geometry.

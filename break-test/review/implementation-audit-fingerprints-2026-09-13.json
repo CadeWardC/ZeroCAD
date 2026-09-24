@@ -1,0 +1,26 @@
+[
+  {
+    "Path": "C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\zerocad-core\\src\\parametric\\eval.rs",
+    "Hash": "B41C8DE9E9D1229AF3C120D57A0DE054B5C14A4165364809C41692C6C9BF191C"
+  },
+  {
+    "Path": "C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\zerocad-core\\src\\parametric\\direct_edit.rs",
+    "Hash": "F7544FDAFBBD87F0A45A351DC7E3E055363E5E1C2C151A9F5089BA22B57B0963"
+  },
+  {
+    "Path": "C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\zerocad-core\\src\\parametric\\edge_mod.rs",
+    "Hash": "5F0849028B864882963B4E4C2F6DF7FD585A79AF850DB9C3C4882A20163584DB"
+  },
+  {
+    "Path": "C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\OpenRCAD\\crates\\openrcad-topo\\src\\solid.rs",
+    "Hash": "BB2986A7BCAE72D459CA7AC485FB20BF1BCAF3E5E159369D1E68D28DEE55E048"
+  },
+  {
+    "Path": "C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\OpenRCAD\\crates\\openrcad-topo\\src\\arena.rs",
+    "Hash": "01CE453430A86D4705A175316A662D2CABEF6EE709EE18E9F7F61298409788F4"
+  },
+  {
+    "Path": "C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\OpenRCAD\\crates\\openrcad-algo\\tests\\cut_coincident_cap.rs",
+    "Hash": "2209E92D392B7F9B23453ECDAF5CAD2269DDEF17A94F3D3F3DA0FAE0FEA93C34"
+  }
+]

@@ -339,14 +339,20 @@ pub fn sew_with_policy(
     policy
         .validate()
         .map_err(SewError::InvalidTolerancePolicy)?;
-    let value = sew_impl(faces, policy);
+    let sewn = Solid::new(sew_impl(faces, policy));
+    // Adjacent faces may describe the same boundary with different edge
+    // subdivisions. Imprint existing interior vertices before validating the
+    // shell; the healer returns the original unless the full strict gate passes.
+    let healed = crate::merge::heal_tjunctions_with_policy(&sewn, policy);
+    let healed_tjunctions = !Arc::ptr_eq(sewn.brep(), healed.brep());
+    let value = healed.shell();
     let validation = ValidationReport::for_solid(&Solid::new(value.clone()), policy);
     if !validation.is_valid() {
         return Err(SewError::InvalidOutput(validation));
     }
     let history = TopologyHistory::generated_shell(&value);
     debug_assert!(history.coverage_for_shell(&value).is_complete());
-    let recovery = if faces.len() > 1 {
+    let mut recovery = if faces.len() > 1 {
         RecoveryReport {
             actions: vec![RecoveryAction::SewFaces {
                 face_count: faces.len(),
@@ -355,6 +361,9 @@ pub fn sew_with_policy(
     } else {
         RecoveryReport::default()
     };
+    if healed_tjunctions {
+        recovery.actions.push(RecoveryAction::HealTJunctions);
+    }
     Ok(OperationResult {
         value,
         history,
@@ -1096,6 +1105,44 @@ mod tests {
                 face_count: source.face_count(),
             }]
         );
+    }
+
+    #[test]
+    fn canonical_sew_heals_mismatched_boundary_subdivisions() {
+        let source = openrcad_primitives::make_box_operation(&Pnt::origin(), 3.0, 4.0, 5.0)
+            .unwrap()
+            .value;
+        let mut faces = source.faces();
+        let face = faces[0].clone();
+        let edge = face.outer_wire().unwrap().edges()[0].clone();
+        let data = &face.brep().edges[edge.id()];
+        let t = (data.first + data.last) * 0.5;
+        let point = data.curve.as_ref().unwrap().point(t);
+        let mut builder = openrcad_topo::BRepBuilder::from_brep((**face.brep()).clone());
+        let vertex = builder
+            .brep_mut()
+            .vertices
+            .insert(openrcad_topo::arena::VertexData {
+                point,
+                tolerance: TolerancePolicy::STANDARD.linear,
+            });
+        builder.split_edge(edge.id(), vertex, t);
+        faces[0] = Face::from_id(builder.build(), face.id(), face.orientation());
+
+        let outcome = sew_with_policy(&faces, &TolerancePolicy::STANDARD).unwrap();
+        assert!(outcome.validation.is_valid());
+        assert!(outcome
+            .recovery
+            .actions
+            .contains(&RecoveryAction::HealTJunctions));
+        let solid = Solid::new(outcome.value);
+        assert_eq!(solid.split_disconnected().len(), 1);
+        assert!(solid
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .is_ok());
+        // Healing must not close a genuinely missing face.
+        faces.pop();
+        assert!(sew_with_policy(&faces, &TolerancePolicy::STANDARD).is_err());
     }
 
     /// A unit square in the Z=0 plane at `offset_x`, every boundary vertex built

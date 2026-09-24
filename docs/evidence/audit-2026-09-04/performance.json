@@ -1,0 +1,1139 @@
+{
+  "profile": "optimized",
+  "warmup_seconds": 1,
+  "measurement_seconds": 2,
+  "sample_size": 10,
+  "workloads": [
+    {
+      "workload": "mechanical_parts_v1/curved_step_import/cached",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 19094.354249321164,
+            "upper_bound": 20982.126209961283
+          },
+          "point_estimate": 20019.63614421481,
+          "standard_error": 482.64998624064117
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 18272.34688489968,
+            "upper_bound": 21147.560278071105
+          },
+          "point_estimate": 20266.93241816262,
+          "standard_error": 748.075569045672
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 198.75288163510024,
+            "upper_bound": 3047.8427626798343
+          },
+          "point_estimate": 1724.6477267731482,
+          "standard_error": 712.9954527905888
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 18589.098468749253,
+            "upper_bound": 20935.13220865768
+          },
+          "point_estimate": 19734.659553751422,
+          "standard_error": 613.0703556465161
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 969.7826632340325,
+            "upper_bound": 2025.4594520728838
+          },
+          "point_estimate": 1612.869504067104,
+          "standard_error": 280.4023696403823
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          1894.0,
+          3788.0,
+          5682.0,
+          7576.0,
+          9470.0,
+          11364.0,
+          13258.0,
+          15152.0,
+          17046.0,
+          18940.0
+        ],
+        "times": [
+          36249100.0,
+          86799800.0,
+          115884000.0,
+          138431300.0,
+          190715700.0,
+          237367300.0,
+          239343500.0,
+          325244200.0,
+          355062900.0,
+          342838400.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/curved_step_import/cold",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7981461.883333333,
+            "upper_bound": 8574438.194761902
+          },
+          "point_estimate": 8228342.207142858,
+          "standard_error": 156003.68745274429
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7904566.666666667,
+            "upper_bound": 8422760.0
+          },
+          "point_estimate": 8052632.75,
+          "standard_error": 126106.20105535949
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 63030.26688098931,
+            "upper_bound": 565910.3867530825
+          },
+          "point_estimate": 240558.39387923456,
+          "standard_error": 129255.55068503912
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7978640.40798969,
+            "upper_bound": 8783204.306220096
+          },
+          "point_estimate": 8318861.298701298,
+          "standard_error": 207652.85473821522
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 132120.88175718707,
+            "upper_bound": 769187.9595715463
+          },
+          "point_estimate": 521759.40341369255,
+          "standard_error": 195451.41365095173
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          5.0,
+          10.0,
+          15.0,
+          20.0,
+          25.0,
+          30.0,
+          35.0,
+          40.0,
+          45.0,
+          50.0
+        ],
+        "times": [
+          39097700.0,
+          78761900.0,
+          126341400.0,
+          163028000.0,
+          201920200.0,
+          239255800.0,
+          335422800.0,
+          321138300.0,
+          355705500.0,
+          422249900.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/curved_step_import/trailing_edit",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 206488.92399891777,
+            "upper_bound": 236721.10885642137
+          },
+          "point_estimate": 220709.00374278502,
+          "standard_error": 7751.350968339378
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 199775.94696969696,
+            "upper_bound": 241840.8143939394
+          },
+          "point_estimate": 208133.96915584416,
+          "standard_error": 13368.431734836127
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1052.3160466585484,
+            "upper_bound": 44377.27387123681
+          },
+          "point_estimate": 13834.225194734301,
+          "standard_error": 13233.017744385592
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 200865.46185868586,
+            "upper_bound": 227421.81359044995
+          },
+          "point_estimate": 211133.70867768594,
+          "standard_error": 7366.140994965783
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13229.385951662118,
+            "upper_bound": 31819.291787987986
+          },
+          "point_estimate": 25824.77639877096,
+          "standard_error": 4764.223034823889
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          176.0,
+          352.0,
+          528.0,
+          704.0,
+          880.0,
+          1056.0,
+          1232.0,
+          1408.0,
+          1584.0,
+          1760.0
+        ],
+        "times": [
+          40819100.0,
+          94645200.0,
+          132926600.0,
+          150848400.0,
+          175339500.0,
+          210963400.0,
+          248857400.0,
+          279285800.0,
+          380899900.0,
+          352727200.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/engraved_plate/cached",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4693942.041666667,
+            "upper_bound": 5211900.396354167
+          },
+          "point_estimate": 4940872.520833334,
+          "standard_error": 133265.58760670727
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4571170.833333334,
+            "upper_bound": 5320591.458333334
+          },
+          "point_estimate": 4785023.4375,
+          "standard_error": 228626.78545299682
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 37377.73527391255,
+            "upper_bound": 764750.7030479601
+          },
+          "point_estimate": 390428.0315060166,
+          "standard_error": 214766.38938690195
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4816998.0,
+            "upper_bound": 5490464.685089975
+          },
+          "point_estimate": 5198665.324675324,
+          "standard_error": 175091.60169844225
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 238874.8444146838,
+            "upper_bound": 539790.4724991078
+          },
+          "point_estimate": 440945.41886026505,
+          "standard_error": 77366.34837382523
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          8.0,
+          16.0,
+          24.0,
+          32.0,
+          40.0,
+          48.0,
+          56.0,
+          64.0,
+          72.0,
+          80.0
+        ],
+        "times": [
+          36887700.0,
+          72191800.0,
+          108753100.0,
+          148211500.0,
+          205675900.0,
+          263965700.0,
+          256546500.0,
+          316060000.0,
+          376365600.0,
+          458774300.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/engraved_plate/cold",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 277582420.0,
+            "upper_bound": 309799420.0
+          },
+          "point_estimate": 292524350.0,
+          "standard_error": 8368884.639767752
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 271087700.0,
+            "upper_bound": 328762200.0
+          },
+          "point_estimate": 277372350.0,
+          "standard_error": 14131661.509016177
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1333821.0663199425,
+            "upper_bound": 41906355.42601347
+          },
+          "point_estimate": 11978369.967341423,
+          "standard_error": 11006795.866109513
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 8902309.083328387,
+            "upper_bound": 32217234.686311748
+          },
+          "point_estimate": 27931540.658436455,
+          "standard_error": 5010271.999556226
+        }
+      },
+      "samples": {
+        "sampling_mode": "Flat",
+        "iters": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "times": [
+          328861700.0,
+          271087700.0,
+          278857900.0,
+          290592100.0,
+          337942600.0,
+          274666400.0,
+          269294600.0,
+          269291500.0,
+          328762200.0,
+          275886800.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/engraved_plate/trailing_edit",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 138563645.0,
+            "upper_bound": 152630185.25
+          },
+          "point_estimate": 144987920.0,
+          "standard_error": 3622840.177336145
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 136566000.0,
+            "upper_bound": 153889850.0
+          },
+          "point_estimate": 138988200.0,
+          "standard_error": 4540050.416760063
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 477100.6715297699,
+            "upper_bound": 19618059.371709824
+          },
+          "point_estimate": 4304173.048585653,
+          "standard_error": 4922447.990637323
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2533185.2949970756,
+            "upper_bound": 15698421.785080789
+          },
+          "point_estimate": 12089806.335095327,
+          "standard_error": 3015018.031509422
+        }
+      },
+      "samples": {
+        "sampling_mode": "Flat",
+        "iters": [
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0
+        ],
+        "times": [
+          274034500.0,
+          277812000.0,
+          272747300.0,
+          319128300.0,
+          307779700.0,
+          273132000.0,
+          271593000.0,
+          278140800.0,
+          340997900.0,
+          284392900.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/filleted_block/cached",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 19005.26322375541,
+            "upper_bound": 20629.93861161448
+          },
+          "point_estimate": 19798.383379056344,
+          "standard_error": 416.3278684400802
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 18865.3911205074,
+            "upper_bound": 20926.81544472969
+          },
+          "point_estimate": 19462.45375264271,
+          "standard_error": 499.7821589594843
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21.431875940864686,
+            "upper_bound": 2510.6497973051423
+          },
+          "point_estimate": 1206.7497890938819,
+          "standard_error": 606.837103498205
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 18806.390606344583,
+            "upper_bound": 20823.539633595094
+          },
+          "point_estimate": 19846.14782680322,
+          "standard_error": 513.8357302490137
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 727.6436516169425,
+            "upper_bound": 1746.2824913660031
+          },
+          "point_estimate": 1389.9487299551186,
+          "standard_error": 254.27309479268942
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          1892.0,
+          3784.0,
+          5676.0,
+          7568.0,
+          9460.0,
+          11352.0,
+          13244.0,
+          15136.0,
+          17028.0,
+          18920.0
+        ],
+        "times": [
+          41580200.0,
+          73628700.0,
+          110361000.0,
+          147326300.0,
+          167488300.0,
+          209235900.0,
+          265115600.0,
+          330507300.0,
+          353894300.0,
+          356933200.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/filleted_block/cold",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4650395.950954861,
+            "upper_bound": 5331722.675260417
+          },
+          "point_estimate": 4969474.690972222,
+          "standard_error": 176096.87010999105
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4514770.833333333,
+            "upper_bound": 5608232.5
+          },
+          "point_estimate": 4689789.236111111,
+          "standard_error": 292191.94263024547
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 40652.06761161494,
+            "upper_bound": 931370.8478398626
+          },
+          "point_estimate": 323113.23087817663,
+          "standard_error": 253381.66462307292
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4568128.682097298,
+            "upper_bound": 5427539.865123086
+          },
+          "point_estimate": 4986716.98051948,
+          "standard_error": 227584.72802865825
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 215627.59591160543,
+            "upper_bound": 684305.7624812031
+          },
+          "point_estimate": 584359.544911237,
+          "standard_error": 103731.16391777237
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          8.0,
+          16.0,
+          24.0,
+          32.0,
+          40.0,
+          48.0,
+          56.0,
+          64.0,
+          72.0,
+          80.0
+        ],
+        "times": [
+          46359800.0,
+          71396600.0,
+          108354500.0,
+          153919000.0,
+          198741500.0,
+          284672300.0,
+          255039400.0,
+          286810700.0,
+          329011900.0,
+          448658600.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/filleted_block/trailing_edit",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 268890.495683086,
+            "upper_bound": 322809.92466068553
+          },
+          "point_estimate": 295368.55230618815,
+          "standard_error": 13816.604899833736
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 254823.91304347827,
+            "upper_bound": 340289.653784219
+          },
+          "point_estimate": 285660.29373706004,
+          "standard_error": 25056.593941630374
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4081.4473188441766,
+            "upper_bound": 75670.07626528323
+          },
+          "point_estimate": 52617.49694024884,
+          "standard_error": 18586.87551004211
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 289017.77408637875,
+            "upper_bound": 343160.7803535107
+          },
+          "point_estimate": 319990.6022962545,
+          "standard_error": 13952.793522797307
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 28942.24736353951,
+            "upper_bound": 53508.04160807414
+          },
+          "point_estimate": 45976.27922040357,
+          "standard_error": 6277.4875559642605
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          138.0,
+          276.0,
+          414.0,
+          552.0,
+          690.0,
+          828.0,
+          966.0,
+          1104.0,
+          1242.0,
+          1380.0
+        ],
+        "times": [
+          35632100.0,
+          69744600.0,
+          98212400.0,
+          140662800.0,
+          234593000.0,
+          295514400.0,
+          276901300.0,
+          314279300.0,
+          402007900.0,
+          495202500.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/open_enclosure/cached",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 28162.831672077922,
+            "upper_bound": 29939.352803030302
+          },
+          "point_estimate": 29043.124880952382,
+          "standard_error": 455.8473624327219
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 27398.363636363636,
+            "upper_bound": 30689.21212121212
+          },
+          "point_estimate": 28980.01038961039,
+          "standard_error": 843.7915314767706
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 193.9061056483865,
+            "upper_bound": 2504.314972357704
+          },
+          "point_estimate": 2358.719643578901,
+          "standard_error": 623.9211811554037
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 29086.90173228159,
+            "upper_bound": 30545.702431443813
+          },
+          "point_estimate": 29980.374734356552,
+          "standard_error": 371.60990653186946
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 983.8569695119463,
+            "upper_bound": 1755.7183506389133
+          },
+          "point_estimate": 1518.8267012290582,
+          "standard_error": 196.24134627457377
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          1100.0,
+          2200.0,
+          3300.0,
+          4400.0,
+          5500.0,
+          6600.0,
+          7700.0,
+          8800.0,
+          9900.0,
+          11000.0
+        ],
+        "times": [
+          30857000.0,
+          59741800.0,
+          90353300.0,
+          120552800.0,
+          160528900.0,
+          202548800.0,
+          221551700.0,
+          273201500.0,
+          305029200.0,
+          329340300.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/open_enclosure/cold",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5821017.189814814,
+            "upper_bound": 6824494.424999999
+          },
+          "point_estimate": 6272707.476851853,
+          "standard_error": 259196.1680602514
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5672300.0,
+            "upper_bound": 6903465.0
+          },
+          "point_estimate": 5976545.833333334,
+          "standard_error": 311202.5594961984
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 68222.76441380313,
+            "upper_bound": 1374250.3321021793
+          },
+          "point_estimate": 463873.09988960694,
+          "standard_error": 324668.5972284938
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5865044.432153393,
+            "upper_bound": 6773458.350003126
+          },
+          "point_estimate": 6309877.575757576,
+          "standard_error": 235480.9348967252
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 282236.5443477465,
+            "upper_bound": 1165642.1163395792
+          },
+          "point_estimate": 863330.1876542801,
+          "standard_error": 227018.38978945668
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          6.0,
+          12.0,
+          18.0,
+          24.0,
+          30.0,
+          36.0,
+          42.0,
+          48.0,
+          54.0,
+          60.0
+        ],
+        "times": [
+          33809500.0,
+          73062800.0,
+          97859500.0,
+          196784500.0,
+          211801300.0,
+          211122900.0,
+          239806700.0,
+          273236100.0,
+          331423000.0,
+          414207900.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/open_enclosure/trailing_edit",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 466733.4815012368,
+            "upper_bound": 528748.4682539683
+          },
+          "point_estimate": 495575.66238919814,
+          "standard_error": 15988.406714871604
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 450468.05194805196,
+            "upper_bound": 532183.2792207792
+          },
+          "point_estimate": 487386.4357864358,
+          "standard_error": 19364.520180138155
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4930.901806398382,
+            "upper_bound": 84623.29789157552
+          },
+          "point_estimate": 49045.39392472473,
+          "standard_error": 20888.501979577333
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 455313.72897594207,
+            "upper_bound": 496555.0
+          },
+          "point_estimate": 473686.8207117558,
+          "standard_error": 10638.354645810687
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21259.294141852788,
+            "upper_bound": 67806.58740794582
+          },
+          "point_estimate": 53427.26837210951,
+          "standard_error": 11914.662482288872
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          77.0,
+          154.0,
+          231.0,
+          308.0,
+          385.0,
+          462.0,
+          539.0,
+          616.0,
+          693.0,
+          770.0
+        ],
+        "times": [
+          44080200.0,
+          92307600.0,
+          113081000.0,
+          151504100.0,
+          170112000.0,
+          207691500.0,
+          247251000.0,
+          318243700.0,
+          336274600.0,
+          346860400.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/patterned_plate/cached",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 63526.07521025288,
+            "upper_bound": 67412.20881052842
+          },
+          "point_estimate": 65287.55682568386,
+          "standard_error": 999.6355719461448
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 62521.23482304314,
+            "upper_bound": 66965.67209162147
+          },
+          "point_estimate": 64772.94454490657,
+          "standard_error": 1228.5758772170386
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 226.44848528051338,
+            "upper_bound": 5090.580886417371
+          },
+          "point_estimate": 3180.178698965496,
+          "standard_error": 1301.1210517562772
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 62909.29319236767,
+            "upper_bound": 65077.25035161744
+          },
+          "point_estimate": 63852.44404781475,
+          "standard_error": 561.3325144671032
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1447.6393000673045,
+            "upper_bound": 4576.175887230376
+          },
+          "point_estimate": 3342.619260861803,
+          "standard_error": 895.4826550939928
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          553.0,
+          1106.0,
+          1659.0,
+          2212.0,
+          2765.0,
+          3318.0,
+          3871.0,
+          4424.0,
+          4977.0,
+          5530.0
+        ],
+        "times": [
+          36379700.0,
+          80614100.0,
+          113053000.0,
+          137447500.0,
+          184265300.0,
+          214702600.0,
+          242019700.0,
+          277538100.0,
+          310939100.0,
+          358551100.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/patterned_plate/cold",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 67567485.83333334,
+            "upper_bound": 70768207.49999999
+          },
+          "point_estimate": 69217806.66666666,
+          "standard_error": 815224.3220514026
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 67514850.0,
+            "upper_bound": 70835033.33333334
+          },
+          "point_estimate": 69407950.0,
+          "standard_error": 720365.4097358851
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 286734.8349094391,
+            "upper_bound": 4777777.255177494
+          },
+          "point_estimate": 1670148.8703489304,
+          "standard_error": 1149377.9793600084
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1179499.7825506553,
+            "upper_bound": 3610927.6509909956
+          },
+          "point_estimate": 2717754.382419517,
+          "standard_error": 614323.4386829105
+        }
+      },
+      "samples": {
+        "sampling_mode": "Flat",
+        "iters": [
+          3.0,
+          3.0,
+          3.0,
+          3.0,
+          3.0,
+          3.0,
+          3.0,
+          3.0,
+          3.0,
+          3.0
+        ],
+        "times": [
+          210307800.0,
+          207984200.0,
+          211642600.0,
+          197685100.0,
+          192307200.0,
+          207404000.0,
+          221153800.0,
+          204883600.0,
+          214702400.0,
+          208463500.0
+        ]
+      }
+    },
+    {
+      "workload": "mechanical_parts_v1/patterned_plate/trailing_edit",
+      "estimates_ns": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1963863.5717261904,
+            "upper_bound": 2298079.613392857
+          },
+          "point_estimate": 2110175.7468253965,
+          "standard_error": 86801.09846286356
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1922167.857142857,
+            "upper_bound": 2223544.722222222
+          },
+          "point_estimate": 2009569.5833333335,
+          "standard_error": 75215.75472923438
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 24784.747309983006,
+            "upper_bound": 379560.41926145554
+          },
+          "point_estimate": 164321.23233271527,
+          "standard_error": 92535.09312737055
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1922311.2987012987,
+            "upper_bound": 2545977.1081035445
+          },
+          "point_estimate": 2258202.090909091,
+          "standard_error": 168405.4803891227
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 76575.93367519684,
+            "upper_bound": 404593.07820331067
+          },
+          "point_estimate": 288876.5812332444,
+          "standard_error": 89678.03909995065
+        }
+      },
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          20.0,
+          40.0,
+          60.0,
+          80.0,
+          100.0,
+          120.0,
+          140.0,
+          160.0,
+          180.0,
+          200.0
+        ],
+        "times": [
+          41119900.0,
+          79133800.0,
+          131781900.0,
+          150024400.0,
+          200736000.0,
+          241413500.0,
+          269103500.0,
+          298405600.0,
+          430397000.0,
+          559662200.0
+        ]
+      }
+    }
+  ]
+}

@@ -38,15 +38,32 @@ impl ZeroCadApp {
         id: EntityId,
         dimension: Dimension,
     ) -> bool {
-        let Some(constraint) = self.sketch_solver_model.as_mut().and_then(|model| {
-            model
-                .constraints
-                .iter_mut()
-                .find(|constraint| constraint.id() == id)
-        }) else {
+        let Some(mut candidate) = self.sketch_solver_model.clone() else {
             return false;
         };
+        let Some(constraint) = candidate.constraints.iter_mut().find(|c| c.id() == id) else {
+            return false;
+        };
+        if !dimension.value.is_finite()
+            || (matches!(
+                constraint,
+                Constraint::Distance { .. }
+                    | Constraint::Radius { .. }
+                    | Constraint::Diameter { .. }
+                    | Constraint::LineDistance { .. }
+            ) && dimension.value <= 0.0)
+        {
+            self.status_msg = "Enter a finite, positive length.".to_string();
+            return false;
+        }
         set_constraint_dimension(constraint, dimension);
+        let report = zerocad_core::sketch::solve_model(&candidate, &self.document.variable_map());
+        if report.outcome != SolveOutcome::Converged {
+            self.status_msg = "That dimension conflicts with another constraint. The previous geometry is preserved.".to_string();
+            return false;
+        }
+        zerocad_core::sketch::solve::apply_solution(&mut candidate, &report);
+        self.sketch_solver_model = Some(candidate);
         true
     }
 
@@ -127,13 +144,30 @@ impl ZeroCadApp {
         screen_position: egui::Pos2,
     ) -> Result<(), String> {
         let id = EntityId(self.sketch_next_entity_id);
-        let (constraint, initial, is_angle) =
+        let (mut constraint, mut initial, is_angle) =
             self.infer_dimension_constraint(id, sketch_position)?;
 
+        let existing = self
+            .sketch_solver_model
+            .as_ref()
+            .and_then(|model| zerocad_core::sketch::dimension::existing_driver(model, &constraint));
+        let reused = existing.is_some();
+        if let Some(driver) = existing {
+            initial = constraint_dimension(&driver).unwrap().1;
+            constraint = driver;
+        }
+        let id = constraint.id();
+
         self.push_working_sketch_undo();
-        self.sketch_next_entity_id = self.sketch_next_entity_id.saturating_add(1);
+        if !reused {
+            self.sketch_next_entity_id = self.sketch_next_entity_id.saturating_add(1);
+        }
         if let Some(model) = &mut self.sketch_solver_model {
-            model.constraints.push(constraint);
+            if let Some(current) = model.constraints.iter_mut().find(|c| c.id() == id) {
+                *current = constraint;
+            } else {
+                model.constraints.push(constraint);
+            }
         }
         self.sketch_dimension_positions.insert(id, sketch_position);
         self.sketch_selected_ids.clear();
@@ -1592,6 +1626,143 @@ pub(crate) fn constraint_label(c: &Constraint) -> String {
 mod dimension_tool_tests {
     use super::*;
     use zerocad_core::sketch::{SketchPoint, SketchSolverModel};
+
+    #[test]
+    fn promoted_dimensions_resize_without_duplicate_drivers_and_undo() {
+        for pick in 0..7 {
+            let mut app = ZeroCadApp::new();
+            app.is_sketch_mode = true;
+            app.sketch_shapes = vec![if pick == 0 {
+                SketchShape::Circle {
+                    center: (0.0, 0.0),
+                    diameter: Dimension::literal(10.0),
+                }
+            } else {
+                SketchShape::Rectangle {
+                    origin: (0.0, 0.0),
+                    sx: 1.0,
+                    sy: 1.0,
+                    w: Dimension::literal(10.0),
+                    h: Dimension::literal(6.0),
+                    from_center: false,
+                }
+            }];
+            app.ensure_active_solver_model();
+            let original = app.sketch_solver_model.clone().unwrap();
+            let entities: Vec<_> = original.entities.iter().map(|e| e.id()).collect();
+            app.select_for_dimension(
+                entities[match pick {
+                    2 => 2,
+                    3 | 4 => 1,
+                    5 => 3,
+                    _ => 0,
+                }],
+            );
+            if pick == 3 || pick == 6 {
+                app.select_for_dimension(entities[if pick == 3 { 3 } else { 2 }]);
+            }
+            app.place_inferred_dimension((15.0, 15.0), egui::pos2(400.0, 300.0))
+                .unwrap();
+            let id = app.sketch_dimension_editor.as_ref().unwrap().constraint_id;
+            assert_eq!(
+                app.sketch_solver_model.as_ref().unwrap().constraints.len(),
+                original.constraints.len()
+            );
+            assert!(app.set_live_constraint_dimension(id, Dimension::literal(20.0)));
+            app.rebuild_active_sketch_curves();
+            if pick == 0 {
+                assert!((app.sketch_curves.circles[0].radius - 10.0).abs() < 1e-4);
+            } else {
+                let xmax = app
+                    .sketch_curves
+                    .segments
+                    .iter()
+                    .map(|s| if pick < 4 { s.a.0 } else { s.a.1 })
+                    .fold(f32::NEG_INFINITY, f32::max);
+                assert!((xmax - 20.0).abs() < 1e-4, "pick {pick}: {xmax}");
+                assert_eq!(app.detected_regions.len(), 1);
+            }
+            assert!(!app.set_live_constraint_dimension(id, Dimension::literal(-1.0)));
+            app.undo_last_sketch_action();
+            assert_eq!(app.sketch_solver_model.as_ref().unwrap(), &original);
+
+            // Commit a body, reopen its source sketch, and edit through the
+            // same placement/Finish path used by the viewport.
+            app.rebuild_active_sketch_curves();
+            app.finish_active_sketch(&egui::Context::default());
+            let sketch_id = app
+                .document
+                .graph
+                .node_weights()
+                .find(|n| matches!(n.feature, FeatureType::Sketch { .. }))
+                .unwrap()
+                .id
+                .clone();
+            app.document.add_feature(FeatureNode {
+                id: "dimension_body".into(),
+                name: "Dimension body".into(),
+                feature: FeatureType::Extrude {
+                    target: None,
+                    depth: 5.0,
+                    region_indices: vec![],
+                    mode: ExtrudeMode::NewBody,
+                    depth_expr: None,
+                    draft_angle_deg: 0.0,
+                    draft_angle_expr: None,
+                },
+            });
+            app.document.add_dependency(&sketch_id, "dimension_body");
+            let volume = |document: &zerocad_core::Document| {
+                let bodies = document.evaluate_bodies(&Default::default()).unwrap();
+                assert_eq!(bodies.len(), 1);
+                bodies[0].1.mass_properties().unwrap().volume
+            };
+            let before = volume(&app.document);
+            app.edit_sketch(&sketch_id, 0.0);
+            app.select_for_dimension(
+                entities[match pick {
+                    2 => 2,
+                    3 | 4 => 1,
+                    5 => 3,
+                    _ => 0,
+                }],
+            );
+            if pick == 3 || pick == 6 {
+                app.select_for_dimension(entities[if pick == 3 { 3 } else { 2 }]);
+            }
+            app.place_inferred_dimension((15.0, 15.0), egui::pos2(400.0, 300.0))
+                .unwrap();
+            let id = app.sketch_dimension_editor.as_ref().unwrap().constraint_id;
+            assert!(app.set_live_constraint_dimension(id, Dimension::literal(20.0)));
+            app.rebuild_active_sketch_curves();
+            app.finish_active_sketch(&egui::Context::default());
+            let after = volume(&app.document);
+            assert!(
+                (after / before
+                    - if pick == 0 {
+                        4.0
+                    } else if pick < 4 {
+                        2.0
+                    } else {
+                        20.0 / 6.0
+                    })
+                .abs()
+                    < 1e-4
+            );
+            let document = app.document.clone();
+            let bytes = zerocad_core::write_document_to_vec(
+                &document,
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap();
+            let reopened = zerocad_core::read_document_from_slice(&bytes, &Default::default())
+                .unwrap()
+                .document;
+            let bodies = reopened.evaluate_bodies(&Default::default()).unwrap();
+            assert!((bodies[0].1.mass_properties().unwrap().volume - after).abs() < 1e-4);
+        }
+    }
 
     fn app_with_model(model: SketchSolverModel, selected: Vec<EntityId>) -> ZeroCadApp {
         let mut app = ZeroCadApp::new();

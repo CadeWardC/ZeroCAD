@@ -1339,7 +1339,7 @@ impl ZeroCadApp {
                                     // region detection, so the face count here
                                     // matches the viewport and the evaluator.
                                     if let Some(b) = face_boundary.as_ref() {
-                                        eff.extend_curves(b);
+                                        eff.extend_face_boundary(b);
                                     }
                                     ui.label(
                                         egui::RichText::new(format!(

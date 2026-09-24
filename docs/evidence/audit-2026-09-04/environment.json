@@ -1,0 +1,28 @@
+{
+  "base_commit": "9b1290f14f25daa188fb6e8bcd62a5664fcdd9a0",
+  "uncommitted": true,
+  "source_and_tooling_sha256": "fbd25d9a663c0301a203adfd2c0639b6bf019ac885fdc219d5d2a71ccedf7dfd",
+  "root_lockfile_sha256": "e558696363d3f225bc37f40206e56ac694d30f347992700790fda56bf5e1771b",
+  "compiler": "rustc 1.94.0 (4a4ef493e 2026-03-02)\nbinary: rustc\ncommit-hash: 4a4ef493e3a1488c6e321570238084b38948f6db\ncommit-date: 2026-03-02\nhost: x86_64-pc-windows-msvc\nrelease: 1.94.0\nLLVM version: 21.1.8",
+  "os": "Windows-10-10.0.26200-SP0",
+  "machine": {
+    "memory_bytes": 16309932032,
+    "cpu": {
+      "Name": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics     ",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 16
+    }
+  },
+  "profile": "release / Criterion bench; opt-level=3, LTO, codegen-units=1",
+  "rayon_num_threads": 2,
+  "qualification": "single local measurement; no pre-change comparison, peak-memory measurement, or controlled-machine qualification",
+  "verification": {
+    "application_tests": 926,
+    "kernel_tests": 575,
+    "ignored_tests": 0,
+    "warning_gate_tests": 3,
+    "fuzz_targets_compiled": 2,
+    "independent_boolean_cases": 4,
+    "independent_step_files": 6
+  }
+}

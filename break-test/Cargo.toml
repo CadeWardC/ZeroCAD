@@ -1,0 +1,15 @@
+[package]
+name = "break-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Adversarial part-builder stress tests: real-world parts plus degenerate/niche inputs that must fail gracefully, never panic."
+
+[dependencies]
+zerocad-core = { path = "../zerocad-core" }
+
+[dev-dependencies]
+openrcad = { workspace = true }
+blake3 = { workspace = true }
+tempfile = "3"
+epaint_default_fonts = { workspace = true }

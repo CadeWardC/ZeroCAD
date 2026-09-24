@@ -349,6 +349,15 @@ impl ZeroCadApp {
             if let evaluation_worker::EvaluationPurpose::EdgeModPreview(key) = completion.purpose {
                 if self.edge_mod_arc_inflight == Some(key) {
                     self.edge_mod_arc_inflight = None;
+                    // Completion is polled before scheduling this frame. A
+                    // mode/size change must not display the old operation's error.
+                    if !self
+                        .edge_mod_op
+                        .as_ref()
+                        .is_some_and(|op| Self::edge_mod_arc_key(op, &self.hidden_nodes) == key)
+                    {
+                        continue;
+                    }
                     match completion.result {
                         Ok(output) if !output.has_diagnostic_warnings() => {
                             let warnings = output.rendered_warnings();
@@ -367,16 +376,21 @@ impl ZeroCadApp {
                                 })
                                 .map(|diagnostic| diagnostic.rendered_message().to_string())
                                 .unwrap_or_else(|| "the blend could not be computed".into());
-                            self.status_msg = format!(
-                                "This size does not work here: {msg} Try another size or cancel."
-                            );
+                            let missing_selection = output.diagnostics.iter().any(|diagnostic| {
+                                diagnostic.code == zerocad_core::DiagnosticCode::reference_missing()
+                                    || diagnostic.code
+                                        == zerocad_core::DiagnosticCode::reference_ambiguous()
+                            });
+                            self.status_msg = if missing_selection {
+                                format!("The selected geometry could not be resolved: {msg} Cancel and select the edge again.")
+                            } else {
+                                format!("The blend could not be previewed: {msg}")
+                            };
                             self.edge_mod_arc_failed = Some(key);
                         }
                         Err(err) => {
                             self.edge_mod_arc_cache = None;
-                            self.status_msg = format!(
-                                "This size does not work here: {err} Try another size or cancel."
-                            );
+                            self.status_msg = format!("The blend could not be previewed: {err}");
                             self.edge_mod_arc_failed = Some(key);
                         }
                     }

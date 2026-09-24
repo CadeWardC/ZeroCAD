@@ -1,0 +1,136 @@
+Gnuplot not found, using plotters backend
+Benchmarking mechanical_parts_v1/patterned_plate/cold
+Benchmarking mechanical_parts_v1/patterned_plate/cold: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 3.9s or enable flat sampling.
+Benchmarking mechanical_parts_v1/patterned_plate/cold: Collecting 10 samples in estimated 3.9413 s (55 iterations)
+Benchmarking mechanical_parts_v1/patterned_plate/cold: Analyzing
+mechanical_parts_v1/patterned_plate/cold
+                        time:   [64.569 ms 65.309 ms 66.502 ms]
+                        change: [-7.4853% -4.7605% -1.4578%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/patterned_plate/cached
+Benchmarking mechanical_parts_v1/patterned_plate/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/patterned_plate/cached: Collecting 10 samples in estimated 2.0012 s (30k iterations)
+Benchmarking mechanical_parts_v1/patterned_plate/cached: Analyzing
+mechanical_parts_v1/patterned_plate/cached
+                        time:   [64.502 µs 66.045 µs 67.180 µs]
+                        change: [-2.8398% +0.6917% +4.0332%] (p = 0.73 > 0.05)
+                        No change in performance detected.
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit: Collecting 10 samples in estimated 2.0167 s (2365 iterations)
+Benchmarking mechanical_parts_v1/patterned_plate/trailing_edit: Analyzing
+mechanical_parts_v1/patterned_plate/trailing_edit
+                        time:   [779.73 µs 793.22 µs 813.85 µs]
+                        change: [-65.404% -62.292% -59.286%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/open_enclosure/cold
+Benchmarking mechanical_parts_v1/open_enclosure/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/open_enclosure/cold: Collecting 10 samples in estimated 2.1635 s (495 iterations)
+Benchmarking mechanical_parts_v1/open_enclosure/cold: Analyzing
+mechanical_parts_v1/open_enclosure/cold
+                        time:   [4.2741 ms 4.3561 ms 4.4444 ms]
+                        change: [-36.716% -31.169% -25.612%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/open_enclosure/cached
+Benchmarking mechanical_parts_v1/open_enclosure/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/open_enclosure/cached: Collecting 10 samples in estimated 2.0002 s (92k iterations)
+Benchmarking mechanical_parts_v1/open_enclosure/cached: Analyzing
+mechanical_parts_v1/open_enclosure/cached
+                        time:   [22.139 µs 22.620 µs 23.355 µs]
+                        change: [-24.976% -21.989% -18.842%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit: Collecting 10 samples in estimated 2.0104 s (9515 iterations)
+Benchmarking mechanical_parts_v1/open_enclosure/trailing_edit: Analyzing
+mechanical_parts_v1/open_enclosure/trailing_edit
+                        time:   [205.59 µs 207.06 µs 208.90 µs]
+                        change: [-60.872% -58.203% -55.616%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/filleted_block/cold
+Benchmarking mechanical_parts_v1/filleted_block/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/filleted_block/cold: Collecting 10 samples in estimated 2.0178 s (550 iterations)
+Benchmarking mechanical_parts_v1/filleted_block/cold: Analyzing
+mechanical_parts_v1/filleted_block/cold
+                        time:   [3.5030 ms 3.5662 ms 3.6420 ms]
+                        change: [-32.125% -26.932% -21.321%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/filleted_block/cached
+Benchmarking mechanical_parts_v1/filleted_block/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/filleted_block/cached: Collecting 10 samples in estimated 2.0003 s (145k iterations)
+Benchmarking mechanical_parts_v1/filleted_block/cached: Analyzing
+mechanical_parts_v1/filleted_block/cached
+                        time:   [13.521 µs 13.599 µs 13.699 µs]
+                        change: [-33.853% -31.043% -28.133%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit: Collecting 10 samples in estimated 2.0033 s (16k iterations)
+Benchmarking mechanical_parts_v1/filleted_block/trailing_edit: Analyzing
+mechanical_parts_v1/filleted_block/trailing_edit
+                        time:   [124.39 µs 124.96 µs 125.76 µs]
+                        change: [-61.055% -57.452% -53.202%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/engraved_plate/cold
+Benchmarking mechanical_parts_v1/engraved_plate/cold: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 2.4s.
+Benchmarking mechanical_parts_v1/engraved_plate/cold: Collecting 10 samples in estimated 2.3710 s (10 iterations)
+Benchmarking mechanical_parts_v1/engraved_plate/cold: Analyzing
+mechanical_parts_v1/engraved_plate/cold
+                        time:   [237.22 ms 244.47 ms 251.18 ms]
+                        change: [-21.456% -16.428% -11.125%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/engraved_plate/cached
+Benchmarking mechanical_parts_v1/engraved_plate/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/engraved_plate/cached: Collecting 10 samples in estimated 2.1793 s (495 iterations)
+Benchmarking mechanical_parts_v1/engraved_plate/cached: Analyzing
+mechanical_parts_v1/engraved_plate/cached
+                        time:   [4.0633 ms 4.1743 ms 4.3718 ms]
+                        change: [-19.677% -14.632% -9.2089%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit: Collecting 10 samples in estimated 2.4429 s (165 iterations)
+Benchmarking mechanical_parts_v1/engraved_plate/trailing_edit: Analyzing
+mechanical_parts_v1/engraved_plate/trailing_edit
+                        time:   [14.571 ms 14.983 ms 15.335 ms]
+                        change: [-90.349% -89.819% -89.298%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking mechanical_parts_v1/curved_step_import/cold
+Benchmarking mechanical_parts_v1/curved_step_import/cold: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/curved_step_import/cold: Collecting 10 samples in estimated 2.0759 s (275 iterations)
+Benchmarking mechanical_parts_v1/curved_step_import/cold: Analyzing
+mechanical_parts_v1/curved_step_import/cold
+                        time:   [6.8649 ms 7.0968 ms 7.2747 ms]
+                        change: [-18.350% -14.608% -11.085%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/curved_step_import/cached
+Benchmarking mechanical_parts_v1/curved_step_import/cached: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/curved_step_import/cached: Collecting 10 samples in estimated 2.0004 s (139k iterations)
+Benchmarking mechanical_parts_v1/curved_step_import/cached: Analyzing
+mechanical_parts_v1/curved_step_import/cached
+                        time:   [14.022 µs 14.219 µs 14.373 µs]
+                        change: [-32.527% -29.248% -25.736%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit: Warming up for 1.0000 s
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit: Collecting 10 samples in estimated 2.0034 s (19k iterations)
+Benchmarking mechanical_parts_v1/curved_step_import/trailing_edit: Analyzing
+mechanical_parts_v1/curved_step_import/trailing_edit
+                        time:   [103.39 µs 104.07 µs 105.32 µs]
+                        change: [-56.113% -52.901% -49.596%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild

@@ -15,6 +15,7 @@ pub mod mock_kernel;
 pub mod parametric;
 pub mod release;
 pub mod sketch;
+pub mod step_export;
 pub mod stl;
 pub mod text;
 pub mod units;

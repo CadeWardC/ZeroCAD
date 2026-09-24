@@ -31,4 +31,16 @@ fuzz_target!(|data: &[u8]| {
     let replay = case.replay().expect("bounded overlap case is valid");
     assert_eq!(replay.outcome, BooleanReplayOutcome::Resolved);
     assert_eq!(replay.body_count, 1);
+    let size = side * 10_f64.powi(i32::from(case.logarithmic_scale));
+    let length = size * (2.0 - overlap);
+    let expected = zerocad_core::boolean_case::v2::GeometryObservation {
+        body_count: 1,
+        volume: length * size * size,
+        surface_area: 2.0 * (2.0 * length * size + size * size),
+        centroid: [length / 2.0, size / 2.0, size / 2.0],
+    };
+    case.observe()
+        .expect("supported union has measurable geometry")
+        .compare(&expected, 1e-5, 1e-8)
+        .expect("union matches analytic rectangular envelope");
 });

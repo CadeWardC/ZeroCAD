@@ -1,6 +1,8 @@
 //! End-to-end Wave 5C acceptance through the persisted parametric document.
 
 use std::collections::HashSet;
+#[path = "support/document_fixture.rs"]
+mod document_fixture;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -182,8 +184,9 @@ fn overflow_fillet_survives_real_disk_reload_with_durable_topology() {
         std::fs::read(&fixture_path).expect("the promoted fillet-overflow fixture must be present");
     let temporary_bytes = std::fs::read(&path).expect("read temporary overflow lifecycle file");
     assert_eq!(
-        fixture_bytes, temporary_bytes,
-        "the public-operation recipe must reproduce the overflow fixture byte-for-byte"
+        document_fixture::canonical_fixture_bytes(&fixture_path),
+        temporary_bytes,
+        "the public-operation recipe must reproduce the fixture through the current writer"
     );
     let manifest: serde_json::Value =
         serde_json::from_str(include_str!("modeling_fixtures/manifest.json"))

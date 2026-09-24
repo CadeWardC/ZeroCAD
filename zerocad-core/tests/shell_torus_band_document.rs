@@ -1,6 +1,8 @@
 //! End-to-end Wave 4C acceptance through the persisted parametric document.
 
 use std::collections::HashSet;
+#[path = "support/document_fixture.rs"]
+mod document_fixture;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -126,6 +128,7 @@ fn add_shell_and_downstream_datum(graph: &mut ParametricGraph) {
         .iter()
         .find(|face| {
             face.normal[2].abs() < 0.1
+                && face.normal.iter().map(|n| n * n).sum::<f32>() > 0.9
                 && face
                     .topology
                     .as_ref()
@@ -187,6 +190,19 @@ fn fillet_shell_multiple_openings_survive_real_disk_reload_and_reattach() {
         .join("modeling_fixtures");
     let fixture_path = fixture_directory.join("shell-on-fillet-band.zcad");
     if std::env::var_os("ZEROCAD_UPDATE_MODELING_FIXTURES").is_some() {
+        if fixture_path.exists() {
+            let previous = read_document_file(&fixture_path, &LoadOptions::default())
+                .expect("previous fixture must remain readable")
+                .document;
+            let (_, warnings) = previous
+                .evaluator_graph()
+                .evaluate_bodies_with_warnings(&HashSet::new())
+                .expect("previous recipe must rebuild");
+            assert!(
+                warnings.is_empty(),
+                "previous fixture must still resolve: {warnings:?}"
+            );
+        }
         std::fs::create_dir_all(&fixture_directory).expect("create fixture directory");
         write_document_file(
             &fixture_path,
@@ -202,8 +218,9 @@ fn fillet_shell_multiple_openings_survive_real_disk_reload_and_reattach() {
         .expect("the promoted torus-band Shell fixture must be present");
     let temporary_bytes = std::fs::read(&path).expect("read temporary lifecycle file");
     assert_eq!(
-        fixture_bytes, temporary_bytes,
-        "the public-operation recipe must reproduce the promoted fixture byte-for-byte"
+        document_fixture::canonical_fixture_bytes(&fixture_path),
+        temporary_bytes,
+        "the public-operation recipe must reproduce the fixture through the current writer"
     );
     let manifest: serde_json::Value =
         serde_json::from_str(include_str!("modeling_fixtures/manifest.json"))

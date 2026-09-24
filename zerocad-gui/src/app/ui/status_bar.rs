@@ -296,7 +296,7 @@ impl ZeroCadApp {
                 &variables,
             );
             if let Some(boundary) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
-                region_curves.extend_curves(boundary);
+                region_curves.extend_face_boundary(boundary);
             }
             let regions = self.cached_finished_regions(
                 node.id.as_str(),

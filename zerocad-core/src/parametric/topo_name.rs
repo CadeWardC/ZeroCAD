@@ -26,6 +26,8 @@
 /// verbatim so `Display` is total and lossless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopoName {
+    /// Proven branch of an intersection between two named support faces.
+    PairSide { pair: String, positive: bool },
     /// `sketch:{body}:region:{i}:face:{role}[:occ:{n}]`
     SketchFace {
         body: String,
@@ -140,6 +142,11 @@ impl TopoName {
 impl std::fmt::Display for TopoName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TopoName::PairSide { pair, positive } => write!(
+                f,
+                "edge-pair:{pair}:side:{}",
+                if *positive { "+" } else { "-" }
+            ),
             TopoName::SketchFace {
                 body,
                 region,
@@ -214,6 +221,24 @@ impl std::fmt::Display for TopoName {
 }
 
 fn parse_name(s: &str) -> Option<TopoName> {
+    if let Some(rest) = s.strip_prefix("edge-pair:") {
+        let (pair, side) = rest.split_once(":side:")?;
+        if pair.len() != 64
+            || !pair
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        return Some(TopoName::PairSide {
+            pair: pair.into(),
+            positive: match side {
+                "+" => true,
+                "-" => false,
+                _ => return None,
+            },
+        });
+    }
     // Trailing `:occ:{n}` applies to the sketch face/edge forms.
     fn split_occ(s: &str) -> (&str, Option<usize>) {
         if let Some(idx) = s.rfind(":occ:") {

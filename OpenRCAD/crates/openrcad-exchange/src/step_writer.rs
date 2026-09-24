@@ -708,6 +708,256 @@ fn f(val: f64) -> String {
 
 /// Write `solid` to `path` as a STEP file (AP242 B-Rep).
 pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
+    // Validate and serialize before opening an existing destination.
+    let mut bytes = Vec::new();
+    write_step_bodies(&[("Body", solid)], &mut bytes)?;
+    File::create(path)?.write_all(&bytes)
+}
+
+/// Write named, independent B-Rep bodies with explicit millimetre units.
+/// All geometry is validated before any output is written. Assembly placements
+/// must already be applied by the caller; this is part/multi-body interchange.
+pub fn write_step_bodies(bodies: &[(&str, &Solid)], file: &mut impl Write) -> io::Result<()> {
+    let definitions: Vec<_> = bodies
+        .iter()
+        .map(|(name, solid)| (*name, vec![*solid]))
+        .collect();
+    write_step_model(&definitions, None, file)
+}
+
+/// A placed use of a definition. Placement maps local coordinates to the root.
+pub struct StepOccurrence<'a> {
+    pub name: &'a str,
+    pub definition: usize,
+    pub placement: Ax3,
+}
+
+/// Export one assembly level, sharing each definition's exact local B-Rep.
+pub fn write_step_assembly(
+    definitions: &[(&str, Vec<&Solid>)],
+    occurrences: &[StepOccurrence<'_>],
+    file: &mut impl Write,
+) -> io::Result<()> {
+    if occurrences.is_empty()
+        || occurrences
+            .iter()
+            .any(|o| o.definition >= definitions.len())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid STEP assembly occurrences",
+        ));
+    }
+    write_step_model(definitions, Some(occurrences), file)
+}
+
+fn write_step_model(
+    bodies: &[(&str, Vec<&Solid>)],
+    occurrences: Option<&[StepOccurrence<'_>]>,
+    file: &mut impl Write,
+) -> io::Result<()> {
+    if bodies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No STEP bodies",
+        ));
+    }
+    let mut writer = StepWriter::new();
+    let app = writer.alloc_id();
+    writer.write_line(
+        app,
+        "APPLICATION_CONTEXT('managed model based 3d engineering')".into(),
+    );
+    let protocol = writer.alloc_id();
+    writer.write_line(protocol, format!("APPLICATION_PROTOCOL_DEFINITION('international standard','ap242_managed_model_based_3d_engineering',2014,#{app})"));
+    let length = writer.alloc_id();
+    writer.write_line(
+        length,
+        "(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.))".into(),
+    );
+    let angle = writer.alloc_id();
+    writer.write_line(
+        angle,
+        "(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.))".into(),
+    );
+    let solid_angle = writer.alloc_id();
+    writer.write_line(
+        solid_angle,
+        "(NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT())".into(),
+    );
+    let uncertainty = writer.alloc_id();
+    writer.write_line(uncertainty, format!("UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-7),#{length},'distance_accuracy_value','')"));
+    let context = writer.alloc_id();
+    writer.write_line(context, format!("(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{uncertainty})) GLOBAL_UNIT_ASSIGNED_CONTEXT((#{length},#{angle},#{solid_angle})) REPRESENTATION_CONTEXT('',''))"));
+    let mut products = Vec::new();
+    for (name, solids) in bodies {
+        if solids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Empty STEP definition",
+            ));
+        }
+        let mut shapes = Vec::new();
+        for solid in solids {
+            shapes.push(append_solid(&mut writer, solid, name)?);
+        }
+        let shape = shapes
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let name = step_string(name);
+        let product_context = writer.alloc_id();
+        writer.write_line(
+            product_context,
+            format!("PRODUCT_CONTEXT('',#{app},'mechanical')"),
+        );
+        let product = writer.alloc_id();
+        writer.write_line(
+            product,
+            format!("PRODUCT({name},{name},'',(#{product_context}))"),
+        );
+        let formation = writer.alloc_id();
+        writer.write_line(
+            formation,
+            format!("PRODUCT_DEFINITION_FORMATION('','',#{product})"),
+        );
+        let definition_context = writer.alloc_id();
+        writer.write_line(
+            definition_context,
+            format!("PRODUCT_DEFINITION_CONTEXT('part definition',#{app},'design')"),
+        );
+        let definition = writer.alloc_id();
+        writer.write_line(
+            definition,
+            format!("PRODUCT_DEFINITION('design','',#{formation},#{definition_context})"),
+        );
+        let definition_shape = writer.alloc_id();
+        writer.write_line(
+            definition_shape,
+            format!("PRODUCT_DEFINITION_SHAPE('','',#{definition})"),
+        );
+        let representation = writer.alloc_id();
+        writer.write_line(
+            representation,
+            format!("ADVANCED_BREP_SHAPE_REPRESENTATION({name},({shape}),#{context})"),
+        );
+        let relationship = writer.alloc_id();
+        writer.write_line(
+            relationship,
+            format!("SHAPE_DEFINITION_REPRESENTATION(#{definition_shape},#{representation})"),
+        );
+        products.push((definition, representation));
+    }
+    if let Some(occurrences) = occurrences {
+        let pc = writer.alloc_id();
+        writer.write_line(pc, format!("PRODUCT_CONTEXT('',#{app},'mechanical')"));
+        let product = writer.alloc_id();
+        writer.write_line(
+            product,
+            format!("PRODUCT('Assembly','Assembly','',(#{pc}))"),
+        );
+        let formation = writer.alloc_id();
+        writer.write_line(
+            formation,
+            format!("PRODUCT_DEFINITION_FORMATION('','',#{product})"),
+        );
+        let dc = writer.alloc_id();
+        writer.write_line(
+            dc,
+            format!("PRODUCT_DEFINITION_CONTEXT('part definition',#{app},'design')"),
+        );
+        let root = writer.alloc_id();
+        writer.write_line(
+            root,
+            format!("PRODUCT_DEFINITION('design','',#{formation},#{dc})"),
+        );
+        let pds = writer.alloc_id();
+        writer.write_line(pds, format!("PRODUCT_DEFINITION_SHAPE('','',#{root})"));
+        let origin = writer.write_axis2_placement_3d(&Ax3::new_axes(
+            Pnt::new(0.0, 0.0, 0.0),
+            Dir::new(0.0, 0.0, 1.0),
+            Dir::new(1.0, 0.0, 0.0),
+        ));
+        let representation = writer.alloc_id();
+        writer.write_line(
+            representation,
+            format!("SHAPE_REPRESENTATION('Assembly',(#{origin}),#{context})"),
+        );
+        let sdr = writer.alloc_id();
+        writer.write_line(
+            sdr,
+            format!("SHAPE_DEFINITION_REPRESENTATION(#{pds},#{representation})"),
+        );
+        for (index, occurrence) in occurrences.iter().enumerate() {
+            let (child, child_representation) = products[occurrence.definition];
+            let name = step_string(occurrence.name);
+            let usage = writer.alloc_id();
+            writer.write_line(
+                usage,
+                format!(
+                    "NEXT_ASSEMBLY_USAGE_OCCURRENCE('{}',{name},'',#{root},#{child},$)",
+                    index + 1
+                ),
+            );
+            let usage_shape = writer.alloc_id();
+            writer.write_line(
+                usage_shape,
+                format!("PRODUCT_DEFINITION_SHAPE('','',#{usage})"),
+            );
+            let placed = writer.write_axis2_placement_3d(&occurrence.placement);
+            let transformation = writer.alloc_id();
+            writer.write_line(
+                transformation,
+                format!("ITEM_DEFINED_TRANSFORMATION('','',#{origin},#{placed})"),
+            );
+            let relationship = writer.alloc_id();
+            writer.write_line(relationship, format!("(REPRESENTATION_RELATIONSHIP('','',#{child_representation},#{representation}) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{transformation}) SHAPE_REPRESENTATION_RELATIONSHIP())"));
+            let cdsr = writer.alloc_id();
+            writer.write_line(
+                cdsr,
+                format!("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#{relationship},#{usage_shape})"),
+            );
+        }
+    }
+    writeln!(file, "ISO-10303-21;\nHEADER;")?;
+    writeln!(file, "FILE_DESCRIPTION(('OpenRCAD'),'2;1');")?;
+    writeln!(
+        file,
+        "FILE_NAME('OpenRCAD.step','',('OpenRCAD'),(''),'OpenRCAD','OpenRCAD','');"
+    )?;
+    writeln!(
+        file,
+        "FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF'));\nENDSEC;\nDATA;"
+    )?;
+    for line in &writer.lines {
+        writeln!(file, "{line}")?;
+    }
+    writeln!(file, "ENDSEC;\nEND-ISO-10303-21;")
+}
+
+fn step_string(text: &str) -> String {
+    let mut out = String::from("'");
+    for c in text.chars() {
+        match c {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => {
+                out.push_str("\\X2\\");
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("{unit:04X}"));
+                }
+                out.push_str("\\X0\\");
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn append_solid(writer: &mut StepWriter, solid: &Solid, name: &str) -> io::Result<u32> {
+    reject_nested_planar_holes(solid)?;
     solid
         .validate_strict_with_policy(&TolerancePolicy::STANDARD)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
@@ -718,9 +968,20 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
             format!("STEP output requires a healthy watertight solid: {health:?}"),
         ));
     }
-    let mut writer = StepWriter::new();
     let brep = solid.brep();
     let solid_data = &brep.solids[solid.id()];
+    if solid_data.shells.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "STEP solid has no shell",
+        ));
+    }
+    let void_faces: HashSet<_> = solid_data
+        .shells
+        .iter()
+        .skip(1)
+        .flat_map(|shell| brep.shells[*shell].faces.iter().copied())
+        .collect();
 
     // Traverse only this solid's reachable topology. B-Rep arenas may retain
     // construction intermediates, which are not part of the exported shape.
@@ -983,6 +1244,8 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     for f_id in face_ids {
         let f_data = &brep.faces[f_id];
         let surface_id = surface_map[&f_id];
+        let void = void_faces.contains(&f_id);
+        let bound_sense = if void { ".F." } else { ".T." };
 
         let mut bound_ids = Vec::new();
         if let Some(outer_l) = f_data.outer_wire {
@@ -990,18 +1253,21 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
             let fob_id = writer.alloc_id();
             writer.write_line(
                 fob_id,
-                format!("FACE_OUTER_BOUND('', #{}, .T.)", loop_step_id),
+                format!("FACE_OUTER_BOUND('', #{}, {bound_sense})", loop_step_id),
             );
             bound_ids.push(fob_id);
         }
         for &inner_l in &f_data.inner_wires {
             let loop_step_id = loop_map[&inner_l];
             let fb_id = writer.alloc_id();
-            writer.write_line(fb_id, format!("FACE_BOUND('', #{}, .T.)", loop_step_id));
+            writer.write_line(
+                fb_id,
+                format!("FACE_BOUND('', #{}, {bound_sense})", loop_step_id),
+            );
             bound_ids.push(fb_id);
         }
 
-        let same_sense = if f_data.orientation.is_forward() {
+        let same_sense = if f_data.orientation.is_forward() ^ void {
             ".T."
         } else {
             ".F."
@@ -1039,32 +1305,98 @@ pub fn write_step(solid: &Solid, path: &str) -> io::Result<()> {
     // 7. Write solids
     let shell_step_id = shell_map[&solid_data.shells[0]];
     let solid_step_id = writer.alloc_id();
-    writer.write_line(
-        solid_step_id,
-        format!("MANIFOLD_SOLID_BREP('', #{})", shell_step_id),
-    );
-
-    // Save output
-    let mut file = File::create(path)?;
-    writeln!(file, "ISO-10303-21;")?;
-    writeln!(file, "HEADER;")?;
-    writeln!(file, "FILE_DESCRIPTION(('OpenRCAD'),'2;1');")?;
-    writeln!(
-        file,
-        "FILE_NAME('OpenRCAD.step','2026-06-19T00:00:00',('OpenRCAD'),(''),'OpenRCAD','OpenRCAD','');"
-    )?;
-    writeln!(
-        file,
-        "FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF'));"
-    )?;
-    writeln!(file, "ENDSEC;")?;
-    writeln!(file, "DATA;")?;
-    for line in &writer.lines {
-        writeln!(file, "{}", line)?;
+    if solid_data.shells.len() == 1 {
+        writer.write_line(
+            solid_step_id,
+            format!(
+                "MANIFOLD_SOLID_BREP({}, #{shell_step_id})",
+                step_string(name)
+            ),
+        );
+    } else {
+        let mut voids = Vec::new();
+        for shell in solid_data.shells.iter().skip(1) {
+            let id = writer.alloc_id();
+            // STEP ABSR voids use an outward CLOSED_SHELL with reversed use.
+            writer.write_line(
+                id,
+                format!("ORIENTED_CLOSED_SHELL('', *, #{}, .F.)", shell_map[shell]),
+            );
+            voids.push(format!("#{id}"));
+        }
+        writer.write_line(
+            solid_step_id,
+            format!(
+                "BREP_WITH_VOIDS({}, #{shell_step_id}, ({}))",
+                step_string(name),
+                voids.join(",")
+            ),
+        );
     }
-    writeln!(file, "ENDSEC;")?;
-    writeln!(file, "END-ISO-10303-21;")?;
 
+    Ok(solid_step_id)
+}
+
+// A hole contained in another hole is not a valid single face. In particular,
+// overlapping text contours can reach this representation despite passing the
+// current native manifold checks. Do not publish an invalid STEP face or try
+// to infer missing material in the exchange layer. This sampled rejection
+// guard is not a proof of completeness for arbitrary curved arrangements.
+fn reject_nested_planar_holes(solid: &Solid) -> io::Result<()> {
+    for face in solid.shell().faces() {
+        let Some(GeomSurface::Plane(plane)) = face.surface() else {
+            continue;
+        };
+        let holes = face.inner_wires();
+        if holes.len() < 2 {
+            continue;
+        }
+        let frame = plane.position();
+        let x = openrcad_foundation::Vec::from_dir(frame.x_direction());
+        let y = openrcad_foundation::Vec::from_dir(frame.y_direction());
+        let polygons: Vec<Vec<_>> = holes
+            .iter()
+            .map(|wire| {
+                let mut polygon = Vec::new();
+                for edge in wire.edges() {
+                    let mut points = if let Some(curve) = edge.curve() {
+                        openrcad_mesh::triangulate::discretize_edge_curve(
+                            curve,
+                            edge.first(),
+                            edge.last(),
+                            1e-5,
+                        )
+                        .into_iter()
+                        .map(|t| curve.point(t))
+                        .collect::<Vec<_>>()
+                    } else {
+                        vec![edge.start().point(), edge.end().point()]
+                    };
+                    if !edge.orientation().is_forward() {
+                        points.reverse();
+                    }
+                    points.pop(); // The next edge supplies the shared endpoint.
+                    polygon.extend(points.into_iter().map(|point| {
+                        let d = point - frame.location();
+                        (d.dot(&x), d.dot(&y))
+                    }));
+                }
+                polygon
+            })
+            .collect();
+        for (i, polygon) in polygons.iter().enumerate() {
+            for (j, other) in polygons.iter().enumerate() {
+                if i != j
+                    && polygon.first().is_some_and(|point| {
+                        openrcad_topo::containment::point_in_polygon_2d(*point, other)
+                    })
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "STEP export rejected nested planar holes; repair the source face arrangement (for text, use non-overlapping contours)"));
+                }
+            }
+        }
+    }
     Ok(())
 }
 

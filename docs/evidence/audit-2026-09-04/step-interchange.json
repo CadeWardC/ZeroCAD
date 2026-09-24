@@ -1,0 +1,81 @@
+{
+  "occt_version": "7.8.1.1",
+  "tolerances": {
+    "volume_relative": 0.01,
+    "volume_absolute_mm3": 1e-06
+  },
+  "exports": [
+    {
+      "file": "curved_step_import.step",
+      "sha256": "34c57ad8944644a7a76c128807266bdb49a882d43424b8d337e7981f11cd0375",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "volume_mm3": 13571.680263507906,
+      "expected": {
+        "body_count": 1,
+        "volume": 13532.955305925723
+      }
+    },
+    {
+      "file": "engraved_plate.step",
+      "sha256": "d1f8bdfcee15dbe955bf26fe3d708b85075089702eec9c98edfc0079257957ce",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "volume_mm3": 19166.943410962045,
+      "expected": {
+        "body_count": 1,
+        "volume": 19166.99465708023
+      }
+    },
+    {
+      "file": "filleted_block.step",
+      "sha256": "eec07f0ecfbf19eb232a87c14b2bbe36151461aaa16dd3e87379e1b5a627b0bf",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "volume_mm3": 47971.02875205871,
+      "expected": {
+        "body_count": 1,
+        "volume": 47969.390467874604
+      }
+    },
+    {
+      "file": "multi.step",
+      "sha256": "ad68550c429e352ab90d7f9fa1092ddbb175611e65239b1260e774403d5c5976",
+      "passed": true,
+      "valid": true,
+      "body_count": 2,
+      "volume_mm3": 504.0,
+      "expected": {
+        "volume": 504.0,
+        "body_count": 2
+      }
+    },
+    {
+      "file": "open_enclosure.step",
+      "sha256": "0d8d220cbf7dc405dfb2ea6cd2a09d012c2a181b00f00a87f0619569f5eed799",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "volume_mm3": 11712.000000000131,
+      "expected": {
+        "body_count": 1,
+        "volume": 11711.999999999953
+      }
+    },
+    {
+      "file": "patterned_plate.step",
+      "sha256": "0bb58754c76245f20e44652be37b9116c9faf25d19601433d4c358598ee49a7a",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "volume_mm3": 18257.522203923065,
+      "expected": {
+        "body_count": 1,
+        "volume": 18268.65440038465
+      }
+    }
+  ]
+}

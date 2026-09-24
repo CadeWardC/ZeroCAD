@@ -21,6 +21,100 @@ fn no_hidden() -> HashSet<String> {
     HashSet::new()
 }
 
+#[test]
+fn saved_bracket_circular_selections_resolve() {
+    let mut graph = crate::read_document_from_slice(
+        include_bytes!("../../../tests/fixtures/bracket-face-cut.zcad"),
+        &Default::default(),
+    )
+    .unwrap()
+    .document
+    .into_evaluator_graph();
+    // The frozen save predates the corrected circular-region selection.
+    for node in graph.graph.node_weights_mut() {
+        if node.id == "extrude_8" {
+            if let FeatureType::Extrude { region_indices, .. } = &mut node.feature {
+                *region_indices = vec![1];
+            }
+        }
+    }
+    graph.commit_feature_edit("extrude_8").unwrap();
+    let (meshes, warnings) = graph.evaluate_bodies_with_warnings(&no_hidden()).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let (live, _) = graph.build_live(&no_hidden(), false).unwrap();
+    let mut circles = 0;
+    for (id, mesh) in meshes {
+        let body = live.iter().find(|body| body.id == id).unwrap();
+        for selected in &mesh.edge_refs {
+            if !matches!(
+                selected.curve,
+                Some(EdgeCurveHint::Circle { closed: true, .. })
+            ) {
+                continue;
+            }
+            circles += 1;
+            let edge = edge_ref_from_mesh_edge(&id, selected);
+            assert!(
+                resolve_edge_ref_by_topology(body, &edge).is_some(),
+                "{edge:?}"
+            );
+            let mut renumbered = edge.clone();
+            let topology = renumbered.topology.as_mut().unwrap();
+            topology.edge_id = Some("mesh:4294967295".into());
+            topology.adjacent_face_ids.clear();
+            assert!(resolve_edge_ref_by_topology(body, &renumbered).is_some());
+            let mut deleted = renumbered.clone();
+            deleted.topology.as_mut().unwrap().edge_id =
+                Some("sketch:deleted:region:0:fragment:shape:99:circle:role:top".into());
+            assert!(resolve_edge_ref_by_topology(body, &deleted).is_none());
+            // Boolean/display edge names may be transient and their closed
+            // curve seam may move. Geometry must identify the complete circle.
+            let mut candidate = selected.clone();
+            candidate.topology = None;
+            candidate.p1 = candidate.p0;
+            let mut captured = edge.clone();
+            captured.topology = None;
+            captured.p0 = selected.p1;
+            captured.p1 = captured.p0;
+            assert!(mesh_candidate_matches_captured_edge(&candidate, &captured));
+            if let Some(EdgeCurveHint::Circle { radius, .. }) = &mut captured.curve {
+                *radius *= 1.1;
+            }
+            assert!(!mesh_candidate_matches_captured_edge(&candidate, &captured));
+            let mut captured = edge.clone();
+            captured.topology = None;
+            if let Some(EdgeCurveHint::Circle { closed, .. }) = &mut captured.curve {
+                *closed = false;
+            }
+            assert!(!mesh_candidate_matches_captured_edge(&candidate, &captured));
+            for kind in [
+                crate::sketch::CornerKind::Fillet,
+                crate::sketch::CornerKind::Chamfer,
+            ] {
+                let mut blended = live.clone();
+                let mut warnings = Vec::new();
+                apply_edge_blend(
+                    "blend",
+                    &id,
+                    std::slice::from_ref(&renumbered),
+                    0.2,
+                    kind,
+                    EdgeCornerMode::Auto,
+                    &mut blended,
+                    &mut warnings,
+                );
+                assert!(warnings.is_empty(), "{kind:?}: {edge:?}: {warnings:?}");
+                let result = blended.iter().find(|body| body.id == id).unwrap();
+                assert!(result
+                    .parts
+                    .iter()
+                    .all(|solid| solid.is_watertight() && solid.health_report().is_healthy()));
+            }
+        }
+    }
+    assert!(circles > 0);
+}
+
 /// Variable `w` (default `w0`), a `w × 12` rectangle extruded 8mm as a new body.
 /// The right-hand side of the rectangle tracks `w`, so editing `w` moves the
 /// captured edge — the perfect probe for "did the reference follow the geometry?"
@@ -539,20 +633,15 @@ fn unresolvable_edge_mod_reports_unresolved_status_for_that_feature() {
 }
 
 // ---------------------------------------------------------------------------
-// Half-space discriminator (N4) — spec'd ahead, implemented on demand
+// Half-space discriminator (N4) — named cylinder/plane branches
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "half-space discriminator (plan stage N4): one face-owner pair yielding \
-            two edges needs a side discriminator; implement when a real model \
-            hits the collision"]
 fn pair_collision_edges_reattach_by_side_discriminator() {
     // A slab cut across a cylinder produces TWO edges with the same adjacent
     // face-owner pair (slab-plane × cylinder-lateral) — one on each side of the
-    // axis. Today the multi-candidate face-pair path falls to geometry; the N4
-    // design appends `:side:{+,-}` from the edge-group centroid's sign against
-    // a reference plane so each side reattaches by identity even after large
-    // edits. This row pins the acceptance criterion.
+    // axis. A branch sign in the support frame distinguishes them across
+    // radius edits and rigid transforms. Missing branches reject reattachment.
     let mut g = ParametricGraph::new();
     g.add_feature(FeatureNode {
         id: "cyl_1".to_string(),
@@ -562,7 +651,8 @@ fn pair_collision_edges_reattach_by_side_discriminator() {
     add_sketch(&mut g, "sketch_2", rect_sketch((-8.0, -8.0), (8.0, 8.0)));
     add_extrude(&mut g, "extrude_3", "sketch_2", 4.0, ExtrudeMode::Cut);
 
-    let bodies = g.evaluate_bodies(&no_hidden()).unwrap();
+    let (bodies, warnings) = g.evaluate_bodies_with_warnings(&no_hidden()).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
     let side_edges: Vec<_> = bodies[0]
         .1
         .edge_refs
@@ -577,6 +667,99 @@ fn pair_collision_edges_reattach_by_side_discriminator() {
         side_edges.len() >= 2,
         "pair-collision edges must carry side discriminators, got {side_edges:?}"
     );
+    let selected = side_edges
+        .iter()
+        .find(|edge| edge.p0[0] < -4. && edge.p0[2] >= 4. - 1.0e-5)
+        .unwrap();
+    let captured = edge_ref_from_mesh_edge("cyl_1", selected);
+    let captured_id = captured.topology.as_ref().unwrap().edge_id.clone();
+    let index = g.node_map["cyl_1"];
+    if let FeatureType::Cylinder { r, .. } = &mut g.graph[index].feature {
+        *r = 7.5;
+    }
+    let (live, warnings) = g.build_live(&no_hidden(), false).unwrap();
+    assert!(warnings.is_empty());
+    let resolved = resolve_edge_ref_by_topology(&live[0], &captured)
+        .expect("named left branch follows radius edit");
+    assert!(resolved.p0[0] < -6. && resolved.p1[0] < -6.);
+    assert_eq!(resolved.topology.as_ref().unwrap().edge_id, captured_id);
+    // Rigid transformations preserve the support-based branch, not world-axis signs.
+    let solid = &live[0].parts[0];
+    let pristine = live[0].pristine.as_ref().unwrap();
+    let names = crate::mock_kernel::input_shell_face_names(pristine, solid);
+    let transform =
+        openrcad::foundation::Trsf::translation(openrcad::foundation::Vec::new(200., -100., 60.))
+            .multiply(&openrcad::foundation::Trsf::rotation(
+                &openrcad::foundation::Ax1::new(
+                    openrcad::foundation::Pnt::origin(),
+                    openrcad::foundation::Dir::new(0.3, 0.4, 0.5),
+                ),
+                1.2,
+            ));
+    let rotated = solid.transformed(&transform);
+    let history = openrcad::algo::BooleanFaceHistory {
+        face_source: (0..solid.face_count())
+            .map(|i| Some(openrcad::algo::BooleanFaceSource::Object(i)))
+            .collect(),
+    };
+    let rotated_mesh = crate::mock_kernel::propagate_face_names_via_history(
+        pristine,
+        &names,
+        &rotated,
+        &history,
+        "cyl_1",
+        "cut:extrude_3",
+    );
+    assert!(
+        rotated_mesh.edge_refs.iter().any(|edge| edge
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.edge_id == captured_id)),
+        "rotated IDs {:?}, names {names:?}",
+        rotated_mesh
+            .edge_refs
+            .iter()
+            .map(|e| (&e.curve, &e.topology))
+            .collect::<Vec<_>>()
+    );
+    // Persist the actual consumer and check its selection after reopening.
+    // Blend support on this curved intersection is a separate capability.
+    g.add_feature(FeatureNode {
+        id: "edge_4".into(),
+        name: "Left fillet".into(),
+        feature: FeatureType::EdgeMod {
+            target: "cyl_1".into(),
+            edge: captured.clone(),
+            dist: 0.2,
+            dist_expr: None,
+            kind: crate::sketch::CornerKind::Fillet,
+        },
+    });
+    g.add_dependency("extrude_3", "edge_4");
+    let bytes = crate::write_document_to_vec(
+        &crate::Document::from_graph(g.clone_document(), Unit::Millimeter),
+        &crate::SaveOptions::default(),
+        &crate::HydrationBundle::default(),
+    )
+    .unwrap();
+    let loaded = crate::read_document_from_slice(&bytes, &crate::LoadOptions::default())
+        .unwrap()
+        .document;
+    let saved_index = loaded.node_map["edge_4"];
+    let FeatureType::EdgeMod {
+        edge: saved_edge, ..
+    } = &loaded.graph[saved_index].feature
+    else {
+        panic!("lost edge consumer");
+    };
+    assert_eq!(saved_edge.topology, captured.topology);
+    assert!(resolve_edge_ref_by_topology(&live[0], saved_edge).is_some());
+    // Removing the intersection cannot cause a silent retarget to the other side.
+    if let FeatureType::Cylinder { r, .. } = &mut g.graph[index].feature {
+        *r = 20.;
+    }
+    let (live, _) = g.build_live(&no_hidden(), false).unwrap();
+    assert!(resolve_edge_ref_by_topology(&live[0], &captured).is_none());
 }
 
 // ---------------------------------------------------------------------------

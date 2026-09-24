@@ -2,6 +2,8 @@
 //! and real save-to-disk/reload behavior.
 
 use std::collections::HashSet;
+#[path = "support/document_fixture.rs"]
+mod document_fixture;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -119,7 +121,7 @@ fn exact_smooth_loft_survives_real_disk_reload_with_durable_topology() {
     let fixture_bytes =
         std::fs::read(&fixture_path).expect("the promoted Smooth Loft fixture must be present");
     assert_eq!(
-        fixture_bytes,
+        document_fixture::canonical_fixture_bytes(&fixture_path),
         std::fs::read(&path).expect("read temporary Smooth Loft lifecycle file")
     );
     let manifest: serde_json::Value =

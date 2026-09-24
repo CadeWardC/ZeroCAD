@@ -5,6 +5,11 @@ Use this as the quick map before editing. The longer architecture notes live in
 
 ## First Stops
 
+- Product priorities and acceptance: `docs/competitive-development-plan.md`.
+  Optimize measured changed-work costs and preserve a compact native runtime.
+  New capabilities should share the core transaction/diagnostic paths between
+  GUI and headless callers. Record supported scope and evidence, not parity claims.
+
 - Core parametric behavior: `zerocad-core/src/parametric/`
   - `mod.rs` is the map.
   - `types.rs` owns public feature graph data.

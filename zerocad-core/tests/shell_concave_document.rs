@@ -2,6 +2,8 @@
 //! cache equivalence, and atomic rejection.
 
 use std::collections::HashSet;
+#[path = "support/document_fixture.rs"]
+mod document_fixture;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -179,7 +181,10 @@ fn concave_shell_survives_real_disk_reload_with_durable_topology() {
     let fixture_bytes =
         std::fs::read(&fixture_path).expect("the promoted concave Shell fixture must be present");
     let temporary_bytes = std::fs::read(&path).expect("read temporary concave Shell file");
-    assert_eq!(fixture_bytes, temporary_bytes);
+    assert_eq!(
+        document_fixture::canonical_fixture_bytes(&fixture_path),
+        temporary_bytes
+    );
     let manifest: serde_json::Value =
         serde_json::from_str(include_str!("modeling_fixtures/manifest.json"))
             .expect("valid modeling fixture manifest");

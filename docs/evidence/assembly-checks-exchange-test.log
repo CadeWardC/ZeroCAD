@@ -1,0 +1,46 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling serde_core v1.0.228
+   Compiling crossbeam-utils v0.8.21
+   Compiling crossbeam-epoch v0.9.18
+   Compiling crossbeam-deque v0.8.6
+   Compiling rayon-core v1.13.0
+   Compiling serde v1.0.228
+   Compiling either v1.16.0
+   Compiling openrcad-foundation v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-foundation)
+   Compiling slotmap v1.1.1
+   Compiling rayon v1.12.0
+   Compiling openrcad-geom v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-geom)
+   Compiling openrcad-geom2d v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-geom2d)
+   Compiling openrcad-topo v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-topo)
+   Compiling openrcad-mesh v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-mesh)
+   Compiling openrcad-primitives v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-primitives)
+   Compiling openrcad-exchange v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-exchange)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.10s
+     Running unittests src\lib.rs (OpenRCAD\target\debug\deps\openrcad_exchange-62a92af724b9abfb.exe)
+
+running 17 tests
+test step_reader::tests::surface_curve_import_attaches_face_specific_pcurves ... ok
+test stl::tests::ascii_stl_has_expected_facets ... ok
+test stl::tests::binary_stl_header_and_count ... ok
+test stl::tests::degenerate_triangle_has_zero_normal ... ok
+test stl::tests::negative_zero_is_trimmed ... ok
+test step_writer::tests::exact_torus_boundaries_have_deterministic_step_exchange_approximations ... ok
+test tests::read_step_str_matches_read_step ... ok
+test tests::step_box_roundtrip ... ok
+test tests::step_box_shares_physical_edges_and_restores_exact_linear_pcurves ... ok
+test tests::step_cylinder_roundtrip ... ok
+test tests::step_sphere_roundtrip ... ok
+test tests::step_truncated_and_apex_cones_round_trip_strictly ... ok
+test tests::strict_step_rejects_missing_pcurves_and_named_compatibility_reports_recovery ... ok
+test threemf::tests::assembly_reuses_meshes_and_writes_transformed_build_items ... ok
+test threemf::tests::crc32_matches_known_vector ... ok
+test threemf::tests::package_has_zip_structure_and_model ... ok
+test tests::step_writer_is_byte_deterministic_for_strict_round_trip ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests openrcad_exchange
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

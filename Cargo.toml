@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "zerocad-core",
     "zerocad-gui",
+    "break-test",
 ]
 # OpenRCAD is its own cargo workspace living inside this tree; exclude it so this
 # workspace doesn't try to absorb its member crates. It is consumed only through

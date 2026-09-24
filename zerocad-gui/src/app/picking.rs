@@ -708,7 +708,7 @@ impl ZeroCadApp {
 
             let mut region_curves = curves;
             if let Some(boundary) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
-                region_curves.extend_curves(boundary);
+                region_curves.extend_face_boundary(boundary);
             }
             let cached_regions = self.cached_finished_regions(
                 node.id.as_str(),
@@ -1219,12 +1219,10 @@ impl ZeroCadApp {
     }
 
     /// The boundary loops of body face `(node_id, fid)` — its outer wire plus
-    /// any hole rims — projected into `cs`'s 2D plane as line segments, ready
-    /// to join a sketch's region detection as reference geometry. Thin wrapper
-    /// over the shared kernel extraction (`mesh_face_boundary_2d`) — the SAME
-    /// code the evaluator uses to re-derive the outline when the body changes,
-    /// so a just-captured boundary and an eval-refreshed one are bit-identical
-    /// for an unchanged face. Empty when the face/body is missing.
+    /// any hole rims — projected into `cs`'s 2D plane for sketch reference
+    /// geometry. Supported native faces retain exact lines and circular arcs
+    /// through the same extraction used by evaluation. Other faces use the
+    /// shared mesh-boundary fallback. Empty when the face/body is missing.
     pub(crate) fn face_boundary_curves(
         &self,
         node_id: &str,
@@ -1234,6 +1232,21 @@ impl ZeroCadApp {
         let Some((instance, mesh)) = self.evaluated_scene.find(node_id) else {
             return SketchCurves::new();
         };
+        if instance.placement().is_identity() {
+            if let Ok(bodies) = self.document.evaluated_kernel_bodies(&HashSet::new()) {
+                if let Some((_, parts)) = bodies.iter().find(|(id, _)| id == node_id) {
+                    if let [part] = parts.as_slice() {
+                        if let Some(face) = part.shell().faces().get(fid as usize) {
+                            if let Some(boundary) =
+                                zerocad_core::mock_kernel::kernel_face_boundary_2d(face, cs)
+                            {
+                                return boundary;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let transformed;
         let world_mesh = if instance.placement().is_identity() {
             mesh

@@ -176,6 +176,7 @@ pub struct BandBoundary {
 /// Typed, fail-closed errors shared by Shell, Fillet, and recut operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BandTopologyError {
+    Cancelled,
     OperationBudgetExhausted {
         stage: GeometryWorkStage,
         limit: u64,
@@ -197,6 +198,7 @@ impl BandTopologyError {
     /// Stable diagnostic code used by higher-level typed adapters.
     pub const fn diagnostic_code(&self) -> &'static str {
         match self {
+            Self::Cancelled => "operation.cancelled",
             Self::OperationBudgetExhausted { .. } => "operation.budget_exhausted",
             Self::UnsupportedTransition { .. } => "shell.unsupported_band_transition",
             Self::InconsistentPcurve { .. } => "topology.inconsistent_pcurve",
@@ -209,6 +211,7 @@ impl BandTopologyError {
 impl core::fmt::Display for BandTopologyError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("geometry operation cancelled"),
             Self::OperationBudgetExhausted {
                 stage,
                 limit,

@@ -1,0 +1,39 @@
+{
+  "working_tree": "Includes uncommitted prior work and this correction; selected source hashes below",
+  "base_commit": "9b1290f14f25daa188fb6e8bcd62a5664fcdd9a0",
+  "clippy": "core all-targets passed with existing warnings",
+  "toolchain": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "performance_claim": "No qualified latency, memory, or package-size measurement",
+  "formatting": "both workspaces passed",
+  "tests": {
+    "kernel-tests-final": {
+      "passed": 576,
+      "ignored": 0
+    },
+    "tests-final": {
+      "passed": 934,
+      "ignored": 0
+    }
+  },
+  "log_directory": "target/competitive-checks",
+  "independent_step": {
+    "passed": 12,
+    "occt_version": "7.8.1.1"
+  },
+  "warning_baseline": "passed without new warnings",
+  "date": "2026-09-05",
+  "source_sha256": {
+    "OpenRCAD/Cargo.lock": "906f80685778a3c15f42f783aa88aa0df713afaddb357a1cef04ff609d26f3e2",
+    "zerocad-core/tests/smooth_loft_document.rs": "db8ecd318a6afd7fea24992160fd372d99af2a4c49358717efc22690925d7608",
+    "OpenRCAD/crates/openrcad-algo/src/offset.rs": "aeb6cfd43fc766a121fa83fcd938e05115a7ee3a7c887e36d3fe46cf89e1daca",
+    "Cargo.lock": "e558696363d3f225bc37f40206e56ac694d30f347992700790fda56bf5e1771b",
+    "zerocad-core/tests/shell_concave_document.rs": "eb1d751fcba8a284219b3b4b8c672cf27e372a74dda24682948c7b862e8475a5",
+    "zerocad-core/tests/shell_torus_band_document.rs": "efdf33c68b27ec563fcc6336fd32d8b2e1e30cdb34efe9f146802003cd77ff51",
+    "OpenRCAD/crates/openrcad-algo/tests/closed_box_shell.rs": "0e5115d98d7871ff095412c4d0fdfcf6e01a670685caf28736fb7232d8617695",
+    "zerocad-core/tests/support/document_fixture.rs": "3f9065e2abd61282d6d84304aa50c924c16cf1948220be842a723200ca52c605",
+    "zerocad-core/src/zcad_format.rs": "3259544f6b8f1915cb84a09c0ffe68e70881a6813dd95f59a3aa487cc33e4391",
+    "zerocad-core/tests/fillet_overflow_document.rs": "dabdfcf5a1cfb8d787e046515a2364263b0df2fa8c98cabe56b39fe859550cbf",
+    "zerocad-core/tests/mechanical_workflows.rs": "3b837a40d6767ffae3d75ed2784c85a69d1839e9c9d14abc953dd9b6366755ca"
+  },
+  "check": "passed"
+}

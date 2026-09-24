@@ -1,0 +1,23 @@
+{
+  "base_commit": "9b1290f14f25daa188fb6e8bcd62a5664fcdd9a0",
+  "executable_blake3": "5ee704e047544f536a07aa8434f4e31a3dec1a71413536cdf937fb4a45deef3a",
+  "machine": "CADEW; windows; x86_64; 16 logical CPUs",
+  "measured_samples": 31,
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)\n",
+  "source_blake3": {
+    "Cargo.lock": "9f6083d73f65f695371ba659766719ca5bc5536ea2170b7b72f17e503b7caaff",
+    "Cargo.toml": "70c5090c6d16e0955435fce4386efb401f02fe4bb5051c14eaf6adc36f967f28",
+    "zerocad-core/Cargo.toml": "aa65a3d64d37eaec4387ae3da3f8547ff1a28163ccd1e686179b95aed68f1dca",
+    "zerocad-core/examples/assembly_measure.rs": "55b684c3ec41316700cbc7de7cfbc8a4b841427d47ae87558c10aee032d95fcf",
+    "zerocad-core/src/assembly.rs": "6fae9928bb84b8efcf034da7ce90073a8fdaffc52c7d3c3487dacb8689972762",
+    "zerocad-core/src/assembly_mates.rs": "1a43ca17d1e2b551077d6155a792cbd8fb31db239cc57d7bbbf86f1f5986a07b",
+    "zerocad-core/src/assembly_ops.rs": "d0aace7a2cf558b6e121e823b93d0de2f9267b1597eeff65e5dcb1084beda424",
+    "zerocad-core/src/assembly_release.rs": "da90822b2ae4bb937d5de27641ae80775367d3e8bf20132aa7d01ee7dff6aa72",
+    "zerocad-core/src/assembly_solver.rs": "f697c381d4f88804b35a27b8a9b8200f2269f65b100de99b6f097209875e92b1",
+    "zerocad-core/src/assembly_solver_release.rs": "4c3792ff61bba20536a831e27605a39c16b540224af3858ef0be202de8260a94",
+    "zerocad-core/tests/support/assembly_corpus.rs": "16551e2313f07fc77242bf7926fbe62efa589c4e94876fd893b04db26c6b09a7"
+  },
+  "source_scope": "assembly solver and fixture inputs; working tree is not a committed release",
+  "unix_seconds": 1788558532,
+  "warmup_samples": 1
+}

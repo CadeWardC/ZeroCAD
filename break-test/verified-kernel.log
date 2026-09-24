@@ -1,0 +1,2462 @@
+   Compiling openrcad-topo v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-topo)
+   Compiling openrcad-mesh v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-mesh)
+   Compiling openrcad-primitives v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-primitives)
+   Compiling openrcad-algo v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-algo)
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\edge_param_consistency.rs:13:21
+   |
+13 | use openrcad_algo::{boolean, fillet_edges, BooleanOp};
+   |                     ^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\edge_param_consistency.rs:16:27
+   |
+16 | use openrcad_primitives::{make_box, make_box_operation_with_policy, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\edge_param_consistency.rs:16:69
+   |
+16 | use openrcad_primitives::{make_box, make_box_operation_with_policy, make_cylinder};
+   |                                                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\edge_param_consistency.rs:48:16
+   |
+48 |     let base = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\edge_param_consistency.rs:50:15
+   |
+50 |     let cyl = make_cylinder(&axis, 14.0, 10.5);
+   |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\edge_param_consistency.rs:51:16
+   |
+51 |     let body = boolean(&base, &cyl, BooleanOp::Cut);
+   |                ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:16:21
+   |
+16 | use openrcad_algo::{boolean_checked, BooleanError, BooleanOp};
+   |                     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:18:27
+   |
+18 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:18:37
+   |
+18 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:29:17
+   |
+29 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:30:19
+   |
+30 |     let through = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
+   |                   ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:33:9
+   |
+33 |         boolean_checked(&block, &through, BooleanOp::Cut),
+   |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:39:17
+   |
+39 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:40:17
+   |
+40 |     let blind = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 5.0), Dir::dz()), 3.0, 8.0);
+   |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:43:9
+   |
+43 |         boolean_checked(&block, &blind, BooleanOp::Cut),
+   |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:50:15
+   |
+50 |     let cyl = make_cylinder(&Ax2::new(Pnt::origin(), Dir::dy()), 6.0, 20.0);
+   |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:51:16
+   |
+51 |     let tool = make_box(&Pnt::new(-7.0, 5.0, -1.0), 14.0, 10.0, 7.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:54:9
+   |
+54 |         boolean_checked(&cyl, &tool, BooleanOp::Cut),
+   |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:64:17
+   |
+64 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:65:16
+   |
+65 |     let boss = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 10.0), Dir::dz()), 3.0, 8.0);
+   |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cylinder.rs:68:9
+   |
+68 |         boolean_checked(&block, &boss, BooleanOp::Fuse),
+   |         ^^^^^^^^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_cylinder") generated 15 warnings
+warning: `openrcad-algo` (test "edge_param_consistency") generated 6 warnings
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+ --> crates\openrcad-algo\tests\repro_screenshots.rs:6:21
+  |
+6 | use openrcad_algo::{boolean, boolean_checked, boolean_checked_bodies, BooleanOp};
+  |                     ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_screenshots.rs:6:30
+  |
+6 | use openrcad_algo::{boolean, boolean_checked, boolean_checked_bodies, BooleanOp};
+  |                              ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked_bodies`: Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_screenshots.rs:6:47
+  |
+6 | use openrcad_algo::{boolean, boolean_checked, boolean_checked_bodies, BooleanOp};
+  |                                               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_screenshots.rs:8:26
+  |
+8 | use openrcad_primitives::make_box;
+  |                          ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:36:11
+   |
+36 |     match boolean_checked(object, tool, op) {
+   |           ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:62:17
+   |
+62 |     let floor = make_box(&Pnt::new(0.0, 0.0, 0.0), 40.0, 40.0, 2.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:63:16
+   |
+63 |     let wall = make_box(&Pnt::new(0.0, 0.0, 0.0), 40.0, 2.0, 40.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:64:13
+   |
+64 |     let u = boolean(&floor, &wall, BooleanOp::Fuse);
+   |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:73:16
+   |
+73 |     let base = make_box(&Pnt::new(0.0, 0.0, 0.0), 40.0, 40.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:74:16
+   |
+74 |     let boss = make_box(&Pnt::new(30.0, 30.0, 5.0), 20.0, 20.0, 20.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:75:13
+   |
+75 |     let u = boolean(&base, &boss, BooleanOp::Fuse);
+   |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:84:16
+   |
+84 |     let body = make_box(&Pnt::new(-20.0, -20.0, 0.0), 40.0, 40.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:87:16
+   |
+87 |     let tool = make_box(&Pnt::new(0.0, -30.0, -5.0), 10.0, 60.0, 20.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked_bodies`: Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:88:18
+   |
+88 |     let bodies = boolean_checked_bodies(&body, &tool, BooleanOp::Cut)
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:97:17
+   |
+97 |     let plate = make_box(&Pnt::new(0.0, 0.0, 0.0), 40.0, 40.0, 2.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:98:16
+   |
+98 |     let slot = make_box(&Pnt::new(15.0, -5.0, -1.0), 10.0, 50.0, 4.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked_bodies`: Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_screenshots.rs:99:18
+   |
+99 |     let bodies = boolean_checked_bodies(&plate, &slot, BooleanOp::Cut)
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:110:13
+    |
+110 |     let a = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+    |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:111:13
+    |
+111 |     let b = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+    |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:112:13
+    |
+112 |     let u = boolean(&a, &b, BooleanOp::Fuse);
+    |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:134:13
+    |
+134 |     let a = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+    |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:135:13
+    |
+135 |     let b = make_box(&Pnt::new(5.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+    |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:136:13
+    |
+136 |     let u = boolean(&a, &b, BooleanOp::Fuse);
+    |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_screenshots.rs:149:9
+    |
+149 |         boolean_checked(&a, &b, BooleanOp::Fuse).is_ok(),
+    |         ^^^^^^^^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_screenshots") generated 24 warnings
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+ --> crates\openrcad-algo\tests\repro_cut_fillet.rs:8:21
+  |
+8 | use openrcad_algo::{boolean, chamfer_edges, fillet_edges, BooleanOp};
+  |                     ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:11:27
+   |
+11 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:11:37
+   |
+11 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:18:16
+   |
+18 |     let cube = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:21:15
+   |
+21 |     let cyl = make_cylinder(&axis, 4.0, 12.0);
+   |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:22:5
+   |
+22 |     boolean(&cube, &cyl, BooleanOp::Cut)
+   |     ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:30:16
+   |
+30 |     let cube = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:33:15
+   |
+33 |     let cyl = make_cylinder(&axis, 4.0, 12.0);
+   |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:34:5
+   |
+34 |     boolean(&cube, &cyl, BooleanOp::Cut)
+   |     ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:38:16
+   |
+38 |     let base = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:40:15
+   |
+40 |     let cyl = make_cylinder(&axis, 14.0, 10.5);
+   |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_cut_fillet.rs:41:5
+   |
+41 |     boolean(&base, &cyl, BooleanOp::Cut)
+   |     ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_pocket_tangent_chain.rs:10:26
+   |
+10 | use openrcad_primitives::make_box;
+   |                          ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_pocket_tangent_chain.rs:14:17
+   |
+14 |     let block = make_box(&Pnt::origin(), 30.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_pocket_tangent_chain") generated 2 warnings
+warning: `openrcad-algo` (test "repro_cut_fillet") generated 12 warnings
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:10:20
+   |
+10 | use openrcad_mesh::tessellate;
+   |                    ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:11:26
+   |
+11 | use openrcad_primitives::make_box;
+   |                          ^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:18:16
+   |
+18 |     let mesh = tessellate(solid, 0.05, 0.5);
+   |                ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:44:16
+   |
+44 |     let mesh = tessellate(solid, 0.05, 0.5);
+   |                ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:105:16
+    |
+105 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:157:16
+    |
+157 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:194:16
+    |
+194 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:213:16
+    |
+213 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:267:16
+    |
+267 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:348:20
+    |
+348 |         let cube = make_box(&Pnt::origin(), w, h, d);
+    |                    ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:377:16
+    |
+377 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:434:13
+    |
+434 |     let m = tessellate(&s, 0.05, 0.5).gpu_mesh();
+    |             ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:479:16
+    |
+479 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:537:22
+    |
+537 |         let source = make_box(&Pnt::ORIGIN, w, h, d)
+    |                      ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:593:16
+    |
+593 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:653:16
+    |
+653 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_sequential_fillet.rs:705:16
+    |
+705 |     let cube = make_box(&Pnt::origin(), w, h, d);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\robustness.rs:12:21
+   |
+12 | use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
+   |                     ^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\robustness.rs:12:30
+   |
+12 | use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
+   |                              ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::chamfer`: use chamfer_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:12:47
+   |
+12 | use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
+   |                                               ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::fillet`: use fillet_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:12:56
+   |
+12 | use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
+   |                                                        ^^^^^^
+
+warning: use of deprecated function `openrcad_algo::shell_solid`: use shell_solid_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:12:64
+   |
+12 | use openrcad_algo::{boolean, boolean_checked, chamfer, fillet, shell_solid, BooleanOp, SolidExt};
+   |                                                                ^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\robustness.rs:14:27
+   |
+14 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\robustness.rs:14:37
+   |
+14 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\robustness.rs:27:5
+   |
+27 |     make_box(&o, 10.0, 10.0, 10.0)
+   |     ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::fillet`: use fillet_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:49:13
+   |
+49 |     let f = fillet(&rbox, 1.0).expect("rotated box should fillet");
+   |             ^^^^^^
+
+warning: use of deprecated function `openrcad_algo::chamfer`: use chamfer_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:61:13
+   |
+61 |     let c = chamfer(&rbox, 1.0).expect("rotated box should chamfer");
+   |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\robustness.rs:67:16
+   |
+67 |     let rcyl = make_cylinder(&Ax2::new(Pnt::origin(), Dir::dz()), 2.0, 8.0)
+   |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::fillet`: use fillet_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:69:13
+   |
+69 |     let f = fillet(&rcyl, 0.5).expect("rotated cylinder should fillet");
+   |             ^^^^^^
+
+warning: use of deprecated function `openrcad_algo::shell_solid`: use shell_solid_with_policy
+  --> crates\openrcad-algo\tests\robustness.rs:79:13
+   |
+79 |     let s = shell_solid(&rbox, 1.0, &one).expect("rotated box should shell");
+   |             ^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\robustness.rs:87:13
+   |
+87 |     let r = boolean(
+   |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\robustness.rs:99:13
+   |
+99 |     let r = boolean(
+   |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:101:10
+    |
+101 |         &make_box(&Pnt::new(3.0, 3.0, 3.0), 4.0, 4.0, 4.0),
+    |          ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\robustness.rs:115:13
+    |
+115 |     let r = boolean(
+    |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:117:10
+    |
+117 |         &make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0),
+    |          ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:125:16
+    |
+125 |     let side = make_cylinder(&Ax2::new(Pnt::new(-1.0, 5.0, 5.0), Dir::dx()), 2.0, 12.0);
+    |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:126:13
+    |
+126 |     let r = boolean_checked(&box10(Pnt::origin()), &side, BooleanOp::Cut)
+    |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:143:16
+    |
+143 |     let side = make_cylinder(&Ax2::new(Pnt::new(-1.0, 5.0, 5.0), Dir::dx()), 2.0, 12.0);
+    |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\robustness.rs:144:13
+    |
+144 |     let r = boolean(&box10(Pnt::origin()), &side, BooleanOp::Cut);
+    |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\robustness.rs:150:13
+    |
+150 |     let r = boolean(
+    |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:160:16
+    |
+160 |     let tool = make_box(&Pnt::new(3.0, 3.0, 5.0), 4.0, 4.0, 8.0);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\robustness.rs:161:13
+    |
+161 |     let r = boolean(&box10(Pnt::origin()), &tool, BooleanOp::Cut);
+    |             ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\robustness.rs:167:16
+    |
+167 |     let tool = make_box(&Pnt::new(5.0, 5.0, -2.0), 6.0, 6.0, 14.0).transformed(&Trsf::rotation(
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\robustness.rs:171:13
+    |
+171 |     let r = boolean(&box10(Pnt::origin()), &tool, BooleanOp::Cut);
+    |             ^^^^^^^
+
+warning: `openrcad-algo` (test "repro_sequential_fillet") generated 17 warnings
+warning: `openrcad-algo` (test "robustness") generated 27 warnings
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:11:21
+   |
+11 | use openrcad_algo::{boolean, fillet_edges, prism, BooleanOp};
+   |                     ^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:11:44
+   |
+11 | use openrcad_algo::{boolean, fillet_edges, prism, BooleanOp};
+   |                                            ^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:14:20
+   |
+14 | use openrcad_mesh::tessellate;
+   |                    ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:15:26
+   |
+15 | use openrcad_primitives::make_cylinder;
+   |                          ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:36:17
+   |
+36 |     let wedge = prism(&tri, GeomVec::new(0.0, 0.0, PRISM_H)).expect("triangle should extrude");
+   |                 ^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:37:16
+   |
+37 |     let boss = make_cylinder(&Ax2::new(Pnt::new(20.0, 15.0, 0.0), Dir::dz()), R, BOSS_H);
+   |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:38:17
+   |
+38 |     let fused = boolean(&wedge, &boss, BooleanOp::Fuse);
+   |                 ^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:55:16
+   |
+55 |     let mesh = tessellate(s, 0.05, 0.5);
+   |                ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:168:16
+    |
+168 |     let mesh = tessellate(body, 0.05, 0.5);
+    |                ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_prism_boss_fillet.rs:221:16
+    |
+221 |     let body = prism(&face, GeomVec::new(0.0, 0.0, height)).expect("triangle base should extrude");
+    |                ^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\corner_flow.rs:18:27
+   |
+18 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\corner_flow.rs:18:37
+   |
+18 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\corner_flow.rs:25:17
+   |
+25 |     let block = make_box(&Pnt::new(0.0, 0.0, 0.0), 30.0, 30.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\corner_flow.rs:26:18
+   |
+26 |     let cutter = make_cylinder(&Ax2::new(Pnt::new(30.0, 0.0, -1.0), Dir::dz()), 10.0, 12.0);
+   |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\corner_flow.rs:27:20
+   |
+27 |     openrcad_algo::boolean_checked(&block, &cutter, openrcad_algo::BooleanOp::Cut)
+   |                    ^^^^^^^^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_prism_boss_fillet") generated 10 warnings
+warning: `openrcad-algo` (test "corner_flow") generated 5 warnings
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_curved_wall_runout.rs:11:35
+   |
+11 | use openrcad_algo::{fillet_edges, prism};
+   |                                   ^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_curved_wall_runout.rs:14:20
+   |
+14 | use openrcad_mesh::tessellate;
+   |                    ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_curved_wall_runout.rs:43:5
+   |
+43 |     prism(&face, GeomVec::new(0.0, 0.0, 5.0)).expect("D profile should extrude")
+   |     ^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_curved_wall_runout.rs:51:16
+   |
+51 |     let mesh = tessellate(s, 0.05, 0.5);
+   |                ^^^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_curved_wall_runout") generated 4 warnings
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:14:21
+   |
+14 | use openrcad_algo::{boolean_checked, BooleanOp};
+   |                     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:17:27
+   |
+17 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:17:37
+   |
+17 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:54:17
+   |
+54 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:55:17
+   |
+55 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
+   |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:56:13
+   |
+56 |     let s = boolean_checked(&block, &drill, BooleanOp::Cut).expect("through-drill should succeed");
+   |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:75:17
+   |
+75 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:76:17
+   |
+76 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
+   |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:77:13
+   |
+77 |     let s = boolean_checked(&block, &drill, BooleanOp::Cut).expect("through-drill should succeed");
+   |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:98:17
+   |
+98 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_identity.rs:99:17
+   |
+99 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
+   |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_identity.rs:100:13
+    |
+100 |     let s = boolean_checked(&block, &drill, BooleanOp::Cut).expect("through-drill should succeed");
+    |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:16:21
+   |
+16 | use openrcad_algo::{boolean_checked, boolean_checked_bodies, BooleanError, BooleanOp};
+   |                     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::boolean_checked_bodies`: Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:16:38
+   |
+16 | use openrcad_algo::{boolean_checked, boolean_checked_bodies, BooleanError, BooleanOp};
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:19:27
+   |
+19 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:19:37
+   |
+19 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:51:13
+   |
+51 |     let a = boolean_checked(object, tool, op)
+   |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:53:13
+   |
+53 |     let b = boolean_checked(object, tool, op)
+   |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:127:17
+    |
+127 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:128:17
+    |
+128 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:131:9
+    |
+131 |         boolean_checked(&block, &drill, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:153:17
+    |
+153 |     let block = make_box(&Pnt::origin(), width as f64, depth as f64, height as f64);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:154:17
+    |
+154 |     let drill = make_cylinder(
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:165:9
+    |
+165 |         boolean_checked(&block, &drill, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:176:17
+    |
+176 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:177:17
+    |
+177 |     let blind = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 5.0), Dir::dz()), 3.0, 8.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:180:9
+    |
+180 |         boolean_checked(&block, &blind, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:190:17
+    |
+190 |     let block = make_box(&Pnt::origin(), 40.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:191:17
+    |
+191 |     let blind = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 4.0), Dir::dz()), 4.0, 6.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:194:9
+    |
+194 |         boolean_checked(&block, &blind, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:205:17
+    |
+205 |     let block = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:206:18
+    |
+206 |     let cutter = make_cylinder(&Ax2::new(Pnt::new(20.0, 8.0, -1.0), Dir::dz()), 14.0, 12.0);
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:209:9
+    |
+209 |         boolean_checked(&block, &cutter, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:223:17
+    |
+223 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 20.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:225:17
+    |
+225 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, -2.0, 8.0), axis), 3.0, 30.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:228:9
+    |
+228 |         boolean_checked(&block, &drill, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:234:17
+    |
+234 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 20.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:236:17
+    |
+236 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, -2.0, 8.0), axis), 3.0, 30.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:239:9
+    |
+239 |         boolean_checked(&block, &drill, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:249:17
+    |
+249 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:250:16
+    |
+250 |     let boss = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 10.0), Dir::dz()), 3.0, 8.0);
+    |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:253:9
+    |
+253 |         boolean_checked(&block, &boss, BooleanOp::Fuse),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:264:17
+    |
+264 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:265:16
+    |
+265 |     let boss = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 10.0), Dir::dz()), 4.0, 8.0);
+    |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:268:9
+    |
+268 |         boolean_checked(&block, &boss, BooleanOp::Fuse),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:279:17
+    |
+279 |     let lower = make_cylinder(&Ax2::new(Pnt::new(0.0, 0.0, 0.0), Dir::dz()), 6.0, 5.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:280:17
+    |
+280 |     let upper = make_cylinder(&Ax2::new(Pnt::new(0.0, 0.0, 5.0), Dir::dz()), 6.0, 5.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:284:9
+    |
+284 |         boolean_checked(&lower, &upper, BooleanOp::Fuse),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:294:17
+    |
+294 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:295:17
+    |
+295 |     let small = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 2.0, 12.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:297:9
+    |
+297 |         boolean_checked(&block, &small, BooleanOp::Cut).expect("initial drill should succeed");
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:298:15
+    |
+298 |     let big = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 4.0, 12.0);
+    |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:301:9
+    |
+301 |         boolean_checked(&drilled, &big, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:314:17
+    |
+314 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:315:16
+    |
+315 |     let bore = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 2.0, 12.0);
+    |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:316:19
+    |
+316 |     let drilled = boolean_checked(&block, &bore, BooleanOp::Cut).expect("initial bore");
+    |                   ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:319:17
+    |
+319 |     let cbore = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 7.0), Dir::dz()), 4.0, 4.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:322:9
+    |
+322 |         boolean_checked(&drilled, &cbore, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:332:13
+    |
+332 |     let a = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+    |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:333:13
+    |
+333 |     let b = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+    |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:334:45
+    |
+334 |     let s = assert_sound("flush box union", boolean_checked(&a, &b, BooleanOp::Fuse));
+    |                                             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:344:17
+    |
+344 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:345:21
+    |
+345 |     let bore_tool = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 4.0, 12.0);
+    |                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:346:16
+    |
+346 |     let plug = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, 0.0), Dir::dz()), 4.0, 10.0);
+    |                ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:347:17
+    |
+347 |     let bored = boolean_checked(&block, &bore_tool, BooleanOp::Cut).expect("make through bore");
+    |                 ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:350:9
+    |
+350 |         boolean_checked(&bored, &plug, BooleanOp::Fuse),
+    |         ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:362:15
+    |
+362 |     let bar = make_box(&Pnt::origin(), 30.0, 10.0, 10.0);
+    |               ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:363:17
+    |
+363 |     let knife = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked_bodies`: Phase 3 compatibility API for multi-body results; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:364:18
+    |
+364 |     let bodies = boolean_checked_bodies(&bar, &knife, BooleanOp::Cut)
+    |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:382:16
+    |
+382 |     let cube = make_box(&Pnt::new(-13.4, 0.0, -12.8), 21.0, back, 17.6);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:385:15
+    |
+385 |     let cyl = make_cylinder(&axis, 7.81, 23.0);
+    |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_robustness_matrix.rs:388:9
+    |
+388 |         boolean_checked(&cube, &cyl, BooleanOp::Cut),
+    |         ^^^^^^^^^^^^^^^
+
+warning: `openrcad-algo` (test "boolean_identity") generated 12 warnings
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\circular_blend.rs:11:27
+   |
+11 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\circular_blend.rs:11:37
+   |
+11 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\circular_blend.rs:16:5
+   |
+16 |     make_cylinder(&Ax2::new(Pnt::origin(), Dir::dz()), r, h)
+   |     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\circular_blend.rs:66:31
+   |
+66 |     let mesh = openrcad_mesh::tessellate(s, 0.05, 0.5);
+   |                               ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:109:17
+    |
+109 |     let block = make_box(&Pnt::new(-10.0, -10.0, 0.0), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:110:17
+    |
+110 |     let drill = make_cylinder(&Ax2::new(Pnt::new(0.0, 0.0, -1.0), Dir::dz()), 4.0, 12.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:111:32
+    |
+111 |     let bored = openrcad_algo::boolean_checked(&block, &drill, openrcad_algo::BooleanOp::Cut)
+    |                                ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:170:17
+    |
+170 |     let block = make_box(&Pnt::new(-10.0, -10.0, 0.0), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:171:17
+    |
+171 |     let drill = make_cylinder(&Ax2::new(Pnt::new(0.0, 0.0, -1.0), Dir::dz()), 4.0, 12.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:172:32
+    |
+172 |     let bored = openrcad_algo::boolean_checked(&block, &drill, openrcad_algo::BooleanOp::Cut)
+    |                                ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:203:17
+    |
+203 |     let block = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:204:18
+    |
+204 |     let cutter = make_cylinder(&Ax2::new(Pnt::new(20.0, 8.0, -1.0), Dir::dz()), 14.0, 12.0);
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\circular_blend.rs:205:33
+    |
+205 |     let bitten = openrcad_algo::boolean_checked(&block, &cutter, openrcad_algo::BooleanOp::Cut)
+    |                                 ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\circular_blend.rs:220:31
+    |
+220 |     let mesh = openrcad_mesh::tessellate(s, 0.05, 0.5);
+    |                               ^^^^^^^^^^
+
+warning: `openrcad-algo` (test "boolean_robustness_matrix") generated 60 warnings
+warning: `openrcad-algo` (test "circular_blend") generated 14 warnings
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_fillet.rs:6:26
+  |
+6 | use openrcad_primitives::make_box;
+  |                          ^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet.rs:28:16
+   |
+28 |     let cube = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet.rs:43:17
+   |
+43 |     let plate = make_box(&Pnt::origin(), 40.0, 40.0, 2.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet.rs:60:13
+   |
+60 |     let a = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet.rs:61:13
+   |
+61 |     let b = make_box(&Pnt::new(10.0, 0.0, 0.0), 20.0, 20.0, 10.0);
+   |             ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_fillet.rs:62:16
+   |
+62 |     let body = boolean(&a, &b, BooleanOp::Fuse); // 30x20x10 merged box
+   |                ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\repro_fillet.rs:57:25
+   |
+57 |     use openrcad_algo::{boolean, BooleanOp};
+   |                         ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet.rs:98:21
+   |
+98 |         let block = make_box(&Pnt::origin(), w, h, d);
+   |                     ^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\repro_fillet.rs:103:20
+    |
+103 |         let mesh = tessellate(&solid, 0.05, 0.5);
+    |                    ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_fillet.rs:87:24
+   |
+87 |     use openrcad_mesh::tessellate;
+   |                        ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_fillet.rs:148:17
+    |
+148 |     let block = make_box(&Pnt::origin(), 40.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_fillet.rs:149:17
+    |
+149 |     let drill = make_cylinder(&Ax2::new(Pnt::new(20.0, 10.0, 4.0), Dir::dz()), 4.0, 6.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\repro_fillet.rs:150:16
+    |
+150 |     let body = boolean(&block, &drill, BooleanOp::Cut);
+    |                ^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\repro_fillet.rs:143:25
+    |
+143 |     use openrcad_algo::{boolean, BooleanOp};
+    |                         ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_fillet.rs:145:30
+    |
+145 |     use openrcad_primitives::make_cylinder;
+    |                              ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_fillet.rs:174:17
+    |
+174 |     let plate = make_box(&Pnt::origin(), 40.0, 40.0, 3.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+ --> crates\openrcad-algo\tests\perf_tessellate.rs:6:21
+  |
+6 | use openrcad_algo::{boolean, fillet_edges, BooleanOp};
+  |                     ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+ --> crates\openrcad-algo\tests\perf_tessellate.rs:8:20
+  |
+8 | use openrcad_mesh::tessellate;
+  |                    ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\perf_tessellate.rs:9:27
+  |
+9 | use openrcad_primitives::{make_box, make_cylinder};
+  |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\perf_tessellate.rs:9:37
+  |
+9 | use openrcad_primitives::{make_box, make_cylinder};
+  |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:15:14
+   |
+15 |     let bx = make_box(&Pnt::new(0.0, 0.0, 0.0), 40.0, 30.0, 10.0);
+   |              ^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:17:13
+   |
+17 |     let m = tessellate(&bx, 0.05, 0.13);
+   |             ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:25:16
+   |
+25 |     let base = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:27:15
+   |
+27 |     let cyl = make_cylinder(&axis, 14.0, 10.5);
+   |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:29:16
+   |
+29 |     let body = boolean(&base, &cyl, BooleanOp::Cut);
+   |                ^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:34:17
+   |
+34 |         let m = tessellate(&body, chord, angle);
+   |                 ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\perf_tessellate.rs:56:13
+   |
+56 |     let m = tessellate(&filleted, 0.05, 0.13);
+   |             ^^^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_fillet") generated 16 warnings
+warning: `openrcad-algo` (test "perf_tessellate") generated 11 warnings
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+ --> crates\openrcad-algo\tests\repro_gui_cracks.rs:7:21
+  |
+7 | use openrcad_algo::{boolean, fillet_edges, prism, BooleanOp};
+  |                     ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_circular_bite.rs:12:21
+   |
+12 | use openrcad_algo::{boolean_checked, BooleanError, BooleanOp};
+   |                     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_circular_bite.rs:15:27
+   |
+15 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_gui_cracks.rs:7:44
+  |
+7 | use openrcad_algo::{boolean, fillet_edges, prism, BooleanOp};
+  |                                            ^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_circular_bite.rs:15:37
+   |
+15 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_gui_cracks.rs:10:20
+   |
+10 | use openrcad_mesh::tessellate;
+   |                    ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_circular_bite.rs:26:17
+   |
+26 |     let block = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_gui_cracks.rs:11:27
+   |
+11 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_circular_bite.rs:28:18
+   |
+28 |     let cutter = make_cylinder(
+   |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_circular_bite.rs:33:5
+   |
+33 |     boolean_checked(&block, &cutter, BooleanOp::Cut)
+   |     ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_gui_cracks.rs:11:37
+   |
+11 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_gui_cracks.rs:19:16
+   |
+19 |     let mesh = tessellate(solid, 0.05, 0.5);
+   |                ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_gui_cracks.rs:73:17
+   |
+73 |     let solid = prism(&rect_face(40.0, 30.0), GeomVec::new(0.0, 0.0, 15.0)).unwrap();
+   |                 ^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_gui_cracks.rs:84:17
+   |
+84 |     let solid = prism(&rect_face(40.0, 30.0), GeomVec::new(0.0, 0.0, 15.0)).unwrap();
+   |                 ^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_gui_cracks.rs:101:16
+    |
+101 |     let box_ = make_box(&Pnt::origin(), 40.0, 30.0, 15.0);
+    |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_gui_cracks.rs:103:15
+    |
+103 |     let cyl = make_cylinder(
+    |               ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\repro_gui_cracks.rs:108:16
+    |
+108 |     let body = boolean(&box_, &cyl, BooleanOp::Fuse);
+    |                ^^^^^^^
+
+warning: `openrcad-algo` (test "repro_circular_bite") generated 6 warnings
+warning: `openrcad-algo` (test "repro_gui_cracks") generated 11 warnings
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+ --> crates\openrcad-algo\tests\concave_blend.rs:6:21
+  |
+6 | use openrcad_algo::{boolean, boolean_operation, chamfer_edges, fillet_edges, BooleanOp};
+  |                     ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\concave_blend.rs:9:26
+  |
+9 | use openrcad_primitives::make_box;
+  |                          ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\concave_blend.rs:15:17
+   |
+15 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\concave_blend.rs:16:16
+   |
+16 |     let tool = make_box(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 7.0);
+   |                ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\concave_blend.rs:17:15
+   |
+17 |     let cut = boolean(&block, &tool, BooleanOp::Cut);
+   |               ^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\concave_blend.rs:218:17
+    |
+218 |     let block = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\concave_blend.rs:219:16
+    |
+219 |     let tool = make_box(&Pnt::new(5.0, 5.0, 4.0), 10.0, 10.0, 6.0);
+    |                ^^^^^^^^
+
+warning: `openrcad-algo` (test "concave_blend") generated 7 warnings
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_chained_boolean.rs:8:21
+  |
+8 | use openrcad_algo::{boolean_checked, BooleanOp};
+  |                     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:10:26
+   |
+10 | use openrcad_primitives::make_box;
+   |                          ^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:15:31
+   |
+15 |     let mesh = openrcad_mesh::tessellate(solid, 0.05, 0.35);
+   |                               ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:30:5
+   |
+30 |     make_box(&Pnt::origin(), 4.0, 4.0, 2.0)
+   |     ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:35:5
+   |
+35 |     make_box(&Pnt::origin(), 60.0, 20.0, 5.0)
+   |     ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:43:15
+   |
+43 |     let one = boolean_checked(&base, &stud(6.0), BooleanOp::Fuse).expect("first fuse");
+   |               ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:44:15
+   |
+44 |     let two = boolean_checked(&one, &stud(20.0), BooleanOp::Fuse).expect("second fuse");
+   |               ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:63:15
+   |
+63 |     let one = boolean_checked(&base, &stud(6.0), BooleanOp::Cut).expect("first cut");
+   |               ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_chained_boolean.rs:64:15
+   |
+64 |     let two = boolean_checked(&one, &stud(20.0), BooleanOp::Cut).expect("second cut");
+   |               ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+ --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:9:21
+  |
+9 | use openrcad_algo::{boolean, boolean_checked, fillet_edges, prism, BooleanOp};
+  |                     ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:9:30
+  |
+9 | use openrcad_algo::{boolean, boolean_checked, fillet_edges, prism, BooleanOp};
+  |                              ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+ --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:9:61
+  |
+9 | use openrcad_algo::{boolean, boolean_checked, fillet_edges, prism, BooleanOp};
+  |                                                             ^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:12:20
+   |
+12 | use openrcad_mesh::tessellate;
+   |                    ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:13:27
+   |
+13 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:13:37
+   |
+13 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:27:17
+   |
+27 |     let block = make_box(&Pnt::origin(), BOX_W, BOX_H, BOX_D);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:44:5
+   |
+44 |     make_cylinder(
+   |     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::prism`: use prism_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:79:5
+   |
+79 |     prism(&face, GeomVec::new(0.0, 0.0, CUT_HEIGHT)).expect("faceted cutter prism should build")
+   |     ^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+  --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:83:16
+   |
+83 |     let mesh = tessellate(s, 0.05, 0.5);
+   |                ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:285:11
+    |
+285 |     match boolean_checked(body, tool, BooleanOp::Cut) {
+    |           ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:293:17
+    |
+293 |                 boolean(body, tool, BooleanOp::Cut)
+    |                 ^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\repro_fillet_then_cut.rs:304:16
+    |
+304 |     let mesh = tessellate(s, 0.05, 0.5);
+    |                ^^^^^^^^^^
+
+warning: `openrcad-algo` (test "repro_chained_boolean") generated 9 warnings
+warning: `openrcad-algo` (test "repro_fillet_then_cut") generated 13 warnings
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+  --> crates\openrcad-algo\tests\boolean_determinism.rs:14:21
+   |
+14 | use openrcad_algo::{boolean, boolean_checked, fillet_edges, BooleanOp};
+   |                     ^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_determinism.rs:14:30
+   |
+14 | use openrcad_algo::{boolean, boolean_checked, fillet_edges, BooleanOp};
+   |                              ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_determinism.rs:16:27
+   |
+16 | use openrcad_primitives::{make_box, make_cylinder};
+   |                           ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_determinism.rs:16:37
+   |
+16 | use openrcad_primitives::{make_box, make_cylinder};
+   |                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_determinism.rs:98:17
+   |
+98 |     let block = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+   |                 ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+  --> crates\openrcad-algo\tests\boolean_determinism.rs:99:18
+   |
+99 |     let cutter = make_cylinder(&Ax2::new(Pnt::new(20.0, 8.0, -1.0), Dir::dz()), 14.0, 12.0);
+   |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:100:16
+    |
+100 |     let bite = boolean_checked(&block, &cutter, BooleanOp::Cut).expect("bite cut");
+    |                ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:104:14
+    |
+104 |     let b2 = make_box(&Pnt::origin(), 20.0, 20.0, 10.0);
+    |              ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:105:17
+    |
+105 |     let drill = make_cylinder(&Ax2::new(Pnt::new(10.0, 10.0, -1.0), Dir::dz()), 3.0, 12.0);
+    |                 ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:106:19
+    |
+106 |     let drilled = boolean_checked(&b2, &drill, BooleanOp::Cut).expect("drill");
+    |                   ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:110:14
+    |
+110 |     let u1 = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+    |              ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:111:14
+    |
+111 |     let u2 = make_box(&Pnt::new(10.0, 0.0, 0.0), 10.0, 10.0, 10.0);
+    |              ^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean_checked`: use boolean_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:112:17
+    |
+112 |     let union = boolean_checked(&u1, &u2, BooleanOp::Fuse).expect("union");
+    |                 ^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:127:31
+    |
+127 |     let mesh = openrcad_mesh::tessellate(&drilled, 0.05, 0.5);
+    |                               ^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_box`: use make_box_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:155:19
+    |
+155 |     let cb_base = make_box(&Pnt::new(0.0, 5.0, 0.0), 40.0, 30.0, 10.0);
+    |                   ^^^^^^^^
+
+warning: use of deprecated function `openrcad_primitives::make_cylinder`: use make_cylinder_operation; this wrapper discards operation metadata
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:157:18
+    |
+157 |     let cb_cyl = make_cylinder(&cb_axis, 14.0, 10.5);
+    |                  ^^^^^^^^^^^^^
+
+warning: use of deprecated function `openrcad_algo::boolean`: use boolean_operation; this wrapper discards metadata and panics on failure
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:158:19
+    |
+158 |     let cb_body = boolean(&cb_base, &cb_cyl, BooleanOp::Cut);
+    |                   ^^^^^^^
+
+warning: use of deprecated function `openrcad_mesh::tessellate`: use tessellate_checked; this wrapper panics on strict validation failure
+   --> crates\openrcad-algo\tests\boolean_determinism.rs:168:36
+    |
+168 |             let m = openrcad_mesh::tessellate(&cb_fil, 0.05, 0.5);
+    |                                    ^^^^^^^^^^
+
+warning: `openrcad-algo` (test "boolean_determinism") generated 18 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.72s
+     Running unittests src\lib.rs (OpenRCAD\target\debug\deps\openrcad_algo-3dbc1bfe5c9bcfc0.exe)
+
+running 126 tests
+test band_topology::tests::budget_exhaustion_is_deterministic_and_typed ... ok
+test band_topology::tests::owner_is_independent_of_traversal_order ... ok
+test band_topology::tests::exact_plane_torus_circle_carries_two_valid_pcurves ... ok
+test blend::tests::detects_cylinder ... ok
+test blend::tests::fillet_cylinder_is_watertight_with_tori ... ok
+test blend::tests::chamfer_cylinder_is_watertight_with_cones ... ok
+test blend::tests::rejects_oversized_parameters ... ok
+test blend::tests::shell_cylinder_open_top_has_offset_wall ... ok
+test blend::tests::shell_cylinder_without_open_caps_has_void_boundary ... ok
+test boolean::tests::cancelled_checked_boolean_returns_no_partial_solid ... ok
+test boolean::tests::checked_boolean_rejects_invalid_policy_before_modeling ... ok
+test boolean::tests::cut_severing_a_bar_yields_two_bodies ... ok
+test boolean::tests::history_attributes_faces_merged_across_removed_imprint_seam ... ok
+test boolean::tests::explicit_standard_policy_preserves_checked_boolean_result ... ok
+test boolean::tests::history_traces_cut_pocket_walls_to_the_tool ... ok
+test boolean::tests::ordered_curve_bounds_accept_reversed_and_nonfinite_limits ... ok
+test boolean::tests::history_traces_union_faces_to_their_operands ... ok
+test boolean::tests::primitives_pass_structural_validation ... ok
+test boolean::tests::scaled_box_minus_cylinder_drills_watertight_hole ... ok
+test boolean::tests::snap_fires_for_tiny_gap_but_preserves_real_clearance ... ok
+test boolean::tests::snap_skips_when_planes_do_not_overlap ... ok
+test boolean::tests::split_disconnected_separates_two_packed_boxes ... ok
+test boolean::tests::owner_classes_block_cross_owner_coplanar_merge ... ok
+test boolean::tests::structured_boolean_result_carries_history_recovery_and_validation ... ok
+test boolean::tests::structured_severing_cut_has_local_complete_history ... ok
+test boolean::tests::test_boolean_box_minus_cylinder_drills_hole ... ok
+test boolean::tests::test_boolean_box_minus_cylinder_runs_and_drills_caps ... ok
+test boolean::tests::test_boolean_difference_of_overlapping_cubes ... ok
+test boolean::tests::test_boolean_intersection_of_overlapping_cubes ... ok
+test boolean::tests::test_boolean_union_of_overlapping_cubes ... ok
+test boolean::tests::watertight_sliver_is_rejected_by_checked ... ok
+test bvh::tests::test_bvh_build_and_queries ... ok
+test bvh::tests::test_overlapping_pairs ... ok
+test chamfer::tests::plane_cylinder_trim_parallel_axis_requires_same_generator ... ok
+test chamfer::tests::plane_cylinder_trim_samples_when_axis_not_parallel_to_plane ... ok
+test chamfer::tests::test_box_chamfering ... ok
+test corner_network::tests::canonical_order_is_input_independent_for_verified_valences ... ok
+test corner_network::tests::orthogonal_three_valent_plan_selects_exact_sphere_specialization ... ok
+test corner_network::tests::tangent_sphere_solve_is_scale_and_far_origin_stable ... ok
+test corner_network::tests::unsupported_or_ambiguous_inputs_reject_before_geometry ... ok
+test euler::tests::mef_preserves_invariant_and_kef_inverts ... ok
+test euler::tests::mev_preserves_invariant_and_kev_inverts ... ok
+test facade::tests::fluent_blend_matches_free_function ... ok
+test facade::tests::selectors_find_axis_faces ... ok
+test fillet::tests::policy_aware_fillet_rejects_invalid_policy ... ok
+test fillet::tests::test_box_filleting ... ok
+test heal::tests::canonical_healing_preserves_a_strict_box ... ok
+test heal::tests::canonical_healing_records_safe_small_collinear_collapse ... ok
+test heal::tests::canonical_healing_rejects_disconnected_closed_components ... ok
+test intersect::tests::analytic_circle_circle_coplanar ... ok
+test intersect::tests::analytic_line_line_crossing_and_skew ... ok
+test intersect::tests::analytic_line_torus_quartic_holds_across_scale_rotation_and_origin ... ok
+test intersect::tests::coaxial_cone_cylinder_intersections_are_exact_circles ... ok
+test intersect::tests::oblique_plane_cylinder_is_analytic_ellipse_on_both_surfaces ... ok
+test intersect::tests::ordered_clamp_accepts_reversed_bounds ... ok
+test intersect::tests::outer_support_membership_does_not_misclassify_an_inner_hole ... ok
+test intersect::tests::perpendicular_plane_cone_is_exact_circle ... ok
+test intersect::tests::point_in_polygon_robust_basic_and_sliver ... ok
+test intersect::tests::test_curve_curve_intersection ... ok
+test intersect::tests::test_curve_surface_intersection ... ok
+test intersect::tests::test_ray_face_intersection ... ok
+test intersect::tests::test_surface_surface_intersection ... ok
+test intersect::tests::test_surface_surface_two_spheres ... ok
+test merge::tests::chained_flush_fuses_collapse_to_one_face_per_outer_plane ... ok
+test merge::tests::corner_cut_crossing_seam_merges_to_one_wall ... ok
+test merge::tests::partial_end_join_builds_one_concave_top_face ... ok
+test merge::tests::plain_cylinder_lateral_faces_are_left_alone ... ok
+test offset::tests::closed_box_shell_has_outer_and_void_boundaries ... ok
+test offset::tests::general_shell_rejects_closed_hollow_and_curved ... ok
+test offset::tests::general_shell_triangle_prism_open_top ... ok
+test offset::tests::test_solid_shelling ... ok
+test boolean::tests::tiny_gap_cut_is_clean_after_snap_and_fillets ... ok
+test plane_split::tests::centered_box_split_is_strict_and_conservative ... ok
+test plane_split::tests::outside_plane_is_rejected ... ok
+test prism::tests::bspline_inner_wire_removes_volume_from_a_line_bounded_profile ... ok
+test prism::tests::circular_boundary_generates_cylindrical_laterals ... ok
+test prism::tests::cylindrical_laterals_face_outward_for_a_negative_sweep ... ok
+test prism::tests::cylindrical_laterals_face_outward_for_a_positive_sweep ... ok
+test prism::tests::extrudes_face_with_hole ... ok
+test prism::tests::extrudes_triangle_to_watertight_prism ... ok
+test prism::tests::inner_wire_role_removes_volume_regardless_of_input_winding ... ok
+test prism::tests::mixed_line_bspline_inner_wire_removes_volume ... ok
+test prism::tests::multiple_bspline_inner_wires_all_remove_volume ... ok
+test prism::tests::prism_caps_are_oriented_outward ... ok
+test prism::tests::ruled_lateral_pcurves_follow_natural_edges_after_loop_reversal ... ok
+test prism::tests::slightly_tilted_circle_axis_still_makes_a_cylinder ... ok
+test prism::tests::tolerated_bspline_junctions_keep_prism_pcurves_consistent ... ok
+test revolve::tests::circle_profile_makes_torus ... ok
+test revolve::tests::crossing_profile_and_bad_axis_are_rejected ... ok
+test revolve::tests::full_revolve_of_axis_touching_rect_is_cylinder ... ok
+test revolve::tests::full_revolve_of_offset_rect_is_washer ... ok
+test revolve::tests::quarter_revolve_has_caps_and_correct_volume ... ok
+test revolve::tests::revolved_solid_survives_boolean ... ok
+test revolve::tests::skew_profile_line_makes_cone ... ok
+test rolling_ball::tests::box_edge_blend_takes_the_minor_arc_on_both_ends ... ok
+test rolling_ball::tests::concave_probe_classifies_pocket_and_box_edges ... ok
+test rolling_ball::tests::continues_single_face_overflow_without_vertex_clamping ... ok
+test rolling_ball::tests::cylindrical_cap_merge_requires_a_shared_seam_on_one_oriented_support ... ok
+test rolling_ball::tests::error_variant_set_is_renamed ... ok
+test rolling_ball::tests::fillet_edges_blends_two_independent_box_edges ... ok
+test rolling_ball::tests::fillets_single_planar_box_edge_into_watertight_solid ... ok
+test rolling_ball::tests::ordered_clamp_accepts_reversed_surface_bounds ... ok
+test rolling_ball::tests::overflow_intersection_budget_exhausts_deterministically ... ok
+test rolling_ball::tests::rejects_boundary_edge_without_two_faces ... ok
+test rolling_ball::tests::rejects_overflow_that_consumes_the_entire_profile ... ok
+test rolling_ball::tests::solves_contacts_for_box_edge ... ok
+test rolling_ball::tests::solves_curved_face_blending_cylinder ... ok
+test rolling_ball::tests::solves_longitudinal_plane_cylinder_fillet ... ok
+test sew::tests::canonical_sew_heals_mismatched_boundary_subdivisions ... ok
+test sew::tests::canonical_sew_returns_complete_validated_metadata ... ok
+test sew::tests::sew_keeps_outward_box_outward ... ok
+test sew::tests::sew_reorients_inverted_box_outward ... ok
+test sew::tests::test_sewing_aligns_normals ... ok
+test sew::tests::test_sewing_disconnected_components ... ok
+test sew::tests::test_sewing_heals_gap ... ok
+test sew::tests::test_sewing_respects_per_entity_tolerance ... ok
+test skin::tests::bad_inputs_are_rejected ... ok
+test skin::tests::misaligned_rings_are_realigned ... ok
+test skin::tests::multi_ring_skin_through_offset_sections ... ok
+test skin::tests::ordered_rotating_skin_uses_exactly_reparameterized_rails_and_native_pcurves ... ok
+test skin::tests::reordered_holes_receive_inner_caps_and_oriented_walls ... ok
+test skin::tests::straight_skin_is_a_box ... ok
+test skin::tests::symmetric_hole_motion_is_unresolved ... ok
+test skin::tests::tapered_skin_is_a_frustum ... ok
+test smooth_skin::certificate_tests::control_certificate_rejects_an_overlap_between_legacy_sample_stations ... ok
+test plane_split::tests::axial_cylinder_split_keeps_periodic_boundaries_strict ... ok
+
+test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.26s
+
+     Running tests\all_edge_blend.rs (OpenRCAD\target\debug\deps\all_edge_blend-a0431d642fa5952d.exe)
+
+running 7 tests
+test arbitrary_analytic_solid_returns_all_discovered_blockers_atomically ... ok
+test global_limit_reports_every_blocking_edge_without_mutating_the_source ... ok
+test invalid_values_reject_before_geometry ... ok
+test primitive_fast_paths_return_complete_validated_history ... ok
+test strict_all_edge_paths_hold_across_scale_rotation_and_far_origin ... ok
+test sub_tolerance_values_reject_typed_and_leave_the_source_unchanged ... ok
+test extreme_aspect_sweep_is_strict_or_deterministically_typed_and_atomic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
+     Running tests\boolean_determinism.rs (OpenRCAD\target\debug\deps\boolean_determinism-d9684b37e1832dae.exe)
+
+running 1 test
+test print_boolean_fingerprints ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests\boolean_identity.rs (OpenRCAD\target\debug\deps\boolean_identity-f3e92a3d18a40381.exe)
+
+running 3 tests
+test through_drill_bore_is_analytic_cylinder ... ok
+test central_drill_leaves_top_perimeter_edges_intact ... ok
+test through_drill_preserves_six_planar_faces ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\boolean_intersection_contract.rs (OpenRCAD\target\debug\deps\boolean_intersection_contract-353240d4a777e0e6.exe)
+
+running 3 tests
+test disjoint_union_needs_no_surface_intersection_budget ... ok
+test recursive_surface_intersection_observes_cancellation ... ok
+test exhausted_intersection_rejects_both_boolean_contracts_without_changing_operands ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\boolean_robustness_matrix.rs (OpenRCAD\target\debug\deps\boolean_robustness_matrix-96badd998ce492c2.exe)
+
+running 16 tests
+test blind_counterbore_over_through_bore ... ok
+test coaxial_concentric_boss_union ... ok
+test coaxial_recut_existing_hole ... ok
+test coplanar_flush_through_cut ... ok
+test coplanar_two_box_flush_union ... ok
+test cyl_cut_blind_pocket ... ok
+test coincident_cylinder_fills_bore_back_to_one_box ... ok
+test cyl_cut_blind_pocket_with_flush_tool_cap ... ok
+test cyl_cut_oblique_axis ... ok
+test cyl_cut_oblique_axis_corner_exit ... ok
+test cyl_cut_straddling_bite ... ok
+test cyl_cut_scaled_through_hole_regression ... ok
+test cyl_join_boss_straddling_edge ... ok
+test cyl_join_coplanar_boss ... ok
+test cyl_cut_through_drill ... ok
+test near_coincident_cut_snaps_clean ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests\circular_blend.rs (OpenRCAD\target\debug\deps\circular_blend-43f419cb94ba7903.exe)
+
+running 10 tests
+test bite_arc_fillet_is_deterministic ... ok
+test bite_arc_open_chain_fillet_is_watertight_flush_and_crack_free ... ok
+test bored_hole_rim_chamfer_is_watertight_with_cone ... ok
+test bored_hole_rim_fillet_is_watertight_with_torus ... ok
+test cylinder_top_rim_chamfer_is_watertight_with_cone ... ok
+test cylinder_top_rim_fillet_is_watertight_with_torus ... ok
+test oversized_bite_arc_fillet_fails_safely ... ok
+test oversized_rim_fillet_fails_and_leaves_input_untouched ... ok
+test rim_fillet_is_deterministic ... ok
+test bite_arc_open_chain_chamfer_is_watertight_flush_and_crack_free ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests\closed_box_shell.rs (OpenRCAD\target\debug\deps\closed_box_shell-0fa67960415e4f2f.exe)
+
+running 1 test
+test closed_box_shell_preserves_material_moments_and_directed_boundaries ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests\concave_blend.rs (OpenRCAD\target\debug\deps\concave_blend-42ab3d4eefa6fc34.exe)
+
+running 7 tests
+test concave_chamfer_adds_beveled_corner_material ... ok
+test concave_fillet_adds_rounded_corner_material ... ok
+test concave_fillet_on_flush_cut_pocket ... ok
+test convex_edge_on_pocketed_block_still_subtracts ... ok
+test pocket_top_inner_wire_edge_chamfer_succeeds ... ok
+test pocket_top_inner_wire_edge_fillet_succeeds ... ok
+test equal_radius_concave_fillets_miter_in_both_orders ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.40s
+
+     Running tests\corner_flow.rs (OpenRCAD\target\debug\deps\corner_flow-a2cc0cf4f7a5afe6.exe)
+
+running 4 tests
+test arc_then_straight_fillets_flow_through_the_corner ... ok
+test corner_flow_is_order_independent ... ok
+test sequential_chamfer_after_straight_fillet_degrades_safely ... ok
+test straight_then_arc_fillets_flow_through_the_corner ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+
+     Running tests\corner_network_fillet.rs (OpenRCAD\target\debug\deps\corner_network_fillet-ce1fe5b9ab520123.exe)
+
+running 5 tests
+test corner_network_operation_reports_complete_face_and_edge_history ... ok
+test four_through_six_valent_corners_are_selection_order_independent ... ok
+test four_through_six_valent_corner_meshes_use_shared_boundaries ... ok
+test incomplete_and_unverified_corner_networks_reject_before_mutation ... ok
+test four_through_six_valent_pyramid_corners_pass_the_mandatory_sweep ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+     Running tests\cut_coincident_cap.rs (OpenRCAD\target\debug\deps\cut_coincident_cap-b3b0895686d6b780.exe)
+
+running 3 tests
+test coaxial_tool_flush_with_cap_changes_nothing ... ok
+test coaxial_tool_into_cap_removes_exact_annulus ... ok
+test overlapping_second_bore_currently_fails_validation_cleanly ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests\cut_support_face.rs (OpenRCAD\target\debug\deps\cut_support_face-20db5a89c9f50ab2.exe)
+
+running 1 test
+test circular_cut_touching_support_preserves_its_disk_winding ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests\edge_param_consistency.rs (OpenRCAD\target\debug\deps\edge_param_consistency-c7f0cb591ce2270d.exe)
+
+running 3 tests
+test shell_rebuilt_coedges_preserve_raw_and_oriented_parameters ... ok
+test smooth_loft_generated_coedges_preserve_raw_oriented_and_pcurve_parameters ... ok
+test circular_bite_fillet_edges_are_param_consistent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
+     Running tests\fillet_overflow.rs (OpenRCAD\target\debug\deps\fillet_overflow-6e885912f7174259.exe)
+
+running 6 tests
+test overflow_that_consumes_the_profile_rejects_atomically ... ok
+test curved_successor_rejects_instead_of_approximating_the_contact ... ok
+test planar_overflow_continues_across_multiple_successive_faces ... ok
+test planar_overflow_has_the_requested_radius_and_volume ... ok
+test planar_overflow_operation_has_complete_history_without_pcurve_recovery ... ok
+test planar_overflow_holds_across_scale_aspect_rotation_and_far_origin ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests\perf_tessellate.rs (OpenRCAD\target\debug\deps\perf_tessellate-7972e7acc714c075.exe)
+
+running 1 test
+test perf_tessellate_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.76s
+
+     Running tests\repro_chained_boolean.rs (OpenRCAD\target\debug\deps\repro_chained_boolean-95d5591628104037.exe)
+
+running 2 tests
+test chained_difference_removes_only_its_tools ... ok
+test chained_union_accumulates_every_tool ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\repro_circular_bite.rs (OpenRCAD\target\debug\deps\repro_circular_bite-8dbe0f14edde03f1.exe)
+
+running 2 tests
+test straddling_cylinder_cut_keeps_analytic_bite_wall ... ok
+test straddling_cylinder_cut_is_watertight_and_healthy ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests\repro_curved_wall_runout.rs (OpenRCAD\target\debug\deps\repro_curved_wall_runout-1a968b141e4170e8.exe)
+
+running 1 test
+test fillet_planar_edge_runs_out_into_tangent_curved_wall ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests\repro_cut_fillet.rs (OpenRCAD\target\debug\deps\repro_cut_fillet-313bdb7de3508648.exe)
+
+running 7 tests
+test fillet_away_from_cut_is_unaffected ... ok
+test fillet_into_cut_oversized_radius_is_graceful ... ok
+test chamfer_into_cut_trims_flush_and_keeps_cut_clean ... ok
+test seam_crossing_cut_merges_to_one_face_and_fillets_flush ... ok
+test zerocad_circular_bite_chamfer_into_cut_stays_analytic ... ok
+test fillet_into_cut_trims_flush_and_keeps_cut_clean ... ok
+test zerocad_circular_bite_fillet_into_cut_stays_analytic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+     Running tests\repro_cylinder.rs (OpenRCAD\target\debug\deps\repro_cylinder-a9b340d79100e6fe.exe)
+
+running 4 tests
+test native_cylinder_blind_pocket_is_watertight ... ok
+test native_cylinder_as_cut_object_is_watertight ... ok
+test native_cylinder_boss_union_is_watertight ... ok
+test native_cylinder_through_drill_is_watertight ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\repro_fillet.rs (OpenRCAD\target\debug\deps\repro_fillet-089deb6c62f96bc1.exe)
+
+running 6 tests
+test fillet_one_box_edge_closed ... ok
+test fillet_thin_plate_edge_closed ... ok
+test fillet_top_edge_of_a_face_that_has_a_bored_hole ... ok
+test fillet_edge_of_union_result ... ok
+test fillet_various_radii_on_plate ... ok
+test filleted_box_tessellation_is_crack_free ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+
+     Running tests\repro_fillet_then_cut.rs (OpenRCAD\target\debug\deps\repro_fillet_then_cut-e5e976c5342d7bcc.exe)
+
+running 2 tests
+test faceted_cylinder_cuts_through_filleted_box_edge ... ok
+test smooth_cylinder_cuts_through_filleted_box_edge ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.32s
+
+     Running tests\repro_gui_cracks.rs (OpenRCAD\target\debug\deps\repro_gui_cracks-e93a89f725bd6926.exe)
+
+running 3 tests
+test diag_boss_union ... ok
+test diag_prism_plain ... ok
+test diag_prism_filleted ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests\repro_pocket_tangent_chain.rs (OpenRCAD\target\debug\deps\repro_pocket_tangent_chain-a637226f5199df4f.exe)
+
+running 4 tests
+test rounded_pocket_inner_rim_fillet_is_fail_safe ... ok
+test rounded_pocket_inner_rim_chamfer_is_fail_safe ... ok
+test tangent_pocket_inner_rim_chamfer_is_fail_safe ... ok
+test tangent_pocket_inner_rim_fillet_is_fail_safe ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\repro_prism_boss_fillet.rs (OpenRCAD\target\debug\deps\repro_prism_boss_fillet-1cf3dc14b6203bab.exe)
+
+running 6 tests
+test fillet_acute_prism_corner_edge ... ok
+test debug_dump_fused_faces ... ok
+test fillet_obtuse_prism_corner_edge ... ok
+test fillet_boss_plane_seam_edge ... ok
+test fillet_prism_top_edge_with_boss_bite ... ok
+test fillet_sharp_prism_corner_edge ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests\repro_screenshots.rs (OpenRCAD\target\debug\deps\repro_screenshots-7c73ae40ef650a2b.exe)
+
+running 6 tests
+test corner_overlap_union_is_watertight ... ok
+test cube_union_loops_are_all_contiguous ... ok
+test rotated_box_cut_is_watertight ... ok
+test thin_plate_l_union_is_watertight ... ok
+test control_clean_cube_union_is_watertight ... ok
+test thin_plate_slot_cut_is_watertight ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests\repro_sequential_fillet.rs (OpenRCAD\target\debug\deps\repro_sequential_fillet-9d1e74ba702e6305.exe)
+
+running 12 tests
+test fillet_three_edges_makes_spherical_corner ... ok
+test fillet_all_four_top_edges_in_one_call ... ok
+test fillet_two_parallel_top_edges ... ok
+test fillet_top_edge_into_existing_vertical_round ... ok
+test fillet_two_perpendicular_in_one_call ... ok
+test fillet_two_perpendicular_makes_miter_seam ... ok
+test fillet_two_perpendicular_top_edges ... ok
+test fillet_two_unequal_radius_perpendicular_corner ... ok
+test miter_tessellation_is_manifold_across_aspect_ratios ... ok
+test fillet_two_unequal_radius_perpendicular_corner_larger_second_radius ... ok
+test three_edge_corner_planner_holds_across_scale_rotation_and_far_origin ... ok
+test three_edge_corner_is_selection_order_independent ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.05s
+
+     Running tests\robustness.rs (OpenRCAD\target\debug\deps\robustness-717f50ddc6e3d194.exe)
+
+running 12 tests
+test chamfer_rotated_box_is_watertight ... ok
+test blind_pocket_cut_should_be_watertight ... ok
+test checked_boolean_accepts_side_drill ... ok
+test corner_overlap_intersection_is_watertight ... ok
+test enclosed_void_cut_is_closed ... ok
+test corner_overlap_union_should_be_watertight ... ok
+test fillet_rotated_box_is_watertight ... ok
+test fillet_rotated_cylinder_is_watertight ... ok
+test rotated_tool_partial_cut_should_be_watertight ... ok
+test face_flush_union_is_watertight ... ok
+test shell_rotated_box_open_face_is_watertight ... ok
+test through_side_drill_should_be_closed ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests\shell_concave.rs (OpenRCAD\target\debug\deps\shell_concave-e4d08f2715801e46.exe)
+
+running 3 tests
+test l_prism_shell_is_atomic_watertight_and_measured ... ok
+test oversized_concave_shell_reports_its_typed_failure ... ok
+test concave_shell_full_scale_aspect_rotation_and_origin_sweep ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.49s
+
+     Running tests\shell_feasibility_gate.rs (OpenRCAD\target\debug\deps\shell_feasibility_gate-791d1cb7a2f3d0d1.exe)
+
+running 3 tests
+test stage4c_retains_its_explicit_review_and_all_prerequisites_are_green ... ok
+test wave4_support_matrices_are_complete_and_record_the_verified_4c_subset ... ok
+test wave4_topology_pcurve_and_self_intersection_contracts_are_explicit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\shell_torus_band.rs (OpenRCAD\target\debug\deps\shell_torus_band-6f7ae442fda933ea.exe)
+
+running 7 tests
+test far_origin_torus_source_transform_is_bounded ... ok
+test far_origin_raw_torus_band_shell_candidate_is_bounded_and_watertight ... ok
+test torus_band_collapse_rejects_before_mutating_the_source ... ok
+test shell_crosses_constant_radius_torus_band_atomically ... ok
+test torus_band_shell_holds_at_large_far_origin ... ok
+test torus_band_shell_holds_at_small_scale ... ok
+test torus_band_shell_holds_under_arbitrary_rotation ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     Running tests\shell_wave4_contract.rs (OpenRCAD\target\debug\deps\shell_wave4_contract-779df492102ae403.exe)
+
+running 12 tests
+test cylinder_seam_crossing_fixture_is_pinned_before_mixed_shell ... ok
+test primitive_shell_paths_remain_reachable_measured_and_crack_free ... ok
+test cut_derived_shell_normals_are_material_checked_across_scale_and_origin ... ok
+test primitive_shells_hold_across_scale_and_far_origin ... ok
+test stage4a_shells_a_block_with_a_cylindrical_boss ... ok
+test stage4a_shells_a_drilled_block_with_mixed_plane_cylinder_supports ... ok
+test stage4b_cone_and_sphere_hold_across_scale_and_far_origin ... ok
+test stage4b_rejects_disappearing_cone_and_sphere_offsets_atomically ... ok
+test stage4a_mixed_shell_holds_across_scale_aspect_and_far_origin ... ok
+test stage4b_shells_a_spherical_dome_on_a_planar_body ... ok
+test stage4b_shells_a_truncated_cone_with_measured_analytic_thickness ... ok
+test stage4b_shells_a_countersunk_block_across_cone_cylinder_transitions ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+
+     Running tests\smooth_loft.rs (OpenRCAD\target\debug\deps\smooth_loft-5ad77e52313dd9d3.exe)
+
+running 8 tests
+test smooth_loft_matches_reordered_holes_uniquely ... ok
+test smooth_loft_rejects_a_twisted_self_intersecting_correspondence ... ok
+test smooth_loft_rejects_an_interpolation_with_non_positive_homogeneous_weights ... ok
+test smooth_loft_rejects_coincident_and_reversed_section_order ... ok
+test smooth_loft_rejects_topology_change_before_building_a_candidate ... ok
+test smooth_loft_interpolates_two_through_five_exact_sections ... ok
+test smooth_loft_unifies_degree_knots_and_non_unit_weights_exactly ... ok
+test smooth_loft_scale_and_far_origin_sweep_is_valid ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests\split_scale_operation_gate.rs (OpenRCAD\target\debug\deps\split_scale_operation_gate-c68b18bc7e875387.exe)
+
+running 2 tests
+test transform_orientation_flag_must_match_the_matrix ... ok
+test common_split_and_scale_share_the_strict_operation_gate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.90s
+
+     Running tests\tolerance_scale_sweep.rs (OpenRCAD\target\debug\deps\tolerance_scale_sweep-ebe5a8fef0804c67.exe)
+
+running 1 test
+test booleans_hold_across_scale_aspect_and_far_origin_sweeps ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+
+     Running tests\torus_band_intersection.rs (OpenRCAD\target\debug\deps\torus_band_intersection-3a61cf65199d4f0d.exe)
+
+running 2 tests
+test generic_intersection_stops_at_the_exact_work_budget ... ok
+test exact_torus_transition_matrix_survives_scale_rotation_and_far_origin ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\translated_boolean_bounds.rs (OpenRCAD\target\debug\deps\translated_boolean_bounds-6a61063cf4abeca7.exe)
+
+running 1 test
+test translated_overlapping_boxes_preserve_all_three_boolean_volumes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running unittests src\lib.rs (OpenRCAD\target\debug\deps\openrcad_topo-141d2dde44015f97.exe)
+
+running 48 tests
+test arena::tests::merge_still_dedups_coincident_vertices ... ok
+test arena::tests::merge_extreme_and_nonfinite_points_does_not_panic_or_merge ... ok
+test builder::tests::ordered_clamp_accepts_reversed_surface_bounds ... ok
+test arena::tests::merging_opposite_edges_preserves_coedge_and_pcurve_directions ... ok
+test builder::tests::split_edge_keeps_both_loops_contiguous_across_a_shared_seam ... ok
+test builder::tests::split_edge_splits_each_coedges_independent_pcurve_range ... ok
+test builder::tests::test_partition_face_3_anchor ... ok
+test builder::tests::test_partition_face_4_anchor ... ok
+test builder::tests::test_split_edge ... ok
+test containment::tests::near_sliver_edge_is_stable ... ok
+test containment::tests::unit_square_classifies_corners_and_centre ... ok
+test builder::tests::test_split_face ... ok
+test edge::tests::rotated_segment_keeps_length ... ok
+test edge::tests::segment_carries_a_line_and_endpoints ... ok
+test edge::tests::transformed_moves_endpoints_and_curve ... ok
+test face::tests::face_exposes_its_wires ... ok
+test face::tests::face_with_hole_has_outer_and_inner ... ok
+test face::tests::transformed_face_moves_surface_and_wire ... ok
+test history::tests::history_queries_split_merge_and_deletion ... ok
+test pcurve::tests::cylinder_section_scale_preserves_angle_and_scales_axial_distance ... ok
+test pcurve::tests::diagonal_surface_scale_maps_line_pcurves_exactly ... ok
+test pcurve::tests::periodic_seam_keeps_an_unwrapped_curve_continuous ... ok
+test pcurve::tests::splitting_preserves_independent_ranges_and_periodicity ... ok
+test shape::tests::dimensions ... ok
+test shell::tests::empty_shell_is_default ... ok
+test solid::tests::bounding_box_covers_vertices ... ok
+test solid::tests::connected_boundary_stays_one_body ... ok
+test solid::tests::conservative_bounds_cover_cylindrical_extrema_beyond_vertices ... ok
+test solid::tests::disjoint_faces_split_into_separate_bodies ... ok
+test solid::tests::triangle_dedups_to_3_vertices_and_3_edges ... ok
+test solid::tests::edge_sharing_faces_stay_one_body ... ok
+test validate::tests::assert_valid_panics_on_broken_loop - should panic ... ok
+test validate::tests::closed_two_faces_share_all_edges ... ok
+test validate::tests::consistent_face_pcurves_pass_validation ... ok
+test validate::tests::health_report_flags_degenerate_edge ... ok
+test validate::tests::health_report_includes_validation_errors ... ok
+test validate::tests::non_contiguous_loop_is_detected ... ok
+test validate::tests::pcurve_surface_edge_mismatch_is_rejected ... ok
+test validate::tests::open_square_is_not_watertight ... ok
+test validate::tests::strict_validation_rejects_free_edges ... ok
+test validate::tests::strict_validation_rejects_disconnected_closed_components ... ok
+test validate::tests::strict_validation_rejects_non_manifold_edge_uses ... ok
+test validate::tests::strict_validation_rejects_same_direction_shared_coedges ... ok
+test validate::tests::two_semicircle_arcs_of_one_circle_are_distinct_edges ... ok
+test wire::tests::open_path_is_not_closed ... ok
+test wire::tests::reversed_boundary_coedges_use_oriented_endpoints_for_closure ... ok
+test validate::tests::valid_square_solid_passes ... ok
+test wire::tests::square_loop_is_closed ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests openrcad_algo
+
+running 4 tests
+test crates\openrcad-algo\src\facade.rs - facade (line 6) ... ok
+test crates\openrcad-algo\src\facade.rs - facade::SolidExt (line 33) ... ok
+test crates\openrcad-algo\src\lib.rs - boolean (line 84) ... ok
+test crates\openrcad-algo\src\lib.rs - fillet (line 168) ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s
+
+   Doc-tests openrcad_topo
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

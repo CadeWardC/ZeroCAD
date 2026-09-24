@@ -42,7 +42,6 @@ fn geometry_safety_net_is_enabled() {
         .parent()
         .expect("zerocad-core must be inside the workspace");
     let roots = [workspace.join("zerocad-core"), workspace.join("OpenRCAD")];
-    let allowed = Path::new("src/parametric/tests/reattachment_matrix.rs");
     let mut ignored = Vec::new();
     for root in roots {
         let mut files = Vec::new();
@@ -51,10 +50,6 @@ fn geometry_safety_net_is_enabled() {
             let text = fs::read_to_string(&file).expect("test source must be readable");
             for (index, line) in text.lines().enumerate() {
                 if line.trim_start().starts_with("#[ignore") {
-                    let relative = file.strip_prefix(&root).expect("file below scan root");
-                    if root.ends_with("zerocad-core") && relative == allowed {
-                        continue;
-                    }
                     ignored.push(format!("{}:{}", file.display(), index + 1));
                 }
             }

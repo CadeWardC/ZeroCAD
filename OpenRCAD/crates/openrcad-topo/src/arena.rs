@@ -195,12 +195,24 @@ impl BRep {
         // always land in the same or an adjacent cell, so the 27-neighbour
         // probe sees every candidate the old full scan would have.
         let cell = tol.max(1e-12);
+        // Keys live in a central band of i64 so the ±1 neighbour probes below
+        // can never overflow. Finite coordinates beyond the band (and NaN/inf,
+        // which cannot participate in tolerance matching at all) saturate to
+        // the band edge: sharing a bucket only produces merge *candidates*,
+        // and the exact `is_equal` distance test still rejects them, so
+        // saturation never merges distinct points — it merely keeps extreme
+        // finite inputs from panicking the neighbour arithmetic.
+        const KEY_LIMIT: i64 = i64::MAX / 4;
         let key_of = |p: &Pnt| -> (i64, i64, i64) {
-            (
-                (p.x() / cell).floor() as i64,
-                (p.y() / cell).floor() as i64,
-                (p.z() / cell).floor() as i64,
-            )
+            let axis_key = |v: f64| -> i64 {
+                let scaled = v / cell;
+                if scaled.is_finite() {
+                    (scaled.floor() as i64).clamp(-KEY_LIMIT, KEY_LIMIT)
+                } else {
+                    KEY_LIMIT
+                }
+            };
+            (axis_key(p.x()), axis_key(p.y()), axis_key(p.z()))
         };
         let mut vgrid: std::collections::HashMap<(i64, i64, i64), Vec<VertexId>> =
             std::collections::HashMap::new();
@@ -253,6 +265,7 @@ impl BRep {
             }
 
             // 2. Merge and deduplicate edges
+            let mut edge_reversals = std::collections::HashMap::new();
             for (e_id, e_data) in &other.edges {
                 let new_start = map.vertices[&e_data.start];
                 let new_end = map.vertices[&e_data.end];
@@ -298,6 +311,14 @@ impl BRep {
                     ebuckets.entry(bkey).or_default().push(id);
                     id
                 };
+                let representative = &self.edges[new_id];
+                let reversed = if new_start == new_end {
+                    (representative.last - representative.first) * (e_data.last - e_data.first)
+                        < 0.0
+                } else {
+                    representative.start != new_start
+                };
+                edge_reversals.insert(e_id, reversed);
                 map.edges.insert(e_id, new_id);
             }
 
@@ -313,10 +334,25 @@ impl BRep {
                 let new_edges: Vec<OrientedEdge> = l_data
                     .edges
                     .iter()
-                    .map(|&oe| OrientedEdge {
-                        id: map.edges[&oe.id],
-                        orientation: oe.orientation,
-                        pcurve: oe.pcurve.map(|id| map.pcurves[&id]),
+                    .map(|&oe| {
+                        let reversed = edge_reversals[&oe.id];
+                        let pcurve = oe.pcurve.map(|id| {
+                            let mapped = map.pcurves[&id];
+                            if reversed {
+                                self.pcurves.insert(self.pcurves[mapped].reversed())
+                            } else {
+                                mapped
+                            }
+                        });
+                        OrientedEdge {
+                            id: map.edges[&oe.id],
+                            orientation: if reversed {
+                                oe.orientation.reversed()
+                            } else {
+                                oe.orientation
+                            },
+                            pcurve,
+                        }
                     })
                     .collect();
                 let new_id = self.loops.insert(LoopData { edges: new_edges });
@@ -566,5 +602,142 @@ impl MergeMap {
             shells: std::collections::HashMap::new(),
             solids: std::collections::HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openrcad_foundation::Pnt;
+
+    #[test]
+    fn merging_opposite_edges_preserves_coedge_and_pcurve_directions() {
+        use openrcad_foundation::{Dir, Dir2d, Pnt2d};
+        use openrcad_geom::Line;
+        use openrcad_geom2d::{GeomCurve2d, Line2d};
+
+        for reverse_order in [false, true] {
+            let arenas: Vec<_> = [reverse_order, !reverse_order]
+                .into_iter()
+                .map(|reverse| {
+                    let mut arena = arena_with_points(&[Pnt::origin(), Pnt::new(1., 0., 0.)]);
+                    let vertices: Vec<_> = arena.vertices.keys().collect();
+                    let (a, b) = if reverse { (1, 0) } else { (0, 1) };
+                    let edge = arena.edges.insert(EdgeData {
+                        curve: Some(GeomCurve::line(Line::from_point_dir(
+                            Pnt::origin(),
+                            Dir::dx(),
+                        ))),
+                        first: a as f64,
+                        last: b as f64,
+                        start: vertices[a],
+                        end: vertices[b],
+                        tolerance: 1e-9,
+                    });
+                    let pcurve = arena.pcurves.insert(PcurveData::new(
+                        GeomCurve2d::line(Line2d::from_point_dir(Pnt2d::origin(), Dir2d::dx())),
+                        a as f64,
+                        b as f64,
+                    ));
+                    arena.loops.insert(LoopData {
+                        edges: vec![OrientedEdge {
+                            id: edge,
+                            orientation: Orientation::Forward,
+                            pcurve: Some(pcurve),
+                        }],
+                    });
+                    arena
+                })
+                .collect();
+            let mut merged = BRep::new();
+            let maps = merged.merge_many(&[&arenas[0], &arenas[1]]);
+            assert_eq!(
+                merged.edges.len(),
+                1,
+                "identical spans must still share one edge"
+            );
+            for (index, source) in arenas.iter().enumerate() {
+                let loop_id = source.loops.keys().next().unwrap();
+                let coedge = merged.loops[maps[index].loops[&loop_id]].edges[0];
+                let edge = &merged.edges[coedge.id];
+                let pcurve = &merged.pcurves[coedge.pcurve.unwrap()];
+                let reversed = coedge.orientation == Orientation::Reversed;
+                let start = if reversed { edge.end } else { edge.start };
+                let end = if reversed { edge.start } else { edge.end };
+                let original = &source.edges[source.loops[loop_id].edges[0].id];
+                assert_eq!(
+                    merged.vertices[start].point,
+                    source.vertices[original.start].point
+                );
+                assert_eq!(
+                    merged.vertices[end].point,
+                    source.vertices[original.end].point
+                );
+                assert_eq!(
+                    if reversed { pcurve.last } else { pcurve.first },
+                    original.first
+                );
+                assert_eq!(
+                    if reversed { pcurve.first } else { pcurve.last },
+                    original.last
+                );
+            }
+        }
+    }
+
+    fn arena_with_points(points: &[Pnt]) -> BRep {
+        let mut brep = BRep::new();
+        for &p in points {
+            brep.vertices.insert(VertexData {
+                point: p,
+                tolerance: 1e-7,
+            });
+        }
+        brep
+    }
+
+    /// Extreme finite and non-finite coordinates must not panic the neighbour
+    /// probe (`key ± 1`) of `merge_many` — they saturate into a safe key band
+    /// and the exact distance test still decides every merge (regression for
+    /// the huge-dimension/NaN-depth arena overflow).
+    #[test]
+    fn merge_extreme_and_nonfinite_points_does_not_panic_or_merge() {
+        let extreme = arena_with_points(&[
+            Pnt::new(1.0e300, 0.0, 0.0),
+            Pnt::new(f64::MAX, f64::MIN, 0.0),
+            Pnt::new(-1.0e250, 1.0e250, -1.0e250),
+        ]);
+        let mut host = arena_with_points(&[Pnt::origin()]);
+        let maps = host.merge_many(&[&extreme, &extreme]);
+        assert_eq!(maps.len(), 2);
+        // None of the extreme points is within tolerance of the origin or of
+        // each other, so the first merge inserts all three. The second merge
+        // of the SAME arena then finds each point exactly equal to its own
+        // earlier insertion and maps onto it: 1 origin + 3 inserted.
+        assert_eq!(host.vertices.len(), 4);
+        assert!(maps.iter().all(|map| map.vertices.len() == 3));
+
+        let nonfinite = arena_with_points(&[
+            Pnt::new(f64::NAN, 0.0, 0.0),
+            Pnt::new(f64::INFINITY, f64::NEG_INFINITY, 0.0),
+        ]);
+        let mut host2 = arena_with_points(&[Pnt::origin()]);
+        host2.merge_many(&[&nonfinite]);
+        // NaN/inf never satisfy the tolerance equality, so all three vertices
+        // survive as distinct entries.
+        assert_eq!(host2.vertices.len(), 3);
+    }
+
+    /// Ordinary tolerance deduplication must keep working exactly as before
+    /// the key band was introduced.
+    #[test]
+    fn merge_still_dedups_coincident_vertices() {
+        let mut host = arena_with_points(&[Pnt::new(0.0, 0.0, 0.0)]);
+        let near = arena_with_points(&[Pnt::new(3e-10, -4e-10, 1e-10), Pnt::new(5.0, 0.0, 0.0)]);
+        let maps = host.merge_many(&[&near]);
+        // The coincident point merged onto the host origin; only the far point
+        // inserted a new vertex.
+        assert_eq!(host.vertices.len(), 2);
+        assert_eq!(maps[0].vertices.len(), 2);
     }
 }

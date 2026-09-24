@@ -834,6 +834,24 @@ pub(crate) fn build_analytic_extrusion_solid<P>(
     depth: f64,
     cs: &crate::geometry::CoordinateSystem,
 ) -> Option<KernelSolid> {
+    build_analytic_prism(region, depth, cs, false)
+}
+
+/// Section faces will be combined and oriented by one final global sew.
+pub(crate) fn build_analytic_section_solid<P>(
+    region: &openrcad::sketch::ArrangementRegion<P>,
+    depth: f64,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Option<KernelSolid> {
+    build_analytic_prism(region, depth, cs, true)
+}
+
+fn build_analytic_prism<P>(
+    region: &openrcad::sketch::ArrangementRegion<P>,
+    depth: f64,
+    cs: &crate::geometry::CoordinateSystem,
+    section: bool,
+) -> Option<KernelSolid> {
     if region.outer.spans.len() < 2 || depth.abs() < f64::EPSILON {
         return None;
     }
@@ -841,7 +859,16 @@ pub(crate) fn build_analytic_extrusion_solid<P>(
     let inners: Vec<Wire> = region
         .holes
         .iter()
-        .map(|hole| analytic_loop_to_wire(hole, cs))
+        .map(|hole| {
+            let wire = analytic_loop_to_wire(hole, cs)?;
+            Some(
+                if section && hole.signed_area * region.outer.signed_area > 0. {
+                    Wire::from_edges(wire.edges().into_iter().rev().map(|edge| edge.reversed()))
+                } else {
+                    wire
+                },
+            )
+        })
         .collect::<Option<_>>()?;
     let outer_points: Vec<Pnt> = region
         .outer
@@ -878,13 +905,19 @@ pub(crate) fn build_analytic_extrusion_solid<P>(
             .map_err(|error| log::warn!("analytic sketch exact regularization failed: {error}"))
             .ok();
     }
-    let direct = consume_operation(
-        "analytic sketch prism extrusion",
-        openrcad::algo::prism::prism_operation(&face, sweep),
-    );
+    let operation = if section {
+        openrcad::algo::prism::prism_operation_for_sections(
+            &face,
+            sweep,
+            &openrcad::foundation::TolerancePolicy::STANDARD,
+        )
+    } else {
+        openrcad::algo::prism::prism_operation(&face, sweep)
+    };
+    let direct = consume_operation("analytic sketch prism extrusion", operation);
     match direct {
         Ok(outcome) => Some(outcome.solid),
-        Err(direct_error) if !inners.is_empty() => {
+        Err(direct_error) if !inners.is_empty() && !section => {
             log::warn!(
                 "{direct_error}; retrying as exact outer-minus-void solids to regularize shared text contours"
             );

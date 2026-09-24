@@ -148,16 +148,14 @@ impl DimInput {
 pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
     let fields: &[bool] = match tool {
         SketchTool::Rectangle | SketchTool::RectangleCenter => &[false, false],
-        SketchTool::Circle => &[false],
+        SketchTool::Circle | SketchTool::Ellipse | SketchTool::ThreePointEllipse => &[false],
         SketchTool::PolygonInscribed | SketchTool::PolygonCircumscribed => &[false],
         SketchTool::Line => &[false, true],
-        // 3-point tools (rotated rectangle, 3-point circle, ellipses) draw by
+        // Other 3-point tools (rotated rectangle, 3-point circle) draw by
         // clicking points; the corner tools (fillet/chamfer) take their radius
         // from the toolbar. None use inline dimension fields.
         SketchTool::RectangleThreePoint
         | SketchTool::ThreePointCircle
-        | SketchTool::Ellipse
-        | SketchTool::ThreePointEllipse
         | SketchTool::Slot
         | SketchTool::Offset
         | SketchTool::Trim
@@ -257,7 +255,7 @@ impl ZeroCadApp {
         if changed {
             if let Some(dimension) = parsed_dimension.clone() {
                 if self.set_live_constraint_dimension(constraint_id, dimension) {
-                    self.solve_live_sketch();
+                    self.rebuild_active_sketch_curves_throttled();
                 }
             }
         }
@@ -265,7 +263,11 @@ impl ZeroCadApp {
         let enter = ctx.input(|input| input.key_pressed(egui::Key::Enter));
         let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
         if enter && !accepted_via_key {
-            if parsed_dimension.is_some() {
+            if let Some(dimension) = parsed_dimension {
+                if !self.set_live_constraint_dimension(constraint_id, dimension) {
+                    return;
+                }
+                self.rebuild_active_sketch_curves();
                 self.sketch_dimension_editor = None;
                 self.autocomplete = None;
                 self.status_msg =
@@ -275,21 +277,10 @@ impl ZeroCadApp {
                     "Enter a valid number, expression, or defined variable.".to_string();
             }
         } else if escape {
-            if let Some(model) = &mut self.sketch_solver_model {
-                model
-                    .constraints
-                    .retain(|constraint| constraint.id() != constraint_id);
-                model
-                    .driven_dimensions
-                    .retain(|candidate| *candidate != constraint_id);
-            }
-            self.sketch_dimension_positions.remove(&constraint_id);
-            self.sketch_selected_constraint = None;
-            self.sketch_dimension_editor = None;
+            // Restore geometry as well as the driver (which may have existed
+            // before placement). Removing an equation cannot undo solved motion.
+            self.undo_last_sketch_action();
             self.autocomplete = None;
-            // The placement snapshot was pushed immediately before creation.
-            self.working_sketch_undo.pop();
-            self.solve_live_sketch();
             self.status_msg =
                 "Dimension cancelled — the Dimension tool remains active.".to_string();
         }
@@ -493,7 +484,9 @@ impl ZeroCadApp {
                 if all_locked {
                     let start = self.sketch_temp_start.unwrap_or((0.0, 0.0));
                     let cursor = self.last_cursor.unwrap_or((start.0 + 1.0, start.1 + 1.0));
-                    self.finalize_shape(cursor);
+                    if !self.advance_ellipse_axis(cursor) {
+                        self.finalize_shape(cursor);
+                    }
                 }
             }
         }
@@ -618,6 +611,42 @@ mod tests {
             let fields = dim_fields_for(tool);
             assert_eq!(fields.len(), 1);
             assert!(!fields[0].is_angle);
+        }
+    }
+
+    #[test]
+    fn ellipse_enter_advances_axis_before_committing_shape() {
+        for tool in [SketchTool::Ellipse, SketchTool::ThreePointEllipse] {
+            let mut app = ZeroCadApp::new();
+            app.is_sketch_mode = true;
+            app.active_tool = Some(tool);
+            app.sketch_points.push((0.0, 0.0));
+            app.sketch_temp_start = Some((0.0, 0.0));
+            app.last_cursor = Some((10.0, 0.0));
+            let mut dim = dimension_input(None);
+            dim.fields = dim_fields_for(tool);
+            dim.fields[0].value = "20".into();
+            dim.fields[0].edited = true;
+            app.dim_input = Some(dim);
+            let ctx = egui::Context::default();
+            let enter = || egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(enter(), |ctx| app.show_dimension_dialog(ctx));
+            assert_eq!(app.sketch_points, vec![(0.0, 0.0), (20.0, 0.0)]);
+            assert!(app.sketch_shapes.is_empty());
+            app.dim_input.as_mut().unwrap().fields[0].value = "5".into();
+            app.last_cursor = Some((0.0, 5.0));
+            let _ = ctx.run(enter(), |ctx| app.show_dimension_dialog(ctx));
+            assert_eq!(app.sketch_shapes.len(), 1);
+            assert!(app.dim_input.is_none());
         }
     }
 

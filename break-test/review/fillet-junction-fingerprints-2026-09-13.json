@@ -1,0 +1,5 @@
+{
+  "OpenRCAD/crates/openrcad-algo/src/rolling_ball.rs": "c2e39d3295dbdc8b968926e9af0188ed8077b53fb90a8808185f17cba78ca840",
+  "zerocad-core/tests/repro_prism_boss_fillet.rs": "0a8f9013cee26c26428b44dbbcc772ef30bd41725a7b4a8853f5844a193faf32",
+  "zerocad-core/src/zcad_format.rs": "6f71c6ca925cd9db878866171539f2da9bc3633d0fa2dadea6212edad08a0c65"
+}

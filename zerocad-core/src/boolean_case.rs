@@ -16,6 +16,9 @@ use std::fmt;
 const CASE_MAGIC: &[u8; 8] = b"ZBCV1\0\0\0";
 const MAX_ABS_LOG_SCALE: i8 = 9;
 
+#[path = "boolean_case_v2.rs"]
+pub mod v2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BooleanVerificationOp {
@@ -192,8 +195,27 @@ pub struct BooleanReplaySummary {
 }
 
 impl BooleanCaseV1 {
+    /// Geometric observation for external differential comparison of V1 cases.
+    pub fn observe(&self) -> Result<v2::GeometryObservation, String> {
+        self.validate().map_err(|e| e.to_string())?;
+        let scale = 10.0f64.powi(self.logarithmic_scale as i32);
+        let object = build_operand(&self.object, scale).map_err(|e| e.to_string())?;
+        let tool = build_operand(&self.tool, scale).map_err(|e| e.to_string())?;
+        let result = boolean_bodies_operation_with_classes_policy_and_cancel(
+            &object,
+            &tool,
+            self.operation.kernel(),
+            None,
+            None,
+            &TolerancePolicy::STANDARD,
+            &openrcad::foundation::NeverCancelled,
+        )
+        .map_err(|e| e.to_string())?;
+        v2::observe_bodies(result.value.bodies)
+    }
+
     pub fn validate(&self) -> Result<(), BooleanCaseError> {
-        if self.logarithmic_scale.abs() > MAX_ABS_LOG_SCALE {
+        if !(-MAX_ABS_LOG_SCALE..=MAX_ABS_LOG_SCALE).contains(&self.logarithmic_scale) {
             return Err(BooleanCaseError::LogScaleOutOfRange(self.logarithmic_scale));
         }
         validate_operand(&self.object)?;

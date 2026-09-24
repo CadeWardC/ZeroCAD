@@ -1,0 +1,49 @@
+    Checking openrcad-foundation v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-foundation)
+    Checking openrcad-geom2d v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-geom2d)
+    Checking openrcad-geom v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-geom)
+    Checking openrcad-topo v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-topo)
+    Checking openrcad-mesh v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-mesh)
+    Checking openrcad-primitives v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-primitives)
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> crates\openrcad-mesh\src\triangulate.rs:2006:15
+     |
+2006 |     Geometric(((i64, i64, i64), (i64, i64, i64), (i64, i64, i64))),
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+     = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: `openrcad-mesh` (lib) generated 1 warning
+    Checking openrcad-exchange v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-exchange)
+warning: returning the result of a `let` binding from a block
+    --> crates\openrcad-exchange\src\step_reader.rs:2147:17
+     |
+2144 | /                 let l_id = brep.loops.insert(LoopData {
+2145 | |                     edges: oriented_edges,
+2146 | |                 });
+     | |___________________- unnecessary `let` binding
+2147 |                   l_id
+     |                   ^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#let_and_return
+     = note: `#[warn(clippy::let_and_return)]` on by default
+help: return the expression directly
+     |
+2144 ~
+2145 ~                 brep.loops.insert(LoopData {
+2146 +                     edges: oriented_edges,
+2147 +                 })
+     |
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+    --> crates\openrcad-exchange\src\step_reader.rs:1904:28
+     |
+1904 |                     oe_refs.iter().copied().collect()
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `.to_vec()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#iter_cloned_collect
+     = note: `#[warn(clippy::iter_cloned_collect)]` on by default
+
+warning: `openrcad-exchange` (lib) generated 2 warnings (run `cargo clippy --fix --lib -p openrcad-exchange` to apply 2 suggestions)
+warning: `openrcad-exchange` (lib test) generated 2 warnings (2 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.90s

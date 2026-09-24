@@ -1,0 +1,11 @@
+   Compiling zerocad-gui v0.7.5 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-gui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.06s
+     Running unittests src\main.rs (target\debug\deps\zerocad_gui-b09c125c5fa84b47.exe)
+
+running 4 tests
+test app::ui::assembly::tests::failed_or_unchanged_commands_do_not_create_history ... ok
+test app::ui::assembly::tests::missing_face_reference_survives_reopen_and_can_be_repaired ... ok
+test app::ui::assembly::tests::staged_rename_pushes_undo_only_after_validation ... ok
+test app::ui::assembly::tests::real_plate_replacement_visibility_and_mate_suppression_survive_gui_history ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.17s

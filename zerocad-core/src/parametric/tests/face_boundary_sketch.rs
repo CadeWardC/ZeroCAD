@@ -526,7 +526,7 @@ fn direct_face_join_preserves_a_concave_outline() {
 
 #[test]
 fn unnamed_ambiguous_face_reference_is_rejected() {
-    let solid = crate::mock_kernel::box_solid(10.0, 10.0, 10.0);
+    let solid = crate::mock_kernel::box_solid(10.0, 10.0, 10.0).expect("valid box");
     let mesh = MockMesh::from_solid(&solid);
     let top = mesh
         .face_refs

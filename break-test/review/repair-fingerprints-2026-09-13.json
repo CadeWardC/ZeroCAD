@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-09-13T23:35:39.3566311Z",
+  "head": "9b1290f14f25daa188fb6e8bcd62a5664fcdd9a0",
+  "note": "Repair verification source fingerprints; working tree includes pre-existing unrelated changes.",
+  "sha256": {
+    "OpenRCAD/crates/openrcad-topo/src/solid.rs": "b13ef57bd664418555cb105033190cc98e09b05716e466f8cf67b62e2a0f9898",
+    "OpenRCAD/crates/openrcad-algo/src/plane_split.rs": "d5ac57fdc9c2773481c4f0b6be7c94070ab92bbb62fe07ac0e937a3bfed39f94",
+    "OpenRCAD/crates/openrcad-algo/tests/cut_coincident_cap.rs": "254caea928eca9a0307ca369457b32e0b852f95670774e18281324a7d5629419",
+    "zerocad-core/src/mock_kernel/geom_utils.rs": "0c4b510abbde0ddd49698af44050918c928f7df2099b09ef4655dbe9c02ff236",
+    "zerocad-core/src/mock_kernel/history.rs": "f23d5aa23de75ca077238dddb2553c17e2c0aa103db843f4640af1f8f34501f8",
+    "zerocad-core/src/mock_kernel/primitives.rs": "d17387e4f36278e14bc12870f30b3fa6bc9ba8d4bd9794fddf418dd8bc160129",
+    "zerocad-core/src/parametric/eval.rs": "d7b6c170621ba6e5696762bf31d1cb620342bbd8dfcbf45d7c2afe3f4c963d58",
+    "zerocad-core/src/parametric/cut.rs": "68afeaf2d8e3e756c03d4c16dffb4698bcc070a5539217c6a5149e052286c1cd",
+    "zerocad-core/src/parametric/cap_pocket.rs": "da9bbbe2314781165171352ff531d283e0f0f007b770532330773ffa67356b67",
+    "zerocad-core/src/parametric/direct_edit.rs": "50257143d589c81eb8c37d22878dc0ef662f10503e3cb8ead471925864feaf1a",
+    "zerocad-core/src/parametric/edge_mod.rs": "0503193476aeadca1f99686cc5829d055dfa478c3473c577e0239f154699be17",
+    "zerocad-core/src/zcad_format.rs": "e0d2fe444fde696b3642946eeb8307807413813b670d3e9795aa42e1254cf53c",
+    "zerocad-core/tests/implementation_audit_regressions.rs": "163c2850cddf675b16ecae2a35db56461adadcb6a0395e9c84d9065e44858746",
+    "zerocad-core/src/parametric/tests/thread_join_head.rs": "4e219f1ef9f70673a1421d89be2372f7d9f3594621547aec9bf5e0a79abc06c5",
+    "break-test/tests/thread_torture.rs": "456101d2ebbf1c95caef93d7c07df6ff2e64a75678957d6c8948862cf75cae9e",
+    "break-test/tests/common/mod.rs": "ac57ebaa678a11af72fbfdabce6f98af2da08cb217e23bb68e580554e453bb78",
+    "break-test/tests/degenerate_params.rs": "d633f7dfd8e38b33050f9b50a4836cec2375d08ad717961387be5789bc02980d",
+    "break-test/tests/multi_sketch_extrude.rs": "2f4c2c8b6c2b6994376ed815d4b37c93d7add1d9eb31c0f0091045659ff8ada1",
+    "break-test/tests/torture_sweeps_holes.rs": "4f8dba9ad4473e8537cf1e339ef32b433e1bdddf041808c2b79d6b8c54798cd9",
+    "zerocad-core/tests/repro_gui_issues.rs": "ebf0ea7134b586a223be85aad1fc67694450ac0ce081b5c3ac891fddb7242c9e",
+    "zerocad-core/tests/shell_torus_band_document.rs": "25902e9d0766d868a10c172d4bef516e1921af37ffd28613c4098238e5789cbc",
+    "zerocad-core/tests/modeling_fixtures/shell-on-fillet-band.zcad": "d84c53bc558c8f52585a68cff02f34b49a931e3f1869f4fe3883e0cab23fd896",
+    "zerocad-core/tests/modeling_fixtures/manifest.json": "56d3291aa3c35b6e6b300fcb9a2e2a1e06e02882440189b3f6db9be5d2229d4b",
+    "break-test/Cargo.toml": "9949eeacd699fa0a16f05ed27813f90e20e484e059a113ca31453c2988194bb5"
+  }
+}

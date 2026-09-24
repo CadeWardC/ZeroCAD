@@ -85,11 +85,18 @@ impl std::error::Error for SweepError {}
 /// plane normal is parallel to the sweep vector generate cylindrical faces.
 /// Other curves generate ruled lateral faces between the base and translated
 /// edge, which covers NURBS/B-spline boundaries and skew circular sweeps.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LateralOrientation {
+    Material,
+    Intrinsic,
+    Unreconciled,
+}
+
 fn build_prism(
     face: &Face,
     vector: GeomVec,
     policy: &TolerancePolicy,
-    reconcile_laterals: bool,
+    reconcile_laterals: LateralOrientation,
 ) -> Result<Solid, SweepError> {
     if vector.magnitude() <= tolerance::CONFUSION {
         return Err(SweepError::DegenerateVector);
@@ -207,10 +214,29 @@ pub fn prism_operation_with_policy(
     vector: GeomVec,
     policy: &TolerancePolicy,
 ) -> Result<OperationResult<Solid>, SweepError> {
+    prism_operation_oriented(face, vector, policy, LateralOrientation::Material)
+}
+
+/// Build section faces with loop winding aligned to the intrinsic surface
+/// normal. A later sew of exposed sections establishes the final material side.
+pub fn prism_operation_for_sections(
+    face: &Face,
+    vector: GeomVec,
+    policy: &TolerancePolicy,
+) -> Result<OperationResult<Solid>, SweepError> {
+    prism_operation_oriented(face, vector, policy, LateralOrientation::Intrinsic)
+}
+
+fn prism_operation_oriented(
+    face: &Face,
+    vector: GeomVec,
+    policy: &TolerancePolicy,
+    orientation: LateralOrientation,
+) -> Result<OperationResult<Solid>, SweepError> {
     policy
         .validate()
         .map_err(SweepError::InvalidTolerancePolicy)?;
-    let solid = build_prism(face, vector, policy, true)?;
+    let solid = build_prism(face, vector, policy, orientation)?;
     let validation = ValidationReport::for_solid(&solid, policy);
     let strict = solid.validate_strict_with_policy(policy).err();
     if !validation.is_valid() || strict.is_some() {
@@ -248,7 +274,7 @@ pub(crate) fn prism_operation_with_policy_unreconciled(
     policy
         .validate()
         .map_err(SweepError::InvalidTolerancePolicy)?;
-    let solid = build_prism(face, vector, policy, false)?;
+    let solid = build_prism(face, vector, policy, LateralOrientation::Unreconciled)?;
     let validation = ValidationReport::for_solid(&solid, policy);
     let strict = solid.validate_strict_with_policy(policy).err();
     if !validation.is_valid() || strict.is_some() {
@@ -342,7 +368,7 @@ fn lateral_face(
     translation: &Trsf,
     vector: GeomVec,
     profile: &Face,
-    reconcile: bool,
+    reconcile: LateralOrientation,
 ) -> Result<Face, SweepError> {
     let p0 = edge.source().point();
     let p1 = edge.target().point();
@@ -389,55 +415,72 @@ fn lateral_face(
     //
     // The wire is reversed rather than the surface: flipping a cylinder's axis
     // does not survive `sew`, which re-canonicalizes it straight back.
-    let reverse_loop = reconcile
-        && match (&surface, edge.curve()) {
-            (GeomSurface::Cylinder(_), Some(GeomCurve::Circle(circle))) => {
-                let mid = circle.point(edge.first() + (edge.last() - edge.first()) * 0.5);
-                match ((mid - circle.center()).normalized(), vector.normalized()) {
-                    (Some(radial), Some(sweep)) => {
-                        let radial = GeomVec::from_dir(radial);
-                        let step = (circle.radius() * 1.0e-3).max(tolerance::CONFUSION * 10.0);
-                        let material_outside = profile_contains(profile, mid + radial * step);
+    let reverse_loop = if reconcile == LateralOrientation::Intrinsic
+        && !matches!(surface, GeomSurface::Plane(_))
+    {
+        let center = Pnt::new(
+            (p0.x() + p1.x() + q0.x() + q1.x()) * 0.25,
+            (p0.y() + p1.y() + q0.y() + q1.y()) * 0.25,
+            (p0.z() + p1.z() + q0.z() + q1.z()) * 0.25,
+        );
+        !crate::revolve::loop_agrees_with_surface(
+            &Wire::from_edges(edges.to_vec()),
+            &surface,
+            center,
+        )
+    } else {
+        reconcile == LateralOrientation::Material
+            && match (&surface, edge.curve()) {
+                (GeomSurface::Cylinder(_), Some(GeomCurve::Circle(circle))) => {
+                    let mid = circle.point(edge.first() + (edge.last() - edge.first()) * 0.5);
+                    match ((mid - circle.center()).normalized(), vector.normalized()) {
+                        (Some(radial), Some(sweep)) => {
+                            let radial = GeomVec::from_dir(radial);
+                            let step = (circle.radius() * 1.0e-3).max(tolerance::CONFUSION * 10.0);
+                            let material_outside = profile_contains(profile, mid + radial * step);
 
-                        // Which way the built wall FACES is decided by the wire's
-                        // actual traversal, not by `loop_agrees_with_surface`: the
-                        // cylinder is constructed on the SWEEP axis, and
-                        // `is_parallel` accepts an ANTIPARALLEL circle axis, so an
-                        // arc wound about -sweep traverses oppositely inside the
-                        // built frame. Compute the winding normal directly.
-                        let mut sense = if edge.last() >= edge.first() {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        if edge.orientation() == Orientation::Reversed {
-                            sense = -sense;
+                            // Which way the built wall FACES is decided by the wire's
+                            // actual traversal, not by `loop_agrees_with_surface`: the
+                            // cylinder is constructed on the SWEEP axis, and
+                            // `is_parallel` accepts an ANTIPARALLEL circle axis, so an
+                            // arc wound about -sweep traverses oppositely inside the
+                            // built frame. Compute the winding normal directly.
+                            let mut sense = if edge.last() >= edge.first() {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            if edge.orientation() == Orientation::Reversed {
+                                sense = -sense;
+                            }
+                            let traversal = GeomVec::from_dir(circle.position().direction())
+                                .cross(&radial)
+                                * sense;
+                            // The wire's first edge is `edge.reversed()`, so the
+                            // boundary runs against the profile traversal.
+                            let winding_normal =
+                                (traversal * -1.0).cross(&GeomVec::from_dir(sweep));
+                            let faces_away = winding_normal.dot(&radial) > 0.0;
+
+                            // Convex boundary (material inside the cylinder) wants the
+                            // wall looking away from the axis; concave wants it looking
+                            // toward the axis.
+                            let wants_away = !material_outside;
+                            faces_away != wants_away
                         }
-                        let traversal =
-                            GeomVec::from_dir(circle.position().direction()).cross(&radial) * sense;
-                        // The wire's first edge is `edge.reversed()`, so the
-                        // boundary runs against the profile traversal.
-                        let winding_normal = (traversal * -1.0).cross(&GeomVec::from_dir(sweep));
-                        let faces_away = winding_normal.dot(&radial) > 0.0;
-
-                        // Convex boundary (material inside the cylinder) wants the
-                        // wall looking away from the axis; concave wants it looking
-                        // toward the axis.
-                        let wants_away = !material_outside;
-                        faces_away != wants_away
+                        _ => false,
                     }
-                    _ => false,
                 }
+                // A ruled surface uses `(u = curve parameter, v = sweep fraction)`.
+                // The constructed boundary starts with the base edge reversed, so
+                // an increasing profile traversal makes that UV loop clockwise.
+                // Reverse the whole loop (and its pcurves below) to keep the curved
+                // face winding aligned with the surface's intrinsic `dU x dV`
+                // normal before sewing propagates the profile's material side.
+                (GeomSurface::Ruled(_), _) => target_parameter > source_parameter,
+                _ => false,
             }
-            // A ruled surface uses `(u = curve parameter, v = sweep fraction)`.
-            // The constructed boundary starts with the base edge reversed, so
-            // an increasing profile traversal makes that UV loop clockwise.
-            // Reverse the whole loop (and its pcurves below) to keep the curved
-            // face winding aligned with the surface's intrinsic `dU x dV`
-            // normal before sewing propagates the profile's material side.
-            (GeomSurface::Ruled(_), _) => target_parameter > source_parameter,
-            _ => false,
-        };
+    };
     // Pcurves describe each 3D edge in its NATURAL first..last direction, not
     // the direction in which a particular loop traverses that edge.  The
     // distinction matters here because the base rail is deliberately used as
@@ -1009,8 +1052,14 @@ mod tests {
         // use covers glyph spans whose contour traversal opposes their stored
         // spline parameterization.
         for edge_use in [edge.clone(), edge.reversed()] {
-            let lateral = lateral_face(&edge_use, &translation, vector, &profile, true)
-                .expect("ruled lateral");
+            let lateral = lateral_face(
+                &edge_use,
+                &translation,
+                vector,
+                &profile,
+                LateralOrientation::Material,
+            )
+            .expect("ruled lateral");
             assert_face_pcurves_follow_natural_edges(&lateral, 1.0e-9);
         }
     }

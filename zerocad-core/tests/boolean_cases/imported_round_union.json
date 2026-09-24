@@ -1,5 +1,5 @@
 {
-  "stage": "imported_brep",
+  "stage": "primitive",
   "case": {
     "operation": "union",
     "object": {

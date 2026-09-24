@@ -72,7 +72,7 @@ fn a_real_polygon_stays_faceted() {
 fn booleans_with_a_cylinder_never_panic() {
     let pts = circle_pts(4.0, 4.0, 2.5, 48);
     let cyl = mock_kernel::extruded_region_solid(&pts, &[], 6.0, &CoordinateSystem::XY).unwrap();
-    let bx = mock_kernel::box_solid(7.0, 7.0, 4.0);
+    let bx = mock_kernel::box_solid(7.0, 7.0, 4.0).expect("valid box");
     // These used to panic inside truck; now they return Some/None, never unwind.
     let _ = mock_kernel::union(&bx, &cyl);
     let _ = mock_kernel::difference(&bx, &cyl);

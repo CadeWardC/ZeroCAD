@@ -1399,6 +1399,47 @@ impl ParametricGraph {
         }
     }
 
+    /// Evaluate final, visible B-Reps for interchange. Refuse a partial design
+    /// or a mesh-only body rather than exporting an earlier valid feature state.
+    pub fn evaluated_kernel_bodies(
+        &self,
+        hidden: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, Vec<crate::mock_kernel::KernelSolid>)>, String> {
+        let (live, warnings) = self.build_live(hidden, false)?;
+        if !warnings.is_empty() {
+            return Err(format!(
+                "Resolve model warnings before CAD export: {}",
+                warnings.join("; ")
+            ));
+        }
+        if let Some(status) = self
+            .eval_cache
+            .borrow()
+            .checkpoints
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .and_then(|cp| cp.statuses.iter().find(|status| status.is_unresolved()))
+        {
+            return Err(format!("Unresolved feature: {}", status.feature_id));
+        }
+        let live = self.visible_live_bodies(live, hidden);
+        if live.is_empty() {
+            return Err("No visible solid bodies to export".into());
+        }
+        if let Some(body) = live.iter().find(|body| body.parts.is_empty()) {
+            return Err(format!(
+                "Body {} is mesh-only and cannot be exported as STEP",
+                body.id
+            ));
+        }
+        Ok(live
+            .into_iter()
+            .map(|body| (body.id.to_string(), body.parts))
+            .collect())
+    }
+
     /// Diagnostic/test only: the raw B-Rep kernel solids per body, before
     /// tessellation, keyed by body node id. Mirrors [`evaluate_bodies_inner`]
     /// but skips meshing so callers can inspect surface/topology directly.
@@ -1537,9 +1578,25 @@ impl ParametricGraph {
         ) = {
             let cache = self.eval_cache.borrow();
             let cps = &cache.checkpoints;
-            let matched = (0..keys.len().min(cps.len()))
-                .rev()
-                .find(|&i| cps[i].as_ref().is_some_and(|cp| cp.key == keys[i]));
+            let matched = (0..keys.len().min(cps.len())).rev().find(|&i| {
+                cps[i].as_ref().is_some_and(|cp| {
+                    cp.key == keys[i]
+                        && cp.live.iter().all(|body| {
+                            // Serialized caches omit analytic arrangements.
+                            // They can display a finished result, but a new
+                            // modeling operation needs the retained sources.
+                            body.sketch_source.as_ref().is_none_or(|source| {
+                                (!source.regions.is_empty() || !source.joined_prisms.is_empty())
+                                    && source.regions.iter().chain(&source.joined_prisms).all(
+                                        |region| {
+                                            region.analytic.is_some()
+                                                || super::join::source_region(region).is_some()
+                                        },
+                                    )
+                            })
+                        })
+                })
+            });
             if let Some(last) = matched {
                 let cp = cps[last].as_ref().expect("matched checkpoint missing");
                 let mut retained = vec![None; keys.len()];
@@ -2199,6 +2256,7 @@ impl ParametricGraph {
         }
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
+        let mut diagnostics = Vec::new();
         match family {
             crate::document::FeatureEvaluatorKind::Pattern => {
                 let FeatureType::Pattern { source, kind } = &context.feature.feature else {
@@ -2215,6 +2273,8 @@ impl ParametricGraph {
                     context.datums,
                     &mut candidate_body_state,
                     &mut warnings,
+                    &mut diagnostics,
+                    context.cancellation,
                 );
             }
             crate::document::FeatureEvaluatorKind::BodyTransform => {
@@ -2236,6 +2296,7 @@ impl ParametricGraph {
                     *copy,
                     &mut candidate_body_state,
                     &mut warnings,
+                    &mut diagnostics,
                 );
             }
             crate::document::FeatureEvaluatorKind::FeaturePattern => {
@@ -2274,16 +2335,28 @@ impl ParametricGraph {
                 )
             }
         }
-        let diagnostics = warnings
-            .into_iter()
-            .filter_map(|message| {
-                super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.clone(),
-                    feature_name: context.feature.name.clone(),
-                    state: ResolutionState::Unresolved(message),
+        // Directly typed diagnostics (invalid parameters) take precedence;
+        // classify only the warnings they do not already cover.
+        let diagnostics = {
+            let mut direct = diagnostics;
+            let classified = warnings
+                .iter()
+                .filter(|message| {
+                    !direct
+                        .iter()
+                        .any(|diagnostic| diagnostic.rendered_message() == *message)
                 })
-            })
-            .collect();
+                .filter_map(|message| {
+                    super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                        feature_id: context.feature_id.clone(),
+                        feature_name: context.feature.name.clone(),
+                        state: ResolutionState::Unresolved(message.clone()),
+                    })
+                })
+                .collect::<Vec<_>>();
+            direct.extend(classified);
+            direct
+        };
         let topology_history = Vec::new();
         let validation_evidence = FeatureValidationEvidence {
             input_body_count: context.live_bodies.len(),
@@ -2338,6 +2411,7 @@ impl ParametricGraph {
         };
         let mut candidate_body_state = context.live_bodies.to_vec();
         let mut warnings = Vec::new();
+        let mut diagnostics = Vec::new();
         apply_thread(
             context.feature_id.as_str(),
             target,
@@ -2352,17 +2426,30 @@ impl ParametricGraph {
             *flip,
             &mut candidate_body_state,
             &mut warnings,
+            &mut diagnostics,
         );
-        let diagnostics = warnings
-            .into_iter()
-            .filter_map(|message| {
-                super::diagnostics::diagnostic_for_status(&FeatureStatus {
-                    feature_id: context.feature_id.clone(),
-                    feature_name: context.feature.name.clone(),
-                    state: ResolutionState::Unresolved(message),
+        // Directly typed diagnostics (invalid parameters) take precedence;
+        // classify only the warnings they do not already cover.
+        let diagnostics = {
+            let mut direct = diagnostics;
+            let classified = warnings
+                .iter()
+                .filter(|message| {
+                    !direct
+                        .iter()
+                        .any(|diagnostic| diagnostic.rendered_message() == *message)
                 })
-            })
-            .collect();
+                .filter_map(|message| {
+                    super::diagnostics::diagnostic_for_status(&FeatureStatus {
+                        feature_id: context.feature_id.clone(),
+                        feature_name: context.feature.name.clone(),
+                        state: ResolutionState::Unresolved(message.clone()),
+                    })
+                })
+                .collect::<Vec<_>>();
+            direct.extend(classified);
+            direct
+        };
         let topology_history = Vec::new();
         let validation_evidence = FeatureValidationEvidence {
             input_body_count: context.live_bodies.len(),
@@ -2538,7 +2625,35 @@ impl ParametricGraph {
                 let FeatureType::Box { w, h, d } = &node.feature else {
                     return Err(payload_mismatch());
                 };
+                // Untrusted-input boundary (A1/A3 regression): dimensions come
+                // from the persisted graph or user entry and may be zero,
+                // negative, NaN, or infinite. Validate BEFORE either
+                // constructor — both the region builder and `box_solid` panic
+                // on such inputs. Huge-but-finite values stay legal; the
+                // kernel's arena arithmetic is overflow-safe, so no magnitude
+                // limit is invented here.
+                let dimension_ok = |v: &f32| v.is_finite() && *v > 0.0;
+                if !(dimension_ok(w) && dimension_ok(h) && dimension_ok(d)) {
+                    let message = format!(
+                        "Box '{}': dimensions must be positive finite numbers (w={w}, h={h}, d={d}).",
+                        node.id
+                    );
+                    parameter_invalid_warning(
+                        &node.id,
+                        "box dimensions",
+                        vec![
+                            ("w", DiagnosticParameterValue::Decimal(w.to_string())),
+                            ("h", DiagnosticParameterValue::Decimal(h.to_string())),
+                            ("d", DiagnosticParameterValue::Decimal(d.to_string())),
+                        ],
+                        message,
+                        warnings,
+                        diagnostics,
+                    );
+                    return Ok(());
+                }
                 let source = SketchExtrudeSource {
+                    joined_prisms: Vec::new(),
                     regions: vec![SketchExtrudeRegionSource {
                         boundary: vec![(0.0, 0.0), (*w, 0.0), (*w, *h), (0.0, *h)],
                         holes: Vec::new(),
@@ -2554,7 +2669,32 @@ impl ParametricGraph {
                     source.regions[0].depth,
                     &source.regions[0].cs,
                 )
-                .unwrap_or_else(|| crate::mock_kernel::box_solid(*w, *h, *d));
+                .or_else(|| crate::mock_kernel::box_solid(*w, *h, *d));
+                // Positive-but-sub-tolerance dimensions pass the finite/positive
+                // gate above yet collapse in the kernel's tolerance model (the
+                // region builder returns None and the primitive reports
+                // degenerate edges). That is an invalid parameter, not a crash
+                // and not a "successful" collapsed body.
+                let Some(solid) = solid else {
+                    let message = format!(
+                        "Box '{}': dimensions are below the modeling tolerance; \
+                         no valid solid can be built (w={w}, h={h}, d={d}).",
+                        node.id
+                    );
+                    parameter_invalid_warning(
+                        &node.id,
+                        "box dimensions",
+                        vec![
+                            ("w", DiagnosticParameterValue::Decimal(w.to_string())),
+                            ("h", DiagnosticParameterValue::Decimal(h.to_string())),
+                            ("d", DiagnosticParameterValue::Decimal(d.to_string())),
+                        ],
+                        message,
+                        warnings,
+                        diagnostics,
+                    );
+                    return Ok(());
+                };
                 // Derive the display from the part (single source of truth) so a
                 // primitive box matches a sketched-extruded rectangle exactly;
                 // the analytic make_box mesh is only the cracked-mesh fallback.
@@ -2701,6 +2841,30 @@ impl ParametricGraph {
                     },
                     None => *depth,
                 };
+                // Untrusted-input boundary (A2 regression): validate the
+                // EFFECTIVE depth — after expression evaluation and after the
+                // f64→f32 conversion, which can overflow a finite f64 to an
+                // infinite f32 — before any geometry work. All modes
+                // (NewBody/Join/Cut) and the direct-face path share this
+                // entry point, so one guard covers them. Signed finite depths
+                // (including negative) remain legal.
+                if !eff_depth.is_finite() {
+                    parameter_invalid_warning(
+                        &node.id,
+                        "extrude depth",
+                        vec![(
+                            "depth",
+                            DiagnosticParameterValue::Decimal(eff_depth.to_string()),
+                        )],
+                        format!(
+                            "Extrude '{}': depth must be a finite number (got {eff_depth}).",
+                            node.id
+                        ),
+                        warnings,
+                        diagnostics,
+                    );
+                    return Ok(());
+                }
                 let eff_draft_angle = match draft_angle_expr.as_ref() {
                     Some(expression) => match crate::expr::eval(expression, vars) {
                         Ok(value) => value as f32,
@@ -3259,7 +3423,7 @@ impl ParametricGraph {
                     match &face_boundary {
                         Some(boundary) => {
                             let mut merged = effective.clone();
-                            merged.extend_curves(boundary);
+                            merged.extend_face_boundary(boundary);
                             self.cached_regions(&merged)
                         }
                         None => self.cached_regions(&effective),
@@ -3695,13 +3859,41 @@ impl ParametricGraph {
         warnings: &mut Vec<String>,
         diagnostics: &mut Vec<EvaluationDiagnostic>,
     ) {
-        // Resolve the parent sketch's plane + regions.
-        let parent_idx = self
+        // Resolve the parent sketch's plane + regions. Exactly one sketch
+        // input drives an Extrude (E21 regression: `.find(...)` used to pick
+        // the first matching parent and silently DROP the rest — a body grew
+        // by one boss with no warning). Count SKETCH parents specifically:
+        // body/datum dependencies remain legal inputs.
+        // Resolve the parent sketch's plane + regions. Exactly one sketch
+        // input drives an Extrude (E21 regression: `.find(...)` used to pick
+        // the first matching parent and silently DROP the rest — a body grew
+        // by one boss with no warning). Count SKETCH parents specifically:
+        // body/datum dependencies remain legal inputs.
+        let sketch_parents: Vec<NodeIndex> = self
             .graph
             .neighbors_directed(idx, petgraph::Direction::Incoming)
-            .find(|p| sketch_cache.contains_key(p));
-        let Some(parent_idx) = parent_idx else {
-            return;
+            .filter(|p| sketch_cache.contains_key(p))
+            .collect();
+        let parent_idx = match sketch_parents.as_slice() {
+            [single] => *single,
+            [] => {
+                warnings.push(format!(
+                    "Extrude '{node_id}': no sketch input drives this feature; it was left \
+                     unresolved and every body is unchanged."
+                ));
+                return;
+            }
+            many => {
+                let names: Vec<String> = many.iter().map(|p| self.graph[*p].id.clone()).collect();
+                warnings.push(format!(
+                    "Extrude '{node_id}': {} sketch inputs are attached ({}); an Extrude drives \
+                     exactly one sketch, so the feature was left unresolved and every body is \
+                     unchanged. Split the sketches across separate Extrude features.",
+                    many.len(),
+                    names.join(", ")
+                ));
+                return;
+            }
         };
         let sketch = &sketch_cache[&parent_idx];
         // Sketch-on-face: re-derive the plane from wherever its face is now (the
@@ -3834,7 +4026,7 @@ impl ParametricGraph {
         {
             if hash_curves(&fresh_boundary) != hash_curves(stored_boundary) {
                 let mut merged = sketch.curves.clone();
-                merged.extend_curves(&fresh_boundary);
+                merged.extend_face_boundary(&fresh_boundary);
                 let fresh_regions = self.cached_regions(&merged);
                 let mut remapped: Vec<usize> = Vec::new();
                 let mut lost = 0usize;
@@ -4056,6 +4248,7 @@ impl ParametricGraph {
         // prism constructions for R disjoint letters of extruded text.
         let mut region_source_keys: Vec<Option<[i64; 6]>> = Vec::new();
         let mut sketch_source = SketchExtrudeSource {
+            joined_prisms: Vec::new(),
             regions: Vec::new(),
         };
         let mut newbody_mesh = MockMesh::empty();
@@ -4219,6 +4412,11 @@ impl ParametricGraph {
                         }
                         ExtrudeMode::Cut => {
                             let (cut_cs, cut_depth) = directional_cut(cs, depth);
+                            let mut circle_curves = crate::sketch::SketchCurves::new();
+                            circle_curves.add_circle(circle.center, circle.radius);
+                            let circle_region = crate::sketch::detect_regions(&circle_curves)
+                                .into_iter()
+                                .next();
                             let smooth = crate::mock_kernel::circular_cylinder_tool(
                                 &boundary,
                                 &[],
@@ -4262,12 +4460,22 @@ impl ParametricGraph {
                             cut_tools.push(CutTool {
                                 smooth,
                                 exact,
-                                exact_source: None,
+                                exact_source: circle_region.clone().map(|region| ExactCutSource {
+                                    region,
+                                    cs: cut_cs,
+                                    depth: cut_depth,
+                                    arc_circles: Vec::new(),
+                                }),
                                 expanded,
                                 expanded_source,
                                 smooth_rev,
                                 exact_rev,
-                                exact_rev_source: None,
+                                exact_rev_source: circle_region.map(|region| ExactCutSource {
+                                    region,
+                                    cs: rev_cs,
+                                    depth: rev_depth,
+                                    arc_circles: Vec::new(),
+                                }),
                                 expanded_rev,
                                 expanded_rev_source,
                                 circle: Some(circle),
@@ -4435,17 +4643,14 @@ impl ParametricGraph {
                     // Cut in the drawn direction (the sign of `depth`): a negative
                     // depth cuts *into* the body the sketch sits on, a positive
                     // depth sweeps *outward* from the sketch face, removing
-                    // material from whatever body lies in that path. Overshoot
-                    // keeps both end caps off the body's faces (which the solver
-                    // can't resolve), so a cut that punches clean through a body
-                    // still exits cleanly.
+                    // material from whatever body lies in that path. Both caps
+                    // stay at the requested positions, including blind floors.
                     //
                     // exact = the drawn pocket (precise dimensions, used whenever
                     // the solver accepts it). expanded = walls nudged ~0.1mm
                     // outward so a pocket reaching the edge of a face doesn't
                     // leave the tool's side wall coplanar with the body's side
-                    // face — the other half of the coplanarity problem
-                    // `directional_cut` solves only for the end caps.
+                    // face. The fallback retains the same axial extent.
                     let (cut_cs, cut_depth) = directional_cut(cs, depth);
                     let smooth = cyl_tool(region, &cut_cs, cut_depth);
                     let (exact, exact_source) = if has_draft {
@@ -4629,10 +4834,12 @@ impl ParametricGraph {
                             smooth,
                             exact,
                             dipped,
-                            profile: Some(JoinProfileSource {
-                                region: region.clone(),
-                                depth,
-                                cs: *cs,
+                            profile: (draft_angle_deg.abs() <= f32::EPSILON).then(|| {
+                                JoinProfileSource {
+                                    region: region.clone(),
+                                    depth,
+                                    cs: *cs,
+                                }
                             }),
                         });
                     } else {
@@ -4810,6 +5017,7 @@ impl ParametricGraph {
                                     .then(|| std::sync::Arc::new(mesh)),
                                 sketch_source: (!part_source_regions.is_empty()).then_some(
                                     SketchExtrudeSource {
+                                        joined_prisms: Vec::new(),
                                         regions: part_source_regions,
                                     },
                                 ),
@@ -5161,7 +5369,29 @@ fn apply_body_transform(
     copy: bool,
     live: &mut Vec<LiveBody>,
     warnings: &mut Vec<String>,
+    diagnostics: &mut Vec<EvaluationDiagnostic>,
 ) {
+    if !translation.iter().all(|t| t.is_finite()) {
+        parameter_invalid_warning(
+            node_id,
+            "body transform translation",
+            vec![(
+                "translation",
+                DiagnosticParameterValue::Text(format!(
+                    "[{}, {}, {}]",
+                    translation[0], translation[1], translation[2]
+                )),
+            )],
+            format!(
+                "Body transform '{node_id}': translation components must be finite numbers \
+                 (got [{}, {}, {}]).",
+                translation[0], translation[1], translation[2]
+            ),
+            warnings,
+            diagnostics,
+        );
+        return;
+    }
     let Some(source_index) = live.iter().position(|body| body.id == source) else {
         warnings.push(format!(
             "Body transform '{node_id}': source body '{source}' no longer exists."
@@ -5182,11 +5412,17 @@ fn apply_body_transform(
         translation[1] as f64,
         translation[2] as f64,
     ));
-    let parts: Vec<KernelSolid> = source_body
+    let parts = source_body
         .parts
         .iter()
-        .map(|part| crate::mock_kernel::transformed_solid(part, &transform, false))
-        .collect();
+        .map(|part| crate::mock_kernel::transformed_solid_diagnostic(part, &transform, false))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(parts) = parts else {
+        warnings.push(format!(
+            "Body transform '{node_id}': transformed geometry is invalid; source unchanged."
+        ));
+        return;
+    };
     let mut mesh = source_body.pristine.as_ref().map_or_else(
         || {
             let mut mesh = MockMesh::empty();
@@ -5480,7 +5716,7 @@ impl ParametricGraph {
         match rederive_face_boundary(face_ref, live, cs) {
             Some(boundary) => {
                 let mut current = sketch.curves.clone();
-                current.extend_curves(&boundary);
+                current.extend_face_boundary(&boundary);
                 Ok(self.cached_regions(&current))
             }
             None if face_ref_is_named(face_ref) => Err(format!(
@@ -5619,6 +5855,16 @@ impl ParametricGraph {
                 };
                 analytic_resolved.push((cs, analytic));
             }
+        }
+        let first_plane = resolved[0].0;
+        if resolved.iter().all(|(cs, _, _)| {
+            cs.n.dot(first_plane.n).abs() > 1.0 - 1.0e-6
+                && cs.origin.sub(first_plane.origin).dot(first_plane.n).abs() <= 1.0e-6
+        }) {
+            warnings.push(format!(
+                "Loft '{node_id}': all section profiles lie in the same plane; no solid volume can be created."
+            ));
+            return;
         }
         let solid = match surface_mode {
             LoftSurfaceMode::Ruled => {
@@ -6442,6 +6688,9 @@ fn apply_shell(
     let body = &mut live[body_idx];
     body.parts = new_parts;
     body.pristine = (!named_result.indices.is_empty()).then(|| std::sync::Arc::new(named_result));
+    // Shell changes the material sections. Reusing the original solid prism
+    // for a subsequent sectional cut/join would silently fill the cavity.
+    body.sketch_source = None;
 }
 
 /// Evaluate one Hole node: compose the drill from analytic cylinder/cone
@@ -6477,17 +6726,28 @@ fn apply_hole(
         return;
     }
     // Through-all length: comfortably past the target's bounding diagonal.
-    let diag = body
+    // Conservative bounds: the vertex-only box can miss curved extrema and
+    // stop a through-all bore short of the far wall.
+    let finite_bounds = body
         .parts
         .iter()
-        .filter_map(|p| p.bounding_box().corners())
-        .map(|(lo, hi)| {
-            let dx = hi.x() - lo.x();
-            let dy = hi.y() - lo.y();
-            let dz = hi.z() - lo.z();
-            (dx * dx + dy * dy + dz * dz).sqrt() as f32
-        })
-        .fold(0.0f32, f32::max);
+        .map(|p| p.try_conservative_bounding_box().and_then(|b| b.corners()))
+        .collect::<Option<Vec<_>>>();
+    if depth.is_none() && finite_bounds.is_none() {
+        warnings.push(format!("Hole '{node_id}': through-all extent is unresolved for this surface; source unchanged."));
+        return;
+    }
+    let diag = finite_bounds
+        .unwrap_or_default()
+        .iter()
+        .map(|(lo, hi)| lo.distance(hi) as f32)
+        .fold(0.0_f32, f32::max);
+    if !diag.is_finite() {
+        warnings.push(format!(
+            "Hole '{node_id}': extent exceeds the supported numeric range; source unchanged."
+        ));
+        return;
+    }
     let overshoot = CUT_OVERSHOOT;
     let start = pos.sub(dir.mul(overshoot));
     let bore_len = match depth {
@@ -6510,6 +6770,26 @@ fn apply_hole(
     // Head-before-bore is also the natural machining order, so this is a
     // correct model, not merely a dodge.
     let mut cut_tools: Vec<CutTool> = Vec::new();
+    // Keep the exact cylindrical profile so holes through joined prisms share
+    // the sectional cut path with sketch pockets, including counterbore steps.
+    let cylindrical_cut = |solid, radius: f32, length: f32| {
+        let axis = if dir.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let u = axis.sub(dir.mul(axis.dot(dir))).normalize();
+        let cs = CoordinateSystem::new(start, u, dir.cross(u));
+        let mut curves = SketchCurves::new();
+        curves.add_circle((0., 0.), radius);
+        let mut tool = CutTool::single_direction(Some(solid), None, None, None);
+        tool.exact_source = crate::sketch::detect_regions(&curves)
+            .into_iter()
+            .next()
+            .map(|region| ExactCutSource {
+                region,
+                cs,
+                depth: length,
+                arc_circles: Vec::new(),
+            });
+        tool
+    };
     if drill_point_angle_deg.is_some_and(|angle| !(angle > 0.0 && angle < 180.0)) {
         warnings.push(format!(
             "Hole '{node_id}': drill-point angle must be in (0, 180)."
@@ -6529,7 +6809,7 @@ fn apply_hole(
                     *cb_d as f64 / 2.0,
                     (*cb_depth + overshoot) as f64,
                 ) {
-                    cut_tools.push(CutTool::single_direction(Some(tool), None, None, None));
+                    cut_tools.push(cylindrical_cut(tool, *cb_d / 2., *cb_depth + overshoot));
                 }
             } else {
                 warnings.push(format!(
@@ -6576,7 +6856,11 @@ fn apply_hole(
         }
     };
     match bore {
-        Some(tool) => cut_tools.push(CutTool::single_direction(Some(tool), None, None, None)),
+        Some(tool) => cut_tools.push(if drill_point_angle_deg.is_some() && depth.is_some() {
+            CutTool::single_direction(Some(tool), None, None, None)
+        } else {
+            cylindrical_cut(tool, diameter / 2., bore_len)
+        }),
         None => {
             warnings.push(format!("Hole '{node_id}': bore cutter failed to build."));
             return;
@@ -6596,6 +6880,35 @@ fn apply_hole(
 /// path closes watertight the body is left intact with a cosmetic note — the
 /// honest fallback the user opted into.
 #[allow(clippy::too_many_arguments)]
+/// Record an invalid-parameter rejection at an untrusted-input boundary: the
+/// warning marks the feature unresolved (its bodies stay unchanged) and the
+/// directly constructed `PARAMETER_INVALID` diagnostic carries the parameter
+/// and value context the legacy string classifier cannot recover on its own.
+#[allow(clippy::type_complexity)]
+fn parameter_invalid_warning(
+    feature_id: &str,
+    operation: &str,
+    parameters: Vec<(&'static str, DiagnosticParameterValue)>,
+    message: String,
+    warnings: &mut Vec<String>,
+    diagnostics: &mut Vec<EvaluationDiagnostic>,
+) {
+    let mut diagnostic = EvaluationDiagnostic::new(
+        feature_id,
+        operation,
+        DiagnosticCode::parameter_invalid(),
+        DiagnosticSeverity::Warning,
+        message.clone(),
+    )
+    .with_fallback("the feature was left unresolved; every body is unchanged");
+    for (name, value) in parameters {
+        diagnostic = diagnostic.with_parameter(name, value);
+    }
+    diagnostics.push(diagnostic);
+    warnings.push(message);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_thread(
     node_id: &str,
     target: &str,
@@ -6610,7 +6923,55 @@ fn apply_thread(
     flip: bool,
     live: &mut Vec<LiveBody>,
     warnings: &mut Vec<String>,
+    diagnostics: &mut Vec<EvaluationDiagnostic>,
 ) {
+    let lead = pitch * starts.max(1) as f32;
+    let length_valid = length.is_none_or(|l| l.is_finite() && l > 0.0);
+    if !pitch.is_finite()
+        || !depth.is_finite()
+        || !angle_deg.is_finite()
+        || !lead.is_finite()
+        || !length_valid
+    {
+        parameter_invalid_warning(
+            node_id,
+            "thread parameters",
+            vec![
+                (
+                    "pitch",
+                    DiagnosticParameterValue::Decimal(pitch.to_string()),
+                ),
+                (
+                    "depth",
+                    DiagnosticParameterValue::Decimal(depth.to_string()),
+                ),
+                (
+                    "angle_deg",
+                    DiagnosticParameterValue::Decimal(angle_deg.to_string()),
+                ),
+                (
+                    "starts",
+                    DiagnosticParameterValue::Unsigned(u64::from(starts)),
+                ),
+                (
+                    "length",
+                    DiagnosticParameterValue::Text(
+                        length
+                            .map(|l| l.to_string())
+                            .unwrap_or_else(|| "full face span".to_string()),
+                    ),
+                ),
+            ],
+            format!(
+                "Thread '{node_id}': pitch, depth, angle, lead, and optional length must be finite \
+                 numbers (pitch={pitch}, depth={depth}, angle={angle_deg}, starts={starts}, \
+                 length={length:?})."
+            ),
+            warnings,
+            diagnostics,
+        );
+        return;
+    }
     if pitch <= 1e-3 || depth <= 1e-3 || angle_deg <= 0.0 || angle_deg >= 180.0 {
         warnings.push(format!(
             "Thread '{node_id}': needs positive pitch/depth and an angle in (0, 180)."
@@ -6641,6 +7002,10 @@ fn apply_thread(
         Err(ThreadFailure::NoCylinderFace) => warnings.push(format!(
             "Thread '{node_id}': no cylindrical face found near the selection — thread left cosmetic."
         )),
+        Err(ThreadFailure::AmbiguousCylinderFace) => warnings.push(format!(
+            "Thread '{node_id}': the selection is ambiguous — it does not sit on exactly one \
+             cylindrical wall of the target — thread left cosmetic and the body is unchanged."
+        )),
         Err(ThreadFailure::WallReplaceFailed) => warnings.push(format!(
             "Thread '{node_id}': modeled as cosmetic — the thread wall could not be cut into this \
              body's cylindrical face (interrupted wall or too-short thread length)."
@@ -6654,6 +7019,9 @@ fn apply_thread(
 pub(crate) enum ThreadFailure {
     /// No cylindrical face resolved near the selection on any part.
     NoCylinderFace,
+    /// The selection matched more than one plausible cylindrical face, so
+    /// threading any of them would guess at user intent.
+    AmbiguousCylinderFace,
     /// The face resolved but the analytic wall replacement didn't close
     /// watertight (interrupted wall, crossing feature, or too-short window).
     WallReplaceFailed,
@@ -6670,55 +7038,123 @@ pub(crate) fn thread_one(
     body: &mut LiveBody,
     step: &ThreadParameters,
 ) -> Result<(), ThreadFailure> {
-    // Resolve the selected cylindrical face and which component it belongs to.
-    // A LiveBody may intentionally contain several parts after a severing cut. Do
-    // not stop at the first part that happens to contain a cylinder: the thread
-    // preview captured a real point on the picked wall, so rank the best
-    // cylinder from EVERY part by its distance from that point. The axial term
-    // also disambiguates coaxial walls with the same radius but different spans.
-    let selection_error = |info: &crate::mock_kernel::CylinderFaceInfo| {
-        let p = step.face.centroid;
-        let rel = [
-            p[0] - info.origin[0],
-            p[1] - info.origin[1],
-            p[2] - info.origin[2],
-        ];
-        let axial = rel[0] * info.dir[0] + rel[1] * info.dir[1] + rel[2] * info.dir[2];
-        let radial_vec = [
-            rel[0] - info.dir[0] * axial,
-            rel[1] - info.dir[1] * axial,
-            rel[2] - info.dir[2] * axial,
-        ];
-        let radial = (radial_vec[0] * radial_vec[0]
-            + radial_vec[1] * radial_vec[1]
-            + radial_vec[2] * radial_vec[2])
-            .sqrt();
-        let radial_error = (radial - info.radius).abs();
-        let axial_error = if axial < info.axial_min {
-            info.axial_min - axial
-        } else if axial > info.axial_max {
-            axial - info.axial_max
-        } else {
-            0.0
-        };
-        radial_error.hypot(axial_error)
+    let named = face_ref_is_named(&step.face);
+    let resolved = if named {
+        let resolved =
+            resolve_face_on_body(body, &step.face).ok_or(ThreadFailure::NoCylinderFace)?;
+        if resolved
+            .face
+            .topology
+            .as_ref()
+            .and_then(|t| t.surface_kind.as_deref())
+            .is_some_and(|kind| !kind.eq_ignore_ascii_case("cylinder"))
+        {
+            return Err(ThreadFailure::NoCylinderFace);
+        }
+        Some(resolved)
+    } else {
+        None
     };
-    let component = resolve_face_on_body(body, &step.face).map(|resolved| resolved.component_index);
-    let resolved = body
-        .parts
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| component.is_none_or(|component| *index == component))
-        .filter_map(|(pi, part)| {
-            crate::mock_kernel::cylinder_face_near(part, step.face.centroid).map(|info| (pi, info))
-        })
-        .min_by(|(_, a), (_, b)| {
-            selection_error(a)
-                .partial_cmp(&selection_error(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    let Some((pi, info)) = resolved else {
-        return Err(ThreadFailure::NoCylinderFace);
+    // Resolve the named display face first, then match its complete sampled
+    // support to a native connected wall. Face centroids of coaxial walls can
+    // coincide, so neither nearest-centroid nor component identity is enough.
+    let reference_mesh = resolved.as_ref().map(|_| {
+        body.pristine
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| super::edge_mod::edge_mod_reference_mesh(body))
+    });
+    let selected_points = if let (Some(r), Some(mesh)) = (&resolved, &reference_mesh) {
+        let wanted = r.face.topology.as_ref().and_then(|t| t.face_id.as_deref());
+        let picked = mesh
+            .face_refs
+            .iter()
+            .filter(|f| f.topology.as_ref().and_then(|t| t.face_id.as_deref()) == wanted)
+            .min_by(|a, b| {
+                distance3(a.centroid, r.face.centroid)
+                    .total_cmp(&distance3(b.centroid, r.face.centroid))
+            })
+            .ok_or(ThreadFailure::NoCylinderFace)?;
+        let mut points = Vec::new();
+        for (tri, face_id) in mesh.indices.chunks_exact(3).zip(&mesh.face_ids) {
+            if *face_id == picked.face_id {
+                for index in tri {
+                    let k = *index as usize * 6;
+                    points.push([mesh.vertices[k], mesh.vertices[k + 1], mesh.vertices[k + 2]]);
+                }
+            }
+        }
+        if points.is_empty() {
+            return Err(ThreadFailure::NoCylinderFace);
+        }
+        Some(points)
+    } else {
+        None
+    };
+    let mut candidates = Vec::new();
+    for (pi, part) in body.parts.iter().enumerate() {
+        if resolved.as_ref().is_some_and(|r| r.component_index != pi) {
+            continue;
+        }
+        for (indices, info) in crate::mock_kernel::cylindrical_wall_groups(part) {
+            if let Some(points) = &selected_points {
+                let tolerance = 1.0e-4 * info.radius.max(1.0);
+                if !points.iter().all(|p| {
+                    let rel = [
+                        p[0] - info.origin[0],
+                        p[1] - info.origin[1],
+                        p[2] - info.origin[2],
+                    ];
+                    let axial: f32 = (0..3).map(|i| rel[i] * info.dir[i]).sum();
+                    let radial = (0..3)
+                        .map(|i| (rel[i] - axial * info.dir[i]).powi(2))
+                        .sum::<f32>()
+                        .sqrt();
+                    (radial - info.radius).abs() <= tolerance
+                        && axial >= info.axial_min - tolerance
+                        && axial <= info.axial_max + tolerance
+                }) {
+                    continue;
+                }
+            }
+            let p = resolved
+                .as_ref()
+                .map_or(step.face.centroid, |r| r.face.centroid);
+            let rel = [
+                p[0] - info.origin[0],
+                p[1] - info.origin[1],
+                p[2] - info.origin[2],
+            ];
+            let axial: f32 = (0..3).map(|i| rel[i] * info.dir[i]).sum();
+            let radial = (0..3)
+                .map(|i| (rel[i] - axial * info.dir[i]).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            if !named {
+                let normal_length = step.face.normal.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let axial_normal = (0..3)
+                    .map(|i| step.face.normal[i] * info.dir[i])
+                    .sum::<f32>()
+                    .abs();
+                if normal_length > 1e-6 && axial_normal > 0.9 * normal_length {
+                    continue;
+                }
+            }
+            let gate = 0.1 * info.radius + 0.1;
+            if axial.is_finite()
+                && radial.is_finite()
+                && axial >= info.axial_min - gate
+                && axial <= info.axial_max + gate
+                && radial <= info.radius + gate
+            {
+                candidates.push((pi, indices, info));
+            }
+        }
+    }
+    let (pi, selected_faces, info) = match candidates.len() {
+        0 => return Err(ThreadFailure::NoCylinderFace),
+        1 => candidates.pop().unwrap(),
+        _ => return Err(ThreadFailure::AmbiguousCylinderFace),
     };
 
     let face_len = info.axial_max - info.axial_min;
@@ -6742,13 +7178,14 @@ pub(crate) fn thread_one(
     // stop) fade out through a runout band into an untouched cylinder collar,
     // so rim blends survive.
     let original = body.parts[pi].clone();
-    let Some(threaded) = crate::mock_kernel::threaded_replace_cylinder_wall_with_policy(
+    let Some(threaded) = crate::mock_kernel::threaded_replace_selected_cylinder_wall_with_policy(
         &body.parts[pi],
         &info,
         &spec,
         step.length.map(|l| l as f64),
         step.flip,
         &openrcad::foundation::TolerancePolicy::STANDARD,
+        Some(&selected_faces),
     ) else {
         return Err(ThreadFailure::WallReplaceFailed);
     };
@@ -6925,8 +7362,12 @@ fn feature_pattern_material_delta(
         return Err("the source feature did not produce a measurable material change".into());
     }
 
-    let mut delta = base.parts.clone();
-    for subtractor_part in &subtractor.parts {
+    // Retained exact sections avoid a coincident-shell subtraction when
+    // recovering a pocket from the plate and its already-pocketed version.
+    let sectional_delta = super::profile_cut::try_profile_difference(base, subtractor);
+    let needs_boolean = sectional_delta.is_none();
+    let mut delta = sectional_delta.unwrap_or_else(|| base.parts.clone());
+    for subtractor_part in subtractor.parts.iter().filter(|_| needs_boolean) {
         let mut next = Vec::new();
         for part in delta {
             let overlaps = crate::mock_kernel::solid_aabb(&part)
@@ -7380,6 +7821,7 @@ fn apply_feature_pattern(
 /// pattern's transforms. All instances land in ONE new live body (id = the
 /// pattern node), so the whole array selects/hides/deletes as a unit; the
 /// source body is left untouched.
+#[allow(clippy::too_many_arguments)]
 fn apply_pattern(
     node_id: &str,
     source: &str,
@@ -7388,6 +7830,8 @@ fn apply_pattern(
     datums: &HashMap<String, DatumValue>,
     live: &mut Vec<LiveBody>,
     warnings: &mut Vec<String>,
+    diagnostics: &mut Vec<EvaluationDiagnostic>,
+    cancellation: Option<&EvaluationCancellation>,
 ) {
     let Some(src) = live.iter().find(|b| b.id == source) else {
         warnings.push(format!(
@@ -7395,6 +7839,27 @@ fn apply_pattern(
         ));
         return;
     };
+    // Bound both instance count and topology amplification before cloning or
+    // allocating transforms. These are runtime work budgets, not file limits.
+    const MAX_INSTANCES: u32 = 4096;
+    const MAX_FACE_INSTANCES: usize = 262_144;
+    let count = match kind {
+        PatternKind::Linear { count, .. } | PatternKind::Circular { count, .. } => *count,
+        PatternKind::Mirror { .. } => 2,
+    };
+    let faces = src
+        .parts
+        .iter()
+        .try_fold(0usize, |sum, p| sum.checked_add(p.faces().len()));
+    if count > MAX_INSTANCES
+        || faces
+            .and_then(|n| n.checked_mul(count as usize))
+            .is_none_or(|n| n > MAX_FACE_INSTANCES)
+    {
+        parameter_invalid_warning(node_id, "pattern work budget", vec![("count", DiagnosticParameterValue::Unsigned(count as u64))],
+            format!("Pattern '{node_id}': requested work exceeds the instance/topology budget; source unchanged."), warnings, diagnostics);
+        return;
+    }
     let parts = src.parts.clone();
     let source_pristine = src.pristine.clone();
     if parts.is_empty() {
@@ -7424,6 +7889,12 @@ fn apply_pattern(
                 ));
                 return;
             };
+            if ![d.x, d.y, d.z].iter().all(|v| v.is_finite()) || d == Vec3::ZERO {
+                warnings.push(format!(
+                    "Pattern '{node_id}': direction is not finite and nonzero; source unchanged."
+                ));
+                return;
+            }
             let step = match spacing_expr.as_ref() {
                 Some(e) => match crate::expr::eval(e, vars) {
                     Ok(v) => v as f32,
@@ -7437,6 +7908,25 @@ fn apply_pattern(
                 },
                 None => *spacing,
             };
+            if !step.is_finite() {
+                // A4 regression: a non-finite spacing becomes a NaN translation
+                // whose post-transform validation used to panic. Valid NEGATIVE
+                // spacing keeps its current mirror-image semantics.
+                parameter_invalid_warning(
+                    node_id,
+                    "pattern spacing",
+                    vec![(
+                        "spacing",
+                        DiagnosticParameterValue::Decimal(step.to_string()),
+                    )],
+                    format!(
+                        "Pattern '{node_id}': linear spacing must be a finite number (got {step})."
+                    ),
+                    warnings,
+                    diagnostics,
+                );
+                return;
+            }
             if *count < 2 || step.abs() < 1e-6 {
                 warnings.push(format!(
                     "Pattern '{node_id}': needs count ≥ 2 and a non-zero spacing."
@@ -7465,8 +7955,35 @@ fn apply_pattern(
                 ));
                 return;
             };
+            if ![origin.x, origin.y, origin.z, d.x, d.y, d.z]
+                .iter()
+                .all(|v| v.is_finite())
+                || d == Vec3::ZERO
+            {
+                warnings.push(format!(
+                    "Pattern '{node_id}': axis is not finite and nonzero; source unchanged."
+                ));
+                return;
+            }
             if *count < 2 {
                 warnings.push(format!("Pattern '{node_id}': needs count ≥ 2."));
+                return;
+            }
+            if !total_angle_deg.is_finite() {
+                parameter_invalid_warning(
+                    node_id,
+                    "pattern total angle",
+                    vec![(
+                        "total_angle_deg",
+                        DiagnosticParameterValue::Decimal((*total_angle_deg).to_string()),
+                    )],
+                    format!(
+                        "Pattern '{node_id}': total angle must be a finite number (got \
+                         {total_angle_deg})."
+                    ),
+                    warnings,
+                    diagnostics,
+                );
                 return;
             }
             let total = (*total_angle_deg as f64).to_radians();
@@ -7501,6 +8018,23 @@ fn apply_pattern(
                 ));
                 return;
             };
+            if ![
+                cs.origin.x,
+                cs.origin.y,
+                cs.origin.z,
+                cs.n.x,
+                cs.n.y,
+                cs.n.z,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+                || cs.n == Vec3::ZERO
+            {
+                warnings.push(format!(
+                    "Pattern '{node_id}': mirror plane is invalid; source unchanged."
+                ));
+                return;
+            }
             let frame = Ax2::new(to_pnt(cs.origin), to_dir(cs.n));
             let mirror = Trsf::mirror_plane(&frame);
             let effective_offset = match offset_expr.as_ref() {
@@ -7521,6 +8055,25 @@ fn apply_pattern(
                 cs.n.y as f64 * effective_offset as f64,
                 cs.n.z as f64 * effective_offset as f64,
             ));
+            if !effective_offset.is_finite() {
+                // A6 regression: a NaN mirror offset becomes a NaN translation
+                // whose post-transform validation used to panic.
+                parameter_invalid_warning(
+                    node_id,
+                    "mirror offset",
+                    vec![(
+                        "offset",
+                        DiagnosticParameterValue::Decimal(effective_offset.to_string()),
+                    )],
+                    format!(
+                        "Mirror '{node_id}': offset must be a finite number (got \
+                         {effective_offset})."
+                    ),
+                    warnings,
+                    diagnostics,
+                );
+                return;
+            }
             if effective_offset.abs() < 1.0e-4 {
                 mirror_join_plane = Some((cs.origin, cs.n));
             }
@@ -7535,20 +8088,53 @@ fn apply_pattern(
     let mut mesh = MockMesh::empty();
     for (k, (t, is_reflection)) in transforms.iter().enumerate() {
         for part in &parts {
-            let s = crate::mock_kernel::transformed_solid(part, t, *is_reflection);
+            if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
+                warnings.push(format!(
+                    "Pattern '{node_id}': evaluation was cancelled; source unchanged."
+                ));
+                return;
+            }
+
+            // The numeric guards above make non-finite transforms unreachable
+            // in practice; this boundary still reports a failed instance
+            // instead of panicking should any other path produce one.
+            let transformed =
+                crate::mock_kernel::transformed_solid_diagnostic(part, t, *is_reflection);
+            let Ok(s) = transformed else {
+                warnings.push(format!(
+                    "Pattern '{node_id}': instance {} could not be transformed; the pattern was rolled back.",
+                    k + 1
+                ));
+                return;
+            };
             let mut m = MockMesh::from_solid(&s);
             if m.indices.is_empty() {
                 warnings.push(format!(
                     "Pattern '{node_id}': instance {} tessellated empty.",
                     k + 1
                 ));
-                continue;
+                return;
+            }
+            // Keep the staged display allocation bounded as well as topology.
+            if mesh.vertices.len().saturating_add(m.vertices.len()) > 12_000_000
+                || mesh.indices.len().saturating_add(m.indices.len()) > 12_000_000
+            {
+                warnings.push(format!(
+                    "Pattern '{node_id}': display work budget exceeded; source unchanged."
+                ));
+                return;
             }
             stamp_pattern_face_refs(&mut m, node_id, k + 1);
             crate::mock_kernel::populate_edge_adjacent_face_names(&mut m);
             mesh.append(m);
             new_parts.push(s);
         }
+    }
+    if cancellation.is_some_and(EvaluationCancellation::is_cancelled) {
+        warnings.push(format!(
+            "Pattern '{node_id}': evaluation was cancelled; source unchanged."
+        ));
+        return;
     }
     let join_mirror = matches!(kind, PatternKind::Mirror { join: true, .. });
     if join_mirror && !new_parts.is_empty() {
@@ -7823,22 +8409,41 @@ fn rederive_sketch_cs(face_ref: &FaceRef, live: &[LiveBody]) -> Option<Coordinat
     let body_id = face_ref.topology.as_ref()?.body_id.as_deref()?;
     let body = live.iter().find(|b| b.id == body_id)?;
     let resolved = resolve_face_ref_by_topology(body, face_ref)?;
-    Some(cs_from_face(resolved.centroid, resolved.normal))
+    // Re-tessellating an unchanged support can shift its sampled centroid by
+    // a few f32 ULPs. Do not move sketch geometry by that noise: consecutive
+    // coaxial cuts would otherwise become nearly coincident cylinders.
+    let capture_scale = face_ref
+        .centroid
+        .iter()
+        .chain(&resolved.centroid)
+        .map(|value| value.abs())
+        .fold(1.0_f32, f32::max);
+    let centroid =
+        if distance3(face_ref.centroid, resolved.centroid) <= capture_scale * f32::EPSILON * 8.0 {
+            face_ref.centroid
+        } else {
+            resolved.centroid
+        };
+    Some(cs_from_face(centroid, resolved.normal))
 }
 
 /// Re-project a face-attached sketch's boundary outline from wherever its face
 /// is NOW, into `cs` (the sketch's already re-derived placement plane, so the
 /// outline and the drawn curves land in the same 2D space). Resolves the face
 /// the same way plane re-derivation does (topology name first, geometry
-/// fallback), then reads the numeric mesh face id off the nearest matching
-/// `MeshFaceRef` and extracts its boundary loops with the SAME shared code the
-/// GUI used at capture time — an unchanged face reproduces the stored snapshot
-/// bit-for-bit, which is the caller's cheap "did anything move?" test.
+/// fallback). Supported planar faces use the shared native line/arc extraction
+/// also used by GUI capture, preserving circles instead of display chords.
+/// Other faces retain the mesh-boundary fallback.
 fn rederive_face_boundary(
     face_ref: &FaceRef,
     live: &[LiveBody],
     cs: &CoordinateSystem,
 ) -> Option<SketchCurves> {
+    if let Ok(resolved) = resolve_exact_planar_face(live, face_ref, None) {
+        if let Some(boundary) = crate::mock_kernel::kernel_face_boundary_2d(&resolved.face, cs) {
+            return Some(boundary);
+        }
+    }
     let body_id = face_ref.topology.as_ref()?.body_id.as_deref()?;
     let body = live.iter().find(|b| b.id == body_id)?;
     let resolved = resolve_face_ref_by_topology(body, face_ref)?;

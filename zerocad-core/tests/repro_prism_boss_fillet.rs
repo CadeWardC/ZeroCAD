@@ -408,6 +408,7 @@ fn fillet_acute_prism_corner_edge_gui_path() {
 #[test]
 fn fillet_prism_top_edge_with_boss_bite() {
     let mut graph = prism_boss_graph();
+    let source = graph.debug_kernel_solids(&HashSet::new()).unwrap();
     // Top edge of the hypotenuse face from corner (40,0) toward the boss;
     // the boss pierces the top face, so this edge segment ends at the wall.
     let (bx, by) = seam_xy(-1.0); // (24.8, 11.4)
@@ -436,4 +437,174 @@ fn fillet_prism_top_edge_with_boss_bite() {
         warnings.is_empty(),
         "top edge fillet should apply cleanly, got {warnings:?}"
     );
+    let result = graph.debug_kernel_solids(&HashSet::new()).unwrap();
+    let result_mesh = openrcad::mesh::tessellate_checked(&result[0].1[0], 0.01, 0.05).unwrap();
+    let source_volume = plane_cylinder_volume(&source[0].1[0]);
+    assert!(
+        (source_volume - (12000.0 + 720.0 * std::f64::consts::PI)).abs() < 0.02,
+        "source integration: {source_volume}"
+    );
+    let removed = source_volume - plane_cylinder_volume(&result[0].1[0]);
+    // Independent cross-section oracle. q is distance inward from the
+    // hypotenuse. The rounded corner removes height 3-sqrt(9-(q-3)^2).
+    // Its length runs from the oblique end plane s=4q/3 to the boss wall
+    // s=25-sqrt(36-q^2). Integrate that exact section with midpoint quadrature.
+    let samples = 20_000;
+    let dq = 3.0 / samples as f64;
+    let expected: f64 = (0..samples)
+        .map(|i| {
+            let q = (i as f64 + 0.5) * dq;
+            (3.0 - (9.0 - (q - 3.0).powi(2)).sqrt())
+                * (25.0 - (36.0 - q * q).sqrt() - 4.0 * q / 3.0)
+                * dq
+        })
+        .sum();
+    assert!(
+        (removed - expected).abs() < 0.02,
+        "fillet must remove only the selected wedge: removed={removed}, expected={expected}"
+    );
+    // Sample face interiors on their native support surfaces. Project display
+    // triangle centroids back to the surface to exclude tessellation chord sag.
+    // A planar cap or misplaced blend entering the boss must still fail.
+    let faces = result[0].1[0].faces();
+    for (index, triangle) in result_mesh.triangles.iter().enumerate() {
+        let points = triangle
+            .iter()
+            .map(|&i| result_mesh.vertices[i as usize])
+            .collect::<Vec<_>>();
+        let p = openrcad::foundation::Pnt::new(
+            points.iter().map(|p| p.x()).sum::<f64>() / 3.0,
+            points.iter().map(|p| p.y()).sum::<f64>() / 3.0,
+            points.iter().map(|p| p.z()).sum::<f64>() / 3.0,
+        );
+        use openrcad::{foundation::Vec as V, geom::GeomSurface};
+        let p = match faces[result_mesh.face_ids[index] as usize]
+            .surface()
+            .unwrap()
+        {
+            GeomSurface::Plane(plane) => {
+                let n = V::from_dir(plane.normal());
+                p - n * (p - plane.location()).dot(&n)
+            }
+            GeomSurface::Cylinder(c) => {
+                let frame = c.position();
+                let axis = V::from_dir(frame.direction());
+                let delta = p - frame.location();
+                let axial = axis * delta.dot(&axis);
+                let radial = delta - axial;
+                frame.location() + axial + radial * (c.radius() / radial.magnitude())
+            }
+            other => panic!("unexpected support: {other:?}"),
+        };
+        if p.z() > 0.01 && p.z() < BOSS_H as f64 - 0.01 {
+            assert!(
+                (p.x() - 20.0).hypot(p.y() - 15.0) >= R as f64 - 0.03,
+                "boss was gouged: {p:?}"
+            );
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("boss-junction-fillet.zcad");
+    let document = zerocad_core::Document::from_graph(graph, zerocad_core::Unit::Millimeter);
+    zerocad_core::write_document_file(
+        &path,
+        &document,
+        &zerocad_core::SaveOptions::default(),
+        &zerocad_core::HydrationBundle::default(),
+    )
+    .unwrap();
+    let loaded = zerocad_core::read_document_file(&path, &zerocad_core::LoadOptions::default())
+        .unwrap()
+        .document;
+    let cold = loaded
+        .evaluator_graph()
+        .evaluate_bodies_with_warnings(&HashSet::new())
+        .unwrap();
+    assert!(cold.1.is_empty(), "saved recipe rebuild: {:?}", cold.1);
+}
+
+/// Divergence theorem on the actual analytic surfaces, independently of the
+/// display tessellator. Planes use their boundary fan; cylinders use Green's
+/// theorem in (u,v), integrating R*(origin dot radial + R)/3 over the trim.
+/// Quadrature samples the stored edge curves, including the toleranced seam.
+fn plane_cylinder_volume(solid: &openrcad::topo::Solid) -> f64 {
+    use openrcad::foundation::{Pnt, Vec as V};
+    use openrcad::geom::{Curve, GeomSurface};
+    let mut volume = 0.0;
+    for face in solid.faces() {
+        for (wire_index, wire) in face.wires().iter().enumerate() {
+            let orientation = if face.orientation() == openrcad::topo::Orientation::Reversed {
+                -1.0
+            } else {
+                1.0
+            };
+            let loop_sign = if wire_index == 0 { 1.0 } else { -1.0 };
+            let mut points = Vec::new();
+            for edge in wire.edges() {
+                for k in 0..512 {
+                    let t = k as f64 / 512.0;
+                    let t = if edge.orientation() == openrcad::topo::Orientation::Reversed {
+                        1.0 - t
+                    } else {
+                        t
+                    };
+                    points.push(
+                        edge.curve()
+                            .unwrap()
+                            .point(edge.first() + t * (edge.last() - edge.first())),
+                    );
+                }
+            }
+            points.push(points[0]);
+            match face.surface().unwrap() {
+                GeomSurface::Plane(plane) => {
+                    let mut area = V::new(0.0, 0.0, 0.0);
+                    let a = points[0] - Pnt::origin();
+                    for pair in points[1..].windows(2) {
+                        area += (pair[0] - points[0]).cross(&(pair[1] - points[0])) * 0.5;
+                    }
+                    volume += area.dot(&V::from_dir(plane.normal())).abs()
+                        * a.dot(&V::from_dir(plane.normal()))
+                        / 3.0
+                        * orientation
+                        * loop_sign;
+                }
+                GeomSurface::Cylinder(c) => {
+                    let frame = c.position();
+                    let x = V::from_dir(frame.x_direction());
+                    let y = V::from_dir(frame.y_direction());
+                    let axis = V::from_dir(frame.direction());
+                    let origin = frame.location() - Pnt::origin();
+                    let handedness = x.cross(&y).dot(&axis);
+                    let uv = |p: Pnt| {
+                        let delta = p - frame.location();
+                        (delta.dot(&y).atan2(delta.dot(&x)), delta.dot(&axis))
+                    };
+                    let primitive = |u: f64| {
+                        c.radius() / 3.0
+                            * (origin.dot(&x) * u.sin() - origin.dot(&y) * u.cos() + c.radius() * u)
+                    };
+                    let (mut u, mut v) = uv(points[0]);
+                    let mut flux = 0.0;
+                    let mut area = 0.0;
+                    for point in &points[1..] {
+                        let (mut next_u, next_v) = uv(*point);
+                        while next_u - u > std::f64::consts::PI {
+                            next_u -= std::f64::consts::TAU;
+                        }
+                        while next_u - u < -std::f64::consts::PI {
+                            next_u += std::f64::consts::TAU;
+                        }
+                        flux +=
+                            handedness * (primitive(u) + primitive(next_u)) * 0.5 * (next_v - v);
+                        area += (u + next_u) * 0.5 * (next_v - v);
+                        (u, v) = (next_u, next_v);
+                    }
+                    volume += flux * area.signum() * orientation * loop_sign;
+                }
+                other => panic!("unsupported oracle surface: {other:?}"),
+            }
+        }
+    }
+    volume.abs()
 }

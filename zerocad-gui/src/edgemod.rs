@@ -1329,7 +1329,10 @@ impl ZeroCadApp {
     /// Hash of everything that determines an edge-mod's committed geometry — the
     /// exact size, kind, target body, selected edge identity, and hidden nodes.
     /// The preview worker result is only reusable when this full identity matches.
-    fn edge_mod_arc_key(op: &EdgeModOp, hidden_nodes: &std::collections::HashSet<String>) -> u64 {
+    pub(crate) fn edge_mod_arc_key(
+        op: &EdgeModOp,
+        hidden_nodes: &std::collections::HashSet<String>,
+    ) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         if let Some(edges) = op.persisted_edges() {

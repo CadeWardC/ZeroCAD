@@ -1,13 +1,32 @@
 use super::*;
 
-/// Axis-aligned bounding box of a solid from its B-Rep vertices, as
-/// `(min, max)`. Exact for polygonal solids; a conservative-enough estimate for
-/// curved ones (used only for cheap overlap pre-tests). `None` if vertexless.
+/// Axis-aligned bounding box of a solid as `(min, max)`, in f32 for the
+/// cheap broad-phase tests.
+///
+/// Returns an outward-rounded enclosure, or `None` when the native surface
+/// bounds are unknown. Contact/direction decisions need their own tolerance;
+/// this box is exclusively an enclosure for broad-phase rejection.
 pub fn solid_aabb(solid: &KernelSolid) -> Option<([f32; 3], [f32; 3])> {
-    let (lo, hi) = solid.bounding_box().corners()?;
+    let (lo, hi) = solid.try_conservative_bounding_box()?.corners()?;
+    let lower = |x: f64| {
+        let f = x as f32;
+        if f as f64 > x {
+            f.next_down()
+        } else {
+            f
+        }
+    };
+    let upper = |x: f64| {
+        let f = x as f32;
+        if (f as f64) < x {
+            f.next_up()
+        } else {
+            f
+        }
+    };
     Some((
-        [lo.x() as f32, lo.y() as f32, lo.z() as f32],
-        [hi.x() as f32, hi.y() as f32, hi.z() as f32],
+        [lower(lo.x()), lower(lo.y()), lower(lo.z())],
+        [upper(hi.x()), upper(hi.y()), upper(hi.z())],
     ))
 }
 
@@ -124,6 +143,55 @@ pub struct CylinderFaceInfo {
     pub internal: bool,
 }
 
+/// Connected cylindrical face groups, retaining the native shell indices.
+/// Extents come from the selected group's topology, never unrelated faces.
+pub(crate) fn cylindrical_wall_groups(solid: &KernelSolid) -> Vec<(Vec<usize>, CylinderFaceInfo)> {
+    let faces = solid.shell().faces();
+    let mut groups = std::collections::BTreeMap::<u32, Vec<usize>>::new();
+    for (i, group) in cylinder_surface_groups(solid).into_iter().enumerate() {
+        if matches!(faces[i].surface(), Some(GeomSurface::Cylinder(_))) {
+            groups.entry(group).or_default().push(i);
+        }
+    }
+    groups
+        .into_values()
+        .filter_map(|indices| {
+            let Some(GeomSurface::Cylinder(cyl)) = faces[indices[0]].surface() else {
+                return None;
+            };
+            let pos = cyl.position();
+            let origin = pos.location();
+            let axis = GeomVec::from_dir(pos.direction());
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &i in &indices {
+                for wire in faces[i].wires() {
+                    for edge in wire.edges() {
+                        for p in [edge.start().point(), edge.end().point()] {
+                            let axial = (p - origin).dot(&axis);
+                            lo = lo.min(axial);
+                            hi = hi.max(axial);
+                        }
+                    }
+                }
+            }
+            if !lo.is_finite() || !hi.is_finite() || hi - lo <= 1e-6 {
+                return None;
+            }
+            let info = CylinderFaceInfo {
+                origin: [origin.x() as f32, origin.y() as f32, origin.z() as f32],
+                dir: [axis.x() as f32, axis.y() as f32, axis.z() as f32],
+                radius: cyl.radius() as f32,
+                axial_min: lo as f32,
+                axial_max: hi as f32,
+                internal: (faces[indices[0]].orientation() == Orientation::Reversed)
+                    ^ !cyl.position().is_direct(),
+            };
+            Some((indices, info))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConeFaceInfo {
     pub origin: [f32; 3],
@@ -194,7 +262,9 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
                 origin,
                 dir,
                 r,
-                face.orientation() == Orientation::Reversed,
+                // A left-handed cylinder parameterization reverses the
+                // geometric normal even when the face is Forward.
+                (face.orientation() == Orientation::Reversed) ^ !p.is_direct(),
             ));
         }
     }
@@ -205,11 +275,23 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
     let tol = 0.05 * radius.max(1.0) + 0.05;
     let mut amin = f32::INFINITY;
     let mut amax = f32::NEG_INFINITY;
+    let mut radial_normal = 0.0_f64;
     for v in mesh.vertices.chunks(6) {
         let (radial, t) = radial_dist([v[0], v[1], v[2]], origin, dir);
         if (radial - radius).abs() <= tol {
             amin = amin.min(t);
             amax = amax.max(t);
+        }
+        // Sewing aligns boundary traversal but a stored surface's orientation
+        // flag alone need not describe its material side. The closed display
+        // mesh has consistently outward normals, including cavity walls.
+        if (radial - radius).abs() <= 1.0e-4 * radius.max(1.0) {
+            let dot: f32 = (0..3)
+                .map(|i| (v[i] - origin[i] - dir[i] * t) * v[i + 3])
+                .sum();
+            if dot.abs() > 0.25 * radius {
+                radial_normal += f64::from(dot);
+            }
         }
     }
     if !amin.is_finite() || amax - amin <= 1e-3 {
@@ -221,7 +303,11 @@ pub fn cylinder_face_near(solid: &KernelSolid, centroid: [f32; 3]) -> Option<Cyl
         radius,
         axial_min: amin,
         axial_max: amax,
-        internal,
+        internal: if radial_normal.abs() > f64::from(radius) * 0.25 {
+            radial_normal < 0.0
+        } else {
+            internal
+        },
     })
 }
 

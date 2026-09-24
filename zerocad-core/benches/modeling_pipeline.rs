@@ -8,6 +8,69 @@ use zerocad_core::{
 
 #[path = "support/benchmark_corpus.rs"]
 mod corpus;
+#[path = "support/real_parts.rs"]
+mod real_parts;
+
+fn real_part_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mechanical_parts_v1");
+    group.sample_size(10);
+    for &(name, builder) in real_parts::PARTS {
+        group.bench_function(format!("{name}/cold"), |b| {
+            b.iter_batched(
+                builder,
+                |graph| {
+                    black_box(
+                        graph
+                            .evaluate_bodies_with_warnings(&HashSet::new())
+                            .unwrap(),
+                    )
+                },
+                BatchSize::SmallInput,
+            )
+        });
+        let mut graph = builder();
+        graph.evaluate_bodies(&HashSet::new()).unwrap();
+        group.bench_function(format!("{name}/cached"), |b| {
+            b.iter(|| black_box(graph.evaluate_bodies(&HashSet::new()).unwrap()))
+        });
+        let predecessor = graph.graph.node_weights().last().unwrap().id.clone();
+        real_parts::add(
+            &mut graph,
+            "move_99",
+            zerocad_core::FeatureType::BodyTransform {
+                source: "base_1".into(),
+                translation: [0.; 3],
+                copy: false,
+            },
+        );
+        graph.add_dependency(&predecessor, "move_99");
+        graph
+            .evaluate_bodies_with_warnings(&HashSet::new())
+            .unwrap();
+        let mut offset = false;
+        group.bench_function(format!("{name}/trailing_edit"), |b| {
+            b.iter(|| {
+                offset = !offset;
+                let index = graph
+                    .graph
+                    .node_indices()
+                    .find(|&i| graph.graph[i].id == "move_99")
+                    .unwrap();
+                if let zerocad_core::FeatureType::BodyTransform { translation, .. } =
+                    &mut graph.graph[index].feature
+                {
+                    translation[0] = if offset { 0.25 } else { 0. };
+                }
+                black_box(
+                    graph
+                        .evaluate_bodies_with_warnings(&HashSet::new())
+                        .unwrap(),
+                )
+            })
+        });
+    }
+    group.finish();
+}
 
 fn modeling_pipeline(c: &mut Criterion) {
     let hidden = HashSet::new();
@@ -158,5 +221,10 @@ fn phase6_hotspots(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, modeling_pipeline, phase6_hotspots);
+criterion_group!(
+    benches,
+    modeling_pipeline,
+    phase6_hotspots,
+    real_part_pipeline
+);
 criterion_main!(benches);

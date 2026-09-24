@@ -99,10 +99,16 @@ pub(crate) fn apply_face_offset(
     let component = &source.parts[component_index];
     let policy = openrcad::foundation::TolerancePolicy::STANDARD;
     let overshoot = direct_edit_overshoot(component, &policy);
+    // The tool must START past the selected face so the boolean cap is never
+    // coincident with it, and STOP exactly at the requested plane: start `±o`,
+    // sweep such that the endpoint is `distance` on both sides. (E12
+    // regression: the inward branch used to sweep `distance − 2·o`, landing
+    // one overshoot PAST the requested plane and silently over-removing by a
+    // model-scale-dependent amount.)
     let (start_offset, sweep) = if distance > 0.0 {
         (-overshoot, distance + overshoot)
     } else {
-        (overshoot, distance - 2.0 * overshoot)
+        (overshoot, distance - overshoot)
     };
     let start = face.transformed(&openrcad::foundation::Trsf::translation(
         openrcad::foundation::Vec::new(
@@ -218,58 +224,30 @@ pub(crate) fn apply_face_thicken(
         ));
         return;
     }
-    if let Some((body_index, component_index, cylinder)) =
+    if let Some((body_index, _component_index, cylinder)) =
         selected_cylindrical_face(target, reference, live)
     {
         let source = live[body_index].clone();
         apply_cylindrical_face_thicken(
-            node_id,
-            body_index,
-            component_index,
-            source,
-            cylinder,
-            thickness,
-            reverse,
-            live,
-            warnings,
+            node_id, &source, cylinder, thickness, reverse, live, warnings,
         );
         return;
     }
-    if let Some((body_index, component_index, cone)) =
+    if let Some((body_index, _component_index, cone)) =
         selected_conical_face(target, reference, live)
     {
         let source = live[body_index].clone();
-        apply_conical_face_thicken(
-            node_id,
-            body_index,
-            component_index,
-            source,
-            cone,
-            thickness,
-            reverse,
-            live,
-            warnings,
-        );
+        apply_conical_face_thicken(node_id, &source, cone, thickness, reverse, live, warnings);
         return;
     }
-    if let Some((body_index, component_index, sphere)) =
+    if let Some((body_index, _component_index, sphere)) =
         selected_spherical_face(target, reference, live)
     {
         let source = live[body_index].clone();
-        apply_spherical_face_thicken(
-            node_id,
-            body_index,
-            component_index,
-            source,
-            sphere,
-            thickness,
-            reverse,
-            live,
-            warnings,
-        );
+        apply_spherical_face_thicken(node_id, &source, sphere, thickness, reverse, live, warnings);
         return;
     }
-    let Some((body_index, component_index, face, mut normal)) =
+    let Some((body_index, _component_index, face, mut normal)) =
         resolve_planar_edit_face(target, reference, live, node_id, "Thicken face", warnings)
     else {
         return;
@@ -299,16 +277,7 @@ pub(crate) fn apply_face_thicken(
             return;
         }
     };
-    commit_component_replacement(
-        node_id,
-        body_index,
-        component_index,
-        source,
-        vec![solid],
-        None,
-        live,
-        warnings,
-    );
+    commit_new_body_alongside_source(node_id, &source, solid, live, warnings);
 }
 
 fn selected_cylindrical_face(
@@ -496,12 +465,9 @@ fn apply_cylindrical_face_offset(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_cylindrical_face_thicken(
     node_id: &str,
-    body_index: usize,
-    component_index: usize,
-    source: LiveBody,
+    source: &LiveBody,
     cylinder: crate::mock_kernel::CylinderFaceInfo,
     thickness: f32,
     reverse: bool,
@@ -527,16 +493,7 @@ fn apply_cylindrical_face_thicken(
         ));
         return;
     };
-    commit_component_replacement(
-        node_id,
-        body_index,
-        component_index,
-        source,
-        vec![solid],
-        None,
-        live,
-        warnings,
-    );
+    commit_new_body_alongside_source(node_id, source, solid, live, warnings);
 }
 
 fn cylindrical_annulus(
@@ -786,12 +743,9 @@ fn apply_spherical_face_offset(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_conical_face_thicken(
     node_id: &str,
-    body_index: usize,
-    component_index: usize,
-    source: LiveBody,
+    source: &LiveBody,
     cone: crate::mock_kernel::ConeFaceInfo,
     thickness: f32,
     reverse: bool,
@@ -828,24 +782,12 @@ fn apply_conical_face_thicken(
         ));
         return;
     };
-    commit_component_replacement(
-        node_id,
-        body_index,
-        component_index,
-        source,
-        vec![solid],
-        None,
-        live,
-        warnings,
-    );
+    commit_new_body_alongside_source(node_id, source, solid, live, warnings);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_spherical_face_thicken(
     node_id: &str,
-    body_index: usize,
-    component_index: usize,
-    source: LiveBody,
+    source: &LiveBody,
     sphere: crate::mock_kernel::SphereFaceInfo,
     thickness: f32,
     reverse: bool,
@@ -874,16 +816,7 @@ fn apply_spherical_face_thicken(
         ));
         return;
     };
-    commit_component_replacement(
-        node_id,
-        body_index,
-        component_index,
-        source,
-        vec![solid],
-        None,
-        live,
-        warnings,
-    );
+    commit_new_body_alongside_source(node_id, source, solid, live, warnings);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1038,6 +971,118 @@ fn try_move_parallelepiped_face(
     true
 }
 
+/// Remove an isolated cylindrical boss or hole by restoring its supporting
+/// planar faces. Require exact circular boundary loops: a cap and one opening,
+/// or two distinct openings for an internal through-hole.
+fn heal_cylindrical_feature(
+    part: &KernelSolid,
+    info: &crate::mock_kernel::CylinderFaceInfo,
+) -> Option<KernelSolid> {
+    use openrcad::geom::{GeomCurve, GeomSurface};
+    let axis =
+        openrcad::foundation::Vec::new(info.dir[0] as f64, info.dir[1] as f64, info.dir[2] as f64);
+    let origin = openrcad::foundation::Pnt::new(
+        info.origin[0] as f64,
+        info.origin[1] as f64,
+        info.origin[2] as f64,
+    );
+    let tol = 1e-5 * (info.radius as f64).max(1.0);
+    let ring = |wire: &openrcad::topo::Wire| -> Option<f64> {
+        let mut height = None;
+        for edge in wire.edges() {
+            let Some(GeomCurve::Circle(c)) = edge.curve() else {
+                return None;
+            };
+            let pos = c.position();
+            let rel = pos.location() - origin;
+            let h = rel.dot(&axis);
+            if (c.radius() - info.radius as f64).abs() > tol
+                || (rel - axis * h).magnitude() > tol
+                || openrcad::foundation::Vec::from_dir(pos.direction())
+                    .dot(&axis)
+                    .abs()
+                    < 1.0 - 1e-6
+                || height.is_some_and(|v: f64| (v - h).abs() > tol)
+            {
+                return None;
+            }
+            height = Some(h);
+        }
+        height.filter(|h| {
+            (*h - info.axial_min as f64).abs() <= tol || (*h - info.axial_max as f64).abs() <= tol
+        })
+    };
+    let walls = crate::mock_kernel::cylindrical_wall_groups(part)
+        .into_iter()
+        .find(|(_, c)| {
+            (c.radius - info.radius).abs() < tol as f32
+                && c.origin
+                    .iter()
+                    .zip(info.origin)
+                    .all(|(a, b)| (*a - b).abs() < tol as f32)
+                && (c.axial_min - info.axial_min).abs() < tol as f32
+                && (c.axial_max - info.axial_max).abs() < tol as f32
+        })?
+        .0;
+    let mut faces = Vec::new();
+    let mut cap_height = None;
+    let mut support_heights = Vec::new();
+    for (i, face) in part.faces().into_iter().enumerate() {
+        if walls.contains(&i) {
+            continue;
+        }
+        if !matches!(face.surface(), Some(GeomSurface::Plane(_))) {
+            faces.push(face);
+            continue;
+        }
+        if face.inner_wires().is_empty() {
+            if let Some(h) = face.outer_wire().as_ref().and_then(&ring) {
+                if cap_height.replace(h).is_some() {
+                    return None;
+                }
+                continue;
+            }
+        }
+        let mut holes = Vec::new();
+        let mut changed = false;
+        for hole in face.inner_wires() {
+            if let Some(h) = ring(&hole) {
+                if support_heights.len() >= 2 {
+                    return None;
+                }
+                support_heights.push(h);
+                changed = true;
+            } else {
+                holes.push(hole);
+            }
+        }
+        if changed {
+            faces.push(openrcad::topo::Face::with_wires(
+                face.surface().cloned(),
+                face.outer_wire(),
+                holes,
+                face.orientation(),
+            ));
+        } else {
+            faces.push(face);
+        }
+    }
+    let supported = match (cap_height, support_heights.as_slice()) {
+        (Some(cap), [support]) => (cap - support).abs() > tol,
+        (None, [first, second]) => info.internal && (first - second).abs() > tol,
+        _ => false,
+    };
+    if !supported {
+        return None;
+    }
+    let sewn = openrcad::algo::sew::sew_with_policy(
+        &faces,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+    )
+    .ok()?;
+    Some(KernelSolid::new(sewn.value))
+}
+
 pub(crate) fn apply_face_delete(
     node_id: &str,
     target: &str,
@@ -1077,6 +1122,19 @@ pub(crate) fn apply_face_delete(
         ));
         return;
     };
+    if let Some(healed) = heal_cylindrical_feature(component, &cylinder) {
+        commit_component_replacement(
+            node_id,
+            body_index,
+            resolved.component_index,
+            source,
+            vec![healed],
+            None,
+            live,
+            warnings,
+        );
+        return;
+    }
     let axis = Vec3::new(cylinder.dir[0], cylinder.dir[1], cylinder.dir[2]).normalize();
     let axis_origin = Vec3::new(cylinder.origin[0], cylinder.origin[1], cylinder.origin[2]);
     // A delete-face heal fills exactly the trimmed wall span. Overshooting here
@@ -1234,6 +1292,50 @@ pub(crate) fn commit_component_replacement(
         live,
         warnings,
     )
+}
+
+/// Create-new-body commit route for FaceThicken's documented contract (E10):
+/// the source body stays exactly as it was — every component, its id, and its
+/// pristine mesh — and the thickened prism/shell becomes a NEW body owned by
+/// the feature node (later features chain on the feature id, like BodyCut).
+/// The new solid passes the same watertight / health / pcurve /
+/// strict-validation / checked-tessellation gate as every other direct-edit
+/// commit before anything is added.
+pub(crate) fn commit_new_body_alongside_source(
+    node_id: &str,
+    source: &LiveBody,
+    thickened: KernelSolid,
+    live: &mut Vec<LiveBody>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if let Err(reason) = replacement_solid_commit_check(&thickened) {
+        warnings.push(format!(
+            "Thicken face '{node_id}': the thickened body failed the runtime commit gate \
+             ({reason}); the source was left unchanged."
+        ));
+        return false;
+    }
+    let pristine = source
+        .pristine
+        .as_deref()
+        .and_then(|input_mesh| {
+            let mesh = crate::mock_kernel::propagate_face_names(input_mesh, &thickened, node_id);
+            (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh))
+        })
+        .or_else(|| {
+            let mesh = MockMesh::from_solid(&thickened);
+            (!mesh.indices.is_empty()).then(|| std::sync::Arc::new(mesh))
+        });
+    apply_new(
+        live,
+        LiveBody {
+            id: node_id.into(),
+            parts: vec![thickened],
+            pristine,
+            sketch_source: None,
+        },
+    );
+    true
 }
 
 /// Atomic replacement boundary shared by direct edits that yield one or more

@@ -1,0 +1,765 @@
+    Checking zerocad-core v0.7.5 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-core)
+warning: method `add` can be confused for the standard trait method `std::ops::Add::add`
+  --> zerocad-core\src\geometry.rs:34:5
+   |
+34 | /     pub fn add(self, other: Self) -> Self {
+35 | |         Self::new(self.x + other.x, self.y + other.y, self.z + other.z)
+36 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::ops::Add` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#should_implement_trait
+   = note: `#[warn(clippy::should_implement_trait)]` on by default
+
+warning: method `sub` can be confused for the standard trait method `std::ops::Sub::sub`
+  --> zerocad-core\src\geometry.rs:38:5
+   |
+38 | /     pub fn sub(self, other: Self) -> Self {
+39 | |         Self::new(self.x - other.x, self.y - other.y, self.z - other.z)
+40 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::ops::Sub` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#should_implement_trait
+
+warning: method `mul` can be confused for the standard trait method `std::ops::Mul::mul`
+  --> zerocad-core\src\geometry.rs:42:5
+   |
+42 | /     pub fn mul(self, scalar: f32) -> Self {
+43 | |         Self::new(self.x * scalar, self.y * scalar, self.z * scalar)
+44 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::ops::Mul` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#should_implement_trait
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\src\mock_kernel\geom_utils.rs:170:19
+    |
+170 |     let mut best: Option<(f32, [f32; 3], [f32; 3], f32, bool)> = None;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this `map_or` can be simplified
+   --> zerocad-core\src\mock_kernel\geom_utils.rs:191:12
+    |
+191 |         if best.as_ref().map_or(true, |b| err < b.0) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use is_none_or instead
+    |
+191 -         if best.as_ref().map_or(true, |b| err < b.0) {
+191 +         if best.as_ref().is_none_or(|b| err < b.0) {
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\src\mock_kernel\geom_utils.rs:424:20
+    |
+424 |     let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> zerocad-core\src\mock_kernel\mesh_topology.rs:36:23
+   |
+36 |     let mut edge_use: HashMap<((i64, i64, i64), (i64, i64, i64)), (u32, Vec3, Vec3)> =
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> zerocad-core\src\mock_kernel\mesh_topology.rs:60:23
+   |
+60 |     let mut boundary: Vec<(((i64, i64, i64), (i64, i64, i64)), Vec3, Vec3)> = edge_use
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: the loop variable `fi` is used to index `kinds`
+   --> zerocad-core\src\mock_kernel\mesh_topology.rs:529:15
+    |
+529 |     for fi in 0..faces.len() {
+    |               ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+    |
+529 -     for fi in 0..faces.len() {
+529 +     for (fi, <item>) in kinds.iter().enumerate().take(faces.len()) {
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\src\mock_kernel\mesh_topology.rs:553:6
+    |
+553 | ) -> (Vec<f32>, Vec<u32>, Vec<f32>, Vec<(u32, u32)>) {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\src\mock_kernel\mesh_topology.rs:583:20
+    |
+583 |     let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), EdgeRec> = HashMap::new();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\primitives.rs:4277:6
+     |
+4277 | ) -> Option<((f32, f32), (f32, f32), (f32, f32), f32)> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1164:6
+     |
+1164 | ) -> Result<(Vec<f32>, Vec<u32>, Vec<u32>), DisplayTessellationError> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1411:24
+     |
+1411 |     let mut edge_tris: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1422:46
+     |
+1422 |     let directed = |t: usize, flip: bool| -> [((i64, i64, i64), (i64, i64, i64)); 3] {
+     |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: this function has too many arguments (9/7)
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1711:1
+     |
+1711 | / pub(crate) fn add_missing_straight_brep_edges(
+1712 | |     solid: &KernelSolid,
+1713 | |     vertices: &[f32],
+1714 | |     indices: &[u32],
+...    |
+1720 | |     edge_pairs: &mut Vec<(u32, u32)>,
+1721 | | ) {
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_arguments
+     = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1752:27
+     |
+1752 |     let mut face_samples: HashMap<u32, Vec<([f32; 3], [f32; 3])>> = HashMap::new();
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1796:25
+     |
+1796 |       let mut topo_edges: HashMap<
+     |  _________________________^
+1797 | |         ((i64, i64, i64), (i64, i64, i64)),
+1798 | |         ([f32; 3], [f32; 3], Vec<u32>),
+1799 | |     > = HashMap::new();
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: accessing first element with `faces.get(0)`
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1878:18
+     |
+1878 |           let n0 = faces
+     |  __________________^
+1879 | |             .get(0)
+     | |___________________^ help: try: `faces.first()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#get_first
+     = note: `#[warn(clippy::get_first)]` on by default
+
+warning: this function has too many arguments (9/7)
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1907:1
+     |
+1907 | / pub(crate) fn add_analytic_curved_brep_edges(
+1908 | |     solid: &KernelSolid,
+1909 | |     vertices: &[f32],
+1910 | |     indices: &[u32],
+...    |
+1916 | |     edge_pairs: &mut Vec<(u32, u32)>,
+1917 | | ) -> HashSet<(u32, u32)> {
+     | |________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_arguments
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:1949:27
+     |
+1949 |     let mut face_samples: HashMap<u32, Vec<([f32; 3], [f32; 3])>> = HashMap::new();
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\mock_kernel\tessellation.rs:2107:19
+     |
+2107 |     face_samples: &HashMap<u32, Vec<([f32; 3], [f32; 3])>>,
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: the loop variable `axis` is used to index `center`
+   --> zerocad-core\src\mock_kernel\types.rs:206:25
+    |
+206 |             for axis in 0..3 {
+    |                         ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+206 -             for axis in 0..3 {
+206 +             for (axis, <item>) in center.iter().enumerate() {
+    |
+
+warning: the loop variable `axis` is used to index `center`
+   --> zerocad-core\src\mock_kernel\types.rs:212:25
+    |
+212 |             for axis in 0..3 {
+    |                         ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+212 -             for axis in 0..3 {
+212 +             for (axis, <item>) in center.iter().enumerate() {
+    |
+
+warning: this function has too many arguments (9/7)
+   --> zerocad-core\src\parametric\cut.rs:310:1
+    |
+310 | / pub(crate) fn cut_part_one_dir(
+311 | |     part: &KernelSolid,
+312 | |     pbb: Option<&([f32; 3], [f32; 3])>,
+313 | |     smooth: &Option<KernelSolid>,
+...   |
+319 | |     obj_classes: Option<&[Option<u64>]>,
+320 | | ) -> Option<CutOutcome> {
+    | |_______________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_arguments
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\src\parametric\cut.rs:431:6
+    |
+431 | ) -> (Option<([f32; 3], [f32; 3])>, Option<([f32; 3], [f32; 3])>) {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\edge_mod.rs:2479:20
+     |
+2479 |     let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\edge_mod.rs:2524:20
+     |
+2524 |     let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\eval.rs:1175:10
+     |
+1175 |     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\eval.rs:1188:10
+     |
+1188 |     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>, Vec<FeatureStatus>), String> {
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\eval.rs:1366:10
+     |
+1366 |     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\eval.rs:1382:10
+     |
+1382 |     ) -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> zerocad-core\src\parametric\eval.rs:1383:25
+     |
+1383 |         let run = || -> Result<(Vec<(String, MockMesh)>, Vec<String>), String> {
+     |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: writing `&mut Vec` instead of `&mut [_]` involves a new object where a slice will do
+    --> zerocad-core\src\parametric\eval.rs:6652:11
+     |
+6652 |     live: &mut Vec<LiveBody>,
+     |           ^^^^^^^^^^^^^^^^^^ help: change this to: `&mut [LiveBody]`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#ptr_arg
+     = note: `#[warn(clippy::ptr_arg)]` on by default
+
+warning: the loop variable `i` is used to index `reached`
+    --> zerocad-core\src\parametric\eval.rs:7752:14
+     |
+7752 |     for i in 0..source_parts.len() {
+     |              ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+7752 -     for i in 0..source_parts.len() {
+7752 +     for (i, <item>) in reached.iter_mut().enumerate().take(source_parts.len()) {
+     |
+
+warning: this `map_or` can be simplified
+    --> zerocad-core\src\parametric\extrude.rs:1420:20
+     |
+1420 |                 if best_rect.as_ref().map_or(true, |(best, _)| dist < *best) {
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnecessary_map_or
+help: use is_none_or instead
+     |
+1420 -                 if best_rect.as_ref().map_or(true, |(best, _)| dist < *best) {
+1420 +                 if best_rect.as_ref().is_none_or(|(best, _)| dist < *best) {
+     |
+
+warning: this `map_or` can be simplified
+    --> zerocad-core\src\parametric\extrude.rs:1430:20
+     |
+1430 |                 if best_circle.as_ref().map_or(true, |(best, _)| dist < *best) {
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnecessary_map_or
+help: use is_none_or instead
+     |
+1430 -                 if best_circle.as_ref().map_or(true, |(best, _)| dist < *best) {
+1430 +                 if best_circle.as_ref().is_none_or(|(best, _)| dist < *best) {
+     |
+
+warning: length comparison to zero
+    --> zerocad-core\src\parametric\extrude.rs:1579:8
+     |
+1579 |     if region.holes.len() > 0 {
+     |        ^^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!region.holes.is_empty()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#len_zero
+     = note: `#[warn(clippy::len_zero)]` on by default
+
+warning: this block may be rewritten with the `?` operator
+   --> zerocad-core\src\parametric\join.rs:915:5
+    |
+915 | /     if tool_source.region.analytic.is_none() {
+916 | |         return None;
+917 | |     }
+    | |_____^ help: replace it with: `tool_source.region.analytic.as_ref()?;`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#question_mark
+    = note: `#[warn(clippy::question_mark)]` on by default
+
+warning: this `impl` can be derived
+  --> zerocad-core\src\parametric\types.rs:14:1
+   |
+14 | / impl Default for ExtrudeMode {
+15 | |     fn default() -> Self {
+16 | |         ExtrudeMode::NewBody
+17 | |     }
+18 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#derivable_impls
+   = note: `#[warn(clippy::derivable_impls)]` on by default
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+ 5 + #[derive(Default)]
+ 6 | pub enum ExtrudeMode {
+ 7 |     /// Create a standalone new body (the historical default).
+ 8 ~     #[default]
+ 9 ~     NewBody,
+   |
+
+warning: the loop variable `r` is used to index `v`
+  --> zerocad-core\src\sketch\linalg.rs:61:18
+   |
+61 |         for r in 0..self.rows {
+   |                  ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+61 -         for r in 0..self.rows {
+61 +         for (r, <item>) in v.iter().enumerate().take(self.rows) {
+   |
+
+warning: the loop variable `c` is used to index `out`
+  --> zerocad-core\src\sketch\linalg.rs:63:22
+   |
+63 |             for c in 0..self.cols {
+   |                      ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+63 -             for c in 0..self.cols {
+63 +             for (c, <item>) in out.iter_mut().enumerate().take(self.cols) {
+   |
+
+warning: the loop variable `v` is only used to index `outgoing`
+    --> zerocad-core\src\sketch.rs:2336:14
+     |
+2336 |     for v in 0..vertices.len() {
+     |              ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+2336 -     for v in 0..vertices.len() {
+2336 +     for <item> in outgoing.iter().take(vertices.len()) {
+     |
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> zerocad-core\src\parametric\tests\boolean_extrude.rs:286:59
+    |
+286 |     let vol: f32 = bodies.iter().map(|(_, m)| mesh_volume(&m)).sum();
+    |                                                           ^^ help: change this to: `m`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\src\parametric\tests\circular_bite_helpers.rs:212:20
+    |
+212 |     let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: `zerocad-core` (lib) generated 43 warnings (run `cargo clippy --fix --lib -p zerocad-core` to apply 7 suggestions)
+warning: usage of `bool::then` in `filter_map`
+   --> zerocad-core\src\parametric\tests\extrude_modes.rs:651:14
+    |
+651 |               .filter_map(|(triangle, indices)| {
+    |  ______________^
+652 | |                 indices
+653 | |                     .iter()
+654 | |                     .all(|&vertex| {
+...   |
+658 | |                     .then(|| mesh.face_ids[triangle])
+659 | |             })
+    | |______________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#filter_map_bool_then
+    = note: `#[warn(clippy::filter_map_bool_then)]` on by default
+help: use `filter` then `map` instead
+    |
+651 ~             .filter(|&(triangle, indices)| indices
+652 +                     .iter()
+653 +                     .all(|&vertex| {
+654 +                         let base = vertex as usize * 6;
+655 +                         (mesh.vertices[base + axis] - coordinate).abs() < 0.02
+656 +                     })).map(|(triangle, indices)| mesh.face_ids[triangle])
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> zerocad-core\tests\repro_extrude_one_region.rs:43:20
+   |
+43 |     let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+   = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: `zerocad-core` (test "repro_extrude_one_region") generated 1 warning
+warning: manual `RangeInclusive::contains` implementation
+    --> zerocad-core\src\sketch.rs:3181:50
+     |
+3181 |             let in_r1 = x >= -6.0 && x <= 4.0 && y >= -2.0 && y <= 10.0;
+     |                                                  ^^^^^^^^^^^^^^^^^^^^^^ help: use: `(-2.0..=10.0).contains(&y)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#manual_range_contains
+     = note: `#[warn(clippy::manual_range_contains)]` on by default
+
+warning: manual `RangeInclusive::contains` implementation
+    --> zerocad-core\src\sketch.rs:3181:25
+     |
+3181 |             let in_r1 = x >= -6.0 && x <= 4.0 && y >= -2.0 && y <= 10.0;
+     |                         ^^^^^^^^^^^^^^^^^^^^^ help: use: `(-6.0..=4.0).contains(&x)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#manual_range_contains
+
+warning: manual `RangeInclusive::contains` implementation
+    --> zerocad-core\src\sketch.rs:3182:50
+     |
+3182 |             let in_r2 = x >= 0.0 && x <= 12.0 && y >= -8.0 && y <= 4.0;
+     |                                                  ^^^^^^^^^^^^^^^^^^^^^ help: use: `(-8.0..=4.0).contains(&y)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#manual_range_contains
+
+warning: manual `RangeInclusive::contains` implementation
+    --> zerocad-core\src\sketch.rs:3182:25
+     |
+3182 |             let in_r2 = x >= 0.0 && x <= 12.0 && y >= -8.0 && y <= 4.0;
+     |                         ^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.0..=12.0).contains(&x)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#manual_range_contains
+
+warning: this assertion has a constant value
+   --> zerocad-core\tests\release_stability_gate.rs:307:5
+    |
+307 | /     assert!(
+308 | |         cfg!(panic = "unwind"),
+309 | |         "the evaluator and guarded kernel operations require panic=unwind"
+310 | |     );
+    | |_____^
+    |
+    = help: consider moving this into a const block: `const { assert!(..) }`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#assertions_on_constants
+    = note: `#[warn(clippy::assertions_on_constants)]` on by default
+
+warning: `zerocad-core` (test "release_stability_gate") generated 1 warning
+warning: `zerocad-core` (lib test) generated 50 warnings (43 duplicates) (run `cargo clippy --fix --lib -p zerocad-core --tests` to apply 6 suggestions)
+warning: this `if` has identical blocks
+  --> zerocad-core\tests\sketch_fillet_convexity.rs:95:35
+   |
+95 |           let zmid = if depth > 0.0 {
+   |  ___________________________________^
+96 | |             depth as f64 / 2.0
+97 | |         } else {
+   | |_________^
+   |
+note: same as this
+  --> zerocad-core\tests\sketch_fillet_convexity.rs:97:16
+   |
+97 |           } else {
+   |  ________________^
+98 | |             depth as f64 / 2.0
+99 | |         };
+   | |_________^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#if_same_then_else
+   = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: `zerocad-core` (test "sketch_fillet_convexity") generated 1 warning
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\tests\repro_fillet_then_fillet.rs:234:20
+    |
+234 |     let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: `zerocad-core` (test "repro_fillet_then_fillet") generated 1 warning
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\tests\repro_gui_issues.rs:176:24
+    |
+176 |         let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\tests\repro_gui_issues.rs:405:20
+    |
+405 |     let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+
+warning: `zerocad-core` (test "repro_gui_issues") generated 2 warnings
+warning: using `clone` on type `CoordinateSystem` which implements the `Copy` trait
+   --> zerocad-core\tests\corner_bite_extrude.rs:143:34
+    |
+143 |     let g = corner_bite_graph_on(cs.clone(), (0.0, 0.0), 8.0, (1.5, 1.5));
+    |                                  ^^^^^^^^^^ help: try removing the `clone` call: `cs`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#clone_on_copy
+    = note: `#[warn(clippy::clone_on_copy)]` on by default
+
+warning: using `clone` on type `CoordinateSystem` which implements the `Copy` trait
+   --> zerocad-core\tests\corner_bite_extrude.rs:151:34
+    |
+151 |     let g = corner_bite_graph_on(cs.clone(), (-2.0, -2.0), 8.0, (1.5, 1.5));
+    |                                  ^^^^^^^^^^ help: try removing the `clone` call: `cs`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#clone_on_copy
+
+warning: using `clone` on type `CoordinateSystem` which implements the `Copy` trait
+   --> zerocad-core\tests\corner_bite_extrude.rs:160:34
+    |
+160 |     let g = corner_bite_graph_on(cs.clone(), (0.0, 0.0), 8.0, (1.5, 1.5));
+    |                                  ^^^^^^^^^^ help: try removing the `clone` call: `cs`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#clone_on_copy
+
+warning: using `clone` on type `CoordinateSystem` which implements the `Copy` trait
+   --> zerocad-core\tests\corner_bite_extrude.rs:171:38
+    |
+171 |     let mut g = corner_bite_graph_on(cs.clone(), (0.0, 0.0), 8.0, (1.5, 1.5));
+    |                                      ^^^^^^^^^^ help: try removing the `clone` call: `cs`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#clone_on_copy
+
+warning: using `clone` on type `CoordinateSystem` which implements the `Copy` trait
+   --> zerocad-core\tests\corner_bite_extrude.rs:211:34
+    |
+211 |     let g = corner_bite_graph_on(cs.clone(), (15.0, 0.0), 8.0, (15.0, 1.5));
+    |                                  ^^^^^^^^^^ help: try removing the `clone` call: `cs`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#clone_on_copy
+
+warning: `zerocad-core` (test "corner_bite_extrude") generated 5 warnings (run `cargo clippy --fix --test "corner_bite_extrude" -p zerocad-core` to apply 5 suggestions)
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\tests\smooth_cylinder.rs:299:20
+    |
+299 |     let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: `zerocad-core` (test "smooth_cylinder") generated 1 warning
+warning: returning the result of a `let` binding from a block
+   --> zerocad-core\tests\cylinder_tests.rs:285:9
+    |
+280 | /         let vertical_tangent = near(p0[0], 0.0)
+281 | |             && near(p1[0], 0.0)
+282 | |             && (near(p0[1], 0.0) || near(p0[1], 2.0))
+283 | |             && near(p0[1], p1[1])
+284 | |             && (p0[2] - p1[2]).abs() > 2.9;
+    | |___________________________________________- unnecessary `let` binding
+285 |           vertical_tangent
+    |           ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#let_and_return
+    = note: `#[warn(clippy::let_and_return)]` on by default
+help: return the expression directly
+    |
+280 ~
+281 ~         near(p0[0], 0.0)
+282 +             && near(p1[0], 0.0)
+283 +             && (near(p0[1], 0.0) || near(p0[1], 2.0))
+284 +             && near(p0[1], p1[1])
+285 +             && (p0[2] - p1[2]).abs() > 2.9
+    |
+
+warning: `zerocad-core` (test "cylinder_tests") generated 1 warning (run `cargo clippy --fix --test "cylinder_tests" -p zerocad-core` to apply 1 suggestion)
+warning: doc list item without indentation
+ --> zerocad-core\tests\repro_ground_cylinder_chamfer.rs:6:5
+  |
+6 | //! and the preview band flares OUTWARD past the wall.
+  |     ^
+  |
+  = help: if this is supposed to be its own paragraph, add a blank line
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#doc_lazy_continuation
+  = note: `#[warn(clippy::doc_lazy_continuation)]` on by default
+help: indent this line
+  |
+6 | //!     and the preview band flares OUTWARD past the wall.
+  |     ++++
+
+warning: `zerocad-core` (test "repro_ground_cylinder_chamfer") generated 1 warning
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\tests\parametric_tests.rs:113:26
+    |
+113 |     let mut edge_counts: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: length comparison to zero
+   --> zerocad-core\tests\parametric_tests.rs:158:13
+    |
+158 |     assert!(mesh.vertices.len() > 0);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!mesh.vertices.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#len_zero
+    = note: `#[warn(clippy::len_zero)]` on by default
+
+warning: length comparison to zero
+   --> zerocad-core\tests\parametric_tests.rs:159:13
+    |
+159 |     assert!(mesh.indices.len() > 0);
+    |             ^^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!mesh.indices.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#len_zero
+
+warning: length comparison to zero
+   --> zerocad-core\tests\parametric_tests.rs:205:13
+    |
+205 |     assert!(mesh.vertices.len() > 0);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!mesh.vertices.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#len_zero
+
+warning: length comparison to zero
+   --> zerocad-core\tests\parametric_tests.rs:206:13
+    |
+206 |     assert!(mesh.indices.len() > 0);
+    |             ^^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!mesh.indices.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#len_zero
+
+warning: length comparison to zero
+   --> zerocad-core\tests\parametric_tests.rs:312:9
+    |
+312 |         with_hole.vertices.len() > 0,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!with_hole.vertices.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#len_zero
+
+warning: `zerocad-core` (test "parametric_tests") generated 6 warnings (run `cargo clippy --fix --test "parametric_tests" -p zerocad-core` to apply 5 suggestions)
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> zerocad-core\tests\repro_prism_boss_fillet.rs:131:20
+    |
+131 |     let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> zerocad-core\tests\repro_prism_boss_fillet.rs:180:62
+    |
+180 | ...                   e.curve().map(|c| curve_kind(&c)).unwrap_or("?")
+    |                                                    ^^ help: change this to: `c`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: `zerocad-core` (test "repro_prism_boss_fillet") generated 2 warnings (run `cargo clippy --fix --test "repro_prism_boss_fillet" -p zerocad-core` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.73s

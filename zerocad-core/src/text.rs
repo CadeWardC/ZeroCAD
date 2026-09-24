@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     fn plate() -> crate::mock_kernel::KernelSolid {
-        crate::mock_kernel::box_solid(60.0, 20.0, 5.0)
+        crate::mock_kernel::box_solid(60.0, 20.0, 5.0).expect("fixed plate dimensions are valid")
     }
 
     fn request<'a>(text: &'a str, mode: EmbossMode) -> EmbossRequest<'a> {

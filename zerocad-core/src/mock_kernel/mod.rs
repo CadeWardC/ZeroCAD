@@ -37,6 +37,7 @@ mod arc_display;
 mod blend;
 mod boolean;
 mod circle_geom;
+mod edge_identity;
 mod geom_utils;
 mod history;
 mod mesh_topology;
@@ -55,9 +56,9 @@ pub use circle_geom::*;
 pub use geom_utils::*;
 #[allow(unused_imports)]
 pub use history::*;
-pub use mesh_topology::mesh_face_boundary_2d;
 #[allow(unused_imports)]
 pub(crate) use mesh_topology::*;
+pub use mesh_topology::{kernel_face_boundary_2d, mesh_face_boundary_2d};
 pub(crate) use outcome::*;
 pub use primitives::*;
 pub use section::*;

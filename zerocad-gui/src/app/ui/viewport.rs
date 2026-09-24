@@ -644,14 +644,13 @@ impl ZeroCadApp {
                                 } else {
                                     let point_count = tool.point_count();
                                     if self.sketch_points.is_empty() {
-                                        // First point (click or press-drag). Dimensioned 2-point
-                                        // tools open the inline dimension dialog here; the
-                                        // point-drawn tools (rotated rect, 3-point circle,
-                                        // ellipses, polygon, mirror) draw by clicking each point
-                                        // with a live preview and no dialog.
+                                        // Open numeric input for dimensioned tools. Ellipses
+                                        // reuse one field for each successive axis.
                                         self.sketch_points.push(pt);
                                         self.sketch_temp_start = Some(pt);
-                                        if point_count == 2 && !tool.is_point_drawn() {
+                                        if (point_count == 2 && !tool.is_point_drawn())
+                                            || matches!(tool, SketchTool::Ellipse | SketchTool::ThreePointEllipse)
+                                        {
                                             self.dim_anchor = Some(hover_pos);
                                             self.dim_input = Some(DimInput {
                                                 fields: dim_fields_for(tool),
@@ -681,7 +680,7 @@ impl ZeroCadApp {
                                             } else {
                                                 self.finalize_shape(pt);
                                             }
-                                        } else {
+                                        } else if !self.advance_ellipse_axis(pt) {
                                             self.sketch_points.push(pt);
                                             self.status_msg = format!(
                                                 "Point {} of {} set — click to place the next point.",
@@ -1196,7 +1195,7 @@ impl ZeroCadApp {
                                             .sketch_face_boundaries
                                             .get(node.id.as_str())
                                         {
-                                            region_curves.extend_curves(b);
+                                            region_curves.extend_face_boundary(b);
                                         }
                                         let cached_regions = self
                                             .cached_finished_regions(
@@ -1508,7 +1507,15 @@ impl ZeroCadApp {
                                     };
                                     vec![length_pos, a + egui::vec2(34.0, 18.0)]
                                 }
-                                // 3-point tools have no inline dimensions.
+                                SketchTool::Ellipse | SketchTool::ThreePointEllipse => {
+                                    self.ellipse_dimension_segment(cursor, true)
+                                        .map(|(a, b)| {
+                                            let a = to_screen(a);
+                                            let b = to_screen(b);
+                                            vec![a + (b - a) * 0.5 + egui::vec2(0.0, -18.0)]
+                                        })
+                                        .unwrap_or_default()
+                                }
                                 _ => Vec::new(),
                             };
                         } else {

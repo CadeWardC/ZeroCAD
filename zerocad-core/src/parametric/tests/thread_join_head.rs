@@ -142,32 +142,53 @@ fn join_head_onto_threaded_shaft_fuses_and_keeps_threads() {
 /// material and keep the body whole.
 #[test]
 fn cut_pocket_into_threaded_shaft_removes_material() {
+    for shift in [Vec3::ZERO, Vec3::new(25.0, -10.0, 7.0)] {
+        check_threaded_pocket(shift);
+    }
+}
+
+fn check_threaded_pocket(shift: Vec3) {
     let (r, h) = (6.0f32, 10.0f32);
     let mut g = ParametricGraph::new();
     add_cylinder(&mut g, "cyl_1", r, h);
     add_thread(&mut g, "thread_2", "cyl_1", r, h);
+    let body_id = if shift != Vec3::ZERO {
+        g.add_feature(FeatureNode {
+            id: "translated".into(),
+            name: "Translated shaft".into(),
+            feature: FeatureType::BodyTransform {
+                source: "cyl_1".into(),
+                translation: [shift.x, shift.y, shift.z],
+                copy: false,
+            },
+        });
+        g.add_dependency("thread_2", "translated");
+        "translated"
+    } else {
+        "cyl_1"
+    };
     let (threaded_only, baseline_warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
     assert!(baseline_warnings.is_empty(), "{baseline_warnings:?}");
-    let threaded_volume = body_mesh(&threaded_only, "cyl_1")
+    let threaded_volume = body_mesh(&threaded_only, body_id)
         .mass_properties()
         .expect("closed threaded shaft")
         .volume;
 
     // A small square pocket cut into the top face (y=h), sweeping downward (-Y).
     // u=X, v=Z ⇒ n=-Y at the top; positive depth bores into the shaft.
-    let top = CoordinateSystem::new(Vec3::new(0.0, h, 0.0), Vec3::X, Vec3::Z);
+    let top = CoordinateSystem::new(Vec3::new(0.0, h, 0.0).add(shift), Vec3::X, Vec3::Z);
     let pocket = rect_sketch((-2.0, -2.0), (2.0, 2.0));
     add_sketch_cs(&mut g, "sketch_3", top, pocket);
     add_extrude(&mut g, "extrude_4", "sketch_3", 3.0, ExtrudeMode::Cut);
-    g.add_dependency("cyl_1", "extrude_4");
+    g.add_dependency(body_id, "extrude_4");
 
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&std::collections::HashSet::new())
         .unwrap();
     assert_eq!(bodies.len(), 1, "still one body; got {:?}", ids(&bodies));
-    let mesh = body_mesh(&bodies, "cyl_1");
+    let mesh = body_mesh(&bodies, body_id);
     assert!(
         !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
         "pocketed body keeps a valid mesh"
@@ -177,7 +198,19 @@ fn cut_pocket_into_threaded_shaft_removes_material() {
         "the pocket must subtract, not fail on overlap: {warnings:?}"
     );
 
+    assert!(warnings.is_empty(), "{warnings:?}");
     let props = mesh.mass_properties().expect("closed pocketed solid");
+    assert!(
+        (threaded_volume - props.volume - 48.0).abs() < 0.1,
+        "exact 4x4x3 pocket: {}",
+        threaded_volume - props.volume
+    );
+    let cold = g
+        .clone_document()
+        .evaluate_bodies(&std::collections::HashSet::new())
+        .unwrap();
+    let cold_volume = body_mesh(&cold, body_id).mass_properties().unwrap().volume;
+    assert!((cold_volume - props.volume).abs() < 1e-5);
     assert!(
         props.volume < threaded_volume - 0.5,
         "the pocket must remove material: {:.2} vs threaded baseline {:.2}",
@@ -190,7 +223,7 @@ fn cut_pocket_into_threaded_shaft_removes_material() {
 fn mesh_aabb(mesh: &MockMesh) -> ([f32; 3], [f32; 3]) {
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];
-    for v in mesh.vertices.chunks_exact(3) {
+    for v in mesh.vertices.chunks_exact(6) {
         for k in 0..3 {
             lo[k] = lo[k].min(v[k]);
             hi[k] = hi[k].max(v[k]);

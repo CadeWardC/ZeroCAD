@@ -1,0 +1,18 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling zerocad-core v0.7.5 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.06s
+     Running tests\assembly_step.rs (target\debug\deps\assembly_step-fc3ed211b5877a21.exe)
+
+running 2 tests
+test unsolved_mates_cannot_silently_export_manual_placements ... ok
+test step_preserves_shared_parts_names_and_resolved_placements ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\assembly_workflows.rs (target\debug\deps\assembly_workflows-439def0ece5fbf27.exe)
+
+running 2 tests
+test invalid_replacement_and_mate_edit_leave_live_assembly_unchanged ... ok
+test plate_array_replacement_suppression_repair_and_history_roundtrip ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s

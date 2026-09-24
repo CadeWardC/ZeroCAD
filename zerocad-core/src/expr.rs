@@ -32,6 +32,12 @@ fn is_ident_char(c: char) -> bool {
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, String> {
+    // Dimension expressions can come from untrusted documents. Bound work
+    // before allocating the character buffer or identifier strings.
+    const MAX_EXPRESSION_BYTES: usize = 64 * 1024;
+    if input.len() > MAX_EXPRESSION_BYTES {
+        return Err("expression exceeds the 65536-byte input limit".into());
+    }
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -84,6 +90,7 @@ pub fn eval(input: &str, vars: &HashMap<String, f64>) -> Result<f64, String> {
         tokens: &tokens,
         pos: 0,
         vars,
+        depth: 0,
     };
     let v = p.expr()?;
     if p.pos != p.tokens.len() {
@@ -99,6 +106,7 @@ struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     vars: &'a HashMap<String, f64>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -158,17 +166,18 @@ impl<'a> Parser<'a> {
 
     // factor := ('+' | '-') factor | primary
     fn factor(&mut self) -> Result<f64, String> {
-        match self.peek() {
-            Some(Token::Minus) => {
-                self.bump();
-                Ok(-self.factor()?)
+        // A pasted chain of signs must not allocate one stack frame per sign.
+        let mut negative = false;
+        while let Some(token) = self.peek() {
+            match token {
+                Token::Minus => negative = !negative,
+                Token::Plus => {}
+                _ => break,
             }
-            Some(Token::Plus) => {
-                self.bump();
-                self.factor()
-            }
-            _ => self.primary(),
+            self.bump();
         }
+        let value = self.primary()?;
+        Ok(if negative { -value } else { value })
     }
 
     // primary := Num | Ident | '(' expr ')'
@@ -181,7 +190,13 @@ impl<'a> Parser<'a> {
                 .copied()
                 .ok_or_else(|| format!("unknown variable '{name}'")),
             Some(Token::LParen) => {
-                let v = self.expr()?;
+                if self.depth >= 64 {
+                    return Err("expression exceeds the 64-level nesting limit".into());
+                }
+                self.depth += 1;
+                let result = self.expr();
+                self.depth -= 1;
+                let v = result?;
                 match self.bump() {
                     Some(Token::RParen) => Ok(v),
                     _ => Err("expected ')'".into()),

@@ -227,9 +227,43 @@ pub fn arrange_curve_spans<P: Clone>(
     let half_edges = build_half_edges(&atomics);
     let next = compute_next(&half_edges, &atomics, &vertices);
     let cycles = walk_cycles(&half_edges, &next);
+    // An edge traversed on both sides by the same face is a graph bridge,
+    // not a material boundary. Remove these open strokes before walking faces
+    // again, including bridges that connect an inner loop to its container.
+    let edge_count = atomics.len();
+    let mut face_of_half = vec![usize::MAX; half_edges.len()];
+    for (face, cycle) in cycles.iter().enumerate() {
+        for &half in cycle {
+            face_of_half[half] = face;
+        }
+    }
+    let mut atomic_index = 0;
+    let mut original_atomics = Vec::new();
+    atomics.retain(|_| {
+        let keep = face_of_half[2 * atomic_index] != face_of_half[2 * atomic_index + 1];
+        if keep {
+            original_atomics.push(atomic_index);
+        }
+        atomic_index += 1;
+        keep
+    });
+    let half_edges = build_half_edges(&atomics);
+    let next = compute_next(&half_edges, &atomics, &vertices);
+    let cycles = walk_cycles(&half_edges, &next);
     let minimum_area = options.tolerance * options.tolerance;
     let mut loops = Vec::new();
+    let mut outside_loops = Vec::new();
     for cycle in cycles {
+        // Keep the original face-walk order used by persisted region indices,
+        // even when a removed open stroke used to be a face's first edge.
+        let order = cycle
+            .iter()
+            .map(|&half| {
+                let edge = half_edges[half];
+                face_of_half[2 * original_atomics[edge.atomic] + usize::from(edge.reversed)]
+            })
+            .min()
+            .unwrap_or(usize::MAX);
         let mut cycle_spans = Vec::with_capacity(cycle.len());
         for half in cycle {
             let edge = half_edges[half];
@@ -241,19 +275,40 @@ pub fn arrange_curve_spans<P: Clone>(
         }
         let signed_area: f64 = cycle_spans.iter().map(span_signed_area).sum();
         if signed_area > minimum_area {
-            loops.push(ArrangementLoop {
-                spans: cycle_spans,
-                signed_area,
+            loops.push((
+                order,
+                ArrangementLoop {
+                    spans: cycle_spans,
+                    signed_area,
+                    junction_tolerance: options.tolerance,
+                },
+            ));
+        } else if signed_area < -minimum_area {
+            // The clockwise face of a disconnected component is the complete
+            // hole boundary, even when that component contains several cells.
+            // Keep the public hole convention (CCW) used by prism consumers.
+            outside_loops.push(ArrangementLoop {
+                spans: cycle_spans
+                    .into_iter()
+                    .rev()
+                    .map(|span| span.reversed())
+                    .collect(),
+                signed_area: -signed_area,
                 junction_tolerance: options.tolerance,
             });
         }
     }
 
-    let regions = assign_holes(loops, options.tolerance);
+    loops.sort_by_key(|(order, _)| *order);
+    let regions = assign_holes(
+        loops.into_iter().map(|(_, loop_)| loop_).collect(),
+        outside_loops,
+        options.tolerance,
+    );
     Ok(Arrangement {
         regions,
         vertex_count: vertices.len(),
-        edge_count: atomics.len(),
+        edge_count,
     })
 }
 
@@ -1477,22 +1532,24 @@ fn quadrature_area<P>(span: &CurveSpan<P>) -> f64 {
 
 fn assign_holes<P: Clone>(
     loops: Vec<ArrangementLoop<P>>,
+    outside_loops: Vec<ArrangementLoop<P>>,
     tolerance: f64,
 ) -> Vec<ArrangementRegion<P>> {
     let polygons: Vec<Vec<Pnt2d>> = loops.iter().map(sample_loop_for_containment).collect();
-    let probes: Vec<Pnt2d> = polygons
+    let probes: Vec<Pnt2d> = outside_loops
         .iter()
-        .map(|polygon| interior_point(polygon))
+        .map(|loop_| interior_point(&sample_loop_for_containment(loop_)))
         .collect();
-    let mut parents: Vec<Option<usize>> = vec![None; loops.len()];
-    for child in 0..loops.len() {
+    let mut parents: Vec<Option<usize>> = vec![None; outside_loops.len()];
+    for child in 0..outside_loops.len() {
         for candidate in 0..loops.len() {
-            if child == candidate || loops[candidate].area() <= loops[child].area() + tolerance {
+            if loops[candidate].area() <= outside_loops[child].area() + tolerance {
                 continue;
             }
             if point_in_polygon(probes[child], &polygons[candidate])
-                && parents[child]
-                    .is_none_or(|parent| loops[candidate].area() < loops[parent].area())
+                && parents[child].map_or(true, |parent| {
+                    loops[candidate].area() < loops[parent].area()
+                })
             {
                 parents[child] = Some(candidate);
             }
@@ -1502,7 +1559,7 @@ fn assign_holes<P: Clone>(
         .iter()
         .enumerate()
         .map(|(index, outer)| {
-            let holes: Vec<_> = loops
+            let holes: Vec<_> = outside_loops
                 .iter()
                 .enumerate()
                 .filter(|(child, _)| parents[*child] == Some(index))
@@ -1810,6 +1867,66 @@ mod tests {
             .find(|region| !region.holes.is_empty())
             .expect("annulus");
         assert!((annulus.area - PI * 21.0).abs() < 1.0e-7);
+    }
+
+    #[test]
+    fn divided_inner_component_has_one_hole_and_ignores_open_strokes() {
+        let spans = vec![
+            circle(1, 10.0),
+            circle(2, 5.0),
+            line(3, (-5.0, 0.0), (5.0, 0.0)),
+            line(4, (0.0, 0.0), (0.0, 2.0)),
+        ];
+        let arrangement = arrange_curve_spans(&spans, ArrangementOptions::default()).unwrap();
+        assert_eq!(arrangement.regions.len(), 3);
+        let annulus = arrangement
+            .regions
+            .iter()
+            .find(|r| !r.holes.is_empty())
+            .unwrap();
+        assert_eq!(annulus.holes.len(), 1);
+        assert!((annulus.area - PI * 75.0).abs() < 1.0e-7);
+        assert!(annulus.holes[0].spans.iter().all(|s| s.provenance == 2));
+        assert!(arrangement.regions.iter().all(|r| r
+            .outer
+            .spans
+            .iter()
+            .all(|s| s.provenance != 4)));
+        assert_eq!(
+            arrangement
+                .regions
+                .iter()
+                .filter(|r| r.outer.spans.iter().any(|s| s.provenance == 3))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn bridge_between_nested_loops_does_not_become_a_slit_wall() {
+        let arrangement = arrange_curve_spans(
+            &[
+                circle(1, 10.0),
+                circle(2, 5.0),
+                line(3, (5.0, 0.0), (10.0, 0.0)),
+            ],
+            ArrangementOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(arrangement.regions.len(), 2);
+        let annulus = arrangement
+            .regions
+            .iter()
+            .find(|r| !r.holes.is_empty())
+            .unwrap();
+        assert_eq!(annulus.holes.len(), 1);
+        assert!((annulus.area - PI * 75.0).abs() < 1.0e-7);
+        assert!(annulus
+            .outer
+            .spans
+            .iter()
+            .chain(&annulus.holes[0].spans)
+            .all(|s| s.provenance != 3));
     }
 
     #[test]

@@ -350,7 +350,13 @@ impl MockMesh {
 
     /// Axis-aligned box with one corner at the origin, opposite corner at (w, h, d).
     pub fn make_box(w: f32, h: f32, d: f32) -> Self {
-        let solid = box_solid(w, h, d);
+        // Degenerate dimensions cannot produce a tessellable solid; the
+        // feature layer rejects them before display meshes are built, so an
+        // empty mesh (not a panic) is the right fallback — same contract as
+        // `make_cylinder`.
+        let Some(solid) = box_solid(w, h, d) else {
+            return Self::empty();
+        };
 
         let (vertices, indices, face_ids) = solid_to_flat_mesh(&solid, false, false);
 

@@ -383,6 +383,21 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
         return None;
     }
 
+    // Display group numbers are not persistent identities. A rebuilt boolean
+    // may renumber a rim without retaining its support-face names; recover
+    // only a unique matching complete circle in that case. Named support pairs
+    // still follow the path below so they can survive dimension changes.
+    if requested.edge_id.as_deref().is_some_and(|id| {
+        matches!(
+            super::topo_name::TopoName::parse(id),
+            super::topo_name::TopoName::MeshGroup(_)
+        )
+    }) && requested.adjacent_face_ids.len() != 2
+        && matches!(edge.curve, Some(EdgeCurveHint::Circle { closed: true, .. }))
+    {
+        return resolve_legacy_edge_ref_unique(body, edge);
+    }
+
     // 1. Exact edge-id match (a stable design id survives an equivalent edit).
     //    A boolean can split one design edge into several fragments that all
     //    carry the same id (a bite cuts the middle out of a rectangle's top
@@ -434,6 +449,10 @@ pub(crate) fn resolve_edge_ref_by_topology(body: &LiveBody, edge: &EdgeRef) -> O
         }
         if let Some(resolved) = pick_by_id(&edge_mod_reference_mesh(body)) {
             return Some(resolved);
+        }
+        // A missing proven branch must never silently retarget its sibling.
+        if requested_edge_id.starts_with("edge-pair:") {
+            return None;
         }
     }
 
@@ -829,6 +848,11 @@ fn component_index_for_face(
     body: &LiveBody,
     face: &crate::mock_kernel::MeshFaceRef,
 ) -> Option<usize> {
+    // The face was already found in this body's mesh. A single component
+    // needs no spatial disambiguation, even when its curved bounds are unknown.
+    if body.parts.len() == 1 {
+        return Some(0);
+    }
     if let Some(component_id) = face
         .topology
         .as_ref()
@@ -874,6 +898,17 @@ pub(crate) fn mesh_candidate_matches_captured_edge(
     }
     if captured_edge_uses_stable_design_topology(candidate, edge) {
         return true;
+    }
+
+    // A closed circular edge has no meaningful endpoint span: its seam can
+    // move when rebuilt, and p0 == p1 is valid. Confirm the analytic support
+    // instead of rejecting it as a zero-length straight edge.
+    if matches!(
+        candidate.curve,
+        Some(EdgeCurveHint::Circle { closed: true, .. })
+    ) || matches!(edge.curve, Some(EdgeCurveHint::Circle { closed: true, .. }))
+    {
+        return non_durable_edge_geometry_matches(candidate, edge);
     }
 
     let requested = sub3(edge.p1, edge.p0);
@@ -930,7 +965,7 @@ pub(crate) fn captured_edge_uses_stable_design_topology(
         (candidate_id, requested_id),
         (Some(candidate), Some(requested))
             if candidate == requested
-                && requested.starts_with("sketch:")
+                && (requested.starts_with("sketch:") || matches!(crate::parametric::topo_name::TopoName::parse(requested), crate::parametric::topo_name::TopoName::PairSide { .. }))
                 && !requested.contains(":occ:")
     )
 }
@@ -2965,38 +3000,45 @@ pub(crate) fn normalize3(a: [f32; 3]) -> [f32; 3] {
 /// (`a − b ⊆ a`). A tangent/inverted boolean that self-intersects or adds
 /// material instead flares the result's bounds outside the part; rejecting that
 /// forces the caller to fall through to the robust cutter (or keep the body
-/// intact). Missing bounds → accept (vertexless can't be judged).
+/// intact). Unknown source bounds reject the candidate. This is a rejection
+/// guard; passing it does not prove material containment.
 pub(crate) fn edge_mod_keeps_body(
     part: &KernelSolid,
     result: &KernelSolid,
 ) -> Result<bool, String> {
-    match (
-        crate::mock_kernel::solid_aabb(part),
-        crate::mock_kernel::solid_aabb(result),
-    ) {
-        (Some(p), Some(r)) => {
-            // Must not extend past the part — a subtraction can only remove. The
-            // slack covers the cutter's own end-overshoot/grow and tessellation
-            // noise; real garbage flares out far more than this.
-            const SLACK: f32 = 0.3;
-            let within = (0..3).all(|k| r.0[k] >= p.0[k] - SLACK && r.1[k] <= p.1[k] + SLACK);
-            if !within {
-                return Ok(false);
-            }
-            // Must keep the bulk of the part. TRUE enclosed volume, not AABB
-            // volume: a large-radius fillet on a SHARP sliver corner legitimately
-            // shortens the part's AABB by half while removing little material —
-            // the old AABB-volume proxy rejected exactly those fillets. A coarse
-            // tessellation is plenty accurate for a 50% ratio test.
-            let pv = solid_volume_estimate(part)
-                .map_err(|reason| format!("source volume validation failed: {reason}"))?;
-            let result_volume = solid_volume_estimate(result)
-                .map_err(|reason| format!("candidate volume validation failed: {reason}"))?;
-            Ok(pv <= 1.0e-6 || result_volume >= pv * 0.5)
-        }
-        (None, None) => Ok(true),
-        _ => Ok(false),
+    // A rejection guard, not a material-containment proof. Candidate vertices
+    // and sampled surface interiors must lie in the SOURCE's enclosing box.
+    // Comparing two over-approximations, or two vertex-only boxes, is unsound.
+    let source_box = part
+        .try_conservative_bounding_box()
+        .and_then(|b| b.corners())
+        .ok_or_else(|| "source enclosure is unresolved".to_string())?;
+    let mesh = openrcad::mesh::tessellate_checked_for_display_with_policy_and_cancel(
+        result,
+        0.1,
+        std::f64::consts::PI / 12.0,
+        &openrcad::foundation::TolerancePolicy::STANDARD,
+        &openrcad::foundation::NeverCancelled,
+    )
+    .map_err(|e| format!("candidate surface validation failed: {e}"))?;
+    let (lo, hi) = source_box;
+    let within = |p: &openrcad::foundation::Pnt| {
+        const SLACK: f64 = 0.3;
+        p.x() >= lo.x() - SLACK
+            && p.x() <= hi.x() + SLACK
+            && p.y() >= lo.y() - SLACK
+            && p.y() <= hi.y() + SLACK
+            && p.z() >= lo.z() - SLACK
+            && p.z() <= hi.z() + SLACK
+    };
+    if mesh.vertices.is_empty() || !mesh.vertices.iter().all(within) {
+        return Ok(false);
     }
+    let pv = solid_volume_estimate(part)
+        .map_err(|reason| format!("source volume validation failed: {reason}"))?;
+    let result_volume = solid_volume_estimate(result)
+        .map_err(|reason| format!("candidate volume validation failed: {reason}"))?;
+    Ok(pv <= 1.0e-6 || result_volume >= pv * 0.5)
 }
 
 /// Enclosed volume of `solid` from a coarse tessellation via the divergence

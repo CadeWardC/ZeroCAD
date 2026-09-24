@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "root_assemblies": 1,
+  "components": 3,
+  "shared_definitions": 1,
+  "occurrence_names": [
+    "plate:1",
+    "Rotated plate",
+    "plate:3"
+  ]
+}

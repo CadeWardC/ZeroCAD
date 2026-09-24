@@ -19,6 +19,7 @@ fn apply_new(live: &mut Vec<LiveBody>, body: LiveBody) {
 }
 
 mod body_ops;
+mod cap_pocket;
 mod cut;
 mod datum;
 mod diagnostics;
@@ -30,6 +31,8 @@ mod extrude;
 mod inspection;
 mod join;
 mod mesh_support;
+mod profile_cut;
+mod profile_join;
 mod recovery_certificate;
 pub mod standards;
 pub mod thread;

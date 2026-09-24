@@ -227,6 +227,7 @@ pub(crate) fn difference_bodies_with_history(
                 cancel,
             ),
         )
+        .map_err(|error| log::warn!("boolean cut failed: {error}"))
         .ok()
     })?;
     let mut paired: Vec<_> = outcome

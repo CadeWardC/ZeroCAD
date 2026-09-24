@@ -424,11 +424,13 @@ impl ZeroCadApp {
 
     /// Refresh the live (unlocked, untyped) dimension fields from the current
     /// cursor position so the dialog shows the value the cursor would produce.
-    /// Only the 2-point tools carry inline dimensions; 3-point tools have none.
     pub(crate) fn update_dim_live(&mut self, start: (f32, f32), cursor: (f32, f32)) {
         let Some(tool) = self.active_tool else {
             return;
         };
+        let ellipse_distance = self
+            .ellipse_dimension_segment(cursor, false)
+            .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1));
         let Some(dim) = self.dim_input.as_mut() else {
             return;
         };
@@ -442,6 +444,9 @@ impl ZeroCadApp {
                 vec![2.0 * (dx * dx + dy * dy).sqrt()]
             }
             SketchTool::Line => vec![(dx * dx + dy * dy).sqrt(), dy.atan2(dx).to_degrees()],
+            SketchTool::Ellipse | SketchTool::ThreePointEllipse => {
+                vec![ellipse_distance.unwrap_or(0.0)]
+            }
             // 3-point tools draw without inline dimension fields.
             _ => vec![],
         };
@@ -454,6 +459,78 @@ impl ZeroCadApp {
         }
     }
 
+    /// The current ellipse axis, shared by numeric input and its viewport anchor.
+    pub(crate) fn ellipse_dimension_segment(
+        &self,
+        cursor: (f32, f32),
+        resolve: bool,
+    ) -> Option<((f32, f32), (f32, f32))> {
+        let tool = self.active_tool?;
+        if !matches!(tool, SketchTool::Ellipse | SketchTool::ThreePointEllipse) {
+            return None;
+        }
+        let &p0 = self.sketch_points.first()?;
+        let (origin, direction, distance) = if let Some(&p1) = self.sketch_points.get(1) {
+            let origin = if tool == SketchTool::ThreePointEllipse {
+                ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5)
+            } else {
+                p0
+            };
+            let axis = (p1.0 - p0.0, p1.1 - p0.1);
+            let length = axis.0.hypot(axis.1).max(1.0e-6);
+            let normal = (-axis.1 / length, axis.0 / length);
+            let signed = (cursor.0 - origin.0) * normal.0 + (cursor.1 - origin.1) * normal.1;
+            let sign = if signed < 0.0 { -1.0 } else { 1.0 };
+            (origin, (normal.0 * sign, normal.1 * sign), signed.abs())
+        } else {
+            let delta = (cursor.0 - p0.0, cursor.1 - p0.1);
+            let length = delta.0.hypot(delta.1);
+            let direction = if length > 1.0e-6 {
+                (delta.0 / length, delta.1 / length)
+            } else {
+                (1.0, 0.0)
+            };
+            (p0, direction, length)
+        };
+        let distance = if resolve {
+            self.dim_param(0, distance).value.abs()
+        } else {
+            distance
+        };
+        Some((
+            origin,
+            (
+                origin.0 + direction.0 * distance,
+                origin.1 + direction.1 * distance,
+            ),
+        ))
+    }
+
+    /// Accept the first ellipse axis by click or Enter, then open the radius input.
+    pub(crate) fn advance_ellipse_axis(&mut self, cursor: (f32, f32)) -> bool {
+        if self.sketch_points.len() != 1 {
+            return false;
+        }
+        let Some((origin, endpoint)) = self.ellipse_dimension_segment(cursor, true) else {
+            return false;
+        };
+        if (endpoint.0 - origin.0).hypot(endpoint.1 - origin.1) <= 1.0e-4 {
+            return true;
+        }
+        self.sketch_points.push(endpoint);
+        self.dim_input = Some(DimInput {
+            fields: dim_fields_for(self.active_tool.unwrap()),
+            focus_request: None,
+            active_field: 0,
+            editing_field: None,
+        });
+        self.autocomplete = None;
+        self.update_dim_live(origin, cursor);
+        self.status_msg =
+            "Axis set — click or type the perpendicular radius and press Enter.".to_string();
+        true
+    }
+
     /// Build a parametric [`Dimension`] for dimension field `i`: it captures the
     /// raw expression text for arithmetic or variable expressions, else a plain
     /// literal. `fallback` (the
@@ -463,6 +540,9 @@ impl ZeroCadApp {
             .dim_input
             .as_ref()
             .and_then(|d| d.fields.get(i))
+            // Display values are rounded for readability. Only user-entered
+            // dimensions may replace the precise clicked geometry.
+            .filter(|f| f.edited || f.locked)
             .map(|f| f.value.clone());
         match text {
             Some(t) if zerocad_core::expr::preserves_source(&t) => Dimension {
@@ -478,7 +558,7 @@ impl ZeroCadApp {
     }
 
     /// Baked geometry for the point-driven tools (rotated rectangle, 3-point
-    /// circle, ellipses), which have no dimension fields to bind to variables.
+    /// circle, ellipses). Ellipse inputs are baked into the resulting geometry.
     pub(crate) fn raw_curves_from_points(
         &self,
         tool: SketchTool,
@@ -487,6 +567,14 @@ impl ZeroCadApp {
         last: (f32, f32),
     ) -> SketchCurves {
         let mut sc = SketchCurves::new();
+        if self.sketch_points.len() == 1
+            && matches!(tool, SketchTool::Ellipse | SketchTool::ThreePointEllipse)
+        {
+            if let Some((a, b)) = self.ellipse_dimension_segment(last, true) {
+                sc.add_line(a, b);
+            }
+            return sc;
+        }
         match tool {
             SketchTool::RectangleThreePoint => {
                 // p0→p1 is one edge; the third point sets the perpendicular height.
@@ -516,6 +604,7 @@ impl ZeroCadApp {
                 if rx > 1e-4 {
                     let (pxu, pyu) = (-major.1 / rx, major.0 / rx);
                     let ry = ((last.0 - p0.0) * pxu + (last.1 - p0.1) * pyu).abs();
+                    let ry = self.dim_param(0, ry).value.abs();
                     sc.add_ellipse(p0, major, ry.max(0.01));
                 }
             }
@@ -527,6 +616,7 @@ impl ZeroCadApp {
                 if rx > 1e-4 {
                     let (pxu, pyu) = (-major.1 / rx, major.0 / rx);
                     let ry = ((last.0 - c.0) * pxu + (last.1 - c.1) * pyu).abs();
+                    let ry = self.dim_param(0, ry).value.abs();
                     sc.add_ellipse(c, major, ry.max(0.01));
                 }
             }
@@ -710,21 +800,6 @@ impl ZeroCadApp {
         // Continuous-Line chaining bookkeeping (see the chaining block below).
         let seg_start = self.sketch_points.first().copied();
         let is_line = matches!(self.active_tool, Some(SketchTool::Line));
-        // Closing the loop = the snapped placement landed back on the chain's
-        // start. Test the SNAPPED point `last` (exact), NOT the rebuilt endpoint:
-        // the inline dims are quantized to 2 decimals (update_dim_live), so the
-        // rebuilt endpoint can sit ~0.05 mm off and miss the tolerance.
-        let is_closing = is_line
-            && self.line_chain_start.map_or(false, |cs| {
-                (last.0 - cs.0).powi(2) + (last.1 - cs.1).powi(2) < 1.0e-4
-            });
-        // When closing, drop the quantized inline dims so the closing segment is
-        // rebuilt at full precision from the snapped endpoints — otherwise its
-        // endpoint lands > VERTEX_TOL (1e-3 mm) from the start and detect_regions
-        // won't merge the loop into a face.
-        if is_closing {
-            self.dim_input = None;
-        }
         let mut line_endpoint: Option<(f32, f32)> = None;
         let mut inferred_total = 0usize;
         if let Some(shape) = self.shape_record_from_points(last) {
@@ -752,13 +827,41 @@ impl ZeroCadApp {
             if self.sketch_solver_model.is_some() {
                 let vars = self.document.variable_map();
                 let shape_id = zerocad_core::sketch::EntityId(self.sketch_next_entity_id);
-                let (addition, next) =
+                let (mut addition, next) =
                     zerocad_core::sketch::constraints::promote_shapes_to_entities(
                         std::slice::from_ref(&shape),
                         &[shape_id],
                         &vars,
                         self.sketch_next_entity_id + 1,
                     );
+                // A mouse-placed line owns its clicked endpoints. Going through
+                // length/angle and back introduces float roundoff that prevents
+                // exact endpoint coincidence inference below.
+                if is_line
+                    && self.dim_input.as_ref().is_none_or(|dim| {
+                        dim.fields
+                            .iter()
+                            .all(|field| !field.edited && !field.locked)
+                    })
+                {
+                    if let Some(zerocad_core::sketch::SketchEntity::Line { p0, p1, .. }) =
+                        addition.entities.first()
+                    {
+                        for point in &mut addition.points {
+                            let endpoint = if point.id == *p0 {
+                                seg_start
+                            } else if point.id == *p1 {
+                                Some(last)
+                            } else {
+                                None
+                            };
+                            if let Some(endpoint) = endpoint {
+                                point.pos = (f64::from(endpoint.0), f64::from(endpoint.1));
+                            }
+                        }
+                        line_endpoint = Some(last);
+                    }
+                }
                 let mut next = next;
                 if let Some(model) = &mut self.sketch_solver_model {
                     // Constraint INFERENCE: the click coordinates were already
@@ -830,6 +933,10 @@ impl ZeroCadApp {
         // start, close the loop (the region/face already formed in the rebuild
         // above). Every other tool keeps the one-shot "Shape added" behavior.
         if is_line {
+            let is_closing = self
+                .line_chain_start
+                .zip(line_endpoint)
+                .is_some_and(|(start, end)| (start.0 - end.0).hypot(start.1 - end.1) < 1.0e-5);
             if is_closing {
                 // The loop just closed; the face formed in the rebuild above.
                 self.line_chain_start = None;
@@ -970,6 +1077,115 @@ impl ZeroCadApp {
 #[cfg(test)]
 mod snap_tests {
     use super::*;
+
+    fn line_placement_app(start: (f32, f32), end: (f32, f32)) -> ZeroCadApp {
+        let mut app = ZeroCadApp::new();
+        app.active_tool = Some(SketchTool::Line);
+        app.sketch_points = vec![start];
+        app.sketch_temp_start = Some(start);
+        app.dim_input = Some(DimInput {
+            fields: dim_fields_for(SketchTool::Line),
+            focus_request: None,
+            active_field: 0,
+            editing_field: None,
+        });
+        app.update_dim_live(start, end);
+        app
+    }
+
+    #[test]
+    fn ellipse_staged_dimensions_control_rotated_axes_and_preview() {
+        for tool in [SketchTool::Ellipse, SketchTool::ThreePointEllipse] {
+            let mut app = line_placement_app((2.0, 3.0), (5.0, 7.0));
+            app.active_tool = Some(tool);
+            app.dim_input.as_mut().unwrap().fields = dim_fields_for(tool);
+            app.update_dim_live((2.0, 3.0), (5.0, 7.0));
+            assert_eq!(app.dim_input.as_ref().unwrap().fields[0].value, "5.00");
+            let field = &mut app.dim_input.as_mut().unwrap().fields[0];
+            field.value = "6 + 4".into();
+            field.edited = true;
+            let preview = app.shape_from_points((5.0, 7.0));
+            assert_eq!(preview.segments[0].b, (8.0, 11.0));
+            assert!(app.advance_ellipse_axis((5.0, 7.0)));
+            assert_eq!(app.sketch_points[1], (8.0, 11.0));
+            assert!(!app.dim_input.as_ref().unwrap().fields[0].edited);
+            let field = &mut app.dim_input.as_mut().unwrap().fields[0];
+            field.value = "2 + 1".into();
+            field.edited = true;
+            let center = if tool == SketchTool::Ellipse {
+                (2.0, 3.0)
+            } else {
+                (5.0, 7.0)
+            };
+            let major = if tool == SketchTool::Ellipse {
+                (6.0, 8.0)
+            } else {
+                (3.0, 4.0)
+            };
+            let mut expected = SketchCurves::new();
+            expected.add_ellipse(center, major, 3.0);
+            let preview = app.shape_from_points((-10.0, 20.0));
+            assert_eq!(preview.segments.len(), expected.segments.len());
+            for (actual, expected) in preview.segments.iter().zip(&expected.segments) {
+                assert!((actual.a.0 - expected.a.0).abs() < 1.0e-5);
+                assert!((actual.a.1 - expected.a.1).abs() < 1.0e-5);
+            }
+            assert!(!app.advance_ellipse_axis((-10.0, 20.0)));
+            app.finalize_shape((-10.0, 20.0));
+            assert_eq!(app.sketch_shapes.len(), 1);
+            assert!(app.dim_input.is_none());
+        }
+    }
+
+    #[test]
+    fn clicked_diagonal_closes_existing_bracket_and_persists_coincidence() {
+        let mut app = line_placement_app((35.0, -33.0), (0.0, 0.0));
+        let mut base = SketchCurves::new();
+        base.add_rectangle((-7.0, -50.0), (0.0, 0.0));
+        base.add_rectangle((0.0, -40.0), (35.0, -33.0));
+        app.sketch_shapes.push(SketchShape::Raw { curves: base });
+        app.ensure_active_solver_model();
+        app.finalize_shape((0.0, 0.0));
+        assert_eq!(app.detected_regions.len(), 3);
+        let triangle = app
+            .detected_regions
+            .iter()
+            .find(|r| r.contains((10.0, -20.0)))
+            .unwrap();
+        assert!((triangle.area - 577.5).abs() < 0.001);
+        let model = app.sketch_solver_model.as_ref().unwrap();
+        let zerocad_core::sketch::SketchEntity::Line { p0, p1, .. } =
+            model.entities.last().unwrap()
+        else {
+            panic!("line");
+        };
+        assert_eq!(
+            model.points.iter().find(|p| p.id == *p1).unwrap().pos,
+            (0.0, 0.0)
+        );
+        for endpoint in [p0, p1] {
+            assert!(model.constraints.iter().any(|c| matches!(c,
+                zerocad_core::sketch::Constraint::Coincident { a, b, .. } if a == endpoint || b == endpoint)));
+        }
+    }
+
+    #[test]
+    fn explicit_line_dimensions_survive_click_near_chain_start() {
+        let mut app = line_placement_app((35.0, -33.0), (0.0, 0.0));
+        app.line_chain_start = Some((0.0, 0.0));
+        app.ensure_active_solver_model();
+        let field = &mut app.dim_input.as_mut().unwrap().fields[0];
+        field.value = "10 + 2".into();
+        field.edited = true;
+        app.finalize_shape((0.0, 0.0));
+        let line = app.sketch_curves.segments.last().unwrap();
+        assert!(((line.b.0 - line.a.0).hypot(line.b.1 - line.a.1) - 12.0).abs() < 1.0e-5);
+        assert!(app.line_chain_start.is_some());
+        let SketchShape::Line { length, .. } = app.sketch_shapes.last().unwrap() else {
+            panic!("line");
+        };
+        assert_eq!(length.expr.as_deref(), Some("10 + 2"));
+    }
 
     #[test]
     fn disconnected_outputs_advance_the_next_body_number() {

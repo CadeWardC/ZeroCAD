@@ -15,9 +15,6 @@ struct PromotedCase {
 #[serde(rename_all = "snake_case")]
 enum CorpusStage {
     Primitive,
-    HistoryExtrusion,
-    ImportedBrep,
-    MixedTopology,
 }
 
 const PROMOTED: &[(&str, &str)] = &[

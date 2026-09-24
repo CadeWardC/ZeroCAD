@@ -2313,7 +2313,7 @@ impl ZeroCadApp {
                     &var_map,
                 );
                 if let Some(b) = self.document.sketch_face_boundaries.get(node.id.as_str()) {
-                    eff.extend_curves(b);
+                    eff.extend_face_boundary(b);
                 }
                 let resolved_curves = &eff;
                 let has_text = shapes

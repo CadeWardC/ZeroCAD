@@ -1,0 +1,13 @@
+{
+  "stoppedAt": "2026-09-11T15:05:46.7043598-05:00",
+  "cargoId": 73296,
+  "command": "\"C:\\Users\\cadel\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\cargo.exe\" test --no-fail-fast -- --test-threads=4 --skip hundred_region_vent_plate",
+  "children": [
+    {
+      "ProcessId": 119788,
+      "Name": "misc_torture-bc1bf38ce14aaaf2.exe",
+      "CommandLine": "\"C:\\Users\\cadel\\Documents\\Coding_Projects\\ZeroCAD\\target\\debug\\deps\\misc_torture-bc1bf38ce14aaaf2.exe\" --test-threads=4 --skip hundred_region_vent_plate"
+    }
+  ],
+  "reason": "Manual review time limit; outstanding stress case, not a natural test failure. Full workspace results remain incomplete."
+}

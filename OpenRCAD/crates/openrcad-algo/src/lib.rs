@@ -551,7 +551,24 @@ pub fn transform_operation_with_policy(
         Solid::from_shells(shells)
             .ok_or_else(|| ModelingOperationError::Build("reflection lost all shells".into()))?
     } else {
-        solid.transformed(transform)
+        policy
+            .validate()
+            .map_err(|error| ModelingOperationError::Build(error.to_string()))?;
+        let (value, history) = solid.transformed_with_history(transform);
+        let validation = openrcad_topo::ValidationReport::for_solid(&value, policy);
+        if validation.is_valid() && value.validate_strict_with_policy(policy).is_ok() {
+            // A valid placement preserves topology and pcurves. Merging faces
+            // and emitting all-to-all lineage here adds quadratic work and
+            // destroys the exact correspondence the transform already knows.
+            return Ok(openrcad_topo::OperationResult {
+                value,
+                history,
+                validation,
+                diagnostics: Vec::new(),
+                recovery: Default::default(),
+            });
+        }
+        value
     };
     finish_unary_operation(solid, value, policy)
 }

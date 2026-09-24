@@ -2733,11 +2733,14 @@ fn shell_box(
         frame.to_world_dir(0.0, 0.0, 1.0),
     );
 
+    // Side-wall loops must agree with their supporting normals before sewing.
+    // Sewing can reorient a plane, but cannot change an offset's intrinsic
+    // parameter sense without also changing its base/thickness relationship.
     // Front (Y=0, index 2)
     add_flat_face(
         2,
-        [(0, 0, 0), (0, 0, 1), (1, 0, 1), (1, 0, 0)],
-        [(0, 0, 0), (0, 0, 1), (1, 0, 1), (1, 0, 0)],
+        [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)],
+        [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)],
         frame.to_world(0.0, 0.0, 0.0),
         frame.to_world_dir(0.0, -1.0, 0.0),
     );
@@ -2745,8 +2748,8 @@ fn shell_box(
     // Back (Y=dy, index 3)
     add_flat_face(
         3,
-        [(0, 1, 0), (1, 1, 0), (1, 1, 1), (0, 1, 1)],
-        [(0, 1, 0), (1, 1, 0), (1, 1, 1), (0, 1, 1)],
+        [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)],
+        [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)],
         frame.to_world(0.0, dy, 0.0),
         frame.to_world_dir(0.0, 1.0, 0.0),
     );
@@ -2754,8 +2757,8 @@ fn shell_box(
     // Left (X=0, index 4)
     add_flat_face(
         4,
-        [(0, 0, 0), (0, 1, 0), (0, 1, 1), (0, 0, 1)],
-        [(0, 0, 0), (0, 1, 0), (0, 1, 1), (0, 0, 1)],
+        [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)],
+        [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)],
         frame.to_world(0.0, 0.0, 0.0),
         frame.to_world_dir(-1.0, 0.0, 0.0),
     );
@@ -2763,8 +2766,8 @@ fn shell_box(
     // Right (X=dx, index 5)
     add_flat_face(
         5,
-        [(1, 0, 0), (1, 0, 1), (1, 1, 1), (1, 1, 0)],
-        [(1, 0, 0), (1, 0, 1), (1, 1, 1), (1, 1, 0)],
+        [(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)],
+        [(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)],
         frame.to_world(dx, 0.0, 0.0),
         frame.to_world_dir(1.0, 0.0, 0.0),
     );
@@ -2868,6 +2871,9 @@ fn shell_box(
             .expect("policy was validated by shell_solid_with_policy");
         let inner = sew_with_policy(&inner_faces, policy)
             .expect("policy was validated by shell_solid_with_policy");
+        // Sewing orients each closed boundary outward. A void boundary must
+        // instead face into the void relative to the containing material.
+        let inner = openrcad_topo::Shell::from_faces(inner.faces().iter().map(Face::reversed));
         return Solid::from_shells([outer, inner])
             .expect("closed hollow always has outer and void shells");
     }
@@ -3016,7 +3022,8 @@ mod tests {
         assert_eq!(v - e + f, 2);
 
         // Verify face surface types:
-        // 5 Planes (outer) + 5 Offset surfaces (inner) + 4 Planes (rims) = 9 Planes, 5 Offsets
+        // Keep explicit inner offset/base supports for thickness verification.
+        // 5 outer planes + 5 inner offsets + 4 rim planes.
         let mut planes_count = 0;
         let mut offsets_count = 0;
 
@@ -3032,5 +3039,9 @@ mod tests {
 
         assert_eq!(planes_count, 9);
         assert_eq!(offsets_count, 5);
+        let mesh = openrcad_mesh::tessellate_checked(&cup, 0.005, 0.05).unwrap();
+        let properties = openrcad_mesh::mass_properties(&mesh).unwrap();
+        // A 1 mm cube opened at the top, with 0.1 mm walls and bottom.
+        assert!((properties.volume - (1.0 - 0.8 * 0.8 * 0.9)).abs() < 1e-9);
     }
 }

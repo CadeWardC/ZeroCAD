@@ -10,7 +10,7 @@ pub mod step_writer;
 pub mod stl;
 pub mod threemf;
 
-pub use step_writer::write_step;
+pub use step_writer::{write_step, write_step_assembly, write_step_bodies, StepOccurrence};
 pub use stl::{write_stl_ascii, write_stl_binary};
 pub use threemf::{
     to_3mf_assembly_bytes, to_3mf_bytes, write_3mf, ThreeMfBuildItem, ThreeMfDefinition,

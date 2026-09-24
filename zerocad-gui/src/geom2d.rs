@@ -18,12 +18,9 @@ pub(crate) fn triangulate_region_fill(region: &Region) -> Vec<[(f32, f32); 3]> {
     let as_pos = |points: &[(f32, f32)]| -> Vec<egui::Pos2> {
         points.iter().map(|p| egui::pos2(p.0, p.1)).collect()
     };
-    let mut loops = Vec::with_capacity(1 + region.holes.len());
-    loops.push(as_pos(&region.boundary));
-    for hole in &region.holes {
-        loops.push(as_pos(hole));
-    }
-    triangulate_nested_loops(&loops)
+    let outer = as_pos(&region.boundary);
+    let holes: Vec<_> = region.holes.iter().map(|hole| as_pos(hole)).collect();
+    triangulate_polygon_with_holes(&outer, &holes)
         .into_iter()
         .map(|t| [(t[0].x, t[0].y), (t[1].x, t[1].y), (t[2].x, t[2].y)])
         .collect()
@@ -631,7 +628,7 @@ fn merge_holes(outer: &[egui::Pos2], holes: &[Vec<egui::Pos2>]) -> Vec<egui::Pos
 }
 
 /// Fill a polygon that may have holes (e.g. an annulus from a shape drawn inside
-/// another). Holes are bridged into the outer boundary, then ear-clipped.
+/// another). Use the same triangulation as the cached sketch fill.
 fn fill_polygon_with_holes(
     painter: &egui::Painter,
     outer: &[egui::Pos2],
@@ -641,17 +638,12 @@ fn fill_polygon_with_holes(
     if outer.len() < 3 {
         return;
     }
-    let poly = if holes.is_empty() {
-        outer.to_vec()
-    } else {
-        merge_holes(outer, holes)
-    };
     // Emit all triangles as ONE mesh. Drawing them as separate `convex_polygon`s
     // makes egui anti-alias (feather) every triangle's edges; along the shared
     // diagonals the translucent fill then blends twice, producing seams that
     // shimmer as the view changes. A single mesh has no internal feathering.
     let mut mesh = egui::Mesh::default();
-    for tri in triangulate_simple(&poly) {
+    for tri in triangulate_polygon_with_holes(outer, holes) {
         let base = mesh.vertices.len() as u32;
         for v in tri {
             mesh.colored_vertex(v, color);
@@ -661,6 +653,85 @@ fn fill_polygon_with_holes(
     if !mesh.is_empty() {
         painter.add(egui::Shape::mesh(mesh));
     }
+}
+
+/// Tile an arranged region in horizontal slabs. Unlike bridge ear-clipping,
+/// this accepts holes that share edges and zero-width dangling sketch lines.
+/// The region already owns its holes: re-inferring nesting from a shared
+/// boundary vertex can incorrectly turn an adjacent hole into a filled island.
+/// No edges cross inside a slab because sketch intersections are already split.
+/// Work depends on slab and active-edge counts, and is cached per sketch.
+fn triangulate_polygon_with_holes(
+    outer: &[egui::Pos2],
+    holes: &[Vec<egui::Pos2>],
+) -> Vec<[egui::Pos2; 3]> {
+    if holes.is_empty() {
+        return triangulate_simple(outer);
+    }
+    let mut edges = Vec::new();
+    let mut levels = Vec::new();
+    for (index, polygon) in std::iter::once(outer)
+        .chain(holes.iter().map(Vec::as_slice))
+        .enumerate()
+    {
+        let orientation = if poly_signed_area(polygon) >= 0.0 {
+            1
+        } else {
+            -1
+        };
+        let sign = if index == 0 {
+            orientation
+        } else {
+            -orientation
+        };
+        for i in 0..polygon.len() {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % polygon.len()];
+            levels.push(f64::from(a.y));
+            if a.y != b.y {
+                edges.push((a, b, if a.y > b.y { sign } else { -sign }));
+            }
+        }
+    }
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    let x_at = |a: egui::Pos2, b: egui::Pos2, y: f64| {
+        f64::from(a.x)
+            + (y - f64::from(a.y)) * (f64::from(b.x) - f64::from(a.x))
+                / (f64::from(b.y) - f64::from(a.y))
+    };
+    let mut triangles = Vec::new();
+    let mut active: Vec<&(egui::Pos2, egui::Pos2, i32)> = Vec::new();
+    for level in levels.windows(2) {
+        let (low, high) = (level[0], level[1]);
+        let mid = (low + high) * 0.5;
+        active.clear();
+        active.extend(
+            edges
+                .iter()
+                .filter(|(a, b, _)| f64::from(a.y.min(b.y)) < mid && mid < f64::from(a.y.max(b.y))),
+        );
+        active.sort_by(|(a, b, _), (c, d, _)| x_at(*a, *b, mid).total_cmp(&x_at(*c, *d, mid)));
+        let mut winding = 0;
+        for pair in active.windows(2) {
+            let &(a, b, delta) = pair[0];
+            winding += delta;
+            if winding <= 0 {
+                continue;
+            }
+            let &(c, d, _) = pair[1];
+            let p = egui::pos2(x_at(a, b, low) as f32, low as f32);
+            let q = egui::pos2(x_at(c, d, low) as f32, low as f32);
+            let r = egui::pos2(x_at(c, d, high) as f32, high as f32);
+            let s = egui::pos2(x_at(a, b, high) as f32, high as f32);
+            for triangle in [[p, q, r], [p, r, s]] {
+                if poly_cross(triangle[0], triangle[1], triangle[2]) > 0.0 {
+                    triangles.push(triangle);
+                }
+            }
+        }
+    }
+    triangles
 }
 
 /// Fill coplanar section loops while preserving nested holes. Loops may arrive
@@ -756,6 +827,106 @@ mod tests {
     use zerocad_core::{sketch::Arc, SketchCurves};
 
     #[test]
+    fn saved_overlapping_face_fill_matches_selection_without_double_coverage() {
+        let loaded = zerocad_core::read_document_from_slice(
+            include_bytes!("../../zerocad-core/tests/fixtures/overlapping-face.zcad"),
+            &Default::default(),
+        )
+        .unwrap();
+        let graph = loaded.document.evaluator_graph();
+        let node = graph
+            .graph
+            .node_weights()
+            .find(|node| node.id == "sketch_1")
+            .unwrap();
+        let zerocad_core::FeatureType::Sketch {
+            curves,
+            shapes,
+            corner_mods,
+            mirrors,
+            solver,
+            ..
+        } = &node.feature
+        else {
+            panic!("expected sketch");
+        };
+        let curves = zerocad_core::effective_curves_solved(
+            curves,
+            shapes,
+            corner_mods,
+            mirrors,
+            solver.as_ref(),
+            &graph.variable_map(),
+        );
+        let regions = zerocad_core::detect_regions(&curves);
+        assert_eq!(regions.len(), 4);
+        for region in &regions {
+            let triangles = super::triangulate_region_fill(region);
+            let pos = |p: (f32, f32)| eframe::egui::pos2(p.0, p.1);
+            let polygon_area = |points: &[(f32, f32)]| {
+                super::poly_signed_area(&points.iter().copied().map(pos).collect::<Vec<_>>()).abs()
+            };
+            let expected = polygon_area(&region.boundary)
+                - region.holes.iter().map(|h| polygon_area(h)).sum::<f32>();
+            let actual: f32 = triangles
+                .iter()
+                .map(|t| super::poly_cross(pos(t[0]), pos(t[1]), pos(t[2])).abs() * 0.5)
+                .sum();
+            assert!(
+                (actual - expected).abs() < 0.005,
+                "fill area {actual}, boundary area {expected}"
+            );
+            for x in 0..150 {
+                for y in 0..200 {
+                    let p = (
+                        -37.4 + (x as f32 + 0.371) * 0.2,
+                        -32.8 + (y as f32 + 0.413) * 0.2,
+                    );
+                    let count = triangles
+                        .iter()
+                        .filter(|t| super::point_in_tri(pos(p), pos(t[0]), pos(t[1]), pos(t[2])))
+                        .count();
+                    assert_eq!(
+                        count,
+                        usize::from(region.contains(p)),
+                        "fill disagrees with selection at {p:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_holes_preserve_fill_under_winding_and_scale_changes() {
+        use eframe::egui::pos2;
+        for scale in [0.01, 1.0, 100.0] {
+            for reverse in [false, true] {
+                let make = |points: &[(f32, f32)]| {
+                    let mut p: Vec<_> = points
+                        .iter()
+                        .map(|&(x, y)| pos2(x * scale, y * scale))
+                        .collect();
+                    if reverse {
+                        p.reverse();
+                    }
+                    p
+                };
+                let outer = make(&[(0., 0.), (10., 0.), (10., 10.), (0., 10.)]);
+                let holes = vec![
+                    make(&[(2., 2.), (5., 2.), (5., 8.), (2., 8.)]),
+                    make(&[(5., 2.), (8., 2.), (8., 8.), (5., 8.)]),
+                ];
+                let triangles = super::triangulate_polygon_with_holes(&outer, &holes);
+                let area: f32 = triangles
+                    .iter()
+                    .map(|t| super::poly_cross(t[0], t[1], t[2]).abs() * 0.5)
+                    .sum();
+                assert!((area / (scale * scale) - 64.).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
     fn circumcircle_of_unit_axis_points() {
         // Points (1,0), (0,1), (-1,0) lie on the unit circle centered at origin.
         let (c, r) = circumcircle((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)).unwrap();
@@ -830,7 +1001,7 @@ mod tests {
 
     #[test]
     fn fill_square_with_circular_hole_tiles_without_overlap() {
-        use super::{merge_holes, triangulate_simple};
+        use super::triangulate_polygon_with_holes;
         use eframe::egui;
         // A 100×100 square with a centered Ø40 circular hole (48-gon) — the
         // "circle inside a square" the screenshot flagged. The fill triangles must
@@ -848,8 +1019,7 @@ mod tests {
                 egui::pos2(50.0 + 20.0 * a.cos(), 50.0 + 20.0 * a.sin())
             })
             .collect();
-        let poly = merge_holes(&outer, &[hole.clone()]);
-        let tris = triangulate_simple(&poly);
+        let tris = triangulate_polygon_with_holes(&outer, &[hole.clone()]);
         let area = |t: &[egui::Pos2; 3]| {
             ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
                 * 0.5
@@ -868,7 +1038,7 @@ mod tests {
         };
         let expected = 100.0 * 100.0 - hole_area;
         assert!(
-            (sum - expected).abs() < expected * 0.02,
+            (sum - expected).abs() < expected * 0.00001,
             "fill triangles must tile the annulus (sum={sum:.1}, expected={expected:.1}) — \
              excess area = overlapping bright slivers"
         );

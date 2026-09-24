@@ -3,7 +3,7 @@
   "fixtures": [
     {
       "file": "shell-on-fillet-band.zcad",
-      "sha256": "8c545a6af23db1e136e9a1ded6433fb785305596955068d475bcba775a965239",
+      "sha256": "d84c53bc558c8f52585a68cff02f34b49a931e3f1869f4fe3883e0cab23fd896",
       "expected_resolution": "resolved",
       "body_count": 1,
       "required_features": [

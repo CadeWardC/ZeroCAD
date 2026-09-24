@@ -1,0 +1,294 @@
+{
+  "occt_version": "7.8.1.1",
+  "tolerances": {
+    "volume_relative": 0.01,
+    "volume_absolute_mm3": 1e-06
+  },
+  "exports": [
+    {
+      "file": "0080.step",
+      "sha256": "1e3bc51a7249fc23e1b4faf6542f58fc7dd94a99552d556d875d6b8a0819475d",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          30.018630057723563,
+          19.997147465765998,
+          3.9958471331470906
+        ]
+      ],
+      "volume_mm3": 19178.47414856053,
+      "expected": {
+        "body_count": 1,
+        "volume": 19178.583525587852
+      }
+    },
+    {
+      "file": "0080_through.step",
+      "sha256": "131857d5290b623c152e5ca098e18d6ff3c1f44d9d4ad10032c0483a7dd64846",
+      "passed": true,
+      "valid": true,
+      "body_count": 6,
+      "centers_mm": [
+        [
+          30.409042639327332,
+          19.937455939512517,
+          4.0
+        ],
+        [
+          7.107235416477119,
+          22.54869902254338,
+          3.9999999999999987
+        ],
+        [
+          11.321590885227122,
+          22.54869902254339,
+          4.0
+        ],
+        [
+          15.536172206400074,
+          23.813933687636943,
+          4.0
+        ],
+        [
+          15.536212917231868,
+          21.4329651010439,
+          4.0
+        ],
+        [
+          19.75030182272711,
+          22.548699022543374,
+          4.0
+        ]
+      ],
+      "volume_mm3": 18912.98837375831,
+      "expected": {
+        "body_count": 6,
+        "volume": 18914.44673551271
+      }
+    },
+    {
+      "file": "assembly.step",
+      "sha256": "703a230d856d2affc2aa66bcb5692c14617689c9d8d2b9beef894ad1fcea5d1f",
+      "passed": true,
+      "valid": true,
+      "body_count": 3,
+      "centers_mm": [
+        [
+          5.0,
+          4.0,
+          1.0
+        ],
+        [
+          26.0,
+          25.0,
+          6.0
+        ],
+        [
+          5.0,
+          4.0,
+          25.0
+        ]
+      ],
+      "volume_mm3": 479.99999999999994,
+      "expected": {
+        "volume": 480.0,
+        "body_count": 3,
+        "centers": [
+          [
+            5.0,
+            4.0,
+            1.0
+          ],
+          [
+            26.0,
+            25.0,
+            6.0
+          ],
+          [
+            5.0,
+            4.0,
+            25.0
+          ]
+        ]
+      }
+    },
+    {
+      "file": "B8_0.step",
+      "sha256": "365c13be25001bfd79af9257626da64a81602de868e3f26abe758affe34fad6c",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          30.019005758237782,
+          19.997262642854004,
+          3.9957595332023934
+        ]
+      ],
+      "volume_mm3": 19178.020606411566,
+      "expected": {
+        "body_count": 1,
+        "volume": 19178.07017485947
+      }
+    },
+    {
+      "file": "closed_cavity.step",
+      "sha256": "ad7a14ddd6b1e8bfb25eb3fa19dd138af22d7f58de244b503a1d3beb7310ac02",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          29.999999999999996,
+          19.999999999999993,
+          9.999999999999996
+        ]
+      ],
+      "volume_mm3": 15744.000000000146,
+      "expected": {
+        "volume": 15744.0,
+        "body_count": 1
+      }
+    },
+    {
+      "file": "curved_step_import.step",
+      "sha256": "34c57ad8944644a7a76c128807266bdb49a882d43424b8d337e7981f11cd0375",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          -1.3402831250282475e-16,
+          -8.041698750169485e-16,
+          15.0
+        ]
+      ],
+      "volume_mm3": 13571.680263507906,
+      "expected": {
+        "body_count": 1,
+        "volume": 13532.955305925723
+      }
+    },
+    {
+      "file": "engraved_plate.step",
+      "sha256": "d1f8bdfcee15dbe955bf26fe3d708b85075089702eec9c98edfc0079257957ce",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          30.008989575629272,
+          19.995857332966747,
+          3.993618732859571
+        ]
+      ],
+      "volume_mm3": 19166.943410962045,
+      "expected": {
+        "body_count": 1,
+        "volume": 19166.99465708023
+      }
+    },
+    {
+      "file": "filleted_block.step",
+      "sha256": "eec07f0ecfbf19eb232a87c14b2bbe36151461aaa16dd3e87379e1b5a627b0bf",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          30.0,
+          20.011876294958327,
+          10.00583697316454
+        ]
+      ],
+      "volume_mm3": 47971.02875205871,
+      "expected": {
+        "body_count": 1,
+        "volume": 47969.390467874604
+      }
+    },
+    {
+      "file": "multi.step",
+      "sha256": "ad68550c429e352ab90d7f9fa1092ddbb175611e65239b1260e774403d5c5976",
+      "passed": true,
+      "valid": true,
+      "body_count": 2,
+      "centers_mm": [
+        [
+          5.000000000000001,
+          4.0,
+          3.0
+        ],
+        [
+          1.0000000000000002,
+          1.5,
+          2.0
+        ]
+      ],
+      "volume_mm3": 504.0,
+      "expected": {
+        "volume": 504.0,
+        "body_count": 2
+      }
+    },
+    {
+      "file": "open_enclosure.step",
+      "sha256": "4564f26f425f489ffa568c89de50c6cafffe2b0d91a8395a04774d04039b91f5",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          29.999999999999982,
+          19.99999999999999,
+          6.901639344262327
+        ]
+      ],
+      "volume_mm3": 11712.000000000131,
+      "expected": {
+        "body_count": 1,
+        "volume": 11711.999999999953
+      }
+    },
+    {
+      "file": "patterned_plate.step",
+      "sha256": "0bb58754c76245f20e44652be37b9116c9faf25d19601433d4c358598ee49a7a",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          29.999999999999986,
+          20.0,
+          4.000000000000001
+        ]
+      ],
+      "volume_mm3": 18257.522203923065,
+      "expected": {
+        "body_count": 1,
+        "volume": 18268.65440038465
+      }
+    },
+    {
+      "file": "ZeroCAD_07.step",
+      "sha256": "a0f9944f6fdc2d8dd8189d71849dc0335091ad77697b43b6982d4520cc08a63d",
+      "passed": true,
+      "valid": true,
+      "body_count": 1,
+      "centers_mm": [
+        [
+          30.007828152244514,
+          19.995535483121067,
+          3.993214899316228
+        ]
+      ],
+      "volume_mm3": 19164.855279256426,
+      "expected": {
+        "body_count": 1,
+        "volume": 19164.938060975193
+      }
+    }
+  ]
+}

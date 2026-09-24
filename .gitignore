@@ -4,3 +4,20 @@ target/debug/*
 /target
 /OpenRCAD/target/*
 *.pdb
+
+# Python verification tooling
+__pycache__/
+*.py[cod]
+
+# Local build/package scratch output; retain final break-test evidence only.
+/dist/
+/break-test/*.log
+!/break-test/final-break-after-contact.log
+!/break-test/final-app-packages.log
+!/break-test/final-core-after-contact.log
+!/break-test/final-contact-matrix.log
+!/break-test/verified-kernel.log
+!/break-test/final-check.log
+!/break-test/final-format-check.log
+!/break-test/final-kernel-format-check.log
+!/break-test/final-clippy-baseline.log

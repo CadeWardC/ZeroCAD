@@ -2419,9 +2419,123 @@ fn dot3(first: [f64; 3], second: [f64; 3]) -> f64 {
 }
 
 #[cfg(test)]
+#[path = "../../../../zerocad-core/tests/support/assembly_corpus.rs"]
+mod assembly_workflow_corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn real_plate_replacement_visibility_and_mate_suppression_survive_gui_history() {
+        let (document, _) = assembly_workflow_corpus::corpus(3, false);
+        let mut app = ZeroCadApp::new();
+        app.project_kind = zerocad_core::ProjectKind::Assembly;
+        app.assembly_document = document;
+        app.hydrate_assembly_definitions();
+        let initial = app.assembly_document.clone_authoritative();
+        let (candidate, _) = zerocad_core::assembly_ops::prepare_occurrence_replacement(
+            &app.assembly_document,
+            &[2],
+            assembly_workflow_corpus::part(14.0),
+        )
+        .unwrap();
+        app.commit_candidate_assembly_document(candidate, false);
+        app.hydrate_assembly_definitions();
+        let replaced = app.assembly_document.clone_authoritative();
+        assert_ne!(
+            initial.occurrences[&2].definition_model_hash,
+            replaced.occurrences[&2].definition_model_hash
+        );
+        app.undo();
+        assert_eq!(app.assembly_document.clone_authoritative(), initial);
+        app.redo();
+        assert_eq!(app.assembly_document.clone_authoritative(), replaced);
+        app.set_assembly_occurrence_visible(2, false);
+        app.undo();
+        assert!(!app
+            .assembly_document
+            .presentation
+            .hidden_occurrences
+            .contains(&2));
+        app.redo();
+        assert!(app
+            .assembly_document
+            .presentation
+            .hidden_occurrences
+            .contains(&2));
+        app.edit_assembly_mate(1, MateEditAction::SetSuppressed(true));
+        assert!(app.assembly_document.mates.as_ref().unwrap().mates[&1].suppressed);
+        app.undo();
+        assert!(!app.assembly_document.mates.as_ref().unwrap().mates[&1].suppressed);
+        app.redo();
+        let reopened = assembly_workflow_corpus::roundtrip(&app.assembly_document);
+        assert_eq!(
+            reopened.clone_authoritative(),
+            app.assembly_document.clone_authoritative()
+        );
+        assert!(app.assembly_unresolved_definitions.is_empty());
+    }
+
+    #[test]
+    fn missing_face_reference_survives_reopen_and_can_be_repaired() {
+        let (mut document, _) = assembly_workflow_corpus::corpus(3, false);
+        document
+            .mates
+            .as_mut()
+            .unwrap()
+            .mates
+            .get_mut(&1)
+            .unwrap()
+            .first
+            .local_selector = zerocad_core::AssemblyLocalSelector::Face {
+            stable_id: "deleted-face".into(),
+        };
+        let mut app = ZeroCadApp::new();
+        app.project_kind = zerocad_core::ProjectKind::Assembly;
+        app.assembly_document = assembly_workflow_corpus::roundtrip(&document);
+        app.hydrate_assembly_definitions();
+        assert_eq!(
+            app.assembly_mate_statuses[&1],
+            zerocad_core::MateSolveStatus::Unresolved
+        );
+        assert_eq!(
+            app.assembly_document.mates.as_ref().unwrap().mates[&1]
+                .first
+                .local_selector,
+            zerocad_core::AssemblyLocalSelector::Face {
+                stable_id: "deleted-face".into()
+            }
+        );
+        let prepared = app
+            .assembly_document
+            .prepare_command(zerocad_core::assembly::AssemblyCommand::EditMate {
+                mate_id: 1,
+                edit: zerocad_core::assembly::AssemblyMateEdit::RepairEntities {
+                    first: assembly_workflow_corpus::entity(1),
+                    second: assembly_workflow_corpus::entity(2),
+                },
+            })
+            .unwrap();
+        let (_, previous) = prepared.commit(&mut app.assembly_document);
+        app.finish_replaced_assembly_commit(previous, false);
+        app.hydrate_assembly_definitions();
+        assert_eq!(
+            app.assembly_mate_statuses[&1],
+            zerocad_core::MateSolveStatus::Solved
+        );
+        app.undo();
+        assert_eq!(
+            app.assembly_mate_statuses[&1],
+            zerocad_core::MateSolveStatus::Unresolved
+        );
+        app.redo();
+        assert_eq!(
+            app.assembly_mate_statuses[&1],
+            zerocad_core::MateSolveStatus::Solved
+        );
+    }
 
     fn assembly_app() -> ZeroCadApp {
         let mut app = ZeroCadApp::new();

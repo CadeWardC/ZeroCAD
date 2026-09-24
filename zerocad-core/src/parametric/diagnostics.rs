@@ -36,6 +36,7 @@ fn classify_unresolved_message(message: &str) -> DiagnosticCode {
         DiagnosticCode::reference_ambiguous()
     } else if [
         "no longer exists",
+        "no longer resolves",
         "does not exist",
         "missing",
         "not found",
@@ -108,6 +109,10 @@ mod tests {
     fn behavioral_classification_is_independent_of_renderer_copy() {
         let cases = [
             ("target no longer exists", DiagnosticCode::REFERENCE_MISSING),
+            (
+                "a named selected edge no longer resolves",
+                DiagnosticCode::REFERENCE_MISSING,
+            ),
             (
                 "reference is ambiguous",
                 DiagnosticCode::REFERENCE_AMBIGUOUS,

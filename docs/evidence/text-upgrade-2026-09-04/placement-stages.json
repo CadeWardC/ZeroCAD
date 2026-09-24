@@ -1,0 +1,56 @@
+{
+  "profile": "optimized",
+  "rayon_num_threads": 2,
+  "samples": [
+    {
+      "canonical_operation_ms": 3.63,
+      "history_ms": 83.24910000000001,
+      "merge_cylinders_ms": 0.3413,
+      "merge_planes_ms": 15.5992,
+      "pcurve_repair_ms": 10.1175,
+      "strict_validation_ms": 1.2699,
+      "transform_ms": 0.3151,
+      "validation_report_ms": 1.596
+    },
+    {
+      "canonical_operation_ms": 3.5913999999999997,
+      "history_ms": 78.5614,
+      "merge_cylinders_ms": 0.1597,
+      "merge_planes_ms": 13.9685,
+      "pcurve_repair_ms": 9.7989,
+      "strict_validation_ms": 1.1282,
+      "transform_ms": 0.2747,
+      "validation_report_ms": 1.6234000000000002
+    },
+    {
+      "canonical_operation_ms": 3.8508999999999998,
+      "history_ms": 49.742399999999996,
+      "merge_cylinders_ms": 0.1604,
+      "merge_planes_ms": 13.8242,
+      "pcurve_repair_ms": 9.732,
+      "strict_validation_ms": 1.1207,
+      "transform_ms": 0.27980000000000005,
+      "validation_report_ms": 1.5353
+    },
+    {
+      "canonical_operation_ms": 3.6814999999999998,
+      "history_ms": 59.1064,
+      "merge_cylinders_ms": 0.1739,
+      "merge_planes_ms": 14.0847,
+      "pcurve_repair_ms": 9.712,
+      "strict_validation_ms": 1.1238000000000001,
+      "transform_ms": 0.27940000000000004,
+      "validation_report_ms": 1.6144
+    },
+    {
+      "canonical_operation_ms": 3.7167,
+      "history_ms": 77.25219999999999,
+      "merge_cylinders_ms": 0.2161,
+      "merge_planes_ms": 14.2079,
+      "pcurve_repair_ms": 9.811399999999999,
+      "strict_validation_ms": 1.1259,
+      "transform_ms": 0.32989999999999997,
+      "validation_report_ms": 1.606
+    }
+  ]
+}

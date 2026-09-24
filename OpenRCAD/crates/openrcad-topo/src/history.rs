@@ -423,6 +423,17 @@ fn result_inventory(solid: &Solid) -> Vec<TopologyRef> {
         .collect()
 }
 
+/// Called only by the arena-preserving transform builder after checking the
+/// canonical vertex and edge representatives. All other traversal orders are
+/// preserved by cloning the arena and changing geometry alone.
+pub(crate) fn arena_preserving_history(result: &Solid) -> TopologyHistory {
+    let mut history = TopologyHistory::default();
+    for entity in result_inventory(result) {
+        history.modified(InputTopologyRef::new(0, entity), entity);
+    }
+    history
+}
+
 /// A malformed history event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopologyHistoryError {

@@ -193,9 +193,15 @@ fn half_space_tools(
     plane: &Plane,
     policy: &TolerancePolicy,
 ) -> Result<(Solid, Solid), PlaneSplitError> {
-    let (lo, hi) = solid.bounding_box().corners().ok_or_else(|| {
-        PlaneSplitError::InvalidPlaneTool("the input solid has no finite bounds".into())
-    })?;
+    // Conservative bounds: the vertex-only box can miss curved-surface
+    // extrema, which would both falsely reject a plane that does split the
+    // solid and under-size the cutting rectangle.
+    let (lo, hi) = solid
+        .try_conservative_bounding_box()
+        .and_then(|b| b.corners())
+        .ok_or_else(|| {
+            PlaneSplitError::InvalidPlaneTool("the input solid has no finite bounds".into())
+        })?;
     let origin = plane.location();
     let u = GeomVec::from_dir(plane.position().x_direction());
     let v = GeomVec::from_dir(plane.position().y_direction());

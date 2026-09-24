@@ -7,13 +7,35 @@ fillets/chamfers, shells, draft, holes, threads, and patterns; combine bodies
 with join/cut/intersect/split; edit faces directly; and assemble parts into a
 mated, deterministically-solved assembly. All of it is driven by an editable
 feature history, and all built on **[OpenRCAD](OpenRCAD/)**, an in-tree
-pure-Rust B-Rep geometry kernel. Imports: STEP, STL, DXF. Exports: STL, 3MF,
-OBJ.
+pure-Rust B-Rep geometry kernel. Imports: STEP, STL, DXF. Exports: STEP (part B-Reps), STL, 3MF, OBJ.
+OpenCASCADE is used only by optional independent verification tools; it is not
+a build, runtime, or release-package dependency.
+
+## Debian / Ubuntu installation
+
+Download the amd64 `.deb` from the [GitHub releases](https://github.com/CadeWardC/ZeroCAD/releases)
+and install it with `sudo apt install ./zerocad_0.7.6~alpha_amd64.deb`.
+The package targets Ubuntu 22.04 or newer, includes the ZeroCAD icon, and adds
+ZeroCAD to the application menu. You can also launch it with `zerocad`.
+This is an alpha release; see [the repair and validation report](break-test/review/2026-09-17-repairs.md)
+for tested behavior and remaining limitations.
+
+To package a Linux build locally, install `dpkg-dev`, `librsvg2-bin` and
+`desktop-file-utils`, build with `cargo build --release -p zerocad-gui --locked`,
+then run `bash packaging/build-deb.sh v0.7.6-alpha`. The package is written to
+`dist/`; runtime library dependencies are calculated from the built binary.
 
 This document is the architectural map. It exists so that a new contributor —
 human or agent — does not have to reconstruct the non-obvious design decisions
 from comments scattered across the source. Read it before changing the geometry
 engine.
+
+The [September audit follow-through](docs/audit-follow-through-2026-09-04.md)
+records the latest reliability and interchange work and its remaining limits.
+
+The [competitive development plan](docs/competitive-development-plan.md) sets
+the product priorities for responsive sketching, dependable solids, assemblies,
+and exchange, with explicit lightweightness and contributor-accessibility goals.
 
 The authoritative delivery roadmap is
 [`docs/part-design-master-plan.md`](docs/part-design-master-plan.md). It records
@@ -90,7 +112,7 @@ ZeroCAD/
         ├── eval.rs      # Shortcut dispatch + reevaluate_geometry.
         ├── editing.rs / sketch.rs / picking.rs / io.rs / datum.rs   # Sketch camera,
         │                #   region detection, hit-testing, all file IO
-        │                #   (.zcad/STEP/STL/DXF; STL/3MF/OBJ export), datums.
+        │                #   (.zcad/STEP/STL/DXF; STEP/STL/3MF/OBJ export), datums.
         └── ui/          # egui panels: viewport, top_bar*, feature_tree,
                          #   feature_properties, extrude_panel, status_bar,
                          #   assembly (occurrences + mates), constraints_panel,
@@ -233,8 +255,8 @@ These are the decisions that look wrong until you hit the bug they prevent.
 OpenRCAD's `boolean_operation*` returns a `Result` and can *reject* a configuration
 it cannot resolve watertightly (and, defensively, its own catch-unwind guards a
 panic in the solver). **Never call `openrcad::algo::boolean*` directly.** Use
-`mock_kernel::union` / `difference`, which wrap it in `quiet_panic()` (silences
-the panic hook so a degraded drag frame doesn't spam the console) and hand back
+`mock_kernel::union` / `difference`, which wrap it in `quiet_panic()`
+(a catch-unwind boundary that does not change the process-global panic hook) and hand back
 an `Option` — `None` on any failure or non-watertight output. Callers degrade
 gracefully from `None` (keep the original body intact, raise a warning). This is
 also why the release profile keeps `panic = "unwind"` (see the note in the root
@@ -272,9 +294,11 @@ is built in ordered variants and tried in turn:
   `exact` (faceted prism, perfect dimensions) → `dipped` (near cap nudged
   `CUT_OVERSHOOT = 0.1 mm` *into* the body to break coplanarity; the dip is
   swallowed by the joined body).
-- **Cut** (`CutTool`): `smooth` → `exact` → `expanded` (end caps pushed clear via
-  `directional_cut`, side walls grown `CUT_WALL_GROW = 0.1 mm` past the body face
-  via `grow_loop`). Each also has a **reversed-direction** variant so a cut whose
+- **Cut** (`CutTool`): `smooth` → `exact` → `expanded` (side walls grown
+  `CUT_WALL_GROW = 0.1 mm` via `grow_loop`, subject to recovery validation).
+  All variants retain the requested start and end planes: axial overshoot can
+  scar the supporting face or deepen a blind pocket. Each also has a
+  **reversed-direction** variant so a cut whose
   drawn direction sweeps into empty air still bites material (fixes "cut works
   once, then does nothing").
 
@@ -644,6 +668,11 @@ only after an edit validates, and geometry caches are pruned by the change set
 rather than rebuilt wholesale. `File → New Assembly` starts one; the assembly
 panel edits occurrences and mates, and the solver-controlled drag path
 deliberately does not push per-drag undo snapshots.
+
+`Export STEP assembly…` writes named part instances with shared definitions and
+resolved placements. See [assembly qualification](docs/assembly-qualification-2026-09-04.md)
+for the workflow regressions, independent STEP checks, and measured performance
+blockers. Full viewport performance is not yet release-qualified.
 
 ---
 

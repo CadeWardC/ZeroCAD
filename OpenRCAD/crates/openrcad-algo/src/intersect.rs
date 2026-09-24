@@ -421,6 +421,10 @@ fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
 /// Nearest parameter to `p` on `c` within its bounds: coarse sample sweep then a
 /// few Newton steps. Used only by [`curves_overlap`].
 fn nearest_param_on_curve(c: &GeomCurve, p: &Pnt) -> f64 {
+    if let GeomCurve::Line(_) = c {
+        let (origin, direction) = c.d1(0.0);
+        return (*p - origin).dot(&direction) / direction.dot(&direction);
+    }
     let (a, b) = c.bounds();
     let a = clamp_bound(a, -100.0);
     let b = clamp_bound(b, 100.0);
@@ -1715,6 +1719,26 @@ pub fn surface_surface_with_budget(
     tol: f64,
     budget: &mut GeometryWorkBudget,
 ) -> Result<Vec<GeomCurve>, BandTopologyError> {
+    surface_surface_with_budget_and_cancel(
+        s1,
+        s2,
+        tol,
+        budget,
+        &openrcad_foundation::NeverCancelled,
+    )
+}
+
+/// Checked intersection with cooperative cancellation and a shared work budget.
+pub fn surface_surface_with_budget_and_cancel(
+    s1: &GeomSurface,
+    s2: &GeomSurface,
+    tol: f64,
+    budget: &mut GeometryWorkBudget,
+    cancel: &dyn openrcad_foundation::CancellationProbe,
+) -> Result<Vec<GeomCurve>, BandTopologyError> {
+    cancel
+        .check_cancelled()
+        .map_err(|_| BandTopologyError::Cancelled)?;
     budget.charge(GeometryWorkStage::Intersection, 1)?;
     if let Some(curves) = analytic_surface_surface(s1, s2, tol) {
         return Ok(curves);
@@ -1762,6 +1786,7 @@ pub fn surface_surface_with_budget(
         (tauu1, tauv1, tauu2, tauv2),
         &mut intersection_points,
         budget,
+        cancel,
     )?;
 
     let chain_tol = nearest_neighbour_chain_tol(&intersection_points, tol);
@@ -1804,7 +1829,11 @@ fn ssi_subdivide(
     tau: (f64, f64, f64, f64),
     out: &mut Vec<Pnt>,
     budget: &mut GeometryWorkBudget,
+    cancel: &dyn openrcad_foundation::CancellationProbe,
 ) -> Result<(), BandTopologyError> {
+    cancel
+        .check_cancelled()
+        .map_err(|_| BandTopologyError::Cancelled)?;
     budget.charge(GeometryWorkStage::Intersection, 1)?;
     let mut b1 = s1
         .interval_point(u1_min, u1_max, v1_min, v1_max)
@@ -1869,6 +1898,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
             ssi_subdivide(
                 s1,
@@ -1886,6 +1916,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
         }
         1 => {
@@ -1906,6 +1937,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
             ssi_subdivide(
                 s1,
@@ -1923,6 +1955,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
         }
         2 => {
@@ -1943,6 +1976,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
             ssi_subdivide(
                 s1,
@@ -1960,6 +1994,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
         }
         _ => {
@@ -1980,6 +2015,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
             ssi_subdivide(
                 s1,
@@ -1997,6 +2033,7 @@ fn ssi_subdivide(
                 tau,
                 out,
                 budget,
+                cancel,
             )?;
         }
     }
@@ -2386,6 +2423,26 @@ pub fn surface_surface_curves_with_budget(
     tol: f64,
     budget: &mut GeometryWorkBudget,
 ) -> Result<Vec<(GeomCurve, f64, f64)>, BandTopologyError> {
+    surface_surface_curves_with_budget_and_cancel(
+        face1,
+        face2,
+        tol,
+        budget,
+        &openrcad_foundation::NeverCancelled,
+    )
+}
+
+/// Checked intersection with cooperative cancellation and a shared work budget.
+pub fn surface_surface_curves_with_budget_and_cancel(
+    face1: &Face,
+    face2: &Face,
+    tol: f64,
+    budget: &mut GeometryWorkBudget,
+    cancel: &dyn openrcad_foundation::CancellationProbe,
+) -> Result<Vec<(GeomCurve, f64, f64)>, BandTopologyError> {
+    cancel
+        .check_cancelled()
+        .map_err(|_| BandTopologyError::Cancelled)?;
     let s1 = match face1.surface() {
         Some(s) => s,
         None => return Ok(Vec::new()),
@@ -2395,7 +2452,7 @@ pub fn surface_surface_curves_with_budget(
         None => return Ok(Vec::new()),
     };
 
-    let raw_curves = surface_surface_with_budget(s1, s2, tol, budget)?;
+    let raw_curves = surface_surface_with_budget_and_cancel(s1, s2, tol, budget, cancel)?;
     let mut trimmed_curves = Vec::new();
     let debug = std::env::var_os("OPENRCAD_BOOLEAN_DEBUG").is_some()
         && matches!(
@@ -2404,7 +2461,45 @@ pub fn surface_surface_curves_with_budget(
         );
 
     for curve in raw_curves {
-        let (c_min, c_max) = curve.bounds();
+        cancel
+            .check_cancelled()
+            .map_err(|_| BandTopologyError::Cancelled)?;
+        let (mut c_min, mut c_max) = curve.bounds();
+        // Plane intersections are infinite lines whose parameter origin is
+        // unrelated to either face. A fixed [-100,100] search drops all splits
+        // when the part is translated. Project the actual face bounds instead.
+        if matches!(curve, GeomCurve::Line(_)) && (!c_min.is_finite() || !c_max.is_finite()) {
+            let (origin, direction) = curve.d1(0.0);
+            let denominator = direction.dot(&direction);
+            let mut low = f64::INFINITY;
+            let mut high = f64::NEG_INFINITY;
+            for face in [face1, face2] {
+                if let Some((lo, hi)) = crate::bvh::compute_face_bounds(face).corners() {
+                    for x in [lo.x(), hi.x()] {
+                        for y in [lo.y(), hi.y()] {
+                            for z in [lo.z(), hi.z()] {
+                                let parameter =
+                                    (Pnt::new(x, y, z) - origin).dot(&direction) / denominator;
+                                low = low.min(parameter);
+                                high = high.max(parameter);
+                            }
+                        }
+                    }
+                }
+            }
+            if low.is_finite() && high.is_finite() {
+                // Artificial search endpoints must stay outside the parameter
+                // deduplication band below; otherwise they replace a real trim
+                // crossing and leave a small open edge in the sewn boolean.
+                let margin = (tol.max(1.0e-5) * 16.0).max((high - low).abs() * 1.0e-6);
+                if !c_min.is_finite() {
+                    c_min = (low - margin).min(-100.0);
+                }
+                if !c_max.is_finite() {
+                    c_max = (high + margin).max(100.0);
+                }
+            }
+        }
         let c_min = if c_min.is_infinite() || c_min.is_nan() {
             -100.0
         } else {

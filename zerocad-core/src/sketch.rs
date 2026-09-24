@@ -32,6 +32,7 @@ use std::collections::HashMap;
 /// entities, constraints). Lives in its own file; re-exported here so callers
 /// keep one `crate::sketch::` namespace.
 pub mod constraints;
+pub mod dimension;
 pub mod linalg;
 pub mod offset;
 pub mod pattern;
@@ -505,12 +506,51 @@ impl SketchCurves {
             && self.splines.is_empty()
     }
 
-    /// Append every curve of `other` after this set's own curves. Used to fold
-    /// a sketch's projected **face boundary** (reference geometry from the body
-    /// face the sketch sits on) into region detection: the merge order —
-    /// drawn curves first, boundary last — must be identical everywhere
-    /// ([`detect_regions`] output order depends on input order, and extrude
-    /// features store region *indices*).
+    /// Append a projected face outline without reintroducing a sampled copy
+    /// of a circle already drawn in the sketch. A complete coincident rim is
+    /// reference geometry; arranging its chords against the analytic circle
+    /// creates tiny selectable slivers and unstable region indices.
+    pub fn extend_face_boundary(&mut self, boundary: &SketchCurves) {
+        let mut boundary = boundary.clone();
+        for circle in &self.circles {
+            let tolerance = circle
+                .radius
+                .abs()
+                .max(circle.center.0.abs())
+                .max(circle.center.1.abs())
+                * f32::EPSILON
+                * 32.0;
+            let mut candidates = Vec::new();
+            let mut sweep = 0.0f64;
+            for (index, segment) in boundary.segments.iter().enumerate() {
+                let a = (segment.a.0 - circle.center.0, segment.a.1 - circle.center.1);
+                let b = (segment.b.0 - circle.center.0, segment.b.1 - circle.center.1);
+                if (a.0.hypot(a.1) - circle.radius).abs() > tolerance
+                    || (b.0.hypot(b.1) - circle.radius).abs() > tolerance
+                {
+                    continue;
+                }
+                let angle =
+                    f64::from(a.0 * b.1 - a.1 * b.0).atan2(f64::from(a.0 * b.0 + a.1 * b.1));
+                if angle.abs() > std::f64::consts::PI / 12.0 {
+                    continue;
+                }
+                candidates.push(index);
+                sweep += angle;
+            }
+            if candidates.len() >= 24 && (sweep.abs() - std::f64::consts::TAU).abs() < 1.0e-4 {
+                let mut index = 0;
+                boundary.segments.retain(|_| {
+                    let keep = candidates.binary_search(&index).is_err();
+                    index += 1;
+                    keep
+                });
+            }
+        }
+        self.extend_curves(&boundary);
+    }
+
+    /// Append every curve of `other` after this set's own curves.
     pub fn extend_curves(&mut self, other: &SketchCurves) {
         self.segments.extend(other.segments.iter().copied());
         self.circles.extend(other.circles.iter().copied());
@@ -2007,7 +2047,7 @@ fn distinct_knots(flat: &[f64]) -> (Vec<f64>, Vec<usize>) {
     (knots, multiplicities)
 }
 
-fn sample_analytic_loop(
+pub(crate) fn sample_analytic_loop(
     loop_: &openrcad::sketch::ArrangementLoop<SketchCurveProvenance>,
 ) -> Vec<(f32, f32)> {
     use openrcad::geom2d::{Curve2d, CurveKind2d};

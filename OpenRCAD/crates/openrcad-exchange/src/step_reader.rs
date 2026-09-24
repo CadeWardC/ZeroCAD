@@ -1739,7 +1739,7 @@ fn parse_associated_pcurve(
     (!candidates.is_empty()).then(|| candidates[occurrence % candidates.len()].clone())
 }
 
-fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result<Solid, String> {
+fn reconstruct_brep(entities: &HashMap<u32, StepEntity>, shell_id: u32) -> Result<Solid, String> {
     let mut brep = BRep::new();
 
     let mut vertex_map = HashMap::new();
@@ -1820,7 +1820,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
             }
         };
 
-        let surface = parse_surface(surface_ref, &entities)?;
+        let surface = parse_surface(surface_ref, entities)?;
 
         let mut outer_wire = None;
         let mut inner_wires = Vec::new();
@@ -2009,7 +2009,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                                     ))
                                 }
                             };
-                            let pt = parse_point(pt_ref, &entities)?;
+                            let pt = parse_point(pt_ref, entities)?;
                             let v_id = brep.vertices.insert(VertexData {
                                 point: pt,
                                 tolerance: openrcad_foundation::tolerance::CONFUSION,
@@ -2045,7 +2045,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                                     ))
                                 }
                             };
-                            let pt = parse_point(pt_ref, &entities)?;
+                            let pt = parse_point(pt_ref, entities)?;
                             let v_id = brep.vertices.insert(VertexData {
                                 point: pt,
                                 tolerance: openrcad_foundation::tolerance::CONFUSION,
@@ -2054,7 +2054,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                             v_id
                         };
 
-                        let curve = parse_curve(curve_ref, &entities)?;
+                        let curve = parse_curve(curve_ref, entities)?;
                         let mut first = project_on_curve(&curve, brep.vertices[start_v_id].point);
                         let mut last = project_on_curve(&curve, brep.vertices[end_v_id].point);
                         if curve.is_periodic() {
@@ -2125,7 +2125,7 @@ fn reconstruct_brep(entities: HashMap<u32, StepEntity>, shell_id: u32) -> Result
                         &surface,
                         brep.vertices[edge_data.start].point,
                         brep.vertices[edge_data.end].point,
-                        &entities,
+                        entities,
                     )
                     .map(|data| brep.pcurves.insert(data));
                     *occurrence += 1;
@@ -2280,10 +2280,23 @@ pub(crate) fn read_step_str_unchecked(content: &str) -> io::Result<Solid> {
         entities.insert(id, ent);
     }
 
-    let solid_ent = entities.iter().find(|(_, ent)| match ent {
-        StepEntity::Simple { name, .. } => name == "MANIFOLD_SOLID_BREP",
-        _ => false,
-    });
+    let mut solids: Vec<_> = entities.iter().filter(|(_, ent)| matches!(ent,
+        StepEntity::Simple { name, .. } if name == "MANIFOLD_SOLID_BREP" || name == "BREP_WITH_VOIDS")).collect();
+    solids.sort_by_key(|(id, _)| **id);
+    if solids.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "This import entry point requires one solid; multiple STEP solids cannot be discarded",
+        ));
+    }
+    let solid_ent = solids.first().copied();
+    if matches!(solid_ent, Some((_, StepEntity::Simple { name, .. })) if name == "BREP_WITH_VOIDS")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "STEP cavity import is not qualified; enclosed voids cannot be discarded",
+        ));
+    }
 
     let shell_id = match solid_ent {
         Some((_, StepEntity::Simple { args, .. })) if args.len() >= 2 => match &args[1] {
@@ -2312,8 +2325,9 @@ pub(crate) fn read_step_str_unchecked(content: &str) -> io::Result<Solid> {
         }
     };
 
-    let solid = reconstruct_brep(entities, shell_id)
+    let solid = reconstruct_brep(&entities, shell_id)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
     Ok(solid)
 }
 
@@ -2534,7 +2548,7 @@ mod tests {
             ),
         );
 
-        let solid = reconstruct_brep(entities, 45).expect("reconstruct STEP pcurve fixture");
+        let solid = reconstruct_brep(&entities, 45).expect("reconstruct STEP pcurve fixture");
 
         assert_eq!(solid.brep().pcurves.len(), 2);
         let face = solid.shell().faces().remove(0);
