@@ -293,3 +293,130 @@ pub(super) fn try_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<Ke
         && solid.split_disconnected().len() == 1)
         .then_some(solid)
 }
+
+/// Join an outward prism to a planar extremity without rebuilding unrelated
+/// walls (for example a bracket already drilled across a different axis).
+/// Only the common cap interface changes: retain body-only and tool-only
+/// patches, discard their overlap, and sew the unchanged walls to those caps.
+pub(super) fn try_cap_join(body: &LiveBody, tool: &JoinTool) -> Option<KernelSolid> {
+    use openrcad::foundation::Pnt;
+    let [part] = body.parts.as_slice() else {
+        return None;
+    };
+    let profile = tool.profile.as_ref()?;
+    let exact = tool.exact.as_ref()?;
+    let cs = profile.cs;
+    let sign = profile.depth.signum();
+    if profile.depth.abs() < 1e-6 {
+        return None;
+    }
+    let (lo, hi) = crate::mock_kernel::solid_aabb(part)?;
+    let scale = lo
+        .iter()
+        .chain(&hi)
+        .map(|v| v.abs())
+        .fold(1.0_f32, f32::max);
+    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+    let tolerance = (scale * f32::EPSILON * 8.0).min(policy.sewing as f32);
+    // The complete enclosing box must be behind the joining plane. This is a
+    // conservative proof of no positive-volume overlap, even for curved walls.
+    for x in [lo[0], hi[0]] {
+        for y in [lo[1], hi[1]] {
+            for z in [lo[2], hi[2]] {
+                if Vec3::new(x, y, z).sub(cs.origin).dot(cs.n) * sign > tolerance {
+                    return None;
+                }
+            }
+        }
+    }
+    let at_cap = |f: &Face| planar_section_height(f, &cs).is_some_and(|h| h.abs() <= tolerance);
+    let caps: Vec<_> = part.faces().into_iter().filter(&at_cap).collect();
+    if caps.is_empty() {
+        return None;
+    }
+    let mut profiles = Vec::new();
+    for cap in &caps {
+        let boundary = crate::mock_kernel::kernel_face_boundary_2d(cap, &cs)?;
+        for region in crate::sketch::detect_regions(&boundary) {
+            let (u, v) = region_material_point(&region);
+            let point = cs.unproject(u, v);
+            let (u, v) = openrcad::algo::intersect::uv_of(
+                cap.surface()?,
+                &Pnt::new(point.x as f64, point.y as f64, point.z as f64),
+            );
+            if openrcad::algo::intersect::is_inside_trimming_loops(u, v, cap) {
+                profiles.push(region);
+            }
+        }
+    }
+    let cap_count = profiles.len();
+    if cap_count == 0 {
+        return None;
+    }
+    profiles.push(profile.region.clone());
+    let tol = f64::from(tolerance).min(policy.sewing);
+    align_line_supports(&mut profiles, tol)?;
+    let mut spans = Vec::new();
+    for region in &profiles {
+        let analytic = region.analytic.as_ref()?;
+        for wire in std::iter::once(&analytic.outer).chain(&analytic.holes) {
+            spans.extend(wire.spans.iter().cloned());
+        }
+    }
+    let cells: Vec<_> = openrcad::sketch::arrange_curve_spans(
+        &spans,
+        openrcad::sketch::ArrangementOptions {
+            tolerance: tol,
+            ..Default::default()
+        },
+    )
+    .ok()?
+    .regions
+    .into_iter()
+    .map(from_analytic)
+    .collect();
+    let mut body_only = Vec::new();
+    let mut tool_only = Vec::new();
+    let mut shared_area = 0.0_f64;
+    for cell in &cells {
+        let p = region_material_point(cell);
+        let in_body = profiles[..cap_count].iter().any(|r| r.contains(p));
+        let in_tool = profiles[cap_count].contains(p);
+        body_only.push(in_body && !in_tool);
+        tool_only.push(in_tool && !in_body);
+        if in_body && in_tool {
+            shared_area += f64::from(cell.area);
+        }
+    }
+    if shared_area <= tol * tol {
+        return None;
+    }
+    let mut faces: Vec<_> = part
+        .faces()
+        .into_iter()
+        .chain(exact.faces())
+        .filter(|f| !at_cap(f))
+        .collect();
+    for (mask, upper) in [(&body_only, true), (&tool_only, false)] {
+        let frame = if upper {
+            cs.with_origin(cs.origin.sub(cs.n.mul(sign)))
+        } else {
+            cs
+        };
+        for prepared in prepare_extrude_regions(&cells, mask) {
+            let helper = crate::mock_kernel::build_analytic_section_solid(
+                prepared.region.analytic.as_ref()?,
+                f64::from(sign),
+                &frame,
+            )?;
+            faces.extend(helper.faces().into_iter().filter(&at_cap));
+        }
+    }
+    let shell = openrcad::algo::sew_with_policy(&faces, &policy).ok()?.value;
+    let solid = KernelSolid::new(shell);
+    (solid.is_watertight()
+        && solid.health_report().is_healthy()
+        && solid.validate_strict_with_policy(&policy).is_ok()
+        && solid.split_disconnected().len() == 1)
+        .then_some(solid)
+}

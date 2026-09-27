@@ -11,9 +11,8 @@ use openrcad_foundation::{
 };
 use openrcad_geom::{Curve, CylindricalSurface, GeomCurve, GeomSurface, Line, Plane, RuledSurface};
 use openrcad_topo::{
-    containment::point_in_polygon_2d, Edge, Face, FaceBuildError, HealthReport, OperationResult,
-    Orientation, RecoveryReport, Solid, SurfacePeriodicity, TopologyHistory, ValidationReport,
-    Wire,
+    Edge, Face, FaceBuildError, HealthReport, OperationResult, Orientation, RecoveryReport, Solid,
+    SurfacePeriodicity, TopologyHistory, ValidationReport, Wire,
 };
 
 use crate::native_pcurve::{analytic_line_pcurve, planar_face_with_pcurves, uv_line};
@@ -194,14 +193,6 @@ fn planar_wire_signed_area(face: &Face, wire: &Wire) -> Option<f64> {
     })
 }
 
-fn wire_has_only_circular_edges(wire: &Wire) -> bool {
-    !wire.edges().is_empty()
-        && wire
-            .edges()
-            .iter()
-            .all(|edge| matches!(edge.curve(), Some(GeomCurve::Circle(_))))
-}
-
 /// Sweep a face and return the solid together with validation, recovery, and
 /// complete generated-topology history.
 pub fn prism_operation(face: &Face, vector: GeomVec) -> Result<OperationResult<Solid>, SweepError> {
@@ -312,62 +303,11 @@ pub fn sweep_prism(face: &Face, vector: GeomVec) -> Result<Solid, SweepError> {
     prism_operation(face, vector).map(|result| result.value)
 }
 
-/// True when `point` (on the profile plane) lies inside the profile face —
-/// inside its outer loop and outside every hole. Curved edges are sampled;
-/// the callers probe well clear of the boundary, so sampling accuracy is not
-/// load-bearing.
-fn profile_contains(face: &Face, point: Pnt) -> bool {
-    let Some(GeomSurface::Plane(plane)) = face.surface() else {
-        return false;
-    };
-    let frame = plane.position();
-    let origin = frame.location();
-    let to_uv = |p: &Pnt| -> (f64, f64) {
-        let d = *p - origin;
-        (
-            d.dot(&GeomVec::from_dir(frame.x_direction())),
-            d.dot(&GeomVec::from_dir(frame.y_direction())),
-        )
-    };
-    let sample_wire = |wire: &Wire| -> Vec<(f64, f64)> {
-        let mut polygon = Vec::new();
-        for edge in wire.edges() {
-            match edge.curve() {
-                Some(curve) => {
-                    const SAMPLES: usize = 24;
-                    let (first, last) = if edge.orientation() == Orientation::Reversed {
-                        (edge.last(), edge.first())
-                    } else {
-                        (edge.first(), edge.last())
-                    };
-                    for step in 0..SAMPLES {
-                        let t = first + (last - first) * step as f64 / SAMPLES as f64;
-                        polygon.push(to_uv(&curve.point(t)));
-                    }
-                }
-                None => polygon.push(to_uv(&edge.source().point())),
-            }
-        }
-        polygon
-    };
-    let uv = to_uv(&point);
-    let Some(outer) = face.outer_wire() else {
-        return false;
-    };
-    if !point_in_polygon_2d(uv, &sample_wire(&outer)) {
-        return false;
-    }
-    !face
-        .inner_wires()
-        .iter()
-        .any(|hole| point_in_polygon_2d(uv, &sample_wire(hole)))
-}
-
 fn lateral_face(
     edge: &Edge,
     translation: &Trsf,
     vector: GeomVec,
-    profile: &Face,
+    _profile: &Face,
     reconcile: LateralOrientation,
 ) -> Result<Face, SweepError> {
     let p0 = edge.source().point();
@@ -400,23 +340,13 @@ fn lateral_face(
     ];
     let surface = lateral_surface(edge, p1, p0, vector, translation);
 
-    // Reconcile a cylindrical wall's effective normal with the MATERIAL side.
-    //
-    // Which way a wall must face is not decided by which wire its edge came
-    // from: an annulus hole (inner wire) and a fillet-clipped corner (outer
-    // wire) both bound concave material and want the wall looking toward the
-    // axis, while a disc boundary wants it looking away. The discriminator is
-    // whether the profile has material just OUTSIDE the arc — probed with a
-    // point nudged radially outward from the arc midpoint.
-    //
-    // Only cylinders are touched. Planar laterals were provably correct before
-    // reconciliation existed, and ruled laterals carry hand-built coordinate
-    // pcurves whose correspondence with the wire the blend solver relies on.
-    //
-    // The wire is reversed rather than the surface: flipping a cylinder's axis
-    // does not survive `sew`, which re-canonicalizes it straight back.
-    let reverse_loop = if reconcile == LateralOrientation::Intrinsic
-        && !matches!(surface, GeomSurface::Plane(_))
+    // Caps normalize hole winding. Curved laterals must agree with their
+    // intrinsic surface normal; sewing then assigns the material-side flag.
+    // Baking inward cavity winding into the wall as well would flip it twice.
+    let reverse_loop = if (reconcile == LateralOrientation::Intrinsic
+        && !matches!(surface, GeomSurface::Plane(_)))
+        || (reconcile == LateralOrientation::Material
+            && matches!(surface, GeomSurface::Cylinder(_)))
     {
         let center = Pnt::new(
             (p0.x() + p1.x() + q0.x() + q1.x()) * 0.25,
@@ -431,46 +361,6 @@ fn lateral_face(
     } else {
         reconcile == LateralOrientation::Material
             && match (&surface, edge.curve()) {
-                (GeomSurface::Cylinder(_), Some(GeomCurve::Circle(circle))) => {
-                    let mid = circle.point(edge.first() + (edge.last() - edge.first()) * 0.5);
-                    match ((mid - circle.center()).normalized(), vector.normalized()) {
-                        (Some(radial), Some(sweep)) => {
-                            let radial = GeomVec::from_dir(radial);
-                            let step = (circle.radius() * 1.0e-3).max(tolerance::CONFUSION * 10.0);
-                            let material_outside = profile_contains(profile, mid + radial * step);
-
-                            // Which way the built wall FACES is decided by the wire's
-                            // actual traversal, not by `loop_agrees_with_surface`: the
-                            // cylinder is constructed on the SWEEP axis, and
-                            // `is_parallel` accepts an ANTIPARALLEL circle axis, so an
-                            // arc wound about -sweep traverses oppositely inside the
-                            // built frame. Compute the winding normal directly.
-                            let mut sense = if edge.last() >= edge.first() {
-                                1.0
-                            } else {
-                                -1.0
-                            };
-                            if edge.orientation() == Orientation::Reversed {
-                                sense = -sense;
-                            }
-                            let traversal = GeomVec::from_dir(circle.position().direction())
-                                .cross(&radial)
-                                * sense;
-                            // The wire's first edge is `edge.reversed()`, so the
-                            // boundary runs against the profile traversal.
-                            let winding_normal =
-                                (traversal * -1.0).cross(&GeomVec::from_dir(sweep));
-                            let faces_away = winding_normal.dot(&radial) > 0.0;
-
-                            // Convex boundary (material inside the cylinder) wants the
-                            // wall looking away from the axis; concave wants it looking
-                            // toward the axis.
-                            let wants_away = !material_outside;
-                            faces_away != wants_away
-                        }
-                        _ => false,
-                    }
-                }
                 // A ruled surface uses `(u = curve parameter, v = sweep fraction)`.
                 // The constructed boundary starts with the base edge reversed, so
                 // an increasing profile traversal makes that UV loop clockwise.
@@ -637,7 +527,6 @@ fn planar_cap(
         .map(transform_wire)
         .map(|wire| {
             if normalize_compound_inners
-                && !wire_has_only_circular_edges(&wire)
                 && outer_winding
                     .zip(planar_wire_signed_area(face, &wire))
                     .is_some_and(|(outer, inner)| outer * inner > 0.0)

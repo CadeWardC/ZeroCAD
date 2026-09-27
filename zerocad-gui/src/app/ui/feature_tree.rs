@@ -618,4 +618,30 @@ mod tests {
             Some("varset_test")
         );
     }
+
+    #[test]
+    fn variable_set_properties_stay_open_while_sketching() {
+        let mut app = ZeroCadApp::new();
+        app.document.add_feature(FeatureNode {
+            id: "varset_test".into(),
+            name: "Variables".into(),
+            feature: FeatureType::VariableSet {
+                variables: Vec::new(),
+            },
+        });
+        app.is_sketch_mode = true;
+        app.select_feature_tree_entry("varset_test", "varset_test", true, false);
+
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.show_feature_properties_window(ctx);
+            });
+            assert!(app.is_sketch_mode);
+            assert_eq!(
+                app.feature_properties_dialog.as_deref(),
+                Some("varset_test")
+            );
+        }
+    }
 }

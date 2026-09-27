@@ -628,12 +628,37 @@ impl BRepBuilder {
             }
         };
 
-        // 1. Gather all edges (outer boundary + splitting edges) and build both Forward and Reversed half-edges
+        // Holes touched by a crosscut participate in the rotation graph. They
+        // can become notches or split boundaries and cannot be redistributed
+        // afterwards as intact inner wires.
+        let split_vertices: std::collections::HashSet<_> = splitting_edges
+            .iter()
+            .filter_map(|id| self.brep.edges.get(*id))
+            .flat_map(|edge| [edge.start, edge.end])
+            .collect();
+        let connected_inners: std::collections::HashSet<_> = face_data
+            .inner_wires
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.brep.loops[*id].edges.iter().any(|oe| {
+                    let edge = &self.brep.edges[oe.id];
+                    split_vertices.contains(&edge.start) || split_vertices.contains(&edge.end)
+                })
+            })
+            .collect();
+        let mut boundary_edges = outer_loop.edges.clone();
+        for id in &face_data.inner_wires {
+            if connected_inners.contains(id) {
+                boundary_edges.extend(self.brep.loops[*id].edges.iter().copied());
+            }
+        }
+
+        // 1. Gather all edges (participating boundaries + splitting edges) and build both Forward and Reversed half-edges
         // so that the graph is symmetric and every edge is traversed in both directions (avoiding dead ends / bijections breaking).
         let mut edges_pool = Vec::new();
         edges_pool.extend(
-            outer_loop
-                .edges
+            boundary_edges
                 .iter()
                 .map(|oe| oe.id)
                 .filter(|edge| self.brep.edges.contains_key(*edge)),
@@ -870,7 +895,7 @@ impl BRepBuilder {
             let mut has_outer_edges = false;
             let mut loop_is_reversed = false;
             for &oe in &loop_edges {
-                if let Some(orig_oe) = outer_loop.edges.iter().find(|o| o.id == oe.id) {
+                if let Some(orig_oe) = boundary_edges.iter().find(|o| o.id == oe.id) {
                     has_outer_edges = true;
                     if oe.orientation == orig_oe.orientation.reversed() {
                         loop_is_reversed = true;
@@ -1014,6 +1039,9 @@ impl BRepBuilder {
         // re-bored hole. (Mirrors the most-nested-container rule used for new
         // holes via `hole_to_face` above.)
         for &inner_loop_id in &face_data.inner_wires {
+            if connected_inners.contains(&inner_loop_id) {
+                continue;
+            }
             let inner_loop = &self.brep.loops[inner_loop_id];
             if let Some(&first_edge) = inner_loop.edges.first() {
                 let (start_v, _) = get_edge_endpoints(&self.brep, first_edge);

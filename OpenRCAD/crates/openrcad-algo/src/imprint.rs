@@ -223,7 +223,18 @@ pub(crate) fn imprint_curve_on_face(
                             tolerance: imprint_tolerance(tol),
                         };
                         let split_edge_id = builder.brep_mut().edges.insert(split_edge_data);
-                        if force_queue_clean_crosscuts {
+                        // A span ending on an existing hole is not an
+                        // outer-to-outer chord. Partition it with the complete
+                        // face graph so the hole can become an open notch.
+                        // split_face only accepts endpoints on the outer wire.
+                        let outer = &builder.brep().loops[outer_loop_id];
+                        let on_outer = |vertex| {
+                            outer.edges.iter().any(|oe| {
+                                let edge = &builder.brep().edges[oe.id];
+                                edge.start == vertex || edge.end == vertex
+                            })
+                        };
+                        if force_queue_clean_crosscuts || !on_outer(v1) || !on_outer(v2) {
                             return (vec![face_id], vec![split_edge_id]);
                         }
                         let (f1, f2) = builder.split_face(face_id, &[split_edge_id]);
@@ -520,9 +531,35 @@ fn cut_hole(
         );
         signed_area += u0 * v1 - u1 * v0;
     }
-    // Raw loops follow the surface; FaceData::orientation is applied later
-    // to both the inherited face and its disk, not to either loop here.
-    let disk_forward = matches!(surface, openrcad_geom::GeomSurface::Plane(_)) && signed_area > 0.0;
+    // Match the inherited outer loop, rather than assuming its raw winding
+    // agrees with the support plane. Reversed extrusions can carry the other
+    // parameterization; a new inner wire must still oppose that outer loop.
+    let outer_area = probe.outer_wire().map_or(0.0, |wire| {
+        let mut points = Vec::new();
+        for edge in wire.edges() {
+            for sample in 0..8 {
+                let fraction = sample as f64 / 8.0;
+                let fraction = if edge.orientation() == Orientation::Reversed {
+                    1.0 - fraction
+                } else {
+                    fraction
+                };
+                let point = edge.curve().map_or_else(
+                    || edge.source().point(),
+                    |curve| curve.point(edge.first() + (edge.last() - edge.first()) * fraction),
+                );
+                points.push(uv_of(&surface, &point));
+            }
+        }
+        points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+            .map(|(&(u0, v0), &(u1, v1))| u0 * v1 - u1 * v0)
+            .sum::<f64>()
+    });
+    let disk_forward =
+        matches!(surface, openrcad_geom::GeomSurface::Plane(_)) && signed_area * outer_area > 0.0;
     let mut inner_edges: Vec<_> = arc_ids
         .iter()
         .map(|&id| OrientedEdge::new(id, Orientation::Forward))
@@ -552,19 +589,42 @@ fn cut_hole(
         .loops
         .insert(LoopData { edges: disk_edges });
 
-    builder
-        .brep_mut()
-        .faces
-        .get_mut(face_id)
-        .unwrap()
-        .inner_wires
-        .push(inner_loop);
     let disk = builder.brep_mut().faces.insert(FaceData {
         surface: face_data.surface.clone(),
         outer_wire: Some(disk_loop),
         inner_wires: Vec::new(),
         orientation: face_data.orientation,
     });
+    // A new closed imprint can enclose existing holes (for example enlarging
+    // a drilled hole into a counterbore). Those loops belong to the enclosed
+    // patch, not to the remaining face outside the new loop. Keeping nested
+    // holes on the outer face leaves free edges after boolean classification.
+    // The caller established that the imprint has no boundary intersections,
+    // so one point on each existing loop determines which patch owns it.
+    let disk_probe = Face::from_id(
+        std::sync::Arc::new(builder.brep().clone()),
+        disk,
+        face_data.orientation,
+    );
+    let mut retained = Vec::new();
+    let mut enclosed = Vec::new();
+    for inner in face_data.inner_wires {
+        let oe = builder.brep().loops[inner].edges.first()?;
+        let edge = &builder.brep().edges[oe.id];
+        let point = edge.curve.as_ref().map_or_else(
+            || builder.brep().vertices[edge.start].point,
+            |curve| curve.point((edge.first + edge.last) * 0.5),
+        );
+        let (u, v) = uv_of(&surface, &point);
+        if is_inside_trimming_loops(u, v, &disk_probe) {
+            enclosed.push(inner);
+        } else {
+            retained.push(inner);
+        }
+    }
+    retained.push(inner_loop);
+    builder.brep_mut().faces[face_id].inner_wires = retained;
+    builder.brep_mut().faces[disk].inner_wires = enclosed;
     for (_, shell) in &mut builder.brep_mut().shells {
         if shell.faces.contains(&face_id) {
             shell.faces.push(disk);

@@ -890,6 +890,21 @@ impl ZeroCadApp {
                             });
                         }
                     }
+                    // A snapped rectangle is positioned by its connection to
+                    // existing geometry. Keeping promotion's automatic anchor
+                    // would also freeze its rounded placement coordinates and
+                    // can contradict exact dimensions along the connected chain.
+                    // Only drop anchors on this new rectangle; existing user
+                    // constraints must remain intact.
+                    if matches!(shape, SketchShape::Rectangle { .. })
+                        && inferred
+                            .iter()
+                            .any(|c| matches!(c, Constraint::Coincident { .. }))
+                    {
+                        addition
+                            .constraints
+                            .retain(|c| !matches!(c, Constraint::Fixed { .. }));
+                    }
                     // Rectangle promotion carries its own H/V; infer only for a
                     // bare drawn Line.
                     if matches!(shape, SketchShape::Line { .. }) {
@@ -1077,6 +1092,121 @@ impl ZeroCadApp {
 #[cfg(test)]
 mod snap_tests {
     use super::*;
+
+    fn place_dimensioned_rectangle(
+        app: &mut ZeroCadApp,
+        start: (f32, f32),
+        end: (f32, f32),
+        dimensions: [&str; 2],
+    ) {
+        app.active_tool = Some(SketchTool::Rectangle);
+        app.sketch_points = vec![start];
+        app.sketch_temp_start = Some(start);
+        app.dim_input = Some(DimInput {
+            fields: dim_fields_for(SketchTool::Rectangle),
+            focus_request: None,
+            active_field: 0,
+            editing_field: None,
+        });
+        for (field, value) in app
+            .dim_input
+            .as_mut()
+            .unwrap()
+            .fields
+            .iter_mut()
+            .zip(dimensions)
+        {
+            field.value = value.into();
+            field.edited = true;
+        }
+        app.finalize_shape(end);
+    }
+
+    #[test]
+    fn snapped_rectangle_does_not_freeze_rounded_chain_endpoint() {
+        use zerocad_core::sketch::{Constraint, SolveOutcome};
+
+        let mut app = ZeroCadApp::new();
+        app.ensure_active_solver_model();
+        place_dimensioned_rectangle(&mut app, (-6.8, -6.2), (35.2, 8.8), ["42", "15"]);
+        let mut line = line_placement_app((35.2, 8.8), (40.2, 8.8));
+        app.active_tool = line.active_tool;
+        app.sketch_points = std::mem::take(&mut line.sketch_points);
+        app.sketch_temp_start = line.sketch_temp_start;
+        app.dim_input = line.dim_input.take();
+        let field = &mut app.dim_input.as_mut().unwrap().fields[0];
+        field.value = "5".into();
+        field.edited = true;
+        app.finalize_shape((40.2, 8.8));
+        let existing_constraints = app
+            .sketch_solver_model
+            .as_ref()
+            .unwrap()
+            .constraints
+            .clone();
+        place_dimensioned_rectangle(&mut app, (40.2, 8.8), (-11.8, -11.2), ["47+5", "15+5"]);
+        let model = app.sketch_solver_model.as_ref().unwrap();
+        assert_eq!(
+            &model.constraints[..existing_constraints.len()],
+            &existing_constraints
+        );
+        assert_eq!(
+            model
+                .constraints
+                .iter()
+                .filter(|c| matches!(c, Constraint::Fixed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            model
+                .constraints
+                .iter()
+                .filter(|c| matches!(c, Constraint::Coincident { .. }))
+                .count(),
+            2
+        );
+        let report = zerocad_core::sketch::solve_model(model, &app.document.variable_map());
+        assert_eq!(report.outcome, SolveOutcome::Converged, "{report:?}");
+        assert!(report.residual < 1e-9);
+
+        // Changing the upstream width must move the connected rectangle,
+        // rather than resurrecting an implicit fixed-position conflict.
+        let mut edited = model.clone();
+        let width = edited
+            .constraints
+            .iter_mut()
+            .find_map(|c| match c {
+                Constraint::Distance { d, .. } if d.value == 42.0 => Some(d),
+                _ => None,
+            })
+            .unwrap();
+        width.value = 43.0;
+        let report = zerocad_core::sketch::solve_model(&edited, &app.document.variable_map());
+        assert_eq!(report.outcome, SolveOutcome::Converged, "{report:?}");
+    }
+
+    #[test]
+    fn disconnected_rectangles_keep_their_placement_anchors() {
+        use zerocad_core::sketch::Constraint;
+        let mut app = ZeroCadApp::new();
+        app.ensure_active_solver_model();
+        place_dimensioned_rectangle(&mut app, (0.0, 0.0), (10.0, 10.0), ["10", "10"]);
+        place_dimensioned_rectangle(&mut app, (20.0, 0.0), (30.0, 10.0), ["10", "10"]);
+        let model = app.sketch_solver_model.as_ref().unwrap();
+        assert_eq!(
+            model
+                .constraints
+                .iter()
+                .filter(|c| matches!(c, Constraint::Fixed { .. }))
+                .count(),
+            2
+        );
+        assert!(!model
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Coincident { .. })));
+    }
 
     fn line_placement_app(start: (f32, f32), end: (f32, f32)) -> ZeroCadApp {
         let mut app = ZeroCadApp::new();

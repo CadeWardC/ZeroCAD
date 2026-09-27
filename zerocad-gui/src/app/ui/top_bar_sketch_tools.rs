@@ -288,9 +288,8 @@ impl ZeroCadApp {
                             }
                         }
 
-                        // Unified driving-dimension command. Geometry clicks
-                        // select the target; a click in empty space places the
-                        // inferred length, distance, radius/diameter, or angle.
+                        // Single entities open their size editor directly;
+                        // pairs retain a placement click for distance/angle.
                         {
                             let is_active = self.active_tool == Some(SketchTool::Dimension);
                             let btn = draw_tool_btn(
@@ -301,7 +300,7 @@ impl ZeroCadApp {
                             );
                             if btn
                                 .on_hover_text(
-                                    "Dimension — select geometry, click to place, then enter a value, expression, or variable",
+                                    "Dimension — click a circle or edge to resize. Shift-click two lines (or pick two points), then click empty space for a distance/angle. Values accept expressions and variables.",
                                 )
                                 .clicked()
                             {
@@ -312,7 +311,7 @@ impl ZeroCadApp {
                                 self.clear_pending_corners();
                                 self.sketch_selected_ids.clear();
                                 self.status_msg =
-                                    "Select one line, one circle/arc, two points, or two lines."
+                                    "Click a circle or edge to resize; Shift-click for two-line dimensions, or pick two points."
                                         .to_string();
                                 log::info!("Switched to Dimension tool");
                             }

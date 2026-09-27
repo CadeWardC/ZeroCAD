@@ -52,6 +52,8 @@ pub(crate) struct SketchDimensionEditor {
     pub(crate) is_angle: bool,
     pub(crate) screen_position: egui::Pos2,
     request_focus: bool,
+    variable_name: String,
+    error: Option<String>,
 }
 
 impl SketchDimensionEditor {
@@ -70,6 +72,8 @@ impl SketchDimensionEditor {
             is_angle,
             screen_position,
             request_focus: true,
+            variable_name: String::new(),
+            error: None,
         }
     }
 }
@@ -178,6 +182,73 @@ pub(crate) fn dim_fields_for(tool: SketchTool) -> Vec<DimField> {
 }
 
 impl ZeroCadApp {
+    /// Commit an optional named driver only after the dimensional solve succeeds.
+    /// The live sketch transaction owns its removal on Undo.
+    pub(crate) fn accept_sketch_dimension(&mut self) -> bool {
+        let Some(editor) = self.sketch_dimension_editor.clone() else {
+            return false;
+        };
+        let Some(mut dimension) =
+            dimension_from_source(&editor.value, &self.visible_variable_map())
+        else {
+            self.status_msg = "Enter a valid number, expression, or defined variable.".into();
+            return false;
+        };
+        let name = editor.variable_name.trim();
+        let mut created = None;
+        if !name.is_empty() {
+            if !zerocad_core::expr::is_valid_identifier(name)
+                || self.document.graph.node_weights().any(|node| {
+                    matches!(&node.feature, crate::FeatureType::VariableSet { variables }
+                        if variables.iter().any(|v| v.name.trim() == name))
+                })
+                || self.working_sketch_undo.is_empty()
+            {
+                self.status_msg =
+                    "Use a new variable name starting with a letter or underscore.".into();
+                return false;
+            }
+            let mut id = format!("dimension_variable_{}", self.id_counter);
+            while self.document.graph.node_weights().any(|node| node.id == id) {
+                self.id_counter += 1;
+                id = format!("dimension_variable_{}", self.id_counter);
+            }
+            self.document.add_feature(crate::FeatureNode {
+                id: id.clone(),
+                name: format!("Parameter: {name}"),
+                feature: crate::FeatureType::VariableSet {
+                    variables: vec![crate::Variable {
+                        name: name.to_string(),
+                        value: dimension.value as f64,
+                        // Solver dimensions and expressions resolve in base units.
+                        unit: Unit::Millimeter,
+                        expression: dimension.expr.clone(),
+                    }],
+                },
+            });
+            dimension.expr = Some(name.to_string());
+            created = Some(id);
+        }
+        if !self.set_live_constraint_dimension(editor.constraint_id, dimension) {
+            if let Some(id) = created {
+                self.document.remove_feature(&id);
+            }
+            return false;
+        }
+        if let Some(id) = created {
+            self.id_counter += 1;
+            self.working_sketch_undo
+                .last_mut()
+                .unwrap()
+                .created_variable_feature = Some(id);
+        }
+        self.rebuild_active_sketch_curves();
+        self.sketch_dimension_editor = None;
+        self.autocomplete = None;
+        self.status_msg = "Dimension set — click more geometry to resize it.".into();
+        true
+    }
+
     /// Value box for a newly placed solver dimension. Every valid edit updates
     /// and solves immediately; malformed intermediate text simply leaves the
     /// last valid dimension in place until the expression becomes valid.
@@ -195,6 +266,8 @@ impl ZeroCadApp {
         let mut area_position = egui::Pos2::ZERO;
         let mut constraint_id = EntityId(0);
         let mut is_angle = false;
+        let mut accept = false;
+        let mut cancel = false;
 
         if let Some(editor) = &self.sketch_dimension_editor {
             area_position = editor.screen_position;
@@ -214,6 +287,20 @@ impl ZeroCadApp {
                     .inner_margin(egui::Margin::symmetric(7.0, 4.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            let label = self
+                                .sketch_solver_model
+                                .as_ref()
+                                .and_then(|model| {
+                                    model.constraints.iter().find(|c| c.id() == constraint_id)
+                                })
+                                .map(|c| match c {
+                                    zerocad_core::sketch::Constraint::Diameter { .. } => "Diameter",
+                                    zerocad_core::sketch::Constraint::Radius { .. } => "Radius",
+                                    zerocad_core::sketch::Constraint::Angle { .. } => "Angle",
+                                    _ => "Distance",
+                                })
+                                .unwrap_or("Dimension");
+                            ui.label(label);
                             let field_id = egui::Id::new("placed_sketch_dimension_value");
                             if let Some(editor) = self.sketch_dimension_editor.as_mut() {
                                 let outcome = crate::expr::autocomplete_field(
@@ -235,11 +322,30 @@ impl ZeroCadApp {
                                 egui::RichText::new(if is_angle {
                                     "°"
                                 } else {
-                                    self.current_unit.suffix()
+                                    // These are solver values; expressions and
+                                    // named parameters resolve in millimeters.
+                                    Unit::Millimeter.suffix()
                                 })
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(100, 116, 139)),
                             );
+                        });
+                        if let Some(editor) = self.sketch_dimension_editor.as_mut() {
+                            ui.horizontal(|ui| {
+                                ui.label("New variable (optional)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut editor.variable_name)
+                                        .desired_width(110.0)
+                                        .hint_text("e.g. hole_size"),
+                                );
+                            });
+                            if let Some(error) = &editor.error {
+                                ui.colored_label(egui::Color32::DARK_RED, error);
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            accept = ui.button("Apply").clicked();
+                            cancel = ui.button("Cancel").clicked();
                         });
                     });
             });
@@ -256,27 +362,25 @@ impl ZeroCadApp {
             if let Some(dimension) = parsed_dimension.clone() {
                 if self.set_live_constraint_dimension(constraint_id, dimension) {
                     self.rebuild_active_sketch_curves_throttled();
+                    self.sketch_dimension_editor.as_mut().unwrap().error = None;
+                } else {
+                    self.sketch_dimension_editor.as_mut().unwrap().error =
+                        Some(self.status_msg.clone());
                 }
+            } else {
+                self.sketch_dimension_editor.as_mut().unwrap().error =
+                    Some("Enter a valid number, expression, or defined variable.".into());
             }
         }
 
         let enter = ctx.input(|input| input.key_pressed(egui::Key::Enter));
         let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        if enter && !accepted_via_key {
-            if let Some(dimension) = parsed_dimension {
-                if !self.set_live_constraint_dimension(constraint_id, dimension) {
-                    return;
-                }
-                self.rebuild_active_sketch_curves();
-                self.sketch_dimension_editor = None;
-                self.autocomplete = None;
-                self.status_msg =
-                    "Dimension set — select more geometry to add another dimension.".to_string();
-            } else {
-                self.status_msg =
-                    "Enter a valid number, expression, or defined variable.".to_string();
+        if accept || enter && !accepted_via_key {
+            if !self.accept_sketch_dimension() {
+                self.sketch_dimension_editor.as_mut().unwrap().error =
+                    Some(self.status_msg.clone());
             }
-        } else if escape {
+        } else if escape || cancel {
             // Restore geometry as well as the driver (which may have existed
             // before placement). Removing an equation cannot undo solved motion.
             self.undo_last_sketch_action();
@@ -513,6 +617,99 @@ mod tests {
     use super::{dim_fields_for, dimension_from_source, DimField, DimInput};
     use crate::{SketchTool, ZeroCadApp};
     use eframe::egui;
+
+    fn picked_circle() -> ZeroCadApp {
+        let mut app = ZeroCadApp::new();
+        app.is_sketch_mode = true;
+        app.sketch_shapes.push(crate::SketchShape::Circle {
+            center: (0.0, 0.0),
+            diameter: crate::Dimension::literal(10.0),
+        });
+        app.ensure_active_solver_model();
+        let id = app.sketch_solver_model.as_ref().unwrap().entities[0].id();
+        app.pick_dimension_target(id, false, (5.0, 0.0), egui::pos2(200.0, 200.0));
+        assert!(app.sketch_dimension_editor.is_some());
+        app
+    }
+
+    #[test]
+    fn direct_circle_dimension_creates_variable_and_undoes_atomically() {
+        let mut app = picked_circle();
+        app.current_unit = crate::Unit::Inch;
+        let editor = app.sketch_dimension_editor.as_mut().unwrap();
+        editor.value = "12 * 2".into();
+        editor.variable_name = "hole_size".into();
+        assert!(app.accept_sketch_dimension());
+        assert_eq!(app.document.variable_map()["hole_size"], 24.0);
+        assert!((app.sketch_curves.circles[0].radius - 12.0).abs() < 1e-4);
+        app.undo_last_sketch_action();
+        assert!(!app.document.variable_map().contains_key("hole_size"));
+        assert!((app.sketch_curves.circles[0].radius - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn named_circle_dimension_survives_finish_and_document_roundtrip() {
+        let mut app = picked_circle();
+        let editor = app.sketch_dimension_editor.as_mut().unwrap();
+        editor.value = "24".into();
+        editor.variable_name = "hole_size".into();
+        app.finish_active_sketch(&egui::Context::default());
+        assert!(!app.is_sketch_mode);
+        let bytes = zerocad_core::write_document_to_vec(
+            &app.document,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let loaded = zerocad_core::read_document_from_slice(&bytes, &Default::default()).unwrap();
+        assert_eq!(loaded.document.variable_map()["hole_size"], 24.0);
+        let sketch = loaded
+            .document
+            .graph
+            .node_weights()
+            .find(|node| matches!(node.feature, crate::FeatureType::Sketch { .. }))
+            .unwrap();
+        let id = sketch.id.clone();
+        app.document = loaded.document;
+        app.edit_sketch(&id, 0.0);
+        assert!((app.sketch_curves.circles[0].radius - 12.0).abs() < 1e-4);
+        for node in app.document.graph.node_weights_mut() {
+            if let crate::FeatureType::VariableSet { variables } = &mut node.feature {
+                variables[0].value = 30.0;
+            }
+        }
+        app.solve_live_sketch();
+        app.rebuild_active_sketch_curves();
+        assert!((app.sketch_curves.circles[0].radius - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn invalid_dimension_does_not_leave_a_variable_or_change_geometry() {
+        let mut app = picked_circle();
+        let before = app.sketch_solver_model.clone();
+        let editor = app.sketch_dimension_editor.as_mut().unwrap();
+        editor.value = "-2".into();
+        editor.variable_name = "bad_size".into();
+        assert!(!app.accept_sketch_dimension());
+        assert_eq!(app.sketch_solver_model, before);
+        assert!(!app.document.variable_map().contains_key("bad_size"));
+        app.sketch_dimension_editor.as_mut().unwrap().value = "12".into();
+        app.sketch_dimension_editor.as_mut().unwrap().variable_name = "bad name".into();
+        assert!(!app.accept_sketch_dimension());
+        app.undo_last_sketch_action();
+        assert!(app.sketch_dimension_editor.is_none());
+        assert!(app.document.variable_map().is_empty());
+    }
+
+    #[test]
+    fn undo_finished_sketch_also_removes_its_new_parameter() {
+        let mut app = picked_circle();
+        app.sketch_dimension_editor.as_mut().unwrap().variable_name = "hole_size".into();
+        app.finish_active_sketch(&egui::Context::default());
+        assert!(app.document.variable_map().contains_key("hole_size"));
+        app.undo();
+        assert!(app.document.variable_map().is_empty());
+    }
 
     fn dimension_input(focus_request: Option<usize>) -> DimInput {
         DimInput {

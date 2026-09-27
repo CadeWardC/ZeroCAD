@@ -169,7 +169,7 @@ mod preview_tests {
                 mode,
                 on_face: mode != ExtrudeMode::NewBody,
                 mode_user_set: true,
-                pending_face_sketch: None,
+                pending_face_sketches: Vec::new(),
             };
             let parts = op.preview_part_meshes(4.0);
             assert_eq!(parts.len(), 1);
@@ -186,6 +186,144 @@ mod preview_tests {
                 .collect();
             assert!(seams.is_empty(), "{mode:?} preview seams: {seams:#?}");
         }
+    }
+
+    fn bracket_app() -> (ZeroCadApp, Vec<(String, u32)>) {
+        let mut app = ZeroCadApp::new();
+        let mut curves = zerocad_core::SketchCurves::new();
+        let points = [
+            (0., 0.),
+            (2., 0.),
+            (2., 8.),
+            (8., 8.),
+            (8., 0.),
+            (10., 0.),
+            (10., 10.),
+            (0., 10.),
+        ];
+        for i in 0..points.len() {
+            curves.add_line(points[i], points[(i + 1) % points.len()]);
+        }
+        app.document.add_feature(FeatureNode {
+            id: "sketch_100".into(),
+            name: "Bracket".into(),
+            feature: FeatureType::Sketch {
+                cs: CoordinateSystem::XY,
+                curves,
+                shapes: Vec::new(),
+                corner_mods: Vec::new(),
+                mirrors: Vec::new(),
+                on_face: false,
+                entity_ids: Vec::new(),
+                next_entity_id: 0,
+                solver: None,
+            },
+        });
+        app.document.add_feature(FeatureNode {
+            id: "extrude_101".into(),
+            name: "Base".into(),
+            feature: FeatureType::Extrude {
+                target: None,
+                depth: 10.,
+                region_indices: vec![0],
+                mode: ExtrudeMode::NewBody,
+                depth_expr: None,
+                draft_angle_deg: 0.,
+                draft_angle_expr: None,
+            },
+        });
+        app.document.add_dependency("sketch_100", "extrude_101");
+        app.id_counter = 102;
+        let bodies = app.document.evaluate_bodies(&HashSet::new()).unwrap();
+        app.set_body_meshes(bodies);
+        let mut faces = Vec::new();
+        for (id, mesh) in app.body_meshes.iter() {
+            let ids: HashSet<_> = mesh.face_ids.iter().copied().collect();
+            for fid in ids {
+                if let Some(cs) = app.face_cs(id, fid) {
+                    if cs.n.y < -0.99 && cs.origin.y.abs() < 0.001 {
+                        faces.push((id.clone(), fid));
+                    }
+                }
+            }
+        }
+        faces.sort();
+        assert_eq!(faces.len(), 2);
+        (app, faces)
+    }
+
+    #[test]
+    fn parallel_body_faces_share_preview_commit_and_undo_unit() {
+        for (depth, mode, expected_volume) in
+            [(3., ExtrudeMode::Join, 640.), (-3., ExtrudeMode::Cut, 400.)]
+        {
+            let (mut app, faces) = bracket_app();
+            let original_count = app.document.graph.node_count();
+            app.begin_extrude_on_body_faces(faces);
+            assert_eq!(app.document.graph.node_count(), original_count);
+            let op = app.extrude_op.as_mut().expect("two faces accepted");
+            assert_eq!(op.targets.len(), 2);
+            assert_eq!(op.pending_face_sketches.len(), 2);
+            op.depth = depth;
+            op.depth_text = depth.to_string();
+            op.mode = mode;
+            let preview = app.build_preview_extrude_document().unwrap();
+            let (bodies, warnings) = preview
+                .evaluate_bodies_with_warnings(&HashSet::new())
+                .unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(bodies.len(), 1);
+            let volume = bodies[0].1.mass_properties().unwrap().volume;
+            assert!(
+                (volume - expected_volume).abs() < 0.01,
+                "{mode:?}: {volume}"
+            );
+            let undo_count = app.undo_stack.len();
+            app.commit_extrude_op();
+            assert_eq!(app.undo_stack.len(), undo_count + 1);
+            let (bodies, warnings) = app
+                .document
+                .evaluate_bodies_with_warnings(&HashSet::new())
+                .unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(bodies.len(), 1);
+            assert!((bodies[0].1.mass_properties().unwrap().volume - expected_volume).abs() < 0.01);
+            let bytes = zerocad_core::zcad_format::write_document_to_vec(
+                &app.document,
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap();
+            let reopened =
+                zerocad_core::zcad_format::read_document_from_slice(&bytes, &Default::default())
+                    .unwrap()
+                    .document;
+            let bodies = reopened.evaluate_bodies(&HashSet::new()).unwrap();
+            assert_eq!(bodies.len(), 1);
+            assert!((bodies[0].1.mass_properties().unwrap().volume - expected_volume).abs() < 0.01);
+            app.undo();
+            assert_eq!(app.document.graph.node_count(), original_count);
+        }
+    }
+
+    #[test]
+    fn multi_face_cancel_and_invalid_selection_leave_graph_untouched() {
+        let (mut app, faces) = bracket_app();
+        let count = app.document.graph.node_count();
+        app.begin_extrude_on_body_faces(faces.clone());
+        app.cancel_extrude_op();
+        assert_eq!(app.document.graph.node_count(), count);
+        let other = app.body_meshes[0]
+            .1
+            .face_ids
+            .iter()
+            .copied()
+            .find(|fid| app.face_cs(&faces[0].0, *fid).unwrap().n.z > 0.99)
+            .unwrap();
+        app.begin_extrude_on_body_faces(vec![faces[0].clone(), (faces[0].0.clone(), other)]);
+        assert!(app.extrude_op.is_none());
+        assert!(app.status_msg.contains("parallel"));
+        assert_eq!(app.document.graph.node_count(), count);
     }
 
     #[test]
@@ -234,7 +372,7 @@ mod preview_tests {
             mode: ExtrudeMode::NewBody,
             on_face: false,
             mode_user_set: false,
-            pending_face_sketch: None,
+            pending_face_sketches: Vec::new(),
         };
 
         assert!(op.requires_background_preview());
@@ -313,9 +451,9 @@ pub(crate) struct ExtrudeOp {
     /// Set once the user clicks a mode button, which freezes the mode so the
     /// direction-driven default stops overriding their choice.
     pub(crate) mode_user_set: bool,
-    /// `Some` for a direct push/pull started from a body face: the helper
-    /// on-face sketch to materialize at commit (see [`PendingFaceSketch`]).
-    pub(crate) pending_face_sketch: Option<PendingFaceSketch>,
+    /// Helpers for a direct push/pull started from body faces:
+    /// on-face sketches to materialize at commit (see [`PendingFaceSketch`]).
+    pub(crate) pending_face_sketches: Vec<PendingFaceSketch>,
 }
 
 impl ExtrudeOp {
@@ -563,7 +701,7 @@ impl ZeroCadApp {
         let mut graph = self.document.clone();
         // Direct face push/pull: the helper sketch only exists in this preview
         // clone (and later at commit) — never in the working graph.
-        if let Some(p) = &op.pending_face_sketch {
+        for p in &op.pending_face_sketches {
             insert_pending_face_sketch(&mut graph, p);
         }
         for (i, target) in op.targets.iter().enumerate() {
@@ -576,11 +714,20 @@ impl ZeroCadApp {
             region_indices.dedup();
 
             let extrude_id = format!("extrude_{}", self.id_counter + i);
+            let body_target = if matches!(op.mode, ExtrudeMode::Join | ExtrudeMode::Cut) {
+                graph
+                    .sketch_face_refs
+                    .get(target.sketch_id.as_str())
+                    .and_then(|fref| fref.topology.as_ref())
+                    .and_then(|topology| topology.body_id.clone())
+            } else {
+                None
+            };
             graph.add_feature(FeatureNode {
                 id: extrude_id.clone(),
                 name: format!("Preview Extrude {}", i + 1),
                 feature: FeatureType::Extrude {
-                    target: None,
+                    target: body_target,
                     depth: op.depth,
                     region_indices,
                     mode: op.mode,
@@ -1214,7 +1361,7 @@ impl ZeroCadApp {
             mode,
             on_face,
             mode_user_set: false,
-            pending_face_sketch: None,
+            pending_face_sketches: Vec::new(),
         });
         // Fresh op — drop any preview cached for a previous one.
         self.extrude_preview_cache = None;
@@ -1225,24 +1372,31 @@ impl ZeroCadApp {
                 .to_string();
     }
 
-    /// Begin a direct push/pull on a planar **body face** — no pre-drawn
-    /// sketch needed. Builds a pending on-face helper sketch whose only
-    /// geometry is the projected face outline, so its region(s) are exactly
-    /// the face; pulling out joins material, pushing in cuts. Nothing touches
-    /// the parametric graph until the user confirms.
-    pub(crate) fn begin_extrude_on_body_face(&mut self, node: String, fid: u32) {
-        if self.extrude_op.is_some() {
-            return;
-        }
-        self.extrude_profile_pick_active = false;
+    /// Selected body faces in deterministic order, shared by the toolbar and tool.
+    pub(crate) fn extrude_body_faces(&self) -> Vec<(String, u32)> {
+        let mut faces: Vec<_> = self
+            .selected_body
+            .iter()
+            .filter_map(|(id, pick)| match pick {
+                crate::BodyPick::Face(fid) => Some((id.clone(), *fid)),
+                _ => None,
+            })
+            .collect();
+        faces.sort();
+        faces.dedup();
+        faces
+    }
+
+    fn prepare_extrude_body_face(
+        &mut self,
+        node: String,
+        fid: u32,
+    ) -> Result<(ExtrudeTarget, PendingFaceSketch), &'static str> {
         if !self.face_is_planar(&node, fid) {
-            self.status_msg =
-                "Extrude needs a flat body face — curved faces aren't supported yet.".to_string();
-            return;
+            return Err("Extrude needs flat body faces; curved faces are not supported yet.");
         }
         let Some(cs) = self.face_cs(&node, fid) else {
-            self.status_msg = "Couldn't resolve the selected face.".to_string();
-            return;
+            return Err("Couldn't resolve the selected face.");
         };
         let fref = self.face_ref(&node, fid);
         let boundary = self.face_boundary_curves(&node, fid, &cs);
@@ -1282,53 +1436,79 @@ impl ZeroCadApp {
                 .collect();
         }
         if indices.is_empty() {
-            self.status_msg = "Couldn't derive a closed outline from that face.".to_string();
-            return;
+            return Err("Couldn't derive a closed outline from a selected face.");
         }
 
         let sketch_id = format!("sketch_{}", self.next_id());
-        let name = self.next_sketch_name();
+        let target = ExtrudeTarget {
+            sketch_id: sketch_id.clone(),
+            cs,
+            ink_mask: vec![true; regions.len()],
+            regions,
+            indices,
+            on_face: true,
+            loops: Vec::new(),
+            circles: Vec::new(),
+            draft_supported: boundary.circles.is_empty()
+                && boundary.arcs.is_empty()
+                && boundary.splines.is_empty(),
+        };
+        let pending = PendingFaceSketch {
+            sketch_id,
+            name: self.next_sketch_name(),
+            cs,
+            fref,
+            boundary,
+            body_id: node,
+        };
+        Ok((target, pending))
+    }
+
+    /// Stage parallel body faces with a shared distance. Helper sketches stay
+    /// outside the document until the entire operation is committed.
+    pub(crate) fn begin_extrude_on_body_faces(&mut self, faces: Vec<(String, u32)>) {
+        if self.extrude_op.is_some() || faces.is_empty() {
+            return;
+        }
+        let mut targets: Vec<ExtrudeTarget> = Vec::new();
+        let mut pending_face_sketches = Vec::new();
+        for (node, fid) in faces {
+            let (target, mut pending) = match self.prepare_extrude_body_face(node, fid) {
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    self.status_msg = message.to_string();
+                    return;
+                }
+            };
+            if let Some(first) = targets.first() {
+                if first.cs.n.sub(target.cs.n).length() > 1e-5 {
+                    self.status_msg = "Select parallel flat faces pointing in the same direction to extrude together.".to_string();
+                    return;
+                }
+            }
+            if !targets.is_empty() {
+                pending.name = format!("{} ({})", pending.name, targets.len() + 1);
+            }
+            targets.push(target);
+            pending_face_sketches.push(pending);
+        }
+        self.extrude_profile_pick_active = false;
         let depth = self.extrude_depth.max(1.0);
-        let mode = default_extrude_mode(true, depth);
         self.extrude_op = Some(ExtrudeOp {
-            targets: vec![ExtrudeTarget {
-                sketch_id: sketch_id.clone(),
-                cs,
-                ink_mask: vec![true; regions.len()],
-                regions,
-                indices,
-                on_face: true,
-                // A direct face push/pull has no drawn overlapping shapes.
-                loops: Vec::new(),
-                circles: Vec::new(),
-                draft_supported: boundary.circles.is_empty()
-                    && boundary.arcs.is_empty()
-                    && boundary.splines.is_empty(),
-            }],
+            targets,
             depth,
             depth_text: format!("{:.2}", depth),
             draft_angle_deg: 0.0,
             draft_angle_text: "0".to_string(),
             focus_request: true,
-            mode,
+            mode: default_extrude_mode(true, depth),
             on_face: true,
             mode_user_set: false,
-            pending_face_sketch: Some(PendingFaceSketch {
-                sketch_id,
-                name,
-                cs,
-                fref,
-                boundary,
-                body_id: node,
-            }),
+            pending_face_sketches,
         });
         self.selected_body.clear();
-        self.extrude_preview_cache = None;
-        self.extrude_preview_mesh_cache = None;
-        self.extrude_ghost_base = None;
-        self.status_msg =
-            "Extrude face: drag along the normal to push/pull (out = Join, in = Cut), or type a distance, then OK."
-                .to_string();
+        self.clear_extrude_preview_eval();
+        self.status_msg = "Extrude faces: all selected faces share the distance and direction. Pull out to Join, push in to Cut, then OK.".to_string();
     }
 
     /// Start an extrude from the currently selected faces.
@@ -1435,7 +1615,7 @@ impl ZeroCadApp {
 
         // Direct face push/pull: materialize the helper on-face sketch now
         // (inside this undo unit), so the extrude below has a real parent.
-        if let Some(p) = &op.pending_face_sketch {
+        for p in &op.pending_face_sketches {
             insert_pending_face_sketch(&mut self.document, p);
         }
 

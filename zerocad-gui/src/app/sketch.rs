@@ -1,6 +1,22 @@
 use crate::*;
 
 impl ZeroCadApp {
+    /// Finishing the sketch commits its newly named parameters in the same
+    /// document undo step as the geometry that uses them.
+    pub(crate) fn push_sketch_commit_undo(&mut self) {
+        self.push_undo();
+        if let Some(UndoSnapshot {
+            project: ProjectDocument::Part(document),
+        }) = self.undo_stack.last_mut()
+        {
+            for snapshot in &self.working_sketch_undo {
+                if let Some(id) = &snapshot.created_variable_feature {
+                    document.evaluator_graph_mut().remove_feature(id);
+                }
+            }
+        }
+    }
+
     /// Begin one atomic live-sketch edit. Multi-entity operations call this
     /// once, immediately before their first mutation.
     pub(crate) fn push_working_sketch_undo(&mut self) {
@@ -8,6 +24,7 @@ impl ZeroCadApp {
             self.working_sketch_undo.remove(0);
         }
         self.working_sketch_undo.push(WorkingSketchSnapshot {
+            created_variable_feature: None,
             shapes: self.sketch_shapes.clone(),
             corner_mods: self.sketch_corner_mods.clone(),
             mirrors: self.sketch_mirrors.clone(),
@@ -18,6 +35,9 @@ impl ZeroCadApp {
     }
 
     fn restore_working_sketch_snapshot(&mut self, snapshot: WorkingSketchSnapshot) {
+        if let Some(id) = &snapshot.created_variable_feature {
+            self.document.remove_feature(id);
+        }
         self.sketch_shapes = snapshot.shapes;
         self.sketch_corner_mods = snapshot.corner_mods;
         self.sketch_mirrors = snapshot.mirrors;

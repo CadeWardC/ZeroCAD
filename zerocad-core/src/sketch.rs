@@ -520,6 +520,21 @@ impl SketchCurves {
                 .max(circle.center.1.abs())
                 * f32::EPSILON
                 * 32.0;
+            // Native face extraction retains circular rims as arcs, not just
+            // display chords. The drawn full circle already supplies every
+            // such span. Do not arrange a second, float-rounded copy against
+            // it: that creates artificial crescent regions on later cuts.
+            let same_support = |center: (f32, f32), radius: f32| {
+                (center.0 - circle.center.0).hypot(center.1 - circle.center.1)
+                    + (radius - circle.radius).abs()
+                    <= tolerance
+            };
+            boundary
+                .circles
+                .retain(|rim| !same_support(rim.center, rim.radius));
+            boundary
+                .arcs
+                .retain(|rim| !same_support(rim.center, rim.radius));
             let mut candidates = Vec::new();
             let mut sweep = 0.0f64;
             for (index, segment) in boundary.segments.iter().enumerate() {

@@ -10,6 +10,9 @@ impl ZeroCadApp {
         if !self.is_sketch_mode && !self.is_plane_selection_mode {
             return;
         }
+        if self.sketch_dimension_editor.is_some() && !self.accept_sketch_dimension() {
+            return;
+        }
 
         log::info!("Finishing sketch - saving it as a 2D object.");
         self.commit_pending_corners();
@@ -33,7 +36,7 @@ impl ZeroCadApp {
         // references and downstream dependencies survive.
         if let Some(editing_id) = self.editing_sketch_id.clone() {
             if !self.sketch_curves.is_empty() {
-                self.push_undo();
+                self.push_sketch_commit_undo();
                 for idx in self.document.graph.node_indices() {
                     if self.document.graph[idx].id != editing_id {
                         continue;
@@ -122,7 +125,7 @@ impl ZeroCadApp {
                 },
             };
 
-            self.push_undo();
+            self.push_sketch_commit_undo();
             self.document.add_feature(sketch_node);
             for source in &projection_sources {
                 self.document.add_dependency(source, &sketch_id);
@@ -441,13 +444,8 @@ impl ZeroCadApp {
             let sel = self.selected_faces.len();
             let extrude_enabled = sel > 0;
 
-            // Direct push/pull: exactly one planar BODY face selected (and no
-            // sketch faces) → the Extrude button pulls/pushes that face via a
-            // hidden helper sketch of its projected outline.
-            let body_face = (sel == 0)
-                .then(|| self.hole_face_candidate())
-                .flatten()
-                .filter(|(n, f)| self.face_is_planar(n, *f));
+            // Direct push/pull shares a distance across parallel body faces.
+            let body_faces = self.extrude_body_faces();
 
             if extrude_enabled {
                 let extrude_btn = icons::Icon::Extrude.labeled_button(
@@ -464,10 +462,10 @@ impl ZeroCadApp {
                 {
                     self.begin_extrude_from_selection();
                 }
-            } else if let Some((node, fid)) = body_face {
+            } else if !body_faces.is_empty() {
                 let extrude_btn = icons::Icon::Extrude.labeled_button(
                     ui,
-                    "Extrude Face",
+                    &format!("Extrude Faces ({})", body_faces.len()),
                     egui::Color32::from_rgb(37, 99, 235),
                     egui::Color32::from_rgb(29, 78, 216),
                     egui::Color32::WHITE,
@@ -479,7 +477,7 @@ impl ZeroCadApp {
                     )
                     .clicked()
                 {
-                    self.begin_extrude_on_body_face(node, fid);
+                    self.begin_extrude_on_body_faces(body_faces);
                 }
             } else {
                 // Command-first workflow: Extrude remains available with no

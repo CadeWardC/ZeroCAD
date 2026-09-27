@@ -17,7 +17,7 @@
 //! watertight + healthy, or does not actually reduce the face count, the original
 //! solid is returned unchanged — so merging can only ever improve a result.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use openrcad_foundation::{Dir2d, Pnt, Pnt2d, TolerancePolicy, Vec as FVec};
@@ -166,12 +166,37 @@ pub fn heal_tjunctions_with_policy(solid: &Solid, policy: &TolerancePolicy) -> S
 fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> Solid {
     // Only relevant when the shell is open; a watertight solid has no T-junctions
     // to heal, and re-running the scan would be wasted work on every boolean.
-    if solid.is_watertight_with_policy(policy) {
+    if solid.is_watertight_with_policy(policy) && solid.validate_strict_with_policy(policy).is_ok()
+    {
         return solid.clone();
     }
 
     let face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
     let mut builder = BRepBuilder::from_brep((**solid.brep()).clone());
+
+    // A T-junction is a mismatch between free boundary subdivisions. Do not
+    // imprint unrelated vertices onto already shared interior edges: nearby
+    // tangent cuts can legitimately have distinct vertices within sewing
+    // tolerance, and connecting their closed face fans creates a pinch point.
+    let mut uses = HashMap::new();
+    for face in solid.faces() {
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                *uses.entry(edge.id()).or_insert(0_usize) += 1;
+            }
+        }
+    }
+    let mut free_edges: HashSet<_> = uses
+        .into_iter()
+        .filter_map(|(id, count)| (count == 1).then_some(id))
+        .collect();
+    let boundary_vertices: HashSet<_> = free_edges
+        .iter()
+        .flat_map(|id| {
+            let edge = &builder.brep().edges[*id];
+            [edge.start, edge.end]
+        })
+        .collect();
 
     // Repeatedly split the first edge that has an interior coincident vertex.
     // Each split turns that vertex into a shared endpoint of the two sub-edges, so
@@ -185,6 +210,9 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
         }
         let edge_ids: Vec<EdgeId> = builder.brep().edges.keys().collect();
         for e_id in edge_ids {
+            if !free_edges.contains(&e_id) {
+                continue;
+            }
             let Some(e) = builder.brep().edges.get(e_id).cloned() else {
                 continue;
             };
@@ -201,7 +229,7 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
 
             let mut chosen = None;
             for (vid, vd) in builder.brep().vertices.iter() {
-                if vid == e.start || vid == e.end {
+                if !boundary_vertices.contains(&vid) || vid == e.start || vid == e.end {
                     continue;
                 }
                 let vp = vd.point;
@@ -220,7 +248,9 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
             }
 
             if let Some((vid, t)) = chosen {
-                builder.split_edge(e_id, vid, t);
+                let (first, second) = builder.split_edge(e_id, vid, t);
+                free_edges.remove(&e_id);
+                free_edges.extend([first, second]);
                 splits += 1;
                 continue 'outer; // edges changed — restart the scan
             }
@@ -238,6 +268,13 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
         .shells
         .insert(ShellData { faces: face_ids });
     let healed = Solid::new(Shell::from_id(builder.build(), shell_id));
+    // Splitting aligns the subdivisions but leaves coincident edges with
+    // distinct IDs. Sew them into shared coedges before the strict topology
+    // gate; geometric watertightness alone also accepts unshared boundaries.
+    let healed = Solid::new(
+        crate::sew::sew_shell_with_policy(&healed.faces(), policy)
+            .expect("healing uses a validated sewing policy"),
+    );
     strict_repaired_candidate(healed, policy).unwrap_or_else(|| solid.clone())
 }
 

@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn merged_straight_profiles_retain_simplified_outer_and_hole() {
+    let mut curves = rect_sketch((0., 0.), (12., 12.));
+    let inner = rect_sketch((4., 4.), (8., 8.));
+    curves.segments.extend(inner.segments);
+    curves.add_line((6., 0.), (6., 12.));
+    let regions = crate::sketch::detect_regions(&curves);
+    assert_eq!(regions.len(), 4);
+    // Select the two halves of the ring, leaving both central cells empty.
+    let selected: Vec<_> = regions.iter().map(|r| r.area > 10.).collect();
+    let prepared = crate::parametric::extrude::prepare_extrude_regions(&regions, &selected);
+    assert_eq!(prepared.len(), 1);
+    let analytic = prepared[0]
+        .region
+        .analytic
+        .as_ref()
+        .expect("retained line profile");
+    assert_eq!(analytic.outer.spans.len(), 4, "no collinear face divisions");
+    assert_eq!(analytic.holes.len(), 1);
+    assert_eq!(analytic.holes[0].spans.len(), 4);
+    assert!((analytic.area - 128.).abs() < 1e-8);
+    assert!(analytic.outer.signed_area > 0.);
+    assert!(analytic.holes[0].signed_area < 0.);
+    let solid =
+        crate::mock_kernel::build_analytic_section_solid(analytic, 3., &CoordinateSystem::XY)
+            .unwrap();
+    assert!(solid.is_watertight());
+    solid
+        .validate_strict_with_policy(&Default::default())
+        .unwrap();
+    let volume = MockMesh::from_solid(&solid)
+        .mass_properties()
+        .unwrap()
+        .volume;
+    assert!((volume - 384.).abs() < 1e-6);
+}
+
+#[test]
 fn newbody_makes_one_body() {
     let mut g = ParametricGraph::new();
     add_sketch(&mut g, "sketch_1", rect_sketch((0.0, 0.0), (10.0, 10.0)));

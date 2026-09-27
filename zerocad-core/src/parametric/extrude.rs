@@ -2363,18 +2363,18 @@ fn merge_analytic_regions(
             reverse_analytic_loop(hole);
         }
     }
-    // A straight-only union is represented more cleanly by the simplified
-    // polygon assembled below. Keeping every arrangement subspan here would
-    // reintroduce collinear face divisions (for example, two overlapping
-    // rectangles would tessellate as 28 triangles instead of the canonical
-    // box-like 12). Curves still need the analytic loop so a later shared-wall
-    // Join sees the exact same arc/cylinder rather than a sampled refit.
+    // Retain exact line provenance too: dropping it prevents later sectional
+    // joins/cuts from rebuilding any merged outline more complex than a box.
+    // Coalesce collinear subspans so retaining the analytic outline does not
+    // reintroduce the internal face divisions removed by polygon preparation.
     if std::iter::once(&outer)
         .chain(loops.iter())
         .flat_map(|loop_| loop_.spans.iter())
         .all(|span| span.kind() == openrcad::geom2d::CurveKind2d::Line)
     {
-        return None;
+        for loop_ in std::iter::once(&mut outer).chain(&mut loops) {
+            simplify_analytic_line_loop(loop_, tolerance);
+        }
     }
     let area = outer.area() - loops.iter().map(|hole| hole.area()).sum::<f64>();
     (area > tolerance * tolerance).then_some(openrcad::sketch::ArrangementRegion {
@@ -2382,6 +2382,36 @@ fn merge_analytic_regions(
         holes: loops,
         area,
     })
+}
+
+fn simplify_analytic_line_loop(
+    loop_: &mut openrcad::sketch::ArrangementLoop<crate::sketch::SketchCurveProvenance>,
+    tolerance: f64,
+) {
+    while loop_.spans.len() > 3 {
+        let count = loop_.spans.len();
+        let removable = (0..count).find(|&i| {
+            let a = loop_.spans[i].start();
+            let b = loop_.spans[i].end();
+            let c = loop_.spans[(i + 1) % count].end();
+            let incoming = (b.x() - a.x(), b.y() - a.y());
+            let outgoing = (c.x() - b.x(), c.y() - b.y());
+            incoming.0 * outgoing.0 + incoming.1 * outgoing.1 > 0.
+                && (incoming.0 * outgoing.1 - incoming.1 * outgoing.0).abs()
+                    <= tolerance * (incoming.0.hypot(incoming.1) + outgoing.0.hypot(outgoing.1))
+        });
+        let Some(i) = removable else { break };
+        let next = (i + 1) % count;
+        let end = loop_.spans[next].end();
+        let openrcad::geom2d::GeomCurve2d::Line(line) = &loop_.spans[i].curve else {
+            return;
+        };
+        let last = (end.x() - line.location().x()) * line.direction().x()
+            + (end.y() - line.location().y()) * line.direction().y();
+        loop_.spans[i].last = last;
+        loop_.spans.remove(next);
+    }
+    loop_.signed_area = analytic_loop_signed_area(&loop_.spans);
 }
 
 /// Merge selected arrangement tiles that share a complete boundary edge.

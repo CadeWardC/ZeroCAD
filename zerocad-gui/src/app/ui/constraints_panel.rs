@@ -33,6 +33,30 @@ struct SplineEdit {
 }
 
 impl ZeroCadApp {
+    /// A plain entity click edits its size immediately. Shift keeps the
+    /// selection open for two-line dimensions. Pairs retain the placement
+    /// click so users can choose horizontal, vertical, or aligned distances.
+    pub(crate) fn pick_dimension_target(
+        &mut self,
+        id: EntityId,
+        extend: bool,
+        sketch_position: (f64, f64),
+        screen_position: egui::Pos2,
+    ) {
+        if !extend && self.sketch_selected_ids.is_empty() {
+            self.sketch_selected_constraint = None;
+        }
+        self.select_for_dimension(id);
+        let selection = self.classify_selection();
+        let ready = selection.circles.len() == 1
+            || selection.lines.len() == 1 && selection.points.is_empty();
+        if !extend && ready {
+            if let Err(message) = self.place_inferred_dimension(sketch_position, screen_position) {
+                self.status_msg = message;
+            }
+        }
+    }
+
     pub(crate) fn set_live_constraint_dimension(
         &mut self,
         id: EntityId,
@@ -1628,6 +1652,40 @@ mod dimension_tool_tests {
     use zerocad_core::sketch::{SketchPoint, SketchSolverModel};
 
     #[test]
+    fn direct_edge_click_resizes_each_rectangle_side_and_shift_defers_editor() {
+        for side in 0..4 {
+            let mut app = ZeroCadApp::new();
+            app.is_sketch_mode = true;
+            app.sketch_shapes.push(SketchShape::Rectangle {
+                origin: (0.0, 0.0),
+                sx: 1.0,
+                sy: 1.0,
+                w: Dimension::literal(10.0),
+                h: Dimension::literal(6.0),
+                from_center: false,
+            });
+            app.ensure_active_solver_model();
+            let original = app.sketch_solver_model.clone().unwrap();
+            let id = original.entities[side].id();
+            app.pick_dimension_target(id, true, (15.0, 15.0), egui::pos2(200.0, 200.0));
+            assert!(app.sketch_dimension_editor.is_none());
+            app.pick_dimension_target(id, false, (15.0, 15.0), egui::pos2(200.0, 200.0));
+            let editor = app.sketch_dimension_editor.as_ref().unwrap();
+            assert!(
+                app.set_live_constraint_dimension(editor.constraint_id, Dimension::literal(20.0))
+            );
+            let model = app.sketch_solver_model.as_ref().unwrap();
+            assert_eq!(model.constraints.len(), original.constraints.len());
+            let SketchEntity::Line { p0, p1, .. } = original.entities[side] else {
+                panic!()
+            };
+            assert!((app.current_point_distance(p0, p1) - 20.0).abs() < 1e-4);
+            app.undo_last_sketch_action();
+            assert_eq!(app.sketch_solver_model.as_ref().unwrap(), &original);
+        }
+    }
+
+    #[test]
     fn promoted_dimensions_resize_without_duplicate_drivers_and_undo() {
         for pick in 0..7 {
             let mut app = ZeroCadApp::new();
@@ -1735,6 +1793,7 @@ mod dimension_tool_tests {
             let id = app.sketch_dimension_editor.as_ref().unwrap().constraint_id;
             assert!(app.set_live_constraint_dimension(id, Dimension::literal(20.0)));
             app.rebuild_active_sketch_curves();
+            app.sketch_dimension_editor.as_mut().unwrap().value = "20".into();
             app.finish_active_sketch(&egui::Context::default());
             let after = volume(&app.document);
             assert!(

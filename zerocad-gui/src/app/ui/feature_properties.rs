@@ -262,12 +262,17 @@ impl ZeroCadApp {
         let Some(feature_id) = self.feature_properties_dialog.clone() else {
             return;
         };
-        let Some(feature_name) = self
+        let Some((feature_name, is_variable_set)) = self
             .document
             .graph
             .node_weights()
             .find(|node| node.id == feature_id)
-            .map(|node| node.name.clone())
+            .map(|node| {
+                (
+                    node.name.clone(),
+                    matches!(node.feature, FeatureType::VariableSet { .. }),
+                )
+            })
         else {
             self.feature_properties_dialog = None;
             return;
@@ -297,7 +302,7 @@ impl ZeroCadApp {
                     });
             });
 
-        if !open || self.is_sketch_mode || self.extrude_op.is_some() {
+        if !open || (self.is_sketch_mode && !is_variable_set) || self.extrude_op.is_some() {
             self.feature_properties_dialog = None;
         }
     }

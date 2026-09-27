@@ -288,6 +288,11 @@ pub fn apply_blend_contour_with_policy(
                     policy,
                 ) {
                     Ok(result) => Ok(result),
+                    Err(
+                        error @ RollingBallError::UnsolvableAdjacency {
+                            reason: crate::rolling_ball::AdjacencyReason::RadiusTooLarge,
+                        },
+                    ) => Err(BlendContourError::Fillet(error)),
                     Err(_) => fillet_edges_with_policy(solid, &contour.edges, value, policy)
                         .map_err(BlendContourError::Fillet),
                 }
@@ -310,6 +315,12 @@ pub fn apply_blend_contour_with_policy(
                     policy,
                 ) {
                     Ok(result) => Ok(result),
+                    Err(RollingBallError::UnsolvableAdjacency {
+                        reason: crate::rolling_ball::AdjacencyReason::RadiusTooLarge,
+                    }) => Err(BlendContourError::Chamfer(ChamferError::CandidateValidation {
+                        stage: "circular shoulder clearance",
+                        reason: "chamfer distance exceeds the available support face; reduce the distance".into(),
+                    })),
                     Err(_) => chamfer_edges_with_policy(solid, &contour.edges, value, policy)
                         .map_err(BlendContourError::Chamfer),
                 }

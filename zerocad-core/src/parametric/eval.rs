@@ -3952,7 +3952,14 @@ impl ParametricGraph {
             .or_else(|| {
                 self.sketch_face_refs
                     .get(sketch_id.as_str())
-                    .and_then(|face_ref| rederive_sketch_cs(face_ref, live))
+                    .and_then(|face_ref| {
+                        rederive_attached_sketch_cs(
+                            face_ref,
+                            live,
+                            sketch.cs,
+                            sketch.face_boundary.as_ref(),
+                        )
+                    })
             })
             .unwrap_or(sketch.cs);
         let cs = &cs_owned;
@@ -5691,7 +5698,12 @@ impl ParametricGraph {
                     .insert(sketch_id.into(), resolved);
             }
         }
-        match rederive_sketch_cs(face_ref, live) {
+        match rederive_attached_sketch_cs(
+            face_ref,
+            live,
+            saved,
+            self.sketch_face_boundaries.get(sketch_id),
+        ) {
             Some(cs) => Ok(cs),
             None if face_ref_is_named(face_ref) => Err(format!(
                 "sketch '{sketch_id}' is attached to a named face that no longer resolves"
@@ -8403,6 +8415,87 @@ fn face_ref_is_named(face_ref: &FaceRef) -> bool {
         .as_ref()
         .and_then(|topology| topology.face_id.as_deref())
         .is_some()
+}
+
+/// A display-mesh centroid is not a stable in-plane attachment point. Retain
+/// the captured frame when the support outline is unchanged, including after
+/// a triangulation change elsewhere in the body. Real outline edits still use
+/// the existing face-following placement path.
+fn rederive_attached_sketch_cs(
+    face_ref: &FaceRef,
+    live: &[LiveBody],
+    saved: CoordinateSystem,
+    boundary: Option<&SketchCurves>,
+) -> Option<CoordinateSystem> {
+    let resolved = rederive_sketch_cs(face_ref, live)?;
+    let Some(boundary) = boundary else {
+        return Some(resolved);
+    };
+    if saved.n.dot(resolved.n) < 1.0 - 1.0e-6 {
+        return Some(resolved);
+    }
+    let Some(current) = rederive_face_boundary(face_ref, live, &saved) else {
+        return Some(resolved);
+    };
+    if equivalent_linear_boundary(boundary, &current) {
+        let offset = resolved.origin.sub(saved.origin).dot(saved.n);
+        return Some(CoordinateSystem {
+            origin: saved.origin.add(saved.n.mul(offset)),
+            ..saved
+        });
+    }
+    Some(resolved)
+}
+
+fn equivalent_linear_boundary(a: &SketchCurves, b: &SketchCurves) -> bool {
+    if [a, b].iter().any(|c| {
+        c.segments.is_empty()
+            || !c.circles.is_empty()
+            || !c.arcs.is_empty()
+            || !c.splines.is_empty()
+    }) {
+        return false;
+    }
+    let scale = [a, b]
+        .iter()
+        .flat_map(|c| &c.segments)
+        .flat_map(|s| [s.a.0.abs(), s.a.1.abs(), s.b.0.abs(), s.b.1.abs()])
+        .fold(1.0_f32, f32::max);
+    let tolerance = f64::from(scale * f32::EPSILON * 16.0);
+    let covers = |source: &SketchCurves, target: &SketchCurves| {
+        source.segments.iter().all(|s| {
+            let dx = f64::from(s.b.0) - f64::from(s.a.0);
+            let dy = f64::from(s.b.1) - f64::from(s.a.1);
+            let length = dx.hypot(dy);
+            if length <= tolerance {
+                return true;
+            }
+            let project = |p: (f32, f32)| {
+                let x = f64::from(p.0) - f64::from(s.a.0);
+                let y = f64::from(p.1) - f64::from(s.a.1);
+                ((x * dx + y * dy) / length, (x * dy - y * dx).abs() / length)
+            };
+            let mut intervals: Vec<_> = target
+                .segments
+                .iter()
+                .filter_map(|t| {
+                    let (p, pd) = project(t.a);
+                    let (q, qd) = project(t.b);
+                    (pd <= tolerance && qd <= tolerance).then_some((p.min(q), p.max(q)))
+                })
+                .collect();
+            intervals.sort_by(|x, y| x.0.total_cmp(&y.0));
+            let mut covered = 0.0_f64;
+            for (lo, hi) in intervals {
+                if lo > covered + tolerance {
+                    break;
+                }
+                covered = covered.max(hi);
+            }
+            covered >= length - tolerance
+        })
+    };
+    covers(a, b) && covers(b, a)
 }
 
 fn rederive_sketch_cs(face_ref: &FaceRef, live: &[LiveBody]) -> Option<CoordinateSystem> {

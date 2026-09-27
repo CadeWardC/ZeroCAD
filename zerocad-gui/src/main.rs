@@ -677,6 +677,7 @@ struct UndoSnapshot {
 /// pushes exactly one of these snapshots and therefore undoes atomically.
 #[derive(Debug, Clone)]
 struct WorkingSketchSnapshot {
+    created_variable_feature: Option<String>,
     shapes: Vec<SketchShape>,
     corner_mods: Vec<CornerMod>,
     mirrors: Vec<zerocad_core::SketchMirror>,

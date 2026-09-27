@@ -247,6 +247,7 @@ pub(crate) fn apply_join(
     _draft: bool,
     warnings: &mut Vec<String>,
 ) {
+    let tools = merge_adjacent_join_profiles(tools);
     // A boss drawn on the cap of a sketch prism is a sectional profile
     // operation. Rebuild the body and every selected profile in one sewn shell
     // before asking the general 3-D Boolean solver to fuse one region at a
@@ -303,6 +304,73 @@ pub(crate) fn apply_join(
     }
 }
 
+/// Selected sketch cells are one material region even when an individual
+/// cell meets the old body only at an edge. Remove their internal boundaries
+/// before fusing, so selection order cannot turn a valid bridge into a failed
+/// intermediate non-manifold solid. Drafted/non-profile tools keep their path.
+fn merge_adjacent_join_profiles(tools: Vec<JoinTool>) -> Vec<JoinTool> {
+    if tools.len() < 2 {
+        return tools;
+    }
+    let Some(profiles) = tools
+        .iter()
+        .map(|t| t.profile.as_ref())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return tools;
+    };
+    let first = profiles[0];
+    if profiles
+        .iter()
+        .any(|p| p.cs != first.cs || p.depth != first.depth)
+    {
+        return tools;
+    }
+    let regions: Vec<_> = profiles.iter().map(|p| p.region.clone()).collect();
+    let prepared = prepare_extrude_regions(&regions, &vec![true; regions.len()]);
+    if !prepared.iter().any(|p| p.source_indices.len() > 1)
+        || prepared
+            .iter()
+            .map(|p| p.source_indices.len())
+            .sum::<usize>()
+            != tools.len()
+    {
+        return tools;
+    }
+    let mut merged = Vec::new();
+    for group in prepared {
+        let region = group.region;
+        let Some(exact) =
+            crate::mock_kernel::extruded_sketch_region_solid(&region, first.depth, &first.cs, &[])
+        else {
+            return tools;
+        };
+        let smooth = crate::mock_kernel::circular_cylinder_tool(
+            &region.boundary,
+            &region.holes,
+            first.depth,
+            &first.cs,
+        );
+        let dipped = crate::mock_kernel::extruded_sketch_region_solid(
+            &region,
+            overshoot_depth(first.depth, 1.0),
+            &overshoot_cs(&first.cs, first.depth),
+            &[],
+        );
+        merged.push(JoinTool {
+            smooth,
+            exact: Some(exact),
+            dipped,
+            profile: Some(JoinProfileSource {
+                region,
+                depth: first.depth,
+                cs: first.cs,
+            }),
+        });
+    }
+    merged
+}
+
 /// Explain the geometric class of a failed Join without weakening its atomic
 /// validity checks. A Common operation distinguishes real volume overlap from
 /// boundary-only contact; the latter is the important modeling case because an
@@ -346,10 +414,13 @@ fn join_failure_detail(
                     boolean_errors.push(error);
                 }
             }
+            // A failed Common cannot disprove a shared face. Check this
+            // independently before interpreting a failed Fuse's topology as
+            // edge-only contact.
+            let shares_face = solids_share_face_area(part, reference);
+            face_area_contact |= shares_face;
             let mut classify_boundary_contact = || {
-                if solids_share_face_area(part, reference) {
-                    face_area_contact = true;
-                } else {
+                if !shares_face {
                     edge_or_point_contact = true;
                 }
             };
@@ -615,7 +686,9 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
     // Resolve exact shared-profile boundaries before invoking the general
     // boolean. Besides being more deterministic, this avoids feeding its
     // splitter the coincident curved wall that this construction recognizes.
-    if let Some(rebuilt) = try_prismatic_boundary_join(body, tool) {
+    if let Some(rebuilt) = try_prismatic_boundary_join(body, tool)
+        .or_else(|| super::profile_join::try_cap_join(body, tool))
+    {
         let named = input_mesh
             .as_ref()
             .map(|mesh| name_join_result(mesh, &rebuilt, &body.id, extrude_id));

@@ -1,39 +1,38 @@
-# Sketch dimension editing
+# Direct sketch dimension editing
 
-The Dimension tool edits the existing driver for a circle, line, or constrained
-rectangle instead of adding a conflicting second size constraint.
+The Dimension tool opens the value editor immediately when a circle, arc, or
+line is clicked. Circles use diameter, arcs use radius, and rectangle sides use
+the existing width or height driver. Existing drivers are reused instead of
+adding competing constraints.
 
-1. Create a sketch or edit the source sketch of an existing body.
-2. Choose Dimension, then select a circle outline, a line, or two parallel lines.
-3. Click away from the geometry to place the value, type a size or expression,
-   and press Enter. Circles use diameter; arcs use radius.
-4. Finish Sketch commits the source sketch in place and rebuilds dependent bodies.
+For a two-line angle or spacing, Shift-click the lines, then click empty space
+to place the dimension. For point distances, select two points and place the
+dimension horizontally, vertically, or diagonally. Unsupported ellipse and
+spline size selections report the limitation.
 
-Either edge of a rectangle edits the corresponding width or height. Selecting
-two opposite sides edits their separation. Repeating the picks reopens the
-existing driver; it does not accumulate size constraints. Escape restores the
-pre-edit sketch, including solved positions, and Undo reverses the whole edit.
-Invalid or conflicting typed values preserve the last valid model.
+The editor accepts numbers, arithmetic, and existing parameter names. Length
+values and expressions use millimeters; angles use degrees. The optional New
+variable field creates a document parameter and binds this dimension to it on
+Apply or Enter. Names must be valid and unused. Parameters remain editable in
+the existing Parameters UI. Conflicting or invalid values preserve the last
+valid geometry and show an error. Cancel/Escape restores the pre-edit sketch.
+Undo removes a newly created parameter together with its dimension edit.
+Finish Sketch validates an open editor before committing.
 
-Driver matching lives in `zerocad-core/src/sketch/dimension.rs`. Rectangle
-equivalence follows horizontal, vertical, and coincident constraints, not
-coordinate proximity or shape names. Rotated or arbitrarily constrained
-quadrilaterals are not inferred as equivalent rectangle dimensions. No document
-schema or runtime dependency was added. Annotation placement remains session
-state; saved dimensions can be reopened by picking the geometry again.
+Regression coverage in `sketch_ui.rs` and `constraints_panel.rs` checks direct
+circle/rectangle picking, all four rectangle sides, driver reuse, named values,
+invalid input, undo, document roundtrip, and parameter-driven updates. Existing
+tests cover point distances, angles, parallel spacing, arcs, and downstream
+extruded volume after editing. Native pointer interaction has not been manually
+verified; these tests do not establish full Fusion behavior or latency targets.
 
-Regression coverage includes circle diameter and all four rectangle edges,
-both opposite-side pairs, atomic undo, invalid lengths, extruded volume changes,
-warm evaluation, save/reopen, expression preservation, and independent overlapping
-shapes. The native interaction check was interrupted by the user's Escape key;
-interactive usability and latency remain unmeasured. Matching builds coordinate
-components once per pick; there is no persistent cache or background task.
-
-Validation: formatting and compilation pass; all 162 GUI tests and both new
-core driver tests pass. Core Clippy completes with existing warnings and no
-diagnostics in the new dimension module. The full test command stops after
-540 core tests pass and two geometry tests fail:
-`delete_external_cylindrical_boss_restores_the_supporting_body` and
-`cut_pocket_into_threaded_shaft_removes_material`. Neither calls the new driver
-resolver. The former fails to heal a boss; the latter leaves pocket volume
-unchanged. These failures remain outside this sketch-tool change.
+Validation on 2026-09-26: `cargo check`, all 174 GUI tests, and the two core
+dimension tests passed. Changed GUI files pass rustfmt. Workspace-wide
+`cargo fmt --all -- --check` reports formatting differences in the independently
+edited `zerocad-core/tests/repro_cut_through_error.rs`. Core Clippy completes
+with existing warnings outside these changes. The full `cargo test` run was
+stopped after more than 13 minutes, when the `misc_torture` test executable had
+run for over five minutes (including the 100-feature and 36-hole stress tests).
+No assertion failure was reported before termination; this is not a full-suite
+pass. Local logs are in `target/dimension-{gui,core}-tests.log` and
+`target/dimension-test-results.log`.

@@ -578,7 +578,14 @@ impl ZeroCadApp {
                                     )
                                 });
                                 if let Some(id) = hit {
-                                    self.select_for_dimension(id);
+                                    let raw =
+                                        self.screen_to_sketch(position, rect, &self.active_sketch_cs);
+                                    self.pick_dimension_target(
+                                        id,
+                                        shift,
+                                        (raw.0 as f64, raw.1 as f64),
+                                        position + egui::vec2(65.0, -35.0),
+                                    );
                                 } else {
                                     let raw =
                                         self.screen_to_sketch(position, rect, &self.active_sketch_cs);

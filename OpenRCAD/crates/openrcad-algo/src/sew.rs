@@ -1145,6 +1145,76 @@ mod tests {
         assert!(sew_with_policy(&faces, &TolerancePolicy::STANDARD).is_err());
     }
 
+    #[test]
+    fn healing_free_edges_preserves_nearby_closed_notch() {
+        // The notch tip is within sewing tolerance of the bottom edge but
+        // does not touch it. Imprinting that already shared edge would pinch
+        // two distinct closed face fans together.
+        let points = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (6.0, 10.0),
+            (5.0, 3.0e-6),
+            (4.0, 10.0),
+            (0.0, 10.0),
+        ]
+        .map(|(x, y)| Pnt::new(x, y, 0.0));
+        let wire = Wire::from_edges(
+            (0..points.len())
+                .map(|i| Edge::between_points(points[i], points[(i + 1) % points.len()])),
+        );
+        let face = Face::new(
+            Some(GeomSurface::plane(Plane::from_point_normal(
+                Pnt::origin(),
+                openrcad_foundation::Dir::dz(),
+            ))),
+            wire,
+        );
+        let source = crate::prism::prism_operation(&face, FVec::new(0.0, 0.0, 5.0))
+            .unwrap()
+            .value;
+        let mut faces = source.faces();
+        let (index, edge) = faces
+            .iter()
+            .enumerate()
+            .find_map(|(index, face)| {
+                face.outer_wire()?
+                    .edges()
+                    .into_iter()
+                    .find(|edge| {
+                        edge.start().point().x().abs() < 1e-9 && edge.end().point().x().abs() < 1e-9
+                    })
+                    .map(|edge| (index, edge))
+            })
+            .unwrap();
+        let face = faces[index].clone();
+        let parameter = (edge.first() + edge.last()) * 0.5;
+        let mut builder = openrcad_topo::BRepBuilder::from_brep((**face.brep()).clone());
+        let vertex = builder
+            .brep_mut()
+            .vertices
+            .insert(openrcad_topo::arena::VertexData {
+                point: edge.curve().unwrap().point(parameter),
+                tolerance: TolerancePolicy::STANDARD.linear,
+            });
+        builder.split_edge(edge.id(), vertex, parameter);
+        faces[index] = Face::from_id(builder.build(), face.id(), face.orientation());
+        let outcome = sew_with_policy(&faces, &TolerancePolicy::STANDARD).unwrap();
+        assert!(outcome
+            .recovery
+            .actions
+            .contains(&RecoveryAction::HealTJunctions));
+        let solid = Solid::new(outcome.value);
+        assert!(solid.is_watertight());
+        assert!(solid.health_report().is_healthy());
+        assert_eq!(solid.euler_characteristic(), 2);
+        solid
+            .validate_strict_with_policy(&TolerancePolicy::STANDARD)
+            .unwrap();
+        assert_eq!(solid.split_disconnected().len(), 1);
+    }
+
     /// A unit square in the Z=0 plane at `offset_x`, every boundary vertex built
     /// with the given per-entity `vtol`.
     fn make_square_face_with_vtol(offset_x: f64, vtol: f64) -> Face {

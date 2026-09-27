@@ -6181,18 +6181,60 @@ fn recover_closed_rim_geom(
     }
 
     let concave = is_concave_cut_cylinder(solid, &cyl_faces[0]);
+    // An inward cylinder can meet either the mouth or the floor of a pocket.
+    // Its inward normal alone cannot distinguish those two material wedges.
+    // At a floor the wall extends along the cap's outward normal, so both
+    // contacts move into the void and the blend adds material.
+    let axial_extent = cyl_faces
+        .iter()
+        .flat_map(|face| face.wires())
+        .flat_map(|wire| wire.edges())
+        .flat_map(|edge| edge_sample_points(&edge))
+        .map(|point| (point - center).dot(&GeomVec::from_dir(n_plane)))
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .ok_or(RollingBallError::UnsupportedTrimTopology)?;
+    let additive = axial_extent > tolerance::CONFUSION;
+    let setback = if additive { -dist } else { dist };
     let major_radius = if concave {
-        spine_r + dist
+        spine_r + setback
     } else {
-        spine_r - dist
+        spine_r - setback
     };
     if major_radius <= tolerance::CONFUSION {
         return Err(RollingBallError::InvalidRadius { radius: dist });
     }
 
-    let contact_center = center - GeomVec::from_dir(n_plane) * dist;
+    let contact_center = center - GeomVec::from_dir(n_plane) * setback;
     let c_plane = Circle::new(Ax3::new_axes(center, cax, cxr), major_radius);
     let c_cyl = Circle::new(Ax3::new_axes(contact_center, cax, cxr), spine_r);
+
+    // Contacts must remain on the finite supports, including a shoulder's
+    // inner bore. Otherwise sewing can accept an inverted or overlapping band.
+    let on_support = |face: &Face, point: Pnt| {
+        face.surface().is_some_and(|surface| {
+            let (u, v) = crate::intersect::search_nearest_parameter(surface, &point, (0.0, 0.0));
+            surface.point(u, v).distance(&point) < 1e-5
+                && crate::intersect::is_inside_trimming_loops(u, v, face)
+        })
+    };
+    // Open chains trim their endpoints against runout faces later; the full
+    // circle test applies only to a closed shoulder.
+    for sample in 0..if spine_wraps_full_circle(spine, chain_edges) {
+        48
+    } else {
+        0
+    } {
+        let angle = core::f64::consts::TAU * (sample as f64 + 0.5) / 48.0;
+        if !on_support(&plane_face, c_plane.point(angle))
+            || !cyl_faces
+                .iter()
+                .any(|face| on_support(face, c_cyl.point(angle)))
+        {
+            return Err(RollingBallError::UnsolvableAdjacency {
+                reason: AdjacencyReason::RadiusTooLarge,
+            });
+        }
+    }
 
     Ok(ClosedRimGeom {
         plane_face,
