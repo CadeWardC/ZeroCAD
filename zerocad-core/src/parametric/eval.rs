@@ -1502,7 +1502,7 @@ impl ParametricGraph {
         // Resolved once per build so every expression-driven dimension (extrude
         // depth and sketch dimensions alike) sees the current variable values.
         let vars = self.variable_map();
-        let sketch_cache = self.sketch_region_cache(&vars);
+        let sketch_cache = self.sketch_region_cache(&vars, cancellation)?;
         // Datums resolve in a pure pre-pass (their inputs never include live
         // bodies). Their warnings stay OUT of the checkpointed `warnings` —
         // they are re-derived fresh each build and appended at return, so a
@@ -1518,6 +1518,19 @@ impl ParametricGraph {
         // identical, so the matching prefix (and its expensive booleans) is
         // restored from the previous evaluation instead of recomputed.
         let nodes: Vec<NodeIndex> = self.body_nodes_in_evaluation_order()?;
+        // Hydrated caches may omit intermediate checkpoints to meet their byte
+        // budget. A reusable suffix still needs each historical sketch support;
+        // resume before a missing support rather than resolving against a later body.
+        let sketch_support_checkpoints: Vec<usize> = self
+            .sketch_face_refs
+            .keys()
+            .filter_map(|id| self.node_map.get(id.as_str()))
+            .filter_map(|index| {
+                nodes
+                    .iter()
+                    .rposition(|node| self.graph[*node].sequence < self.graph[*index].sequence)
+            })
+            .collect();
         let manifests = self.eval_dependency_manifests(&nodes, hidden, &vars);
         let keys: Vec<u64> = manifests
             .iter()
@@ -1581,6 +1594,13 @@ impl ParametricGraph {
             let matched = (0..keys.len().min(cps.len())).rev().find(|&i| {
                 cps[i].as_ref().is_some_and(|cp| {
                     cp.key == keys[i]
+                        && sketch_support_checkpoints.iter().all(|&support| {
+                            support > i
+                                || cps
+                                    .get(support)
+                                    .and_then(Option::as_ref)
+                                    .is_some_and(|snapshot| snapshot.key == keys[support])
+                        })
                         && cp.live.iter().all(|body| {
                             // Serialized caches omit analytic arrangements.
                             // They can display a finished result, but a new
@@ -1795,6 +1815,7 @@ impl ParametricGraph {
                         &vars,
                         &sketch_cache,
                         &datums,
+                        (&nodes, &checkpoints),
                         draft,
                         &mut candidate_live,
                         &mut feature_warnings,
@@ -2495,6 +2516,7 @@ impl ParametricGraph {
             context.variables,
             context.sketches,
             context.datums,
+            (context.history_nodes, context.history_checkpoints),
             context.quality == EvaluationQuality::Interactive,
             &mut candidate_body_state,
             &mut warnings,
@@ -2604,6 +2626,7 @@ impl ParametricGraph {
         vars: &HashMap<String, f64>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         datums: &HashMap<String, DatumValue>,
+        history: (&[NodeIndex], &[Option<EvalCheckpoint>]),
         draft: bool,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
@@ -2889,6 +2912,7 @@ impl ParametricGraph {
                     target.as_deref(),
                     sketch_cache,
                     datums,
+                    history,
                     draft,
                     live,
                     warnings,
@@ -3269,6 +3293,9 @@ impl ParametricGraph {
             {
                 let pn = &self.graph[p];
                 h.write(pn.id.as_bytes());
+                // Moving a sketch in history changes the support snapshot used
+                // by its consumers even when its drawn geometry is unchanged.
+                h.write_u64(pn.sequence.0);
                 h.write_u8(self.is_feature_suppressed(&pn.id) as u8);
                 fold_feature(&mut h, &pn.feature);
             }
@@ -3338,7 +3365,11 @@ impl ParametricGraph {
     /// Detect (or fetch from the region cache) the planar regions of every
     /// sketch in the graph, keyed by node index. Sketches are cached even when
     /// hidden — hiding a sketch must not break dependent extrudes.
-    fn sketch_region_cache(&self, vars: &HashMap<String, f64>) -> HashMap<NodeIndex, SketchEval> {
+    fn sketch_region_cache(
+        &self,
+        vars: &HashMap<String, f64>,
+        cancellation: Option<&EvaluationCancellation>,
+    ) -> Result<HashMap<NodeIndex, SketchEval>, String> {
         let mut cache = HashMap::new();
         for idx in self.graph.node_indices() {
             if self.is_feature_suppressed(&self.graph[idx].id) {
@@ -3355,6 +3386,15 @@ impl ParametricGraph {
                 ..
             } = &self.graph[idx].feature
             {
+                if let Some(model) = solver
+                    .as_ref()
+                    .filter(|m| crate::sketch::solve::has_variable_bound_constraint(m))
+                {
+                    crate::sketch::resolution::resolve_solver_cancellable(model, vars, &|| {
+                        cancellation.is_some_and(EvaluationCancellation::is_cancelled)
+                    })
+                    .ok_or_else(|| "model evaluation was superseded".to_string())?;
+                }
                 // A parametric sketch is rebuilt from its shapes against the
                 // current variables (or from its solver model when present);
                 // the region-cache key (a hash of the resolved curves) then
@@ -3494,7 +3534,7 @@ impl ParametricGraph {
                 );
             }
         }
-        cache
+        Ok(cache)
     }
 
     /// [`detect_regions`] memoized on a content hash of the curves. A miss runs
@@ -3854,6 +3894,7 @@ impl ParametricGraph {
         boolean_target: Option<&str>,
         sketch_cache: &HashMap<NodeIndex, SketchEval>,
         datums: &HashMap<String, DatumValue>,
+        history: (&[NodeIndex], &[Option<EvalCheckpoint>]),
         draft: bool,
         live: &mut Vec<LiveBody>,
         warnings: &mut Vec<String>,
@@ -3922,6 +3963,30 @@ impl ParametricGraph {
         // sketch's saved plane. A datum that no longer resolves fails loud and
         // falls back to the saved plane snapshot.
         let attached_face = self.sketch_face_refs.get(sketch_id.as_str());
+        // A sketch belongs to the body state at its position in history. Later
+        // consumers may already have split its supporting face; resolving against
+        // their output would move the sketch and reinterpret its selected regions.
+        // Borrow the existing prefix snapshot rather than rebuilding geometry.
+        let support_live = if attached_face.is_some() {
+            let sequence = self.graph[parent_idx].sequence;
+            let support = history
+                .0
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, index)| self.graph[**index].sequence < sequence);
+            match support.and_then(|(index, _)| history.1.get(index).and_then(Option::as_ref)) {
+                Some(checkpoint) => checkpoint.live.as_slice(),
+                None => {
+                    warnings.push(format!(
+                        "Extrude '{node_id}': the historical support for sketch '{sketch_id}' is unavailable; the feature was not applied."
+                    ));
+                    return;
+                }
+            }
+        } else {
+            live.as_slice()
+        };
         let datum_cs = self
             .sketch_datum_refs
             .get(sketch_id.as_str())
@@ -3940,7 +4005,8 @@ impl ParametricGraph {
                 .sketch_face_refs
                 .get(sketch_id.as_str())
                 .is_some_and(|face_ref| {
-                    face_ref_is_named(face_ref) && rederive_sketch_cs(face_ref, live).is_none()
+                    face_ref_is_named(face_ref)
+                        && rederive_sketch_cs(face_ref, support_live).is_none()
                 })
         {
             warnings.push(format!(
@@ -3955,7 +4021,7 @@ impl ParametricGraph {
                     .and_then(|face_ref| {
                         rederive_attached_sketch_cs(
                             face_ref,
-                            live,
+                            support_live,
                             sketch.cs,
                             sketch.face_boundary.as_ref(),
                         )
@@ -4021,7 +4087,7 @@ impl ParametricGraph {
         // to the stored snapshot.
         let mut refreshed: Option<(Vec<Region>, Vec<usize>, Vec<bool>)> = None;
         let fresh_face_boundary =
-            attached_face.and_then(|face_ref| rederive_face_boundary(face_ref, live, cs));
+            attached_face.and_then(|face_ref| rederive_face_boundary(face_ref, support_live, cs));
         if attached_face.is_some_and(face_ref_is_named) && fresh_face_boundary.is_none() {
             warnings.push(format!(
                 "Extrude '{node_id}': sketch '{sketch_id}' is attached to a named face whose outline no longer resolves."

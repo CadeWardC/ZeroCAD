@@ -1075,7 +1075,7 @@ impl ZeroCadApp {
                                         let cs = *cs;
                                         let stored_curves = curves;
                                         // Pick against the variable-resolved geometry.
-                                        let eff = zerocad_core::effective_curves_solved(stored_curves, shapes, corner_mods, mirrors, solver.as_ref(), &var_map);
+                                        let eff = self.display_sketch_curves(stored_curves, shapes, corner_mods, mirrors, solver.as_ref(), &var_map);
                                         let curves = &eff;
                                         let to_scr = |u: f32, v: f32| -> egui::Pos2 {
                                             let w = cs.unproject(u, v);
@@ -1209,7 +1209,7 @@ impl ZeroCadApp {
                                                 node.id.as_str(),
                                                 &region_curves,
                                                 shapes.iter().any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
-                                                |regions| zerocad_core::text::sketch_region_ink_mask(
+                                                |regions| self.display_sketch_ink_mask(
                                                     stored_curves,
                                                     shapes,
                                                     corner_mods,

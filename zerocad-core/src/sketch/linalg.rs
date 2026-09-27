@@ -40,9 +40,16 @@ impl Mat {
 
     /// `Aᵀ·A` (n×n, symmetric positive semi-definite).
     pub fn ata(&self) -> Mat {
+        self.ata_cancellable(&|| false).unwrap()
+    }
+
+    pub fn ata_cancellable(&self, cancelled: &dyn Fn() -> bool) -> Option<Mat> {
         let n = self.cols;
         let mut out = Mat::zeros(n, n);
         for i in 0..n {
+            if cancelled() {
+                return None;
+            }
             for j in i..n {
                 let mut s = 0.0;
                 for r in 0..self.rows {
@@ -52,7 +59,7 @@ impl Mat {
                 out.set(j, i, s);
             }
         }
-        out
+        Some(out)
     }
 
     /// `Aᵀ·v` (length n).
@@ -72,11 +79,22 @@ impl Mat {
 /// (`A = L·Lᵀ`). Returns `None` when `A` is not positive definite (a
 /// singular/indefinite normal system — the caller raises damping).
 pub fn cholesky_solve(a: &Mat, b: &[f64]) -> Option<Vec<f64>> {
+    cholesky_solve_cancellable(a, b, &|| false)
+}
+
+pub fn cholesky_solve_cancellable(
+    a: &Mat,
+    b: &[f64],
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<f64>> {
     let n = a.rows;
     debug_assert_eq!(a.cols, n);
     debug_assert_eq!(b.len(), n);
     let mut l = vec![0.0f64; n * n];
     for i in 0..n {
+        if cancelled() {
+            return None;
+        }
         for j in 0..=i {
             let mut s = a.at(i, j);
             for k in 0..j {
@@ -117,10 +135,14 @@ pub fn cholesky_solve(a: &Mat, b: &[f64]) -> Option<Vec<f64>> {
 /// diagonal R entries above `tol` relative to the largest. This is the DOF
 /// analysis workhorse — `dof = n_params − rank(J)`.
 pub fn qr_rank(a: &Mat, tol: f64) -> usize {
+    qr_rank_cancellable(a, tol, &|| false).unwrap()
+}
+
+pub fn qr_rank_cancellable(a: &Mat, tol: f64, cancelled: &dyn Fn() -> bool) -> Option<usize> {
     let m = a.rows;
     let n = a.cols;
     if m == 0 || n == 0 {
-        return 0;
+        return Some(0);
     }
     let mut r = a.clone();
     let kmax = m.min(n);
@@ -128,6 +150,9 @@ pub fn qr_rank(a: &Mat, tol: f64) -> usize {
     let mut diag = Vec::with_capacity(kmax);
 
     for k in 0..kmax {
+        if cancelled() {
+            return None;
+        }
         // Pivot: move the column with the largest remaining norm to position k.
         let mut best = k;
         let mut best_norm = 0.0;
@@ -184,9 +209,9 @@ pub fn qr_rank(a: &Mat, tol: f64) -> usize {
 
     let max_diag = diag.iter().cloned().fold(0.0f64, f64::max);
     if max_diag == 0.0 {
-        return 0;
+        return Some(0);
     }
-    diag.iter().filter(|&&d| d > tol * max_diag).count()
+    Some(diag.iter().filter(|&&d| d > tol * max_diag).count())
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, Condvar, Mutex};
 use zerocad_core::{
     Document, EvaluationCancellation, EvaluationError, EvaluationOutput, EvaluationQuality,
 };
@@ -34,16 +34,24 @@ pub(crate) struct EvaluationCompletion {
 }
 
 /// One persistent, latest-wins geometry worker for the whole application.
+#[derive(Default)]
+struct Mailbox {
+    pending: Option<EvaluationRequest>,
+    completion: Option<EvaluationCompletion>,
+    stopped: bool,
+}
+
 pub(crate) struct ModelEvaluator {
-    request_tx: mpsc::Sender<EvaluationRequest>,
-    completion_rx: mpsc::Receiver<EvaluationCompletion>,
+    mailbox: Arc<(Mutex<Mailbox>, Condvar)>,
     latest_generation: Arc<AtomicU64>,
 }
 
 impl ModelEvaluator {
     pub(crate) fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<EvaluationRequest>();
-        let (completion_tx, completion_rx) = mpsc::channel::<EvaluationCompletion>();
+        // One running request, one replaceable pending snapshot, and one
+        // replaceable completion. No document/mesh backlog during a slow solve.
+        let mailbox = Arc::new((Mutex::new(Mailbox::default()), Condvar::new()));
+        let worker_mailbox = mailbox.clone();
         let latest_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = latest_generation.clone();
 
@@ -51,12 +59,16 @@ impl ModelEvaluator {
             .name("zerocad-model-evaluator".into())
             .spawn(move || {
                 let mut force_cold_after_panic = false;
-                while let Ok(mut request) = request_rx.recv() {
-                    // Collapse bursts before doing geometry. Only the newest
-                    // request can ever become visible.
-                    while let Ok(newer) = request_rx.try_recv() {
-                        request = newer;
-                    }
+                loop {
+                    let request = {
+                        let (lock, wake) = &*worker_mailbox;
+                        let mut slot = lock.lock().unwrap();
+                        while slot.pending.is_none() && !slot.stopped {
+                            slot = wake.wait(slot).unwrap();
+                        }
+                        if slot.stopped { return; }
+                        slot.pending.take().unwrap()
+                    };
                     if worker_generation.load(Ordering::Acquire) != request.generation {
                         log::trace!(
                             "[evaluation] skipped superseded request generation={} purpose={:?}",
@@ -141,11 +153,14 @@ impl ModelEvaluator {
                         }
                     }
                     if !matches!(result, Err(EvaluationError::Cancelled)) {
-                        let _ = completion_tx.send(EvaluationCompletion {
-                            generation: request.generation,
-                            purpose: request.purpose,
-                            result,
-                        });
+                        let mut slot = worker_mailbox.0.lock().unwrap();
+                        if worker_generation.load(Ordering::Acquire) == request.generation && !slot.stopped {
+                            slot.completion = Some(EvaluationCompletion {
+                                generation: request.generation,
+                                purpose: request.purpose,
+                                result,
+                            });
+                        }
                     }
                     if let Some(ctx) = request.repaint {
                         ctx.request_repaint();
@@ -155,8 +170,7 @@ impl ModelEvaluator {
             .expect("failed to start model evaluator thread");
 
         Self {
-            request_tx,
-            completion_rx,
+            mailbox,
             latest_generation,
         }
     }
@@ -176,7 +190,9 @@ impl ModelEvaluator {
                 hidden.len()
             );
         }
-        let _ = self.request_tx.send(EvaluationRequest {
+        let mut slot = self.mailbox.0.lock().unwrap();
+        slot.completion = None;
+        slot.pending = Some(EvaluationRequest {
             generation,
             purpose,
             document,
@@ -184,11 +200,15 @@ impl ModelEvaluator {
             quality,
             repaint,
         });
+        self.mailbox.1.notify_one();
         generation
     }
 
     pub(crate) fn cancel(&self) {
         self.latest_generation.fetch_add(1, Ordering::AcqRel);
+        let mut slot = self.mailbox.0.lock().unwrap();
+        slot.pending = None;
+        slot.completion = None;
     }
 
     pub(crate) fn current_generation(&self) -> u64 {
@@ -196,7 +216,15 @@ impl ModelEvaluator {
     }
 
     pub(crate) fn try_recv(&self) -> Option<EvaluationCompletion> {
-        self.completion_rx.try_recv().ok()
+        self.mailbox.0.lock().unwrap().completion.take()
+    }
+}
+
+impl Drop for ModelEvaluator {
+    fn drop(&mut self) {
+        self.cancel();
+        self.mailbox.0.lock().unwrap().stopped = true;
+        self.mailbox.1.notify_one();
     }
 }
 
@@ -204,6 +232,29 @@ impl ModelEvaluator {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn request_bursts_keep_only_the_latest_document_and_completion() {
+        let evaluator = ModelEvaluator::new();
+        let mut latest = 0;
+        for _ in 0..100 {
+            latest = evaluator.submit(
+                EvaluationPurpose::CommittedModel,
+                Document::new(),
+                HashSet::new(),
+                EvaluationQuality::Final,
+                None,
+            );
+            let slot = evaluator.mailbox.0.lock().unwrap();
+            if let Some(request) = &slot.pending {
+                assert_eq!(request.generation, latest);
+            }
+        }
+        assert!(wait_for(&evaluator, latest).result.is_ok());
+        evaluator.cancel();
+        let slot = evaluator.mailbox.0.lock().unwrap();
+        assert!(slot.pending.is_none() && slot.completion.is_none());
+    }
 
     fn wait_for(evaluator: &ModelEvaluator, generation: u64) -> EvaluationCompletion {
         let deadline = Instant::now() + Duration::from_secs(10);

@@ -244,6 +244,8 @@ impl ZeroCadApp {
         }
         self.rebuild_active_sketch_curves();
         self.sketch_dimension_editor = None;
+        self.dimension_accept_pending = false;
+        self.dimension_solve_pending = false;
         self.autocomplete = None;
         self.status_msg = "Dimension set — click more geometry to resize it.".into();
         true
@@ -358,7 +360,20 @@ impl ZeroCadApp {
             .unwrap_or_default();
         let parsed_dimension = dimension_from_source(&source, &var_map);
 
+        let enter = ctx.input(|input| input.key_pressed(egui::Key::Enter));
+        let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if escape || cancel {
+            self.undo_last_sketch_action();
+            self.autocomplete = None;
+            self.status_msg = "Dimension cancelled - the Dimension tool remains active.".into();
+            return;
+        }
         if changed {
+            self.dimension_accept_pending = false;
+            self.finish_sketch_pending = false;
+        }
+
+        if changed || self.dimension_solve_pending && !self.dimension_accept_pending {
             if let Some(dimension) = parsed_dimension.clone() {
                 if self.set_live_constraint_dimension(constraint_id, dimension) {
                     self.rebuild_active_sketch_curves_throttled();
@@ -368,25 +383,19 @@ impl ZeroCadApp {
                         Some(self.status_msg.clone());
                 }
             } else {
+                self.dimension_solve_pending = false;
+                self.sketch_worker.cancel_live();
                 self.sketch_dimension_editor.as_mut().unwrap().error =
                     Some("Enter a valid number, expression, or defined variable.".into());
             }
         }
 
-        let enter = ctx.input(|input| input.key_pressed(egui::Key::Enter));
-        let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        if accept || enter && !accepted_via_key {
+        if accept || enter && !accepted_via_key || self.dimension_accept_pending {
             if !self.accept_sketch_dimension() {
+                self.dimension_accept_pending = self.dimension_solve_pending;
                 self.sketch_dimension_editor.as_mut().unwrap().error =
                     Some(self.status_msg.clone());
             }
-        } else if escape || cancel {
-            // Restore geometry as well as the driver (which may have existed
-            // before placement). Removing an equation cannot undo solved motion.
-            self.undo_last_sketch_action();
-            self.autocomplete = None;
-            self.status_msg =
-                "Dimension cancelled — the Dimension tool remains active.".to_string();
         }
     }
 

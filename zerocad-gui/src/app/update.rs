@@ -20,6 +20,7 @@ impl eframe::App for ZeroCadApp {
             .set_render_state(frame.wgpu_render_state().cloned());
         // Swap in any finished background refine.
         self.poll_refine_eval();
+        self.poll_sketch_solve(ctx);
         self.poll_document_worker();
         self.recovery.tick();
         self.tick_speculative_edge_mod(ctx);

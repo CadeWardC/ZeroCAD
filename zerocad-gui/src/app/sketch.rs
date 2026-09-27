@@ -35,6 +35,7 @@ impl ZeroCadApp {
     }
 
     fn restore_working_sketch_snapshot(&mut self, snapshot: WorkingSketchSnapshot) {
+        self.cancel_pending_sketch_solve();
         if let Some(id) = &snapshot.created_variable_feature {
             self.document.remove_feature(id);
         }
@@ -975,7 +976,7 @@ impl ZeroCadApp {
         let vars = self.document.variable_map();
         let mut mods = self.sketch_corner_mods.clone();
         mods.extend(self.pending_corner_mods());
-        self.sketch_region_ink_mask = zerocad_core::text::sketch_region_ink_mask(
+        self.sketch_region_ink_mask = self.display_sketch_ink_mask(
             &SketchCurves::new(),
             &self.sketch_shapes,
             &mods,
@@ -1015,6 +1016,7 @@ impl ZeroCadApp {
         self.sketch_region_ink_mask.clear();
         self.selected_region_indices.clear();
         self.editing_sketch_id = None;
+        self.cancel_pending_sketch_solve();
         self.sketch_solver_model = None;
         self.sketch_entity_ids.clear();
         self.sketch_next_entity_id = 0;
@@ -1042,7 +1044,7 @@ impl ZeroCadApp {
         mods.extend(self.pending_corner_mods());
         // A solver model (Edit Sketch session) is the source of truth for the
         // live geometry; a fresh drawing session bakes from the shape list.
-        self.sketch_curves = zerocad_core::effective_curves_solved(
+        self.sketch_curves = self.display_sketch_curves(
             &SketchCurves::new(),
             &self.sketch_shapes,
             &mods,
@@ -1060,15 +1062,19 @@ impl ZeroCadApp {
     /// (last-valid) positions — the geometry degrades, never blanks.
     pub(crate) fn solve_live_sketch(&mut self) {
         let vars = self.document.variable_map();
-        if let Some(model) = &mut self.sketch_solver_model {
-            let report = zerocad_core::sketch::solve_model(model, &vars);
-            if report.outcome == zerocad_core::sketch::SolveOutcome::Converged {
-                zerocad_core::sketch::solve::apply_solution(model, &report);
-                self.sketch_conflict_constraint = None;
+        if let Some(model) = &self.sketch_solver_model {
+            if let Some(result) = self
+                .sketch_worker
+                .edit(model, &vars, self.egui_ctx.as_ref())
+            {
+                self.live_solve_pending = false;
+                self.sketch_conflict_constraint = result.report.conflicting;
+                if result.report.outcome == zerocad_core::sketch::SolveOutcome::Converged {
+                    self.sketch_solver_model = Some(result.model.clone());
+                }
             } else {
-                // Cache the culprit for the red badge/list highlight; geometry
-                // keeps its last-valid positions.
-                self.sketch_conflict_constraint = report.conflicting;
+                self.live_solve_pending = true;
+                self.status_msg = "Updating sketch...".into();
             }
         }
         self.rebuild_active_sketch_curves_throttled();
@@ -1082,7 +1088,7 @@ impl ZeroCadApp {
         let vars = self.document.variable_map();
         let mut mods = self.sketch_corner_mods.clone();
         mods.extend(self.pending_corner_mods());
-        self.sketch_curves = zerocad_core::effective_curves_solved(
+        self.sketch_curves = self.display_sketch_curves(
             &SketchCurves::new(),
             &self.sketch_shapes,
             &mods,

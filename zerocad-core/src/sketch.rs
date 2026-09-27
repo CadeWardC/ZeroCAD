@@ -37,6 +37,7 @@ pub mod linalg;
 pub mod offset;
 pub mod pattern;
 pub mod projection;
+pub mod resolution;
 pub mod solve;
 pub mod trim;
 pub use constraints::{
@@ -1261,19 +1262,31 @@ pub fn effective_curves_solved_checked(
     solver: Option<&SketchSolverModel>,
     vars: &HashMap<String, f64>,
 ) -> (SketchCurves, Vec<(EntityId, SketchOffsetError)>) {
+    let resolved = solver
+        .filter(|m| !m.is_empty() && solve::has_variable_bound_constraint(m))
+        .map(|m| resolution::resolve_solver(m, vars));
+    effective_curves_from_resolved(
+        curves,
+        shapes,
+        corner_mods,
+        mirrors,
+        resolved.as_ref().map(|r| &r.model).or(solver),
+        vars,
+    )
+}
+
+/// Bake an already resolved (or explicitly last-valid) model. Never solves.
+/// GUI drawing and picking use this while a background solve is pending.
+pub fn effective_curves_from_resolved(
+    curves: &SketchCurves,
+    shapes: &[SketchShape],
+    corner_mods: &[CornerMod],
+    mirrors: &[SketchMirror],
+    solver: Option<&SketchSolverModel>,
+    vars: &HashMap<String, f64>,
+) -> (SketchCurves, Vec<(EntityId, SketchOffsetError)>) {
     if let Some(model) = solver.filter(|m| !m.is_empty()) {
-        let mut c = if solve::has_variable_bound_constraint(model) {
-            let report = solve::solve_model(model, vars);
-            if report.outcome == SolveOutcome::Converged {
-                let mut solved = model.clone();
-                solve::apply_solution(&mut solved, &report);
-                constraints::bake_entities_to_curves(&solved)
-            } else {
-                constraints::bake_entities_to_curves(model)
-            }
-        } else {
-            constraints::bake_entities_to_curves(model)
-        };
+        let mut c = constraints::bake_entities_to_curves(model);
         for m in corner_mods {
             let r = m.radius.resolve(vars);
             apply_corner_mod(&mut c, m.at, r, m.kind);
@@ -1322,20 +1335,12 @@ pub fn entity_curves_solved(
     vars: &HashMap<String, f64>,
 ) -> Option<SketchCurves> {
     if let Some(model) = solver.filter(|model| !model.is_empty()) {
-        let mut solved = model.clone();
-        if solve::has_variable_bound_constraint(model) {
-            let report = solve::solve_model(model, vars);
-            if report.outcome == SolveOutcome::Converged {
-                solve::apply_solution(&mut solved, &report);
-            }
-        }
-        let construction = solved.construction.clone();
-        solved.entities.retain(|candidate| {
-            !construction.contains(&candidate.id())
-                && (candidate.id() == entity || candidate.derived_from() == Some(entity))
+        let resolved = solve::has_variable_bound_constraint(model)
+            .then(|| resolution::resolve_solver(model, vars));
+        let model = resolved.as_ref().map(|r| &r.model).unwrap_or(model);
+        let curves = constraints::bake_entities_to_curves_filtered(model, &|candidate| {
+            candidate.id() == entity || candidate.derived_from() == Some(entity)
         });
-        solved.construction.clear();
-        let curves = constraints::bake_entities_to_curves(&solved);
         return (!curves.is_empty()).then_some(curves);
     }
 

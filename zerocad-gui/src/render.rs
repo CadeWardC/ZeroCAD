@@ -2304,7 +2304,7 @@ impl ZeroCadApp {
                 // Draw the variable-resolved geometry of the sketch, with the
                 // projected face boundary folded in (sketch-on-face) so the
                 // fills/regions match what an extrude of this sketch builds.
-                let mut eff = zerocad_core::effective_curves_solved(
+                let mut eff = self.display_sketch_curves(
                     curves,
                     shapes,
                     corner_mods,
@@ -2321,7 +2321,7 @@ impl ZeroCadApp {
                     .any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. }));
                 let cached =
                     self.cached_finished_regions(&node.id, resolved_curves, has_text, |regions| {
-                        zerocad_core::text::sketch_region_ink_mask(
+                        self.display_sketch_ink_mask(
                             curves,
                             shapes,
                             corner_mods,

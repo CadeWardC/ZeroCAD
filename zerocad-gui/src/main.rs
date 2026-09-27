@@ -42,6 +42,7 @@ mod settings;
 mod shell_ui;
 mod shortcuts;
 mod sketch_ui;
+mod sketch_worker;
 mod text_ui;
 mod theme;
 mod thread_ui;
@@ -1011,6 +1012,11 @@ struct ZeroCadApp {
     /// shapes are promoted on entry) — the source of truth for the live
     /// geometry; drag-to-solve mutates it and Finish persists it.
     sketch_solver_model: Option<zerocad_core::sketch::SketchSolverModel>,
+    sketch_worker: sketch_worker::SketchWorker,
+    live_solve_pending: bool,
+    dimension_solve_pending: bool,
+    dimension_accept_pending: bool,
+    finish_sketch_pending: bool,
     /// Durable per-shape ids of the active sketch (parallel to
     /// `sketch_shapes`). Loaded from the node on Edit Sketch; new shapes drawn
     /// during the session get fresh ids at commit. NEVER resequenced — a

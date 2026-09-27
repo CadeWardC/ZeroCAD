@@ -368,6 +368,8 @@ impl ZeroCadApp {
                     .sketch_face_boundaries
                     .get(self.document.graph[idx].id.as_str())
                     .cloned();
+                let sketch_worker = &self.sketch_worker;
+                let sketch_context = self.egui_ctx.as_ref();
                 let node = &mut self.document.graph[idx];
 
                 // Render inside a semantic inspector card so the same hierarchy
@@ -1332,13 +1334,14 @@ impl ZeroCadApp {
                                     ui.add_space(4.0);
                                     // Resolve against the current variables so the counts
                                     // (and any extrude below) reflect variable-driven dims.
-                                    let mut eff = zerocad_core::effective_curves_solved(
+                                    let mut eff = sketch_worker.curves(
                                         curves,
                                         shapes,
                                         corner_mods,
                                         mirrors,
                                         solver.as_ref(),
                                         &var_map,
+                                        sketch_context,
                                     );
                                     // Sketch-on-face: the projected boundary joins
                                     // region detection, so the face count here
@@ -1360,7 +1363,7 @@ impl ZeroCadApp {
                                         selected_id,
                                         &eff,
                                         shapes.iter().any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
-                                        |regions| zerocad_core::text::sketch_region_ink_mask(
+                                        |regions| sketch_worker.ink_mask(
                                             curves,
                                             shapes,
                                             corner_mods,
@@ -1368,6 +1371,7 @@ impl ZeroCadApp {
                                             solver.as_ref(),
                                             &var_map,
                                             regions,
+                                            sketch_context,
                                         ),
                                     );
                                     let inked_faces = regions.ink_mask.iter().filter(|ink| **ink).count();
@@ -1437,9 +1441,7 @@ impl ZeroCadApp {
                                     }
                                     // Constraint status: DOF / fully constrained /
                                     // conflict, from the solver model when present.
-                                    if let Some(model) = solver.as_ref().filter(|m| !m.is_empty()) {
-                                        let report =
-                                            zerocad_core::sketch::solve_model(model, &var_map);
+                                    if let Some(report) = solver.as_ref().filter(|m| !m.is_empty()).and_then(|m| sketch_worker.request(m, &var_map, sketch_context, false).map(|r| r.report.clone())) {
                                         let (text, color) = match report.outcome {
                                             zerocad_core::sketch::SolveOutcome::Conflicting => (
                                                 match report.conflicting {

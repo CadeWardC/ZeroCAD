@@ -18,12 +18,15 @@
 //!   geometry).
 
 use super::constraints::{Constraint, EntityId, SketchEntity, SketchSolverModel};
-use super::linalg::{cholesky_solve, qr_rank, Mat};
+use super::linalg::{cholesky_solve_cancellable, qr_rank_cancellable, Mat};
 use std::collections::HashMap;
 
 const MAX_ITERATIONS: usize = 50;
-/// Convergence: every residual row below this (mm / mm² scale).
+/// Strict iteration target. Final acceptance uses explicit per-row units.
 const RESIDUAL_TOL: f64 = 1.0e-9;
+/// One nanometre in mm. This is a local physical bound, independent of world
+/// coordinates. It permits legacy f32 loop rounding, not manufacturing error.
+const LINEAR_ACCEPTANCE_MM: f64 = 1.0e-6;
 /// Gradient stagnation: ‖Jᵀr‖∞ below this with a large residual means the
 /// solver is at a local minimum of an inconsistent system → Conflicting.
 const GRADIENT_TOL: f64 = 1.0e-10;
@@ -52,7 +55,7 @@ pub struct SolveReport {
     /// configuration. A fully constrained sketch reports 0.
     pub dof: usize,
     /// When `Conflicting`, the constraint whose removal makes the rest
-    /// satisfiable (found by leave-one-out), if one exists.
+    /// satisfiable (bounded leave-one-out). None means no culprit was established.
     pub conflicting: Option<EntityId>,
     /// Max residual magnitude at exit (diagnostics).
     pub residual: f64,
@@ -60,46 +63,67 @@ pub struct SolveReport {
 
 /// Solve `model` against the document variables. Pure — see module docs.
 pub fn solve_model(model: &SketchSolverModel, vars: &HashMap<String, f64>) -> SolveReport {
-    let mut system = System::build(model, vars);
-    let outcome = system.run_lm();
+    super::resolution::resolve_solver(model, vars)
+        .report
+        .clone()
+}
+
+/// The uncached solver, with cooperative cancellation for interactive workers.
+/// A cancelled solve has no report and must never be committed.
+pub fn solve_model_cancellable(
+    model: &SketchSolverModel,
+    vars: &HashMap<String, f64>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<SolveReport> {
+    if cancelled() {
+        return None;
+    }
+    let mut system = System::build(model, vars, cancelled)?;
+    let outcome = system.run_lm(cancelled)?;
     let residual = system.max_residual();
     let rank = if system.params.is_empty() {
         0
     } else {
-        qr_rank(&system.jacobian(), RANK_TOL)
+        qr_rank_cancellable(&system.jacobian(), RANK_TOL, cancelled)?
     };
     let dof = system.params.len().saturating_sub(rank);
 
     let conflicting = if outcome == SolveOutcome::Conflicting {
-        find_conflicting_constraint(model, vars)
+        find_conflicting_constraint(model, vars, cancelled)?
     } else {
         None
     };
 
-    SolveReport {
+    if cancelled() {
+        return None;
+    }
+    Some(SolveReport {
         outcome,
         positions: system.positions(),
         radii: system.radii(),
         dof,
         conflicting,
         residual,
-    }
+    })
 }
 
 /// Leave-one-out: the first constraint whose removal lets the rest converge.
 fn find_conflicting_constraint(
     model: &SketchSolverModel,
     vars: &HashMap<String, f64>,
-) -> Option<EntityId> {
-    for skip in 0..model.constraints.len() {
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Option<EntityId>> {
+    // Attribution is optional; bound its cost on large conflicting sketches.
+    // None means no single culprit was established within this budget.
+    for skip in 0..model.constraints.len().min(64) {
         let mut reduced = model.clone();
         let removed = reduced.constraints.remove(skip);
-        let mut system = System::build(&reduced, vars);
-        if system.run_lm() == SolveOutcome::Converged {
-            return Some(removed.id());
+        let mut system = System::build(&reduced, vars, cancelled)?;
+        if system.run_lm(cancelled)? == SolveOutcome::Converged {
+            return Some(Some(removed.id()));
         }
     }
-    None
+    Some(None)
 }
 
 /// One scalar unknown: a point coordinate or an entity radius.
@@ -117,6 +141,7 @@ struct System {
     /// Index of each param for Jacobian assembly.
     index: HashMap<Param, usize>,
     rows: Vec<ResidualRow>,
+    acceptance: Vec<f64>,
 }
 
 /// One residual row: closed-form value + sparse analytic gradient.
@@ -172,7 +197,11 @@ fn point_on_line_row(
 }
 
 impl System {
-    fn build(model: &SketchSolverModel, vars: &HashMap<String, f64>) -> System {
+    fn build(
+        model: &SketchSolverModel,
+        vars: &HashMap<String, f64>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<System> {
         // Parameter layout in EntityId order — deterministic across runs.
         let mut point_ids: Vec<EntityId> = model.points.iter().map(|p| p.id).collect();
         point_ids.sort();
@@ -187,6 +216,9 @@ impl System {
         let mut params = Vec::new();
         let mut x = Vec::new();
         for &id in &point_ids {
+            if cancelled() {
+                return None;
+            }
             let p = model.point(id).expect("point ids come from the model");
             params.push(Param::PointX(id));
             x.push(p.pos.0);
@@ -194,6 +226,9 @@ impl System {
             x.push(p.pos.1);
         }
         for &id in &radius_ids {
+            if cancelled() {
+                return None;
+            }
             let r = model
                 .entities
                 .iter()
@@ -218,9 +253,10 @@ impl System {
             x,
             index,
             rows: Vec::new(),
+            acceptance: Vec::new(),
         };
-        system.assemble_rows(model, vars);
-        system
+        system.assemble_rows(model, vars, cancelled)?;
+        Some(system)
     }
 
     fn px(&self, id: EntityId) -> Option<usize> {
@@ -275,13 +311,22 @@ impl System {
         ])
     }
 
-    fn assemble_rows(&mut self, model: &SketchSolverModel, vars: &HashMap<String, f64>) {
+    fn assemble_rows(
+        &mut self,
+        model: &SketchSolverModel,
+        vars: &HashMap<String, f64>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<()> {
         // Constraints assemble in stored order; unresolvable references (a
         // deleted entity) contribute no row — degraded, never wrong.
         for constraint in &model.constraints {
+            if cancelled() {
+                return None;
+            }
             if model.is_driven_dimension(constraint.id()) {
                 continue;
             }
+            let first_row = self.rows.len();
             match constraint {
                 Constraint::Coincident { a, b, .. } => {
                     if let (Some(ax), Some(ay), Some(bx), Some(by)) =
@@ -310,14 +355,15 @@ impl System {
                             value_and_grad: Box::new(move |s| {
                                 let dx = s.x[bx] - s.x[ax];
                                 let dy = s.x[by] - s.x[ay];
-                                let f = dx * dx + dy * dy - target * target;
+                                let length = dx.hypot(dy);
+                                let inverse = 1.0 / length.max(1.0e-15);
                                 (
-                                    f,
+                                    length - target,
                                     vec![
-                                        (ax, -2.0 * dx),
-                                        (ay, -2.0 * dy),
-                                        (bx, 2.0 * dx),
-                                        (by, 2.0 * dy),
+                                        (ax, -dx * inverse),
+                                        (ay, -dy * inverse),
+                                        (bx, dx * inverse),
+                                        (by, dy * inverse),
                                     ],
                                 )
                             }),
@@ -724,12 +770,30 @@ impl System {
                     }
                 }
             }
+            let tolerance = match constraint {
+                Constraint::Coincident { .. }
+                | Constraint::Horizontal { .. }
+                | Constraint::Vertical { .. }
+                | Constraint::Distance { .. }
+                | Constraint::Radius { .. }
+                | Constraint::Diameter { .. }
+                | Constraint::Fixed { .. }
+                | Constraint::DistanceX { .. }
+                | Constraint::DistanceY { .. }
+                | Constraint::Concentric { .. } => LINEAR_ACCEPTANCE_MM,
+                _ => RESIDUAL_TOL,
+            };
+            self.acceptance.resize(first_row, RESIDUAL_TOL);
+            self.acceptance.resize(self.rows.len(), tolerance);
         }
 
         // Projected references are immutable solver inputs. Other geometry may
         // constrain itself to them, but the solver must never move the source
         // edge's points or analytic radius to satisfy such a constraint.
         for projection in &model.projected_edges {
+            if cancelled() {
+                return None;
+            }
             for point in &projection.point_ids {
                 if let (Some(xi), Some(yi)) = (self.px(*point), self.py(*point)) {
                     let x0 = self.x[xi];
@@ -757,6 +821,7 @@ impl System {
                 }
             }
         }
+        Some(())
     }
 
     /// Row `x[i] − x[j]`.
@@ -822,7 +887,20 @@ impl System {
     }
 
     fn max_residual(&self) -> f64 {
-        self.residuals().iter().fold(0.0f64, |m, r| m.max(r.abs()))
+        self.residuals().iter().fold(0.0f64, |m, r| {
+            if r.is_finite() {
+                m.max(r.abs())
+            } else {
+                f64::INFINITY
+            }
+        })
+    }
+
+    fn acceptable(&self) -> bool {
+        self.x.iter().all(|x| x.is_finite())
+            && self.residuals().iter().enumerate().all(|(i, r)| {
+                r.is_finite() && r.abs() <= self.acceptance.get(i).copied().unwrap_or(RESIDUAL_TOL)
+            })
     }
 
     fn jacobian(&self) -> Mat {
@@ -837,15 +915,22 @@ impl System {
     }
 
     /// Levenberg-Marquardt: `(JᵀJ + λI)·δ = −Jᵀr`, λ adapting to progress.
-    fn run_lm(&mut self) -> SolveOutcome {
+    fn run_lm(&mut self, cancelled: &dyn Fn() -> bool) -> Option<SolveOutcome> {
         if self.rows.is_empty() || self.params.is_empty() {
-            return SolveOutcome::Converged;
+            return Some(if self.acceptable() {
+                SolveOutcome::Converged
+            } else {
+                SolveOutcome::DidNotConverge
+            });
         }
         let mut lambda = 1.0e-6;
         let mut cost = self.residuals().iter().map(|r| r * r).sum::<f64>();
         for _ in 0..MAX_ITERATIONS {
-            if self.max_residual() < RESIDUAL_TOL {
-                return SolveOutcome::Converged;
+            if cancelled() {
+                return None;
+            }
+            if self.max_residual() < RESIDUAL_TOL && self.acceptable() {
+                return Some(SolveOutcome::Converged);
             }
             let j = self.jacobian();
             let r = self.residuals();
@@ -853,19 +938,26 @@ impl System {
             let grad_inf = grad.iter().fold(0.0f64, |m, g| m.max(g.abs()));
             if grad_inf < GRADIENT_TOL {
                 // Stationary but unsatisfied: inconsistent constraint set.
-                return SolveOutcome::Conflicting;
+                return Some(if self.acceptable() {
+                    SolveOutcome::Converged
+                } else {
+                    SolveOutcome::Conflicting
+                });
             }
-            let mut jtj = j.ata();
+            let mut jtj = j.ata_cancellable(cancelled)?;
             let neg_grad: Vec<f64> = grad.iter().map(|g| -g).collect();
 
             // Inner loop: raise damping until a step reduces the cost.
             let mut stepped = false;
             for _ in 0..16 {
+                if cancelled() {
+                    return None;
+                }
                 let mut damped = jtj.clone();
                 for i in 0..damped.rows {
                     damped.add_at(i, i, lambda);
                 }
-                if let Some(delta) = cholesky_solve(&damped, &neg_grad) {
+                if let Some(delta) = cholesky_solve_cancellable(&damped, &neg_grad, cancelled) {
                     let saved = self.x.clone();
                     for (xi, d) in self.x.iter_mut().zip(&delta) {
                         *xi += d;
@@ -886,20 +978,20 @@ impl System {
             }
             if !stepped {
                 // No downhill step exists: either done or inconsistent.
-                return if self.max_residual() < RESIDUAL_TOL {
+                return Some(if self.acceptable() {
                     SolveOutcome::Converged
                 } else {
                     SolveOutcome::Conflicting
-                };
+                });
             }
             // Reuse jtj to appease the borrow of clarity; nothing else.
             let _ = &mut jtj;
         }
-        if self.max_residual() < RESIDUAL_TOL {
+        Some(if self.acceptable() {
             SolveOutcome::Converged
         } else {
             SolveOutcome::DidNotConverge
-        }
+        })
     }
 
     fn positions(&self) -> Vec<(EntityId, (f64, f64))> {

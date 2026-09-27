@@ -1211,7 +1211,7 @@ impl ZeroCadApp {
                 } = &node.feature
                 {
                     // Resolve variable-driven dimensions before detecting faces.
-                    let mut eff = zerocad_core::effective_curves_solved(
+                    let mut eff = self.display_sketch_curves(
                         curves,
                         shapes,
                         corner_mods,
@@ -1236,7 +1236,7 @@ impl ZeroCadApp {
                     let draft_supported =
                         eff.circles.is_empty() && eff.arcs.is_empty() && eff.splines.is_empty();
                     let regions = detect_regions(&eff);
-                    let ink_mask = zerocad_core::text::sketch_region_ink_mask(
+                    let ink_mask = self.display_sketch_ink_mask(
                         curves,
                         shapes,
                         corner_mods,

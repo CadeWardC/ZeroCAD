@@ -81,12 +81,24 @@ impl ZeroCadApp {
             return false;
         }
         set_constraint_dimension(constraint, dimension);
-        let report = zerocad_core::sketch::solve_model(&candidate, &self.document.variable_map());
+        self.live_solve_pending = false;
+        let result = self.sketch_worker.edit(
+            &candidate,
+            &self.document.variable_map(),
+            self.egui_ctx.as_ref(),
+        );
+        let Some(result) = result else {
+            self.dimension_solve_pending = true;
+            self.status_msg = "Checking dimension...".into();
+            return false;
+        };
+        self.dimension_solve_pending = false;
+        let report = &result.report;
         if report.outcome != SolveOutcome::Converged {
             self.status_msg = "That dimension conflicts with another constraint. The previous geometry is preserved.".to_string();
             return false;
         }
-        zerocad_core::sketch::solve::apply_solution(&mut candidate, &report);
+        zerocad_core::sketch::solve::apply_solution(&mut candidate, report);
         self.sketch_solver_model = Some(candidate);
         true
     }
@@ -391,12 +403,11 @@ impl ZeroCadApp {
             return;
         }
         let vars = self.document.variable_map();
-        // Solve once per frame for the status line + conflict highlight (the
-        // model is tiny; the solve is microseconds).
+        // Reuse the report; a cache miss schedules background work.
         let report = self
             .sketch_solver_model
             .as_ref()
-            .map(|m| zerocad_core::sketch::solve_model(m, &vars));
+            .and_then(|m| self.sketch_report(m, &vars));
 
         let sel = self.classify_selection();
         let mut spline_edit = (sel.splines.len() == 1)
@@ -490,6 +501,9 @@ impl ZeroCadApp {
                         ),
                     };
                     ui.label(egui::RichText::new(text).size(12.0).color(color));
+                    ui.separator();
+                } else {
+                    ui.label("Checking constraints...");
                     ui.separator();
                 }
 

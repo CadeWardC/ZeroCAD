@@ -378,6 +378,31 @@ pub fn sketch_region_ink_mask(
     vars: &std::collections::HashMap<String, f64>,
     regions: &[crate::sketch::Region],
 ) -> Vec<bool> {
+    let resolved = solver
+        .filter(|m| crate::sketch::solve::has_variable_bound_constraint(m))
+        .map(|m| crate::sketch::resolution::resolve_solver(m, vars));
+    sketch_region_ink_mask_resolved(
+        curves,
+        shapes,
+        corner_mods,
+        mirrors,
+        resolved.as_ref().map(|r| &r.model).or(solver),
+        vars,
+        regions,
+    )
+}
+
+/// Display-side typography mask from an already resolved/last-valid snapshot.
+/// This path never invokes the constraint solver.
+pub fn sketch_region_ink_mask_resolved(
+    curves: &SketchCurves,
+    shapes: &[crate::sketch::SketchShape],
+    corner_mods: &[crate::sketch::CornerMod],
+    mirrors: &[crate::sketch::SketchMirror],
+    solver: Option<&crate::sketch::SketchSolverModel>,
+    vars: &std::collections::HashMap<String, f64>,
+    regions: &[crate::sketch::Region],
+) -> Vec<bool> {
     let text_shapes: Vec<_> = shapes
         .iter()
         .filter(|shape| matches!(shape, crate::sketch::SketchShape::Text { .. }))
@@ -390,14 +415,15 @@ pub fn sketch_region_ink_mask(
     // The solver treats text as one rigid anchor and appends these baked
     // outlines unchanged. Rebuilding only the text subset with the sketch's
     // associative mirrors therefore reproduces the text part of `effective`.
-    let text_curves = crate::sketch::effective_curves_solved(
+    let text_curves = crate::sketch::effective_curves_from_resolved(
         &SketchCurves::new(),
         &text_shapes,
         &[],
         mirrors,
         None,
         vars,
-    );
+    )
+    .0;
 
     let non_text_shapes: Vec<_> = shapes
         .iter()
@@ -413,14 +439,15 @@ pub fn sketch_region_ink_mask(
     } else {
         SketchCurves::new()
     };
-    let non_text_curves = crate::sketch::effective_curves_solved(
+    let non_text_curves = crate::sketch::effective_curves_from_resolved(
         &non_text_base,
         &non_text_shapes,
         corner_mods,
         mirrors,
         solver,
         vars,
-    );
+    )
+    .0;
     let non_text_regions = if non_text_curves.is_empty() {
         Vec::new()
     } else {

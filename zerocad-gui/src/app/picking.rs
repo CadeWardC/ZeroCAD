@@ -608,7 +608,7 @@ impl ZeroCadApp {
                 continue;
             };
             let stored_curves = curves;
-            let curves = zerocad_core::effective_curves_solved(
+            let curves = self.display_sketch_curves(
                 stored_curves,
                 shapes,
                 corner_mods,
@@ -717,7 +717,7 @@ impl ZeroCadApp {
                     .iter()
                     .any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
                 |regions| {
-                    zerocad_core::text::sketch_region_ink_mask(
+                    self.display_sketch_ink_mask(
                         stored_curves,
                         shapes,
                         corner_mods,

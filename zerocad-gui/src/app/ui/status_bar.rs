@@ -287,7 +287,7 @@ impl ZeroCadApp {
                 measured_sketch_id = Some(node.id.clone());
             }
 
-            let mut region_curves = zerocad_core::effective_curves_solved(
+            let mut region_curves = self.display_sketch_curves(
                 curves,
                 shapes,
                 corner_mods,
@@ -305,7 +305,7 @@ impl ZeroCadApp {
                     .iter()
                     .any(|shape| matches!(shape, zerocad_core::SketchShape::Text { .. })),
                 |regions| {
-                    zerocad_core::text::sketch_region_ink_mask(
+                    self.display_sketch_ink_mask(
                         curves,
                         shapes,
                         corner_mods,
@@ -435,7 +435,7 @@ impl ZeroCadApp {
             else {
                 continue;
             };
-            let curves = zerocad_core::effective_curves_solved(
+            let curves = self.display_sketch_curves(
                 curves,
                 shapes,
                 corner_mods,
@@ -532,7 +532,7 @@ impl ZeroCadApp {
             else {
                 continue;
             };
-            let curves = zerocad_core::effective_curves_solved(
+            let curves = self.display_sketch_curves(
                 curves,
                 shapes,
                 corner_mods,

@@ -87,11 +87,10 @@ const SEC_ASSEMBLY_RECIPE: u16 = 9;
 const SEC_ASSEMBLY_PRESENTATION: u16 = 10;
 const SEC_ASSEMBLY_HYDRATION: u16 = 11;
 const HYDRATED_CACHE_SCHEMA: u16 = 3;
-// Rebuild joins after restricting T-junction repair to open boundaries, along
-// with merged polygon profiles and the preceding cut/blend repairs. The
-// authoritative recipe schema is unchanged.
-const OPENRCAD_CACHE_ABI: u16 = 15;
-const MESH_CACHE_ABI: u16 = 15;
+// Invalidate generated geometry after historical sketch attachment resolution
+// changed. Authoritative recipes and payloads are unchanged.
+const OPENRCAD_CACHE_ABI: u16 = 17;
+const MESH_CACHE_ABI: u16 = 17;
 pub const DEFAULT_HYDRATED_CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

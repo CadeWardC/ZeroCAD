@@ -963,3 +963,44 @@ fn every_mutable_persisted_feature_leaf_matches_a_cache_free_rebuild() {
         "mutation coverage unexpectedly fell to {exercised} leaves"
     );
 }
+#[test]
+fn sparse_checkpoints_rebuild_missing_face_sketch_support() {
+    let loaded = crate::read_document_from_slice(
+        include_bytes!("../../../tests/fixtures/broken-extrusion.zcad"),
+        &Default::default(),
+    )
+    .unwrap();
+    let mut graph = loaded.document.into_evaluator_graph();
+    graph.evaluate_bodies(&Default::default()).unwrap();
+    let nodes = graph.body_nodes_in_creation_order();
+    let support = nodes
+        .iter()
+        .position(|index| graph.graph[*index].id == "extrude_8")
+        .unwrap();
+    // Model a hydrated cache retaining the latest body while dropping the
+    // earlier support snapshot to meet its accelerator budget.
+    std::sync::Arc::make_mut(&mut graph.eval_cache.borrow_mut()).checkpoints[support] = None;
+    graph.add_feature(FeatureNode {
+        id: "extrude_11".into(),
+        name: "Reused strip".into(),
+        feature: FeatureType::Extrude {
+            depth: 30.0,
+            region_indices: vec![0],
+            mode: ExtrudeMode::NewBody,
+            target: None,
+            depth_expr: None,
+            draft_angle_deg: 0.0,
+            draft_angle_expr: None,
+        },
+    });
+    graph.add_dependency("sketch_9", "extrude_11");
+    let (bodies, warnings) = graph
+        .evaluate_bodies_with_warnings(&Default::default())
+        .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mesh = &bodies.iter().find(|(id, _)| id == "extrude_11").unwrap().1;
+    assert!(mesh
+        .vertices
+        .chunks_exact(6)
+        .all(|v| v[0] >= -8.653 && v[0] <= -6.399));
+}

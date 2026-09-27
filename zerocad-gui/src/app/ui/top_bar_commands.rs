@@ -11,6 +11,12 @@ impl ZeroCadApp {
             return;
         }
         if self.sketch_dimension_editor.is_some() && !self.accept_sketch_dimension() {
+            self.finish_sketch_pending = self.dimension_solve_pending;
+            return;
+        }
+        if self.live_solve_pending {
+            self.finish_sketch_pending = true;
+            self.status_msg = "Waiting for the current sketch edit...".into();
             return;
         }
 

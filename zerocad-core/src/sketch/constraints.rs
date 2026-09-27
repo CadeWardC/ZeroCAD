@@ -434,12 +434,19 @@ impl IdAllocator {
 /// `region:{i}` name grammar are order-sensitive, so the bake must never
 /// iterate a hash map or re-sort.
 pub fn bake_entities_to_curves(model: &SketchSolverModel) -> crate::sketch::SketchCurves {
+    bake_entities_to_curves_filtered(model, &|_| true)
+}
+
+pub(crate) fn bake_entities_to_curves_filtered(
+    model: &SketchSolverModel,
+    include: &dyn Fn(&SketchEntity) -> bool,
+) -> crate::sketch::SketchCurves {
     let mut curves = crate::sketch::SketchCurves::new();
     let pos = |id: EntityId| -> Option<(f32, f32)> {
         model.point(id).map(|p| (p.pos.0 as f32, p.pos.1 as f32))
     };
     for entity in &model.entities {
-        if model.construction.contains(&entity.id()) {
+        if model.construction.contains(&entity.id()) || !include(entity) {
             continue;
         }
         match entity {

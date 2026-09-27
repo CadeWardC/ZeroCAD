@@ -141,7 +141,7 @@ impl ZeroCadApp {
         };
         self.sketch_solver_model = Some(model);
         self.sketch_next_entity_id = next;
-        self.rebuild_active_sketch_curves();
+        self.solve_live_sketch();
         self.status_msg = format!(
             "Editing sketch {node_id}: drag points to move constrained geometry; \
              Finish Sketch commits in place."
