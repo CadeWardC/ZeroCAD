@@ -268,6 +268,16 @@ fn solids_overlap_with_volume(a: &KernelSolid, b: &KernelSolid) -> bool {
     (0..3).all(|axis| ahi[axis].min(bhi[axis]) - alo[axis].max(blo[axis]) > 1.0e-5)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Join/Cut features a test forces off the exact sectional path.
+    pub(crate) static FORCE_GENERAL_PATH: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// Cut features the exact sectional path performed, in evaluation order.
+    pub(crate) static SECTIONAL_CUTS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(crate) fn recut_debug_enabled() -> bool {
     std::env::var_os("ZEROCAD_RECUT_DEBUG").is_some()
 }
@@ -293,6 +303,9 @@ pub(crate) fn directional_cut(cs: &CoordinateSystem, depth: f32) -> (CoordinateS
 /// expanded (and their axis-aligned fallbacks). `None` if the tool's AABB misses
 /// the part or the solver couldn't subtract it. All use the body-splitting
 /// difference, so a cut that severs the part yields separate parts.
+/// Each kernel rejection is appended to `rejections` as `"{variant}: {reason}"`
+/// so a preserved-material warning can report what OpenRCAD objected to.
+///
 /// A successful one-direction cut: the severed parts, plus — when the general
 /// boolean produced them — the kernel's exact face history and the pre-split
 /// combined result its face indices refer to. Axis-aligned fallback paths
@@ -302,6 +315,10 @@ pub(crate) struct CutOutcome {
     pub(crate) trace: Option<Vec<crate::mock_kernel::BooleanFaceHistory>>,
 }
 
+// The tool's per-direction variants are passed apart because `exact` and
+// `expanded` are rebuilt in place on the caller's tool; `rejections` collects
+// each variant's kernel error for the user-facing warning.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cut_part_one_dir(
     part: &KernelSolid,
     pbb: Option<&([f32; 3], [f32; 3])>,
@@ -312,6 +329,8 @@ pub(crate) fn cut_part_one_dir(
     expanded_source: &Option<ExpandedCutSource>,
     tbb: Option<&([f32; 3], [f32; 3])>,
     obj_classes: Option<&[Option<u64>]>,
+    rejections: &mut Vec<String>,
+    proven_miss: &mut bool,
 ) -> Option<CutOutcome> {
     let tbb = tbb?;
     let overlaps = pbb.is_none_or(|p| crate::mock_kernel::aabbs_overlap(p, tbb, 0.05));
@@ -355,42 +374,56 @@ pub(crate) fn cut_part_one_dir(
             trace: None,
         });
     }
-    let changed_difference = |label: &str,
-                              tool: &KernelSolid,
-                              exact_reference: Option<&KernelSolid>| {
-        let outcome = crate::mock_kernel::difference_bodies_with_history(part, tool, obj_classes)?;
-        if cut_parts_changed(part, &outcome.bodies) {
-            if label == "expanded" {
-                let Some(exact_tool) = exact_reference else {
-                    recut_debug("expanded cut candidate rejected: no exact reference tool");
+    let mut changed_difference =
+        |label: &str, tool: &KernelSolid, exact_reference: Option<&KernelSolid>| {
+            let outcome = match crate::mock_kernel::difference_bodies_with_history_diagnostic(
+                part,
+                tool,
+                obj_classes,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    recut_debug(format!("cut variant '{label}' rejected: {error}"));
+                    rejections.push(format!("{label}: {error}"));
                     return None;
-                };
-                match super::recovery_certificate::certify_expanded_cut(
-                    part,
-                    exact_tool,
-                    tool,
-                    &outcome.bodies,
-                ) {
-                    Ok(certificate) => recut_debug(format!(
-                        "expanded cut recovery certified: {}",
-                        certificate.summary()
-                    )),
-                    Err(error) => {
-                        recut_debug(format!("expanded cut candidate rejected: {error}"));
+                }
+            };
+            if cut_parts_changed(part, &outcome.bodies) {
+                if label == "expanded" {
+                    let Some(exact_tool) = exact_reference else {
+                        recut_debug("expanded cut candidate rejected: no exact reference tool");
                         return None;
+                    };
+                    match super::recovery_certificate::certify_expanded_cut(
+                        part,
+                        exact_tool,
+                        tool,
+                        &outcome.bodies,
+                    ) {
+                        Ok(certificate) => recut_debug(format!(
+                            "expanded cut recovery certified: {}",
+                            certificate.summary()
+                        )),
+                        Err(error) => {
+                            recut_debug(format!("expanded cut candidate rejected: {error}"));
+                            rejections.push(format!("{label}: recovery not certified: {error}"));
+                            return None;
+                        }
                     }
                 }
+                recut_debug(format!("cut variant '{label}' changed part"));
+                Some(CutOutcome {
+                    parts: outcome.bodies,
+                    trace: Some(outcome.face_history),
+                })
+            } else {
+                recut_debug(format!("cut variant '{label}' made no geometry change"));
+                // The kernel cut this tool from this part and found nothing to
+                // remove: a real miss, though the boxes overlap.
+                *proven_miss = true;
+                None
             }
-            recut_debug(format!("cut variant '{label}' changed part"));
-            Some(CutOutcome {
-                parts: outcome.bodies,
-                trace: Some(outcome.face_history),
-            })
-        } else {
-            recut_debug(format!("cut variant '{label}' made no geometry change"));
-            None
-        }
-    };
+        };
     if let Some(outcome) = smooth
         .as_ref()
         .and_then(|tool| changed_difference("smooth", tool, exact.as_ref()))
@@ -1205,6 +1238,10 @@ pub(crate) fn apply_cut(
             {
                 continue;
             }
+            #[cfg(test)]
+            if FORCE_GENERAL_PATH.with(|forced| forced.borrow().contains(extrude_id)) {
+                continue;
+            }
             let before_parts = body.parts.clone();
             let before_pristine = body.pristine.clone();
             let Some((parts, source)) = super::profile_cut::try_profile_cut(body, &tools)
@@ -1238,6 +1275,8 @@ pub(crate) fn apply_cut(
             body.parts = parts;
             body.sketch_source = source;
             rebuilt_bodies.insert(body.id.clone());
+            #[cfg(test)]
+            SECTIONAL_CUTS.with(|cuts| cuts.borrow_mut().push(extrude_id.to_string()));
         }
     }
 
@@ -1251,6 +1290,7 @@ pub(crate) fn apply_cut(
         // overlapped (either direction)? If so the body keeps material the user
         // meant to remove.
         let mut failed_on_overlap = false;
+        let mut rejections = Vec::new();
         for body in live.iter_mut() {
             if rebuilt_bodies.contains(&body.id) {
                 continue;
@@ -1277,6 +1317,8 @@ pub(crate) fn apply_cut(
                 .map(|names| crate::mock_kernel::owner_classes_from_names(names));
             let mut cut_trace: Option<Vec<crate::mock_kernel::BooleanFaceHistory>> = None;
             let mut changed = false;
+            // The sweep (reverse or not) each changed part was cut with.
+            let mut applied_sweeps: Vec<bool> = Vec::new();
             let mut next: Vec<KernelSolid> = Vec::with_capacity(body.parts.len());
             for part in body.parts.drain(..) {
                 let pbb = crate::mock_kernel::solid_aabb(&part);
@@ -1312,6 +1354,8 @@ pub(crate) fn apply_cut(
                 };
                 let reverse_first =
                     overlap_vol(fwd_bb.as_ref()) == 0.0 && overlap_vol(rev_bb.as_ref()) > 0.0;
+                let mut part_rejections = Vec::new();
+                let mut proven_miss = false;
                 let mut cut_direction = |reverse: bool| {
                     if reverse {
                         cut_part_one_dir(
@@ -1324,6 +1368,8 @@ pub(crate) fn apply_cut(
                             &tool.expanded_rev_source,
                             rev_bb.as_ref(),
                             owner_classes.as_deref(),
+                            &mut part_rejections,
+                            &mut proven_miss,
                         )
                     } else {
                         cut_part_one_dir(
@@ -1336,6 +1382,8 @@ pub(crate) fn apply_cut(
                             &tool.expanded_source,
                             fwd_bb.as_ref(),
                             owner_classes.as_deref(),
+                            &mut part_rejections,
+                            &mut proven_miss,
                         )
                     }
                 };
@@ -1347,6 +1395,7 @@ pub(crate) fn apply_cut(
                 match cut_parts {
                     Some(outcome) => {
                         changed = true;
+                        applied_sweeps.push(reverse_first);
                         cut_trace = outcome.trace;
                         next.extend(outcome.parts);
                     }
@@ -1354,9 +1403,16 @@ pub(crate) fn apply_cut(
                         // Only a genuine solver failure (the tool overlapped this
                         // part in some direction) warrants the warning — a tool that
                         // simply misses the body is normal once both directions are
-                        // tried.
-                        if overlaps_dir(fwd_bb.as_ref()) || overlaps_dir(rev_bb.as_ref()) {
+                        // tried. A lump the cut severed earlier can sit inside the
+                        // tool's box yet clear of the tool: a successful boolean
+                        // that removed nothing proves that miss, so it must not
+                        // revert the cut of the other parts.
+                        let missed = proven_miss && part_rejections.is_empty();
+                        if !missed
+                            && (overlaps_dir(fwd_bb.as_ref()) || overlaps_dir(rev_bb.as_ref()))
+                        {
                             failed_on_overlap = true;
+                            rejections.append(&mut part_rejections);
                         }
                         next.push(part);
                     }
@@ -1364,9 +1420,32 @@ pub(crate) fn apply_cut(
             }
             body.parts = next;
             if changed {
+                // Keep the body's prism record whenever the cut it describes is
+                // exactly the one applied, so later features stay on the exact
+                // sectional path instead of inheriting this boolean fallback.
+                let uniform_sweep = applied_sweeps
+                    .first()
+                    .copied()
+                    .filter(|&reverse| applied_sweeps.iter().all(|&other| other == reverse));
                 let next_source = body.sketch_source.as_ref().and_then(|source| {
+                    let reverse = uniform_sweep?;
+                    let applied = if reverse {
+                        tool.exact_rev_source.as_ref()
+                    } else {
+                        tool.exact_source.as_ref()
+                    };
                     tool.circle
-                        .and_then(|circle| sketch_source_after_circle_cut(source, circle))
+                        .zip(applied)
+                        .and_then(|(circle, exact)| {
+                            sketch_source_after_circle_cut(source, circle, &exact.cs, exact.depth)
+                        })
+                        .or_else(|| {
+                            super::profile_cut::profile_cut_record(
+                                source,
+                                tool,
+                                super::profile_cut::CutSweep::Applied { reverse },
+                            )
+                        })
                 });
                 // Propagate the input body's face names through the cut so a captured
                 // face survives the boolean (Phase 3). When the kernel emitted an
@@ -1402,10 +1481,16 @@ pub(crate) fn apply_cut(
         }
         if failed_on_overlap {
             live.clone_from_slice(&original);
+            // Variants run most-exact first, so the first rejection describes
+            // the cut the user actually drew.
+            let detail = rejections
+                .first()
+                .map(|reason| format!(" OpenRCAD rejected the result ({reason})."))
+                .unwrap_or_default();
             warnings.push(format!(
                 "Cut '{extrude_id}': the overlapping cut could not produce a valid \
                  solid. The original material was preserved; this boundary \
-                 configuration needs a geometry repair."
+                 configuration needs a geometry repair.{detail}"
             ));
             return;
         }

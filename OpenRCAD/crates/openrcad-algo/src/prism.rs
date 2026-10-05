@@ -320,14 +320,20 @@ fn lateral_face(
     } else {
         (edge.first(), edge.last())
     };
+    // A vertex a little off its edge's curve makes the seam ruling just as far
+    // off the lateral surface. The seam carries that measured gap as its
+    // tolerance; validation re-measures it through the seam's pcurve, which
+    // can come out slightly larger (more so after a later boolean re-projects
+    // it), so the stored value gets relative and absolute slack.
+    let slack = |gap: f64| gap * (1.0 + 1.0e-6) + tolerance::CONFUSION;
     let (source_tolerance, target_tolerance) =
         edge.curve()
             .map_or((edge.tolerance(), edge.tolerance()), |curve| {
                 (
                     edge.tolerance()
-                        .max(p0.distance(&curve.point(source_parameter))),
+                        .max(slack(p0.distance(&curve.point(source_parameter)))),
                     edge.tolerance()
-                        .max(p1.distance(&curve.point(target_parameter))),
+                        .max(slack(p1.distance(&curve.point(target_parameter)))),
                 )
             });
 

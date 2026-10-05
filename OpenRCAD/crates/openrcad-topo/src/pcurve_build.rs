@@ -366,7 +366,11 @@ fn build_pcurve(
         // can alias by whole turns and agree exactly at every knot and midpoint
         // while deviating between them. The coprime interval count detects that
         // alias and forces refinement until adjacent samples unwrap correctly.
-        let deviation = max_deviation(brep, surface, edge, &candidate, count * 2 + 1);
+        // The caller re-verifies every built pcurve on a 96-interval grid. A
+        // candidate that passes only its own grid would be accepted here and
+        // then rejected there as inconsistent, so check both.
+        let deviation = max_deviation(brep, surface, edge, &candidate, count * 2 + 1)
+            .max(max_deviation(brep, surface, edge, &candidate, 96));
         if deviation <= tolerance {
             return Some(candidate);
         }

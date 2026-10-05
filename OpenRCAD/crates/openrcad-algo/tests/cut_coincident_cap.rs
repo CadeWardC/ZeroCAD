@@ -78,20 +78,14 @@ fn coaxial_tool_into_cap_removes_exact_annulus() {
     );
 }
 
-/// E16 kernel half, characterized (found 2026-09-11 via break-test E16 and
-/// the turn-down fixture): a box already carrying one cylindrical void, cut
-/// by a second cylinder overlapping that void, SHOULD lose only the crescent
-/// of new material — cutting air may never abort the whole subtraction.
-/// The difference currently fails validation
-/// (`InvalidOutput { InvalidEulerCharacteristic(1), FreeEdge }`): the
-/// imprint/classification of the overlapping cylindrical walls produces an
-/// unsewable face set. This pins today's honest outcome — the guarded
-/// boolean REFUSES to return broken geometry and the caller keeps the
-/// material. A successful result must satisfy the exact union-volume oracle
-/// below. Both façade feature paths now warn and preserve the source on
-/// rejection; this does not establish overlapping-bore support.
+/// E16 kernel half (found 2026-09-11 via break-test E16 and the turn-down
+/// fixture): a box already carrying one cylindrical void, cut by a second
+/// cylinder overlapping that void, loses only the crescent of new material.
+/// Parallel cylinders used to report no intersection at all, so neither wall
+/// was split where the other crosses it and the result had free edges. They
+/// now meet along their two common rulings.
 #[test]
-fn overlapping_second_bore_currently_fails_validation_cleanly() {
+fn overlapping_second_bore_removes_only_the_crescent() {
     let block = make_box_operation(&Pnt::origin(), 30.0, 30.0, 10.0)
         .expect("block")
         .value;
@@ -106,32 +100,82 @@ fn overlapping_second_bore_currently_fails_validation_cleanly() {
         make_cylinder_operation(&Ax2::new(Pnt::new(20.0, 15.0, -1.0), Dir::dz()), 4.0, 12.0)
             .expect("second bore")
             .value;
-    let outcome = boolean_operation(&once, &second, BooleanOp::Cut);
-    match outcome {
-        Ok(result) => {
-            // Two r=4 discs 5 mm apart remove their union area times height:
-            // (2*pi*r² - intersection lens) * height ≈ 875 mm³.
-            let r = 4.0_f64;
-            let s = 5.0_f64;
-            let lens =
-                2.0 * r * r * (s / (2.0 * r)).acos() - 0.5 * s * (4.0 * r * r - s * s).sqrt();
-            let removed = (2.0 * std::f64::consts::PI * r * r - lens) * 10.0;
-            let expected = 30.0 * 30.0 * 10.0 - removed;
-            assert!(expected < volume(&once));
-            let measured = volume(&result.value);
-            assert!(
-                (measured - expected).abs() / expected < 5.0e-3,
-                "with the kernel repaired, only the crescent goes: {measured} vs {expected}"
-            );
-        }
-        Err(error) => {
-            // Today's pinned behavior: the guarded difference refuses the
-            // unsewable overlapping-wall result instead of returning broken
-            // geometry.
-            assert!(
-                matches!(error, openrcad_algo::BooleanError::InvalidOutput { .. }),
-                "the failure must stay a clean validation rejection: {error:?}"
-            );
-        }
-    }
+    let result = boolean_operation(&once, &second, BooleanOp::Cut)
+        .expect("the overlapping second bore")
+        .value;
+    // Two r=4 discs 5 mm apart remove their union area times height.
+    let expected = 30.0 * 30.0 * 10.0 - disc_union_area(4.0, 4.0, 5.0) * 10.0;
+    assert!(expected < volume(&once));
+    let measured = volume(&result);
+    assert!(
+        (measured - expected).abs() / expected < 5.0e-3,
+        "only the crescent goes: {measured} vs {expected}"
+    );
+}
+
+/// Two overlapping parallel bosses of different radii fuse into one solid
+/// whose volume is the union of their cross-sections times the height. Large
+/// radii keep the tessellated volume's chordal error well under the tolerance.
+#[test]
+fn overlapping_parallel_bosses_fuse() {
+    let first = make_cylinder_operation(&Ax2::new(Pnt::origin(), Dir::dz()), 20.0, 32.0)
+        .expect("first boss")
+        .value;
+    let second =
+        make_cylinder_operation(&Ax2::new(Pnt::new(16.0, 12.0, -8.0), Dir::dz()), 12.0, 48.0)
+            .expect("second boss")
+            .value;
+    let fused = boolean_operation(&first, &second, BooleanOp::Fuse)
+        .expect("parallel bosses fuse")
+        .value;
+    // The second boss overhangs both caps by 8 mm.
+    let (a1, a2) = (400.0 * std::f64::consts::PI, 144.0 * std::f64::consts::PI);
+    let lens = a1 + a2 - disc_union_area(20.0, 12.0, 20.0);
+    let expected = a1 * 32.0 + a2 * 48.0 - lens * 32.0;
+    let measured = volume(&fused);
+    assert!(
+        (measured - expected).abs() / expected < 5.0e-3,
+        "union of the bosses: {measured} vs {expected}"
+    );
+}
+
+/// A small bore straddling a large bore's wall (found by the ZeroCAD join/cut
+/// census, chain 45). The bottom face's arc of the small bore must stop
+/// exactly where it enters the large bore; the face-containment test sampled
+/// the large bore's rim with six chords per edge, whose 0.1 mm sag took points
+/// just inside the large bore for face material and left an open edge.
+#[test]
+fn small_bore_straddling_a_large_bore_wall() {
+    let block = make_box_operation(&Pnt::origin(), 50.0, 45.0, 9.8)
+        .expect("block")
+        .value;
+    let (c1, r1) = ((29.15, 14.77), 6.91);
+    let (c2, r2) = ((28.98, 20.06), 2.06);
+    let bore = |(x, y): (f64, f64), r: f64| {
+        make_cylinder_operation(&Ax2::new(Pnt::new(x, y, -2.0), Dir::dz()), r, 14.0)
+            .expect("bore")
+            .value
+    };
+    let once = boolean_operation(&block, &bore(c1, r1), BooleanOp::Cut)
+        .expect("large bore")
+        .value;
+    let twice = boolean_operation(&once, &bore(c2, r2), BooleanOp::Cut)
+        .expect("small bore straddling the large one")
+        .value;
+    let s = f64::hypot(c2.0 - c1.0, c2.1 - c1.1);
+    let expected = (50.0 * 45.0 - disc_union_area(r1, r2, s)) * 9.8;
+    let measured = volume(&twice);
+    assert!(
+        (measured - expected).abs() / expected < 1.0e-3,
+        "both bores removed: {measured} vs {expected}"
+    );
+}
+
+/// Area of the union of two discs of radii `r1`, `r2` with centres `s` apart
+/// (crossing, not nested).
+fn disc_union_area(r1: f64, r2: f64, s: f64) -> f64 {
+    let lens = r1 * r1 * ((s * s + r1 * r1 - r2 * r2) / (2.0 * s * r1)).acos()
+        + r2 * r2 * ((s * s + r2 * r2 - r1 * r1) / (2.0 * s * r2)).acos()
+        - 0.5 * ((-s + r1 + r2) * (s + r1 - r2) * (s - r1 + r2) * (s + r1 + r2)).sqrt();
+    std::f64::consts::PI * (r1 * r1 + r2 * r2) - lens
 }

@@ -115,11 +115,13 @@ fn align_line_supports(profiles: &mut [Region], tolerance: f64) -> Option<()> {
 /// the shell, even when a tool crosses a concave supporting cap. All profiles
 /// participate in one transaction; edge/point-only contacts still fail the
 /// strict one-solid gate.
-pub(super) fn try_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<KernelSolid> {
+/// The result has one solid per lump: a body that earlier cuts severed keeps
+/// its untouched lumps, and a Join may reunite lumps but never add one.
+pub(super) fn try_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<Vec<KernelSolid>> {
     const TOL: f32 = 1.0e-4;
     let retained = joined_source(body, tools)?;
     let source = retained.joined_prisms.first()?;
-    if body.parts.len() != 1 || tools.is_empty() || !source.depth.is_finite() {
+    if body.parts.is_empty() || tools.is_empty() || !source.depth.is_finite() {
         return None;
     }
     let length = source.depth.abs();
@@ -174,7 +176,7 @@ pub(super) fn try_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<Ke
     )
     .ok()?;
     let cells: Vec<_> = arranged.regions.into_iter().map(from_analytic).collect();
-    let probes: Vec<_> = cells.iter().map(region_material_point).collect();
+    let probes: Vec<_> = cells.iter().map(cell_probe_point).collect();
     let footprints: Vec<Vec<_>> = profiles
         .iter()
         .map(|region| probes.iter().map(|&p| region.contains(p)).collect())
@@ -273,11 +275,30 @@ pub(super) fn try_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<Ke
             }
         }
     }
+    // Each lump is sewn and strictly validated on its own; one shell holding
+    // several lumps would fail the single-solid gate.
     let policy = openrcad::foundation::TolerancePolicy::STANDARD;
-    let shell = openrcad::algo::sew_with_policy(&faces, &policy).ok()?.value;
-    let solid = KernelSolid::new(shell);
-    let bounds = crate::mock_kernel::solid_aabb(&solid)?;
-    for input in std::iter::once(Some(&body.parts[0])).chain(
+    let lumps: Vec<KernelSolid> = openrcad::algo::sew_bodies_with_policy(&faces, &policy)
+        .ok()?
+        .into_iter()
+        .map(|body| KernelSolid::new(body.value))
+        .collect();
+    if lumps.is_empty() || lumps.len() > body.parts.len() {
+        return None;
+    }
+    let mut bounds: Option<([f32; 3], [f32; 3])> = None;
+    for lump in &lumps {
+        let (lo, hi) = crate::mock_kernel::solid_aabb(lump)?;
+        bounds = Some(match bounds {
+            None => (lo, hi),
+            Some((a, b)) => (
+                std::array::from_fn(|i| a[i].min(lo[i])),
+                std::array::from_fn(|i| b[i].max(hi[i])),
+            ),
+        });
+    }
+    let bounds = bounds?;
+    for input in body.parts.iter().map(Some).chain(
         tools
             .iter()
             .map(|tool| tool.exact.as_ref().or(tool.smooth.as_ref())),
@@ -287,11 +308,7 @@ pub(super) fn try_profile_join(body: &LiveBody, tools: &[JoinTool]) -> Option<Ke
             return None;
         }
     }
-    (solid.is_watertight()
-        && solid.health_report().is_healthy()
-        && solid.validate_strict_with_policy(&policy).is_ok()
-        && solid.split_disconnected().len() == 1)
-        .then_some(solid)
+    Some(lumps)
 }
 
 /// Join an outward prism to a planar extremity without rebuilding unrelated
@@ -379,7 +396,7 @@ pub(super) fn try_cap_join(body: &LiveBody, tool: &JoinTool) -> Option<KernelSol
     let mut tool_only = Vec::new();
     let mut shared_area = 0.0_f64;
     for cell in &cells {
-        let p = region_material_point(cell);
+        let p = cell_probe_point(cell);
         let in_body = profiles[..cap_count].iter().any(|r| r.contains(p));
         let in_tool = profiles[cap_count].contains(p);
         body_only.push(in_body && !in_tool);

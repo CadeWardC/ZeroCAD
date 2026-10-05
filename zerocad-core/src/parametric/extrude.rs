@@ -44,6 +44,10 @@ impl std::error::Error for ExtrudeDraftError {}
 pub(crate) struct DraftedRegionLoops {
     pub(crate) top_boundary: Vec<(f32, f32)>,
     pub(crate) top_holes: Vec<Vec<(f32, f32)>>,
+    /// The far section before rounding to sketch precision: each offset edge
+    /// stays exactly parallel to its source edge, so the walls are planar.
+    pub(crate) exact_top_boundary: Vec<(f64, f64)>,
+    pub(crate) exact_top_holes: Vec<Vec<(f64, f64)>>,
 }
 
 #[derive(Debug)]
@@ -516,8 +520,10 @@ fn line_loop(
         .take(points.len())
         .enumerate()
     {
-        let dx = f64::from(end.0 - start.0);
-        let dy = f64::from(end.1 - start.1);
+        // Subtract after widening: an f32 difference rounds the direction, so
+        // the line would miss its own end vertex by up to ~1e-7.
+        let dx = f64::from(end.0) - f64::from(start.0);
+        let dy = f64::from(end.1) - f64::from(start.1);
         let length = dx.hypot(dy);
         if !length.is_finite() || length <= 1.0e-7 {
             return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
@@ -545,15 +551,26 @@ fn line_loop(
     })
 }
 
-fn span_loop_points<P>(loop_: &openrcad::sketch::ArrangementLoop<P>) -> Vec<(f32, f32)> {
+fn span_loop_points<P>(loop_: &openrcad::sketch::ArrangementLoop<P>) -> Vec<(f64, f64)> {
     loop_
         .spans
         .iter()
         .map(|span| {
             let point = span.start();
-            (point.x() as f32, point.y() as f32)
+            (point.x(), point.y())
         })
         .collect()
+}
+
+fn widen(points: &[(f32, f32)]) -> Vec<(f64, f64)> {
+    points
+        .iter()
+        .map(|&(u, v)| (f64::from(u), f64::from(v)))
+        .collect()
+}
+
+fn narrow(points: &[(f64, f64)]) -> Vec<(f32, f32)> {
+    points.iter().map(|&(u, v)| (u as f32, v as f32)).collect()
 }
 
 fn correspondence_is_unchanged(
@@ -590,6 +607,8 @@ pub(crate) fn drafted_region_loops(
         return Ok(DraftedRegionLoops {
             top_boundary: boundary.to_vec(),
             top_holes: holes.to_vec(),
+            exact_top_boundary: widen(boundary),
+            exact_top_holes: holes.iter().map(|hole| widen(hole)).collect(),
         });
     }
     let outer = line_loop(boundary, 0)?;
@@ -652,9 +671,42 @@ pub(crate) fn drafted_region_loops(
     if !outer_moved_correctly || !holes_moved_correctly || output.area <= area_tolerance {
         return Err(ExtrudeDraftError::ProfileCollapse);
     }
+    // The arrangement above validated the offset's topology, but it rebuilds
+    // corners through a tolerance merge that can move them ~1e-8, enough to
+    // tilt a wall off its plane. The chain offset intersects the shifted lines
+    // exactly and keeps the source loops' vertex order, which is what the
+    // walls are skinned from.
+    let exact_chain = |loop_: &openrcad::sketch::ArrangementLoop<(usize, usize)>, side: f64| {
+        openrcad::sketch::offset_curve_chain(
+            &loop_.spans,
+            side,
+            openrcad::sketch::OffsetOptions { tolerance: 1.0e-6 },
+        )
+        .map(|chain| {
+            span_loop_points(&openrcad::sketch::ArrangementLoop {
+                spans: chain.spans,
+                signed_area: loop_.signed_area,
+                junction_tolerance: loop_.junction_tolerance,
+            })
+        })
+        .map_err(ExtrudeDraftError::Offset)
+    };
+    let exact_top_boundary =
+        exact_chain(&input.outer, -input.outer.signed_area.signum() * distance)?;
+    let exact_top_holes = input
+        .holes
+        .iter()
+        .map(|hole| exact_chain(hole, hole.signed_area.signum() * distance))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(DraftedRegionLoops {
-        top_boundary: span_loop_points(&output.outer),
-        top_holes: output.holes.iter().map(span_loop_points).collect(),
+        top_boundary: narrow(&span_loop_points(&output.outer)),
+        top_holes: output
+            .holes
+            .iter()
+            .map(|hole| narrow(&span_loop_points(hole)))
+            .collect(),
+        exact_top_boundary,
+        exact_top_holes,
     })
 }
 
@@ -752,9 +804,13 @@ pub fn drafted_region_solid(
 ) -> Result<KernelSolid, ExtrudeDraftError> {
     let drafted = drafted_region_loops(boundary, holes, depth, angle_deg)?;
     let top_cs = cs.with_origin(cs.origin.add(cs.n.mul(depth)));
-    let solid = crate::mock_kernel::lofted_solid(&[
-        (*cs, boundary.to_vec(), holes.to_vec()),
-        (top_cs, drafted.top_boundary, drafted.top_holes),
+    let solid = crate::mock_kernel::lofted_solid_exact(&[
+        (
+            *cs,
+            widen(boundary),
+            holes.iter().map(|hole| widen(hole)).collect(),
+        ),
+        (top_cs, drafted.exact_top_boundary, drafted.exact_top_holes),
     ])
     .ok_or(ExtrudeDraftError::KernelFailure)?;
     let expected_faces = 2 + boundary.len() + holes.iter().map(Vec::len).sum::<usize>();
@@ -767,9 +823,9 @@ pub fn drafted_region_solid(
 fn shifted_loop_with_selected_edges(
     points: &[(f32, f32)],
     selected: &[bool],
-    shift_into_material: f32,
+    shift_into_material: f64,
     outer: bool,
-) -> Result<Vec<(f32, f32)>, ExtrudeDraftError> {
+) -> Result<Vec<(f64, f64)>, ExtrudeDraftError> {
     if points.len() < 3 || selected.len() != points.len() {
         return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
     }
@@ -783,6 +839,9 @@ fn shifted_loop_with_selected_edges(
     } else {
         -orientation_sign
     };
+    // f64 throughout: each shifted edge must stay exactly parallel to its
+    // source edge, or the wall between them is not planar.
+    let points = widen(points);
     let mut lines = Vec::with_capacity(points.len());
     for (index, (&start, &end)) in points
         .iter()
@@ -827,9 +886,14 @@ fn shifted_loop_with_selected_edges(
         }
         output.push(point);
     }
-    if signed_area(&output).signum() != signed_area(points).signum()
-        || signed_area(&output).abs() <= 1.0e-8
-    {
+    let area = |ring: &[(f64, f64)]| {
+        ring.iter()
+            .zip(ring.iter().cycle().skip(1))
+            .map(|(a, b)| a.0 * b.1 - b.0 * a.1)
+            .sum::<f64>()
+            / 2.0
+    };
+    if area(&output).signum() != area(&points).signum() || area(&output).abs() <= 1.0e-8 {
         return Err(ExtrudeDraftError::ProfileCollapse);
     }
     Ok(output)
@@ -856,22 +920,29 @@ pub(crate) fn drafted_region_solid_selected(
     {
         return Err(ExtrudeDraftError::ChangedEdgeCorrespondence);
     }
-    let shift = depth.abs() * angle_deg.to_radians().tan();
-    let top_boundary = shifted_loop_with_selected_edges(boundary, selected_outer, shift, true)?;
-    let top_holes = holes
+    let shift = f64::from(depth.abs()) * f64::from(angle_deg).to_radians().tan();
+    let exact_top_boundary =
+        shifted_loop_with_selected_edges(boundary, selected_outer, shift, true)?;
+    let exact_top_holes = holes
         .iter()
         .zip(selected_holes)
         .map(|(hole, selected)| shifted_loop_with_selected_edges(hole, selected, shift, false))
         .collect::<Result<Vec<_>, _>>()?;
     let drafted = DraftedRegionLoops {
-        top_boundary: top_boundary.clone(),
-        top_holes: top_holes.clone(),
+        top_boundary: narrow(&exact_top_boundary),
+        top_holes: exact_top_holes.iter().map(|hole| narrow(hole)).collect(),
+        exact_top_boundary,
+        exact_top_holes,
     };
     validate_drafted_region_set(std::slice::from_ref(&drafted))?;
     let top_cs = cs.with_origin(cs.origin.add(cs.n.mul(depth)));
-    let solid = crate::mock_kernel::lofted_solid(&[
-        (*cs, boundary.to_vec(), holes.to_vec()),
-        (top_cs, top_boundary, top_holes),
+    let solid = crate::mock_kernel::lofted_solid_exact(&[
+        (
+            *cs,
+            widen(boundary),
+            holes.iter().map(|hole| widen(hole)).collect(),
+        ),
+        (top_cs, drafted.exact_top_boundary, drafted.exact_top_holes),
     ])
     .ok_or(ExtrudeDraftError::KernelFailure)?;
     let expected_faces = 2 + boundary.len() + holes.iter().map(Vec::len).sum::<usize>();
@@ -934,6 +1005,45 @@ mod draft_tests {
             drafted_region_loops(&boundary, &[], 10.0, 45.0),
             Err(ExtrudeDraftError::Offset(_) | ExtrudeDraftError::ProfileCollapse)
         ));
+    }
+
+    /// Every wall of a drafted straight-edged profile is planar. Irregular
+    /// f32 corners on a tilted plane used to round the offset (f32 edge
+    /// directions, f32 far section, f32 lift) just past the skin's
+    /// coplanarity test, giving near-flat ruled walls that later booleans
+    /// rejected.
+    #[test]
+    fn drafted_walls_stay_planar() {
+        let hexagon = [
+            (14.351_624, 15.005_057),
+            (8.629_574, 20.305_824),
+            (1.177_949_2, 18.000_767),
+            (-0.551_624_6, 10.394_942),
+            (5.170_426_4, 5.094_175),
+            (12.622_05, 7.399_232_4),
+        ];
+        let tilted = CoordinateSystem::new(
+            crate::geometry::Vec3::new(3.0, -2.0, 7.5),
+            crate::geometry::Vec3::new(0.94, 0.17, -0.29),
+            crate::geometry::Vec3::new(-0.08, 0.93, 0.36),
+        );
+        let all_planar =
+            |solid: &KernelSolid| {
+                solid.shell().faces().iter().all(|face| {
+                    matches!(face.surface(), Some(openrcad::geom::GeomSurface::Plane(_)))
+                })
+            };
+        for cs in [CoordinateSystem::XY, tilted] {
+            for (depth, angle) in [(-4.5, -1.4), (4.5, 3.0), (9.0, 7.5)] {
+                let solid = drafted_region_solid(&hexagon, &[], depth, &cs, angle)
+                    .expect("drafted hexagon");
+                assert!(all_planar(&solid), "draft {angle} depth {depth} on {cs:?}");
+            }
+            let selected = [true, false, true, true, false, true];
+            let solid = drafted_region_solid_selected(&hexagon, &[], 6.0, &cs, 4.0, &selected, &[])
+                .expect("partially drafted hexagon");
+            assert!(all_planar(&solid), "selected-edge draft on {cs:?}");
+        }
     }
 
     #[test]
@@ -1674,15 +1784,24 @@ pub(crate) fn rect_circle_region_base_and_cutter_from_provenance(
     )
 }
 
+/// `circle` is in the coordinates of the cut sketch `tool_cs`, swept
+/// `tool_depth`; only regions it cuts straight through are rewritten.
 pub(crate) fn sketch_source_after_circle_cut(
     source: &SketchExtrudeSource,
     circle: Circle,
+    tool_cs: &CoordinateSystem,
+    tool_depth: f32,
 ) -> Option<SketchExtrudeSource> {
     let mut next = source.clone();
     let mut any = false;
     for region in &mut next.regions {
         if !region.holes.is_empty() || region.rect_circle.is_some() {
             continue;
+        }
+        if !circle_cut_spans_region(tool_cs, tool_depth, &region.cs, region.depth) {
+            // A circle from a side sketch, an offset frame, or a blind pocket
+            // is not a rect-minus-circle through profile of this region.
+            return None;
         }
         let (rect_min, rect_max) = loop_bounds_2d(&region.boundary)?;
         if !circle_intersects_rect_boundary(rect_min, rect_max, circle.center, circle.radius) {
@@ -1691,7 +1810,24 @@ pub(crate) fn sketch_source_after_circle_cut(
         let mut provenance_curves = SketchCurves::new();
         provenance_curves.add_rectangle(rect_min, rect_max);
         provenance_curves.add_circle(circle.center, circle.radius);
-        if let Some(material_region) = detect_regions(&provenance_curves).into_iter().find(|r| {
+        let regions = detect_regions(&provenance_curves);
+        let material_regions = regions
+            .iter()
+            .filter(|r| {
+                let (x, y) = region_material_point(r);
+                let inside_rect =
+                    x > rect_min.0 && x < rect_max.0 && y > rect_min.1 && y < rect_max.1;
+                let outside_circle =
+                    (x - circle.center.0).hypot(y - circle.center.1) > circle.radius;
+                inside_rect && outside_circle
+            })
+            .count();
+        if material_regions != 1 {
+            // The circle severs the rectangle into several lumps; one
+            // rect-minus-circle profile would silently drop the others.
+            return None;
+        }
+        if let Some(material_region) = regions.into_iter().find(|r| {
             region_is_rect_minus_circle_material(
                 r,
                 rect_min,
@@ -1722,6 +1858,30 @@ pub(crate) fn sketch_source_after_circle_cut(
         any = true;
     }
     any.then_some(next)
+}
+
+/// Whether a circle drawn in `tool_cs` and swept `tool_depth` cuts straight
+/// through a region prism: the same in-plane axes and origin, so the circle's
+/// coordinates mean the same thing in both frames, and a sweep covering the
+/// region's full height.
+fn circle_cut_spans_region(
+    tool_cs: &CoordinateSystem,
+    tool_depth: f32,
+    region_cs: &CoordinateSystem,
+    region_depth: f32,
+) -> bool {
+    const TOL: f32 = 1.0e-4;
+    let offset = tool_cs.origin.sub(region_cs.origin);
+    let same_axes = tool_cs.u.sub(region_cs.u).length() <= 1.0e-5
+        && tool_cs.v.sub(region_cs.v).length() <= 1.0e-5;
+    if !same_axes || offset.dot(region_cs.u).abs() > TOL || offset.dot(region_cs.v).abs() > TOL {
+        return false;
+    }
+    let axis = region_cs.n;
+    let start = offset.dot(axis);
+    let end = start + tool_depth * tool_cs.n.dot(axis);
+    let (low, high) = (start.min(end), start.max(end));
+    low <= region_depth.min(0.0) + TOL && high >= region_depth.max(0.0) - TOL
 }
 
 pub(crate) fn rectangle_bounds_from_source_curves(
@@ -1904,6 +2064,19 @@ fn loop_area(poly: &[(f32, f32)]) -> f32 {
 /// in any hole. `polygon_interior_point` only sees the outer boundary, so for a
 /// holed region (an annulus) its ear-centroid can land in the hole; this falls
 /// back to boundary-edge midpoints nudged inward until one is truly inside.
+/// A classification point for one cell of a curve arrangement: the point
+/// deepest inside it. Cells are tested against the profiles that formed the
+/// arrangement, whose arcs are flattened; a point near the cell's boundary can
+/// fall between an arc and its chords (within the chord sag) and read the
+/// wrong side. Arrangement cells list their holes, so the deepest point is
+/// inside the cell. Regions that may overlap others without listing them as
+/// holes (e.g. from `detect_regions`) must use [`region_material_point`].
+pub(crate) fn cell_probe_point(cell: &Region) -> (f32, f32) {
+    crate::sketch::polygon_pole_of_inaccessibility(&cell.boundary, &cell.holes)
+        .filter(|&p| cell.contains(p))
+        .unwrap_or_else(|| region_material_point(cell))
+}
+
 pub(crate) fn region_material_point(region: &Region) -> (f32, f32) {
     let p = crate::sketch::polygon_interior_point(&region.boundary);
     if region.holes.is_empty() || region.contains(p) {

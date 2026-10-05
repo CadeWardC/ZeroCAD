@@ -5,6 +5,47 @@ use super::*;
 /// boolean operations (join/cut) before tessellating to a `MockMesh`.
 pub type KernelSolid = Solid;
 
+/// Display meshes kept per thread for [`MockMesh::try_from_solid`].
+const RECENT_MESH_CAPACITY: usize = 8;
+
+/// A tessellated solid, the budget it was meshed at, and its display mesh.
+type RecentMesh = (KernelSolid, (f64, f64), MockMesh);
+
+thread_local! {
+    /// The last few solids tessellated on this thread. A boolean feature
+    /// tessellates its result, and the next feature re-tessellates that same
+    /// solid (same `Arc<BRep>`) to recover its input face names; reusing the
+    /// mesh saves a full tessellation per boolean feature. Each entry holds its
+    /// solid, so a cached BRep can never be freed and its address reused by a
+    /// different solid. The key includes the active tessellation budget.
+    static RECENT_MESHES: std::cell::RefCell<std::collections::VecDeque<RecentMesh>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+fn recent_mesh(solid: &KernelSolid, budget: (f64, f64)) -> Option<MockMesh> {
+    RECENT_MESHES.with(|recent| {
+        recent
+            .borrow()
+            .iter()
+            .find(|(cached, cached_budget, _)| {
+                std::sync::Arc::ptr_eq(cached.brep(), solid.brep())
+                    && cached.id() == solid.id()
+                    && *cached_budget == budget
+            })
+            .map(|(_, _, mesh)| mesh.clone())
+    })
+}
+
+fn remember_mesh(solid: &KernelSolid, budget: (f64, f64), mesh: &MockMesh) {
+    RECENT_MESHES.with(|recent| {
+        let mut recent = recent.borrow_mut();
+        if recent.len() == RECENT_MESH_CAPACITY {
+            recent.pop_front();
+        }
+        recent.push_back((solid.clone(), budget, mesh.clone()));
+    });
+}
+
 /// Analytic curve metadata for a selected display edge.
 ///
 /// Viewport wireframes are rendered as line segments, but selected-edge CAD
@@ -549,8 +590,15 @@ impl MockMesh {
     /// solids may still need pcurve reconstruction, and a failed reconstruction
     /// is an ordinary rejected feature result rather than a process panic.
     pub(crate) fn try_from_solid(solid: &KernelSolid) -> Result<Self, String> {
+        let budget = super::tessellation::active_tess_budget();
+        if let Some(mesh) = recent_mesh(solid, budget) {
+            return Ok(mesh);
+        }
         match Self::try_from_solid_with_cancel(solid, &openrcad::foundation::NeverCancelled) {
-            Ok(mesh) => Ok(mesh),
+            Ok(mesh) => {
+                remember_mesh(solid, budget, &mesh);
+                Ok(mesh)
+            }
             Err(DisplayTessellationError::Cancelled) => {
                 unreachable!("NeverCancelled cannot cancel")
             }

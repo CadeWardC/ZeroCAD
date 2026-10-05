@@ -16,6 +16,9 @@ use openrcad_topo::{
 pub enum SewError {
     InvalidTolerancePolicy(TolerancePolicyError),
     InvalidOutput(ValidationReport),
+    /// A connected component encloses negative volume: an inward-facing void
+    /// boundary, which is not a body on its own.
+    EnclosedVoid,
 }
 
 impl fmt::Display for SewError {
@@ -26,6 +29,10 @@ impl fmt::Display for SewError {
                 f,
                 "sewing: invalid output (watertight={}, pcurves_complete={}): {:?}",
                 report.watertight, report.pcurves_complete, report.health
+            ),
+            Self::EnclosedVoid => write!(
+                f,
+                "sewing: a connected component encloses a void, not a body"
             ),
         }
     }
@@ -373,6 +380,91 @@ pub fn sew_with_policy(
     })
 }
 
+/// Sew faces that may bound several disjoint bodies, returning one validated
+/// shell per body.
+///
+/// [`sew_with_policy`] validates its output as one solid, so disjoint lumps in
+/// a single shell fail the Euler gate, and its T-junction healer (gated on that
+/// same whole-solid check) declines to heal them. Here T-junctions are imprinted
+/// across the whole face set first; each connected component is then re-sewn
+/// alone, which orients it outward (the global outward pass only runs on a
+/// closed shell, so it cannot orient one lump inside an open or mixed set), and
+/// must pass the full strict gate on its own. A component nested inside another
+/// is an enclosed void's inner boundary, not a body, and is rejected.
+pub fn sew_bodies_with_policy(
+    faces: &[Face],
+    policy: &TolerancePolicy,
+) -> Result<Vec<OperationResult<Shell>>, SewError> {
+    policy
+        .validate()
+        .map_err(SewError::InvalidTolerancePolicy)?;
+    let sewn = Solid::new(sew_impl(faces, policy));
+    let candidate = crate::merge::imprint_tjunctions(&sewn, policy.sewing, policy).unwrap_or(sewn);
+    let mut bodies = Vec::new();
+    for component in candidate.split_disconnected() {
+        let resewn = Solid::new(sew_impl(&component.faces(), policy));
+        let Some(body) = crate::merge::strict_repaired_candidate(resewn.clone(), policy) else {
+            return Err(SewError::InvalidOutput(ValidationReport::for_solid(
+                &resewn, policy,
+            )));
+        };
+        bodies.push(body);
+    }
+    for (index, inner) in bodies.iter().enumerate() {
+        let Some(probe) = inner.vertices().first().map(|vertex| vertex.point()) else {
+            continue;
+        };
+        let nested = bodies.iter().enumerate().any(|(other, outer)| {
+            other != index
+                && box_contains(outer, inner)
+                && crate::boolean::point_in_solid(&probe, outer)
+        });
+        if nested {
+            return Err(SewError::EnclosedVoid);
+        }
+    }
+    bodies
+        .into_iter()
+        .map(|body| {
+            let value = body.shell();
+            let validation = ValidationReport::for_solid(&body, policy);
+            if !validation.is_valid() {
+                return Err(SewError::InvalidOutput(validation));
+            }
+            Ok(OperationResult {
+                history: TopologyHistory::generated_shell(&value),
+                diagnostics: Vec::<Diagnostic>::new(),
+                recovery: RecoveryReport {
+                    actions: vec![RecoveryAction::SewFaces {
+                        face_count: value.faces().len(),
+                    }],
+                },
+                validation,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// A permissive prefilter for nesting: the outer lump's enclosing box against
+/// the inner lump's vertex box. Exact point classification decides.
+fn box_contains(outer: &Solid, inner: &Solid) -> bool {
+    match (
+        outer.conservative_bounding_box().corners(),
+        inner.bounding_box().corners(),
+    ) {
+        (Some((outer_lo, outer_hi)), Some((inner_lo, inner_hi))) => {
+            outer_lo.x() <= inner_lo.x()
+                && outer_lo.y() <= inner_lo.y()
+                && outer_lo.z() <= inner_lo.z()
+                && inner_hi.x() <= outer_hi.x()
+                && inner_hi.y() <= outer_hi.y()
+                && inner_hi.z() <= outer_hi.z()
+        }
+        _ => false,
+    }
+}
+
 /// Internal shell assembly for modeling stages that intentionally create an
 /// open intermediate. The stage that closes the body owns strict validation.
 pub(crate) fn sew_shell_with_policy(
@@ -652,11 +744,16 @@ fn sew_impl(faces: &[Face], policy: &TolerancePolicy) -> Shell {
     // Vertex welding can collapse a short boolean-intersection sliver to one
     // representative point. Keeping its now-zero coedge corrupts Euler counts
     // and leaves a microscopic UV loop discontinuity at otherwise-valid miter
-    // seams. Remove only edges whose complete analytic span (endpoints and
-    // midpoint) is within their certified local/global linear tolerance.
+    // seams. Remove only edges whose endpoints welded into one vertex and whose
+    // complete analytic span (endpoints and midpoint) is within their certified
+    // local/global linear tolerance. An edge shorter than its own tolerance
+    // whose endpoints stayed distinct still joins two vertices: dropping it
+    // leaves both of its loops open (a 9e-5 stretch of a pocket rim where a
+    // fused cylinder crossed it just short of a corner).
     let collapsed: HashSet<EdgeId> = brep
         .edges
         .iter()
+        .filter(|(_, edge)| edge.start == edge.end)
         .filter_map(|(edge_id, edge)| {
             let start = brep.vertices[edge.start].point;
             let end = brep.vertices[edge.end].point;
@@ -1143,6 +1240,84 @@ mod tests {
         // Healing must not close a genuinely missing face.
         faces.pop();
         assert!(sew_with_policy(&faces, &TolerancePolicy::STANDARD).is_err());
+    }
+
+    fn box_faces(x: f64) -> Vec<Face> {
+        openrcad_primitives::make_box_operation(&Pnt::new(x, 0.0, 0.0), 3.0, 4.0, 5.0)
+            .unwrap()
+            .value
+            .faces()
+    }
+
+    /// Split the first edge of `faces[index]` at its midpoint, so its neighbour
+    /// meets it in a T-junction.
+    fn split_first_edge(faces: &mut [Face], index: usize) {
+        let face = faces[index].clone();
+        let edge = face.outer_wire().unwrap().edges()[0].clone();
+        let data = &face.brep().edges[edge.id()];
+        let t = (data.first + data.last) * 0.5;
+        let point = data.curve.as_ref().unwrap().point(t);
+        let mut builder = openrcad_topo::BRepBuilder::from_brep((**face.brep()).clone());
+        let vertex = builder
+            .brep_mut()
+            .vertices
+            .insert(openrcad_topo::arena::VertexData {
+                point,
+                tolerance: TolerancePolicy::STANDARD.linear,
+            });
+        builder.split_edge(edge.id(), vertex, t);
+        faces[index] = Face::from_id(builder.build(), face.id(), face.orientation());
+    }
+
+    #[test]
+    fn body_sew_returns_each_disjoint_lump_validated() {
+        let policy = TolerancePolicy::STANDARD;
+        let mut faces = box_faces(0.0);
+        split_first_edge(&mut faces, 0);
+        let mut second = box_faces(10.0);
+        split_first_edge(&mut second, 2);
+        faces.extend(second);
+
+        // One shell holding two lumps fails the whole-solid gate, so the
+        // single-body sew cannot heal either T-junction.
+        assert!(sew_with_policy(&faces, &policy).is_err());
+
+        let bodies = sew_bodies_with_policy(&faces, &policy).expect("two healed lumps");
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            assert!(body.validation.is_valid());
+            let solid = Solid::new(body.value.clone());
+            assert_eq!(solid.face_count(), 6);
+            assert!(solid.validate_strict_with_policy(&policy).is_ok());
+            assert!(body.history.coverage_for_shell(&body.value).is_complete());
+        }
+    }
+
+    #[test]
+    fn body_sew_rejects_open_lumps_and_enclosed_voids() {
+        let policy = TolerancePolicy::STANDARD;
+        let mut open = box_faces(0.0);
+        open.extend(box_faces(10.0));
+        open.pop();
+        let result = sew_bodies_with_policy(&open, &policy);
+        assert!(
+            matches!(result, Err(SewError::InvalidOutput(_))),
+            "{:?}",
+            result.as_ref().map(|bodies| bodies.len())
+        );
+
+        // An inward-facing inner boundary is a cavity, never a body.
+        let outer =
+            openrcad_primitives::make_box_operation(&Pnt::new(-1.0, -1.0, -1.0), 5.0, 6.0, 7.0)
+                .unwrap()
+                .value
+                .faces();
+        let mut hollow = outer;
+        hollow.extend(box_faces(0.0).iter().map(Face::reversed));
+        assert_eq!(
+            sew_bodies_with_policy(&hollow, &policy),
+            Err(SewError::EnclosedVoid)
+        );
     }
 
     #[test]

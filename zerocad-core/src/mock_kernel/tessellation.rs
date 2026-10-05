@@ -438,6 +438,66 @@ pub(crate) fn loop_to_polyline_wire(
     Some(Wire::from_edges(edges))
 }
 
+/// The sketch plane's in-plane axes in f64, orthonormalized. A frame is
+/// orthonormal by definition, but f32 storage leaves a tilted `u`/`v` up to
+/// ~1e-7 off unit length and perpendicularity. Lifting points through the raw
+/// axes while lifting circles as true circles then disagrees by `r * 1e-7`,
+/// which puts an arc's endpoint off its own curve past the 1e-7 tolerance.
+/// Axis-aligned frames are returned unchanged.
+pub(super) fn plane_axes(cs: &crate::geometry::CoordinateSystem) -> ([f64; 3], [f64; 3]) {
+    let widen = |a: crate::geometry::Vec3| [f64::from(a.x), f64::from(a.y), f64::from(a.z)];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let unit = |a: [f64; 3]| {
+        let length = dot(a, a).sqrt();
+        if length > 0.0 {
+            a.map(|value| value / length)
+        } else {
+            a
+        }
+    };
+    let u = unit(widen(cs.u));
+    let v = widen(cs.v);
+    let along = dot(u, v);
+    let v = unit([0, 1, 2].map(|i| v[i] - u[i] * along));
+    (u, v)
+}
+
+/// The unit sweep direction of an extrusion from this plane: `u x v` of
+/// [`plane_axes`], oriented like the stored `n` (the ground plane constant is
+/// left-handed). A lifted circle's axis is exactly `u x v`, so sweeping along
+/// the separately rounded f32 `n` tilts a tilted arc's wall off its own
+/// cylinder by ~1e-7 rad, a micron over a few millimetres of depth.
+pub(super) fn plane_sweep_direction(cs: &crate::geometry::CoordinateSystem) -> [f64; 3] {
+    let (u, v) = plane_axes(cs);
+    let normal = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let stored = [f64::from(cs.n.x), f64::from(cs.n.y), f64::from(cs.n.z)];
+    let sign = if normal[0] * stored[0] + normal[1] * stored[1] + normal[2] * stored[2] < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    normal.map(|value| value * sign)
+}
+
+/// Lift a sketch-plane point in f64. Rounding the 2D point to f32 first moves
+/// a non-integer junction (a circle meeting a line) off its analytic curve by
+/// up to half an f32 ulp — microns at 80 mm — which fails the 1e-6 pcurve
+/// audit. Only the origin is f32; the axes are [`plane_axes`], which conic
+/// frames share.
+pub(super) fn analytic_point_on_plane(
+    point: openrcad::foundation::Pnt2d,
+    cs: &crate::geometry::CoordinateSystem,
+) -> Pnt {
+    let (u, v) = plane_axes(cs);
+    let origin = [cs.origin.x, cs.origin.y, cs.origin.z];
+    let axis = |i: usize| f64::from(origin[i]) + u[i] * point.x() + v[i] * point.y();
+    Pnt::new(axis(0), axis(1), axis(2))
+}
+
 /// Lift one ordered analytic sketch loop into the sketch plane without
 /// replacing curves with display chords. The resulting topology retains exact
 /// line, circle/arc, ellipse, and B-Spline geometry through the prism sweep.
@@ -447,22 +507,15 @@ pub(crate) fn analytic_loop_to_wire<P>(
 ) -> Option<Wire> {
     use openrcad::geom2d::{Curve2d, CurveSpan, GeomCurve2d};
 
-    fn point_on_plane(
-        point: openrcad::foundation::Pnt2d,
-        cs: &crate::geometry::CoordinateSystem,
-    ) -> Pnt {
-        let point = cs.unproject(point.x() as f32, point.y() as f32);
-        Pnt::new(point.x as f64, point.y as f64, point.z as f64)
-    }
-
     fn direction_on_plane(
         direction: openrcad::foundation::Dir2d,
         cs: &crate::geometry::CoordinateSystem,
     ) -> Option<Dir> {
+        let (u, v) = plane_axes(cs);
         GeomVec::new(
-            f64::from(cs.u.x) * direction.x() + f64::from(cs.v.x) * direction.y(),
-            f64::from(cs.u.y) * direction.x() + f64::from(cs.v.y) * direction.y(),
-            f64::from(cs.u.z) * direction.x() + f64::from(cs.v.z) * direction.y(),
+            u[0] * direction.x() + v[0] * direction.y(),
+            u[1] * direction.x() + v[1] * direction.y(),
+            u[2] * direction.x() + v[2] * direction.y(),
         )
         .normalized()
     }
@@ -471,7 +524,7 @@ pub(crate) fn analytic_loop_to_wire<P>(
         position: openrcad::foundation::Ax22d,
         cs: &crate::geometry::CoordinateSystem,
     ) -> Option<Ax3> {
-        let center = point_on_plane(position.location(), cs);
+        let center = analytic_point_on_plane(position.location(), cs);
         let x_direction = direction_on_plane(position.x_direction(), cs)?;
         let y_direction = direction_on_plane(position.y_direction(), cs)?;
         let normal = x_direction.try_cross(&y_direction)?;
@@ -497,7 +550,7 @@ pub(crate) fn analytic_loop_to_wire<P>(
                 let poles = spline
                     .poles()
                     .iter()
-                    .map(|point| point_on_plane(*point, cs))
+                    .map(|point| analytic_point_on_plane(*point, cs))
                     .collect();
                 Some(GeomCurve::bspline(BSplineCurve::new(
                     spline.degree(),
@@ -594,8 +647,8 @@ pub(crate) fn analytic_loop_to_wire<P>(
 
     let mut junctions = Vec::with_capacity(count);
     for index in 0..count {
-        let previous_end = point_on_plane(spans[(index + count - 1) % count].end(), cs);
-        let start = point_on_plane(spans[index].start(), cs);
+        let previous_end = analytic_point_on_plane(spans[(index + count - 1) % count].end(), cs);
+        let start = analytic_point_on_plane(spans[index].start(), cs);
         if previous_end.distance(&start) > weld_limit {
             log::warn!(
                 "analytic sketch loop junction {index} disagrees by {:e} (limit {weld_limit:e}); \
@@ -604,11 +657,22 @@ pub(crate) fn analytic_loop_to_wire<P>(
             );
             return None;
         }
-        junctions.push(Pnt::new(
-            (previous_end.x() + start.x()) * 0.5,
-            (previous_end.y() + start.y()) * 0.5,
-            (previous_end.z() + start.z()) * 0.5,
-        ));
+        // A line is rebuilt through whatever junction it gets, so where a line
+        // meets a curve the junction is the curve's own analytic endpoint: the
+        // curve then carries no residual at all. A residual becomes the edge's
+        // tolerance, and validators re-measuring it (especially after a later
+        // boolean re-projects the pcurve) land a hair above the stored value.
+        let is_line = |span: &CurveSpan<P>| matches!(span.curve, GeomCurve2d::Line(_));
+        let previous_is_line = is_line(spans[(index + count - 1) % count]);
+        junctions.push(match (previous_is_line, is_line(spans[index])) {
+            (false, true) => previous_end,
+            (true, false) => start,
+            _ => Pnt::new(
+                (previous_end.x() + start.x()) * 0.5,
+                (previous_end.y() + start.y()) * 0.5,
+                (previous_end.z() + start.z()) * 0.5,
+            ),
+        });
     }
 
     let mut edges = Vec::with_capacity(count);
@@ -619,6 +683,10 @@ pub(crate) fn analytic_loop_to_wire<P>(
             Edge::between_points(start, end)
         } else {
             let curve = lift_curve(span, cs)?;
+            // The residual becomes the edge's tolerance. Validation measures
+            // the same gap again through each face's pcurve, which can come
+            // out slightly larger (more so once a boolean re-projects it), so
+            // the stored value gets relative and absolute slack.
             let endpoint_residual = curve
                 .point(span.first)
                 .distance(&start)
@@ -629,7 +697,7 @@ pub(crate) fn analytic_loop_to_wire<P>(
                 span.last,
                 Vertex::new(start),
                 Vertex::new(end),
-                endpoint_residual.max(openrcad::foundation::tolerance::CONFUSION),
+                endpoint_residual * (1.0 + 1.0e-6) + openrcad::foundation::tolerance::CONFUSION,
             )
         };
         edges.push(edge);
@@ -870,15 +938,18 @@ fn build_analytic_prism<P>(
             )
         })
         .collect::<Option<_>>()?;
+    // Sample each span's midpoint too: a lens bounded by two arcs has only two
+    // span endpoints, which cannot orient the plane.
     let outer_points: Vec<Pnt> = region
         .outer
         .spans
         .iter()
-        .map(|span| {
-            let point = span.start();
-            let point = cs.unproject(point.x() as f32, point.y() as f32);
-            Pnt::new(point.x as f64, point.y as f64, point.z as f64)
+        .flat_map(|span| {
+            use openrcad::geom2d::Curve2d;
+            let middle = span.curve.point(0.5 * (span.first + span.last));
+            [span.start(), middle]
         })
+        .map(|point| analytic_point_on_plane(point, cs))
         .collect();
     let normal = newell_normal(&outer_points)?;
     let plane = GeomSurface::plane(Plane::from_point_normal(outer_points[0], normal));
@@ -892,10 +963,11 @@ fn build_analytic_prism<P>(
             Orientation::Forward,
         )
     };
+    let direction = plane_sweep_direction(cs);
     let sweep = GeomVec::new(
-        f64::from(cs.n.x) * depth,
-        f64::from(cs.n.y) * depth,
-        f64::from(cs.n.z) * depth,
+        direction[0] * depth,
+        direction[1] * depth,
+        direction[2] * depth,
     );
     if analytic_void_boundaries_intersect(&region.holes) {
         log::debug!(

@@ -695,7 +695,7 @@ impl BRepBuilder {
                 | openrcad_geom::GeomSurface::Sphere(_)
                 | openrcad_geom::GeomSurface::Torus(_)
         );
-        let u_anchor = outer_loop
+        let vertex_anchor = outer_loop
             .edges
             .first()
             .and_then(|&oe| {
@@ -708,6 +708,70 @@ impl BRepBuilder {
                 )
             })
             .unwrap_or(0.0);
+        // Points are unwrapped to within pi of the anchor. Anchored at a vertex,
+        // that window cuts through any face spanning more than pi (a tunnel's
+        // upper wall left by a flat-roofed cut) and scrambles its UV loop, so
+        // its winding and every exterior test come out inverted. Anchor at the
+        // middle of the angular range the boundary covers instead; a face with
+        // no uncovered gap (a full turn split at a seam) keeps the vertex
+        // anchor.
+        let u_anchor = if periodic {
+            // Angular intervals swept by the boundary edges, as (start, length).
+            let mut covered: Vec<(f64, f64)> = Vec::new();
+            for &oriented in &outer_loop.edges {
+                let edge = &self.brep.edges[oriented.id];
+                let Some(curve) = &edge.curve else {
+                    continue;
+                };
+                let angle_at = |fraction: f64| {
+                    let pt = curve.point(edge.first + (edge.last - edge.first) * fraction);
+                    analytic_surface_uv(surface, pt)
+                        .unwrap_or_else(|| search_nearest_parameter(surface, pt))
+                        .0
+                };
+                const STEPS: usize = 16;
+                let mut previous = angle_at(0.0);
+                for step in 1..=STEPS {
+                    let next = angle_at(step as f64 / STEPS as f64);
+                    // The short way round between neighbouring samples.
+                    let delta = (next - previous + PI).rem_euclid(2.0 * PI) - PI;
+                    let (from, length) = if delta >= 0.0 {
+                        (previous, delta)
+                    } else {
+                        (next, -delta)
+                    };
+                    covered.push((from.rem_euclid(2.0 * PI), length));
+                    previous = next;
+                }
+            }
+            covered.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // Walk the circle twice so a gap across 2 pi is seen in one pass.
+            let mut widest: Option<(f64, f64)> = None;
+            if let Some(&(first_start, _)) = covered.first() {
+                let mut reach = first_start;
+                for lap in 0..2 {
+                    for &(from, length) in &covered {
+                        let from = from + lap as f64 * 2.0 * PI;
+                        if from > reach {
+                            let gap = from - reach;
+                            if widest.map_or(true, |(_, best)| gap > best) {
+                                widest = Some((reach, gap));
+                            }
+                        }
+                        reach = reach.max(from + length);
+                    }
+                }
+            }
+            match widest {
+                // Centre the window on the covered range, so the cut falls in
+                // the middle of the gap with half of it to spare on each side
+                // (a cut at the gap's edge would sit on a boundary vertex).
+                Some((from, gap)) if gap > 1.0e-3 => from + gap + 0.5 * (2.0 * PI - gap),
+                _ => vertex_anchor,
+            }
+        } else {
+            vertex_anchor
+        };
 
         // Helper to project 3D point to 2D parametric UV coordinates. Analytic
         // cylinders are periodic in `u`, so align every projected point to the
@@ -1010,17 +1074,23 @@ impl BRepBuilder {
         let mut hole_to_face = std::collections::HashMap::new();
 
         for i in 0..n_loops {
-            if !containers[i].is_empty() {
-                // Find the direct container (parent), which is the container with the largest number of containers
-                let &parent_idx = containers[i]
+            if containers[i].is_empty() {
+                continue;
+            }
+            // The walk traces face loops counter-clockwise (positive area) and
+            // hole loops clockwise, so a loop's own sign says what it is. A
+            // hole belongs to the innermost face that contains it. Comparing
+            // against the innermost container's sign instead took an island
+            // face for a hole whenever its container was itself a hole (a slot
+            // piece inside the boundary of slot plus an intersecting boss) and
+            // dropped the island.
+            if loop_areas[i] < 0.0 {
+                let parent = containers[i]
                     .iter()
-                    .max_by_key(|&&c_idx| containers[c_idx].len())
-                    .unwrap();
-
-                // If the loop's sign is opposite to the parent's sign, it's a hole of the parent
-                let parent_area = loop_areas[parent_idx];
-                let current_area = loop_areas[i];
-                if parent_area.signum() != current_area.signum() {
+                    .copied()
+                    .filter(|&c_idx| loop_areas[c_idx] > 0.0)
+                    .max_by_key(|&c_idx| containers[c_idx].len());
+                if let Some(parent_idx) = parent {
                     is_face[i] = false;
                     hole_to_face.insert(i, parent_idx);
                 }

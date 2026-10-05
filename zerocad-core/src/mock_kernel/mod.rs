@@ -22,6 +22,12 @@ use openrcad::topo::{Edge, Face, Orientation, Solid, Vertex, Wire};
 
 use crate::geometry::Vec3;
 
+/// A loft section in exact sketch coordinates: plane, outer loop, holes.
+pub(crate) type ExactLoftSection = (
+    crate::geometry::CoordinateSystem,
+    Vec<(f64, f64)>,
+    Vec<Vec<(f64, f64)>>,
+);
 pub(crate) type LoftSectionProfile = (
     crate::geometry::CoordinateSystem,
     Vec<(f32, f32)>,

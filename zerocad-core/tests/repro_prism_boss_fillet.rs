@@ -152,63 +152,6 @@ fn fused_body_mesh_is_crack_free() {
     assert_eq!(cracks.len(), 0, "fused body render mesh must be crack-free");
 }
 
-#[test]
-fn debug_dump_edges() {
-    let graph = prism_boss_graph();
-    let hidden = HashSet::new();
-    let solids = graph.debug_kernel_solids(&hidden).expect("kernel solids");
-    for (id, parts) in &solids {
-        for (pi, part) in parts.iter().enumerate() {
-            println!("body {id} part {pi}: watertight={}", part.is_watertight());
-            for (fi, face) in part.shell().faces().iter().enumerate() {
-                println!("  face {fi}: surface={:?}", face.surface().map(surf_kind));
-                for wire in face.wires() {
-                    let pts: Vec<String> = wire
-                        .edges()
-                        .iter()
-                        .map(|e| {
-                            let a = e.source().point();
-                            let b = e.target().point();
-                            format!(
-                                "[{:.9},{:.9},{:.9}]->[{:.9},{:.9},{:.9}]{}",
-                                a.x(),
-                                a.y(),
-                                a.z(),
-                                b.x(),
-                                b.y(),
-                                b.z(),
-                                e.curve().map(|c| curve_kind(&c)).unwrap_or("?")
-                            )
-                        })
-                        .collect();
-                    println!("    wire: {}", pts.join(" "));
-                }
-            }
-        }
-    }
-}
-
-fn surf_kind(s: &openrcad::geom::GeomSurface) -> &'static str {
-    use openrcad::geom::GeomSurface::*;
-    match s {
-        Plane(_) => "Plane",
-        Cylinder(_) => "Cylinder",
-        Cone(_) => "Cone",
-        Sphere(_) => "Sphere",
-        Torus(_) => "Torus",
-        _ => "Other",
-    }
-}
-
-fn curve_kind(c: &openrcad::geom::GeomCurve) -> &'static str {
-    use openrcad::geom::GeomCurve::*;
-    match c {
-        Line(_) => " L",
-        Circle(_) => " C",
-        _ => " O",
-    }
-}
-
 /// The hypotenuse line is 3x + 4y = 120 with outward normal (0.6, 0.8, 0).
 /// The boss circle is centered on it, so the wall∩plane seam edges are at
 /// ±R along the line direction (-0.8, 0.6) from (20, 15).

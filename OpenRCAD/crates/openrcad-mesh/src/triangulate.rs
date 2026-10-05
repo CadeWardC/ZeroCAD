@@ -401,6 +401,12 @@ fn recover_constrained_edges(
 ) -> Vec<Tri> {
     let mut locked_edges = HashSet::new();
     let max_flips = constraints.len().max(1) * tris.len().max(1) * tris.len().max(1);
+    // A recoverable constraint needs about one flip per edge it crosses. One
+    // that cannot be recovered (a vertex lying just off its segment) makes
+    // the first-flippable rule cycle, so without a per-constraint budget it
+    // burns the whole global budget — ~50 s on a 73-point face — and ends
+    // unrecovered anyway.
+    let max_flips_per_constraint = 8 * tris.len().max(1);
     let mut flips = 0;
 
     for &(a, b) in constraints {
@@ -408,8 +414,9 @@ fn recover_constrained_edges(
             continue;
         }
 
+        let mut constraint_flips = 0;
         while !mesh_has_edge(&tris, a, b) {
-            if flips >= max_flips {
+            if flips >= max_flips || constraint_flips >= max_flips_per_constraint {
                 break;
             }
 
@@ -425,6 +432,7 @@ fn recover_constrained_edges(
                 if flip_edge(&mut tris, points, crossing) {
                     flipped = true;
                     flips += 1;
+                    constraint_flips += 1;
                     break;
                 }
             }

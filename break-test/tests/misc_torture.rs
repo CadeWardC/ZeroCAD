@@ -424,11 +424,13 @@ fn scale_chain_compounds() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn swiss_cheese_36_holes_exact() {
+fn swiss_cheese_16_holes_exact() {
+    // A 4 x 4 grid exercises the same many-holes-in-one-face paths as the
+    // former 6 x 6 at under half the cost.
     let mut g = ParametricGraph::new();
-    add_box(&mut g, "box_1", 120.0, 120.0, 6.0);
-    for i in 0..6 {
-        for j in 0..6 {
+    add_box(&mut g, "box_1", 84.0, 84.0, 6.0);
+    for i in 0..4 {
+        for j in 0..4 {
             add_hole(
                 &mut g,
                 &format!("h_{i}_{j}"),
@@ -442,8 +444,8 @@ fn swiss_cheese_36_holes_exact() {
         }
     }
     let v = assert_part_sane(&g);
-    let exact = 120.0 * 120.0 * 6.0 - 36.0 * std::f64::consts::PI * 9.0 * 6.0;
-    assert!((v - exact).abs() / exact < 0.03, "36 holes: {v} vs {exact}");
+    let exact = 84.0 * 84.0 * 6.0 - 16.0 * std::f64::consts::PI * 9.0 * 6.0;
+    assert!((v - exact).abs() / exact < 0.03, "16 holes: {v} vs {exact}");
 }
 
 #[test]

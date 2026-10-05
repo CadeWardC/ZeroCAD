@@ -540,12 +540,10 @@ pub fn boolean_bodies_operation_with_classes_policy_and_cancel_and_budget(
             let count = match kind {
                 openrcad_topo::TopologyKind::Vertex => body.vertex_count(),
                 openrcad_topo::TopologyKind::Edge => body.edge_count(),
-                openrcad_topo::TopologyKind::Wire => body
-                    .shell()
-                    .faces()
-                    .iter()
-                    .map(|face| face.wires().len())
-                    .sum(),
+                // Every shell's faces: a body may bound enclosed voids.
+                openrcad_topo::TopologyKind::Wire => {
+                    body.faces().iter().map(|face| face.wires().len()).sum()
+                }
                 _ => unreachable!(),
             };
             for _ in 0..count {
@@ -554,7 +552,8 @@ pub fn boolean_bodies_operation_with_classes_policy_and_cancel_and_budget(
             }
         }
     }
-    for index in 0..bodies.len() {
+    let shell_count: usize = bodies.iter().map(|body| body.shells().len()).sum();
+    for index in 0..shell_count {
         history.generated(
             [InputTopologyRef::new(
                 0,
@@ -562,6 +561,8 @@ pub fn boolean_bodies_operation_with_classes_policy_and_cancel_and_budget(
             )],
             TopologyRef::new(openrcad_topo::TopologyKind::Shell, index),
         );
+    }
+    for index in 0..bodies.len() {
         history.generated(
             [InputTopologyRef::new(
                 0,
@@ -1029,6 +1030,7 @@ fn boolean_impl(
         for &fid in sub.iter() {
             if let Some(mut edges) = split_map.remove(&fid) {
                 if builder.brep().faces.contains_key(fid) {
+                    planarize_splitting_edges(builder, &mut edges, policy.intersection);
                     deduplicate_splitting_edges(builder, &mut edges, policy.intersection);
                     discard_existing_boundary_splits(
                         builder,
@@ -1360,7 +1362,7 @@ fn boolean_impl(
                 removed_faces: before_count.saturating_sub(solid.face_count()),
             });
     }
-    let solid = package_nested_cut_shells(solid, op, policy);
+    let solid = package_nested_shells(solid, op, policy);
     let history = want_history
         .then(|| resolve_face_origins(&solid, &kept_faces, &kept_sources, policy))
         .map(|face_source| BooleanFaceHistory { face_source });
@@ -1368,12 +1370,13 @@ fn boolean_impl(
     Ok((solid, history, recovery))
 }
 
-/// Convert a cut whose kept boundary has one enclosing component plus one or
-/// more fully enclosed components into a single multi-shell solid. A severing
-/// cut remains a packed disconnected shell so the public multi-body adapter can
-/// split it into independent bodies.
-fn package_nested_cut_shells(solid: Solid, op: BooleanOp, policy: &TolerancePolicy) -> Solid {
-    if op != BooleanOp::Cut {
+/// Convert a result whose kept boundary has one enclosing component plus one
+/// or more fully enclosed components into a single multi-shell solid: a cut
+/// that hollows out a cavity, or a fuse that seals one off (a block bridging a
+/// blind tunnel). A severing cut remains a packed disconnected shell so the
+/// public multi-body adapter can split it into independent bodies.
+fn package_nested_shells(solid: Solid, op: BooleanOp, policy: &TolerancePolicy) -> Solid {
+    if !matches!(op, BooleanOp::Cut | BooleanOp::Fuse) {
         return solid;
     }
     let mut components = solid.split_disconnected();
@@ -1556,6 +1559,7 @@ fn validate_output(solid: Solid, policy: &TolerancePolicy) -> Result<Solid, Bool
         }
     }
     if !report.is_healthy() {
+        debug_dump_rejected(&solid, &report);
         return Err(BooleanError::InvalidOutput { report });
     }
     if !solid.is_watertight_with_policy(policy) {
@@ -1566,6 +1570,39 @@ fn validate_output(solid: Solid, policy: &TolerancePolicy) -> Result<Solid, Bool
         return Err(BooleanError::DegenerateSliver { thickness });
     }
     Ok(solid)
+}
+
+/// With `OPENRCAD_BOOLEAN_DEBUG` set, print a rejected result's faces and
+/// their edges so a failing case can be located geometrically.
+fn debug_dump_rejected(solid: &Solid, report: &openrcad_topo::HealthReport) {
+    if std::env::var_os("OPENRCAD_BOOLEAN_DEBUG").is_none() {
+        return;
+    }
+    eprintln!("rejected boolean output: {report:?}");
+    for (index, face) in solid.faces().iter().enumerate() {
+        let kind = match face.surface() {
+            Some(GeomSurface::Plane(_)) => "plane",
+            Some(GeomSurface::Cylinder(_)) => "cylinder",
+            Some(_) => "other",
+            None => "none",
+        };
+        eprintln!("  face {index} {:?} {kind}", face.id());
+        for wire in face.wires() {
+            for edge in wire.edges() {
+                let (a, b) = (edge.source().point(), edge.target().point());
+                eprintln!(
+                    "    {:?} ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4})",
+                    edge.id(),
+                    a.x(),
+                    a.y(),
+                    a.z(),
+                    b.x(),
+                    b.y(),
+                    b.z()
+                );
+            }
+        }
+    }
 }
 
 fn repair_boolean_output(
@@ -1623,6 +1660,9 @@ struct PlanarFaceInfo {
     y: Dir,
     offset: f64, // normal · (point on plane)
     verts: Vec<Pnt>,
+    /// -1 when the face is reversed against its plane, so `normal * outward`
+    /// points out of the solid.
+    outward: f64,
 }
 
 fn planar_faces(solid: &Solid) -> Vec<PlanarFaceInfo> {
@@ -1645,6 +1685,11 @@ fn planar_faces(solid: &Solid) -> Vec<PlanarFaceInfo> {
                 y: pos.y_direction(),
                 offset: n.x() * loc.x() + n.y() * loc.y() + n.z() * loc.z(),
                 verts,
+                outward: if f.orientation() == openrcad_topo::Orientation::Reversed {
+                    -1.0
+                } else {
+                    1.0
+                },
             });
         }
     }
@@ -1776,7 +1821,8 @@ fn snap_tool_to_object(
 }
 
 /// Smallest wall thickness of a degenerate sliver in `solid`: two planar faces
-/// that are parallel, within `tol` of coincident, and overlap in projection.
+/// that face opposite ways, are within `tol` of coincident, and overlap in
+/// projection.
 /// `None` if no sliver. (Exactly-coincident faces, `d ≈ 0`, are excluded — those
 /// surface as non-manifold/non-watertight and are caught earlier.)
 fn degenerate_sliver_thickness(solid: &Solid, tol: f64, resolution: f64) -> Option<f64> {
@@ -1785,7 +1831,11 @@ fn degenerate_sliver_thickness(solid: &Solid, tol: f64, resolution: f64) -> Opti
     for i in 0..planes.len() {
         for j in (i + 1)..planes.len() {
             let (a, b) = (&planes[i], &planes[j]);
-            if dir_dot(a.normal, b.normal).abs() < 0.999 {
+            // Only opposite-facing faces can bound a thin wall (or a thin
+            // crack). Same-facing pieces of one plane, built from
+            // single-precision sketch points, sit a rounding error apart and
+            // are not a sliver.
+            if dir_dot(a.normal, b.normal) * a.outward * b.outward > -0.999 {
                 continue;
             }
             let d = plane_dist(a, b.verts[0]).abs();
@@ -1885,6 +1935,76 @@ fn split_tracked(
         result.extend(next_faces);
     }
     *subfaces = result;
+}
+
+/// Split queued edges where another queued edge ends on them while running
+/// along them. Spans queued by different face pairs can overlap without
+/// sharing vertices: a coplanar cavity floor imprints its outline on a cutter
+/// face, then a wall crossing the same cutter face queues one long line over
+/// that outline's edge. The partition graph needs every junction of the
+/// overlap as a vertex; once split, the duplicated stretch is removed by
+/// [`deduplicate_splitting_edges`]. Transverse T-junctions are left alone: a
+/// degenerate tangency span ending on another edge must stay dangling rather
+/// than become a partition chord.
+fn planarize_splitting_edges(builder: &mut BRepBuilder, edges: &mut Vec<EdgeId>, tolerance: f64) {
+    const MAX_SPLITS: usize = 256;
+    // How far along an edge, as a fraction of its span, the overlap probe
+    // looks from the endpoint.
+    const PROBE_FRACTION: f64 = 1.0e-3;
+    for _ in 0..MAX_SPLITS {
+        // Each queued endpoint with a probe point just inside its own edge.
+        let endpoints: Vec<(openrcad_topo::arena::VertexId, Pnt, Pnt)> = edges
+            .iter()
+            .filter_map(|&edge| builder.brep().edges.get(edge))
+            .flat_map(|data| {
+                let probe = |fraction: f64| match &data.curve {
+                    Some(curve) => curve.point(data.first + (data.last - data.first) * fraction),
+                    None => {
+                        let start = builder.brep().vertices[data.start].point;
+                        let end = builder.brep().vertices[data.end].point;
+                        start + (end - start) * fraction
+                    }
+                };
+                [
+                    (data.start, probe(PROBE_FRACTION)),
+                    (data.end, probe(1.0 - PROBE_FRACTION)),
+                ]
+            })
+            .map(|(vertex, probe)| (vertex, builder.brep().vertices[vertex].point, probe))
+            .collect();
+        let split = edges.iter().enumerate().find_map(|(index, &edge)| {
+            let data = builder.brep().edges.get(edge)?;
+            let curve = data.curve.as_ref()?;
+            let (start, end) = (
+                builder.brep().vertices[data.start].point,
+                builder.brep().vertices[data.end].point,
+            );
+            let (low, high) = (data.first.min(data.last), data.first.max(data.last));
+            let on_curve = |point: &Pnt| {
+                let t = project_point_on_curve(point, curve, low, high);
+                (curve.point(t).distance(point) <= tolerance).then_some(t)
+            };
+            endpoints.iter().find_map(|&(vertex, point, probe)| {
+                if vertex == data.start
+                    || vertex == data.end
+                    || point.distance(&start) <= tolerance
+                    || point.distance(&end) <= tolerance
+                {
+                    return None;
+                }
+                let t = on_curve(&point).filter(|&t| t > low && t < high)?;
+                on_curve(&probe)?;
+                Some((index, edge, vertex, t))
+            })
+        });
+        let Some((index, edge, vertex, t)) = split else {
+            return;
+        };
+        let (first, second) = builder.split_edge(edge, vertex, t);
+        edges.remove(index);
+        edges.push(first);
+        edges.push(second);
+    }
 }
 
 /// Remove repeated geometric split spans contributed by adjacent face pairs.
@@ -3136,6 +3256,19 @@ mod tests {
         let (cube, tool) = box_and_gap_cut(2e-5);
         let res = boolean_checked(&cube, &tool, BooleanOp::Cut);
         assert!(res.is_err(), "a degenerate sliver must be rejected, got Ok");
+    }
+
+    #[test]
+    fn thin_planar_wall_is_rejected_as_a_sliver() {
+        // A pocket stopping 5e-6 short of the far face leaves a wall whose two
+        // faces point opposite ways: a sliver, not a usable solid.
+        let cube = make_box(&Pnt::origin(), 10.0, 10.0, 10.0);
+        let pocket = make_box(&Pnt::new(2.0, 2.0, -1.0), 6.0, 6.0, 11.0 - 5.0e-6);
+        let res = boolean_checked(&cube, &pocket, BooleanOp::Cut);
+        assert!(
+            matches!(res, Err(BooleanError::DegenerateSliver { .. })),
+            "the 5e-6 floor must be rejected as a sliver, got {res:?}"
+        );
     }
 
     #[test]

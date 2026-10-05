@@ -23,12 +23,15 @@ jobs:
         with:
           toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
+      # Tests run under the optimized `fast-test` profile (Cargo.toml): debug
+      # geometry is 5-10x slower and dominated suite time. It keeps
+      # debug assertions and line tables; the build shares its artifacts.
       - name: Build workspace
-        run: cargo build --workspace --locked
+        run: cargo build --workspace --locked --profile fast-test
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --profile fast-test
       - name: Replay promoted boolean regressions
-        run: cargo test -p zerocad-core --test boolean_replay --locked
+        run: cargo test -p zerocad-core --test boolean_replay --locked --profile fast-test
 
   # Geometry/parametric engine on Linux. zerocad-core has no GUI dependencies,
   # so it builds and tests cleanly without any system packages — fast coverage
@@ -49,7 +52,7 @@ jobs:
           toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       - name: Test zerocad-core
-        run: cargo test -p zerocad-core --locked
+        run: cargo test -p zerocad-core --locked --profile fast-test
 
   # OpenRCAD is intentionally a separate workspace, so the jobs above only
   # compile it as a dependency; they do not run the kernel's own regression
@@ -73,7 +76,7 @@ jobs:
         with:
           workspaces: OpenRCAD -> target
       - name: Test OpenRCAD workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --profile fast-test
 
   # Formatting is normalized and required.
   format:

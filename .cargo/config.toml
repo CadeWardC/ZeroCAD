@@ -12,3 +12,5 @@ RAYON_NUM_THREADS = "2"
 [alias]
 dev = "run -p zerocad-gui"
 test-safe = "test --workspace --jobs 2 -- --test-threads=2"
+# Optimized full suite (see [profile.fast-test] in Cargo.toml); ~5x faster runs.
+test-fast = "test --profile fast-test"

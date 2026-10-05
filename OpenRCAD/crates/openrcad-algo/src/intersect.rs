@@ -507,6 +507,11 @@ fn line_line(a: &openrcad_geom::Line, b: &openrcad_geom::Line, tol: f64) -> Vec<
 /// A line generically pierces the circle's plane once (1 pt iff it lands on the
 /// circle); a line lying in the plane reduces to a 2D line/circle quadratic.
 fn line_circle(l: &openrcad_geom::Line, ci: &Circle, tol: f64) -> Vec<Pnt> {
+    // Planes and rims built from single-precision sketch points differ by a
+    // rounding (1e-7 tilts and offsets), so "the line lies in the circle's
+    // plane" is judged at the intersection tolerance over the circle's span;
+    // the in-plane solve below uses only in-plane components.
+    const IN_PLANE: f64 = 1.0e-5;
     let p = l.location();
     let d = GeomVec::from_dir(l.direction());
     let c = ci.center();
@@ -514,17 +519,21 @@ fn line_circle(l: &openrcad_geom::Line, ci: &Circle, tol: f64) -> Vec<Pnt> {
     let r = ci.radius();
     let on_tol = tol.max(1e-7);
     let dn = d.dot(&n);
-    if dn.abs() > 1e-12 {
+    // Where the line passes the circle's centre, and how far it drifts out of
+    // the plane across the circle.
+    let foot = p + d * (c - p).dot(&d);
+    let in_plane =
+        dn.abs() * 2.0 * r <= IN_PLANE && (foot - c).dot(&n).abs() <= on_tol.max(IN_PLANE);
+    if !in_plane {
+        if dn.abs() <= 1e-12 {
+            return Vec::new();
+        }
         // Pierces the plane at one point; keep it only if it lands on the circle.
         let t = (c - p).dot(&n) / dn;
         let pt = p + d * t;
         if ((pt - c).magnitude() - r).abs() <= on_tol {
             return vec![pt];
         }
-        return Vec::new();
-    }
-    // Parallel to the plane: no hit unless the line lies in the plane.
-    if (p - c).dot(&n).abs() > on_tol {
         return Vec::new();
     }
     let x = GeomVec::from_dir(ci.position().x_direction());
@@ -539,6 +548,58 @@ fn line_circle(l: &openrcad_geom::Line, ci: &Circle, tol: f64) -> Vec<Pnt> {
         .into_iter()
         .map(|t| p + d * t)
         .collect()
+}
+
+/// Closed-form line/ellipse intersection, as [`line_circle`]. Without it the
+/// pair fell to the subdivision search, which clamps an infinite line to
+/// parameters [-100, 100]: a tilted cylinder's ruling, parameterized from a
+/// distant axis origin, crosses its planar section beyond that window, and the
+/// trim then fell back to a bisected containment transition 1e-3 off the true
+/// crossing (a dangling spur on a tilted slot cap).
+fn line_ellipse(l: &openrcad_geom::Line, ellipse: &Ellipse, tol: f64) -> Vec<Pnt> {
+    const IN_PLANE: f64 = 1.0e-5;
+    let p = l.location();
+    let d = GeomVec::from_dir(l.direction());
+    let position = ellipse.position();
+    let c = ellipse.center();
+    let n = GeomVec::from_dir(position.direction());
+    let x = GeomVec::from_dir(position.x_direction());
+    let y = GeomVec::from_dir(position.y_direction());
+    let (a, b) = (ellipse.major_radius(), ellipse.minor_radius());
+    if a <= 0.0 || b <= 0.0 {
+        return Vec::new();
+    }
+    let on_tol = tol.max(1e-7);
+    let dn = d.dot(&n);
+    let foot = p + d * (c - p).dot(&d);
+    let in_plane =
+        dn.abs() * 2.0 * a <= IN_PLANE && (foot - c).dot(&n).abs() <= on_tol.max(IN_PLANE);
+    if !in_plane {
+        if dn.abs() <= 1e-12 {
+            return Vec::new();
+        }
+        // Pierces the plane at one point; keep it only if it lands on the
+        // ellipse. The normalized radius is off by about distance / b.
+        let t = (c - p).dot(&n) / dn;
+        let pt = p + d * t;
+        let local = pt - c;
+        let (u, v) = (local.dot(&x) / a, local.dot(&y) / b);
+        if ((u * u + v * v).sqrt() - 1.0).abs() * b <= on_tol {
+            return vec![pt];
+        }
+        return Vec::new();
+    }
+    let po = p - c;
+    let (px, py) = (po.dot(&x) / a, po.dot(&y) / b);
+    let (dx, dy) = (d.dot(&x) / a, d.dot(&y) / b);
+    solve_quadratic(
+        dx * dx + dy * dy,
+        2.0 * (px * dx + py * dy),
+        px * px + py * py - 1.0,
+    )
+    .into_iter()
+    .map(|t| p + d * t)
+    .collect()
 }
 
 /// Closed-form intersection of two coplanar circles via the radical line (0, 1,
@@ -624,6 +685,8 @@ fn analytic_curve_curve(c1: &GeomCurve, c2: &GeomCurve, tol: f64) -> Option<Vec<
         (GeomCurve::Line(a), GeomCurve::Line(b)) => Some(line_line(a, b, tol)),
         (GeomCurve::Line(l), GeomCurve::Circle(ci))
         | (GeomCurve::Circle(ci), GeomCurve::Line(l)) => Some(line_circle(l, ci, tol)),
+        (GeomCurve::Line(l), GeomCurve::Ellipse(e))
+        | (GeomCurve::Ellipse(e), GeomCurve::Line(l)) => Some(line_ellipse(l, e, tol)),
         (GeomCurve::Circle(a), GeomCurve::Circle(b)) => Some(circle_circle(a, b, tol)),
         (GeomCurve::BSpline(a), GeomCurve::BSpline(b)) if a.degree() == 1 && b.degree() == 1 => {
             Some(polyline_polyline_intersections(a.poles(), b.poles(), tol))
@@ -895,7 +958,10 @@ fn curve_curve_refine(
     let mut t = t_start;
     let mut s = s_start;
 
-    for _ in 0..10 {
+    // Near-tangent crossings (a section curve meeting a blend's tangent
+    // edge) converge slowly; the vertex must still land within the kernel's
+    // vertex tolerance of both curves.
+    for _ in 0..60 {
         let (p1, v1) = c1.d1(t);
         let (p2, v2) = c2.d1(s);
 
@@ -905,7 +971,9 @@ fn curve_curve_refine(
         let c = v2.dot(&v2);
 
         let det = a * c - b_coeff * b_coeff;
-        if det.abs() < 1e-12 {
+        // Relative to the tangent lengths, so a curve parameterized by arc
+        // length and one by angle stop at the same near-tangency.
+        if det.abs() <= 1e-14 * a * c {
             // Tangent contact
             break;
         }
@@ -1630,6 +1698,10 @@ fn plane_cylinder_curves(plane: &Plane, cyl: &CylindricalSurface) -> Vec<GeomCur
         ];
     }
 
+    if let Some(lines) = near_parallel_plane_cylinder_lines(plane, cyl) {
+        return lines;
+    }
+
     // Oblique plane ∩ cylinder = an exact ellipse. Emitting the analytic curve
     // (instead of a 160-point sampled B-spline) keeps the imprinted seam exactly
     // on both surfaces, so the cut trims watertight instead of leaving the tiny
@@ -1653,57 +1725,309 @@ fn plane_cylinder_curves(plane: &Plane, cyl: &CylindricalSurface) -> Vec<GeomCur
     vec![GeomCurve::Ellipse(Ellipse::new(frame, major, minor))]
 }
 
+/// A plane within a rounding error of parallel to a cylinder's axis (a wall
+/// built from single-precision sketch points) cuts it in an ellipse whose major
+/// axis is millions of radii long. Over any real face that ellipse is straight
+/// to far below tolerance, but its parameter span there is below the trimming
+/// resolution, so the intersection vanishes. Emit instead the ellipse's tangent
+/// lines where it crosses the plane's own axial station: they lie exactly in
+/// the plane, and leave the cylinder only at second order (curvature
+/// `eps^2 / (r sin^3 t)`), which is bounded here. `None` when the plane is
+/// not nearly parallel or the lines would stray.
+fn near_parallel_plane_cylinder_lines(
+    plane: &Plane,
+    cyl: &CylindricalSurface,
+) -> Option<Vec<GeomCurve>> {
+    /// Largest axis tilt (radians) handled as nearly parallel.
+    const MAX_TILT: f64 = 1.0e-6;
+    /// Half-length over which the lines must hug the cylinder, and how close.
+    const REACH: f64 = 100.0;
+    const STRAY: f64 = 1.0e-8;
+    let axis = cyl.position();
+    let w = GeomVec::from_dir(axis.direction());
+    let n = GeomVec::from_dir(plane.normal());
+    let tilt = w.dot(&n);
+    if tilt.abs() > MAX_TILT {
+        return None;
+    }
+    let r = cyl.radius();
+    // The cross-section through the plane's location.
+    let station = (plane.location() - axis.location()).dot(&w);
+    let center = axis.location() + w * station;
+    let in_section = n - w * tilt;
+    let scale = in_section.magnitude();
+    let toward = in_section * (1.0 / scale);
+    let side = w.cross(&toward);
+    // Points c + r u on the section circle with n.(c + r u - p) = 0.
+    let along = (plane.location() - center).dot(&n) / (r * scale);
+    if along.abs() > 1.0 + 1.0e-9 {
+        return Some(Vec::new());
+    }
+    let across = (1.0 - along * along).max(0.0).sqrt();
+    let curvature = tilt * tilt / (r * across.max(1.0e-3).powi(3));
+    if 0.5 * curvature * REACH * REACH > STRAY {
+        return None;
+    }
+    let line = |u: GeomVec| {
+        let point = center + u * r;
+        // The section curve's tangent: perpendicular to both surface normals.
+        let direction = n.cross(&u).normalized()?;
+        Some(GeomCurve::Line(openrcad_geom::Line::from_point_dir(
+            point, direction,
+        )))
+    };
+    if across <= 1.0e-9 {
+        return Some(line(toward * along.signum()).into_iter().collect());
+    }
+    Some(
+        [
+            line(toward * along + side * across),
+            line(toward * along - side * across),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    )
+}
+
+/// Parallel cylinders meet along rulings: where their cross-section circles
+/// cross in a plane perpendicular to the shared axis direction. Two lines when
+/// the circles cross, one where they touch, none when coaxial (coincident or
+/// nested walls are not a crossing) or apart.
+fn parallel_cylinder_lines(c1: &CylindricalSurface, c2: &CylindricalSurface) -> Vec<GeomCurve> {
+    let axis = GeomVec::from_dir(c1.position().direction());
+    let o1 = c1.position().location();
+    let offset = c2.position().location() - o1;
+    let across = offset - axis * offset.dot(&axis);
+    let distance = across.magnitude();
+    let (r1, r2) = (c1.radius(), c2.radius());
+    let scale = r1.max(r2).max(distance);
+    let touch = 1.0e-9 * scale;
+    if distance <= touch || distance > r1 + r2 + touch || distance < (r1 - r2).abs() - touch {
+        return Vec::new();
+    }
+    let toward = across * (1.0 / distance);
+    // Distance from c1's axis, along `toward`, to the chord through both
+    // crossings, and the chord's half length.
+    let along = (distance * distance + r1 * r1 - r2 * r2) / (2.0 * distance);
+    let half = (r1 * r1 - along * along).max(0.0).sqrt();
+    let foot = o1 + toward * along;
+    let Some(direction) = axis.normalized() else {
+        return Vec::new();
+    };
+    let line = |point: Pnt| GeomCurve::Line(openrcad_geom::Line::from_point_dir(point, direction));
+    if half <= touch {
+        return vec![line(foot)];
+    }
+    let side = axis.cross(&toward) * half;
+    vec![line(foot + side), line(foot - side)]
+}
+
 fn cylinder_cylinder_curves(c1: &CylindricalSurface, c2: &CylindricalSurface) -> Vec<GeomCurve> {
     let w1 = GeomVec::from_dir(c1.position().direction());
     let w2 = GeomVec::from_dir(c2.position().direction());
     if w1.cross(&w2).magnitude() < 1e-9 {
-        return Vec::new();
+        return parallel_cylinder_lines(c1, c2);
     }
 
-    let samples = 768usize;
-    let mut current: [Option<usize>; 2] = [None, None];
-    let mut branches: Vec<Vec<Pnt>> = Vec::new();
-    let max_step = (c1.radius().max(c2.radius()) * 0.35).max(0.25);
-
-    for i in 0..=samples {
-        let u = 2.0 * PI * (i as f64) / (samples as f64);
-        let base = c1.point(u, 0.0);
-        let d = base - c2.position().location();
-        let m = w1 - w2 * w1.dot(&w2);
+    // The point c1(u, v) lies on c2 when its distance from c2's axis is r2:
+    // `qa v^2 + qb(u) v + qc(u) = 0`. `qa = |w1 - (w1.w2) w2|^2` is the squared
+    // sine of the axis angle, so it is positive for non-parallel axes.
+    let m = w1 - w2 * w1.dot(&w2);
+    let qa = m.dot(&m);
+    let coefficients = |u: f64| {
+        let d = c1.point(u, 0.0) - c2.position().location();
         let n = d - w2 * d.dot(&w2);
-        let qa = m.dot(&m);
-        let qb = 2.0 * n.dot(&m);
-        let qc = n.dot(&n) - c2.radius() * c2.radius();
-        let mut roots = solve_quadratic(qa, qb, qc);
-        roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (2.0 * n.dot(&m), n.dot(&n) - c2.radius() * c2.radius())
+    };
+    let discriminant = |u: f64| {
+        let (qb, qc) = coefficients(u);
+        qb * qb - 4.0 * qa * qc
+    };
+    // Both roots, lower first. At a turning point the discriminant is zero and
+    // the two coincide, which is what closes a loop exactly.
+    let roots = |u: f64| {
+        let (qb, qc) = coefficients(u);
+        let s = (qb * qb - 4.0 * qa * qc).max(0.0).sqrt();
+        ((-qb - s) / (2.0 * qa), (-qb + s) / (2.0 * qa))
+    };
 
-        for slot in 0..2 {
-            let Some(&v) = roots.get(slot) else {
-                current[slot] = None;
-                continue;
-            };
-            let p = c1.point(u, v);
-            match current[slot] {
-                Some(branch_idx)
-                    if branches[branch_idx]
-                        .last()
-                        .is_some_and(|prev| prev.distance(&p) <= max_step) =>
-                {
-                    branches[branch_idx].push(p);
-                }
-                _ => {
-                    branches.push(vec![p]);
-                    current[slot] = Some(branches.len() - 1);
-                }
+    // Where the discriminant changes sign the curve turns back in u. Sampling
+    // alone never lands on that point, so a loop traced from samples stops
+    // short of it on both branches and leaves a gap that splitting cannot
+    // close. Locate each turning point by bisection instead.
+    const SAMPLES: usize = 1024;
+    // Starting spans per traced branch; adaptive subdivision adds the rest.
+    const LOOP_SAMPLES: usize = 32;
+    let step = 2.0 * PI / SAMPLES as f64;
+    let positive: Vec<bool> = (0..SAMPLES)
+        .map(|i| discriminant(i as f64 * step) > 0.0)
+        .collect();
+    let mut rising = Vec::new();
+    let mut falling = Vec::new();
+    for i in 0..SAMPLES {
+        let (from, to) = (positive[i], positive[(i + 1) % SAMPLES]);
+        if from == to {
+            continue;
+        }
+        let (mut lo, mut hi) = (i as f64 * step, (i + 1) as f64 * step);
+        for _ in 0..64 {
+            let mid = 0.5 * (lo + hi);
+            if (discriminant(mid) > 0.0) == from {
+                lo = mid;
+            } else {
+                hi = mid;
             }
+        }
+        let turning = 0.5 * (lo + hi);
+        if to {
+            rising.push(turning);
+        } else {
+            falling.push(turning);
         }
     }
 
-    branches
+    // Samples are (u, upper root?) pairs. Each loop is a C1 cubic Hermite
+    // spline through exact points with exact tangents (the cross product of
+    // the two surface normals), subdivided until its quarter points lie within
+    // OFF_SURFACE of both cylinders. A degree-one polyline needs tens of
+    // thousands of points for the same accuracy, and vertices found by
+    // intersecting it with other edges must sit well inside the kernel's 1e-5
+    // vertex and pcurve tolerances.
+    const OFF_SURFACE: f64 = 1.0e-7;
+    let radial = |p: Pnt, cylinder: &CylindricalSurface| {
+        let axis = GeomVec::from_dir(cylinder.position().direction());
+        let d = p - cylinder.position().location();
+        (d - axis * d.dot(&axis), cylinder.radius())
+    };
+    let off_surface = |p: Pnt| {
+        let (r1, radius1) = radial(p, c1);
+        let (r2, radius2) = radial(p, c2);
+        (r1.magnitude() - radius1)
+            .abs()
+            .max((r2.magnitude() - radius2).abs())
+    };
+    let at = |u: f64, upper: bool| {
+        let (lower, higher) = roots(u);
+        let p = c1.point(u, if upper { higher } else { lower });
+        let tangent = radial(p, c1).0.cross(&radial(p, c2).0);
+        let unit = tangent.normalized().map(GeomVec::from_dir);
+        (p, unit.unwrap_or(GeomVec::new(0.0, 0.0, 0.0)))
+    };
+    let trace = |samples: &[(f64, bool)]| -> (Vec<Pnt>, Vec<GeomVec>) {
+        let (p0, t0) = at(samples[0].0, samples[0].1);
+        let (mut points, mut tangents) = (vec![p0], vec![t0]);
+        for pair in samples.windows(2) {
+            let ((u0, _), (u1, upper)) = (pair[0], pair[1]);
+            // Across a turning point the branches meet, so the span from it
+            // runs along the branch it leads into.
+            let start = (
+                *points.last().expect("seeded"),
+                *tangents.last().expect("seeded"),
+            );
+            let mut stack = vec![(u0, start, u1, at(u1, upper), 0)];
+            while let Some((a, (pa, ta), b, (pb, tb), depth)) = stack.pop() {
+                // Orient both tangents along the span before testing it.
+                let chord = pb - pa;
+                let ta = if ta.dot(&chord) < 0.0 { ta * -1.0 } else { ta };
+                let tb = if tb.dot(&chord) < 0.0 { tb * -1.0 } else { tb };
+                let length = chord.magnitude();
+                let (b1, b2) = (pa + ta * (length / 3.0), pb - tb * (length / 3.0));
+                let bezier = |s: f64| {
+                    let r = 1.0 - s;
+                    let w = [r * r * r, 3.0 * r * r * s, 3.0 * r * s * s, s * s * s];
+                    Pnt::new(
+                        w[0] * pa.x() + w[1] * b1.x() + w[2] * b2.x() + w[3] * pb.x(),
+                        w[0] * pa.y() + w[1] * b1.y() + w[2] * b2.y() + w[3] * pb.y(),
+                        w[0] * pa.z() + w[1] * b1.z() + w[2] * b2.z() + w[3] * pb.z(),
+                    )
+                };
+                let error = [0.25, 0.5, 0.75]
+                    .into_iter()
+                    .map(|s| off_surface(bezier(s)))
+                    .fold(0.0, f64::max);
+                if depth < 24 && error > OFF_SURFACE {
+                    let mid = 0.5 * (a + b);
+                    let pm = at(mid, upper);
+                    // Right half first on the stack so the left half pops next.
+                    stack.push((mid, pm, b, (pb, tb), depth + 1));
+                    stack.push((a, (pa, ta), mid, pm, depth + 1));
+                } else {
+                    // Keep each point's tangent oriented along the loop.
+                    *tangents.last_mut().expect("seeded") = ta;
+                    points.push(pb);
+                    tangents.push(tb);
+                }
+            }
+        }
+        // A loop closes on the very same point, not a rounded neighbour.
+        let (first, first_tangent) = (points[0], tangents[0]);
+        *points.last_mut().expect("non-empty") = first;
+        let last = tangents.last_mut().expect("non-empty");
+        if last.dot(&first_tangent) < 0.0 {
+            *last = *last * -1.0;
+        }
+        (points, tangents)
+    };
+
+    let mut loops: Vec<(Vec<Pnt>, Vec<GeomVec>)> = Vec::new();
+    if rising.is_empty() {
+        if !positive[0] {
+            return Vec::new();
+        }
+        // c1 passes right through c2: one closed loop per root.
+        for upper in [false, true] {
+            let samples: Vec<_> = (0..=2 * LOOP_SAMPLES)
+                .map(|i| (i as f64 * PI / LOOP_SAMPLES as f64, upper))
+                .collect();
+            loops.push(trace(&samples));
+        }
+    } else {
+        // Each interval where the discriminant is positive is one loop: out
+        // along the lower root, back along the upper, meeting at both turning
+        // points. Cosine spacing clusters samples there, where v changes like
+        // the square root of the distance in u.
+        for &start in &rising {
+            let Some(end) = falling
+                .iter()
+                .map(|&u| if u > start { u } else { u + 2.0 * PI })
+                .min_by(f64::total_cmp)
+            else {
+                continue;
+            };
+            let u_at = |i: usize| {
+                start + (end - start) * 0.5 * (1.0 - (PI * i as f64 / LOOP_SAMPLES as f64).cos())
+            };
+            let mut samples: Vec<_> = (0..=LOOP_SAMPLES).map(|i| (u_at(i), false)).collect();
+            samples.extend((0..LOOP_SAMPLES).rev().map(|i| (u_at(i), true)));
+            loops.push(trace(&samples));
+        }
+    }
+
+    loops
         .into_iter()
-        .filter(|branch| branch.len() >= 2)
-        .map(|branch| GeomCurve::BSpline(polyline_to_bspline(&branch)))
+        .filter(|(points, _)| points.len() >= 2)
+        .map(|(points, tangents)| GeomCurve::BSpline(hermite_bspline(&points, &tangents)))
         .collect()
+}
+
+/// A C1 cubic B-spline through `points` with unit `tangents`, parameterized by
+/// chord length: each span is the Bezier segment of its Hermite data.
+fn hermite_bspline(points: &[Pnt], tangents: &[GeomVec]) -> BSplineCurve {
+    let mut poles = vec![points[0]];
+    let mut knots = vec![0.0];
+    let mut mults = vec![4];
+    let mut parameter = 0.0;
+    for (span, pair) in points.windows(2).enumerate() {
+        let length = pair[0].distance(&pair[1]).max(1.0e-12);
+        poles.push(pair[0] + tangents[span] * (length / 3.0));
+        poles.push(pair[1] - tangents[span + 1] * (length / 3.0));
+        poles.push(pair[1]);
+        parameter += length;
+        knots.push(parameter);
+        mults.push(if span + 2 == points.len() { 4 } else { 3 });
+    }
+    BSplineCurve::new(3, poles, None, knots, mults)
 }
 
 /// Find intersection curves between two surfaces.
@@ -2269,50 +2593,149 @@ fn search_nearest_parameter_newton(s: &GeomSurface, p: &Pnt, hint: (f64, f64)) -
     (u, v)
 }
 
-/// Sample the boundary `wire` of a face carried by `surface` into a polygon in
-/// the surface's `(u, v)` parameter space. Each edge is sampled in its oriented
+/// One vertex of a sampled boundary loop: its `(u, v)`, and the boundary edge
+/// (index into the wire's edges) and curve parameters of the chord from it to
+/// the next vertex.
+struct LoopSample {
+    uv: (f64, f64),
+    edge: usize,
+    from: f64,
+    to: f64,
+}
+
+/// Shift a periodic `u` onto the `2π` branch nearest `reference`.
+fn unwrap_u(mut u: f64, reference: f64) -> f64 {
+    while u - reference > PI {
+        u -= 2.0 * PI;
+    }
+    while reference - u > PI {
+        u += 2.0 * PI;
+    }
+    u
+}
+
+/// Sample the boundary loop `edges` of a face carried by `surface` in the
+/// surface's `(u, v)` parameter space. Each edge is sampled in its oriented
 /// traversal direction; the angular coordinate is unwrapped so the polygon does
 /// not jump across the `0 / 2π` seam.
-fn loop_uv_polygon(surface: &GeomSurface, wire: &openrcad_topo::Wire) -> Vec<(f64, f64)> {
+fn loop_uv_samples(surface: &GeomSurface, edges: &[openrcad_topo::Edge]) -> Vec<LoopSample> {
     let periodic = !matches!(surface, GeomSurface::Plane(_) | GeomSurface::BSpline(_));
     let samples = 6;
-    let mut poly: Vec<(f64, f64)> = Vec::new();
-    for edge in wire.edges() {
+    let mut poly: Vec<LoopSample> = Vec::new();
+    for (index, edge) in edges.iter().enumerate() {
         let reversed = edge.orientation() == Orientation::Reversed;
         let (a, b) = (edge.first(), edge.last());
-        for i in 0..samples {
+        let at = |i: usize| {
             let frac = i as f64 / samples as f64;
-            let t = if reversed {
+            if reversed {
                 b + (a - b) * frac
             } else {
                 a + (b - a) * frac
-            };
+            }
+        };
+        for i in 0..samples {
+            let t = at(i);
             let p = match edge.curve() {
                 Some(c) => c.point(t),
                 None => edge.start().point(),
             };
             let (mut pu, pv) = uv_of(surface, &p);
             if periodic {
-                if let Some(&(prev_u, _)) = poly.last() {
-                    while pu - prev_u > PI {
-                        pu -= 2.0 * PI;
-                    }
-                    while prev_u - pu > PI {
-                        pu += 2.0 * PI;
-                    }
+                if let Some(previous) = poly.last() {
+                    pu = unwrap_u(pu, previous.uv.0);
                 }
             }
-            poly.push((pu, pv));
+            poly.push(LoopSample {
+                uv: (pu, pv),
+                edge: index,
+                from: t,
+                to: at(i + 1),
+            });
         }
     }
     poly
 }
 
-/// Bring the test angle `u` onto the same `2π` branch as `poly`'s angular range.
+/// Add the points between `p0` and `p1` (the chord over `t0..t1` of `curve`)
+/// needed to decide containment of `query` exactly: a chord is subdivided only
+/// while `query` lies within its sag band, where the chord and the curve can
+/// disagree about which side the query is on.
+#[allow(clippy::too_many_arguments)]
+fn refine_chord(
+    surface: &GeomSurface,
+    curve: &GeomCurve,
+    periodic: bool,
+    (t0, t1): (f64, f64),
+    p0: (f64, f64),
+    p1: (f64, f64),
+    query: (f64, f64),
+    depth: u32,
+    out: &mut Vec<(f64, f64)>,
+) {
+    const MAX_DEPTH: u32 = 30;
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let distance_to_chord = |p: (f64, f64)| {
+        let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+        let length2 = dx * dx + dy * dy;
+        let s = if length2 > 0.0 {
+            (((p.0 - p0.0) * dx + (p.1 - p0.1) * dy) / length2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (p.0 - p0.0 - s * dx).hypot(p.1 - p0.1 - s * dy)
+    };
+    let tm = 0.5 * (t0 + t1);
+    let (mut mu, mv) = uv_of(surface, &curve.point(tm));
+    if periodic {
+        mu = unwrap_u(mu, p0.0);
+    }
+    let mid = (mu, mv);
+    // For an arc the midpoint is the farthest point from the chord; twice its
+    // offset bounds a smooth curve's sag over a span this short.
+    let sag = distance_to_chord(mid);
+    if sag <= 1.0e-12 || distance_to_chord(query) > 2.0 * sag {
+        return;
+    }
+    refine_chord(
+        surface,
+        curve,
+        periodic,
+        (t0, tm),
+        p0,
+        mid,
+        query,
+        depth + 1,
+        out,
+    );
+    out.push(mid);
+    refine_chord(
+        surface,
+        curve,
+        periodic,
+        (tm, t1),
+        mid,
+        p1,
+        query,
+        depth + 1,
+        out,
+    );
+}
+
+/// Bring the test angle `u` onto the same `2π` branch as `poly`'s angular
+/// range. A branch inside the polygon's `u` extent wins; aligning to the mean
+/// alone fails for a face wider than half a turn (a merged hole wall spans
+/// ~335°), where the mean can sit more than π from part of the face.
 fn align_u(u: f64, poly: &[(f64, f64)]) -> f64 {
     if poly.is_empty() {
         return u;
     }
+    let (low, high) = poly
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), p| {
+            (low.min(p.0), high.max(p.0))
+        });
     let mean = poly.iter().map(|p| p.0).sum::<f64>() / poly.len() as f64;
     let mut x = u;
     while x - mean > PI {
@@ -2321,14 +2744,53 @@ fn align_u(u: f64, poly: &[(f64, f64)]) -> f64 {
     while mean - x > PI {
         x += 2.0 * PI;
     }
-    x
+    if (low..=high).contains(&x) {
+        return x;
+    }
+    [x - 2.0 * PI, x + 2.0 * PI]
+        .into_iter()
+        .find(|candidate| (low..=high).contains(candidate))
+        .unwrap_or(x)
 }
 
+/// Whether `(u, v)` lies inside the loop `wire`. The loop is a coarse polygon
+/// except near the query, where curved boundary edges are refined until the
+/// polygon agrees with the true curve on which side the query lies: six
+/// chords on a 120° arc sag 1.5% of its radius, enough to misclassify a point
+/// just inside an intersecting hole.
 fn is_inside_wire_uv(u: f64, v: f64, surface: &GeomSurface, wire: &openrcad_topo::Wire) -> bool {
     let periodic = !matches!(surface, GeomSurface::Plane(_) | GeomSurface::BSpline(_));
-    let polygon = loop_uv_polygon(surface, wire);
-    let aligned_u = if periodic { align_u(u, &polygon) } else { u };
-    point_in_polygon_2d((aligned_u, v), &polygon)
+    let edges = wire.edges();
+    let samples = loop_uv_samples(surface, &edges);
+    let coarse: Vec<(f64, f64)> = samples.iter().map(|sample| sample.uv).collect();
+    let aligned_u = if periodic { align_u(u, &coarse) } else { u };
+    let query = (aligned_u, v);
+    let mut polygon = Vec::with_capacity(coarse.len());
+    for (index, sample) in samples.iter().enumerate() {
+        polygon.push(sample.uv);
+        let Some(curve) = edges[sample.edge].curve() else {
+            continue;
+        };
+        if matches!(curve, GeomCurve::Line(_)) {
+            continue;
+        }
+        let mut next = coarse[(index + 1) % coarse.len()];
+        if periodic {
+            next.0 = unwrap_u(next.0, sample.uv.0);
+        }
+        refine_chord(
+            surface,
+            curve,
+            periodic,
+            (sample.from, sample.to),
+            sample.uv,
+            next,
+            query,
+            0,
+            &mut polygon,
+        );
+    }
+    point_in_polygon_2d(query, &polygon)
 }
 
 /// Checks if a parametric point `(u, v)` lies inside the face's outer trimming
@@ -2598,6 +3060,7 @@ pub fn surface_surface_curves_with_budget_and_cancel(
         // adjacent accepted spans before returning them: periodic face tests can
         // contribute redundant transition parameters at a seam, but those must
         // not turn one continuous intersection into hundreds of split edges.
+        let mut spans: Vec<(f64, f64)> = Vec::new();
         let mut accepted_span: Option<(f64, f64)> = None;
         for i in 0..unique_params.len() - 1 {
             let t1 = unique_params[i];
@@ -2631,18 +3094,37 @@ pub fn surface_surface_curves_with_budget_and_cancel(
                 match accepted_span.as_mut() {
                     Some((_, end)) if (t1 - *end).abs() <= tol.max(1.0e-8) => *end = t2,
                     Some(_) => {
-                        let (first, last) = accepted_span.replace((t1, t2)).unwrap();
-                        trimmed_curves.push((curve.clone(), first, last));
+                        spans.extend(accepted_span.replace((t1, t2)));
                     }
                     None => accepted_span = Some((t1, t2)),
                 }
-            } else if let Some((first, last)) = accepted_span.take() {
-                trimmed_curves.push((curve.clone(), first, last));
+            } else if let Some(span) = accepted_span.take() {
+                spans.push(span);
             }
         }
-        if let Some((first, last)) = accepted_span {
-            trimmed_curves.push((curve, first, last));
+        spans.extend(accepted_span);
+        // A periodic section (a circle where a plane crosses a cylinder) is
+        // searched over one period starting at an arbitrary origin. When the
+        // kept arc runs through that origin it arrives as two spans, each with
+        // one end on no boundary; imprinting them leaves a chain through an
+        // interior seam vertex that a face partition cannot use. Join them
+        // into one span running past the period end.
+        if spans.len() >= 2 && curve.is_periodic() {
+            let period = curve.period();
+            let wraps = (spans[0].0 - c_min).abs() <= tol.max(1.0e-8)
+                && (spans[spans.len() - 1].1 - c_max).abs() <= tol.max(1.0e-8)
+                && ((c_max - c_min) - period).abs() <= tol.max(1.0e-8);
+            if wraps {
+                let (_, head_end) = spans.remove(0);
+                let tail = spans.last_mut().expect("two spans");
+                tail.1 = head_end + period;
+            }
         }
+        trimmed_curves.extend(
+            spans
+                .into_iter()
+                .map(|(first, last)| (curve.clone(), first, last)),
+        );
     }
 
     Ok(trimmed_curves)
@@ -2869,6 +3351,41 @@ mod tests {
     }
 
     #[test]
+    fn line_ellipse_crossings_are_exact_far_along_the_line() {
+        use openrcad_foundation::Ax3;
+        let ellipse = GeomCurve::Ellipse(Ellipse::new(
+            Ax3::new_axes(Pnt::new(2.0, -1.0, 9.0), Dir::dz(), Dir::new(0.8, 0.6, 0.0)),
+            3.4,
+            2.7,
+        ));
+        // A point on the ellipse, and a tilted line through it whose
+        // parameter there is ~150: past the subdivision search's window.
+        let target = ellipse.point(1.234);
+        let direction = Dir::new(-0.49, 0.37, 0.79);
+        let origin = target - GeomVec::from_dir(direction) * 150.0;
+        let line = GeomCurve::Line(Line::new(Ax1::new(origin, direction)));
+        let hits = curve_curve(&line, &ellipse, 1e-5);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].distance(&target) < 1e-9,
+            "{:?} vs {target:?}",
+            hits[0]
+        );
+
+        // In the ellipse's plane: a chord through the centre meets it twice,
+        // at the ends of the semi-axis it runs along.
+        let chord = GeomCurve::Line(Line::new(Ax1::new(
+            Pnt::new(2.0, -1.0, 9.0) - GeomVec::new(0.8, 0.6, 0.0) * 120.0,
+            Dir::new(0.8, 0.6, 0.0),
+        )));
+        let hits = curve_curve(&chord, &ellipse, 1e-5);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for hit in hits {
+            assert!((hit.distance(&Pnt::new(2.0, -1.0, 9.0)) - 3.4).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn analytic_line_line_crossing_and_skew() {
         use openrcad_foundation::Ax3;
         use openrcad_geom::Circle;
@@ -3058,6 +3575,70 @@ mod tests {
         heights.sort_by(f64::total_cmp);
         assert!((heights[0] - 2.0).abs() <= 1.0e-12);
         assert!((heights[1] - 6.0).abs() <= 1.0e-12);
+    }
+
+    /// A floor line from a single-precision wall (direction tilted 1e-8 out
+    /// of the floor, offset 1.3e-7 from the hole rim's plane) still crosses
+    /// the rim twice. Found by the ZeroCAD join/cut census (chains 373, 405):
+    /// the tilt sent the line down the "pierces the plane far away" branch,
+    /// the crossing was lost, and a slot's floor line overran into the hole.
+    #[test]
+    fn line_a_rounding_off_a_circles_plane_still_crosses_it() {
+        use openrcad_foundation::{Ax3, Dir};
+        let circle = Circle::new(
+            Ax3::new_axes(Pnt::new(28.89, 15.53, 2.8445082957), Dir::dz(), Dir::dx()),
+            5.88,
+        );
+        let direction = Dir::from_vec(&GeomVec::new(-1.0, 0.0, 1.0e-8)).unwrap();
+        let line =
+            openrcad_geom::Line::from_point_dir(Pnt::new(0.0, 11.255, 2.8445084295), direction);
+        let hits = curve_curve(&GeomCurve::Circle(circle), &GeomCurve::Line(line), 1e-7);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for hit in hits {
+            let radial = (hit.x() - 28.89).hypot(hit.y() - 15.53);
+            assert!((radial - 5.88).abs() < 1e-6, "off the rim: {hit:?}");
+        }
+    }
+
+    /// A wall a rounding error off parallel to a hole's axis (found by the
+    /// ZeroCAD join/cut census: a slot side 1.04e-7 rad off vertical) must
+    /// still meet the hole in two straight lines on both surfaces, not an
+    /// ellipse too long to trim.
+    #[test]
+    fn nearly_parallel_plane_cuts_a_cylinder_in_two_lines() {
+        use openrcad_foundation::{Ax3, Dir};
+        use openrcad_geom::CylindricalSurface;
+        let r = 8.0;
+        let cyl = GeomSurface::Cylinder(CylindricalSurface::new(
+            Ax3::new(Pnt::new(7.0, 6.0, -2.0), Dir::dz()),
+            r,
+        ));
+        for tilt in [1.04e-7, 6.0e-7] {
+            let n = Dir::from_vec(&GeomVec::new(1.0, 0.0, tilt)).unwrap();
+            let location = Pnt::new(2.5, -2.0, 4.3);
+            let plane = GeomSurface::Plane(Plane::from_point_normal(location, n));
+            let curves = surface_surface(&plane, &cyl, 1e-7);
+            assert_eq!(curves.len(), 2, "tilt {tilt}: {curves:?}");
+            for curve in &curves {
+                assert!(matches!(curve, GeomCurve::Line(_)), "{curve:?}");
+                // Sample 50 mm either side of the plane's station.
+                let (origin, _) = curve.d1(0.0);
+                for t in [-50.0, 0.0, 50.0] {
+                    let p = curve.point(t - (origin.z() - location.z()));
+                    let radial = ((p.x() - 7.0).powi(2) + (p.y() - 6.0).powi(2)).sqrt();
+                    assert!(
+                        (radial - r).abs() < 1e-9,
+                        "tilt {tilt}: off cylinder by {}",
+                        radial - r
+                    );
+                    let on_plane = GeomVec::from_dir(n).dot(&(p - location));
+                    assert!(
+                        on_plane.abs() < 1e-12,
+                        "tilt {tilt}: off plane by {on_plane}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

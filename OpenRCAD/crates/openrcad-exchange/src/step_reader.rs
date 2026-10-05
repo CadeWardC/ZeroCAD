@@ -1065,7 +1065,7 @@ fn parse_curve(id: u32, entities: &HashMap<u32, StepEntity>) -> Result<GeomCurve
                 Err("Invalid HYPERBOLA arguments".to_string())
             }
             "B_SPLINE_CURVE_WITH_KNOTS" => {
-                if args.len() >= 10 {
+                if args.len() >= 9 {
                     let degree = match args[1] {
                         StepValue::Integer(i) => i as usize,
                         _ => 1,
@@ -2376,6 +2376,46 @@ mod tests {
 
     fn numbers(values: &[f64]) -> StepValue {
         StepValue::List(values.iter().copied().map(StepValue::Real).collect())
+    }
+
+    /// `B_SPLINE_CURVE_WITH_KNOTS` has nine arguments (name, degree, poles,
+    /// form, closed, self-intersect, multiplicities, knots, knot spec). The
+    /// reader demanded ten and rejected every simple-form curve, including
+    /// the writer's own output.
+    #[test]
+    fn simple_bspline_curve_with_knots_parses() {
+        let mut entities = HashMap::new();
+        entities.insert(
+            1,
+            entity("CARTESIAN_POINT", vec![string(), numbers(&[0.0, 0.0, 0.0])]),
+        );
+        entities.insert(
+            2,
+            entity("CARTESIAN_POINT", vec![string(), numbers(&[3.0, 4.0, 0.0])]),
+        );
+        let integers = |values: &[i64]| {
+            StepValue::List(values.iter().copied().map(StepValue::Integer).collect())
+        };
+        entities.insert(
+            3,
+            entity(
+                "B_SPLINE_CURVE_WITH_KNOTS",
+                vec![
+                    string(),
+                    StepValue::Integer(1),
+                    StepValue::List(vec![StepValue::Ref(1), StepValue::Ref(2)]),
+                    StepValue::Enum("UNSPECIFIED".to_string()),
+                    StepValue::Enum("F".to_string()),
+                    StepValue::Enum("F".to_string()),
+                    integers(&[2, 2]),
+                    numbers(&[0.0, 5.0]),
+                    StepValue::Enum("UNSPECIFIED".to_string()),
+                ],
+            ),
+        );
+        let curve = parse_curve(3, &entities).expect("a nine-argument B-spline curve");
+        let end = curve.point(5.0);
+        assert!((end.x() - 3.0).abs() < 1e-12 && (end.y() - 4.0).abs() < 1e-12);
     }
 
     #[test]

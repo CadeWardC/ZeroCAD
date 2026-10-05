@@ -18,8 +18,13 @@ use openrcad_topo::{BRepBuilder, Face, FaceId, LoopId, Orientation};
 use crate::boolean::project_point_on_curve;
 use crate::intersect::{curve_curve, is_inside_trimming_loops, uv_of};
 
+/// Tolerance carried by imprinted edges and vertices: the intersection
+/// tolerance itself. It used to be floored at 1e-4, but an edge no longer
+/// than its own tolerance is degenerate, so a later boolean crossing an
+/// imprinted rim within 1e-4 of a corner left a legitimate short piece that
+/// failed validation (a cylinder fused next to a drafted pocket's corner).
 fn imprint_tolerance(tol: f64) -> f64 {
-    tol.max(1e-4)
+    tol
 }
 
 /// Imprint `curve` onto `face_id` and return the resulting sub-face ids.

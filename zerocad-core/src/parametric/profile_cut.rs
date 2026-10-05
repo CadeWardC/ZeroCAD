@@ -111,23 +111,47 @@ pub(super) fn try_profile_difference(
     try_profile_cut(body, &tools?).map(|(parts, _)| parts)
 }
 
-pub(super) fn try_profile_cut(
-    body: &LiveBody,
+/// Which sweep of a cut tool a section plan subtracts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CutSweep {
+    /// The drawn sweep when it reaches the body, else the reverse one: the
+    /// sectional path's own direction rule.
+    ForwardFirst,
+    /// Exactly the sweep a general-boolean cut already applied.
+    Applied { reverse: bool },
+}
+
+/// A body's retained prisms and the cut tools, resolved into arrangement cells
+/// and constant-depth layers. Planning builds no solids, so a cut that the
+/// general boolean performed can still derive the body's next record.
+struct SectionPlan<'a> {
+    source: &'a SketchExtrudeRegionSource,
+    sign: f32,
+    cells: Vec<Region>,
+    levels: Vec<f32>,
+    /// Per layer (`levels.windows(2)`), which cells hold material.
+    masks: Vec<Vec<bool>>,
+}
+
+const SECTION_TOL: f32 = 1.0e-4;
+
+fn plan_profile_cut<'a>(
+    retained: &'a SketchExtrudeSource,
     tools: &[CutTool],
-) -> Option<(Vec<KernelSolid>, SketchExtrudeSource)> {
-    let retained = body.sketch_source.as_ref()?;
+    sweep: CutSweep,
+) -> Option<SectionPlan<'a>> {
     let sources: Vec<_> = retained
         .regions
         .iter()
         .chain(&retained.joined_prisms)
         .collect();
     let source = *sources.first()?;
-    if body.parts.len() != 1 || tools.is_empty() || !source.depth.is_finite() {
+    if tools.is_empty() || !source.depth.is_finite() {
         return None;
     }
     let length = source.depth.abs();
     let sign = source.depth.signum();
-    const TOL: f32 = 1.0e-4;
+    const TOL: f32 = SECTION_TOL;
     if length <= TOL {
         return None;
     }
@@ -149,11 +173,13 @@ pub(super) fn try_profile_cut(
     let low = levels.iter().copied().fold(f32::INFINITY, f32::min);
     let high = levels.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for tool in tools {
+        let sweeps = match sweep {
+            CutSweep::ForwardFirst => [tool.exact_source.as_ref(), tool.exact_rev_source.as_ref()],
+            CutSweep::Applied { reverse: false } => [tool.exact_source.as_ref(), None],
+            CutSweep::Applied { reverse: true } => [tool.exact_rev_source.as_ref(), None],
+        };
         let mut candidates = Vec::new();
-        for exact in [tool.exact_source.as_ref(), tool.exact_rev_source.as_ref()]
-            .into_iter()
-            .flatten()
-        {
+        for exact in sweeps.into_iter().flatten() {
             if !exact.depth.is_finite() || exact.cs.n.cross(source.cs.n).length() > 1.0e-6 {
                 continue;
             }
@@ -188,7 +214,7 @@ pub(super) fn try_profile_cut(
     )
     .ok()?;
     let cells: Vec<_> = arranged.regions.into_iter().map(from_analytic).collect();
-    let probes: Vec<_> = cells.iter().map(region_material_point).collect();
+    let probes: Vec<_> = cells.iter().map(cell_probe_point).collect();
     let footprint_masks: Vec<Vec<_>> = profiles
         .iter()
         .map(|r| probes.iter().map(|&p| r.contains(p)).collect())
@@ -214,125 +240,157 @@ pub(super) fn try_profile_cut(
                 .collect()
         })
         .collect();
-    let build = |mask: &[bool], lo: f32, hi: f32| -> Option<Vec<KernelSolid>> {
-        let cs = source
-            .cs
-            .with_origin(source.cs.origin.add(source.cs.n.mul(sign * lo)));
-        let prepared = prepare_extrude_regions(&cells, mask);
-        prepared
-            .into_iter()
-            .map(|p| {
-                let solid = match p.region.analytic.as_ref() {
-                    Some(analytic) => crate::mock_kernel::build_analytic_section_solid(
-                        analytic,
-                        f64::from(sign * (hi - lo)),
-                        &cs,
-                    ),
-                    None => crate::mock_kernel::extruded_sketch_region_solid(
-                        &p.region,
-                        sign * (hi - lo),
-                        &cs,
-                        &[],
-                    ),
-                };
-                if solid.is_none() {
-                    recut_debug(format!(
-                        "profile cut: failed section {lo}..{hi}, area {}",
-                        p.region.area
-                    ));
-                }
-                solid
-            })
-            .collect()
-    };
-    let at_height = |face: &Face, h: f32| {
-        planar_section_height(face, &source.cs).is_some_and(|v| (v - sign * h).abs() < TOL)
-    };
-    let mut faces = Vec::new();
-    let mut remaining_prisms = Vec::new();
-    for (layer, pair) in levels.windows(2).enumerate() {
-        let cs = source
-            .cs
-            .with_origin(source.cs.origin.add(source.cs.n.mul(sign * pair[0])));
-        for prepared in prepare_extrude_regions(&cells, &masks[layer]) {
-            remaining_prisms.push(SketchExtrudeRegionSource {
-                boundary: prepared.region.boundary,
-                holes: prepared.region.holes,
-                analytic: prepared.region.analytic,
-                depth: sign * (pair[1] - pair[0]),
-                cs,
-                rect_circle: None,
-            });
+    Some(SectionPlan {
+        source,
+        sign,
+        cells,
+        levels,
+        masks,
+    })
+}
+
+impl SectionPlan<'_> {
+    fn layer_cs(&self, height: f32) -> CoordinateSystem {
+        let cs = self.source.cs;
+        cs.with_origin(cs.origin.add(cs.n.mul(self.sign * height)))
+    }
+
+    /// The remaining material as constant-depth prisms, one per layer region.
+    fn record(&self) -> SketchExtrudeSource {
+        let mut remaining_prisms = Vec::new();
+        for (layer, pair) in self.levels.windows(2).enumerate() {
+            let cs = self.layer_cs(pair[0]);
+            for prepared in prepare_extrude_regions(&self.cells, &self.masks[layer]) {
+                remaining_prisms.push(SketchExtrudeRegionSource {
+                    boundary: prepared.region.boundary,
+                    holes: prepared.region.holes,
+                    analytic: prepared.region.analytic,
+                    depth: self.sign * (pair[1] - pair[0]),
+                    cs,
+                    rect_circle: None,
+                });
+            }
         }
-        for solid in build(&masks[layer], pair[0], pair[1])? {
-            faces.extend(
-                solid
-                    .shell()
-                    .faces()
-                    .into_iter()
-                    .filter(|f| !at_height(f, pair[0]) && !at_height(f, pair[1])),
-            );
+        SketchExtrudeSource {
+            regions: Vec::new(),
+            joined_prisms: remaining_prisms,
         }
     }
-    let empty = vec![false; cells.len()];
-    for (level, &height) in levels.iter().enumerate() {
-        let below = if level == 0 {
-            &empty
-        } else {
-            &masks[level - 1]
+
+    /// Sweep every layer, keep only exposed boundaries, and sew one validated
+    /// solid per lump.
+    fn build_parts(&self) -> Option<Vec<KernelSolid>> {
+        const TOL: f32 = SECTION_TOL;
+        let (sign, source) = (self.sign, self.source);
+        let build = |mask: &[bool], lo: f32, hi: f32| -> Option<Vec<KernelSolid>> {
+            let cs = self.layer_cs(lo);
+            let prepared = prepare_extrude_regions(&self.cells, mask);
+            prepared
+                .into_iter()
+                .map(|p| {
+                    let solid = match p.region.analytic.as_ref() {
+                        Some(analytic) => crate::mock_kernel::build_analytic_section_solid(
+                            analytic,
+                            f64::from(sign * (hi - lo)),
+                            &cs,
+                        ),
+                        None => crate::mock_kernel::extruded_sketch_region_solid(
+                            &p.region,
+                            sign * (hi - lo),
+                            &cs,
+                            &[],
+                        ),
+                    };
+                    if solid.is_none() {
+                        recut_debug(format!(
+                            "profile cut: failed section {lo}..{hi}, area {}",
+                            p.region.area
+                        ));
+                    }
+                    solid
+                })
+                .collect()
         };
-        let above = masks.get(level).unwrap_or(&empty);
-        for (material, void, upper) in [(below, above, true), (above, below, false)] {
-            let exposed: Vec<_> = material.iter().zip(void).map(|(&a, &b)| a && !b).collect();
-            // A one-unit helper prism supplies the cap with the correct outward
-            // sense for either sweep direction; only that cap enters the shell.
-            let (lo, hi) = if upper {
-                (height - 1., height)
-            } else {
-                (height, height + 1.)
-            };
-            for solid in build(&exposed, lo, hi)? {
+        let at_height = |face: &Face, h: f32| {
+            planar_section_height(face, &source.cs).is_some_and(|v| (v - sign * h).abs() < TOL)
+        };
+        let mut faces = Vec::new();
+        for (layer, pair) in self.levels.windows(2).enumerate() {
+            for solid in build(&self.masks[layer], pair[0], pair[1])? {
                 faces.extend(
                     solid
                         .shell()
                         .faces()
                         .into_iter()
-                        .filter(|f| at_height(f, height)),
+                        .filter(|f| !at_height(f, pair[0]) && !at_height(f, pair[1])),
                 );
             }
         }
+        let empty = vec![false; self.cells.len()];
+        for (level, &height) in self.levels.iter().enumerate() {
+            let below = if level == 0 {
+                &empty
+            } else {
+                &self.masks[level - 1]
+            };
+            let above = self.masks.get(level).unwrap_or(&empty);
+            for (material, void, upper) in [(below, above, true), (above, below, false)] {
+                let exposed: Vec<_> = material.iter().zip(void).map(|(&a, &b)| a && !b).collect();
+                // A one-unit helper prism supplies the cap with the correct outward
+                // sense for either sweep direction; only that cap enters the shell.
+                let (lo, hi) = if upper {
+                    (height - 1., height)
+                } else {
+                    (height, height + 1.)
+                };
+                for solid in build(&exposed, lo, hi)? {
+                    faces.extend(
+                        solid
+                            .shell()
+                            .faces()
+                            .into_iter()
+                            .filter(|f| at_height(f, height)),
+                    );
+                }
+            }
+        }
+        if faces.is_empty() {
+            return Some(Vec::new());
+        }
+        // A cut may sever the body; each lump is sewn and strictly validated on
+        // its own, since one shell holding several lumps fails the single-solid gate.
+        let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+        Some(
+            openrcad::algo::sew_bodies_with_policy(&faces, &policy)
+                .map_err(|e| recut_debug(format!("profile cut: sew failed {e:?}")))
+                .ok()?
+                .into_iter()
+                .map(|body| KernelSolid::new(body.value))
+                .collect(),
+        )
     }
-    if faces.is_empty() {
-        return Some((
-            Vec::new(),
-            SketchExtrudeSource {
-                regions: Vec::new(),
-                joined_prisms: Vec::new(),
-            },
-        ));
-    }
-    let policy = openrcad::foundation::TolerancePolicy::STANDARD;
-    let shell = openrcad::algo::sew_with_policy(&faces, &policy)
-        .map_err(|e| recut_debug(format!("profile cut: sew failed {e:?}")))
-        .ok()?
-        .value;
-    let solid = KernelSolid::new(shell);
-    if !solid.is_watertight()
-        || !solid.health_report().is_healthy()
-        || solid.validate_strict_with_policy(&policy).is_err()
-    {
-        recut_debug(format!(
-            "profile cut: invalid sew {:?}, {:?}",
-            solid.health_report(),
-            solid.validate_strict_with_policy(&policy)
-        ));
+}
+
+/// The record describes every lump of the body, so a body earlier cuts
+/// severed is rebuilt whole, one validated solid per resulting lump.
+pub(super) fn try_profile_cut(
+    body: &LiveBody,
+    tools: &[CutTool],
+) -> Option<(Vec<KernelSolid>, SketchExtrudeSource)> {
+    if body.parts.is_empty() {
         return None;
     }
-    Some((
-        solid.split_disconnected(),
-        SketchExtrudeSource {
-            regions: Vec::new(),
-            joined_prisms: remaining_prisms,
-        },
-    ))
+    let plan = plan_profile_cut(body.sketch_source.as_ref()?, tools, CutSweep::ForwardFirst)?;
+    Some((plan.build_parts()?, plan.record()))
+}
+
+/// The prism record of `retained` minus `tool` swept as `sweep`, without
+/// building solids. Keeps a body on the exact sectional path after a cut that
+/// the general boolean had to perform.
+pub(super) fn profile_cut_record(
+    retained: &SketchExtrudeSource,
+    tool: &CutTool,
+    sweep: CutSweep,
+) -> Option<SketchExtrudeSource> {
+    plan_profile_cut(retained, std::slice::from_ref(tool), sweep).map(|plan| plan.record())
 }

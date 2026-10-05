@@ -583,6 +583,15 @@ pub fn sew(faces: &[Face], tol: f64) -> Shell {
     sew::sew(faces, tol)
 }
 
+/// Sew faces that may bound several disjoint bodies into one validated shell
+/// per body (see [`sew::sew_bodies_with_policy`]).
+pub fn sew_bodies_with_policy(
+    faces: &[Face],
+    policy: &openrcad_foundation::TolerancePolicy,
+) -> Result<Vec<openrcad_topo::OperationResult<Shell>>, SewError> {
+    sew::sew_bodies_with_policy(faces, policy)
+}
+
 /// Sew a collection of faces using one validated document tolerance policy.
 pub fn sew_with_policy(
     faces: &[Face],

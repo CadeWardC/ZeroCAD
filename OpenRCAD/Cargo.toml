@@ -104,3 +104,13 @@ codegen-units = 1
 strip = true
 opt-level = 3
 panic = "unwind"
+
+# Full-suite test profile (`cargo test-fast`): optimized geometry with debug
+# assertions and overflow checks still on (inherited from dev).
+[profile.fast-test]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.fast-test.package."*"]
+opt-level = 2

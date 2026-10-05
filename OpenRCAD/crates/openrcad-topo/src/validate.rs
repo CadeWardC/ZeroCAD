@@ -315,6 +315,58 @@ fn validate_uv_loop(
     loop_id: LoopId,
     policy: &TolerancePolicy,
 ) -> Result<(), ValidationError> {
+    let chords = uv_loop_polyline(brep, face_id, surface, loop_id, policy, false)?;
+    if !polyline_self_intersects(&chords, policy) {
+        return Ok(());
+    }
+    // The fast pass stands each curved pcurve in for its endpoint chord, so a
+    // wide arc's chord can cross a neighbouring edge that the arc itself never
+    // meets (a circle wrapping a reflex corner). Re-judge with curved pcurves
+    // subdivided before rejecting the loop.
+    let refined = uv_loop_polyline(brep, face_id, surface, loop_id, policy, true)?;
+    if polyline_self_intersects(&refined, policy) {
+        return Err(ValidationError::UvLoopSelfIntersection { loop_id });
+    }
+    Ok(())
+}
+
+/// Chord segments per curved pcurve for the refined self-intersection pass.
+/// Conics are cut so each chord sags at most `REFINED_SAG` from the curve: a
+/// fixed angle step left a 0.2 mm sag on an 11 mm arc, so the chord still
+/// crossed a block corner the arc clears by 0.12 mm (a boss overhanging the
+/// corner). Free-form curves use a fixed count. This pass runs only when the
+/// endpoint-chord pass already suspects a crossing.
+fn uv_subdivisions(pcurve: &crate::pcurve::PcurveData) -> usize {
+    use openrcad_geom2d::GeomCurve2d;
+    const REFINED_SAG: f64 = 1.0e-4;
+    const MAX_SEGMENTS: usize = 1024;
+    // The tightest radius of curvature along the conic.
+    let radius = match &pcurve.curve {
+        GeomCurve2d::Line(_) => return 1,
+        GeomCurve2d::Circle(circle) => circle.radius(),
+        GeomCurve2d::Ellipse(ellipse) => {
+            ellipse.minor_radius().powi(2) / ellipse.major_radius().max(f64::MIN_POSITIVE)
+        }
+        _ => return 8,
+    };
+    let span = (pcurve.last - pcurve.first).abs();
+    let step = 2.0 * (1.0 - (REFINED_SAG / radius.max(f64::MIN_POSITIVE)).min(1.0)).acos();
+    if step.is_nan() || step <= 0.0 || !span.is_finite() {
+        return MAX_SEGMENTS;
+    }
+    ((span / step).ceil() as usize).clamp(2, MAX_SEGMENTS)
+}
+
+/// The loop's parameter-space polyline, periodic branches aligned. With
+/// `refine`, curved pcurves contribute interior samples, not just endpoints.
+fn uv_loop_polyline(
+    brep: &BRep,
+    face_id: FaceId,
+    surface: &GeomSurface,
+    loop_id: LoopId,
+    policy: &TolerancePolicy,
+    refine: bool,
+) -> Result<Vec<Pnt2d>, ValidationError> {
     let wire = brep
         .loops
         .get(loop_id)
@@ -353,11 +405,12 @@ fn validate_uv_loop(
             (pcurve.point_at_fraction(0.0), pcurve.point_at_fraction(1.0))
         };
         first_periodicity.get_or_insert(pcurve.periodicity);
+        let (mut offset_x, mut offset_y) = (0.0, 0.0);
         if let Some(&previous) = vertices.last() {
             let aligned_x = align_periodic(start.x(), previous.x(), pcurve.periodicity.u_period);
             let aligned_y = align_periodic(start.y(), previous.y(), pcurve.periodicity.v_period);
-            let offset_x = aligned_x - start.x();
-            let offset_y = aligned_y - start.y();
+            offset_x = aligned_x - start.x();
+            offset_y = aligned_y - start.y();
             start = Pnt2d::new(aligned_x, aligned_y);
             end = Pnt2d::new(end.x() + offset_x, end.y() + offset_y);
             let gap = start.distance(&previous);
@@ -387,6 +440,19 @@ fn validate_uv_loop(
             }
         } else {
             vertices.push(start);
+        }
+        if refine {
+            let segments = uv_subdivisions(pcurve);
+            for step in 1..segments {
+                let fraction = step as f64 / segments as f64;
+                let fraction = if coedge.orientation == Orientation::Reversed {
+                    1.0 - fraction
+                } else {
+                    fraction
+                };
+                let point = pcurve.point_at_fraction(fraction);
+                vertices.push(Pnt2d::new(point.x() + offset_x, point.y() + offset_y));
+            }
         }
         vertices.push(end);
         previous_edge_tolerance = Some(edge_tolerance);
@@ -431,8 +497,11 @@ fn validate_uv_loop(
         // self-intersection pass.
         *last = closed;
     }
+    Ok(vertices)
+}
 
-    let segment_count = vertices.len() - 1;
+fn polyline_self_intersects(vertices: &[Pnt2d], policy: &TolerancePolicy) -> bool {
+    let segment_count = vertices.len().saturating_sub(1);
     for first_index in 0..segment_count {
         for second_index in (first_index + 1)..segment_count {
             let adjacent = second_index == first_index + 1
@@ -447,11 +516,11 @@ fn validate_uv_loop(
                 vertices[second_index + 1],
                 policy.pcurve_consistency,
             ) {
-                return Err(ValidationError::UvLoopSelfIntersection { loop_id });
+                return true;
             }
         }
     }
-    Ok(())
+    false
 }
 
 fn segments_cross(a: Pnt2d, b: Pnt2d, c: Pnt2d, d: Pnt2d, tolerance: f64) -> bool {
@@ -1017,6 +1086,17 @@ mod tests {
     use openrcad_foundation::{Dir2d, Pnt2d, Trsf, Vec as GeomVec};
     use openrcad_geom::{GeomSurface, Plane};
     use openrcad_geom2d::{GeomCurve2d, Line2d};
+
+    #[test]
+    fn polyline_crossing_still_detects_a_real_bowtie() {
+        let policy = TolerancePolicy::STANDARD;
+        let square = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+            .map(|(x, y)| Pnt2d::new(x, y));
+        let bowtie = [(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]
+            .map(|(x, y)| Pnt2d::new(x, y));
+        assert!(!polyline_self_intersects(&square, &policy));
+        assert!(polyline_self_intersects(&bowtie, &policy));
+    }
 
     fn square_with_pcurves(offset_y: f64) -> Solid {
         let face = Face::new(

@@ -592,86 +592,69 @@ fn hole_diameter_equal_to_body_width() {
     let _ = warnings;
 }
 
-// E16 remains unsupported: the second overlapping cut is rejected with an
-// attributed warning and the first bore preserved, for both feature paths.
-// Two r=4 bores 5 mm apart should remove ~875 mm³; the preserved first bore
-// removes ~503 mm³. This tests safe rejection, not overlapping-cut support.
-#[test]
-fn unsupported_overlapping_second_cut_warns_and_preserves_material() {
-    // Hole variant: warns, preserves the crescent.
-    let mut g = ParametricGraph::new();
-    add_box(&mut g, "box_1", 30.0, 30.0, 10.0);
-    add_hole(
-        &mut g,
-        "hole_2",
-        "box_1",
-        [15.0, 15.0, 10.0],
-        [0.0, 0.0, -1.0],
-        8.0,
-        None,
-        zerocad_core::HoleKind::Simple,
+// E16: a second cut overlapping the first bore removes the new crescent, for
+// both feature paths. Two r=4 bores 5 mm apart in a 30x30x10 block remove the
+// union area 2*pi*r^2 - lens times the height (~875 mm^3), not only the first
+// bore (~503 mm^3). Probes check the crescent itself, not just the volume.
+fn assert_overlapping_bores_removed(bodies: &[(String, zerocad_core::MockMesh)], second: &str) {
+    assert_meshes_finite(bodies);
+    let (r, s, height) = (4.0_f64, 5.0_f64, 10.0_f64);
+    let lens = 2.0 * r * r * (s / (2.0 * r)).acos() - 0.5 * s * (4.0 * r * r - s * s).sqrt();
+    let union = 2.0 * std::f64::consts::PI * r * r - lens;
+    let expected = 30.0 * 30.0 * 10.0 - union * height;
+    assert_close(
+        total_volume(bodies),
+        expected,
+        1.0,
+        0.005,
+        &format!("block minus both bores ({second})"),
     );
-    add_hole(
-        &mut g,
-        "hole_3",
-        "box_1",
-        [20.0, 15.0, 10.0],
-        [0.0, 0.0, -1.0],
-        8.0,
-        None,
-        zerocad_core::HoleKind::Simple,
+    assert_eq!(bodies.len(), 1, "{second}: the block stays one body");
+    assert_occupancy(
+        &bodies[0].1,
+        &[[5.0, 5.0, 5.0], [15.0, 21.0, 5.0], [25.0, 25.0, 5.0]],
+        &[[15.0, 15.0, 5.0], [22.5, 15.0, 5.0], [23.0, 16.0, 2.0]],
     );
-    let (bodies, warnings) = g
-        .evaluate_bodies_with_warnings(&HashSet::new())
-        .expect("must not hard-fail");
-    assert_meshes_finite(&bodies);
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("hole_3") && w.contains("original material was preserved")),
-        "second overlapping hole currently fails: {warnings:?}"
-    );
-    let v = total_volume(&bodies);
-    let one_bore = 9000.0 - std::f64::consts::PI * 16.0 * 10.0;
-    assert!(
-        (v - one_bore).abs() / one_bore < 0.02,
-        "pinning current behavior: only the first bore removed ({v}); lens-union would be {}",
-        9000.0 - 87.5 * 10.0
-    );
+}
 
-    // Cut-extrude variant must also report the rejected operation.
+#[test]
+fn overlapping_second_cut_removes_the_crescent() {
     let mut g = ParametricGraph::new();
     add_box(&mut g, "box_1", 30.0, 30.0, 10.0);
-    add_sketch_cs(
-        &mut g,
-        "sk_2",
-        xy_plane_at(10.0),
-        circle_sketch((15.0, 15.0), 4.0),
-    );
-    add_extrude(&mut g, "cut_3", "sk_2", -10.0, ExtrudeMode::Cut);
-    add_sketch_cs(
-        &mut g,
-        "sk_4",
-        xy_plane_at(10.0),
-        circle_sketch((20.0, 15.0), 4.0),
-    );
-    add_extrude(&mut g, "cut_5", "sk_4", -10.0, ExtrudeMode::Cut);
+    for (id, x) in [("hole_2", 15.0), ("hole_3", 20.0)] {
+        add_hole(
+            &mut g,
+            id,
+            "box_1",
+            [x, 15.0, 10.0],
+            [0.0, 0.0, -1.0],
+            8.0,
+            None,
+            zerocad_core::HoleKind::Simple,
+        );
+    }
     let (bodies, warnings) = g
         .evaluate_bodies_with_warnings(&HashSet::new())
         .expect("must not hard-fail");
-    assert_meshes_finite(&bodies);
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("cut_5") && w.contains("original material was preserved")),
-        "the rejected extrude must report failure: {warnings:?}"
-    );
-    let v = total_volume(&bodies);
-    let one_circle = 9000.0 - std::f64::consts::PI * 16.0 * 10.0;
-    assert!(
-        (v - one_circle).abs() / one_circle < 0.02,
-        "pinning current behavior: rejected overlapping circle cut preserves material ({v})"
-    );
+    assert!(warnings.is_empty(), "hole variant: {warnings:?}");
+    assert_overlapping_bores_removed(&bodies, "hole_3");
+
+    let mut g = ParametricGraph::new();
+    add_box(&mut g, "box_1", 30.0, 30.0, 10.0);
+    for (sketch, cut, x) in [("sk_2", "cut_3", 15.0), ("sk_4", "cut_5", 20.0)] {
+        add_sketch_cs(
+            &mut g,
+            sketch,
+            xy_plane_at(10.0),
+            circle_sketch((x, 15.0), 4.0),
+        );
+        add_extrude(&mut g, cut, sketch, -10.0, ExtrudeMode::Cut);
+    }
+    let (bodies, warnings) = g
+        .evaluate_bodies_with_warnings(&HashSet::new())
+        .expect("must not hard-fail");
+    assert!(warnings.is_empty(), "cut-extrude variant: {warnings:?}");
+    assert_overlapping_bores_removed(&bodies, "cut_5");
 }
 
 // Control for E16: DISJOINT cuts both apply exactly.

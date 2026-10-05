@@ -12,7 +12,7 @@ known-break test or a `characterization_*` test.
 > E19, E3's fit limit, A3's overflow site) — do not implement this file
 > verbatim. As of that date the A1–A6 panics, E10, E11, E12, E15, E19, and
 > E21 are FIXED with active regressions in this suite; E16's kernel half is
-> pinned by `OpenRCAD/crates/openrcad-algo/tests/cut_coincident_cap.rs`.
+> fixed and locked in by `OpenRCAD/crates/openrcad-algo/tests/cut_coincident_cap.rs`.
 
 Failure taxonomy reconstructed from real CAD sources:
 [Why Fillet Fails on Some Edges in Fusion 360](https://cadin360.com/blog/fusion-360/why-fillet-fails-on-some-edges-in-fusion-360/),
@@ -349,8 +349,20 @@ Failure taxonomy reconstructed from real CAD sources:
   (OpenRCAD fuse/difference) handles partial voids — this looks like a
   precheck in the cut apply path. At minimum the extrude variant MUST warn
   like the hole variant does (the silent path is the worst part).
-- **Test**: `characterization_overlapping_second_cut_removes_nothing` (both
-  variants), control `disjoint_circle_cuts_both_apply`.
+- **Status (2026-09-30)**: FIXED at the feature level for both variants. The
+  first bore takes the general boolean (an untouched box with one circular
+  tool skips section reconstruction), and the body now keeps its exact prism
+  record through that fallback, so the second bore is subtracted by the exact
+  sectional path. The kernel half is FIXED too (2026-09-30): parallel
+  cylinders reported no intersection, so neither wall was split where the
+  other crosses it; they now meet along their two common rulings.
+  `overlapping_second_bore_removes_only_the_crescent` and
+  `overlapping_parallel_bosses_fuse` in
+  `OpenRCAD/crates/openrcad-algo/tests/cut_coincident_cap.rs` check the exact
+  volumes.
+- **Test**: `overlapping_second_cut_removes_the_crescent` (both variants; union
+  volume plus crescent/outside occupancy probes), control
+  `disjoint_circle_cuts_both_apply`.
 
 ### E17. (Verified correct — pinned as regression) BodyCut/BodyIntersect result bodies are owned by the feature
 - After a BodyCut or BodyIntersect, the result body's id becomes the

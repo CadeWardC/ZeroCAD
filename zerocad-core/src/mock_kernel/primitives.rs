@@ -127,6 +127,29 @@ pub fn extruded_sketch_region_solid(
 mod extrusion_safety_tests {
     use super::*;
 
+    /// A 100 x 7 rectangle with a bite through its bottom side, the bite's
+    /// boundary sampled from `bite(t)` for `t` in `[0, pi]`.
+    fn rect_with_bite(bite: impl Fn(f32) -> (f32, f32)) -> Vec<(f32, f32)> {
+        let mut points = vec![(-50.0, -3.5), (-45.0, -3.5)];
+        points.extend((0..=24).map(|i| bite(std::f32::consts::PI * (24 - i) as f32 / 24.0)));
+        points.extend([(50.0, -3.5), (50.0, 3.5), (-50.0, 3.5)]);
+        points
+    }
+
+    #[test]
+    fn rect_minus_circle_recogniser_requires_a_circle() {
+        let circle = rect_with_bite(|t| (5.0 * t.cos(), -3.5 + 5.0 * t.sin()));
+        let (_, _, center, radius) =
+            rect_minus_circle_region_primitives(&circle, &[]).expect("a sampled circular bite");
+        assert!(center.0.abs() < 1e-3 && (center.1 + 3.5).abs() < 1e-3);
+        assert!((radius - 5.0).abs() < 1e-3);
+        // A half-ellipse polyline fits a 281 mm circle to within 2% of its
+        // radius; recognising it built the box minus that cylinder, not the
+        // sketched region (found via overhanging_face_join).
+        let ellipse = rect_with_bite(|t| (45.0 * t.cos(), -3.5 + 4.1 * t.sin()));
+        assert!(rect_minus_circle_region_primitives(&ellipse, &[]).is_none());
+    }
+
     #[test]
     fn failed_holed_profile_never_retries_as_filled_material() {
         let outer = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
@@ -457,6 +480,59 @@ pub fn lofted_solid(sections: &[super::LoftSectionProfile]) -> Option<KernelSoli
         Ok(outcome) => Some(outcome.solid),
         Err(e) => {
             log::warn!("loft failed: {e}");
+            None
+        }
+    }
+}
+
+/// Skin sections whose loops already correspond vertex for vertex, lifting
+/// f64 sketch coordinates through f64 plane arithmetic. A drafted extrude
+/// offsets each edge parallel to itself, so its wall quads are exactly planar
+/// only if neither the offset nor the lift rounds to f32; rounded corners
+/// miss the skin's coplanarity test and the walls become near-flat ruled
+/// surfaces that later booleans cannot intersect cleanly.
+pub(crate) fn lofted_solid_exact(sections: &[super::ExactLoftSection]) -> Option<KernelSolid> {
+    let (_, first_outer, first_holes) = sections.first()?;
+    let corresponds = sections.len() >= 2
+        && first_outer.len() >= 3
+        && sections.iter().all(|(_, outer, holes)| {
+            outer.len() == first_outer.len()
+                && holes.len() == first_holes.len()
+                && holes
+                    .iter()
+                    .zip(first_holes)
+                    .all(|(hole, first)| hole.len() == first.len() && hole.len() >= 3)
+        });
+    if !corresponds {
+        return None;
+    }
+    let lift = |cs: &crate::geometry::CoordinateSystem, ring: &[(f64, f64)]| -> Vec<Pnt> {
+        ring.iter()
+            .map(|&(u, v)| {
+                super::tessellation::analytic_point_on_plane(
+                    openrcad::foundation::Pnt2d::new(u, v),
+                    cs,
+                )
+            })
+            .collect()
+    };
+    let kernel_sections: Vec<_> = sections
+        .iter()
+        .map(|(cs, outer, holes)| openrcad::algo::SectionLoops {
+            outer: lift(cs, outer),
+            holes: holes.iter().map(|hole| lift(cs, hole)).collect(),
+        })
+        .collect();
+    match consume_operation(
+        "loft skin",
+        openrcad::algo::skin_section_loops_operation_with_policy(
+            &kernel_sections,
+            &TolerancePolicy::STANDARD,
+        ),
+    ) {
+        Ok(outcome) => Some(outcome.solid),
+        Err(e) => {
+            log::warn!("exact loft failed: {e}");
             None
         }
     }
@@ -4365,9 +4441,13 @@ pub(crate) fn rect_minus_circle_region_primitives(
         return None;
     }
 
-    let circle_tol = (0.02 * r).max(0.12);
+    // A sampled circle puts every vertex on the circle up to single-precision
+    // rounding. Any looser fit admits other curves: a half-ellipse polyline
+    // fits a 281 mm circle to within 2% of its radius, and the box minus that
+    // cylinder is not the sketched region.
+    let circle_tol = (1.0e-4 * r).max(2.0e-3);
     let near_circle = |p: (f32, f32)| ((p.0 - cx).hypot(p.1 - cy) - r).abs() <= circle_tol;
-    if arc_pts.iter().filter(|&&p| near_circle(p)).count() < arc_pts.len() * 3 / 4 {
+    if !arc_pts.iter().all(|&p| near_circle(p)) {
         return None;
     }
 

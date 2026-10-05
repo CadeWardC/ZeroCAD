@@ -2521,6 +2521,140 @@ pub(crate) fn polygon_interior_point(poly: &[(f32, f32)]) -> (f32, f32) {
     centroid(poly)
 }
 
+/// The interior point of a polygon with holes that lies farthest from every
+/// edge (its pole of inaccessibility), or `None` for an empty or zero-area
+/// outline. Classifying a region by a point near its boundary is unsafe when
+/// the boundary is a flattened arc: the true arc and its chords differ by the
+/// chord sag, so a point that close can land on the wrong side of a curve
+/// shared with another profile. The pole stays as far from that as the
+/// region allows.
+pub(crate) fn polygon_pole_of_inaccessibility(
+    boundary: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+) -> Option<(f32, f32)> {
+    use std::collections::BinaryHeap;
+    if boundary.len() < 3 {
+        return None;
+    }
+    let loops: Vec<Vec<(f64, f64)>> = std::iter::once(boundary)
+        .chain(holes.iter().map(Vec::as_slice))
+        .map(|ring| {
+            ring.iter()
+                .map(|&(x, y)| (f64::from(x), f64::from(y)))
+                .collect()
+        })
+        .collect();
+    // Signed distance: positive inside the outline and outside every hole.
+    let signed_distance = |x: f64, y: f64| -> f64 {
+        let mut inside = false;
+        let mut nearest = f64::INFINITY;
+        for ring in &loops {
+            let mut j = ring.len() - 1;
+            for i in 0..ring.len() {
+                let (ax, ay) = ring[i];
+                let (bx, by) = ring[j];
+                if (ay > y) != (by > y) && x < (bx - ax) * (y - ay) / (by - ay) + ax {
+                    inside = !inside;
+                }
+                let (dx, dy) = (bx - ax, by - ay);
+                let length_squared = dx * dx + dy * dy;
+                let t = if length_squared > 0.0 {
+                    (((x - ax) * dx + (y - ay) * dy) / length_squared).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                nearest = nearest.min((x - ax - t * dx).hypot(y - ay - t * dy));
+                j = i;
+            }
+        }
+        if inside {
+            nearest
+        } else {
+            -nearest
+        }
+    };
+    struct Cell {
+        x: f64,
+        y: f64,
+        half: f64,
+        distance: f64,
+        potential: f64,
+    }
+    impl PartialEq for Cell {
+        fn eq(&self, other: &Self) -> bool {
+            self.potential.total_cmp(&other.potential).is_eq()
+        }
+    }
+    impl Eq for Cell {}
+    impl PartialOrd for Cell {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Cell {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.potential.total_cmp(&other.potential)
+        }
+    }
+    let cell = |x: f64, y: f64, half: f64| {
+        let distance = signed_distance(x, y);
+        Cell {
+            x,
+            y,
+            half,
+            distance,
+            potential: distance + half * std::f64::consts::SQRT_2,
+        }
+    };
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in &loops[0] {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let size = (max_x - min_x).min(max_y - min_y);
+    // Also rejects NaN from a degenerate outline.
+    if size.is_nan() || size <= 0.0 {
+        return None;
+    }
+    // Cover the bounding box with square cells, then refine the most
+    // promising ones until no cell can beat the best point by `precision`.
+    let precision = size * 1.0e-3;
+    let half = size * 0.5;
+    let mut queue = BinaryHeap::new();
+    let mut x = min_x;
+    while x < max_x {
+        let mut y = min_y;
+        while y < max_y {
+            queue.push(cell(x + half, y + half, half));
+            y += size;
+        }
+        x += size;
+    }
+    let mut best = cell((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, 0.0);
+    let mut visited = 0;
+    while let Some(current) = queue.pop() {
+        if current.distance > best.distance {
+            best = Cell { ..current };
+        }
+        visited += 1;
+        if current.potential - best.distance <= precision || visited > 20_000 {
+            continue;
+        }
+        let half = current.half * 0.5;
+        for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            queue.push(cell(current.x + sx * half, current.y + sy * half, half));
+        }
+    }
+    (best.distance > 0.0).then_some((best.x as f32, best.y as f32))
+}
+
 pub fn point_in_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
     let mut inside = false;
     let n = poly.len();

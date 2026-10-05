@@ -258,14 +258,19 @@ pub(crate) fn apply_join(
         if boolean_target.is_some_and(|target| target != body.id) {
             continue;
         }
+        #[cfg(test)]
+        if super::cut::FORCE_GENERAL_PATH.with(|forced| forced.borrow().contains(extrude_id)) {
+            continue;
+        }
         if let Some(rebuilt) = try_prismatic_profile_join(body, &tools)
+            .map(|solid| vec![solid])
             .or_else(|| super::profile_join::try_profile_join(body, &tools))
         {
-            let named = body
-                .pristine
-                .as_ref()
-                .map(|mesh| name_join_result(mesh, &rebuilt, &body.id, extrude_id));
-            body.parts = vec![rebuilt];
+            let named = match (body.pristine.as_ref(), rebuilt.as_slice()) {
+                (Some(mesh), [solid]) => Some(name_join_result(mesh, solid, &body.id, extrude_id)),
+                _ => None,
+            };
+            body.parts = rebuilt;
             body.pristine = named.map(std::sync::Arc::new);
             body.sketch_source = super::profile_join::joined_source(body, &tools);
             return;
@@ -431,8 +436,12 @@ fn join_failure_detail(
                     classify_boundary_contact()
                 }
                 // A failed Common is numerical evidence, not proof of
-                // non-manifold tangency. Preserve the kernel failure below.
-                Err(crate::mock_kernel::CommonBodiesError::Failed(_)) => {}
+                // non-manifold tangency. Preserve the kernel failure below,
+                // and do not let it pass for edge contact when sampled points
+                // show the two interiors overlapping.
+                Err(crate::mock_kernel::CommonBodiesError::Failed(_)) => {
+                    volume_overlap |= interiors_overlap(part, reference);
+                }
                 _ => {}
             }
         }
@@ -675,6 +684,10 @@ fn name_join_result(
 /// connected union exists. If the tool bridges multiple body components, the
 /// newly fused result is repeatedly unioned with every component it now touches.
 fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -> bool {
+    // A union's prism record is the old record plus the tool's prism whichever
+    // path fuses it, so a successful join never forces later features off the
+    // exact sectional path. `None` for drafted or non-profile tools.
+    let next_source = super::profile_join::joined_source(body, std::slice::from_ref(tool));
     let input_mesh = (body.parts.len() == 1)
         .then(|| body.pristine.clone())
         .flatten();
@@ -694,7 +707,7 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
             .map(|mesh| name_join_result(mesh, &rebuilt, &body.id, extrude_id));
         body.parts = vec![rebuilt];
         body.pristine = named.map(std::sync::Arc::new);
-        body.sketch_source = None;
+        body.sketch_source = next_source;
         return true;
     }
 
@@ -750,7 +763,7 @@ fn join_tool_into_body(body: &mut LiveBody, tool: &JoinTool, extrude_id: &str) -
 
         body.parts = parts;
         body.pristine = named.map(std::sync::Arc::new);
-        body.sketch_source = None;
+        body.sketch_source = next_source;
         return true;
     }
     false
@@ -1184,21 +1197,92 @@ fn union_variant_into_parts(
                 index += 1;
             }
         }
-        // A Join is complete only when the tool and every pre-existing part of
-        // the target body become one kernel solid. Returning the partially
-        // merged set here made the feature look successful while leaving the
-        // exact seam the operation promised to remove.
-        if remaining.is_empty() {
-            return Some((vec![merged], history));
+        // A Join is complete only when the tool and every pre-existing part it
+        // reaches become one kernel solid. Returning a partially merged set made
+        // the feature look successful while leaving the exact seam the
+        // operation promised to remove. A body's parts are already separate
+        // components, so the merge can reach another part only through the
+        // tool: a part the tool provably misses is no seam and stays a separate
+        // lump of the body, as it was before the Join.
+        if remaining.iter().all(|part| provably_separate(tool, part)) {
+            let mut parts = vec![merged];
+            parts.extend(remaining);
+            return Some((parts, history));
         }
     }
     None
 }
 
-fn valid_union_result(a: &KernelSolid, b: &KernelSolid, result: &KernelSolid) -> bool {
-    let (Some(abb), Some(bbb), Some(rbb)) = (
+/// Whether sampled points show positive-volume overlap, independent of the
+/// kernel boolean: a grid over the shared bounding box, each point classified
+/// against both solids. A shared box with no thickness (edge or face contact)
+/// has no interior to sample.
+fn interiors_overlap(a: &KernelSolid, b: &KernelSolid) -> bool {
+    let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) = (
         crate::mock_kernel::solid_aabb(a),
         crate::mock_kernel::solid_aabb(b),
+    ) else {
+        return false;
+    };
+    let lo: [f32; 3] = std::array::from_fn(|i| a_lo[i].max(b_lo[i]));
+    let hi: [f32; 3] = std::array::from_fn(|i| a_hi[i].min(b_hi[i]));
+    if (0..3).any(|i| hi[i] - lo[i] <= 1.0e-3) {
+        return false;
+    }
+    const STEPS: usize = 6;
+    let at = |i: usize, step: usize| {
+        f64::from(lo[i]) + f64::from(hi[i] - lo[i]) * (step as f64 + 0.5) / STEPS as f64
+    };
+    (0..STEPS * STEPS * STEPS).any(|index| {
+        let point = openrcad::foundation::Pnt::new(
+            at(0, index % STEPS),
+            at(1, index / STEPS % STEPS),
+            at(2, index / (STEPS * STEPS)),
+        );
+        openrcad::algo::boolean::point_in_solid(&point, a)
+            && openrcad::algo::boolean::point_in_solid(&point, b)
+    })
+}
+
+/// Whether `tool` shares no material, face, or contact with `part`. Any doubt
+/// counts as contact, so the Join keeps demanding one fused solid.
+fn provably_separate(tool: &KernelSolid, part: &KernelSolid) -> bool {
+    let (Some(tool_bb), Some(part_bb)) = (
+        crate::mock_kernel::solid_aabb(tool),
+        crate::mock_kernel::solid_aabb(part),
+    ) else {
+        return false;
+    };
+    if !crate::mock_kernel::aabbs_overlap(&tool_bb, &part_bb, 1.0e-3) {
+        return true;
+    }
+    let no_common_volume = match crate::mock_kernel::common_bodies_with_history(tool, part, None) {
+        Ok(common) => common.bodies.is_empty(),
+        Err(crate::mock_kernel::CommonBodiesError::Empty) => true,
+        Err(crate::mock_kernel::CommonBodiesError::Failed(_)) => false,
+    };
+    no_common_volume
+        && !solids_share_face_area(tool, part)
+        && !crate::mock_kernel::components_form_connected_material(&[tool.clone(), part.clone()])
+}
+
+fn valid_union_result(a: &KernelSolid, b: &KernelSolid, result: &KernelSolid) -> bool {
+    // The result must reach every input vertex. Input vertices lie on input
+    // material, so they bound it from inside; the result's conservative box
+    // bounds it from outside. Comparing two conservative boxes falsely
+    // rejected a valid union when an input arc's circle bound dipped below
+    // the material (a side tunnel breaking out of the bottom face) while the
+    // result's re-trimmed arcs did not.
+    let vertex_box = |solid: &KernelSolid| -> Option<([f32; 3], [f32; 3])> {
+        let (lo, hi) = solid.bounding_box().corners()?;
+        Some((
+            [lo.x() as f32, lo.y() as f32, lo.z() as f32],
+            [hi.x() as f32, hi.y() as f32, hi.z() as f32],
+        ))
+    };
+    let (Some(abb), Some(bbb), Some(rbb)) = (
+        vertex_box(a),
+        vertex_box(b),
         crate::mock_kernel::solid_aabb(result),
     ) else {
         return false;

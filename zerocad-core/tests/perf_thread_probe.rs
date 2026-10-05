@@ -1,7 +1,7 @@
 //! Timing probe for the Thread feature: how expensive is one full re-eval of a
 //! threaded rod (what every preview step pays), and how dense is the resulting
 //! mesh (what every CPU-painted frame pays). Run with:
-//!   cargo test --release -p zerocad-core --test perf_thread_probe -- --nocapture
+//!   ZEROCAD_PERF_PROBES=1 cargo test --release -p zerocad-core --test perf_thread_probe -- --nocapture
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -43,6 +43,10 @@ fn threaded_rod(r: f32, h: f32, pitch: f32, depth: f32) -> ParametricGraph {
 
 #[test]
 fn probe_thread_eval_and_mesh_cost() {
+    // Timings only, no assertions: skip unless explicitly requested.
+    if std::env::var_os("ZEROCAD_PERF_PROBES").is_none() {
+        return;
+    }
     let hidden = HashSet::new();
     for (label, r, h, pitch) in [
         ("M6x1 x 10mm", 3.0f32, 10.0f32, 1.0f32),

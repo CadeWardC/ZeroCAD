@@ -170,7 +170,19 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
     {
         return solid.clone();
     }
+    imprint_tjunctions(solid, tol, policy)
+        .and_then(|healed| strict_repaired_candidate(healed, policy))
+        .unwrap_or_else(|| solid.clone())
+}
 
+/// Split free edges at coincident boundary vertices and re-sew, without the
+/// acceptance gate. `None` when no edge needed splitting. Callers own the gate:
+/// a whole-solid gate for [`heal_tjunctions`], per-body for multi-lump sewing.
+pub(crate) fn imprint_tjunctions(
+    solid: &Solid,
+    tol: f64,
+    policy: &TolerancePolicy,
+) -> Option<Solid> {
     let face_ids: Vec<FaceId> = solid.shell().faces().iter().map(|f| f.id()).collect();
     let mut builder = BRepBuilder::from_brep((**solid.brep()).clone());
 
@@ -259,7 +271,7 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
     }
 
     if splits == 0 {
-        return solid.clone();
+        return None;
     }
 
     builder.brep_mut().retain_faces(&face_ids);
@@ -271,17 +283,19 @@ fn heal_tjunctions_impl(solid: &Solid, tol: f64, policy: &TolerancePolicy) -> So
     // Splitting aligns the subdivisions but leaves coincident edges with
     // distinct IDs. Sew them into shared coedges before the strict topology
     // gate; geometric watertightness alone also accepts unshared boundaries.
-    let healed = Solid::new(
+    Some(Solid::new(
         crate::sew::sew_shell_with_policy(&healed.faces(), policy)
             .expect("healing uses a validated sewing policy"),
-    );
-    strict_repaired_candidate(healed, policy).unwrap_or_else(|| solid.clone())
+    ))
 }
 
 /// Repair pcurves affected by a topology rewrite and apply the complete Phase 1
 /// acceptance gate. Merge/healing helpers intentionally return `None` rather
 /// than leaking a partially repaired candidate to their compatibility callers.
-fn strict_repaired_candidate(candidate: Solid, policy: &TolerancePolicy) -> Option<Solid> {
+pub(crate) fn strict_repaired_candidate(
+    candidate: Solid,
+    policy: &TolerancePolicy,
+) -> Option<Solid> {
     let (candidate, _) = candidate.repair_pcurves(policy).ok()?;
     if candidate.is_watertight_with_policy(policy)
         && candidate.health_report_with_policy(policy).is_healthy()

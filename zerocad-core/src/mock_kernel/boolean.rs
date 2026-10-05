@@ -34,7 +34,47 @@ fn active_cancellation() -> Option<crate::EvaluationCancellation> {
     ACTIVE_CANCELLATION.with(|slot| slot.borrow().clone())
 }
 
+/// Run a guarded boolean; when `ZEROCAD_BOOLEAN_DUMP=<dir>` is set, a failure
+/// writes both operands as STEP (`<n>_<op>_a.step`, `_b.step`) plus the error
+/// (`<n>_<op>.txt`), turning any refused feature into a kernel-level repro.
+fn traced<T>(
+    op: BooleanOp,
+    a: &KernelSolid,
+    b: &KernelSolid,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let result = run();
+    if let (Err(error), Some(dir)) = (&result, std::env::var_os("ZEROCAD_BOOLEAN_DUMP")) {
+        static DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let index = DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stem = format!(
+            "{index:04}_{}",
+            boolean_operation_name(op).replace(' ', "_")
+        );
+        let dir = std::path::Path::new(&dir);
+        let write = |suffix: &str, solid: &KernelSolid| {
+            let path = dir.join(format!("{stem}_{suffix}.step"));
+            if let Err(write_error) = openrcad::exchange::write_step(solid, &path.to_string_lossy())
+            {
+                log::warn!("boolean dump {}: {write_error}", path.display());
+            }
+        };
+        write("a", a);
+        write("b", b);
+        let _ = std::fs::write(dir.join(format!("{stem}.txt")), error);
+    }
+    result
+}
+
 fn checked_boolean(a: &KernelSolid, b: &KernelSolid, op: BooleanOp) -> Result<KernelSolid, String> {
+    traced(op, a, b, || checked_boolean_untraced(a, b, op))
+}
+
+fn checked_boolean_untraced(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    op: BooleanOp,
+) -> Result<KernelSolid, String> {
     let policy = openrcad::foundation::TolerancePolicy::STANDARD;
     let outcome = match active_cancellation() {
         Some(cancel) => consume_operation(
@@ -46,7 +86,58 @@ fn checked_boolean(a: &KernelSolid, b: &KernelSolid, op: BooleanOp) -> Result<Ke
             openrcad::algo::boolean_operation_with_policy(a, b, op, &policy),
         ),
     }?;
+    check_volume_bracket(op, a, b, std::slice::from_ref(&outcome.solid))?;
     Ok(outcome.solid)
+}
+
+/// Volume of a solid's display mesh, or `None` when it cannot be meshed.
+fn display_volume(solid: &KernelSolid) -> Option<f64> {
+    MockMesh::try_from_solid(solid)
+        .ok()?
+        .mass_properties()
+        .map(|properties| properties.volume)
+}
+
+/// Reject a boolean result whose volume contradicts the operation.
+///
+/// Strict validation proves a result is a well-formed solid, not that it holds
+/// the right material: a misclassified face set can close into a valid shell
+/// that is the wrong shape (a cut across a side tunnel once came back 16%
+/// *larger* than its input). Volumes bound every operation — a cut lies
+/// between `a - b` and `a`, a fuse between `max(a, b)` and `a + b`, a common
+/// below `min(a, b)` — so a result outside its bracket is wrong. The slack
+/// covers display-tessellation error; meshes come from the shared cache, so
+/// the result's mesh is reused when the feature later displays it.
+fn check_volume_bracket(
+    op: BooleanOp,
+    a: &KernelSolid,
+    b: &KernelSolid,
+    results: &[KernelSolid],
+) -> Result<(), String> {
+    let (Some(va), Some(vb)) = (display_volume(a), display_volume(b)) else {
+        return Ok(());
+    };
+    let mut volume = 0.0;
+    for result in results {
+        let Some(part) = display_volume(result) else {
+            return Ok(());
+        };
+        volume += part;
+    }
+    let slack = 0.01 * (va.abs() + vb.abs());
+    let (low, high) = match op {
+        BooleanOp::Cut => (va - vb, va),
+        BooleanOp::Fuse => (va.max(vb), va + vb),
+        BooleanOp::Common => (0.0, va.min(vb)),
+    };
+    if volume < low - slack || volume > high + slack {
+        return Err(format!(
+            "{} result volume {volume:.3} lies outside [{low:.3}, {high:.3}] \
+             (inputs {va:.3} and {vb:.3}): the result is not the requested material",
+            boolean_operation_name(op)
+        ));
+    }
+    Ok(())
 }
 
 fn boolean_operation_name(op: BooleanOp) -> &'static str {
@@ -123,26 +214,29 @@ pub(crate) fn union_with_history_diagnostic(
     b: &KernelSolid,
     obj_classes: Option<&[Option<u64>]>,
 ) -> Result<(KernelSolid, openrcad::algo::BooleanFaceHistory), String> {
-    quiet_panic(|| {
-        let policy = openrcad::foundation::TolerancePolicy::STANDARD;
-        let never = openrcad::foundation::NeverCancelled;
-        let active = active_cancellation();
-        let cancel: &dyn openrcad::foundation::CancellationProbe =
-            active.as_ref().map_or(&never, |probe| probe);
-        let outcome = consume_operation(
-            "boolean fuse",
-            openrcad::algo::boolean_operation_with_classes_policy_and_cancel(
-                a,
-                b,
-                BooleanOp::Fuse,
-                obj_classes,
-                None,
-                &policy,
-                cancel,
-            ),
-        )?;
-        let history = outcome.boolean_face_history();
-        Ok((outcome.solid, history))
+    traced(BooleanOp::Fuse, a, b, || {
+        quiet_panic(|| {
+            let policy = openrcad::foundation::TolerancePolicy::STANDARD;
+            let never = openrcad::foundation::NeverCancelled;
+            let active = active_cancellation();
+            let cancel: &dyn openrcad::foundation::CancellationProbe =
+                active.as_ref().map_or(&never, |probe| probe);
+            let outcome = consume_operation(
+                "boolean fuse",
+                openrcad::algo::boolean_operation_with_classes_policy_and_cancel(
+                    a,
+                    b,
+                    BooleanOp::Fuse,
+                    obj_classes,
+                    None,
+                    &policy,
+                    cancel,
+                ),
+            )?;
+            check_volume_bracket(BooleanOp::Fuse, a, b, std::slice::from_ref(&outcome.solid))?;
+            let history = outcome.boolean_face_history();
+            Ok((outcome.solid, history))
+        })
     })
 }
 
@@ -191,6 +285,8 @@ pub(crate) fn common_bodies_with_history(
                 .map_err(CommonBodiesError::Failed),
         }
     })?;
+    check_volume_bracket(BooleanOp::Common, a, b, &outcome.bodies)
+        .map_err(CommonBodiesError::Failed)?;
     let mut paired: Vec<_> = outcome
         .bodies
         .into_iter()
@@ -209,6 +305,28 @@ pub(crate) fn difference_bodies_with_history(
     b: &KernelSolid,
     obj_classes: Option<&[Option<u64>]>,
 ) -> Option<DifferenceBodiesOutcome> {
+    difference_bodies_with_history_diagnostic(a, b, obj_classes)
+        .map_err(|error| log::warn!("boolean cut failed: {error}"))
+        .ok()
+}
+
+/// [`difference_bodies_with_history`] that keeps the kernel's rejection reason,
+/// so a Cut that preserves material can say why instead of "needs repair".
+pub(crate) fn difference_bodies_with_history_diagnostic(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    obj_classes: Option<&[Option<u64>]>,
+) -> Result<DifferenceBodiesOutcome, String> {
+    traced(BooleanOp::Cut, a, b, || {
+        difference_bodies_untraced(a, b, obj_classes)
+    })
+}
+
+fn difference_bodies_untraced(
+    a: &KernelSolid,
+    b: &KernelSolid,
+    obj_classes: Option<&[Option<u64>]>,
+) -> Result<DifferenceBodiesOutcome, String> {
     let policy = openrcad::foundation::TolerancePolicy::STANDARD;
     let never = openrcad::foundation::NeverCancelled;
     let active = active_cancellation();
@@ -227,9 +345,8 @@ pub(crate) fn difference_bodies_with_history(
                 cancel,
             ),
         )
-        .map_err(|error| log::warn!("boolean cut failed: {error}"))
-        .ok()
     })?;
+    check_volume_bracket(BooleanOp::Cut, a, b, &outcome.bodies)?;
     let mut paired: Vec<_> = outcome
         .bodies
         .into_iter()
@@ -237,7 +354,7 @@ pub(crate) fn difference_bodies_with_history(
         .collect();
     paired.sort_by_key(|(solid, _)| part_key(solid));
     let (bodies, face_history) = paired.into_iter().unzip();
-    Some(DifferenceBodiesOutcome {
+    Ok(DifferenceBodiesOutcome {
         bodies,
         face_history,
     })

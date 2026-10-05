@@ -25,6 +25,20 @@ strip = true
 opt-level = 3
 panic = "unwind"
 
+# Full-suite test profile (`cargo test-fast`). Unoptimized geometry runs 5-10x
+# slower, so a debug full suite is dominated by the kernel, not the checks.
+# Debug assertions and overflow checks stay on (inherited from dev). Plain dev
+# builds are untouched, so edit-and-run-one-test loops keep fast rebuilds; this
+# profile trades ~70 s of zerocad-core rebuild after an edit for the faster run.
+[profile.fast-test]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+
+# Dependencies (including the OpenRCAD kernel) change rarely: optimize fully.
+[profile.fast-test.package."*"]
+opt-level = 2
+
 [workspace.dependencies]
 petgraph = { version = "0.6", features = ["serde-1"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
