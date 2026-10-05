@@ -1,0 +1,2003 @@
+   Compiling zerocad-core v0.7.6-alpha.4 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-core)
+    Finished `fast-test` profile [optimized + debuginfo] target(s) in 1m 22s
+     Running tests\property_join_cut_chains.rs (target\fast-test\deps\property_join_cut_chains-0a11da68825cc64c.exe)
+
+running 1 test
+census chain 28 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                60.73965657016271,
+                49.40292609219658,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 9.11067783078371,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                24.343667554903167,
+                -30.657374262311535,
+            ),
+            radius: 3.947513234074113,
+        },
+        axis: Tilted {
+            u: [
+                0.9765781341896529,
+                -0.2151630726278472,
+                0.0,
+            ],
+            v: [
+                -0.2151630726278472,
+                -0.9765781341896529,
+                0.0,
+            ],
+        },
+        offset: -6.127766715979409,
+        depth: 8.127766715979408,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -8.905237282011655,
+                -38.12067018868053,
+            ),
+            radius: 3.033722254475003,
+        },
+        axis: Tilted {
+            u: [
+                -0.7909270822863971,
+                0.6119104105225918,
+                0.0,
+            ],
+            v: [
+                -0.6119104105225918,
+                -0.7909270822863971,
+                0.0,
+            ],
+        },
+        offset: 5.296430159224354,
+        depth: 5.814247671559356,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -17.354804740726095,
+                35.08987744484665,
+            ),
+            radius: 3.947513234074113,
+        },
+        axis: Tilted {
+            u: [
+                0.22167136420041897,
+                -0.975121431563026,
+                0.0,
+            ],
+            v: [
+                0.975121431563026,
+                0.22167136420041897,
+                0.0,
+            ],
+        },
+        offset: 4.995654449831062,
+        depth: 4.439987597024092,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -35.40147463763043,
+                16.710007186243107,
+            ),
+            radius: 2.767735939113869,
+        },
+        axis: Tilted {
+            u: [
+                -0.43222182362260086,
+                -0.9017673176514844,
+                0.0,
+            ],
+            v: [
+                0.9017673176514844,
+                -0.43222182362260086,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 10.9200571636586,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                26.44299339600379,
+                28.866188645922534,
+            ),
+            radius: 6.201730525565929,
+        },
+        axis: Tilted {
+            u: [
+                0.9893098818380153,
+                -0.14582852155066334,
+                0.0,
+            ],
+            v: [
+                0.14582852155066334,
+                0.9893098818380153,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 9.299562095494728,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -35.749806179451,
+                -15.951178790759446,
+            ),
+            radius: 5.587418492322494,
+        },
+        axis: Tilted {
+            u: [
+                -0.9655750696631522,
+                -0.26012455640519366,
+                0.0,
+            ],
+            v: [
+                0.26012455640519366,
+                -0.9655750696631522,
+                0.0,
+            ],
+        },
+        offset: 4.1177674310414005,
+        depth: 4.293673093892481,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+census chain 37 STEP round trip: part 0: strict import failed: InvalidTopology(PcurveMismatch { face: FaceId(1v1), loop_id: LoopId(1v1), edge: EdgeId(3v1), max_deviation: 3.1559563676567776e-6, tolerance: 1e-6 })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                66.84260286946154,
+                37.617666290588986,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 13.02921399254049,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                34.07577611619477,
+                17.595370867294513,
+            ),
+            radius: 4.041635078648945,
+        },
+        axis: Tilted {
+            u: [
+                0.5493151913151093,
+                0.835615234776416,
+                0.0,
+            ],
+            v: [
+                0.835615234776416,
+                -0.5493151913151093,
+                0.0,
+            ],
+        },
+        offset: -2.881068518591423,
+        depth: 4.881068518591423,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -10.26717421368195,
+                -36.9505172838564,
+            ),
+            radius: 6.429573307602305,
+        },
+        axis: Tilted {
+            u: [
+                -0.7058538093096511,
+                0.7083575367588423,
+                0.0,
+            ],
+            v: [
+                -0.7083575367588423,
+                -0.7058538093096511,
+                0.0,
+            ],
+        },
+        offset: 3.787858545351309,
+        depth: 11.24135544718918,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -36.32690644981619,
+                -12.292740201638061,
+            ),
+            radius: 4.041635078648945,
+        },
+        axis: Tilted {
+            u: [
+                -0.9826952867063996,
+                -0.18522951569614154,
+                0.0,
+            ],
+            v: [
+                0.18522951569614154,
+                -0.9826952867063996,
+                0.0,
+            ],
+        },
+        offset: 2.826700413853533,
+        depth: 4.3397310018116215,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                -23.147064248854008,
+                -30.57726296675506,
+            ),
+            radius: 3.176260469729534,
+        },
+        axis: Tilted {
+            u: [
+                -0.9170304395815103,
+                0.3988172173827779,
+                0.0,
+            ],
+            v: [
+                -0.3988172173827779,
+                -0.9170304395815103,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 17.02921399254049,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                36.60554450311003,
+                11.436332694946257,
+            ),
+            radius: 2.8968776982776,
+        },
+        axis: Tilted {
+            u: [
+                0.9780748184547694,
+                0.20825381030048365,
+                0.0,
+            ],
+            v: [
+                -0.20825381030048365,
+                0.9780748184547694,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 12.983835368731848,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -19.486925823431015,
+                33.030520974255964,
+            ),
+            radius: 4.041635078648945,
+        },
+        axis: Tilted {
+            u: [
+                -0.8652314395297414,
+                0.5013726718213624,
+                0.0,
+            ],
+            v: [
+                0.5013726718213624,
+                0.8652314395297414,
+                0.0,
+            ],
+        },
+        offset: -4.998216030166226,
+        depth: 6.998216030166226,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                34.10530945970651,
+                17.538057490392706,
+            ),
+            radius: 2.8842101285151465,
+        },
+        axis: Tilted {
+            u: [
+                0.9992919497461065,
+                0.03762444913384182,
+                0.0,
+            ],
+            v: [
+                -0.03762444913384182,
+                0.9992919497461065,
+                0.0,
+            ],
+        },
+        offset: 9.591292040857654,
+        depth: 5.467162939645643,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+census chain 37 STEP round trip: part 1: strict import failed: InvalidTopology(PcurveMismatch { face: FaceId(1v1), loop_id: LoopId(1v1), edge: EdgeId(3v1), max_deviation: 2.2022817307470967e-6, tolerance: 1e-6 })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                66.84260286946154,
+                37.617666290588986,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 13.02921399254049,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                34.07577611619477,
+                17.595370867294513,
+            ),
+            radius: 4.041635078648945,
+        },
+        axis: Tilted {
+            u: [
+                0.5493151913151093,
+                0.835615234776416,
+                0.0,
+            ],
+            v: [
+                0.835615234776416,
+                -0.5493151913151093,
+                0.0,
+            ],
+        },
+        offset: -2.881068518591423,
+        depth: 4.881068518591423,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -10.26717421368195,
+                -36.9505172838564,
+            ),
+            radius: 6.429573307602305,
+        },
+        axis: Tilted {
+            u: [
+                -0.7058538093096511,
+                0.7083575367588423,
+                0.0,
+            ],
+            v: [
+                -0.7083575367588423,
+                -0.7058538093096511,
+                0.0,
+            ],
+        },
+        offset: 3.787858545351309,
+        depth: 11.24135544718918,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -36.32690644981619,
+                -12.292740201638061,
+            ),
+            radius: 4.041635078648945,
+        },
+        axis: Tilted {
+            u: [
+                -0.9826952867063996,
+                -0.18522951569614154,
+                0.0,
+            ],
+            v: [
+                0.18522951569614154,
+                -0.9826952867063996,
+                0.0,
+            ],
+        },
+        offset: 2.826700413853533,
+        depth: 4.3397310018116215,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                -23.147064248854008,
+                -30.57726296675506,
+            ),
+            radius: 3.176260469729534,
+        },
+        axis: Tilted {
+            u: [
+                -0.9170304395815103,
+                0.3988172173827779,
+                0.0,
+            ],
+            v: [
+                -0.3988172173827779,
+                -0.9170304395815103,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 17.02921399254049,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                36.60554450311003,
+                11.436332694946257,
+            ),
+            radius: 2.8968776982776,
+        },
+        axis: Tilted {
+            u: [
+                0.9780748184547694,
+                0.20825381030048365,
+                0.0,
+            ],
+            v: [
+                -0.20825381030048365,
+                0.9780748184547694,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 12.983835368731848,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -19.486925823431015,
+                33.030520974255964,
+            ),
+            radius: 4.041635078648945,
+        },
+        axis: Tilted {
+            u: [
+                -0.8652314395297414,
+                0.5013726718213624,
+                0.0,
+            ],
+            v: [
+                0.5013726718213624,
+                0.8652314395297414,
+                0.0,
+            ],
+        },
+        offset: -4.998216030166226,
+        depth: 6.998216030166226,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                34.10530945970651,
+                17.538057490392706,
+            ),
+            radius: 2.8842101285151465,
+        },
+        axis: Tilted {
+            u: [
+                0.9992919497461065,
+                0.03762444913384182,
+                0.0,
+            ],
+            v: [
+                -0.03762444913384182,
+                0.9992919497461065,
+                0.0,
+            ],
+        },
+        offset: 9.591292040857654,
+        depth: 5.467162939645643,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+test mixed_axis_refusal_census has been running for over 60 seconds
+census chain 60 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                51.98706411990667,
+                30.06583598549918,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 8.722706250214019,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                24.697502906142216,
+                17.07880799498762,
+            ),
+            radius: 4.08667882405537,
+        },
+        axis: Tilted {
+            u: [
+                0.4272500605573299,
+                0.9041334999621228,
+                0.0,
+            ],
+            v: [
+                0.9041334999621228,
+                -0.4272500605573299,
+                0.0,
+            ],
+        },
+        offset: -2.766610287339737,
+        depth: 4.766610287339737,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -30.026009874961574,
+                -0.3017669916776846,
+            ),
+            radius: 5.831923772742832,
+        },
+        axis: Tilted {
+            u: [
+                -0.8706443277629574,
+                -0.49191305586880696,
+                0.0,
+            ],
+            v: [
+                0.49191305586880696,
+                -0.8706443277629574,
+                0.0,
+            ],
+        },
+        offset: 4.2180694566126125,
+        depth: 4.284525326116368,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -29.875790499920594,
+                3.014875508774905,
+            ),
+            radius: 5.012792262780245,
+        },
+        axis: Tilted {
+            u: [
+                -0.8110165256334171,
+                -0.5850232432557709,
+                0.0,
+            ],
+            v: [
+                0.5850232432557709,
+                -0.8110165256334171,
+                0.0,
+            ],
+        },
+        offset: 6.33768858214351,
+        depth: 4.385017668070509,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -19.78400886830198,
+                22.588610524498954,
+            ),
+            radius: 4.08667882405537,
+        },
+        axis: Tilted {
+            u: [
+                -0.9469603391059959,
+                0.3213504569162107,
+                0.0,
+            ],
+            v: [
+                0.3213504569162107,
+                0.9469603391059959,
+                0.0,
+            ],
+        },
+        offset: -10.361539974625241,
+        depth: 4.5500889249586915,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                28.897987467148806,
+                8.158348648903567,
+            ),
+            radius: 3.1175269266272627,
+        },
+        axis: Tilted {
+            u: [
+                0.9691147225605803,
+                0.246610329297719,
+                0.0,
+            ],
+            v: [
+                -0.246610329297719,
+                0.9691147225605803,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 6.950924625863424,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -15.311620242912525,
+                25.83034296840419,
+            ),
+            radius: 6.837778535950235,
+        },
+        axis: Tilted {
+            u: [
+                -0.8720750682382393,
+                0.4893721236005073,
+                0.0,
+            ],
+            v: [
+                0.4893721236005073,
+                0.8720750682382393,
+                0.0,
+            ],
+        },
+        offset: -11.573416253171846,
+        depth: 4.723214107608207,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+census chain 93 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                41.6952488860596,
+                42.268168991688995,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 13.785836568940494,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -28.947371220831094,
+                -6.5819960345254,
+            ),
+            radius: 3.115725400190427,
+        },
+        axis: Tilted {
+            u: [
+                -0.8426315198929057,
+                -0.5384905957237986,
+                0.0,
+            ],
+            v: [
+                0.5384905957237986,
+                -0.8426315198929057,
+                0.0,
+            ],
+        },
+        offset: 7.983427493623766,
+        depth: 5.249627020199994,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                15.645275524592279,
+                25.22891844995941,
+            ),
+            radius: 3.115725400190427,
+        },
+        axis: Tilted {
+            u: [
+                0.9751313720300452,
+                -0.2216276320380687,
+                0.0,
+            ],
+            v: [
+                0.2216276320380687,
+                0.9751313720300452,
+                0.0,
+            ],
+        },
+        offset: 4.215193818043464,
+        depth: 4.621588074269943,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                5.490330862837602,
+                29.1741193425214,
+            ),
+            radius: 5.84811770720168,
+        },
+        axis: Tilted {
+            u: [
+                0.829514443392421,
+                -0.5584852622973698,
+                0.0,
+            ],
+            v: [
+                0.5584852622973698,
+                0.829514443392421,
+                0.0,
+            ],
+        },
+        offset: 10.749060673248602,
+        depth: 5.710565883470798,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -24.202764694911224,
+                17.19008881646245,
+            ),
+            radius: 5.320584096855938,
+        },
+        axis: Tilted {
+            u: [
+                -0.9847878756817483,
+                -0.17376086990525075,
+                0.0,
+            ],
+            v: [
+                -0.17376086990525075,
+                0.9847878756817483,
+                0.0,
+            ],
+        },
+        offset: -13.914254308822068,
+        depth: 5.346941276628325,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -14.65938539440096,
+                -25.814247853724737,
+            ),
+            radius: 4.127455802070862,
+        },
+        axis: Tilted {
+            u: [
+                0.272273338211042,
+                -0.9622199485041949,
+                0.0,
+            ],
+            v: [
+                -0.9622199485041949,
+                -0.272273338211042,
+                0.0,
+            ],
+        },
+        offset: -15.785836568940494,
+        depth: 5.021608250949919,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -29.102134938268705,
+                -5.859924438924828,
+            ),
+            radius: 4.820247871448594,
+        },
+        axis: Tilted {
+            u: [
+                -0.8289764247840431,
+                -0.559283548079385,
+                0.0,
+            ],
+            v: [
+                0.559283548079385,
+                -0.8289764247840431,
+                0.0,
+            ],
+        },
+        offset: 7.42147693234575,
+        depth: 8.364359636594745,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+]
+census chain 104 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                59.809785272912606,
+                33.98050964097437,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 11.498630912808634,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                -17.034042529168843,
+                -29.879972516345013,
+            ),
+            radius: 6.481929689030109,
+        },
+        axis: Tilted {
+            u: [
+                -0.8597583951346365,
+                0.5107009907915925,
+                0.0,
+            ],
+            v: [
+                -0.5107009907915925,
+                -0.8597583951346365,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 15.498630912808634,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                29.559073807533963,
+                17.585008333914026,
+            ),
+            radius: 8.43037103522221,
+        },
+        axis: Tilted {
+            u: [
+                0.49467567398705387,
+                0.869077659110769,
+                0.0,
+            ],
+            v: [
+                0.869077659110769,
+                -0.49467567398705387,
+                0.0,
+            ],
+        },
+        offset: -6.480058628882901,
+        depth: 4.154215856286622,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                28.08660403910365,
+                -19.852305559145336,
+            ),
+            radius: 10.418396637136983,
+        },
+        axis: Tilted {
+            u: [
+                0.42488868626664983,
+                0.9052456043983866,
+                0.0,
+            ],
+            v: [
+                -0.9052456043983866,
+                0.42488868626664983,
+                0.0,
+            ],
+        },
+        offset: 9.183714565085936,
+        depth: 5.297194488368232,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+census chain 191 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                51.997752323741814,
+                38.73048643859901,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 8.116998379323336,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -23.191135938037043,
+                -22.652271862363197,
+            ),
+            radius: 7.39512521913751,
+        },
+        axis: Tilted {
+            u: [
+                -0.1563119650566492,
+                -0.9877077348994129,
+                0.0,
+            ],
+            v: [
+                -0.9877077348994129,
+                0.1563119650566492,
+                0.0,
+            ],
+        },
+        offset: -10.790329400227836,
+        depth: 4.576732678851023,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                30.551719521799573,
+                -10.84189286445017,
+            ),
+            radius: 3.871646370140561,
+        },
+        axis: Tilted {
+            u: [
+                0.9555756647896174,
+                0.2947459055896801,
+                0.0,
+            ],
+            v: [
+                0.2947459055896801,
+                -0.9555756647896174,
+                0.0,
+            ],
+        },
+        offset: -10.116998379323336,
+        depth: 12.116998379323336,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                19.883560686070247,
+                -25.60465233246268,
+            ),
+            radius: 4.710111066941839,
+        },
+        axis: Tilted {
+            u: [
+                0.9636866625734073,
+                -0.2670356088204866,
+                0.0,
+            ],
+            v: [
+                -0.2670356088204866,
+                -0.9636866625734073,
+                0.0,
+            ],
+        },
+        offset: -9.934836130903244,
+        depth: 4.454519354661797,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+census chain 278 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                47.403986000549736,
+                39.661721397929426,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 10.61456910584841,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -19.258851379664055,
+                24.16907428477214,
+            ),
+            radius: 4.072426204705473,
+        },
+        axis: Tilted {
+            u: [
+                -0.9798116825373034,
+                0.1999226519517446,
+                0.0,
+            ],
+            v: [
+                0.1999226519517446,
+                0.9798116825373034,
+                0.0,
+            ],
+        },
+        offset: -11.381731512901457,
+        depth: 4.803937022177258,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -1.481160463959526,
+                30.868327974265554,
+            ),
+            radius: 5.314958589381718,
+        },
+        axis: Tilted {
+            u: [
+                -0.6777170365114369,
+                0.7353227987912219,
+                0.0,
+            ],
+            v: [
+                0.7353227987912219,
+                0.6777170365114369,
+                0.0,
+            ],
+        },
+        offset: -3.8789162314887613,
+        depth: 5.878916231488761,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -8.65292664849559,
+                -29.66773278601816,
+            ),
+            radius: 3.0645454955363123,
+        },
+        axis: Tilted {
+            u: [
+                0.40128377485913963,
+                -0.9159537826958297,
+                0.0,
+            ],
+            v: [
+                -0.9159537826958297,
+                -0.40128377485913963,
+                0.0,
+            ],
+        },
+        offset: -12.61456910584841,
+        depth: 7.861487268185462,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -11.057017099055852,
+                28.858099055863132,
+            ),
+            radius: 6.4667657902146045,
+        },
+        axis: Tilted {
+            u: [
+                0.3248085543906112,
+                -0.9457797856767088,
+                0.0,
+            ],
+            v: [
+                0.9457797856767088,
+                0.3248085543906112,
+                0.0,
+            ],
+        },
+        offset: 7.199882133742599,
+        depth: 4.907618296013662,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+]
+census chain 352 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                58.598588138381494,
+                35.67226087577397,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 10.639311405043946,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -26.186563703640736,
+                -22.154910592132847,
+            ),
+            radius: 6.869992724298462,
+        },
+        axis: Tilted {
+            u: [
+                -0.3162480773975922,
+                -0.9486765273486673,
+                0.0,
+            ],
+            v: [
+                -0.9486765273486673,
+                0.3162480773975922,
+                0.0,
+            ],
+        },
+        offset: -12.639311405043946,
+        depth: 10.140720508356548,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                4.7089671429852125,
+                -33.976489082842576,
+            ),
+            radius: 7.999805718207894,
+        },
+        axis: Tilted {
+            u: [
+                0.632324974447742,
+                -0.7747032507287306,
+                0.0,
+            ],
+            v: [
+                -0.7747032507287306,
+                -0.632324974447742,
+                0.0,
+            ],
+        },
+        offset: -7.085428329488746,
+        depth: 4.191593270215189,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -33.52759522473413,
+                -7.244069325774024,
+            ),
+            radius: 9.359442062427842,
+        },
+        axis: Tilted {
+            u: [
+                -0.7250943199551898,
+                -0.6886495677546897,
+                0.0,
+            ],
+            v: [
+                -0.6886495677546897,
+                0.7250943199551898,
+                0.0,
+            ],
+        },
+        offset: -12.639311405043946,
+        depth: 6.083950868907736,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+]
+census chain 373 step 6 refused: Join 'extrude_14' could not produce one valid fused solid; the feature was not applied and its input bodies were left unchanged. The exact fuse reached the selected body but OpenRCAD rejected it (boolean fuse: boolean produced invalid topology: HealthReport { errors: [Validation(FreeEdge { loop_id: LoopId(18v1), edge: EdgeId(52v1) })], warnings: [] }).
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                44.22425115553106,
+                35.69141418943129,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 11.279600409246736,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -28.08861412928873,
+                -4.294777709402252,
+            ),
+            radius: 3.876225424991815,
+        },
+        axis: Tilted {
+            u: [
+                -0.6743191241502821,
+                -0.7384400576926989,
+                0.0,
+            ],
+            v: [
+                -0.7384400576926989,
+                0.6743191241502821,
+                0.0,
+            ],
+        },
+        offset: -9.392755616856409,
+        depth: 11.392755616856409,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                -27.06621986897592,
+                -8.650728367109329,
+            ),
+            radius: 3.876225424991815,
+        },
+        axis: Tilted {
+            u: [
+                -0.5500431506038813,
+                -0.8351362358763724,
+                0.0,
+            ],
+            v: [
+                -0.8351362358763724,
+                0.5500431506038813,
+                0.0,
+            ],
+        },
+        offset: -13.279600409246736,
+        depth: 15.279600409246736,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -15.217592575501847,
+                -23.996671341735876,
+            ),
+            radius: 3.017579249561612,
+        },
+        axis: Tilted {
+            u: [
+                -0.9471344299396034,
+                0.3208369860583135,
+                0.0,
+            ],
+            v: [
+                -0.3208369860583135,
+                -0.9471344299396034,
+                0.0,
+            ],
+        },
+        offset: 8.121965916576004,
+        depth: 5.1576344926707325,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -22.765132142738686,
+                17.004826309048344,
+            ),
+            radius: 5.382861065398882,
+        },
+        axis: Tilted {
+            u: [
+                -0.999298070035095,
+                -0.03746154326952362,
+                0.0,
+            ],
+            v: [
+                -0.03746154326952362,
+                0.999298070035095,
+                0.0,
+            ],
+        },
+        offset: -13.279600409246736,
+        depth: 6.789698680553359,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                12.007410815972094,
+                -25.753396761859072,
+            ),
+            radius: 5.811939412617566,
+        },
+        axis: Tilted {
+            u: [
+                0.8980470123602649,
+                -0.4398994926012104,
+                0.0,
+            ],
+            v: [
+                -0.4398994926012104,
+                -0.8980470123602649,
+                0.0,
+            ],
+        },
+        offset: -10.867520108637756,
+        depth: 4.768480038905207,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -18.248552754525434,
+                21.78085585193013,
+            ),
+            radius: 3.876225424991815,
+        },
+        axis: Tilted {
+            u: [
+                -0.018354266047208297,
+                -0.9998315462706047,
+                0.0,
+            ],
+            v: [
+                0.9998315462706047,
+                -0.018354266047208297,
+                0.0,
+            ],
+        },
+        offset: 5.844450811330935,
+        depth: 4.7260484958382705,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                19.613097491839678,
+                -20.560684960692555,
+            ),
+            radius: 2.793432387405404,
+        },
+        axis: Tilted {
+            u: [
+                0.9915680039829939,
+                -0.12958739706152517,
+                0.0,
+            ],
+            v: [
+                -0.12958739706152517,
+                -0.9915680039829939,
+                0.0,
+            ],
+        },
+        offset: -8.379584924983622,
+        depth: 10.379584924983622,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+]
+census chain 417 STEP round trip: part 0: strict import failed: InvalidTopology(PcurveMismatch { face: FaceId(1v1), loop_id: LoopId(1v1), edge: EdgeId(4v1), max_deviation: 1.0804286789879442e-6, tolerance: 1e-6 })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                44.436269402164385,
+                40.86352030017279,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 10.448373004844479,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                -9.781231436405045,
+                -28.555732244394868,
+            ),
+            radius: 5.192274739911869,
+        },
+        axis: Tilted {
+            u: [
+                0.4018463585271934,
+                -0.9157071060871125,
+                0.0,
+            ],
+            v: [
+                -0.9157071060871125,
+                -0.4018463585271934,
+                0.0,
+            ],
+        },
+        offset: -12.448373004844479,
+        depth: 14.448373004844479,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                30.162974250154733,
+                -1.1389981609263344,
+            ),
+            radius: 6.2698108811954185,
+        },
+        axis: Tilted {
+            u: [
+                0.7610964624183966,
+                0.6486387090624505,
+                0.0,
+            ],
+            v: [
+                0.6486387090624505,
+                -0.7610964624183966,
+                0.0,
+            ],
+        },
+        offset: -4.340724178530595,
+        depth: 6.340724178530595,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -10.81377018822772,
+                -28.18092806744108,
+            ),
+            radius: 5.118992496046923,
+        },
+        axis: Tilted {
+            u: [
+                -0.8956708118355985,
+                0.4447176596738205,
+                0.0,
+            ],
+            v: [
+                -0.4447176596738205,
+                -0.8956708118355985,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 11.330962689977358,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                29.757877509463917,
+                5.056783420103397,
+            ),
+            radius: 7.636079849406168,
+        },
+        axis: Tilted {
+            u: [
+                0.8390753592501367,
+                0.5440152033714262,
+                0.0,
+            ],
+            v: [
+                -0.5440152033714262,
+                0.8390753592501367,
+                0.0,
+            ],
+        },
+        offset: 6.37756671451746,
+        depth: 6.070806290327019,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                -29.606374345270087,
+                -5.8791947198425305,
+            ),
+            radius: 5.313983335172646,
+        },
+        axis: Tilted {
+            u: [
+                -0.8538236396935764,
+                -0.5205623807963977,
+                0.0,
+            ],
+            v: [
+                0.5205623807963977,
+                -0.8538236396935764,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 7.25628865055098,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial through hole",
+        profile: Circle {
+            center: (
+                29.825945085747563,
+                -4.638462263300388,
+            ),
+            radius: 6.2698108811954185,
+        },
+        axis: Tilted {
+            u: [
+                0.623316280577416,
+                0.7819698295760112,
+                0.0,
+            ],
+            v: [
+                -0.7819698295760112,
+                0.623316280577416,
+                0.0,
+            ],
+        },
+        offset: -2.0,
+        depth: 14.448373004844479,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+]
+census chain 469 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                61.15963974727476,
+                40.099158885751955,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 10.304680438786589,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                10.734887486099607,
+                34.95530303117232,
+            ),
+            radius: 8.710590166524652,
+        },
+        axis: Tilted {
+            u: [
+                -0.27863669807195124,
+                0.9603965797979293,
+                0.0,
+            ],
+            v: [
+                0.9603965797979293,
+                0.27863669807195124,
+                0.0,
+            ],
+        },
+        offset: -12.866752480570343,
+        depth: 4.998374950869282,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                -13.818704686550483,
+                33.85490245335541,
+            ),
+            radius: 7.804668155812576,
+        },
+        axis: Tilted {
+            u: [
+                -0.8236788423256338,
+                0.5670565798093729,
+                0.0,
+            ],
+            v: [
+                0.5670565798093729,
+                0.8236788423256338,
+                0.0,
+            ],
+        },
+        offset: -12.304680438786589,
+        depth: 7.508015460936537,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                12.397610823051506,
+                -34.40073059137638,
+            ),
+            radius: 5.214715221736217,
+        },
+        axis: Tilted {
+            u: [
+                -0.2322944546561634,
+                0.9726455090812869,
+                0.0,
+            ],
+            v: [
+                -0.9726455090812869,
+                -0.2322944546561634,
+                0.0,
+            ],
+        },
+        offset: 2.3283070649590787,
+        depth: 4.075029873412285,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                12.782545616114664,
+                -34.259561394043715,
+            ),
+            radius: 5.0334813544539845,
+        },
+        axis: Tilted {
+            u: [
+                0.8060495536466782,
+                -0.5918480523462004,
+                0.0,
+            ],
+            v: [
+                -0.5918480523462004,
+                -0.8060495536466782,
+                0.0,
+            ],
+        },
+        offset: -12.304680438786589,
+        depth: 7.580157709035911,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+]
+census chain 496 STEP round trip: part 0: strict import failed: Io(Custom { kind: Unsupported, error: "STEP cavity import is not qualified; enclosed voids cannot be discarded" })
+[
+    Step {
+        label: "base block",
+        profile: Rect {
+            min: (
+                0.0,
+                0.0,
+            ),
+            max: (
+                59.959180668992296,
+                38.40275121168028,
+            ),
+        },
+        axis: Z,
+        offset: 0.0,
+        depth: 11.091698179163123,
+        mode: NewBody,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial bottom blind hole",
+        profile: Circle {
+            center: (
+                18.954112823567282,
+                -30.13652715314507,
+            ),
+            radius: 7.803923938826005,
+        },
+        axis: Tilted {
+            u: [
+                0.904873903009275,
+                -0.4256797148711238,
+                0.0,
+            ],
+            v: [
+                -0.4256797148711238,
+                -0.904873903009275,
+                0.0,
+            ],
+        },
+        offset: -7.4570407632016344,
+        depth: 9.457040763201634,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -8.15290965921533,
+                -34.65542851948943,
+            ),
+            radius: 5.773940784971972,
+        },
+        axis: Tilted {
+            u: [
+                -0.717850325485104,
+                0.6961974649486526,
+                0.0,
+            ],
+            v: [
+                -0.6961974649486526,
+                -0.717850325485104,
+                0.0,
+            ],
+        },
+        offset: 8.106068874829091,
+        depth: 5.090458024415721,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial boss",
+        profile: Circle {
+            center: (
+                -26.907460085179743,
+                -23.312169644741925,
+            ),
+            radius: 6.994121741011949,
+        },
+        axis: Tilted {
+            u: [
+                -0.2832803015857484,
+                -0.9590371581609795,
+                0.0,
+            ],
+            v: [
+                -0.9590371581609795,
+                0.2832803015857484,
+                0.0,
+            ],
+        },
+        offset: -7.958691574508609,
+        depth: 4.3421958351676935,
+        mode: Join,
+        draft_deg: 0.0,
+    },
+    Step {
+        label: "coaxial top blind hole",
+        profile: Circle {
+            center: (
+                11.375656155346563,
+                33.73519095567852,
+            ),
+            radius: 4.871046491532751,
+        },
+        axis: Tilted {
+            u: [
+                -0.2419977476369343,
+                0.9702768110898305,
+                0.0,
+            ],
+            v: [
+                0.9702768110898305,
+                0.2419977476369343,
+                0.0,
+            ],
+        },
+        offset: -13.091698179163123,
+        depth: 5.997226782575653,
+        mode: Cut,
+        draft_deg: 0.0,
+    },
+]
+census: 500 chains, 1 wrongful refusals, 0 unsound
+census: 12 STEP round-trip failures
+     1  coaxial boss circle (cross-axis cylinder present)
+     1  error: FreeEdge
+test mixed_axis_refusal_census ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 584.83s
+

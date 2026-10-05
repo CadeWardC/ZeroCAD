@@ -1,0 +1,635 @@
+    Finished `fast-test` profile [optimized + debuginfo] target(s) in 0.31s
+     Running tests\repro_coincident_cylinder_cut.rs (target\fast-test\deps\repro_coincident_cylinder_cut-7adbc7987d74138a.exe)
+
+running 1 test
+partition start face=FaceId(1v1) surface=plane outer_edges=4 inner_wires=0 split_edges=3
+  split EdgeId(25v1) Forward circle (31.8972,16.7140,0.0000)->(26.2057,20.0000,0.0000)
+  split EdgeId(26v1) Forward circle (26.2057,20.0000,0.0000)->(31.8972,23.2860,0.0000)
+  split EdgeId(27v1) Forward circle (31.8972,23.2860,0.0000)->(31.8972,16.7140,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(1v1) Forward line (0.0000,0.0000,0.0000)->(61.2000,0.0000,0.0000)
+    EdgeId(2v1) Forward line (61.2000,0.0000,0.0000)->(61.2000,42.9000,0.0000)
+    EdgeId(3v1) Forward line (61.2000,42.9000,0.0000)->(0.0000,42.9000,0.0000)
+    EdgeId(4v1) Forward line (0.0000,42.9000,0.0000)->(0.0000,0.0000,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(1v1) Reversed line (0.0000,0.0000,0.0000)->(61.2000,0.0000,0.0000)
+    EdgeId(4v1) Reversed line (0.0000,42.9000,0.0000)->(0.0000,0.0000,0.0000)
+    EdgeId(3v1) Reversed line (61.2000,42.9000,0.0000)->(0.0000,42.9000,0.0000)
+    EdgeId(2v1) Reversed line (61.2000,0.0000,0.0000)->(61.2000,42.9000,0.0000)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(25v1) Forward circle (31.8972,16.7140,0.0000)->(26.2057,20.0000,0.0000)
+    EdgeId(26v1) Forward circle (26.2057,20.0000,0.0000)->(31.8972,23.2860,0.0000)
+    EdgeId(27v1) Forward circle (31.8972,23.2860,0.0000)->(31.8972,16.7140,0.0000)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(25v1) Reversed circle (31.8972,16.7140,0.0000)->(26.2057,20.0000,0.0000)
+    EdgeId(27v1) Reversed circle (31.8972,23.2860,0.0000)->(31.8972,16.7140,0.0000)
+    EdgeId(26v1) Reversed circle (26.2057,20.0000,0.0000)->(31.8972,23.2860,0.0000)
+  candidate loop edges=4 exterior=true
+  candidate loop edges=4 area=2625.48000000 exterior=false
+  candidate loop edges=3 area=44.71387548 exterior=false
+  candidate loop edges=3 area=-44.71387548 exterior=false
+  emitted face=FaceId(7v1) loop_edges=4 area=2625.48000000 inners=1
+  emitted face=FaceId(8v1) loop_edges=3 area=44.71387548 inners=0
+partition start face=FaceId(3v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(7v3) Forward circle (26.2057,20.0000,0.0000)->(31.8972,23.2860,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(3v1) Forward circle (26.2057,20.0000,7.9100)->(31.8972,23.2860,7.9100)
+    EdgeId(13v1) Forward line (31.8972,23.2860,7.9100)->(31.8972,23.2860,0.0000)
+    EdgeId(7v3) Reversed circle (26.2057,20.0000,0.0000)->(31.8972,23.2860,0.0000)
+    EdgeId(9v3) Reversed line (26.2057,20.0000,7.9100)->(26.2057,20.0000,0.0000)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(3v1) Reversed circle (26.2057,20.0000,7.9100)->(31.8972,23.2860,7.9100)
+    EdgeId(9v3) Forward line (26.2057,20.0000,7.9100)->(26.2057,20.0000,0.0000)
+    EdgeId(12v1) Forward line (26.2057,20.0000,0.0000)->(26.2057,20.0000,-2.0000)
+    EdgeId(4v1) Forward circle (26.2057,20.0000,-2.0000)->(31.8972,23.2860,-2.0000)
+    EdgeId(14v1) Reversed line (31.8972,23.2860,0.0000)->(31.8972,23.2860,-2.0000)
+    EdgeId(13v1) Reversed line (31.8972,23.2860,7.9100)->(31.8972,23.2860,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(14v1) Forward line (31.8972,23.2860,0.0000)->(31.8972,23.2860,-2.0000)
+    EdgeId(4v1) Reversed circle (26.2057,20.0000,-2.0000)->(31.8972,23.2860,-2.0000)
+    EdgeId(12v1) Reversed line (26.2057,20.0000,0.0000)->(26.2057,20.0000,-2.0000)
+    EdgeId(7v3) Forward circle (26.2057,20.0000,0.0000)->(31.8972,23.2860,0.0000)
+  candidate loop edges=4 area=16.56666526 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=4.18879020 exterior=false
+  emitted face=FaceId(6v1) loop_edges=4 area=16.56666526 inners=0
+  emitted face=FaceId(7v1) loop_edges=4 area=4.18879020 inners=0
+partition start face=FaceId(4v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(15v1) Forward circle (31.8972,23.2860,0.0000)->(31.8972,16.7140,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(2v1) Forward circle (31.8972,23.2860,7.9100)->(31.8972,16.7140,7.9100)
+    EdgeId(10v1) Forward line (31.8972,16.7140,7.9100)->(31.8972,16.7140,0.0000)
+    EdgeId(15v1) Reversed circle (31.8972,23.2860,0.0000)->(31.8972,16.7140,0.0000)
+    EdgeId(13v1) Reversed line (31.8972,23.2860,7.9100)->(31.8972,23.2860,0.0000)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(2v1) Reversed circle (31.8972,23.2860,7.9100)->(31.8972,16.7140,7.9100)
+    EdgeId(13v1) Forward line (31.8972,23.2860,7.9100)->(31.8972,23.2860,0.0000)
+    EdgeId(14v1) Forward line (31.8972,23.2860,0.0000)->(31.8972,23.2860,-2.0000)
+    EdgeId(5v1) Forward circle (31.8972,23.2860,-2.0000)->(31.8972,16.7140,-2.0000)
+    EdgeId(11v1) Reversed line (31.8972,16.7140,0.0000)->(31.8972,16.7140,-2.0000)
+    EdgeId(10v1) Reversed line (31.8972,16.7140,7.9100)->(31.8972,16.7140,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(11v1) Forward line (31.8972,16.7140,0.0000)->(31.8972,16.7140,-2.0000)
+    EdgeId(5v1) Reversed circle (31.8972,23.2860,-2.0000)->(31.8972,16.7140,-2.0000)
+    EdgeId(14v1) Reversed line (31.8972,23.2860,0.0000)->(31.8972,23.2860,-2.0000)
+    EdgeId(15v1) Forward circle (31.8972,23.2860,0.0000)->(31.8972,16.7140,0.0000)
+  candidate loop edges=4 area=16.56666526 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=4.18879020 exterior=false
+  emitted face=FaceId(3v3) loop_edges=4 area=16.56666526 inners=0
+  emitted face=FaceId(8v1) loop_edges=4 area=4.18879020 inners=0
+partition start face=FaceId(5v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(8v3) Forward circle (31.8972,16.7140,0.0000)->(26.2057,20.0000,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(1v1) Forward circle (31.8972,16.7140,7.9100)->(26.2057,20.0000,7.9100)
+    EdgeId(9v3) Forward line (26.2057,20.0000,7.9100)->(26.2057,20.0000,0.0000)
+    EdgeId(8v3) Reversed circle (31.8972,16.7140,0.0000)->(26.2057,20.0000,0.0000)
+    EdgeId(10v1) Reversed line (31.8972,16.7140,7.9100)->(31.8972,16.7140,0.0000)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(1v1) Reversed circle (31.8972,16.7140,7.9100)->(26.2057,20.0000,7.9100)
+    EdgeId(10v1) Forward line (31.8972,16.7140,7.9100)->(31.8972,16.7140,0.0000)
+    EdgeId(11v1) Forward line (31.8972,16.7140,0.0000)->(31.8972,16.7140,-2.0000)
+    EdgeId(6v1) Forward circle (31.8972,16.7140,-2.0000)->(26.2057,20.0000,-2.0000)
+    EdgeId(12v1) Reversed line (26.2057,20.0000,0.0000)->(26.2057,20.0000,-2.0000)
+    EdgeId(9v3) Reversed line (26.2057,20.0000,7.9100)->(26.2057,20.0000,0.0000)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(12v1) Forward line (26.2057,20.0000,0.0000)->(26.2057,20.0000,-2.0000)
+    EdgeId(6v1) Reversed circle (31.8972,16.7140,-2.0000)->(26.2057,20.0000,-2.0000)
+    EdgeId(11v1) Reversed line (31.8972,16.7140,0.0000)->(31.8972,16.7140,-2.0000)
+    EdgeId(8v3) Forward circle (31.8972,16.7140,0.0000)->(26.2057,20.0000,0.0000)
+  candidate loop edges=4 area=16.56666526 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=4.18879020 exterior=false
+  emitted face=FaceId(4v3) loop_edges=4 area=16.56666526 inners=0
+  emitted face=FaceId(9v1) loop_edges=4 area=4.18879020 inners=0
+partition start face=FaceId(1v1) surface=plane outer_edges=4 inner_wires=0 split_edges=3
+  split EdgeId(22v1) Forward circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+  split EdgeId(23v1) Forward circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+  split EdgeId(24v1) Forward circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(7v1) Forward line (0.0000,42.9000,10.1100)->(0.0000,0.0000,10.1100)
+    EdgeId(1v1) Forward line (0.0000,0.0000,10.1100)->(61.2000,0.0000,10.1100)
+    EdgeId(10v1) Forward line (61.2000,0.0000,10.1100)->(61.2000,42.9000,10.1100)
+    EdgeId(4v1) Forward line (61.2000,42.9000,10.1100)->(0.0000,42.9000,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(7v1) Reversed line (0.0000,42.9000,10.1100)->(0.0000,0.0000,10.1100)
+    EdgeId(4v1) Reversed line (61.2000,42.9000,10.1100)->(0.0000,42.9000,10.1100)
+    EdgeId(10v1) Reversed line (61.2000,0.0000,10.1100)->(61.2000,42.9000,10.1100)
+    EdgeId(1v1) Reversed line (0.0000,0.0000,10.1100)->(61.2000,0.0000,10.1100)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(22v1) Forward circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+    EdgeId(23v1) Forward circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+    EdgeId(24v1) Forward circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(22v1) Reversed circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+    EdgeId(24v1) Reversed circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+    EdgeId(23v1) Reversed circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+  candidate loop edges=4 exterior=true
+  candidate loop edges=4 area=2625.48000000 exterior=false
+  candidate loop edges=3 area=-3.10582854 exterior=false
+  candidate loop edges=3 area=3.10582854 exterior=false
+  emitted face=FaceId(11v1) loop_edges=4 area=2625.48000000 inners=1
+  emitted face=FaceId(12v1) loop_edges=3 area=3.10582854 inners=0
+partition start face=FaceId(3v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(15v1) Forward circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(3v1) Forward circle (30.5403,20.8415,9.0000)->(29.0011,20.0472,9.0000)
+    EdgeId(10v1) Forward line (29.0011,20.0472,9.0000)->(29.0011,20.0472,10.1100)
+    EdgeId(15v1) Reversed circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+    EdgeId(13v1) Reversed line (30.5403,20.8415,9.0000)->(30.5403,20.8415,10.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(3v1) Reversed circle (30.5403,20.8415,9.0000)->(29.0011,20.0472,9.0000)
+    EdgeId(13v1) Forward line (30.5403,20.8415,9.0000)->(30.5403,20.8415,10.1100)
+    EdgeId(14v1) Forward line (30.5403,20.8415,10.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(4v1) Forward circle (30.5403,20.8415,13.9400)->(29.0011,20.0472,13.9400)
+    EdgeId(11v1) Reversed line (29.0011,20.0472,10.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(10v1) Reversed line (29.0011,20.0472,9.0000)->(29.0011,20.0472,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(11v1) Forward line (29.0011,20.0472,10.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(4v1) Reversed circle (30.5403,20.8415,13.9400)->(29.0011,20.0472,13.9400)
+    EdgeId(14v1) Reversed line (30.5403,20.8415,10.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(15v1) Forward circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+  candidate loop edges=4 area=2.32477856 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=8.02153324 exterior=false
+  emitted face=FaceId(6v1) loop_edges=4 area=2.32477856 inners=0
+  emitted face=FaceId(7v1) loop_edges=4 area=8.02153324 inners=0
+partition start face=FaceId(4v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(9v3) Forward circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(2v1) Forward circle (29.0011,20.0472,9.0000)->(30.4586,19.1113,9.0000)
+    EdgeId(7v3) Forward line (30.4586,19.1113,9.0000)->(30.4586,19.1113,10.1100)
+    EdgeId(9v3) Reversed circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+    EdgeId(10v1) Reversed line (29.0011,20.0472,9.0000)->(29.0011,20.0472,10.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(2v1) Reversed circle (29.0011,20.0472,9.0000)->(30.4586,19.1113,9.0000)
+    EdgeId(10v1) Forward line (29.0011,20.0472,9.0000)->(29.0011,20.0472,10.1100)
+    EdgeId(11v1) Forward line (29.0011,20.0472,10.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(5v1) Forward circle (29.0011,20.0472,13.9400)->(30.4586,19.1113,13.9400)
+    EdgeId(12v1) Reversed line (30.4586,19.1113,10.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(7v3) Reversed line (30.4586,19.1113,9.0000)->(30.4586,19.1113,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(12v1) Forward line (30.4586,19.1113,10.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(5v1) Reversed circle (29.0011,20.0472,13.9400)->(30.4586,19.1113,13.9400)
+    EdgeId(11v1) Reversed line (29.0011,20.0472,10.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(9v3) Forward circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+  candidate loop edges=4 area=2.32477856 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=8.02153324 exterior=false
+  emitted face=FaceId(3v3) loop_edges=4 area=2.32477856 inners=0
+  emitted face=FaceId(8v1) loop_edges=4 area=8.02153324 inners=0
+partition start face=FaceId(5v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(8v3) Forward circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(1v1) Forward circle (30.4586,19.1113,9.0000)->(30.5403,20.8415,9.0000)
+    EdgeId(13v1) Forward line (30.5403,20.8415,9.0000)->(30.5403,20.8415,10.1100)
+    EdgeId(8v3) Reversed circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+    EdgeId(7v3) Reversed line (30.4586,19.1113,9.0000)->(30.4586,19.1113,10.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(1v1) Reversed circle (30.4586,19.1113,9.0000)->(30.5403,20.8415,9.0000)
+    EdgeId(7v3) Forward line (30.4586,19.1113,9.0000)->(30.4586,19.1113,10.1100)
+    EdgeId(12v1) Forward line (30.4586,19.1113,10.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(6v1) Forward circle (30.4586,19.1113,13.9400)->(30.5403,20.8415,13.9400)
+    EdgeId(14v1) Reversed line (30.5403,20.8415,10.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(13v1) Reversed line (30.5403,20.8415,9.0000)->(30.5403,20.8415,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(14v1) Forward line (30.5403,20.8415,10.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(6v1) Reversed circle (30.4586,19.1113,13.9400)->(30.5403,20.8415,13.9400)
+    EdgeId(12v1) Reversed line (30.4586,19.1113,10.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(8v3) Forward circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+  candidate loop edges=4 area=2.32477856 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=8.02153324 exterior=false
+  emitted face=FaceId(4v3) loop_edges=4 area=2.32477856 inners=0
+  emitted face=FaceId(9v1) loop_edges=4 area=8.02153324 inners=0
+partition start face=FaceId(7v1) surface=cylinder outer_edges=8 inner_wires=0 split_edges=1
+  split EdgeId(50v1) Forward circle (31.8972,23.2860,3.8300)->(31.8972,16.7140,3.8300)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(18v3) Forward circle (31.8972,23.2860,7.9100)->(32.1984,23.0925,7.9100)
+    EdgeId(38v1) Forward circle (32.1984,23.0925,7.9100)->(31.8972,16.7140,7.9100)
+    EdgeId(19v3) Forward line (31.8972,16.7140,7.9100)->(31.8972,16.7140,3.8300)
+    EdgeId(50v1) Reversed circle (31.8972,23.2860,3.8300)->(31.8972,16.7140,3.8300)
+    EdgeId(20v3) Reversed line (31.8972,23.2860,7.9100)->(31.8972,23.2860,3.8300)
+  traced loop edges=8 repeated_edges=0 closed=true
+    EdgeId(18v3) Reversed circle (31.8972,23.2860,7.9100)->(32.1984,23.0925,7.9100)
+    EdgeId(20v3) Forward line (31.8972,23.2860,7.9100)->(31.8972,23.2860,3.8300)
+    EdgeId(34v1) Forward line (31.8972,23.2860,3.8300)->(31.8972,23.2860,0.0000)
+    EdgeId(14v3) Forward circle (31.8972,23.2860,0.0000)->(32.1984,23.0925,0.0000)
+    EdgeId(40v1) Forward circle (32.1984,23.0925,0.0000)->(31.8972,16.7140,0.0000)
+    EdgeId(33v1) Reversed line (31.8972,16.7140,3.8300)->(31.8972,16.7140,0.0000)
+    EdgeId(19v3) Reversed line (31.8972,16.7140,7.9100)->(31.8972,16.7140,3.8300)
+    EdgeId(38v1) Reversed circle (32.1984,23.0925,7.9100)->(31.8972,16.7140,7.9100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(33v1) Forward line (31.8972,16.7140,3.8300)->(31.8972,16.7140,0.0000)
+    EdgeId(40v1) Reversed circle (32.1984,23.0925,0.0000)->(31.8972,16.7140,0.0000)
+    EdgeId(14v3) Reversed circle (31.8972,23.2860,0.0000)->(32.1984,23.0925,0.0000)
+    EdgeId(34v1) Reversed line (31.8972,23.2860,3.8300)->(31.8972,23.2860,0.0000)
+    EdgeId(50v1) Forward circle (31.8972,23.2860,3.8300)->(31.8972,16.7140,3.8300)
+  candidate loop edges=5 area=8.54513202 exterior=false
+  candidate loop edges=8 exterior=true
+  candidate loop edges=5 area=8.02153324 exterior=false
+  emitted face=FaceId(15v1) loop_edges=5 area=8.54513202 inners=0
+  emitted face=FaceId(16v1) loop_edges=5 area=8.02153324 inners=0
+partition start face=FaceId(8v1) surface=cylinder outer_edges=8 inner_wires=0 split_edges=1
+  split EdgeId(15v3) Forward circle (31.8972,16.7140,3.8300)->(26.2057,20.0000,3.8300)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(21v3) Forward circle (31.8972,16.7140,7.9100)->(31.5790,16.5498,7.9100)
+    EdgeId(35v1) Forward circle (31.5790,16.5498,7.9100)->(26.2057,20.0000,7.9100)
+    EdgeId(31v1) Forward line (26.2057,20.0000,7.9100)->(26.2057,20.0000,3.8300)
+    EdgeId(15v3) Reversed circle (31.8972,16.7140,3.8300)->(26.2057,20.0000,3.8300)
+    EdgeId(19v3) Reversed line (31.8972,16.7140,7.9100)->(31.8972,16.7140,3.8300)
+  traced loop edges=8 repeated_edges=0 closed=true
+    EdgeId(21v3) Reversed circle (31.8972,16.7140,7.9100)->(31.5790,16.5498,7.9100)
+    EdgeId(19v3) Forward line (31.8972,16.7140,7.9100)->(31.8972,16.7140,3.8300)
+    EdgeId(33v1) Forward line (31.8972,16.7140,3.8300)->(31.8972,16.7140,0.0000)
+    EdgeId(16v3) Forward circle (31.8972,16.7140,0.0000)->(31.5790,16.5498,0.0000)
+    EdgeId(36v1) Forward circle (31.5790,16.5498,0.0000)->(26.2057,20.0000,0.0000)
+    EdgeId(32v1) Reversed line (26.2057,20.0000,3.8300)->(26.2057,20.0000,0.0000)
+    EdgeId(31v1) Reversed line (26.2057,20.0000,7.9100)->(26.2057,20.0000,3.8300)
+    EdgeId(35v1) Reversed circle (31.5790,16.5498,7.9100)->(26.2057,20.0000,7.9100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(32v1) Forward line (26.2057,20.0000,3.8300)->(26.2057,20.0000,0.0000)
+    EdgeId(36v1) Reversed circle (31.5790,16.5498,0.0000)->(26.2057,20.0000,0.0000)
+    EdgeId(16v3) Reversed circle (31.8972,16.7140,0.0000)->(31.5790,16.5498,0.0000)
+    EdgeId(33v1) Reversed line (31.8972,16.7140,3.8300)->(31.8972,16.7140,0.0000)
+    EdgeId(15v3) Forward circle (31.8972,16.7140,3.8300)->(26.2057,20.0000,3.8300)
+  candidate loop edges=5 area=8.54513202 exterior=false
+  candidate loop edges=8 exterior=true
+  candidate loop edges=5 area=8.02153324 exterior=false
+  emitted face=FaceId(7v3) loop_edges=5 area=8.54513202 inners=0
+  emitted face=FaceId(17v1) loop_edges=5 area=8.02153324 inners=0
+partition start face=FaceId(9v1) surface=cylinder outer_edges=8 inner_wires=0 split_edges=1
+  split EdgeId(41v1) Forward circle (26.2057,20.0000,3.8300)->(31.8972,23.2860,3.8300)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(13v3) Forward circle (26.2057,20.0000,7.9100)->(26.2226,20.3576,7.9100)
+    EdgeId(37v1) Forward circle (26.2226,20.3576,7.9100)->(31.8972,23.2860,7.9100)
+    EdgeId(20v3) Forward line (31.8972,23.2860,7.9100)->(31.8972,23.2860,3.8300)
+    EdgeId(41v1) Reversed circle (26.2057,20.0000,3.8300)->(31.8972,23.2860,3.8300)
+    EdgeId(31v1) Reversed line (26.2057,20.0000,7.9100)->(26.2057,20.0000,3.8300)
+  traced loop edges=8 repeated_edges=0 closed=true
+    EdgeId(13v3) Reversed circle (26.2057,20.0000,7.9100)->(26.2226,20.3576,7.9100)
+    EdgeId(31v1) Forward line (26.2057,20.0000,7.9100)->(26.2057,20.0000,3.8300)
+    EdgeId(32v1) Forward line (26.2057,20.0000,3.8300)->(26.2057,20.0000,0.0000)
+    EdgeId(17v3) Forward circle (26.2057,20.0000,0.0000)->(26.2226,20.3576,0.0000)
+    EdgeId(39v1) Forward circle (26.2226,20.3576,0.0000)->(31.8972,23.2860,0.0000)
+    EdgeId(34v1) Reversed line (31.8972,23.2860,3.8300)->(31.8972,23.2860,0.0000)
+    EdgeId(20v3) Reversed line (31.8972,23.2860,7.9100)->(31.8972,23.2860,3.8300)
+    EdgeId(37v1) Reversed circle (26.2226,20.3576,7.9100)->(31.8972,23.2860,7.9100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(34v1) Forward line (31.8972,23.2860,3.8300)->(31.8972,23.2860,0.0000)
+    EdgeId(39v1) Reversed circle (26.2226,20.3576,0.0000)->(31.8972,23.2860,0.0000)
+    EdgeId(17v3) Reversed circle (26.2057,20.0000,0.0000)->(26.2226,20.3576,0.0000)
+    EdgeId(32v1) Reversed line (26.2057,20.0000,3.8300)->(26.2057,20.0000,0.0000)
+    EdgeId(41v1) Forward circle (26.2057,20.0000,3.8300)->(31.8972,23.2860,3.8300)
+  candidate loop edges=5 area=8.54513202 exterior=false
+  candidate loop edges=8 exterior=true
+  candidate loop edges=5 area=8.02153324 exterior=false
+  emitted face=FaceId(8v3) loop_edges=5 area=8.54513202 inners=0
+  emitted face=FaceId(18v1) loop_edges=5 area=8.02153324 inners=0
+partition start face=FaceId(10v1) surface=plane outer_edges=4 inner_wires=1 split_edges=3
+  existing inner LoopId(12v1) edges=3
+    EdgeId(22v1) Forward circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+    EdgeId(23v1) Forward circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+    EdgeId(24v1) Forward circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+  split EdgeId(42v1) Forward circle (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+  split EdgeId(43v1) Forward circle (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+  split EdgeId(44v1) Forward circle (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(7v1) Forward line (0.0000,42.9000,10.1100)->(0.0000,0.0000,10.1100)
+    EdgeId(1v1) Forward line (0.0000,0.0000,10.1100)->(61.2000,0.0000,10.1100)
+    EdgeId(10v1) Forward line (61.2000,0.0000,10.1100)->(61.2000,42.9000,10.1100)
+    EdgeId(4v1) Forward line (61.2000,42.9000,10.1100)->(0.0000,42.9000,10.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(7v1) Reversed line (0.0000,42.9000,10.1100)->(0.0000,0.0000,10.1100)
+    EdgeId(4v1) Reversed line (61.2000,42.9000,10.1100)->(0.0000,42.9000,10.1100)
+    EdgeId(10v1) Reversed line (61.2000,0.0000,10.1100)->(61.2000,42.9000,10.1100)
+    EdgeId(1v1) Reversed line (0.0000,0.0000,10.1100)->(61.2000,0.0000,10.1100)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(42v1) Forward circle (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+    EdgeId(44v1) Forward circle (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+    EdgeId(43v1) Forward circle (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(42v1) Reversed circle (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+    EdgeId(43v1) Reversed circle (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+    EdgeId(44v1) Reversed circle (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+  candidate loop edges=4 exterior=true
+  candidate loop edges=4 area=2625.48000000 exterior=false
+  candidate loop edges=3 area=44.71387548 exterior=false
+  candidate loop edges=3 area=-44.71387548 exterior=false
+  emitted face=FaceId(9v3) loop_edges=4 area=2625.48000000 inners=1
+  emitted face=FaceId(19v1) loop_edges=3 area=44.71387548 inners=1
+partition start face=FaceId(12v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(30v3) Forward circle (30.5403,20.8415,12.1100)->(29.0011,20.0472,12.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(45v1) Forward line (29.0011,20.0472,10.1100)->(29.0011,20.0472,12.1100)
+    EdgeId(30v3) Reversed circle (30.5403,20.8415,12.1100)->(29.0011,20.0472,12.1100)
+    EdgeId(48v1) Reversed line (30.5403,20.8415,10.1100)->(30.5403,20.8415,12.1100)
+    EdgeId(24v1) Forward circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(45v1) Reversed line (29.0011,20.0472,10.1100)->(29.0011,20.0472,12.1100)
+    EdgeId(24v1) Reversed circle (30.5403,20.8415,10.1100)->(29.0011,20.0472,10.1100)
+    EdgeId(48v1) Forward line (30.5403,20.8415,10.1100)->(30.5403,20.8415,12.1100)
+    EdgeId(49v1) Forward line (30.5403,20.8415,12.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(25v1) Forward circle (30.5403,20.8415,13.9400)->(29.0011,20.0472,13.9400)
+    EdgeId(46v1) Reversed line (29.0011,20.0472,12.1100)->(29.0011,20.0472,13.9400)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(46v1) Forward line (29.0011,20.0472,12.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(25v1) Reversed circle (30.5403,20.8415,13.9400)->(29.0011,20.0472,13.9400)
+    EdgeId(49v1) Reversed line (30.5403,20.8415,12.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(30v3) Forward circle (30.5403,20.8415,12.1100)->(29.0011,20.0472,12.1100)
+  candidate loop edges=4 area=4.18879020 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=3.83274304 exterior=false
+  emitted face=FaceId(10v3) loop_edges=4 area=4.18879020 inners=0
+  emitted face=FaceId(20v1) loop_edges=4 area=3.83274304 inners=0
+partition start face=FaceId(13v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(29v3) Forward circle (29.0011,20.0472,12.1100)->(30.4586,19.1113,12.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(28v3) Forward line (30.4586,19.1113,10.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(29v3) Reversed circle (29.0011,20.0472,12.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(45v1) Reversed line (29.0011,20.0472,10.1100)->(29.0011,20.0472,12.1100)
+    EdgeId(22v1) Forward circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(28v3) Reversed line (30.4586,19.1113,10.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(22v1) Reversed circle (29.0011,20.0472,10.1100)->(30.4586,19.1113,10.1100)
+    EdgeId(45v1) Forward line (29.0011,20.0472,10.1100)->(29.0011,20.0472,12.1100)
+    EdgeId(46v1) Forward line (29.0011,20.0472,12.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(26v1) Forward circle (29.0011,20.0472,13.9400)->(30.4586,19.1113,13.9400)
+    EdgeId(47v1) Reversed line (30.4586,19.1113,12.1100)->(30.4586,19.1113,13.9400)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(47v1) Forward line (30.4586,19.1113,12.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(26v1) Reversed circle (29.0011,20.0472,13.9400)->(30.4586,19.1113,13.9400)
+    EdgeId(46v1) Reversed line (29.0011,20.0472,12.1100)->(29.0011,20.0472,13.9400)
+    EdgeId(29v3) Forward circle (29.0011,20.0472,12.1100)->(30.4586,19.1113,12.1100)
+  candidate loop edges=4 area=4.18879020 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=3.83274304 exterior=false
+  emitted face=FaceId(12v3) loop_edges=4 area=4.18879020 inners=0
+  emitted face=FaceId(21v1) loop_edges=4 area=3.83274304 inners=0
+partition start face=FaceId(14v1) surface=cylinder outer_edges=6 inner_wires=0 split_edges=1
+  split EdgeId(51v1) Forward circle (30.4586,19.1113,12.1100)->(30.5403,20.8415,12.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(48v1) Forward line (30.5403,20.8415,10.1100)->(30.5403,20.8415,12.1100)
+    EdgeId(51v1) Reversed circle (30.4586,19.1113,12.1100)->(30.5403,20.8415,12.1100)
+    EdgeId(28v3) Reversed line (30.4586,19.1113,10.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(23v1) Forward circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(48v1) Reversed line (30.5403,20.8415,10.1100)->(30.5403,20.8415,12.1100)
+    EdgeId(23v1) Reversed circle (30.4586,19.1113,10.1100)->(30.5403,20.8415,10.1100)
+    EdgeId(28v3) Forward line (30.4586,19.1113,10.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(47v1) Forward line (30.4586,19.1113,12.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(27v1) Forward circle (30.4586,19.1113,13.9400)->(30.5403,20.8415,13.9400)
+    EdgeId(49v1) Reversed line (30.5403,20.8415,12.1100)->(30.5403,20.8415,13.9400)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(49v1) Forward line (30.5403,20.8415,12.1100)->(30.5403,20.8415,13.9400)
+    EdgeId(27v1) Reversed circle (30.4586,19.1113,13.9400)->(30.5403,20.8415,13.9400)
+    EdgeId(47v1) Reversed line (30.4586,19.1113,12.1100)->(30.4586,19.1113,13.9400)
+    EdgeId(51v1) Forward circle (30.4586,19.1113,12.1100)->(30.5403,20.8415,12.1100)
+  candidate loop edges=4 area=4.18879020 exterior=false
+  candidate loop edges=6 exterior=true
+  candidate loop edges=4 area=3.83274304 exterior=false
+  emitted face=FaceId(13v3) loop_edges=4 area=4.18879020 inners=0
+  emitted face=FaceId(22v1) loop_edges=4 area=3.83274304 inners=0
+partition start face=FaceId(1v1) surface=plane outer_edges=6 inner_wires=0 split_edges=3
+  split EdgeId(28v1) Forward circle (29.0011,20.0472,12.1100)->(30.4586,19.1113,12.1100)
+  split EdgeId(29v1) Forward circle (30.5403,20.8415,12.1100)->(29.0011,20.0472,12.1100)
+  split EdgeId(30v1) Forward circle (30.4586,19.1113,12.1100)->(30.5403,20.8415,12.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(18v1) Forward circle (31.8972,16.7140,12.1100)->(31.5790,16.5498,12.1100)
+    EdgeId(8v3) Forward circle (31.5790,16.5498,12.1100)->(26.2057,20.0000,12.1100)
+    EdgeId(16v1) Forward circle (26.2057,20.0000,12.1100)->(26.2226,20.3576,12.1100)
+    EdgeId(1v3) Forward circle (26.2226,20.3576,12.1100)->(31.8972,23.2860,12.1100)
+    EdgeId(19v1) Forward circle (31.8972,23.2860,12.1100)->(32.1984,23.0925,12.1100)
+    EdgeId(9v3) Forward circle (32.1984,23.0925,12.1100)->(31.8972,16.7140,12.1100)
+  traced loop edges=6 repeated_edges=0 closed=true
+    EdgeId(18v1) Reversed circle (31.8972,16.7140,12.1100)->(31.5790,16.5498,12.1100)
+    EdgeId(9v3) Reversed circle (32.1984,23.0925,12.1100)->(31.8972,16.7140,12.1100)
+    EdgeId(19v1) Reversed circle (31.8972,23.2860,12.1100)->(32.1984,23.0925,12.1100)
+    EdgeId(1v3) Reversed circle (26.2226,20.3576,12.1100)->(31.8972,23.2860,12.1100)
+    EdgeId(16v1) Reversed circle (26.2057,20.0000,12.1100)->(26.2226,20.3576,12.1100)
+    EdgeId(8v3) Reversed circle (31.5790,16.5498,12.1100)->(26.2057,20.0000,12.1100)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(28v1) Forward circle (29.0011,20.0472,12.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(30v1) Forward circle (30.4586,19.1113,12.1100)->(30.5403,20.8415,12.1100)
+    EdgeId(29v1) Forward circle (30.5403,20.8415,12.1100)->(29.0011,20.0472,12.1100)
+  traced loop edges=3 repeated_edges=0 closed=true
+    EdgeId(28v1) Reversed circle (29.0011,20.0472,12.1100)->(30.4586,19.1113,12.1100)
+    EdgeId(29v1) Reversed circle (30.5403,20.8415,12.1100)->(29.0011,20.0472,12.1100)
+    EdgeId(30v1) Reversed circle (30.4586,19.1113,12.1100)->(30.5403,20.8415,12.1100)
+  candidate loop edges=6 exterior=true
+  candidate loop edges=6 area=44.78022063 exterior=false
+  candidate loop edges=3 area=3.10582854 exterior=false
+  candidate loop edges=3 area=-3.10582854 exterior=false
+  emitted face=FaceId(6v1) loop_edges=6 area=44.78022063 inners=1
+  emitted face=FaceId(7v1) loop_edges=3 area=3.10582854 inners=0
+partition start face=FaceId(3v1) surface=cylinder outer_edges=10 inner_wires=0 split_edges=2
+  split EdgeId(2v3) Forward circle (31.5790,16.5498,7.9100)->(26.2226,20.3576,7.9100)
+  split EdgeId(5v5) Forward circle (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(8v3) Forward circle (31.5790,16.5498,12.1100)->(26.2057,20.0000,12.1100)
+    EdgeId(16v1) Forward circle (26.2057,20.0000,12.1100)->(26.2226,20.3576,12.1100)
+    EdgeId(7v5) Forward line (26.2226,20.3576,12.1100)->(26.2226,20.3576,10.1100)
+    EdgeId(5v5) Reversed circle (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+    EdgeId(21v1) Reversed line (31.5790,16.5498,12.1100)->(31.5790,16.5498,10.1100)
+  traced loop edges=10 repeated_edges=0 closed=true
+    EdgeId(8v3) Reversed circle (31.5790,16.5498,12.1100)->(26.2057,20.0000,12.1100)
+    EdgeId(21v1) Forward line (31.5790,16.5498,12.1100)->(31.5790,16.5498,10.1100)
+    EdgeId(22v1) Forward line (31.5790,16.5498,10.1100)->(31.5790,16.5498,7.9100)
+    EdgeId(15v1) Forward line (31.5790,16.5498,7.9100)->(31.5790,16.5498,3.8300)
+    EdgeId(10v1) Forward circle (31.5790,16.5498,3.8300)->(26.2057,20.0000,3.8300)
+    EdgeId(11v1) Forward circle (26.2057,20.0000,3.8300)->(26.2226,20.3576,3.8300)
+    EdgeId(14v1) Reversed line (26.2226,20.3576,7.9100)->(26.2226,20.3576,3.8300)
+    EdgeId(23v1) Reversed line (26.2226,20.3576,10.1100)->(26.2226,20.3576,7.9100)
+    EdgeId(7v5) Reversed line (26.2226,20.3576,12.1100)->(26.2226,20.3576,10.1100)
+    EdgeId(16v1) Reversed circle (26.2057,20.0000,12.1100)->(26.2226,20.3576,12.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(23v1) Forward line (26.2226,20.3576,10.1100)->(26.2226,20.3576,7.9100)
+    EdgeId(2v3) Reversed circle (31.5790,16.5498,7.9100)->(26.2226,20.3576,7.9100)
+    EdgeId(22v1) Reversed line (31.5790,16.5498,10.1100)->(31.5790,16.5498,7.9100)
+    EdgeId(5v5) Forward circle (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(14v1) Forward line (26.2226,20.3576,7.9100)->(26.2226,20.3576,3.8300)
+    EdgeId(11v1) Reversed circle (26.2057,20.0000,3.8300)->(26.2226,20.3576,3.8300)
+    EdgeId(10v1) Reversed circle (31.5790,16.5498,3.8300)->(26.2057,20.0000,3.8300)
+    EdgeId(15v1) Reversed line (31.5790,16.5498,7.9100)->(31.5790,16.5498,3.8300)
+    EdgeId(2v3) Forward circle (31.5790,16.5498,7.9100)->(26.2226,20.3576,7.9100)
+  candidate loop edges=5 area=4.18879020 exterior=false
+  candidate loop edges=10 exterior=true
+  candidate loop edges=4 area=4.60766923 exterior=false
+  candidate loop edges=5 area=8.54513202 exterior=false
+  emitted face=FaceId(1v3) loop_edges=5 area=4.18879020 inners=0
+  emitted face=FaceId(8v1) loop_edges=4 area=4.60766923 inners=0
+  emitted face=FaceId(9v1) loop_edges=5 area=8.54513202 inners=0
+partition start face=FaceId(4v1) surface=cylinder outer_edges=10 inner_wires=0 split_edges=2
+  split EdgeId(26v1) Forward circle (26.2226,20.3576,7.9100)->(32.1984,23.0925,7.9100)
+  split EdgeId(27v1) Forward circle (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(1v3) Forward circle (26.2226,20.3576,12.1100)->(31.8972,23.2860,12.1100)
+    EdgeId(19v1) Forward circle (31.8972,23.2860,12.1100)->(32.1984,23.0925,12.1100)
+    EdgeId(24v1) Forward line (32.1984,23.0925,12.1100)->(32.1984,23.0925,10.1100)
+    EdgeId(27v1) Reversed circle (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+    EdgeId(7v5) Reversed line (26.2226,20.3576,12.1100)->(26.2226,20.3576,10.1100)
+  traced loop edges=10 repeated_edges=0 closed=true
+    EdgeId(1v3) Reversed circle (26.2226,20.3576,12.1100)->(31.8972,23.2860,12.1100)
+    EdgeId(7v5) Forward line (26.2226,20.3576,12.1100)->(26.2226,20.3576,10.1100)
+    EdgeId(23v1) Forward line (26.2226,20.3576,10.1100)->(26.2226,20.3576,7.9100)
+    EdgeId(14v1) Forward line (26.2226,20.3576,7.9100)->(26.2226,20.3576,3.8300)
+    EdgeId(6v3) Forward circle (26.2226,20.3576,3.8300)->(31.8972,23.2860,3.8300)
+    EdgeId(13v1) Forward circle (31.8972,23.2860,3.8300)->(32.1984,23.0925,3.8300)
+    EdgeId(17v1) Reversed line (32.1984,23.0925,7.9100)->(32.1984,23.0925,3.8300)
+    EdgeId(25v1) Reversed line (32.1984,23.0925,10.1100)->(32.1984,23.0925,7.9100)
+    EdgeId(24v1) Reversed line (32.1984,23.0925,12.1100)->(32.1984,23.0925,10.1100)
+    EdgeId(19v1) Reversed circle (31.8972,23.2860,12.1100)->(32.1984,23.0925,12.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(25v1) Forward line (32.1984,23.0925,10.1100)->(32.1984,23.0925,7.9100)
+    EdgeId(26v1) Reversed circle (26.2226,20.3576,7.9100)->(32.1984,23.0925,7.9100)
+    EdgeId(23v1) Reversed line (26.2226,20.3576,10.1100)->(26.2226,20.3576,7.9100)
+    EdgeId(27v1) Forward circle (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(17v1) Forward line (32.1984,23.0925,7.9100)->(32.1984,23.0925,3.8300)
+    EdgeId(13v1) Reversed circle (31.8972,23.2860,3.8300)->(32.1984,23.0925,3.8300)
+    EdgeId(6v3) Reversed circle (26.2226,20.3576,3.8300)->(31.8972,23.2860,3.8300)
+    EdgeId(14v1) Reversed line (26.2226,20.3576,7.9100)->(26.2226,20.3576,3.8300)
+    EdgeId(26v1) Forward circle (26.2226,20.3576,7.9100)->(32.1984,23.0925,7.9100)
+  candidate loop edges=5 area=4.18879020 exterior=false
+  candidate loop edges=10 exterior=true
+  candidate loop edges=4 area=4.60766923 exterior=false
+  candidate loop edges=5 area=8.54513202 exterior=false
+  emitted face=FaceId(3v3) loop_edges=5 area=4.18879020 inners=0
+  emitted face=FaceId(10v1) loop_edges=4 area=4.60766923 inners=0
+  emitted face=FaceId(11v1) loop_edges=5 area=8.54513202 inners=0
+partition start face=FaceId(5v1) surface=cylinder outer_edges=10 inner_wires=0 split_edges=2
+  split EdgeId(20v1) Forward circle (32.1984,23.0925,7.9100)->(31.5790,16.5498,7.9100)
+  split EdgeId(3v5) Forward circle (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(9v3) Forward circle (32.1984,23.0925,12.1100)->(31.8972,16.7140,12.1100)
+    EdgeId(18v1) Forward circle (31.8972,16.7140,12.1100)->(31.5790,16.5498,12.1100)
+    EdgeId(21v1) Forward line (31.5790,16.5498,12.1100)->(31.5790,16.5498,10.1100)
+    EdgeId(3v5) Reversed circle (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+    EdgeId(24v1) Reversed line (32.1984,23.0925,12.1100)->(32.1984,23.0925,10.1100)
+  traced loop edges=10 repeated_edges=0 closed=true
+    EdgeId(9v3) Reversed circle (32.1984,23.0925,12.1100)->(31.8972,16.7140,12.1100)
+    EdgeId(24v1) Forward line (32.1984,23.0925,12.1100)->(32.1984,23.0925,10.1100)
+    EdgeId(25v1) Forward line (32.1984,23.0925,10.1100)->(32.1984,23.0925,7.9100)
+    EdgeId(17v1) Forward line (32.1984,23.0925,7.9100)->(32.1984,23.0925,3.8300)
+    EdgeId(4v3) Forward circle (32.1984,23.0925,3.8300)->(31.8972,16.7140,3.8300)
+    EdgeId(12v1) Forward circle (31.8972,16.7140,3.8300)->(31.5790,16.5498,3.8300)
+    EdgeId(15v1) Reversed line (31.5790,16.5498,7.9100)->(31.5790,16.5498,3.8300)
+    EdgeId(22v1) Reversed line (31.5790,16.5498,10.1100)->(31.5790,16.5498,7.9100)
+    EdgeId(21v1) Reversed line (31.5790,16.5498,12.1100)->(31.5790,16.5498,10.1100)
+    EdgeId(18v1) Reversed circle (31.8972,16.7140,12.1100)->(31.5790,16.5498,12.1100)
+  traced loop edges=4 repeated_edges=0 closed=true
+    EdgeId(22v1) Forward line (31.5790,16.5498,10.1100)->(31.5790,16.5498,7.9100)
+    EdgeId(20v1) Reversed circle (32.1984,23.0925,7.9100)->(31.5790,16.5498,7.9100)
+    EdgeId(25v1) Reversed line (32.1984,23.0925,10.1100)->(32.1984,23.0925,7.9100)
+    EdgeId(3v5) Forward circle (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+  traced loop edges=5 repeated_edges=0 closed=true
+    EdgeId(15v1) Forward line (31.5790,16.5498,7.9100)->(31.5790,16.5498,3.8300)
+    EdgeId(12v1) Reversed circle (31.8972,16.7140,3.8300)->(31.5790,16.5498,3.8300)
+    EdgeId(4v3) Reversed circle (32.1984,23.0925,3.8300)->(31.8972,16.7140,3.8300)
+    EdgeId(17v1) Reversed line (32.1984,23.0925,7.9100)->(32.1984,23.0925,3.8300)
+    EdgeId(20v1) Forward circle (32.1984,23.0925,7.9100)->(31.5790,16.5498,7.9100)
+  candidate loop edges=5 area=4.18879020 exterior=false
+  candidate loop edges=10 exterior=true
+  candidate loop edges=4 area=4.60766923 exterior=false
+  candidate loop edges=5 area=8.54513202 exterior=false
+  emitted face=FaceId(4v3) loop_edges=5 area=4.18879020 inners=0
+  emitted face=FaceId(12v1) loop_edges=4 area=4.60766923 inners=0
+  emitted face=FaceId(13v1) loop_edges=5 area=8.54513202 inners=0
+rejected boolean output: HealthReport { errors: [InvalidEulerCharacteristic { value: -3 }, Validation(FreeEdge { loop_id: LoopId(7v1), edge: EdgeId(21v1) })], warnings: [] }
+  face 0 FaceId(1v1) plane
+    EdgeId(8v1) (0.0000,0.0000,0.0000)->(0.0000,0.0000,10.1100)
+    EdgeId(1v1) (0.0000,0.0000,10.1100)->(61.2000,0.0000,10.1100)
+    EdgeId(9v1) (61.2000,0.0000,10.1100)->(61.2000,0.0000,0.0000)
+    EdgeId(2v1) (61.2000,0.0000,0.0000)->(0.0000,0.0000,0.0000)
+  face 1 FaceId(2v1) plane
+    EdgeId(3v1) (0.0000,42.9000,0.0000)->(61.2000,42.9000,0.0000)
+    EdgeId(11v1) (61.2000,42.9000,0.0000)->(61.2000,42.9000,10.1100)
+    EdgeId(4v1) (61.2000,42.9000,10.1100)->(0.0000,42.9000,10.1100)
+    EdgeId(6v1) (0.0000,42.9000,10.1100)->(0.0000,42.9000,0.0000)
+  face 2 FaceId(3v1) plane
+    EdgeId(5v1) (0.0000,0.0000,0.0000)->(0.0000,42.9000,0.0000)
+    EdgeId(6v1) (0.0000,42.9000,0.0000)->(0.0000,42.9000,10.1100)
+    EdgeId(7v1) (0.0000,42.9000,10.1100)->(0.0000,0.0000,10.1100)
+    EdgeId(8v1) (0.0000,0.0000,10.1100)->(0.0000,0.0000,0.0000)
+  face 3 FaceId(4v1) plane
+    EdgeId(9v1) (61.2000,0.0000,0.0000)->(61.2000,0.0000,10.1100)
+    EdgeId(10v1) (61.2000,0.0000,10.1100)->(61.2000,42.9000,10.1100)
+    EdgeId(11v1) (61.2000,42.9000,10.1100)->(61.2000,42.9000,0.0000)
+    EdgeId(12v1) (61.2000,42.9000,0.0000)->(61.2000,0.0000,0.0000)
+  face 4 FaceId(5v1) plane
+    EdgeId(2v1) (61.2000,0.0000,0.0000)->(0.0000,0.0000,0.0000)
+    EdgeId(5v1) (0.0000,0.0000,0.0000)->(0.0000,42.9000,0.0000)
+    EdgeId(3v1) (0.0000,42.9000,0.0000)->(61.2000,42.9000,0.0000)
+    EdgeId(12v1) (61.2000,42.9000,0.0000)->(61.2000,0.0000,0.0000)
+    EdgeId(32v1) (26.2057,20.0000,0.0000)->(31.5790,16.5498,0.0000)
+    EdgeId(16v1) (31.5790,16.5498,0.0000)->(31.8972,16.7140,0.0000)
+    EdgeId(36v1) (31.8972,16.7140,0.0000)->(32.1984,23.0925,0.0000)
+    EdgeId(14v1) (32.1984,23.0925,0.0000)->(31.8972,23.2860,0.0000)
+    EdgeId(35v1) (31.8972,23.2860,0.0000)->(26.2226,20.3576,0.0000)
+    EdgeId(17v1) (26.2226,20.3576,0.0000)->(26.2057,20.0000,0.0000)
+  face 5 FaceId(6v1) cylinder
+    EdgeId(21v1) (31.8972,16.7140,7.9100)->(31.5790,16.5498,7.9100)
+    EdgeId(31v1) (31.5790,16.5498,7.9100)->(26.2057,20.0000,7.9100)
+    EdgeId(27v1) (26.2057,20.0000,7.9100)->(26.2057,20.0000,3.8300)
+    EdgeId(15v1) (26.2057,20.0000,3.8300)->(31.8972,16.7140,3.8300)
+    EdgeId(19v1) (31.8972,16.7140,3.8300)->(31.8972,16.7140,7.9100)
+  face 6 FaceId(7v1) cylinder
+    EdgeId(13v1) (26.2057,20.0000,7.9100)->(26.2226,20.3576,7.9100)
+    EdgeId(33v1) (26.2226,20.3576,7.9100)->(31.8972,23.2860,7.9100)
+    EdgeId(20v1) (31.8972,23.2860,7.9100)->(31.8972,23.2860,3.8300)
+    EdgeId(37v1) (31.8972,23.2860,3.8300)->(26.2057,20.0000,3.8300)
+    EdgeId(27v1) (26.2057,20.0000,3.8300)->(26.2057,20.0000,7.9100)
+  face 7 FaceId(8v1) plane
+    EdgeId(7v1) (0.0000,0.0000,10.1100)->(0.0000,42.9000,10.1100)
+    EdgeId(4v1) (0.0000,42.9000,10.1100)->(61.2000,42.9000,10.1100)
+    EdgeId(10v1) (61.2000,42.9000,10.1100)->(61.2000,0.0000,10.1100)
+    EdgeId(1v1) (61.2000,0.0000,10.1100)->(0.0000,0.0000,10.1100)
+    EdgeId(38v1) (26.2226,20.3576,10.1100)->(31.5790,16.5498,10.1100)
+    EdgeId(39v1) (31.5790,16.5498,10.1100)->(32.1984,23.0925,10.1100)
+    EdgeId(40v1) (32.1984,23.0925,10.1100)->(26.2226,20.3576,10.1100)
+  face 8 FaceId(10v1) cylinder
+    EdgeId(18v1) (31.8972,23.2860,7.9100)->(32.1984,23.0925,7.9100)
+    EdgeId(34v1) (32.1984,23.0925,7.9100)->(31.8972,16.7140,7.9100)
+    EdgeId(19v1) (31.8972,16.7140,7.9100)->(31.8972,16.7140,3.8300)
+    EdgeId(44v1) (31.8972,16.7140,3.8300)->(31.8972,23.2860,3.8300)
+    EdgeId(20v1) (31.8972,23.2860,3.8300)->(31.8972,23.2860,7.9100)
+  face 9 FaceId(11v1) cylinder
+    EdgeId(29v1) (31.8972,16.7140,3.8300)->(31.8972,16.7140,0.0000)
+    EdgeId(36v1) (31.8972,16.7140,0.0000)->(32.1984,23.0925,0.0000)
+    EdgeId(14v1) (32.1984,23.0925,0.0000)->(31.8972,23.2860,0.0000)
+    EdgeId(30v1) (31.8972,23.2860,0.0000)->(31.8972,23.2860,3.8300)
+    EdgeId(44v1) (31.8972,23.2860,3.8300)->(31.8972,16.7140,3.8300)
+  face 10 FaceId(12v1) cylinder
+    EdgeId(28v1) (26.2057,20.0000,3.8300)->(26.2057,20.0000,0.0000)
+    EdgeId(32v1) (26.2057,20.0000,0.0000)->(31.5790,16.5498,0.0000)
+    EdgeId(16v1) (31.5790,16.5498,0.0000)->(31.8972,16.7140,0.0000)
+    EdgeId(29v1) (31.8972,16.7140,0.0000)->(31.8972,16.7140,3.8300)
+    EdgeId(15v1) (31.8972,16.7140,3.8300)->(26.2057,20.0000,3.8300)
+  face 11 FaceId(13v1) cylinder
+    EdgeId(30v1) (31.8972,23.2860,3.8300)->(31.8972,23.2860,0.0000)
+    EdgeId(35v1) (31.8972,23.2860,0.0000)->(26.2226,20.3576,0.0000)
+    EdgeId(17v1) (26.2226,20.3576,0.0000)->(26.2057,20.0000,0.0000)
+    EdgeId(28v1) (26.2057,20.0000,0.0000)->(26.2057,20.0000,3.8300)
+    EdgeId(37v1) (26.2057,20.0000,3.8300)->(31.8972,23.2860,3.8300)
+  face 12 FaceId(18v1) cylinder
+    EdgeId(49v1) (26.2226,20.3576,10.1100)->(26.2226,20.3576,7.9100)
+    EdgeId(46v1) (26.2226,20.3576,7.9100)->(31.5790,16.5498,7.9100)
+    EdgeId(48v1) (31.5790,16.5498,7.9100)->(31.5790,16.5498,10.1100)
+    EdgeId(38v1) (31.5790,16.5498,10.1100)->(26.2226,20.3576,10.1100)
+  face 13 FaceId(19v1) cylinder
+    EdgeId(50v1) (32.1984,23.0925,10.1100)->(32.1984,23.0925,7.9100)
+    EdgeId(51v1) (32.1984,23.0925,7.9100)->(26.2226,20.3576,7.9100)
+    EdgeId(49v1) (26.2226,20.3576,7.9100)->(26.2226,20.3576,10.1100)
+    EdgeId(40v1) (26.2226,20.3576,10.1100)->(32.1984,23.0925,10.1100)
+  face 14 FaceId(20v1) cylinder
+    EdgeId(48v1) (31.5790,16.5498,10.1100)->(31.5790,16.5498,7.9100)
+    EdgeId(47v1) (31.5790,16.5498,7.9100)->(32.1984,23.0925,7.9100)
+    EdgeId(50v1) (32.1984,23.0925,7.9100)->(32.1984,23.0925,10.1100)
+    EdgeId(39v1) (32.1984,23.0925,10.1100)->(31.5790,16.5498,10.1100)
+DBG boolean cut failed: boolean cut: boolean produced invalid topology: HealthReport { errors: [InvalidEulerCharacteristic { value: -3 }, Validation(FreeEdge { loop_id: LoopId(7v1), edge: EdgeId(21v1) })], warnings: [] }
+Err("top hole failed")
+test bore_boss_then_overlapping_hole_applies ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.07s
+

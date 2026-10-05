@@ -1,0 +1,2022 @@
+warning: unused import: `difference_bodies`
+ --> zerocad-core\tests\repro_coincident_cylinder_cut.rs:7:45
+  |
+7 | use zerocad_core::mock_kernel::{difference, difference_bodies};
+  |                                             ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zerocad-core` (test "repro_coincident_cylinder_cut") generated 1 warning (run `cargo fix --test "repro_coincident_cylinder_cut" -p zerocad-core` to apply 1 suggestion)
+    Finished `fast-test` profile [optimized + debuginfo] target(s) in 0.75s
+     Running tests\body_booleans_stress.rs (target\fast-test\deps\body_booleans_stress-0c1cf2191d02192c.exe)
+
+running 15 tests
+test body_cut_chain_three_levels ... ok
+test body_cut_with_keep_tool_then_reuse_tool_twice ... ok
+test body_intersect_disjoint_warns_and_preserves ... ok
+test body_intersect_contained_keeps_small_body ... ok
+test body_intersect_tangent_face_contact_is_graceful ... ok
+test body_intersect_partial_overlap_is_exact ... ok
+test body_join_duplicate_sources_is_graceful ... ok
+test body_join_with_one_ghost_source_reports_and_keeps_valid_pair ... ok
+test body_split_boundary_tangent_plane_is_graceful ... ok
+test body_intersects_of_three_bodies_pairwise_chain ... ok
+test body_split_tangent_to_face_is_graceful ... ok
+test body_split_midplane_then_join_back_is_identity ... ok
+test characterization_cutting_a_whole_island_fails ... ok
+test clearance_plug_join_conserves_volume ... ok
+test flush_coaxial_plug_join_conserves_material_as_two_bodies ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests\boolean_face_selection.rs (target\fast-test\deps\boolean_face_selection-ccf145b2a6d9fedd.exe)
+
+running 1 test
+test drilled_faces_keep_surface_kind_and_producer_after_cold_rebuild ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests\catalog_a_numeric.rs (target\fast-test\deps\catalog_a_numeric-c4f1715d7f4c2eca.exe)
+
+running 13 tests
+test a02_expression_overflowing_the_stored_type_is_attributed ... ok
+test a03_subnormal_box_dimension_terminates_classified ... ok
+test a03_sub_tolerance_magnitudes_are_exact_or_rejected ... ok
+test a04_body_scale_infinite_factor_is_rejected ... ok
+test a04_body_scale_display_range_overflow_known_break ... ok
+test a04_pattern_count_times_spacing_overflow_is_attributed ... ok
+test a05_empty_and_trailing_garbage_expressions_fall_back_with_warning ... ok
+test a05_expression_evaluator_rejects_malformed_input_cleanly ... ok
+test a07_unit_input_paths_agree_within_conversion_contract ... ok
+test a04_thread_starts_times_pitch_overflow_terminates ... ok
+test a08_undo_restores_the_pre_delete_state ... ok
+test a08_variable_rename_is_atomic_on_collision ... ok
+test a08_variable_lifecycle_rename_delete_recreate_reopen ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\catalog_b_constraints.rs (target\fast-test\deps\catalog_b_constraints-c2a4387d55f0860d.exe)
+
+running 9 tests
+test b01_conflicting_variable_bound_model_warns_at_evaluation ... ok
+test b01_incompatible_width_on_fully_constrained_rect_is_attributed ... ok
+test b02_duplicate_constraints_redundant_vs_inconsistent ... ok
+test b03_nearly_collinear_triangle_through_exact_collinearity ... ok
+test b01_conflicting_literal_model_uses_last_valid_geometry_deterministically ... ok
+test b04_mixed_scales_solve_per_entity_accurately ... ok
+test b05_mirrored_start_reaches_mirrored_solution_without_flips ... ok
+test b07_insertion_order_and_repeated_solves_agree ... ok
+test b06_dense_ladder_network_converges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\catalog_c_regions_text.rs (target\fast-test\deps\catalog_c_regions_text-f689df50a3bd8239.exe)
+
+running 8 tests
+test c02_duplicate_and_degenerate_geometry_normalizes ... ok
+test c03_endpoint_gap_closure_tolerance ... ok
+test c04_multiple_intersections_at_one_point ... ok
+test c05_offset_sweep_through_collapse_is_atomic ... ok
+test c06_projected_edge_rebuild_follows_source_and_refuses_kind_change ... ok
+test c07_text_counters_and_overlap_fill_correctly ... ok
+test c01_nested_loops_alternate_material_and_void ... ok
+test c08_baked_text_survives_reopen_without_font ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests\catalog_d_extrude.rs (target\fast-test\deps\catalog_d_extrude-58c8e0f7aad175a6.exe)
+
+running 8 tests
+test d01_profile_on_every_plane_with_both_directions ... ok
+test d03_annulus_holes_survive_geometry_and_mesh ... ok
+test d05_region_selection_survives_region_insertion ... ok
+test d02_depth_drag_through_zero_keeps_mode_semantics ... ok
+test d06_join_with_unfuseable_region_rolls_back_whole_feature ... ok
+test d08_draft_past_collapse_boundary_flips_taper_direction ... ok
+test d07_cut_targeting_changes_exactly_the_intended_bodies ... ok
+test d08_draft_sweep_through_collapse ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests\catalog_e_boolean.rs (target\fast-test\deps\catalog_e_boolean-a371bedb88c0eb5b.exe)
+
+running 7 tests
+test e01_exact_analytic_box_booleans ... ok
+test e03_exactly_tangent_bore_pair_rejects_nonmanifold_wall_atomically ... ok
+test e03_overlapping_bores_drop_the_second_bore_known_break ... ok
+test e03_whole_sketch_overlapping_bores_remove_the_union ... ok
+test e05_full_consumption_and_island_removal ... ok
+test e08_sliver_cut_removed_material_is_measured_directly ... ok
+test e03_overlapping_bores_remove_the_union_once ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests\catalog_f_blends.rs (target\fast-test\deps\catalog_f_blends-6c151b404d7bb822.exe)
+
+running 5 tests
+test f04_fillet_cut_order_dependence_is_exact_each_way ... ok
+test f02_partial_chains_at_three_way_corner ... ok
+test f05_second_blend_intersecting_the_first ... ok
+test f06_upstream_edits_move_split_or_remove_the_selected_edge ... ok
+test f08_blend_volume_is_placement_invariant ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests\catalog_g_faces.rs (target\fast-test\deps\catalog_g_faces-8139c9591be391b4.exe)
+
+running 7 tests
+test g03_shell_on_fillet_warns_failure_but_hollows_known_break ... ok
+test g03_shell_survives_downstream_pocket_edit ... ok
+test g04_face_offset_through_zero_remaining_thickness ... ok
+test g05_face_move_normal_and_tangential ... ok
+test g05_tangential_face_move_changes_material_without_changing_volume ... ok
+test g07_face_thicken_creates_owned_body_and_keeps_source ... ok
+test g06_face_delete_boss_and_hole ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests\catalog_h_sweeps.rs (target\fast-test\deps\catalog_h_sweeps-6b331f889765c564.exe)
+
+running 9 tests
+test h03_loft_section_reorder_is_stable ... ok
+test h04_loft_between_ring_sections_keeps_cavity_continuous ... ok
+test h05_coincident_loft_phantom_body_known_break ... ok
+test h05_coincident_loft_sections_are_rejected_exactly ... ok
+test h06_sweep_tight_bend_self_intersection ... ok
+test h07_zero_length_and_repeated_path_segments ... ok
+test h08_closed_path_sweep_drops_the_closing_leg_known_break ... ok
+test h08_closed_path_sweep_is_a_ring ... ok
+test h01_revolve_seam_closure_at_360_boundary ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests\catalog_i_holes_threads.rs (target\fast-test\deps\catalog_i_holes_threads-a0062e0e4e5e26a0.exe)
+
+running 5 tests
+test i01_exactly_tangent_hole_removes_nothing_known_break ... ok
+test i02_blind_depth_through_back_face_equals_through_all ... ok
+test i03_counterbore_countdersink_invalid_orderings ... ok
+test i01_hole_edge_tangency_and_breakout ... ok
+test i05_tube_outer_wall_vs_inner_bore_thread_separately ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+     Running tests\catalog_j_patterns.rs (target\fast-test\deps\catalog_j_patterns-4fedd6656d473e64.exe)
+
+running 8 tests
+test j01_pattern_count_boundaries ... ok
+test j03_spacing_extremes ... ok
+test j04_circular_near_full_turn_no_duplicate_instances ... ok
+test j06_mid_pattern_cancellation_is_atomic ... ok
+test j07_mirror_doubles_joined_material ... ok
+test j07_second_perpendicular_mirror_doubles_known_break ... ok
+test j08_inverse_transform_chain_drift_is_bounded ... ok
+test j02_face_instance_budget_bounds_complexity ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.37s
+
+     Running tests\closed_sweep_material.rs (target\fast-test\deps\closed_sweep_material-90939855c52fb5f9.exe)
+
+running 1 test
+test closed_rectangular_spines_preserve_leg_cross_section_in_both_directions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests\complex_extrusions.rs (target\fast-test\deps\complex_extrusions-4821b6ef3cc9cc85.exe)
+
+running 24 tests
+test comb_profile_with_many_teeth ... ok
+test concave_l_profile_from_lines ... ok
+test crossed_prism_bars_fuse_correctly ... ok
+test crossing_rib_join_preserves_both_ribs ... ok
+test cut_away_one_body_then_reference_it ... ok
+test cut_targeting_one_of_two_overlapping_bodies ... ok
+test annular_groove_stack_on_plate ... ok
+test deterministic_pseudo_random_pocket_field ... ok
+test eight_body_workbench_document ... ok
+test cylinder_head_block ... ok
+test i_beam_from_three_overlapping_rectangles ... ok
+test interleaved_join_cut_history_twelve_features ... ok
+test join_targeting_one_of_two_touching_bodies ... ok
+test multi_tool_crossing_join_preserves_both_ribs ... ok
+test one_cut_through_two_stacked_bodies ... ok
+test one_sketch_feeds_boss_and_pocket_and_new_body ... ok
+test overlapping_multi_shape_profile_mixed_circles_and_rects ... ok
+test region_grid_cut_25_pockets ... ok
+test ribbed_mounting_plate ... ok
+test same_sketch_cut_then_join_on_different_bodies ... ok
+test selective_region_extrude_extrudes_less_than_all ... ok
+test triangular_gusset_from_three_lines ... ok
+test ziggurat_of_stacked_bosses ... ok
+test hundred_region_vent_plate ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.02s
+
+     Running tests\complex_parts.rs (target\fast-test\deps\complex_parts-8f4ccb4ac8b27340.exe)
+
+running 11 tests
+test body_intersect_crossed_boxes ... ok
+test body_boolean_workflow_plate_with_slot ... ok
+test circular_pattern_full_ring ... ok
+test housing_with_shell_and_pattern ... ok
+test flanged_hub_with_revolve ... ok
+test linear_pattern_of_body ... ok
+test lofted_transition_duct ... ok
+test rotated_off_axis_sketch_extrude_cut ... ok
+test stacked_feature_edit_chain_rebuilds ... ok
+test swept_pipe_elbow ... ok
+test l_bracket_with_bolt_holes ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.99s
+
+     Running tests\cylinder_slab_cut.rs (target\fast-test\deps\cylinder_slab_cut-d96e28cda8f3d50a.exe)
+
+running 1 test
+test transverse_slab_cut_preserves_cylinder_remainder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.79s
+
+     Running tests\degenerate_params.rs (target\fast-test\deps\degenerate_params-5e4899ee48ef4068.exe)
+
+running 17 tests
+test degenerate_box_dimensions_resolve_to_parameter_diagnostics ... ok
+test degenerate_cylinder_dimensions_do_not_panic ... ok
+test degenerate_extrude_depths_do_not_panic ... ok
+test dependency_on_unknown_node_is_survivable ... ok
+test duplicate_feature_ids_are_rejected_structurally ... ok
+test extreme_but_valid_box_dimensions_do_not_panic ... ok
+test extreme_draft_angles_do_not_panic ... ok
+test extrude_targeting_missing_body_fails_loudly ... ok
+test feature_referencing_it_own_target_chain_survives ... ok
+test hole_completely_off_body_leaves_part_intact ... ok
+test hole_direction_vectors_are_normalized_or_rejected_not_crashed ... ok
+test hole_parameters_out_of_range_do_not_panic ... ok
+test huge_finite_box_dimensions_do_not_overflow_the_arena ... ok
+test infinite_box_dimensions_resolve_to_parameter_diagnostics ... ok
+test invalid_box_does_not_block_independent_features ... ok
+test nonfinite_extrude_depths_resolve_to_parameter_diagnostics ... ok
+test degenerate_sketch_geometry_does_not_panic ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
+
+     Running tests\edge_blend_break.rs (target\fast-test\deps\edge_blend_break-94a92321b809bd02.exe)
+
+running 29 tests
+test blend_empty_and_duplicate_edge_selections ... ok
+test blend_mixed_fillet_and_chamfer_corner_modes ... ok
+test blend_three_edges_meeting_at_a_corner ... ok
+test chamfer_setback_larger_than_face ... ok
+test characterization_fillet_larger_than_thickness_warns_cleanly ... ok
+test degenerate_fillet_distances_do_not_panic ... ok
+test edge_mod_on_missing_target_body ... ok
+test edge_mod_referencing_edge_far_away_from_body ... ok
+test edge_mod_with_garbage_edge_geometry ... ok
+test blend_network_with_too_large_radius ... ok
+test fillet_after_hole_through_same_face ... ok
+test fillet_box_to_cylinder_junction ... ok
+test fillet_cylinder_rim_edge ... ok
+test fillet_on_acute_angle_edge ... ok
+test fillet_on_revolved_body_edge ... ok
+test fillet_radius_equal_to_edge_length ... ok
+test fillet_radius_larger_than_thin_plate_thickness ... ok
+test fillet_radius_sweep_up_to_overflow ... ok
+test fillet_survives_preceding_pocket_edit ... ok
+test fillet_then_chamfer_same_edge ... ok
+test legacy_chord_reference_boss_root_fillet_is_rejected_not_guessed ... ok
+test legacy_chord_reference_rim_fillet_is_rejected_not_guessed ... ok
+test simple_chamfer_on_box_edge ... ok
+test simple_fillet_on_box_edge ... ok
+test single_edge_fillet_at_full_face_width_rejects_cleanly ... ok
+test fillet_radius_grows_until_it_hits_the_hole ... ok
+test sub_tolerance_fillet_radius_leaves_body_unchanged_with_warning ... ok
+test single_edge_large_radius_fillet_matches_analytic_volume ... ok
+test two_sequential_fillets_on_adjacent_edges ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests\expression_work_limits.rs (target\fast-test\deps\expression_work_limits-12f75d6290d2dd10.exe)
+
+running 4 tests
+test long_unary_chains_do_not_use_recursive_stack_frames ... ok
+test ordinary_depth_and_long_flat_arithmetic_still_work ... ok
+test oversized_text_is_rejected_by_all_tokenizing_entry_points ... ok
+test deeply_nested_input_is_rejected_without_process_abort ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\extrude_on_faces.rs (target\fast-test\deps\extrude_on_faces-d225791a4d36e959.exe)
+
+running 19 tests
+test boss_on_side_face_extruded_sideways ... ok
+test boss_on_top_face_of_box ... ok
+test cut_exactly_to_the_floor ... ok
+test draft_on_face_boss ... ok
+test extrude_both_directions_with_two_features ... ok
+test extrude_open_profile_of_lines_only ... ok
+test extrude_with_out_of_range_region_indices_does_not_panic ... ok
+test midplane_sketch_cut_through_body_interior ... ok
+test new_body_from_face_sketch_not_touching ... ok
+test pocket_in_pocket_chain ... ok
+test pocket_on_top_face_of_box ... ok
+test sketch_floating_above_the_face ... ok
+test sketch_on_cylinder_top_face_pocket ... ok
+test sketch_on_tilted_face_of_rotated_cut ... ok
+test sketch_on_top_of_boss_then_hole ... ok
+test deep_face_edit_chain_ten_pockets ... ok
+test sliver_extrusion_off_face ... ok
+test sketch_overhanging_the_face ... ok
+test through_cut_on_side_face ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests\feature_edge_cases.rs (target\fast-test\deps\feature_edge_cases-930993d7274ec3b7.exe)
+
+running 19 tests
+test body_cut_consuming_tool_twice_is_rejected_gracefully ... ok
+test circle_in_circle_nested_regions ... ok
+test body_join_of_disconnected_bodies_reports_unresolved ... ok
+test deep_chain_of_alternating_cuts ... ok
+test join_with_empty_and_ghost_sources_fails_gracefully ... ok
+test loft_with_missing_section_sketch_fails_gracefully ... ok
+test loft_with_single_section_fails_gracefully ... ok
+test overlapping_cut_regions_in_one_sketch ... ok
+test pattern_with_degenerate_count_and_spacing_does_not_panic ... ok
+test pattern_with_nan_spacing_resolves_to_parameter_diagnostic ... ok
+test revolve_angle_degenerate_values_do_not_panic ... ok
+test scale_with_degenerate_factor_does_not_panic ... ok
+test shell_on_unsupported_body_warns_instead_of_failing ... ok
+test shell_with_degenerate_thickness_does_not_panic ... ok
+test sweep_with_disconnected_path_fails_gracefully ... ok
+test sweep_with_extreme_twist_does_not_break ... ok
+test thread_on_cylinder_stays_sane ... ok
+test thread_on_flat_box_face_warns_not_crashes ... ok
+test hole_pattern_via_counterbores_on_cylinder_top ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.98s
+
+     Running tests\import_attack_matrix.rs (target\fast-test\deps\import_attack_matrix-36152baa84a29714.exe)
+
+running 6 tests
+test binary_stl_rejects_nonfinite_coordinates_in_every_vertex_slot ... ok
+test binary_stl_triangle_counts_cannot_overflow_or_allocate_unboundedly ... ok
+test every_header_bit_flip_is_rejected ... ok
+test every_container_truncation_is_rejected ... ok
+test hostile_section_lengths_and_offsets_are_rejected_before_allocation ... ok
+test seeded_garbage_never_parses_as_a_document_or_solid_stl ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\join_contract_matrix.rs (target\fast-test\deps\join_contract_matrix-1e36327eb4768449.exe)
+
+running 70 tests
+test corner_overlap::large_translated ... ok
+test corner_overlap::reversed ... ok
+test corner_overlap::small ... ok
+test corner_overlap::xy ... ok
+test corner_overlap::xz ... ok
+test corner_overlap::yz ... ok
+test disconnected_or_missing_sources_roll_back_every_body ... ok
+test bridge_join_all_six_source_orders ... ok
+test identical::large_translated ... ok
+test identical::reversed ... ok
+test identical::small ... ok
+test identical::xy ... ok
+test identical::xz ... ok
+test large_corner_overlap_at_origin ... ok
+test identical::yz ... ok
+test negative_overlap::large_translated ... ok
+test negative_overlap::reversed ... ok
+test negative_overlap::small ... ok
+test negative_overlap::xy ... ok
+test negative_overlap::xz ... ok
+test negative_overlap::yz ... ok
+test partial_face::large_translated ... ok
+test partial_face::reversed ... ok
+test partial_face::small ... ok
+test partial_face::xy ... ok
+test partial_face::xz ... ok
+test partial_face::yz ... ok
+test partial_x::large_translated ... ok
+test partial_x::reversed ... ok
+test partial_x::small ... ok
+test partial_x::xy ... ok
+test partial_x::xz ... ok
+test partial_x::yz ... ok
+test partial_y::large_translated ... ok
+test partial_y::reversed ... ok
+test partial_y::small ... ok
+test partial_y::xy ... ok
+test partial_y::xz ... ok
+test partial_y::yz ... ok
+test partial_z::large_translated ... ok
+test partial_z::reversed ... ok
+test partial_z::small ... ok
+test partial_z::xy ... ok
+test partial_z::xz ... ok
+test partial_z::yz ... ok
+test shared_x_face::large_translated ... ok
+test shared_x_face::reversed ... ok
+test shared_x_face::small ... ok
+test shared_x_face::xy ... ok
+test shared_x_face::xz ... ok
+test shared_x_face::yz ... ok
+test shared_y_face::large_translated ... ok
+test shared_y_face::reversed ... ok
+test shared_y_face::small ... ok
+test shared_y_face::xy ... ok
+test shared_y_face::xz ... ok
+test shared_y_face::yz ... ok
+test shared_z_face::large_translated ... ok
+test shared_z_face::reversed ... ok
+test shared_z_face::small ... ok
+test shared_z_face::xy ... ok
+test shared_z_face::xz ... ok
+test shared_z_face::yz ... ok
+test thin_overlap::large_translated ... ok
+test thin_overlap::reversed ... ok
+test thin_overlap::small ... ok
+test thin_overlap::xy ... ok
+test thin_overlap::xz ... ok
+test thin_overlap::yz ... ok
+test translated_corner_overlap_at_original_size ... ok
+
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+
+     Running tests\join_cut_stress.rs (target\fast-test\deps\join_cut_stress-844aa9cd7b858b03.exe)
+
+running 17 tests
+test cut_c_shape_is_exact ... ok
+test cut_exactly_half_depth_on_slanted_face_chain ... ok
+test cut_join_interleave_returns_to_start ... ok
+test cut_leaving_thin_web_stays_sane ... ok
+test cut_splits_bar_into_two_islands ... ok
+test cut_then_join_same_region_is_identity ... ok
+test cut_through_three_overlapping_bodies_untargeted ... ok
+test drafted_cut_pocket_monotone ... ok
+test join_chain_of_three_bodies ... ok
+test join_edge_touching_only_is_graceful ... ok
+test join_face_touching_boxes_fuses ... ok
+test join_fully_contained_body_changes_nothing ... ok
+test join_of_two_tangent_rods ... ok
+test join_sliver_overlap_fuses_exactly ... ok
+test join_tilted_prisms_overlap ... ok
+test join_vertex_touching_only_is_graceful ... ok
+test alternating_join_cut_chain_twenty_features ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+     Running tests\join_feature_lifecycle.rs (target\fast-test\deps\join_feature_lifecycle-7e6ed23af93e150d.exe)
+
+running 32 tests
+test translated::circular ... ok
+test translated::circular_overhang ... ok
+test translated::negative ... ok
+test translated::negative_circular ... ok
+test translated::negative_circular_overhang ... ok
+test translated::negative_overhang ... ok
+test translated::rectangular ... ok
+test translated::overhang ... ok
+test xy::circular ... ok
+test xy::circular_overhang ... ok
+test xy::negative ... ok
+test xy::negative_circular ... ok
+test xy::negative_circular_overhang ... ok
+test xy::negative_overhang ... ok
+test xy::overhang ... ok
+test xy::rectangular ... ok
+test xz::circular ... ok
+test xz::circular_overhang ... ok
+test xz::negative ... ok
+test xz::negative_circular ... ok
+test xz::negative_circular_overhang ... ok
+test xz::negative_overhang ... ok
+test xz::overhang ... ok
+test xz::rectangular ... ok
+test yz::circular ... ok
+test yz::circular_overhang ... ok
+test yz::negative ... ok
+test yz::negative_circular ... ok
+test yz::negative_circular_overhang ... ok
+test yz::negative_overhang ... ok
+test yz::overhang ... ok
+test yz::rectangular ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running tests\joined_hole_lifecycle.rs (target\fast-test\deps\joined_hole_lifecycle-d73f8f1b46357ef5.exe)
+
+running 4 tests
+test through_bore_heals_on_every_plane_and_sweep_direction ... ok
+test xy_counterbores_after_joins ... ok
+test xz_counterbores_after_joins ... ok
+test yz_counterbores_after_joins ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+
+     Running tests\misc_torture.rs (target\fast-test\deps\misc_torture-6614c65eecb94dd4.exe)
+
+running 15 tests
+test body_cut_with_target_equal_to_tool_is_graceful ... ok
+test body_intersect_with_target_equal_to_tool ... ok
+test corner_to_corner_diagonal_cut ... ok
+test extrude_targeting_a_mesh_body_is_graceful ... ok
+test annular_ring_join_on_rod_od ... ok
+test feature_pattern_of_a_cut_extrude ... ok
+test garbage_stl_bytes_are_rejected_gracefully ... ok
+test feature_pattern_replicates_join_bosses ... ok
+test import_stl_tetrahedron_loads_as_mesh_body ... ok
+test join_boss_entirely_inside_existing_pocket_void ... ok
+test mesh_body_cannot_enter_solid_boolean ... ok
+test scale_chain_compounds ... ok
+test swiss_cheese_16_holes_exact ... ok
+test transform_copy_chain_eight_copies ... ok
+test hundred_feature_document_stress ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.35s
+
+     Running tests\multi_sketch_extrude.rs (target\fast-test\deps\multi_sketch_extrude-1c7fecd917abb216.exe)
+
+running 4 tests
+test one_extrude_with_two_sketch_parents_is_rejected_loudly ... ok
+test one_loft_two_sketch_sections_is_legal ... ok
+test extrude_with_zero_or_non_sketch_parents_is_graceful ... ok
+test two_sketches_two_extrudes_works_exactly ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\research_blend_shell_torture.rs (target\fast-test\deps\research_blend_shell_torture-2beead3e980aa328.exe)
+
+running 15 tests
+test extrude_draft_collapse_angle_boundary_sweep ... ok
+test face_offset_inward_beyond_body_extent_graceful ... ok
+test hole_blind_depth_exactly_plate_thickness_classifies_stably ... ok
+test shell_box_thickness_exactly_half_min_dimension ... ok
+test hole_counterbore_diameter_equals_bore_graceful ... ok
+test shell_cylinder_thickness_exceeds_radius_graceful ... ok
+test shell_cylinder_thickness_near_radius_boundary ... ok
+test shell_open_faces_all_six_is_parameter_error ... ok
+test shell_open_faces_on_two_opposite_sides_stays_connected ... ok
+test thread_internal_band_exceeding_host_hole_graceful ... ok
+test thread_multistart_extreme_start_counts ... ok
+test thread_partial_length_not_multiple_of_pitch_end_trim ... ok
+test shell_on_threaded_rod_chain_survives ... ok
+test thread_very_fine_pitch_300_turns_bounded ... ok
+test thread_pitch_below_depth_self_intersection_boundary ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.46s
+
+     Running tests\research_boolean_metamorphic.rs (target\fast-test\deps\research_boolean_metamorphic-bc8d6213e1d4a2f9.exe)
+
+running 15 tests
+test body_cut_consuming_entire_target_stays_graceful ... ok
+test cut_tool_fully_inside_existing_void_is_noop ... ok
+test boolean_result_invariant_under_far_translation ... ok
+test flush_stack_fuse_with_1e6_size_mismatch_conserves_volume ... ok
+test metamorphic_union_intersect_cut_curved_tool ... ok
+test metamorphic_volume_laws_union_intersect_cut ... ok
+test near_miss_cut_with_1e5_gap_removes_nothing ... ok
+test revolve_axis_crossing_profile_stays_graceful ... ok
+test rotated_frame_45deg_volume_invariance ... ok
+test scale_metamorphic_volume_cubes ... ok
+test through_cut_fails_only_in_the_5e5_breakthrough_band ... ok
+test torus_tube_tangent_to_planar_face_fuse_stays_valid ... ok
+test union_order_independence_three_bodies ... ok
+test vertex_touching_chain_union_stays_graceful ... ok
+test deep_union_chain_with_micro_jitter_stays_exact ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+
+     Running tests\research_exchange_torture.rs (target\fast-test\deps\research_exchange_torture-9d4ca64731bfdd01.exe)
+
+running 11 tests
+test stl_ascii_number_formats_and_truncation ... ok
+test stl_binary_with_solid_header_still_parses_as_binary ... ok
+test stl_degenerate_facets_discarded_with_diagnostic ... ok
+test stl_duplicate_face_reports_nonmanifold_edges ... ok
+test stl_import_via_graph_is_finite_deterministic_and_diagnosed ... ok
+test stl_nan_and_infinite_vertices_rejected_cleanly ... ok
+test stl_single_inconsistent_winding_flagged ... ok
+test stl_single_triangle_open_shell_accepted_with_boundary ... ok
+test stl_truncated_empty_and_count_mismatch_typed_errors ... ok
+test stl_two_cubes_sharing_a_face_soup_is_flagged ... ok
+test step_garbage_and_header_only_data_warn_cleanly ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\research_variables_history_torture.rs (target\fast-test\deps\research_variables_history_torture-826c52b745fa947f.exe)
+
+running 10 tests
+test circular_variable_references_terminate_cleanly ... ok
+test dangling_expression_reference_is_graceful ... ok
+test division_by_zero_expression_is_structurally_rejected ... ok
+test self_referential_variable_terminates_cleanly ... ok
+test deep_variable_chain_200_evaluates_exactly ... ok
+test sketch_far_from_origin_1e6_matches_local_build ... ok
+test two_consumers_of_one_body_fail_and_succeed_independently ... ok
+test zcad_empty_document_roundtrip ... ok
+test zcad_truncation_and_bitflip_never_panic ... ok
+test zcad_roundtrip_unicode_and_boundary_length_ids ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests\sketch_expr_torture.rs (target\fast-test\deps\sketch_expr_torture-9a78bd49ffc93e64.exe)
+
+running 21 tests
+test characterization_out_of_range_region_indices_are_silent ... ok
+test draft_angle_expression_valid_and_broken ... ok
+test duplicate_coincident_rectangles_do_not_double_count ... ok
+test expression_division_by_zero_is_not_finite ... ok
+test expression_syntax_errors_fall_back ... ok
+test crossing_line_grid_regions ... ok
+test internally_tangent_circle_pair ... ok
+test line_exactly_on_rectangle_edge ... ok
+test micro_geometry_sketch ... ok
+test missing_variable_falls_back_with_warning ... ok
+test negative_expression_depth_is_survivable ... ok
+test region_selection_and_duplicates_work_exactly ... ok
+test self_intersecting_bowtie_profile ... ok
+test sketch_at_huge_coordinates ... ok
+test triple_nested_rectangles_cut ... ok
+test variable_driven_extrude_depth_is_exact ... ok
+test variable_driven_pattern_spacing ... ok
+test variable_expression_chain_resolves ... ok
+test variable_unit_conversions_in_expressions ... ok
+test zero_length_and_nan_lines_mixed_with_valid_geometry ... ok
+test fifty_concentric_circles ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests\tangency_sweeps.rs (target\fast-test\deps\tangency_sweeps-d962f07c036cfdf2.exe)
+
+running 8 tests
+test box_cut_through_coplanar_top_face ... ok
+test box_cut_with_flush_side_walls ... ok
+test cut_that_consumes_entire_body ... ok
+test cylinder_cut_tangent_to_flat_face ... ok
+test box_join_through_coplanar_top_face ... ok
+test identical_coincident_bodies_boolean ... ok
+test thin_ribbon_residue_after_cut ... ok
+test cylinder_join_cylinder_coaxial_and_tangent ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+
+     Running tests\thread_torture.rs (target\fast-test\deps\thread_torture-1ed639c491a0c431.exe)
+
+running 16 tests
+test boss_extruded_onto_threaded_rod_end ... ok
+test bolt_shaft_fitted_into_tapped_hole ... ok
+test cross_drill_through_threaded_rod has been running for over 60 seconds
+test cut_the_threaded_end_off has been running for over 60 seconds
+test cut_the_threaded_end_off ... ok
+test external_thread_full_length_stays_sane ... ok
+test external_thread_left_handed_and_multi_start ... ok
+test external_thread_partial_length_both_anchors ... ok
+test internal_thread_in_through_hole ... ok
+test internal_thread_partial_depth_tapped ... ok
+test thread_after_turning_the_rod_down ... ok
+test thread_degenerate_parameters_do_not_panic ... ok
+test thread_external_on_tube_with_coaxial_bore ... ok
+test thread_on_ghost_target_and_far_face_is_graceful ... ok
+test thread_on_revolved_body_cylinder ... ok
+test thread_with_nonfinite_parameters_resolves_to_parameter_diagnostic ... ok
+test threaded_rod_used_as_body_cut_tool ... ok
+test cross_drill_through_threaded_rod ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 244.06s
+
+     Running tests\torture_features.rs (target\fast-test\deps\torture_features-4c8fd4b61f7faf56.exe)
+
+running 27 tests
+test body_split_box_in_half ... ok
+test body_split_on_ghost_plane_fails_gracefully ... ok
+test characterization_bare_face_ref_rejects_whole_document ... ok
+test body_split_cylinder_mid_height ... ok
+test circular_feature_pattern_box_center_bolt_circle_applies ... ok
+test circular_pattern_instances_off_the_target_roll_back ... ok
+test datum_chain_and_cycle ... ok
+test datum_three_collinear_points_is_degenerate_but_survivable ... ok
+test draft_degenerate_angles_do_not_panic ... ok
+test draft_four_side_faces_of_box ... ok
+test draft_with_stale_and_ghost_references_does_not_panic ... ok
+test face_delete_removes_hole ... ok
+test face_move_applies_full_tangential_translation_on_six_face_blocks ... ok
+test face_move_top_face_along_normal ... ok
+test face_offset_degenerate_distances_do_not_panic ... ok
+test face_offset_positive_grows_box_exactly ... ok
+test face_thicken_keeps_source_and_creates_new_body ... ok
+test circular_feature_pattern_on_cylinder_cap_applies ... ok
+test feature_pattern_degenerate_sources_do_not_panic ... ok
+test feature_pattern_blind_hole_with_source_extent ... ok
+test mirror_pattern_creates_reflected_copy ... ok
+test mirror_pattern_extreme_finite_offsets_do_not_panic ... ok
+test mirror_pattern_join_touching_bodies_fuses ... ok
+test mirror_pattern_nan_offset_resolves_to_parameter_diagnostic ... ok
+test negative_face_offset_lands_exactly_on_the_requested_plane ... ok
+test sketch_on_offset_datum_plane_extrudes ... ok
+test feature_pattern_replicates_hole_linear ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+     Running tests\torture_sweeps_holes.rs (target\fast-test\deps\torture_sweeps_holes-74257aeb32da7999.exe)
+
+running 31 tests
+test blind_hole_depths_at_and_past_full_depth ... ok
+test body_cut_with_plane_inside_target_applies ... ok
+test characterization_body_cut_consuming_target_misreports ... ok
+test characterization_inscribed_circle_cut_fails_on_tangency ... ok
+test body_cut_with_tool_based_below_target_applies ... ok
+test coaxial_cylinder_cut_makes_tube ... ok
+test disjoint_circle_cuts_both_apply ... ok
+test hole_centered_exactly_on_body_edge ... ok
+test hole_diameter_equal_to_body_width ... ok
+test hole_tangent_to_body_edge ... ok
+test loft_extreme_area_ratio ... ok
+test loft_five_alternating_sections ... ok
+test loft_identical_stacked_sections_is_prism ... ok
+test loft_rotated_section_45_degrees ... ok
+test loft_section_region_index_out_of_range ... ok
+test loft_zero_height_degenerate ... ok
+test near_inscribed_circle_cut_applies ... ok
+test overlapping_second_cut_removes_the_crescent ... ok
+test revolve_angle_continuum ... ok
+test revolve_as_cut_through_box ... ok
+test revolve_diagonal_axis_creates_torus_like_solid ... ok
+test revolve_profile_crossing_axis_fails_gracefully ... ok
+test revolve_profile_touching_axis_is_solid ... ok
+test sweep_as_cut_mills_channel_through_box ... ok
+test sweep_closed_circular_path_is_torus ... ok
+test sweep_path_with_zero_length_segment ... ok
+test sweep_profile_wider_than_bend_radius ... ok
+test sweep_zigzag_path_ten_corners ... ok
+test tangent_cylinders_boolean_sweep ... ok
+test tilted_hole_45_degrees ... ok
+test counterbore_and_countersink_abuse ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.85s
+
+     Running unittests src\lib.rs (target\fast-test\deps\zerocad_core-2e9ccc233e3db724.exe)
+
+running 549 tests
+test assembly::tests::authoritative_clone_drops_derived_resolved_placements ... ok
+test assembly::tests::duplicate_and_delete_report_precise_runtime_invalidation ... ok
+test assembly::tests::failed_command_and_finalizer_leave_live_document_untouched ... ok
+test assembly::tests::invalid_mate_edits_leave_the_document_untouched ... ok
+test assembly::tests::mate_edits_are_staged_and_report_solver_invalidation ... ok
+test assembly::tests::next_occurrence_id_must_exceed_existing_ids ... ok
+test assembly::tests::quaternion_double_cover_and_signed_zero_canonicalize ... ok
+test assembly::tests::placement_command_respects_grounding_and_marks_only_placement_state ... ok
+test assembly::tests::quaternion_sign_ignores_noisy_near_zero_w ... ok
+test assembly::tests::staged_command_does_not_mutate_until_commit ... ok
+test assembly::tests::unchanged_presentation_command_has_an_empty_change_set ... ok
+test assembly::tests::world_and_local_axis_rotations_use_the_documented_composition_order ... ok
+test assembly_ops::tests::align_faces_threshold_has_deterministic_results_on_both_sides ... ok
+test assembly_ops::tests::align_faces_uses_parametric_u_for_exact_180_degrees ... ok
+test assembly_ops::tests::failed_prepare_is_transactional ... ok
+test assembly_ops::tests::failed_replacement_is_transactional ... ok
+test assembly_ops::tests::bom_counts_hidden_occurrences_and_csv_uses_full_hash ... ok
+test assembly_ops::tests::prepared_insertion_does_not_mutate_the_live_assembly ... ok
+test assembly_ops::tests::repeated_part_insertions_share_one_definition ... ok
+test assembly_release::tests::complete_measured_evidence_passes ... ok
+test assembly_release::tests::current_commit_check_rejects_stale_evidence ... ok
+test assembly_release::tests::median_is_gated_but_maximum_is_diagnostic ... ok
+test assembly_release::tests::placeholder_or_missing_run_cannot_pass ... ok
+test assembly_solver::tests::coincident_mate_moves_only_the_free_occurrence ... ok
+test assembly_solver::tests::component_above_dense_threshold_uses_sparse_path ... ok
+test assembly_solver::tests::concentric_underconstraint_keeps_manual_slide_preference ... ok
+test assembly_solver::tests::dense_and_sparse_paths_agree_at_the_solver_boundary ... ok
+test assembly_solver::tests::failed_new_mate_is_transactional ... ok
+test assembly_solver::tests::inconsistent_fixed_component_is_reported_without_mutation ... ok
+test assembly_solver::tests::interactive_pose_target_is_ephemeral_and_commits_one_manual_preference ... ok
+test assembly_solver::tests::later_exact_duplicate_mate_is_reported_redundant ... ok
+test assembly_solver::tests::multiple_grounded_components_can_form_a_satisfiable_frame ... ok
+test assembly_solver::tests::one_shot_face_target_does_not_persist_a_mate ... ok
+test assembly_ops::tests::replacement_preserves_occurrence_state_and_prunes_unused_definition ... ok
+test assembly_solver::tests::thousand_occurrence_dense_constraint_graph_is_deterministic ... ok
+test assembly_solver::tests::signed_distance_mate_solves_in_millimetres ... ok
+test assembly_solver::tests::thousand_occurrence_sparse_chain_stays_on_sparse_path ... ok
+test assembly_solver_release::tests::complete_measured_v2_evidence_passes ... ok
+test assembly_solver_release::tests::current_commit_check_rejects_stale_solver_evidence ... ok
+test assembly_solver_release::tests::p99_uses_the_measured_tail ... ok
+test assembly_solver_release::tests::placeholders_or_missing_stress_runs_cannot_pass ... ok
+test assembly_solver_release::tests::residual_floor_cannot_silently_relax_accuracy ... ok
+test boolean_case::tests::invalid_and_non_finite_cases_never_reach_the_kernel ... ok
+test boolean_case::tests::identity_normalizes_negative_zero_and_is_json_independent ... ok
+test dxf::tests::imports_bulges_and_nurbs_without_flattening_the_spline_record ... ok
+test dxf::tests::imports_units_layers_and_closed_profile ... ok
+test dxf::tests::reports_unsupported_entities_but_keeps_supported_geometry ... ok
+test evaluated_scene::tests::many_instances_share_one_geometry_and_bound_without_expansion ... ok
+test evaluated_scene::tests::part_adapter_preserves_ids_meshes_and_identity_bounds ... ok
+test evaluated_scene::tests::placement_transforms_points_vectors_mesh_metadata_and_bounds ... ok
+test evaluated_scene::tests::public_scene_boundary_rejects_non_rigid_and_ambiguous_instances ... ok
+test evaluated_scene::tests::stats_distinguish_unreferenced_pool_geometry_from_instance_expansion ... ok
+test expr::tests::arithmetic_and_precedence ... ok
+test expr::tests::arithmetic_expression_preserves_its_source ... ok
+test expr::tests::errors ... ok
+test expr::tests::identifier_helpers_preserve_expression_text_and_boundaries ... ok
+test expr::tests::plain_number ... ok
+test expr::tests::references_variable_detects_identifiers ... ok
+test expr::tests::unary_minus ... ok
+test expr::tests::variables_resolve_and_combine ... ok
+test feature_dto::tests::body_ops_payloads_have_stable_v1_round_trips ... ok
+test feature_dto::tests::draft_has_an_independent_stable_v1_payload ... ok
+test feature_dto::tests::extrude_v1_decodes_zero_draft_and_v2_round_trips_expression ... ok
+test feature_dto::tests::feature_pattern_has_an_independent_stable_v1_payload ... ok
+test feature_dto::tests::geometry_datums_require_v2_while_legacy_datums_remain_v1 ... ok
+test feature_dto::tests::loft_v1_remains_ruled_and_v2_round_trips_smooth_mode ... ok
+test feature_dto::tests::payload_decoder_dispatch_is_schema_aware ... ok
+test feature_dto::tests::phase5_direct_edit_payloads_have_stable_v1_round_trips ... ok
+test feature_dto::tests::sketch_v3_adds_associative_patterns_without_changing_v2_solver_payload ... ok
+test feature_dto::tests::sweep_v1_v2_decode_without_guide_and_v3_round_trips_it ... ok
+test boolean_case::tests::overlapping_box_replay_is_watertight_and_deterministic ... ok
+test mock_kernel::arc_reconstruction_tests::display_mesh_keeps_intentional_octagon_faceted ... ok
+test mock_kernel::arc_reconstruction_tests::full_circle_profile_rebuilds_to_cylinder ... ok
+test mock_kernel::arc_reconstruction_tests::octagon_is_not_mistaken_for_a_circle ... ok
+test mock_kernel::arc_reconstruction_tests::rectangle_stays_a_six_face_box ... ok
+test mock_kernel::arc_reconstruction_tests::display_mesh_for_mixed_profiles_is_render_safe ... ok
+test mock_kernel::history::tests::coplanar_faces_disambiguate_by_footprint_not_plane ... ok
+test mock_kernel::arc_reconstruction_tests::semicircle_d_profile_extrudes_to_smooth_cylinder_wall ... ok
+test mock_kernel::history::tests::difference_maps_hole_walls_to_the_tool ... ok
+test mock_kernel::history::tests::severing_cut_yields_deterministic_ordered_parts ... ok
+test mock_kernel::mesh_topology::surface_group_tests::disjoint_coplanar_faces_stay_separate ... ok
+test mock_kernel::history::tests::union_maps_each_outer_face_to_its_source_solid ... ok
+test mock_kernel::mesh_topology::surface_group_tests::revolved_washer_caps_group_as_one_face_each ... ok
+test mock_kernel::mesh_topology::surface_group_tests::sharp_curved_prism_spans_remain_separate_faces ... ok
+test mock_kernel::mesh_topology::surface_group_tests::tangent_curved_prism_spans_select_as_one_face_without_a_vertical_seam ... ok
+test mock_kernel::primitives::extrusion_safety_tests::analytic_fallback_budget_is_below_dense_glyph_profiles ... ok
+test mock_kernel::primitives::extrusion_safety_tests::failed_holed_profile_never_retries_as_filled_material ... ok
+test mock_kernel::primitives::extrusion_safety_tests::rect_minus_circle_recogniser_requires_a_circle ... ok
+test mock_kernel::section::tests::arbitrary_plane_clips_box_and_closes_contour ... ok
+test mock_kernel::outcome::tests::adapter_requires_complete_history_and_maps_boolean_faces ... ok
+test mock_kernel::tessellation::analytic_loop_tests::analytic_loop_weld_accepts_compounded_f32_endpoint_noise ... ok
+test mock_kernel::types::translation_tests::translation_moves_positions_and_picking_metadata_without_changing_connectivity ... ok
+test mock_kernel::wireframe_tests::analytic_nested_circles_build_inner_wire_prism ... ok
+test mock_kernel::wireframe_tests::analytic_open_spline_chain_reaches_brep_as_bspline_edges ... ok
+test mock_kernel::wireframe_tests::analytic_sketch_circle_reaches_brep_as_circle_edges ... ok
+test mock_kernel::wireframe_tests::annulus_prism_volume_excludes_the_inner_wire ... ok
+test mock_kernel::wireframe_tests::bored_hole_wall_has_no_fake_seam_struts ... ok
+test mock_kernel::wireframe_tests::circular_prism_encloses_its_full_volume ... ok
+test mock_kernel::wireframe_tests::fillet_arc_chords_group_into_one_edge ... ok
+test mock_kernel::wireframe_tests::genuine_perpendicular_crease_is_kept ... ok
+test mock_kernel::wireframe_tests::lone_boundary_edges_are_dropped ... ok
+test mock_kernel::wireframe_tests::same_face_triangle_diagonal_is_not_a_feature_edge ... ok
+test mock_kernel::wireframe_tests::sharp_polygon_struts_every_true_corner ... ok
+test mock_kernel::wireframe_tests::smooth_circle_extrude_has_no_strut_fan ... ok
+test mock_kernel::wireframe_tests::smooth_circle_rim_groups_into_one_edge ... ok
+test mock_kernel::tessellation::analytic_loop_tests::analytic_compound_prism_regularizes_mixed_text_voids ... ok
+test parametric::cut::through_cut_tests::multiple_blind_profiles_sew_one_exact_pocket_with_a_counter ... ok
+test parametric::datum::tests::angle_plane_rotates_rigidly ... ok
+test parametric::datum::tests::axis_from_plane_intersection ... ok
+test parametric::cut::through_cut_tests::multiple_through_profiles_rebuild_one_prism_and_preserve_counter_islands ... ok
+test parametric::datum::tests::datum_chain_resolves_in_creation_order ... ok
+test parametric::datum::tests::datum_dependency_cycle_is_rejected_before_geometry_resolution ... ok
+test parametric::datum::tests::edge_axis_and_incident_edge_vertex_resolve_durably ... ok
+test parametric::datum::tests::missing_durable_face_name_suspends_geometry_datum ... ok
+test parametric::datum::tests::offset_follows_stored_normal_even_left_handed ... ok
+test parametric::datum::tests::cylinder_face_axis_and_circle_center_keep_analytic_geometry ... ok
+test parametric::datum::tests::three_point_plane_and_midplane ... ok
+test parametric::datum::tests::planar_face_datum_resolves_at_its_history_checkpoint_and_reuses_warm ... ok
+test parametric::datum::tests::unresolvable_datum_warns ... ok
+test parametric::diagnostics::tests::behavioral_classification_is_independent_of_renderer_copy ... ok
+test parametric::diagnostics::tests::renderer_copy_has_a_small_explicit_contract_suite ... ok
+test parametric::diagnostics::tests::resolved_and_suppressed_statuses_do_not_emit_diagnostics ... ok
+test parametric::direct_edit::overshoot_tests::boolean_tool_overshoot_tracks_model_scale_and_policy ... ok
+test parametric::extrude::draft_tests::draft_preserves_holes_and_edge_correspondence ... ok
+test parametric::extrude::draft_tests::expanding_far_sections_reject_region_collisions ... ok
+test parametric::extrude::draft_tests::invalid_and_collapsing_drafts_reject_atomically ... ok
+test parametric::extrude::draft_tests::signed_draft_offsets_the_far_section_analytically ... ok
+test parametric::inspection::tests::body_measurement_is_independent_of_viewport_mesh_quality ... ok
+test parametric::extrude::draft_tests::drafted_walls_stay_planar ... ok
+test parametric::inspection::tests::exact_edge_measurement_uses_kernel_curves_and_analytic_hints ... ok
+test parametric::inspection::tests::picked_face_area_is_measured_from_strict_kernel_geometry ... ok
+test parametric::mesh_support::tests::overlapping_mirror_fallback_is_one_continuous_display_body ... ok
+test parametric::recovery_certificate::tests::dipped_join_requires_volume_and_containment_evidence ... ok
+test parametric::inspection::tests::common_based_interference_omits_disjoint_and_reports_overlap ... ok
+test parametric::standards::tests::every_table_key_is_unique_within_its_selection_domain ... ok
+test parametric::standards::tests::library_identity_and_resolved_values_are_frozen_into_references ... ok
+test parametric::standards::tests::phase6_data_pack_is_append_only_and_covers_large_metric_and_inch_sizes ... ok
+test parametric::recovery_certificate::tests::expanded_cut_requires_a_removed_exact_overlap_probe ... ok
+test parametric::tests::body_cut::body_cut_can_keep_the_cutting_body ... ok
+test parametric::tests::body_cut::body_cut_requires_positive_overlap_and_keeps_inputs_on_failure ... ok
+test parametric::tests::body_cut::body_cut_consumes_tool_and_keeps_target_remainder ... ok
+test parametric::tests::body_join::body_join_consumes_two_overlapping_bodies ... ok
+test parametric::tests::body_join::body_join_fuses_bodies_that_touch_on_a_face ... ok
+test parametric::tests::body_join::disconnected_join_fails_and_keeps_both_original_bodies ... ok
+test parametric::tests::body_ops::empty_intersect_is_atomic ... ok
+test parametric::tests::body_ops::intersect_commits_all_overlapping_multipart_pairs_atomically ... ok
+test parametric::tests::body_ops::intersect_handles_box_cylinder_containment_and_keep_tool ... ok
+test parametric::tests::body_ops::invalid_scale_factor_leaves_source_body_visible ... ok
+test parametric::tests::body_ops::split_accepts_a_planar_face_from_an_explicit_reference_body ... ok
+test parametric::tests::body_ops::intersect_keeps_only_common_volume_and_consumes_inputs ... ok
+test parametric::tests::body_ops::split_emits_two_registered_stable_outputs ... ok
+test parametric::tests::body_ops::split_outputs_accept_independent_downstream_features ... ok
+test parametric::tests::body_ops::suppression_restores_inputs_for_every_body_operation ... ok
+test parametric::tests::body_ops::uniform_scale_uses_persisted_pivot_and_expression ... ok
+test parametric::tests::body_transform::body_copy_leaves_source_and_places_translated_body ... ok
+test parametric::tests::body_transform::body_move_consumes_source_and_keeps_volume ... ok
+test parametric::tests::body_transform::body_transform_candidate_contract_cold_warm_cancel_and_restore ... ok
+test parametric::tests::body_transform::missing_transform_source_warns_without_panicking ... ok
+test parametric::tests::body_ops::split_supports_a_rotated_datum_plane ... ok
+test parametric::tests::body_transform::second_disconnected_extrude_body_can_be_transformed_independently ... ok
+test parametric::tests::boolean_extrude::circle_inside_rect_unselected_bores_through ... ok
+test parametric::tests::boolean_extrude::disjoint_shapes_are_not_booleaned ... ok
+test parametric::tests::boolean_extrude::legacy_curves_sketch_keeps_per_region_behavior ... ok
+test parametric::tests::boolean_extrude::concentric_disjoint_regions_stay_separate_valid_parts ... ok
+test parametric::tests::boolean_extrude::single_selected_face_does_not_expand_to_the_rest_of_its_shape ... ok
+test parametric::tests::boolean_extrude::three_overlapping_rects_all_selected_union ... ok
+test parametric::tests::boolean_extrude::two_selected_overlapping_rects_union_into_one_body ... ok
+test parametric::tests::boolean_extrude::selected_rect_cuts_unselected_overlapping_circle ... ok
+test parametric::tests::caching::authoritative_document_clone_drops_warm_evaluator_checkpoints ... ok
+test parametric::tests::caching::cache_snapshot_survives_background_graph_handoff ... ok
+test parametric::tests::caching::checkpoints_share_unchanged_pristine_meshes ... ok
+test parametric::tests::caching::document_revision_advances_for_authoritative_modeling_mutators ... ok
+test parametric::tests::caching::edge_blend_hash_covers_corner_mode_and_complete_selection ... ok
+test parametric::tests::caching::complete_checkpoint_hit_keeps_the_immutable_cache_allocation ... ok
+test parametric::tests::caching::eval_cache_key_changes_when_a_sketch_constraint_changes ... ok
+test parametric::tests::caching::eval_cache_key_changes_when_edge_mod_selection_changes ... ok
+test parametric::tests::caching::eval_cache_is_invalidated_when_an_upstream_node_changes ... ok
+test parametric::tests::caching::evaluation_trace_classifies_cold_and_warm_work_without_wall_clock_time ... ok
+test parametric::tests::caching::eval_cache_matches_cold_eval_after_radius_drag ... ok
+test parametric::tests::caching::graph_clone_shares_warm_cache_until_worker_rebuilds_it ... ok
+test parametric::tests::caching::normal_document_evaluation_stamps_all_revision_bound_writebacks ... ok
+test parametric::tests::caching::region_cache_returns_consistent_regions ... ok
+test parametric::tests::caching::every_mutable_persisted_feature_leaf_matches_a_cache_free_rebuild ... ok
+test parametric::tests::caching::stale_revision_bound_writebacks_are_rejected ... ok
+test parametric::tests::caching::superseded_evaluation_exits_without_geometry ... ok
+test parametric::tests::caching::typed_diagnostics_refresh_while_geometry_checkpoint_is_reused ... ok
+test parametric::tests::circular_bite::circular_bite_newbody_hides_internal_wall_segments ... ok
+test parametric::tests::circular_bite::circular_bite_newbody_keeps_clean_mesh_and_cylindrical_solid ... ok
+test parametric::tests::caching::sparse_checkpoints_rebuild_missing_face_sketch_support ... ok
+test parametric::tests::circular_bite::edge_mod_on_circular_bite_cutoff_edge_succeeds ... ok
+test parametric::tests::circular_bite::edge_mod_on_circular_bite_body_replaces_the_sketch_display_cache ... ok
+test parametric::tests::circular_bite::gui_captured_circular_bite_topology_resolves_to_same_visible_span ... ok
+test parametric::tests::circular_bite::invalid_native_fillet_preserves_later_cuts_and_diagnoses ... ok
+test parametric::tests::circular_bite::rect_with_circular_hole_newbody_renders ... ok
+test parametric::tests::circular_bite::fillet_3mm_on_gui_captured_circular_bite_cutoff_edge_succeeds ... ok
+test parametric::tests::circular_bite::replay_fillet_preserves_explicit_cylinder_cut_bite ... ok
+test parametric::tests::circular_bite::replay_fillet_preserves_rectangular_pocket_cut ... ok
+test parametric::tests::circular_bite::replay_fillet_preserves_rectangular_pocket_cut_positive_depth ... ok
+test parametric::tests::circular_bite::replay_fillet_preserves_explicit_cylinder_cut_bite_positive_depth ... ok
+test parametric::tests::concave_edge_mod::complete_inner_pocket_rim_chamfer_is_one_atomic_miter_network ... ok
+test parametric::tests::concave_edge_mod::concave_pocket_edge_chamfer_applies_and_adds_bevel ... ok
+test parametric::tests::concave_edge_mod::concave_pocket_edge_fillet_applies_and_adds_wedge ... ok
+test parametric::tests::concave_edge_mod::concave_pocket_fillet_passes_selected_blend_presence_check ... ok
+test parametric::tests::concave_edge_mod::rectangular_frame_inner_rim_accepts_fifty_millimeter_chamfer ... ok
+test parametric::tests::concave_edge_mod::chained_pocket_fillets_form_concave_miter_through_parametric_graph ... ok
+test parametric::tests::concave_edge_mod::single_inner_pocket_edge_uses_the_atomic_feature_path ... ok
+test parametric::tests::construction_equivalence::equivalent_flanged_shaft_histories_both_accept_the_same_thread ... ok
+test parametric::tests::datum_attach::editing_the_datum_moves_dependent_geometry ... ok
+test parametric::tests::datum_attach::missing_datum_falls_back_to_saved_plane_with_warning ... ok
+test parametric::tests::datum_attach::sketch_on_datum_extrudes_from_datum_plane ... ok
+test parametric::tests::draft_feature::cancelled_draft_request_never_publishes_geometry ... ok
+test parametric::tests::draft_feature::datum_plane_can_be_the_neutral_reference ... ok
+test parametric::tests::draft_feature::flip_pull_reverses_the_signed_material_change ... ok
+test parametric::tests::draft_feature::missing_named_draft_face_suspends_without_retargeting ... ok
+test parametric::tests::draft_feature::rejected_draft_is_atomic_and_zero_angle_is_exact_noop ... ok
+test parametric::tests::draft_feature::standalone_draft_covers_scale_aspect_and_far_origin_matrix ... ok
+test parametric::tests::draft_feature::standalone_draft_tapers_selected_planar_side_and_reuses_warm ... ok
+test parametric::tests::edge_mods::curved_circular_rim_selection_reaches_native_solver_and_fails_safely ... ok
+test parametric::tests::edge_mods::edge_mod_candidate_contract_cold_warm_cancel_and_restore ... ok
+test parametric::tests::edge_mods::edge_mod_oversized_leaves_body_unchanged_and_warns ... ok
+test parametric::tests::edge_mods::edge_mod_validator_rejects_full_cylinder_ghost_for_circular_bite ... ok
+test parametric::tests::edge_mods::invalid_circular_bite_runout_fails_safely_and_leaves_body ... ok
+test parametric::tests::edge_mods::named_edge_loss_suspends_edge_mod_without_geometric_substitution ... ok
+test parametric::tests::edge_mods::sharp_wedge_fillet_passes_selected_blend_presence_check ... ok
+test parametric::tests::edge_mods::unique_legacy_edge_match_waits_for_explicit_migration ... ok
+test parametric::tests::extrude_draft::curved_draft_remains_unresolved_in_v1 ... ok
+test parametric::tests::extrude_draft::draft_rejection_is_atomic_for_every_extrude_mode ... ok
+test parametric::tests::extrude_draft::drafted_wall_names_are_owned_by_durable_source_curve_ids ... ok
+test parametric::tests::extrude_draft::signed_expression_drives_drafted_far_section ... ok
+test parametric::tests::extrude_draft::zero_draft_is_semantically_identical_to_v1_extrude_for_every_mode ... ok
+test parametric::tests::extrude_modes::bugcase1_partial_height_split_circle_join_fuses_to_one_solid ... ok
+test parametric::tests::extrude_modes::clean_model_has_no_warnings ... ok
+test parametric::tests::extrude_modes::cut_punches_hole_no_extra_body ... ok
+test parametric::tests::concave_edge_mod::rectangular_frame_inner_rim_accepts_fifty_millimeter_fillet ... ok
+test parametric::tests::extrude_modes::edge_mod_on_sketched_prism_applies ... ok
+test parametric::tests::extrude_modes::end_face_join_is_one_continuous_prism ... ok
+test parametric::tests::extrude_modes::edge_mod_on_boss_union_body_keeps_boss ... ok
+test parametric::tests::extrude_modes::join_negative_depth_into_body_keeps_it ... ok
+test parametric::tests::extrude_modes::join_circle_boss_on_top_survives ... ok
+test parametric::tests::extrude_modes::join_overlapping_stays_one_body ... ok
+test parametric::tests::extrude_modes::join_with_no_overlap_is_atomic_and_does_not_create_a_body ... ok
+test parametric::tests::extrude_modes::merged_straight_profiles_retain_simplified_outer_and_hole ... ok
+test parametric::tests::extrude_modes::multi_region_join_rolls_back_when_any_region_cannot_fuse ... ok
+test parametric::tests::extrude_modes::newbody_makes_one_body ... ok
+test parametric::tests::extrude_modes::line_tangent_cylinder_join_reports_non_manifold_contact ... ok
+test parametric::tests::face_boundary_sketch::direct_face_cut_keeps_the_requested_far_plane_exact ... ok
+test parametric::tests::extrude_modes::prism_box_cut_and_join_a_cylinder_through_top ... ok
+test parametric::tests::face_boundary_sketch::direct_face_join_preserves_a_concave_outline ... ok
+test parametric::tests::face_boundary_sketch::direct_face_join_uses_exact_face_wires_and_removes_the_shared_face ... ok
+test parametric::tests::face_boundary_sketch::direct_face_new_body_uses_the_exact_selected_face ... ok
+test parametric::tests::face_boundary_sketch::direct_face_resolution_is_stable_at_large_world_coordinates ... ok
+test parametric::tests::face_boundary_sketch::drawn_circle_splits_against_face_boundary ... ok
+test parametric::tests::face_boundary_sketch::face_boundary_only_sketch_extrudes_the_whole_face ... ok
+test parametric::tests::face_boundary_sketch::face_outline_rederives_when_the_body_changes ... ok
+test parametric::tests::face_boundary_sketch::named_face_loss_suspends_extrude_instead_of_using_stored_outline ... ok
+test parametric::tests::face_boundary_sketch::unique_unnamed_legacy_face_still_uses_exact_brep_geometry ... ok
+test parametric::tests::face_boundary_sketch::unnamed_ambiguous_face_reference_is_rejected ... ok
+test parametric::tests::face_boundary_sketch::direct_face_join_preserves_inner_wires ... ok
+test parametric::tests::feature_pattern::a_missed_later_instance_rolls_back_the_entire_pattern ... ok
+test parametric::tests::feature_pattern::cancelled_feature_pattern_request_publishes_no_candidate ... ok
+test parametric::tests::feature_pattern::a_source_later_in_history_fails_loud_without_reordering_or_guessing ... ok
+test parametric::tests::feature_pattern::count_one_is_the_source_only_and_count_zero_is_unresolved ... ok
+test parametric::tests::feature_pattern::extent_policy_mismatches_are_rejected_atomically ... ok
+test parametric::tests::feature_pattern::feature_pattern_self_and_indirect_cycles_fail_graph_validation ... ok
+test parametric::tests::feature_pattern::invalid_source_feature_families_are_rejected_without_touching_the_target ... ok
+test parametric::tests::feature_pattern::missing_historical_target_before_and_after_source_fail_loud ... ok
+test parametric::tests::feature_pattern::new_body_sources_and_cross_body_holes_are_rejected ... ok
+test parametric::tests::feature_pattern::suppressed_source_suspends_the_pattern_without_guessing ... ok
+test parametric::tests::feature_pattern::extent_and_compute_mode_changes_invalidate_the_pattern_checkpoint ... ok
+test parametric::tests::feature_pattern::through_all_recomputes_depth_for_each_local_target_section ... ok
+test parametric::tests::fillet_chamfer::chamfer_bevels_a_box_edge ... ok
+test parametric::tests::fillet_chamfer::chamfer_large_radius_stays_in_bounds ... ok
+test parametric::tests::fillet_chamfer::fillet_keeps_adjacent_faces_flat ... ok
+test parametric::tests::fillet_chamfer::fillet_round_is_a_single_brep_face ... ok
+test parametric::tests::fillet_chamfer::fillet_rounds_a_box_edge ... ok
+test parametric::tests::feature_pattern::through_all_hole_pattern_recomputes_each_local_cut_and_reuses_warm_checkpoint ... ok
+test parametric::tests::fillet_chamfer::smoothing_keeps_a_plain_box_crisp ... ok
+test parametric::tests::fillet_chamfer::fillet_tangent_boundary_edges_are_hidden ... ok
+test parametric::tests::hole_feature::blind_hole_stops_at_depth ... ok
+test parametric::tests::hole_feature::blind_hole_models_the_persisted_drill_point ... ok
+test parametric::tests::hole_feature::counterbore_removes_extra_ring ... ok
+test parametric::tests::hole_feature::hole_candidate_contract_cold_warm_cancel_and_restore ... ok
+test parametric::tests::hole_feature::missing_target_warns ... ok
+test parametric::tests::hole_feature::countersink_removes_conical_ring ... ok
+test parametric::tests::import::import_graph_serde_round_trips ... ok
+test parametric::tests::import::import_step_bad_data_warns_instead_of_failing ... ok
+test parametric::tests::import::import_step_body_evaluates_to_mesh ... ok
+test parametric::tests::hole_feature::through_hole_removes_full_cylinder ... ok
+test parametric::tests::import::import_step_faces_are_stamped_with_durable_names ... ok
+test parametric::tests::imported_face_edits::analytic_cylinder_offset_and_thicken_preserve_strict_geometry ... ok
+test parametric::tests::imported_face_edits::conical_and_spherical_faces_offset_and_thicken_exactly ... ok
+test parametric::tests::imported_face_edits::cylindrical_reference_face_splits_a_body_into_inside_and_outside ... ok
+test parametric::tests::imported_face_edits::delete_external_cylindrical_boss_restores_the_supporting_body ... ok
+test parametric::tests::imported_face_edits::delete_internal_cylindrical_face_heals_an_imported_hole ... ok
+test parametric::tests::imported_face_edits::bounded_conical_reference_splits_with_volume_conservation ... ok
+test parametric::tests::imported_face_edits::imported_planar_face_move_and_thicken_use_exact_prisms ... ok
+test parametric::tests::imported_face_edits::imported_planar_face_press_pull_is_strict_and_downstream_ready ... ok
+test parametric::tests::imported_face_edits::mesh_body_is_rejected_by_brep_boolean_without_consuming_inputs ... ok
+test parametric::tests::imported_face_edits::open_stl_mesh_reports_volume_and_mass_as_unavailable ... ok
+test parametric::tests::imported_face_edits::stl_mesh_body_supports_transform_scale_measure_and_export ... ok
+test parametric::tests::imported_face_edits::tangential_move_rebuilds_an_imported_block_exactly ... ok
+test parametric::tests::imported_face_edits::every_direct_edit_supports_reorder_suppression_and_explicit_provenance ... ok
+test parametric::tests::imported_face_edits::working_direct_edit_graph_round_trips_through_zcad_with_identical_geometry ... ok
+test parametric::tests::loft_sweep::closed_circle_sweep_closes_seam_without_end_caps ... ok
+test parametric::tests::loft_sweep::closed_sweep_rejects_non_integral_seam_twist_atomically ... ok
+test parametric::tests::loft_sweep::guided_sweep_adaptively_refines_large_but_continuous_frame_rotation ... ok
+test parametric::tests::loft_sweep::guided_sweep_guide_edit_invalidates_its_warm_geometry_checkpoint ... ok
+test parametric::tests::loft_sweep::guided_sweep_progress_mismatch_is_actionable_typed_atomic_rejection ... ok
+test parametric::tests::loft_sweep::guided_sweep_rejects_twist_and_missing_anchor_with_typed_atomic_diagnostics ... ok
+test parametric::tests::loft_sweep::guided_sweep_tracks_anchor_scale_and_is_cache_equivalent_across_property_sweep ... ok
+test parametric::tests::loft_sweep::guided_sweep_transports_outer_and_hole_loops_through_one_frame ... ok
+test parametric::tests::loft_sweep::loft_and_sweep_candidate_contract_gates ... ok
+test parametric::tests::loft_sweep::loft_needs_two_sections ... ok
+test parametric::tests::loft_sweep::loft_preserves_section_holes ... ok
+test parametric::tests::loft_sweep::loft_two_squares_is_a_frustum ... ok
+test parametric::tests::loft_sweep::smooth_loft_preserves_periodic_circle_sections_exactly ... ok
+test parametric::tests::loft_sweep::smooth_loft_rejects_sampled_ellipse_instead_of_persisting_approximate_topology ... ok
+test parametric::tests::loft_sweep::smooth_loft_section_family_mismatch_is_typed_and_atomic ... ok
+test parametric::tests::loft_sweep::smooth_loft_two_through_five_sections_is_resolved_and_cache_equivalent ... ok
+test parametric::tests::loft_sweep::sweep_along_bent_path_is_watertight ... ok
+test parametric::tests::loft_sweep::sweep_preserves_profile_hole ... ok
+test parametric::tests::loft_sweep::sweep_rejects_branching_path ... ok
+test parametric::tests::loft_sweep::sweep_square_along_straight_path_is_a_prism ... ok
+test parametric::tests::loft_sweep::sweep_v2_distributes_signed_total_twist_without_realigning_profile_indices ... ok
+test parametric::tests::node_map_resync::add_dependency_self_heals_after_raw_remove_node ... ok
+test parametric::tests::node_map_resync::evaluator_family_dependency_matrix_is_explicit ... ok
+test parametric::tests::node_map_resync::generated_body_output_dependency_resolves_to_owning_feature ... ok
+test parametric::tests::node_map_resync::re_extrude_after_remove_feature_builds_a_body ... ok
+test parametric::tests::node_map_resync::re_extrude_after_serde_round_trip_builds_a_body ... ok
+test parametric::tests::node_map_resync::serde_restore_rederives_node_map_before_the_first_evaluation ... ok
+test parametric::tests::node_map_resync::sole_sketch_parents_reports_consumed_sketch ... ok
+test parametric::tests::node_map_resync::undo_load_delete_and_re_extrude_preserves_dependency_wiring ... ok
+test parametric::tests::pattern_feature::circular_pattern_ring_spacing ... ok
+test parametric::tests::pattern_feature::linear_pattern_replicates_box ... ok
+test parametric::tests::pattern_feature::mirror_can_follow_a_planar_body_face ... ok
+test parametric::tests::pattern_feature::mirror_join_keeps_disconnected_copy_separate ... ok
+test parametric::tests::pattern_feature::mirror_join_unions_connected_copy_into_source_body ... ok
+test parametric::tests::pattern_feature::mirror_offset_moves_copy_along_plane_normal ... ok
+test parametric::tests::pattern_feature::mirror_produces_well_oriented_copy ... ok
+test parametric::tests::pattern_feature::missing_source_warns ... ok
+test parametric::tests::pattern_feature::offset_mirror_join_names_result_faces_without_plane_cleanup ... ok
+test parametric::tests::pattern_feature::pattern_candidate_contract_cold_warm_cancel_and_restore ... ok
+test parametric::tests::reattachment_matrix::captured_face_follows_its_own_lump_through_a_sever ... ok
+test parametric::tests::reattachment_matrix::clean_model_reports_all_features_resolved ... ok
+test parametric::tests::reattachment_matrix::conflicting_sketch_degrades_to_last_valid_and_reports_unresolved ... ok
+test parametric::tests::reattachment_matrix::cut_walls_carry_generated_names_and_survive_upstream_edit ... ok
+test parametric::tests::reattachment_matrix::cut_with_missing_target_fails_loud_and_touches_nothing ... ok
+test parametric::tests::reattachment_matrix::edge_reattaches_after_deleting_another_shape ... ok
+test parametric::tests::reattachment_matrix::edge_reattaches_after_shrink_edit ... ok
+test parametric::tests::reattachment_matrix::edge_reattaches_to_same_span_after_width_edit ... ok
+test parametric::tests::reattachment_matrix::edge_survives_added_upstream_cut ... ok
+test parametric::tests::reattachment_matrix::face_name_absent_reports_none_rather_than_wrong_face ... ok
+test parametric::tests::reattachment_matrix::face_reattaches_through_added_cut ... ok
+test parametric::tests::reattachment_matrix::face_reattaches_through_join ... ok
+test parametric::tests::reattachment_matrix::face_reattaches_to_same_span_after_width_edit ... ok
+test parametric::tests::reattachment_matrix::face_survives_a_severing_cut ... ok
+test parametric::tests::imported_face_edits::unsupported_external_nist_edit_fails_atomically ... ok
+test parametric::tests::reattachment_matrix::primitive_box_edge_reattaches_after_resize ... ok
+test parametric::tests::reattachment_matrix::primitive_box_faces_and_edges_carry_names ... ok
+test parametric::tests::reattachment_matrix::primitive_cylinder_faces_carry_names ... ok
+test parametric::tests::reattachment_matrix::provenance_fragment_owner_survives_shape_deletion ... ok
+test parametric::tests::reattachment_matrix::saved_bracket_circular_selections_resolve ... ok
+test parametric::tests::reattachment_matrix::sketch_on_face_plane_follows_the_body ... ok
+test parametric::tests::reattachment_matrix::solver_backed_sketch_extrudes_and_follows_its_variable ... ok
+test parametric::tests::reattachment_matrix::targeted_cut_ignores_a_bystander_body ... ok
+test parametric::tests::reattachment_matrix::unresolvable_edge_mod_reports_unresolved_status_for_that_feature ... ok
+test parametric::tests::reattachment_matrix::pair_collision_edges_reattach_by_side_discriminator ... ok
+test parametric::tests::revolve_feature::crossing_profile_warns_and_builds_nothing ... ok
+test parametric::tests::revolve_feature::full_revolve_cap_reads_as_one_face_without_radial_seams ... ok
+test parametric::tests::revolve_feature::full_revolve_makes_cylinder_body ... ok
+test parametric::tests::revolve_feature::partial_revolve_about_datum_axis ... ok
+test parametric::tests::revolve_feature::revolve_contract_cold_warm_cancel_rollback_topology_and_lifecycle ... ok
+test parametric::tests::revolve_feature::revolve_cut_bores_groove_into_box ... ok
+test parametric::tests::semantic_document::body_timeline_and_input_roles_are_explicit ... ok
+test parametric::tests::semantic_document::explicit_refresh_repairs_a_relationship_bearing_payload_edit ... ok
+test parametric::tests::semantic_document::explicit_sequence_replaces_numeric_id_suffix_ordering ... ok
+test parametric::tests::semantic_document::legacy_body_index_backfill_preserves_authoritative_inputs ... ok
+test parametric::tests::semantic_document::semantic_validation_rejects_dependency_input_drift ... ok
+test parametric::tests::semantic_document::semantic_validation_rejects_missing_body_timeline_membership ... ok
+test parametric::tests::semantic_document::shared_selector_suspends_named_references_instead_of_geometric_retargeting ... ok
+test parametric::tests::semantic_document::stable_kind_registry_covers_every_builtin_without_duplicate_ids ... ok
+test parametric::tests::semantic_document::suppression_changes_geometry_while_visibility_only_filters_display ... ok
+test parametric::tests::semantic_document::timeline_reorder_is_independent_but_never_precedes_a_dependency ... ok
+test parametric::tests::shell_feature::shell_box_open_top_matches_cup_volume ... ok
+test parametric::tests::shell_feature::shell_candidate_contract_cold_warm_cancel_and_restore ... ok
+test parametric::tests::shell_feature::shell_does_not_geometrically_substitute_a_missing_durable_face ... ok
+test parametric::tests::shell_feature::shell_preserves_retained_face_names_and_names_generated_faces ... ok
+test parametric::tests::shell_feature::shell_without_open_faces_creates_closed_box_cavity ... ok
+test parametric::tests::thread_feature::external_thread_feature_evaluates_and_keeps_body ... ok
+test parametric::tests::thread_feature::internal_thread_taps_a_drilled_hole ... ok
+test parametric::tests::thread_feature::thread_candidate_contract_cold_warm_cancel_and_restore ... ok
+test parametric::tests::thread_feature::thread_on_missing_body_warns_not_panics ... ok
+test parametric::tests::thread_feature::thread_targets_clicked_cylinder_across_multipart_body ... ok
+test parametric::tests::record_retention::general_path_join_and_cut_keep_later_cuts_sectional ... ok
+test parametric::tests::thread_join_head::cut_pocket_into_threaded_shaft_removes_material ... ok
+test parametric::tests::variables::extrude_depth_follows_a_variable ... ok
+test parametric::tests::variables::feature_variable_references_include_nested_sketch_measurements ... ok
+test parametric::tests::variables::parameter_cycles_report_and_keep_fallback_values ... ok
+test parametric::tests::variables::parameter_expressions_resolve_forward_references_and_units ... ok
+test parametric::tests::variables::rename_variable_rewrites_identifier_references_atomically ... ok
+test parametric::tests::variables::sketch_dimension_follows_a_variable ... ok
+test parametric::tests::variables::topology_edge_ref_reattaches_after_sketch_dimension_edit ... ok
+test parametric::topo_name::tests::durability_and_ownership_classification ... ok
+test parametric::topo_name::tests::every_grammar_form_round_trips_byte_identically ... ok
+test parametric::topo_name::tests::unrecognized_names_pass_through_verbatim ... ok
+test parametric::types::all_edge_selector_tests::adversarial_selector_decoder_is_total_and_only_accepts_canonical_bytes ... ok
+test parametric::types::all_edge_selector_tests::durable_face_pair_is_canonical_and_non_durable_fallback_id_is_ignored ... ok
+test parametric::types::all_edge_selector_tests::malformed_or_ambiguous_selectors_fail_closed ... ok
+test parametric::types::all_edge_selector_tests::selector_is_canonical_lossless_and_distinct_from_normal_edge_ids ... ok
+test parametric::types::all_edge_selector_tests::valid_selector_sweep_round_trips_independent_of_input_order ... ok
+test release::tests::compatibility_ledger_validator_rejects_bad_supplied_data ... ok
+test release::tests::complete_release_evidence_passes ... ok
+test release::tests::unsigned_first_launch_and_unfrozen_alpha_bug_are_hard_failures ... ok
+test release::tests::zero_or_negative_placeholder_measurements_cannot_pass ... ok
+test sketch::constraints::tests::construction_entities_are_editable_but_do_not_form_profiles ... ok
+test sketch::constraints::tests::effective_shape_ids_backfills_legacy_by_position ... ok
+test sketch::constraints::tests::effective_shape_ids_falls_back_when_desynced ... ok
+test sketch::constraints::tests::effective_shape_ids_uses_stored_ids_when_synced ... ok
+test sketch::constraints::tests::legacy_sketch_solver_field_defaults_to_none ... ok
+test sketch::constraints::tests::promotion_bakes_f32_identical_curves ... ok
+test sketch::constraints::tests::promotion_never_reuses_existing_shape_ids ... ok
+test sketch::constraints::tests::solver_model_serde_round_trips_every_variant ... ok
+test sketch::dimension::tests::circle_driver_keeps_identity_and_expression_in_diameter_units ... ok
+test sketch::dimension::tests::coincident_geometry_without_constraints_does_not_share_a_driver ... ok
+test sketch::linalg::tests::ata_and_atv_match_hand_computation ... ok
+test sketch::linalg::tests::cholesky_rejects_singular_systems ... ok
+test sketch::linalg::tests::cholesky_solves_a_known_spd_system ... ok
+test sketch::linalg::tests::qr_rank_detects_dependent_columns ... ok
+test sketch::offset::tests::circle_offset_is_associative_and_read_only ... ok
+test sketch::offset::tests::collapse_and_missing_source_leave_no_partial_geometry ... ok
+test sketch::offset::tests::connected_line_chain_is_ordered_by_topology_not_selection_order ... ok
+test sketch::offset::tests::offset_operation_round_trip_keeps_expression_and_seed ... ok
+test sketch::pattern::tests::circular_pattern_count_includes_source_and_uses_deterministic_instances ... ok
+test sketch::pattern::tests::linear_pattern_follows_source_and_keeps_stable_span_identity ... ok
+test sketch::pattern::tests::missing_source_is_typed_and_appends_no_partial_geometry ... ok
+test sketch::projection::tests::coplanar_circle_projects_as_locked_analytic_construction ... ok
+test sketch::projection::tests::oblique_circle_projects_as_one_associative_analytic_ellipse ... ok
+test sketch::projection::tests::rebuilding_compatible_projection_preserves_ids_and_constraints ... ok
+test sketch::solve::tests::angle_and_point_on_object_constraints_solve ... ok
+test sketch::solve::tests::conflicting_constraints_are_detected_and_attributed ... ok
+test sketch::solve::tests::dof_counts_are_pinned_for_canonical_sketches ... ok
+test sketch::solve::tests::driven_dimension_reports_without_constraining_geometry ... ok
+test sketch::solve::tests::line_distance_keeps_lines_parallel_at_the_requested_separation ... ok
+test sketch::solve::tests::professional_dimension_and_location_constraints_solve ... ok
+test sketch::solve::tests::solve_is_bit_stable_across_repeats ... ok
+test sketch::solve::tests::solved_rectangle_holds_its_dimensions ... ok
+test sketch::solve::tests::spline_endpoint_tangent_and_curvature_have_solver_rows ... ok
+test sketch::solve::tests::tangent_line_touches_the_circle ... ok
+test sketch::solve::tests::variable_edit_drives_the_solve ... ok
+test sketch::tests::associative_mirror_reflects_and_follows_source ... ok
+test sketch::tests::axis_aligned_ellipse_is_one_region_with_right_area ... ok
+test sketch::tests::boundary_only_touching_is_not_overlap ... ok
+test sketch::tests::bugcase1_near_tangent_duplicate_has_no_tolerance_sliver ... ok
+test sketch::tests::circle_alone_one_region ... ok
+test sketch::tests::circle_crossing_rectangle_edge_creates_multiple_regions ... ok
+test sketch::tests::circle_fully_inside_rect_overlaps_via_containment ... ok
+test sketch::tests::circle_inside_rectangle_makes_annulus_and_inner_face ... ok
+test sketch::tests::circle_overlapping_two_rectangles_keeps_all_faces ... ok
+test sketch::tests::circumscribed_polygon_edges_are_tangent_to_guide_circle ... ok
+test sketch::tests::closed_fit_spline_participates_in_region_detection ... ok
+test sketch::tests::contained_circle_overlaps_but_does_not_cross ... ok
+test sketch::tests::control_point_spline_preserves_endpoints_and_trim ... ok
+test sketch::tests::degenerate_ellipse_adds_nothing ... ok
+test sketch::tests::disjoint_shapes_are_singletons ... ok
+test sketch::tests::disjoint_shapes_do_not_cross ... ok
+test sketch::tests::edge_aligned_rects_cross ... ok
+test sketch::tests::edge_aligned_rects_overlap_via_midpoint ... ok
+test sketch::tests::fillet_and_chamfer_round_a_square_corner ... ok
+test sketch::tests::interior_point_is_inside_concave_polygon ... ok
+test sketch::tests::native_slot_is_two_tangent_sides_and_two_analytic_caps ... ok
+test sketch::tests::overlap_partial_circle_and_rect ... ok
+test sketch::tests::overlapping_rectangles_split_into_three_regions ... ok
+test sketch::tests::regular_polygon_uses_expression_diameter_without_emitting_guide_circle ... ok
+test sketch::tests::rotated_ellipse_closes_into_one_region ... ok
+test sketch::tests::shape_loops_recovers_full_outlines ... ok
+test sketch::tests::single_rectangle_one_region ... ok
+test sketch::tests::slot_provenance_and_shape_identity_survive_round_trip ... ok
+test sketch::tests::straddling_circle_crosses ... ok
+test sketch::tests::three_chained_shapes_one_cluster ... ok
+test sketch::tests::two_disjoint_rectangles_two_regions ... ok
+test sketch::tests::zero_length_slot_becomes_circle_and_nonpositive_width_is_rejected ... ok
+test sketch::trim::tests::arc_trim_splits_at_exact_line_intersections ... ok
+test sketch::trim::tests::circle_trim_preserves_id_only_when_remnant_contains_parameter_zero ... ok
+test sketch::trim::tests::coincident_line_overlap_is_typed_ambiguous ... ok
+test sketch::trim::tests::control_and_fit_splines_trim_between_line_intersections ... ok
+test sketch::trim::tests::ellipse_trim_uses_controlled_conic_intersections_and_preserves_start_id ... ok
+test sketch::trim::tests::line_preview_and_apply_share_the_exact_middle_span ... ok
+test sketch::trim::tests::removing_original_line_end_removes_its_orphan_constraint ... ok
+test stl::tests::ascii_open_mesh_reports_boundary_edges ... ok
+test stl::tests::ascii_stl_import_maps_external_z_up_to_internal_y_up ... ok
+test stl::tests::assembly_3mf_reuses_geometry_and_places_two_build_items ... ok
+test stl::tests::assembly_export_refuses_visible_unresolved_geometry ... ok
+test stl::tests::binary_export_round_trips_through_import ... ok
+test stl::tests::binary_stl_export_writes_z_up_coordinates ... ok
+test stl::tests::binary_stl_has_correct_size_and_count ... ok
+test stl::tests::binary_stl_merges_multiple_meshes ... ok
+test stl::tests::degenerate_and_inconsistent_facets_are_diagnosed ... ok
+test stl::tests::facet_normal_points_along_plus_z_for_ccw_quad ... ok
+test stl::tests::interchange_rotation_maps_internal_y_up_to_external_z_up ... ok
+test stl::tests::obj_export_offsets_faces_between_bodies ... ok
+test stl::tests::obj_export_writes_named_z_up_objects ... ok
+test stl::tests::out_of_range_indices_are_skipped_not_panicked ... ok
+test stl::tests::separated_triangle_islands_report_disconnected_components ... ok
+test stl::tests::three_facets_sharing_one_edge_report_non_manifold_topology ... ok
+test stl::tests::three_mf_export_writes_z_up_coordinates ... ok
+test parametric::tests::thread_join_head::join_head_onto_threaded_shaft_fuses_and_keeps_threads ... ok
+test text::tests::alignment_shifts_shorter_lines_only ... ok
+test text::tests::blank_and_invalid_input_is_rejected_without_geometry ... ok
+test text::tests::counter_of_o_is_one_inked_region_with_one_hole ... ok
+test text::tests::a_whole_word_inks_one_region_per_glyph_with_its_counters ... ok
+test text::tests::emboss_keeps_analytic_walls_and_counters ... ok
+test text::tests::extra_lines_stack_below_the_first_baseline ... ok
+test text::tests::fingerprint_identifies_the_face_and_tracks_content ... ok
+test text::tests::glyph_outlines_become_bezier_splines_not_polylines ... ok
+test text::tests::nonzero_winding_keeps_opposite_contour_as_a_counter ... ok
+test text::tests::nonzero_winding_unions_overlapping_contours_without_internal_walls ... ok
+test text::tests::ordinary_sketch_extrude_volume_matches_typographic_ink ... ok
+test text::tests::ordinary_sketch_plate_around_text_is_exact_and_preserves_counters ... ok
+test text::tests::outlines_are_deterministic_across_runs ... ok
+test text::tests::placement_rotates_and_translates_without_resampling ... ok
+test text::tests::raised_text_adds_material_and_engraved_text_removes_it ... ok
+test text::tests::curved_glyph_emboss_awaits_nurbs_boolean_support ... ok
+test text::tests::text_is_one_solver_item_and_still_renders_with_a_model ... ok
+test text::tests::text_blind_cut_rebuilds_one_valid_pocket_without_boolean_retries ... ok
+test text::tests::text_region_extrudes_with_analytic_bspline_walls ... ok
+test text::tests::text_shape_bakes_builds_verbatim_and_round_trips ... ok
+test text::tests::text_join_rebuilds_one_valid_raised_word_without_boolean_retries ... ok
+test text::tests::tracking_widens_the_line_and_size_scales_it ... ok
+test text::tests::two_counters_and_disjoint_contours_both_survive ... ok
+test zcad_format::tests::assembly_bbox_is_preview_data_and_never_gates_load ... ok
+test zcad_format::tests::assembly_decode_is_independent_of_section_table_order ... ok
+test zcad_format::tests::assembly_v2_mates_round_trip_under_strict_recipe_schema ... ok
+test zcad_format::tests::binary_stl_imports_round_trip_as_deduplicated_required_assets ... ok
+test zcad_format::tests::crafted_next_occurrence_id_cannot_reuse_an_existing_id ... ok
+test zcad_format::tests::fresh_only_when_hash_matches ... ok
+test zcad_format::tests::future_project_kind_has_a_clear_error ... ok
+test zcad_format::tests::graph_hash_is_deterministic_and_distinguishing ... ok
+test zcad_format::tests::hydrated_edge_blend_preserves_local_tolerances_and_strict_tessellation ... ok
+test zcad_format::tests::identical_step_imports_share_one_required_asset ... ok
+test zcad_format::tests::legacy_registry_rejects_edge_blend_instead_of_skipping_it ... ok
+test zcad_format::tests::negative_zero_is_canonicalized ... ok
+test zcad_format::tests::populated_assembly_round_trips_deterministically ... ok
+test zcad_format::tests::pre_cavity_fix_cache_abis_discard_accelerators_and_rebuild_recipe ... ok
+test zcad_format::tests::project_part_writer_is_byte_identical_to_part_writer ... ok
+test zcad_format::tests::recipe_and_feature_payload_use_numeric_cbor_keys ... ok
+test zcad_format::tests::recipe_rejects_unregistered_payload_schemas_before_graph_construction ... ok
+test zcad_format::tests::ten_thousand_occurrence_boundary_round_trips ... ok
+test zcad_format::tests::two_phase_decode_accepts_an_injected_test_only_schema_table ... ok
+test text::tests::text_through_cut_rebuilds_the_plate_once_and_preserves_counters ... ok
+
+test result: ok. 549 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.39s
+
+     Running tests\all_edge_blend_document.rs (target\fast-test\deps\all_edge_blend_document-754b6e74e0dcfe5a.exe)
+
+running 5 tests
+test blocked_all_edge_kernel_candidate_reports_complete_set_and_preserves_source ... ok
+test cancelled_all_edge_request_returns_no_partial_result_and_remains_rebuildable ... ok
+test changed_name_set_rejects_atomically_with_typed_reference_diagnostic ... ok
+test primitive_face_pair_identities_keep_both_fast_paths_reachable ... ok
+test durable_all_edge_features_survive_warm_eval_and_real_disk_reload ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests\annular_rim_blend.rs (target\fast-test\deps\annular_rim_blend-b3d8618343514276.exe)
+
+running 2 tests
+test annular_outer_rim_chamfer_commits ... ok
+test annular_outer_rim_fillet_commits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests\assembly_step.rs (target\fast-test\deps\assembly_step-abeb988bbe797666.exe)
+
+running 2 tests
+test unsolved_mates_cannot_silently_export_manual_placements ... ok
+test step_preserves_shared_parts_names_and_resolved_placements ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\assembly_workflows.rs (target\fast-test\deps\assembly_workflows-63547bbd13324d3b.exe)
+
+running 2 tests
+test invalid_replacement_and_mate_edit_leave_live_assembly_unchanged ... ok
+test plate_array_replacement_suppression_repair_and_history_roundtrip ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\bool_matrix.rs (target\fast-test\deps\bool_matrix-43b33096f225f94e.exe)
+
+running 1 test
+test blind_circle_cut_on_top_face ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\boolean_asset_replay.rs (target\fast-test\deps\boolean_asset_replay-c07245079a54ccb8.exe)
+
+running 3 tests
+test all_signed_byte_scale_values_are_validated_without_panicking ... ok
+test imported_operand_reads_the_foreign_asset_and_verifies_material_removal ... ok
+test history_operand_rebuilds_a_saved_sketch_extrusion ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\boolean_replay.rs (target\fast-test\deps\boolean_replay-1c1e618d6ce0667d.exe)
+
+running 1 test
+test promoted_boolean_cases_replay_in_stage_order_with_unique_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests\bracket_face_cut.rs (target\fast-test\deps\bracket_face_cut-359fcbece4290090.exe)
+
+running 2 tests
+test projected_circle_rims_do_not_create_selectable_slivers ... ok
+test saved_bracket_circular_cuts_preserve_material_and_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+
+     Running tests\circular_rim_blend.rs (target\fast-test\deps\circular_rim_blend-220f797cba317ce3.exe)
+
+running 19 tests
+test adjacent_fillets_flow_arc_then_straight ... ok
+test bite_arc_chamfer_via_open_circle_hint_makes_a_cone ... ok
+test bite_arc_chamfer_commits_through_the_graph ... ok
+test bite_arc_fillet_commits_through_the_graph ... ok
+test bite_arc_fillet_via_open_circle_hint_makes_a_torus ... ok
+test bite_fillet_band_reads_as_one_face_with_no_mid_arc_seam ... ok
+test corner_bite_arc_fillet_commits_through_the_graph ... ok
+test cylinder_rim_chamfer_via_circle_hint_makes_a_cone ... ok
+test cylinder_rim_fillet_via_circle_hint_makes_a_torus ... ok
+test oversized_rim_fillet_via_hint_fails_safely ... ok
+test oversized_straight_edge_before_arc_fails_safely ... ok
+test rim_chamfer_band_reads_as_one_face_with_no_sector_seams ... ok
+test rim_chamfer_commits_through_the_graph ... ok
+test rim_edge_mod_reaches_native_solver_and_degrades_safely ... ok
+test rim_fillet_band_reads_as_one_face_with_no_sector_seams ... ok
+test bite_arc_fillet_commits_with_reversed_hint_span ... ok
+test sketch_cylinder_rim_fillet_commits_through_the_graph ... ok
+test slightly_off_fitted_radius_still_matches_the_rim ... ok
+test rim_fillet_commits_through_the_graph ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+     Running tests\construction_equivalence_matrix.rs (target\fast-test\deps\construction_equivalence_matrix-ae49c8b90a66f158.exe)
+
+running 3 tests
+test primitive_and_sketched_prism_are_equivalent ... ok
+test reordered_suppressed_timeline_survives_save_load_and_resume ... ok
+test disjoint_cut_and_fillet_orders_are_equivalent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests\corner_bite_extrude.rs (target\fast-test\deps\corner_bite_extrude-ee361bc9f010f2a0.exe)
+
+running 5 tests
+test circle_centered_on_rect_corner_extrudes_with_bite ... ok
+test circle_straddling_rect_corner_extrudes_with_bite ... ok
+test ground_plane_corner_bite_extrudes_with_bite ... ok
+test circle_straddling_one_edge_still_extrudes_with_bite ... ok
+test oversized_fillet_into_corner_bite_fails_safely ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\curved_face_join.rs (target\fast-test\deps\curved_face_join-1c5b312a39f6641a.exe)
+
+running 3 tests
+test successive_curved_face_join_supports_depth_edits ... ok
+test successive_curved_face_join_preserves_material_and_reopens ... ok
+test successive_join_depth_edit_rebuilds_missing_hydrated_sources ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+     Running tests\cylinder_tests.rs (target\fast-test\deps\cylinder_tests-e2bb845504c75be7.exe)
+
+running 7 tests
+test a_real_polygon_stays_faceted ... ok
+test capsule_union_hides_tangent_generator_seams ... ok
+test construction_line_split_circle_extrudes_as_one_clean_cylinder ... ok
+test construction_line_split_circle_joins_as_one_clean_cylinder ... ok
+test extruded_circle_is_a_smooth_cylinder ... ok
+test fifteen_mm_by_two_mm_cylinder_has_compact_display_buffers ... ok
+test booleans_with_a_cylinder_never_panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\degeneracy_stability.rs (target\fast-test\deps\degeneracy_stability-902b27bdf8a5d00b.exe)
+
+running 5 tests
+test ordinary_faces_report_no_degeneracy ... ok
+test tangent_circle_in_a_band_is_diagnosable ... ok
+test the_reported_sketch_extrudes_every_region_without_dropping_any ... ok
+test total_face_area_is_continuous_through_degeneracy ... ok
+test every_substantial_region_builds_or_explains_itself ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\edge_blend_network.rs (target\fast-test\deps\edge_blend_network-6ce7ee5af55b409e.exe)
+
+running 2 tests
+test two_selected_edges_commit_as_one_atomic_candidate ... ok
+test rejected_network_leaves_the_original_body_unchanged ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running tests\exact_geometry_boundaries.rs (target\fast-test\deps\exact_geometry_boundaries-231e3303c94870df.exe)
+
+running 4 tests
+test cross_cutting_and_construction_equivalence_gates_exist ... ok
+test kernel_debt_apis_are_removed ... ok
+test production_has_no_replay_or_geometry_approximation_escape_hatches ... ok
+test geometry_safety_net_is_enabled ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests\fillet_overflow_document.rs (target\fast-test\deps\fillet_overflow_document-897e58d22872ff2e.exe)
+
+running 1 test
+test overflow_fillet_survives_real_disk_reload_with_durable_topology ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\frozen_perf_corpora.rs (target\fast-test\deps\frozen_perf_corpora-018ad10f756db313.exe)
+
+running 6 tests
+test committed_baseline_json_matches_the_frozen_corpus_manifest ... ok
+test baseline_corpus_manifest_is_stable ... ok
+test committed_modeling_baseline_is_qualified_and_reproducible ... ok
+test external_step_fixture_retains_its_non_openrcad_provenance ... ok
+test geometry_corpora_evaluate_without_warnings ... ok
+test fresh_baseline_evaluations_have_deterministic_body_and_triangle_counts ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     Running tests\implementation_audit_regressions.rs (target\fast-test\deps\implementation_audit_regressions-b17cd67c3dedfee5.exe)
+
+running 6 tests
+test conservative_bounds_must_include_gregory_interior ... ok
+test broad_phase_bounds_round_outward ... ok
+test missing_offset_trim_produces_unknown_bounds ... ok
+test huge_patterns_reject_before_allocating_and_preserve_source ... ok
+test named_planar_cap_must_not_thread_cylindrical_wall ... ok
+test named_cylinder_wall_must_actually_thread ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests\mechanical_workflows.rs (target\fast-test\deps\mechanical_workflows-1318a74bbcb49290.exe)
+
+running 4 tests
+test closed_cavity_step_export_preserves_the_void_and_import_refuses_partial_solid ... ok
+test dense_text_placement_preserves_exact_linear_history_and_material ... ok
+test mechanical_parts_survive_cold_warm_save_reopen_and_step_export ... ok
+test nested_text_counter_cutouts_export_after_save_and_reload ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.28s
+
+     Running tests\native_operation_gate.rs (target\fast-test\deps\native_operation_gate-feb83c1b8c41d1c5.exe)
+
+running 2 tests
+test general_operation_gate ... ok
+test native_import_boolean_and_tessellation_gate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests\no_legacy_kernel_calls.rs (target\fast-test\deps\no_legacy_kernel_calls-c18f37cb75a3ad5a.exe)
+
+running 2 tests
+test production_code_does_not_add_legacy_kernel_calls ... ok
+test evaluator_reachable_code_uses_fallible_dir2d_construction ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\overhanging_face_join.rs (target\fast-test\deps\overhanging_face_join-661420e797c46c6d.exe)
+
+running 3 tests
+test overhanging_join_is_independent_of_world_frame ... ok
+test overhanging_join_preserves_depth_edits_and_negative_sweeps ... ok
+test saved_overhanging_multiregion_join_is_exact_and_reopens ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests\overlapping_face.rs (target\fast-test\deps\overlapping_face-ea2393573d9d3e28.exe)
+
+running 3 tests
+test coplanar_profile_cuts_can_cross_outer_edges_and_existing_holes ... ok
+test saved_overlapping_sketch_extrudes_outer_region_and_reopens ... ok
+test saved_coplanar_cut_preserves_depth_and_existing_keyhole ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests\overlapping_join_cut_stack.rs (target\fast-test\deps\overlapping_join_cut_stack-f013ade6a8a36723.exe)
+
+running 1 test
+test overlapping_join_cut_stack_matches_csg_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.35s
+
+     Running tests\parametric_tests.rs (target\fast-test\deps\parametric_tests-4bd54f9bf9ad216c.exe)
+
+running 11 tests
+test test_coordinate_system_projection ... ok
+test test_box_mesh_is_watertight ... ok
+test test_evaluate_bodies_one_mesh_per_solid_node ... ok
+test test_extrusion_normals_outward_on_all_planes ... ok
+test test_extrude_face_with_hole_is_a_tube ... ok
+test test_face_ids_match_triangle_count ... ok
+test test_parametric_graph_box ... ok
+test test_overlapping_rectangles_fuse_into_one_extruded_body ... ok
+test test_parametric_graph_sketch_extrude ... ok
+test test_unit_conversions ... ok
+test test_parametric_graph_cylinder ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\perf_thread_probe.rs (target\fast-test\deps\perf_thread_probe-a3edde019214a8d6.exe)
+
+running 1 test
+test probe_thread_eval_and_mesh_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\primitive_equals_extrude.rs (target\fast-test\deps\primitive_equals_extrude-0b6fb9782a078e23.exe)
+
+running 2 tests
+test box_primitive_equals_sketched_rectangle ... ok
+test cylinder_primitive_is_analytic_and_display_matches_part ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\property_geometry.rs (target\fast-test\deps\property_geometry-8bd7062ec2f42d76.exe)
+
+running 1 test
+test central_through_holes_remain_valid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests\property_join_cut_chains.rs (target\fast-test\deps\property_join_cut_chains-0a11da68825cc64c.exe)
+
+running 22 tests
+test boss_refilling_a_hole_builds_the_lens_section ... ok
+test boss_overhanging_a_block_corner_joins ... ok
+test cylinder_joined_just_short_of_a_drafted_pocket_corner ... ok
+test broad_kinds_match_the_oracle ... ok
+test degenerate_chains_are_sound ... ok
+test generic_broad_chains_are_exact ... ok
+test generic_mixed_axis_chains_are_exact ... ok
+test join_after_cuts_severed_a_lump_keeps_the_lump_separate ... ok
+test join_bridging_a_blind_tunnel_seals_a_cavity ... ok
+test join_over_a_side_tunnel_tessellates_promptly ... ok
+test mixed_axis_refusal_census ... ok
+test plate_joined_over_a_tunnel_breaking_out_the_bottom ... ok
+test pocket_clipping_a_hole_rim_does_not_refill_the_hole ... ok
+test side_circle_cut_is_not_recorded_as_a_vertical_hole ... ok
+test side_slot_under_an_overhanging_plate_is_not_a_sliver ... ok
+test generic_parallel_chains_are_exact ... ok
+test slot_under_a_corner_boss_is_not_a_sliver ... ok
+test tilted_slot_boss_extrudes ... ok
+test tilted_slot_cut_beside_an_l_boss ... ok
+test tilted_slot_cut_skips_a_severed_lump ... ok
+test tilted_slot_through_cut_applies ... ok
+test side_tunnel_grazing_a_hole_is_never_wrong ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 55.30s
+
+     Running tests\realistic_modes.rs (target\fast-test\deps\realistic_modes-d9ae671ffd2ab645.exe)
+
+running 12 tests
+test cut_into_side_face_negative_depth_carves_pocket ... ok
+test cut_into_top_face_negative_depth_reaches_body ... ok
+test cut_into_xz_origin_plane_body_carves_pocket ... ok
+test cut_on_gui_face_coordinate_system ... ok
+test cut_on_side_face_outward_positive_depth_no_pocket ... ok
+test cut_on_top_face_carves_into_body_regardless_of_sign ... ok
+test cut_reaching_face_edge_still_removes_material ... ok
+test cut_wireframe_stays_within_body_bounds ... ok
+test join_boss_rises_above_body ... ok
+test join_into_body_negative_depth_keeps_original ... ok
+test join_on_top_face_positive_depth ... ok
+test cut_into_cylinder_primitive_carves_pocket ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests\release_stability_gate.rs (target\fast-test\deps\release_stability_gate-c28081614cbe6d65.exe)
+
+running 5 tests
+test guarded_kernel_workspaces_keep_release_unwinding ... ok
+test retained_exceptions_are_owned_and_triggered ... ok
+test curated_occt_differential_oracle ... ok
+test this_build_preserves_unwind_containment ... ok
+test seeded_scale_boolean_and_persistence_stress_smoke ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\repro_broken_cuts.rs (target\fast-test\deps\repro_broken_cuts-faceea11dfc0c8f7.exe)
+
+running 1 test
+test counterbore_ring_around_through_hole_applies ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests\repro_coincident_cylinder_cut.rs (target\fast-test\deps\repro_coincident_cylinder_cut-7adbc7987d74138a.exe)
+
+running 1 test
+test ring_cut_with_inner_wall_on_existing_hole ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+
+     Running tests\repro_cut_through_error.rs (target\fast-test\deps\repro_cut_through_error-fcc0bb18d2f29350.exe)
+
+running 2 tests
+test slots_cross_existing_bores_at_multiple_sizes_and_positions ... ok
+test cut_through_existing_cuts_preserves_material_and_reopens ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.54s
+
+     Running tests\repro_cutout_fillet_mesh.rs (target\fast-test\deps\repro_cutout_fillet_mesh-95ab5a9de76b63e4.exe)
+
+running 1 test
+test cutout_fillet_cylinder_mesh_has_no_visual_diagonal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests\repro_download_geometry.rs (target\fast-test\deps\repro_download_geometry-2ead39a9d48f72be.exe)
+
+running 8 tests
+test downloaded_committed_join_combines_adjacent_regions_on_partial_cap ... ok
+test downloaded_concave_chamfer_adds_only_the_inner_shoulder_wedge ... ok
+test downloaded_cut_crosses_gap_without_damaging_starting_wall ... ok
+test downloaded_edge_only_join_preserves_original_body ... ok
+test downloaded_counterbore_enlarges_existing_hole_and_reopens ... ok
+test downloaded_oversized_shoulder_chamfer_preserves_original_material ... ok
+test projected_analytic_rims_do_not_create_sliver_cut_regions ... ok
+test downloaded_face_join_preserves_sketch_placement_and_reopens ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
+     Running tests\repro_edit_sketch_extrude.rs (target\fast-test\deps\repro_edit_sketch_extrude-e46a042cd957eb39.exe)
+
+running 7 tests
+test edit_keeps_the_same_selected_region_three_rects ... ok
+test edit_single_rectangle_sketch_keeps_extruded_body ... ok
+test edit_two_rectangle_sketch_keeps_selected_region_body ... ok
+test extrude_inner_region_of_nested_rectangles_makes_a_body ... ok
+test extrude_whole_nested_rectangles_keeps_the_hole ... ok
+test region_order_stable_across_promotion_matrix ... ok
+test edit_rect_with_hole_keeps_body ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\repro_extrude_one_region.rs (target\fast-test\deps\repro_extrude_one_region-c6ee7136e2116af0.exe)
+
+running 4 tests
+test extrude_only_selected_region ... ok
+test extrude_separate_shapes_together_is_clean ... ok
+test extrude_whole_overlapping_sketch_has_no_disappearing_faces ... ok
+test extrude_single_nonconvex_region_has_no_disappearing_faces ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests\repro_fillet_problem_zcad.rs (target\fast-test\deps\repro_fillet_problem_zcad-505dec4351934c72.exe)
+
+running 1 test
+test fillet_problem_zcad_fillets_without_warning ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\repro_fillet_then_cut.rs (target\fast-test\deps\repro_fillet_then_cut-73e336c6082abe94.exe)
+
+running 1 test
+test filleted_box_circle_cut_straddling_fillet_succeeds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests\repro_fillet_then_fillet.rs (target\fast-test\deps\repro_fillet_then_fillet-dfe40456ad148a45.exe)
+
+running 1 test
+test fillet_then_larger_fillet_perpendicular_edge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests\repro_fit_gpu.rs (target\fast-test\deps\repro_fit_gpu-7d44f432052c4c2c.exe)
+
+running 2 tests
+test fit_gpu_join_is_valid_and_reopens ... ok
+test merged_polygon_join_preserves_depth_edits_direction_and_frame ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests\repro_ground_cylinder_chamfer.rs (target\fast-test\deps\repro_ground_cylinder_chamfer-1607bf47d333d108.exe)
+
+running 5 tests
+test ground_cylinder_kernel_chamfer_aabb_probe ... ok
+test ground_cylinder_native_tool_chamfer_aabb_probe ... ok
+test ground_cylinder_rim_chamfer_commits_axis_up ... ok
+test ground_cylinder_rim_chamfer_commits_axis_down ... ok
+test ground_cylinder_rim_fillet_commits_axis_up ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests\repro_gui_issues.rs (target\fast-test\deps\repro_gui_issues-54cff0a39a8e0643.exe)
+
+running 6 tests
+test cut_with_positive_depth_on_top_face_still_cuts ... ok
+test box_can_be_cut_twice ... ok
+test extruded_box_fillet_succeeds_and_is_fast ... ok
+test cylinder_boss_join_has_no_inward_faces ... ok
+test fillet_preview_drag_is_responsive ... ok
+test second_cut_scenarios ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests\repro_join_failed.rs (target\fast-test\deps\repro_join_failed-0dfbb22fa68a823b.exe)
+
+running 1 test
+test saved_join_with_near_tangent_cuts_is_valid_and_reopens ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+
+     Running tests\repro_mirror_join_face_history.rs (target\fast-test\deps\repro_mirror_join_face_history-16c3a7d662aa4e08.exe)
+
+running 1 test
+test mirrored_bugcase_join_has_complete_face_attribution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\repro_miter_render.rs (target\fast-test\deps\repro_miter_render-2b082b3b02918d8f.exe)
+
+running 1 test
+test mitered_corner_render_mesh_is_manifold ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests\repro_prism_boss_fillet.rs (target\fast-test\deps\repro_prism_boss_fillet-fd9f0cf1316313cb.exe)
+
+running 5 tests
+test fillet_acute_prism_corner_edge_gui_path ... ok
+test fillet_really_sharp_prism_corner_edge_gui_path ... ok
+test fused_body_mesh_is_crack_free ... ok
+test oversized_boss_plane_seam_fillet_fails_safely ... ok
+test fillet_prism_top_edge_with_boss_bite ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.23s
+
+     Running tests\repro_reused_face_sketch.rs (target\fast-test\deps\repro_reused_face_sketch-5b74e713c453be17.exe)
+
+running 4 tests
+test adjoining_strips_join_successfully_in_the_original_sketch_frame ... ok
+test reused_face_sketch_join_does_not_add_shifted_rectangle ... ok
+test reused_face_sketch_keeps_selected_strip_after_its_first_join ... ok
+test reused_sketch_still_follows_an_upstream_depth_edit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests\repro_small_cylinder_rim_fillet.rs (target\fast-test\deps\repro_small_cylinder_rim_fillet-50504ba7a6c89190.exe)
+
+running 3 tests
+test small_extruded_circle_rim_fillet_1mm_commits ... ok
+test small_extruded_circle_rim_chamfer_3mm_commits ... ok
+test small_extruded_circle_rim_fillet_3mm_commits ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests\scale_imported_step.rs (target\fast-test\deps\scale_imported_step-a2d8de781dfcda11.exe)
+
+running 2 tests
+test imported_step_scales_strictly_across_the_scale_factor_matrix ... ok
+test native_body_intersects_a_strictly_imported_step_body ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\semantic_document_boundaries.rs (target\fast-test\deps\semantic_document_boundaries-e7d45cf995c831a4.exe)
+
+running 3 tests
+test body_evaluation_has_one_exact_registry_transaction_boundary ... ok
+test document_contract_is_authoritative_at_runtime_and_after_round_trip ... ok
+test production_code_uses_the_semantic_document_apis ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests\semantic_golden_manifest.rs (target\fast-test\deps\semantic_golden_manifest-9e2613bd56930448.exe)
+
+running 3 tests
+test comparator_accepts_tolerant_geometry_without_weakening_exact_semantics ... ok
+test comparator_rejects_non_finite_and_out_of_policy_geometry ... ok
+test committed_semantic_golden_matches_the_vnext_baseline ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests\serialization.rs (target\fast-test\deps\serialization-19662ee744b24951.exe)
+
+running 4 tests
+test edge_mod_selection_survives_json_round_trip ... ok
+test malformed_document_is_an_error_not_a_panic ... ok
+test pretty_json_round_trip_matches ... ok
+test graph_survives_json_round_trip ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\shell_concave_document.rs (target\fast-test\deps\shell_concave_document-4dc2bc64159d1303.exe)
+
+running 2 tests
+test concave_shell_collapse_is_typed_atomic_and_cache_stable ... ok
+test concave_shell_survives_real_disk_reload_with_durable_topology ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\shell_torus_band_document.rs (target\fast-test\deps\shell_torus_band_document-f5cc54a0f89c29a0.exe)
+
+running 1 test
+test fillet_shell_multiple_openings_survive_real_disk_reload_and_reattach ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+
+     Running tests\sketch_fillet_convexity.rs (target\fast-test\deps\sketch_fillet_convexity-b9a6989787fcd020.exe)
+
+running 2 tests
+test ground_plane_fillet_corners_are_convex ... ok
+test extruded_fillet_corners_are_convex ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests\sketch_fillet_extrude.rs (target\fast-test\deps\sketch_fillet_extrude-d8ab6c1044897777.exe)
+
+running 3 tests
+test rounded_rectangle_display_mesh_is_the_analytic_part ... ok
+test single_corner_fillet_is_analytic ... ok
+test rounded_rectangle_corners_are_analytic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests\sketch_responsiveness.rs (target\fast-test\deps\sketch_responsiveness-3f221cdc60c971c0.exe)
+
+running 5 tests
+test cancellation_does_not_publish_or_cache_a_solution ... ok
+test non_finite_geometry_cannot_be_reported_as_converged ... ok
+test physical_distance_acceptance_is_local_and_rejects_real_small_conflicts ... ok
+test corrected_solver_diagnostics_survive_evaluation_and_save_reopen ... ok
+test saved_small_rectangles_converge_and_reuse_the_same_solution ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\smooth_cylinder.rs (target\fast-test\deps\smooth_cylinder-349d4737b7cc4961.exe)
+
+running 5 tests
+test cylinder_blind_pocket_is_smooth_and_watertight ... ok
+test cut_hole_rim_renders_as_a_smooth_circle ... ok
+test cylinder_cut_through_is_smooth_and_bores_a_hole ... ok
+test cylinder_boss_join_is_smooth_and_merged ... ok
+test cylinder_primitive_is_smooth ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests\smooth_loft_document.rs (target\fast-test\deps\smooth_loft_document-2a8fc412f4013ac6.exe)
+
+running 1 test
+test exact_smooth_loft_survives_real_disk_reload_with_durable_topology ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\standards_inspection_gate.rs (target\fast-test\deps\standards_inspection_gate-4a1a3d9f727daea6.exe)
+
+running 4 tests
+test projected_edges_and_reference_dimensions_round_trip_with_dependencies ... ok
+test section_and_interference_are_part_of_the_inspection_gate ... ok
+test thread_standard_reference_round_trips_with_identity_and_class ... ok
+test standards_features_survive_rename_save_load_and_rebuild ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests\step_export.rs (target\fast-test\deps\step_export-17f3b936fb17311f.exe)
+
+running 2 tests
+test multiple_bodies_are_all_named_in_one_step_document ... ok
+test step_export_preserves_dimensions_and_replaces_atomically ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\step_interchange_gate.rs (target\fast-test\deps\step_interchange_gate-d339580efe298864.exe)
+
+running 4 tests
+test byte_frozen_third_party_freecad_step_fixture_imports_strictly ... ok
+test exact_inspection_and_strict_step_round_trip_cross_the_interchange_gate ... ok
+test semantic_body_output_ownership_is_behavioral_and_round_trips ... ok
+test sketch_and_standards_extensions_survive_the_canonical_document ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\thread_blend.rs (target\fast-test\deps\thread_blend-162e443f591223fc.exe)
+
+running 10 tests
+test chamfered_rod_thread_cuts_through_the_chamfer ... ok
+test filleted_rod_thread_runs_out_below_the_fillet ... ok
+test flipped_partial_thread_anchors_at_the_bottom ... ok
+test internal_thread_keeps_the_countersink ... ok
+test kernel_deep_chamfer_cut_through_case_a ... ok
+test kernel_partial_runout_mesh_is_clean ... ok
+test kernel_shallow_chamfer_cut_through_case_b ... ok
+test partial_thread_spans_only_its_window ... ok
+test two_start_partial_thread_evaluates ... ok
+test chamfer_after_partial_thread_degrades_safely ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+
+     Running tests\thread_geometry.rs (target\fast-test\deps\thread_geometry-077a4eee1ea72630.exe)
+
+running 5 tests
+test degenerate_thread_params_return_none ... ok
+test internal_thread_tooth_points_inward ... ok
+test external_thread_tooth_builds_and_reaches_crest ... ok
+test left_handed_thread_also_builds ... ok
+test threaded_cylinder_probe_timing ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests\zcad_format.rs (target\fast-test\deps\zcad_format-2e3e06f40391018d.exe)
+
+running 38 tests
+test canonical_round_trip_preserves_creation_time_and_prunes_stale_visibility ... ok
+test canonical_save_rejects_semantic_dependency_drift ... ok
+test compact_profile_has_bounded_overhead_and_no_forbidden_sections ... ok
+test connected_component_face_identity_round_trips ... ok
+test corrupt_disposable_preview_is_dropped_with_a_diagnostic ... ok
+test corrupt_header_is_detected ... ok
+test corrupt_payload_is_detected_not_panicked ... ok
+test duplicate_and_overlapping_sections_are_rejected_before_payload_decode ... ok
+test body_ops_features_save_load_with_equivalent_outputs_and_provenance ... ok
+test extension_mismatch_opens_by_content_and_warns ... ok
+test failed_atomic_save_preserves_the_previous_complete_file ... ok
+test garbage_is_not_zcad ... ok
+test guided_sweep_v3_survives_real_disk_save_reload_and_rebuild ... ok
+test hydrated_budget_is_hard_and_profile_comes_from_content ... ok
+test hydrated_checkpoint_cache_round_trips_and_rebuilds_identically ... ok
+test every_feature_payload_round_trips_and_rebuilds_identically ... ok
+test incompatible_binary_contract_is_rejected ... ok
+test hydrated_sections_fail_independently_without_losing_the_recipe ... ok
+test integer_overflow_and_impossible_lengths_are_rejected ... ok
+test legacy_json_is_rejected_by_the_new_contract ... ok
+test invalid_mesh_accelerator_is_discarded_by_content_validation ... ok
+test load_limits_fail_before_decoding_large_sections ... ok
+test non_finite_parameters_are_rejected_before_storage ... ok
+test malformed_cbor_and_decompression_length_mismatch_are_rejected ... ok
+test round_trip_body_transform_keeps_copy_and_translation ... ok
+test path_save_replaces_an_existing_document_safely ... ok
+test round_trip_recipe_only ... ok
+test round_trip_regular_polygon_keeps_expression_and_no_circle ... ok
+test round_trip_with_thumbnail_and_mesh_cache ... ok
+test round_trip_overlapping_boolean_extrude ... ok
+test stl_asset_chain_round_trips_with_sequence_suppression_and_exact_bytes ... ok
+test streaming_apis_round_trip_without_a_full_file_adapter ... ok
+test truncated_file_is_an_error ... ok
+test unknown_required_section_is_rejected ... ok
+test v5_compact_save_is_deterministic_and_strips_accelerators ... ok
+test unknown_section_is_skipped ... ok
+test wave2_payloads_survive_real_save_to_disk_and_reload ... ok
+test wave3_payloads_survive_real_save_to_disk_and_reload ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+   Doc-tests zerocad_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

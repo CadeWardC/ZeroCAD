@@ -253,8 +253,10 @@ impl Solid {
                     tolerance: allowed_tolerance,
                 });
             }
-            if deviation > tolerance {
-                let promoted = (deviation + policy.resolution).min(allowed_tolerance);
+            if deviation * 1.05 > tolerance {
+                // Validation samples the pcurve on a different grid than the 96 points
+                // measured here and can read slightly more; certify with headroom.
+                let promoted = (deviation * 1.05 + policy.resolution).min(allowed_tolerance);
                 brep.edges[*edge_id].tolerance = brep.edges[*edge_id].tolerance.max(promoted);
                 promoted_edges.insert(*edge_id);
                 maximum_promoted_tolerance = maximum_promoted_tolerance.max(promoted);

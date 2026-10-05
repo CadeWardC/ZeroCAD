@@ -205,13 +205,16 @@ pub fn arrange_curve_spans<P: Clone>(
             }
             let midpoint = candidate.curve.point((first + last) * 0.5);
             let (low, high) = if from < to { (from, to) } else { (to, from) };
-            let key = (
-                low,
-                high,
+            let (qx, qy) = (
                 quantize(midpoint.x(), options.tolerance),
                 quantize(midpoint.y(), options.tolerance),
             );
-            if unique_edges.contains_key(&key) {
+            let key = (low, high, qx, qy);
+            // Coincident edges can have midpoints a hair apart that straddle a
+            // quantisation boundary, so look in the neighbouring cells too.
+            if (-1..=1).any(|dx| {
+                (-1..=1).any(|dy| unique_edges.contains_key(&(low, high, qx + dx, qy + dy)))
+            }) {
                 continue;
             }
             let index = atomics.len();

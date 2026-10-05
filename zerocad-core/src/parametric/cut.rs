@@ -337,6 +337,12 @@ pub(crate) fn cut_part_one_dir(
             let scale = lo.abs().max(hi.abs()).max(local_extent);
             overlap <= 4.0 * f32::EPSILON * scale
         }) {
+            // Tangent or separated: a proven miss, not a solver failure (a lump
+            // a cut severed can rest exactly against the next tool's cap). A
+            // zero-thickness tool is not a miss; it must still warn.
+            if (0..3).all(|i| tool.1[i] - tool.0[i] > 1.0e-5) {
+                *proven_miss = true;
+            }
             return None;
         }
     }

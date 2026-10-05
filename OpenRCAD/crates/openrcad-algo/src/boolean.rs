@@ -902,6 +902,9 @@ fn boolean_impl(
                 // so the imprint engine bores a clean hole (its closed-curve path),
                 // instead of three arcs it can't close into a hole.
                 if let Some(circle) = wire_full_circle(&w_tool, tol) {
+                    if circle_on_face_boundary(&circle, &f_obj, policy.classification) {
+                        continue;
+                    }
                     if circle_inside_face(&circle, &f_obj) {
                         let c = GeomCurve::Circle(circle);
                         let sub = obj_sub.get_mut(&f_obj_id).unwrap();
@@ -943,6 +946,9 @@ fn boolean_impl(
             }
             for w_obj in f_obj.wires() {
                 if let Some(circle) = wire_full_circle(&w_obj, tol) {
+                    if circle_on_face_boundary(&circle, &f_tool, policy.classification) {
+                        continue;
+                    }
                     if circle_inside_face(&circle, &f_tool) {
                         let c = GeomCurve::Circle(circle);
                         let sub = tool_sub.get_mut(&f_tool_id).unwrap();
@@ -1024,7 +1030,13 @@ fn boolean_impl(
             if let Some(mut edges) = split_map.remove(&fid) {
                 if builder.brep().faces.contains_key(fid) {
                     deduplicate_splitting_edges(builder, &mut edges, policy.intersection);
-                    discard_existing_boundary_splits(builder, fid, &mut edges, policy.intersection);
+                    discard_existing_boundary_splits(
+                        builder,
+                        fid,
+                        &mut edges,
+                        policy.intersection,
+                        policy.classification,
+                    );
                     if edges.is_empty() {
                         new_sub.push(fid);
                     } else {
@@ -1093,6 +1105,12 @@ fn boolean_impl(
         })
         .collect();
 
+    // Same-surface curved faces are never imprinted against each other, so
+    // their rim arcs on one shared circle are subdivided at each solid's own
+    // seam vertices. Split both sides at each other's vertices so the kept
+    // pieces sew along identical arcs.
+    line_up_coincident_rims(&mut builder_obj, &mut builder_tool, policy);
+
     let brep_obj = builder_obj.build(); // seals into Arc<BRep>
     let brep_tool = builder_tool.build();
     let active_obj: std::collections::HashSet<FaceId> =
@@ -1129,25 +1147,33 @@ fn boolean_impl(
         let mut coplanar_same = false;
         let mut coplanar_opposite = false;
 
-        for ft_id in bvh_split_tool.box_overlap(&crate::bvh::compute_face_bounds(&face)) {
-            let ft_data = &brep_tool.faces[ft_id];
-            let face_t = Face::from_id(brep_tool.clone(), ft_id, ft_data.orientation);
-            if let (Some(s_obj), Some(s_tool)) = (face.surface(), face_t.surface()) {
-                if surfaces_are_same_domain(s_obj, s_tool, class_tol) {
-                    let (u, v) =
-                        crate::intersect::search_nearest_parameter(s_tool, &pos, (0.0, 0.0));
-                    if crate::intersect::is_inside_trimming_loops(u, v, &face_t) {
-                        let aligned = effective_normal_at(&face, &pos)
-                            .zip(effective_normal_at(&face_t, &pos))
-                            .is_some_and(|(object_normal, tool_normal)| {
-                                object_normal.dot(&tool_normal) > 0.0
-                            });
-                        if aligned {
-                            coplanar_same = true;
-                        } else {
-                            coplanar_opposite = true;
+        // Same-domain curved faces are never imprinted against each other, so
+        // their boundaries need not line up (a hole wall split at 0/120/240
+        // degrees against a cutter wall split at 60/180/300). The centroid probe
+        // can then sit exactly on the other face's boundary and miss it; probe a
+        // few interior points before declaring the face not coincident.
+        let probes = coincidence_probes(&face, pos);
+        'probe: for probe in &probes {
+            for ft_id in bvh_split_tool.box_overlap(&crate::bvh::compute_face_bounds(&face)) {
+                let ft_data = &brep_tool.faces[ft_id];
+                let face_t = Face::from_id(brep_tool.clone(), ft_id, ft_data.orientation);
+                if let (Some(s_obj), Some(s_tool)) = (face.surface(), face_t.surface()) {
+                    if surfaces_are_same_domain(s_obj, s_tool, class_tol) {
+                        let (u, v) =
+                            crate::intersect::search_nearest_parameter(s_tool, probe, (0.0, 0.0));
+                        if crate::intersect::is_inside_trimming_loops(u, v, &face_t) {
+                            let aligned = effective_normal_at(&face, probe)
+                                .zip(effective_normal_at(&face_t, probe))
+                                .is_some_and(|(object_normal, tool_normal)| {
+                                    object_normal.dot(&tool_normal) > 0.0
+                                });
+                            if aligned {
+                                coplanar_same = true;
+                            } else {
+                                coplanar_opposite = true;
+                            }
+                            break 'probe;
                         }
-                        break;
                     }
                 }
             }
@@ -1213,16 +1239,19 @@ fn boolean_impl(
         let pos = point_on_face(&face);
 
         let mut coplanar = false;
-        for fo_id in bvh_split_obj.box_overlap(&crate::bvh::compute_face_bounds(&face)) {
-            let fo_data = &brep_obj.faces[fo_id];
-            let face_o = Face::from_id(brep_obj.clone(), fo_id, fo_data.orientation);
-            if let (Some(s_obj), Some(s_tool)) = (face_o.surface(), face.surface()) {
-                if surfaces_are_same_domain(s_obj, s_tool, class_tol) {
-                    let (u, v) =
-                        crate::intersect::search_nearest_parameter(s_obj, &pos, (0.0, 0.0));
-                    if crate::intersect::is_inside_trimming_loops(u, v, &face_o) {
-                        coplanar = true;
-                        break;
+        let probes = coincidence_probes(&face, pos);
+        'probe: for probe in &probes {
+            for fo_id in bvh_split_obj.box_overlap(&crate::bvh::compute_face_bounds(&face)) {
+                let fo_data = &brep_obj.faces[fo_id];
+                let face_o = Face::from_id(brep_obj.clone(), fo_id, fo_data.orientation);
+                if let (Some(s_obj), Some(s_tool)) = (face_o.surface(), face.surface()) {
+                    if surfaces_are_same_domain(s_obj, s_tool, class_tol) {
+                        let (u, v) =
+                            crate::intersect::search_nearest_parameter(s_obj, probe, (0.0, 0.0));
+                        if crate::intersect::is_inside_trimming_loops(u, v, &face_o) {
+                            coplanar = true;
+                            break 'probe;
+                        }
                     }
                 }
             }
@@ -1558,8 +1587,10 @@ fn repair_multi_body_boolean_output(
     solid: Solid,
     policy: &TolerancePolicy,
 ) -> Result<(Solid, usize), BooleanError> {
+    // Same certified-residual budget as the single-solid path: near-coincident
+    // same-domain walls (f32 sketch noise) differ by up to `intersection`.
     let (solid, reconstructed) = solid
-        .repair_pcurves(policy)
+        .repair_operation_pcurves(policy)
         .map_err(BooleanError::PcurveBuild)?;
     let bodies = solid.split_disconnected();
     if bodies.len() <= 1 {
@@ -1885,6 +1916,7 @@ fn discard_existing_boundary_splits(
     face_id: FaceId,
     edges: &mut Vec<EdgeId>,
     tolerance: f64,
+    coincidence_tolerance: f64,
 ) {
     let Some(face) = builder.brep().faces.get(face_id) else {
         return;
@@ -1904,7 +1936,60 @@ fn discard_existing_boundary_splits(
             .iter()
             .copied()
             .any(|boundary| edge_spans_match(builder, *edge, boundary, tolerance))
+            && !edge_lies_on_boundary(builder, *edge, &boundary_edges, coincidence_tolerance)
     });
+}
+
+/// True when a splitting edge runs entirely along the face's existing boundary
+/// even though no single boundary edge has the same span: a rim arc of a
+/// coincident same-domain face is subdivided at different angles than this
+/// face's rim, so it can straddle two boundary arcs. Imprinting it would cut a
+/// sliver off the face.
+fn edge_lies_on_boundary(
+    builder: &BRepBuilder,
+    edge: EdgeId,
+    boundary_edges: &[EdgeId],
+    tolerance: f64,
+) -> bool {
+    let brep = builder.brep();
+    let Some(candidate) = brep.edges.get(edge) else {
+        return false;
+    };
+    let Some(curve) = candidate.curve.as_ref() else {
+        return false;
+    };
+    let tolerance = tolerance.max(1.0e-8);
+    (0..=8).all(|k| {
+        let point =
+            curve.point(candidate.first + (candidate.last - candidate.first) * (k as f64 / 8.0));
+        boundary_edges.iter().any(|id| {
+            let Some(boundary) = brep.edges.get(*id) else {
+                return false;
+            };
+            match &boundary.curve {
+                Some(boundary_curve) => {
+                    let t = project_point_on_curve(
+                        &point,
+                        boundary_curve,
+                        boundary.first,
+                        boundary.last,
+                    );
+                    boundary_curve.point(t).distance(&point) <= tolerance
+                }
+                None => {
+                    let start = brep.vertices[boundary.start].point;
+                    let end = brep.vertices[boundary.end].point;
+                    let delta = end - start;
+                    let length_squared = delta.dot(&delta);
+                    if length_squared <= 1.0e-24 {
+                        return false;
+                    }
+                    let f = ((point - start).dot(&delta) / length_squared).clamp(0.0, 1.0);
+                    (start + delta * f).distance(&point) <= tolerance
+                }
+            }
+        })
+    })
 }
 
 fn edge_spans_match(builder: &BRepBuilder, left: EdgeId, right: EdgeId, tolerance: f64) -> bool {
@@ -2026,6 +2111,53 @@ fn clamp_ordered(value: f64, min: f64, max: f64) -> f64 {
     } else {
         value.max(lo).min(hi)
     }
+}
+
+/// Points to test when asking whether a face lies on another face's support:
+/// its classification sample first, then a few interior points offset along the
+/// face's parameter box. Only curved faces get extras - a planar sample on a
+/// boundary is already handled by planar imprinting.
+fn coincidence_probes(face: &Face, pos: Pnt) -> Vec<Pnt> {
+    let mut probes = vec![pos];
+    let (Some(outer), Some(surface)) = (face.outer_wire(), face.surface()) else {
+        return probes;
+    };
+    if matches!(surface, GeomSurface::Plane(_)) {
+        return probes;
+    }
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    for index in 0..outer.len() {
+        let Some(pcurve) = outer.pcurve(index) else {
+            return probes;
+        };
+        for k in 0..=8 {
+            let p = pcurve.point_at_fraction(k as f64 / 8.0);
+            bounds = Some(match bounds {
+                None => (p.x(), p.x(), p.y(), p.y()),
+                Some((u0, u1, v0, v1)) => {
+                    (u0.min(p.x()), u1.max(p.x()), v0.min(p.y()), v1.max(p.y()))
+                }
+            });
+        }
+    }
+    let Some((u0, u1, v0, v1)) = bounds else {
+        return probes;
+    };
+    for (fu, fv) in [
+        (0.3, 0.5),
+        (0.7, 0.5),
+        (0.5, 0.3),
+        (0.5, 0.7),
+        (0.37, 0.41),
+        (0.63, 0.59),
+    ] {
+        let u = u0 + (u1 - u0) * fu;
+        let v = v0 + (v1 - v0) * fv;
+        if crate::intersect::is_inside_trimming_loops(u, v, face) {
+            probes.push(surface.point(u, v));
+        }
+    }
+    probes
 }
 
 pub(crate) fn point_on_face(face: &Face) -> Pnt {
@@ -2354,6 +2486,146 @@ fn wire_full_circle(wire: &Wire, tol: f64) -> Option<Circle> {
         }
     }
     circ
+}
+
+/// Split coincident circular rim edges of `a` and `b` at each other's rim
+/// vertices, so both solids subdivide a shared circle identically. Only
+/// circles on the same support (centre, axis, radius within `classification`)
+/// interact; splitting only inserts vertices on existing edges, never new
+/// curves.
+fn line_up_coincident_rims(a: &mut BRepBuilder, b: &mut BRepBuilder, policy: &TolerancePolicy) {
+    let tol = policy.classification;
+    let rims = |builder: &BRepBuilder| -> Vec<(EdgeId, Circle)> {
+        let brep = builder.brep();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (_, wire) in brep.loops.iter() {
+            for coedge in &wire.edges {
+                if !seen.insert(coedge.id) {
+                    continue;
+                }
+                if let Some(openrcad_topo::arena::EdgeData {
+                    curve: Some(GeomCurve::Circle(circle)),
+                    ..
+                }) = brep.edges.get(coedge.id)
+                {
+                    out.push((coedge.id, *circle));
+                }
+            }
+        }
+        out
+    };
+    let same_support = |x: &Circle, y: &Circle| {
+        let axis = GeomVec::from_dir(x.axis());
+        (x.radius() - y.radius()).abs() <= tol
+            && x.axis().is_parallel(&y.axis(), 1e-6)
+            && (y.center() - x.center()).dot(&axis).abs() <= tol
+            && (y.center() - x.center()).cross(&axis).magnitude() <= tol
+    };
+    let endpoints = |builder: &BRepBuilder, edge: EdgeId| -> Option<[Pnt; 2]> {
+        let data = builder.brep().edges.get(edge)?;
+        Some([
+            builder.brep().vertices.get(data.start)?.point,
+            builder.brep().vertices.get(data.end)?.point,
+        ])
+    };
+    let rims_b = rims(b);
+    let rims_a = rims(a);
+    let mut points_for_a: Vec<(EdgeId, Vec<Pnt>)> = Vec::new();
+    let mut points_for_b: Vec<(EdgeId, Vec<Pnt>)> = Vec::new();
+    for (ea, ca) in &rims_a {
+        for (eb, cb) in &rims_b {
+            if !same_support(ca, cb) {
+                continue;
+            }
+            if let Some(points) = endpoints(b, *eb) {
+                points_for_a.push((*ea, points.to_vec()));
+            }
+            if let Some(points) = endpoints(a, *ea) {
+                points_for_b.push((*eb, points.to_vec()));
+            }
+        }
+    }
+    split_rim_at_points(a, points_for_a, policy);
+    split_rim_at_points(b, points_for_b, policy);
+}
+
+fn split_rim_at_points(
+    builder: &mut BRepBuilder,
+    targets: Vec<(EdgeId, Vec<Pnt>)>,
+    policy: &TolerancePolicy,
+) {
+    let mut grouped: Vec<(EdgeId, Vec<Pnt>)> = Vec::new();
+    for (edge, points) in targets {
+        match grouped.iter_mut().find(|(known, _)| *known == edge) {
+            Some((_, known_points)) => known_points.extend(points),
+            None => grouped.push((edge, points)),
+        }
+    }
+    for (edge, points) in grouped {
+        let Some(data) = builder.brep().edges.get(edge).cloned() else {
+            continue;
+        };
+        let Some(curve) = data.curve.clone() else {
+            continue;
+        };
+        let start = builder.brep().vertices[data.start].point;
+        let end = builder.brep().vertices[data.end].point;
+        // Interior parameters of the other side's vertices on this edge.
+        let mut params: Vec<(f64, Pnt)> = Vec::new();
+        for point in points {
+            let t = project_point_on_curve(&point, &curve, data.first, data.last);
+            let on_curve = curve.point(t);
+            if on_curve.distance(&point) > policy.classification
+                || on_curve.distance(&start) < policy.intersection
+                || on_curve.distance(&end) < policy.intersection
+                || params
+                    .iter()
+                    .any(|(_, p)| p.distance(&on_curve) < policy.intersection)
+            {
+                continue;
+            }
+            params.push((t, on_curve));
+        }
+        // Split from the far end first so the remaining parameters stay on
+        // the surviving first half.
+        params.sort_by(|x, y| {
+            let order = x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal);
+            if data.first <= data.last {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+        let mut current = edge;
+        for (t, point) in params {
+            let vertex = builder
+                .brep_mut()
+                .vertices
+                .insert(openrcad_topo::arena::VertexData {
+                    point,
+                    tolerance: policy.linear,
+                });
+            let (first_half, _) = builder.split_edge(current, vertex, t);
+            current = first_half;
+        }
+    }
+}
+
+/// Whether `circle` already runs along one of `face`'s boundary wires (to
+/// within `tol`). Same-domain faces whose rims coincide, up to modelling-unit
+/// noise, have nothing to imprint on each other; imprinting the noisy twin
+/// would shave a sliver off the face.
+fn circle_on_face_boundary(circle: &Circle, face: &Face, tol: f64) -> bool {
+    let tol = tol.max(1.0e-8);
+    (0..8).all(|i| {
+        let p = circle.point(TAU * (i as f64) / 8.0);
+        face.wires().iter().any(|wire| {
+            wire.edges()
+                .iter()
+                .any(|edge| distance_point_to_edge(&p, edge) <= tol)
+        })
+    })
 }
 
 /// Whether `circle` lies on `face`'s surface and strictly inside its trimming

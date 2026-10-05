@@ -1,0 +1,145 @@
+diff --git a/OpenRCAD/crates/openrcad-algo/src/boolean.rs b/OpenRCAD/crates/openrcad-algo/src/boolean.rs
+index 9cde2171..0747fc47 100644
+--- a/OpenRCAD/crates/openrcad-algo/src/boolean.rs
++++ b/OpenRCAD/crates/openrcad-algo/src/boolean.rs
+@@ -1024,6 +1024,7 @@ fn boolean_impl(
+         for &fid in sub.iter() {
+             if let Some(mut edges) = split_map.remove(&fid) {
+                 if builder.brep().faces.contains_key(fid) {
++                    planarize_splitting_edges(builder, &mut edges, policy.intersection);
+                     deduplicate_splitting_edges(builder, &mut edges, policy.intersection);
+                     discard_existing_boundary_splits(builder, fid, &mut edges, policy.intersection);
+                     if edges.is_empty() {
+@@ -1905,6 +1906,52 @@ fn split_tracked(
+     *subfaces = result;
+ }
+ 
++/// Split queued edges where another queued edge ends on them. Spans queued by
++/// different face pairs can overlap without sharing vertices: a coplanar
++/// cavity floor imprints its outline on a cutter face, then a wall crossing
++/// the same cutter face queues one long line over that outline's edge. The
++/// partition graph needs every junction as a vertex; once split, the
++/// duplicated stretch is removed by [`deduplicate_splitting_edges`].
++fn planarize_splitting_edges(builder: &mut BRepBuilder, edges: &mut Vec<EdgeId>, tolerance: f64) {
++    const MAX_SPLITS: usize = 256;
++    for _ in 0..MAX_SPLITS {
++        let endpoints: Vec<(openrcad_topo::arena::VertexId, Pnt)> = edges
++            .iter()
++            .filter_map(|&edge| builder.brep().edges.get(edge))
++            .flat_map(|data| [data.start, data.end])
++            .map(|vertex| (vertex, builder.brep().vertices[vertex].point))
++            .collect();
++        let split = edges.iter().enumerate().find_map(|(index, &edge)| {
++            let data = builder.brep().edges.get(edge)?;
++            let curve = data.curve.as_ref()?;
++            let (start, end) = (
++                builder.brep().vertices[data.start].point,
++                builder.brep().vertices[data.end].point,
++            );
++            endpoints.iter().find_map(|&(vertex, point)| {
++                if vertex == data.start
++                    || vertex == data.end
++                    || point.distance(&start) <= tolerance
++                    || point.distance(&end) <= tolerance
++                {
++                    return None;
++                }
++                let (low, high) = (data.first.min(data.last), data.first.max(data.last));
++                let t = project_point_on_curve(&point, curve, low, high);
++                (curve.point(t).distance(&point) <= tolerance && t > low && t < high)
++                    .then_some((index, edge, vertex, t))
++            })
++        });
++        let Some((index, edge, vertex, t)) = split else {
++            return;
++        };
++        let (first, second) = builder.split_edge(edge, vertex, t);
++        edges.remove(index);
++        edges.push(first);
++        edges.push(second);
++    }
++}
++
+ /// Remove repeated geometric split spans contributed by adjacent face pairs.
+ /// A periodic tool face can overlap both sides of an operand seam, causing the
+ /// same circle arc to be enqueued under two arena IDs. Feeding both copies to
+diff --git a/zerocad-core/tests/property_join_cut_chains.rs b/zerocad-core/tests/property_join_cut_chains.rs
+index 914bf5d8..9b156cc2 100644
+--- a/zerocad-core/tests/property_join_cut_chains.rs
++++ b/zerocad-core/tests/property_join_cut_chains.rs
+@@ -240,13 +240,13 @@ proptest! {
+     }
+ 
+     /// Side cuts mixed in: records cross axes, so the general boolean runs.
+-    /// Soundness only for now: the kernel boolean still rejects some of these
+-    /// (overlapping side cuts, fuses touching a side tunnel), and completeness
+-    /// here is the kernel hardening target. The saved seeds are that worklist.
++    /// Complete as well as sound: every step whose tool overlaps material
++    /// must apply (0 refusals in the 500-chain census as of 2026-10-01). The
++    /// saved seeds are the former kernel-hardening worklist.
+     #[test]
+-    fn generic_mixed_axis_chains_are_sound(block in block(), raw in raw_steps(0..6)) {
++    fn generic_mixed_axis_chains_are_exact(block in block(), raw in raw_steps(0..6)) {
+         let steps = chain(block, &raw, false);
+-        check_chain(&steps, lattice(block), false)?;
++        check_chain(&steps, lattice(block), true)?;
+     }
+ 
+     /// Whole-millimetre placements make flush faces and tangencies. Edge-only
+@@ -944,3 +944,56 @@ fn join_bridging_a_blind_tunnel_seals_a_cavity() {
+         1,
+     );
+ }
++
++/// A side tunnel breaking out through the bottom face leaves arcs whose
++/// circle reaches below the part. The join's sanity check compared two
++/// conservative boxes, so the input's circle-bounded box (below z = 0)
++/// was not inside the result's re-trimmed one and a valid union of an
++/// overhanging plate was refused.
++#[test]
++fn plate_joined_over_a_tunnel_breaking_out_the_bottom() {
++    use ExtrudeMode::{Cut, Join, NewBody};
++    let tunnel = |center, radius, depth| Step {
++        label: "side tunnel",
++        profile: Profile::Circle { center, radius },
++        axis: Axis::Y,
++        offset: -2.0,
++        depth,
++        mode: Cut,
++    };
++    assert_exact(
++        &[
++            Step::along_z(
++                "block",
++                Profile::Rect {
++                    min: (0.0, 0.0),
++                    max: (58.03661742674635, 44.378702409642315),
++                },
++                0.0,
++                8.614592082859806,
++                NewBody,
++            ),
++            tunnel(
++                (1.8980022967709662, 22.816574769015947),
++                3.2505305557234654,
++                22.718273301787637,
++            ),
++            tunnel(
++                (5.862361977790951, 7.991653540269629),
++                3.0147877360049544,
++                15.960789052171188,
++            ),
++            Step::along_z(
++                "plate",
++                Profile::Rect {
++                    min: (20.2296237940877, -1.2557250335545618),
++                    max: (70.54400801908804, 34.059614535699204),
++                },
++                2.084458823949696,
++                4.590029574481609,
++                Join,
++            ),
++        ],
++        1,
++    );
++}

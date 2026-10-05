@@ -274,13 +274,29 @@ impl StepWriter {
                 } else {
                     65
                 };
-                let poles = (0..count)
-                    .map(|index| {
-                        let fraction = index as f64 / (count - 1) as f64;
-                        curve.point(range.0 + fraction * (range.1 - range.0))
+                // The caller trims this curve at the pcurve's own parameters,
+                // so the knots must span that same interval (increasing, poles
+                // sampled at each knot). Knots 0..count once made the trim
+                // select a few segments near index `first`, and every such
+                // section pcurve re-imported millimetres off its edge.
+                let (low, high) = (range.0.min(range.1), range.0.max(range.1));
+                let knots = if high > low {
+                    (0..count)
+                        .map(|index| low + (high - low) * index as f64 / (count - 1) as f64)
+                        .collect::<Vec<_>>()
+                } else {
+                    (0..count).map(|index| index as f64).collect::<Vec<_>>()
+                };
+                let poles = knots
+                    .iter()
+                    .map(|&parameter| {
+                        if high > low {
+                            curve.point(parameter)
+                        } else {
+                            curve.point(range.0)
+                        }
                     })
                     .collect::<Vec<_>>();
-                let knots = (0..count).map(|index| index as f64).collect::<Vec<_>>();
                 let multiplicities = (0..count)
                     .map(|index| {
                         if index == 0 || index == count - 1 {

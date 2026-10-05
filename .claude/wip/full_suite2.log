@@ -1,0 +1,117 @@
+   Compiling openrcad-topo v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-topo)
+   Compiling openrcad-sketch v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-sketch)
+   Compiling openrcad-mesh v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-mesh)
+   Compiling openrcad-primitives v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-primitives)
+   Compiling openrcad-algo v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-algo)
+   Compiling openrcad-document v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-document)
+   Compiling openrcad-exchange v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-exchange)
+   Compiling openrcad v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD)
+   Compiling zerocad-core v0.7.6-alpha.4 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-core)
+   Compiling openrcad-render v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\OpenRCAD\crates\openrcad-render)
+   Compiling break-test v0.1.0 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\break-test)
+   Compiling zerocad-gui v0.7.6-alpha.4 (C:\Users\cadel\Documents\Coding_Projects\ZeroCAD\zerocad-gui)
+    Finished `fast-test` profile [optimized + debuginfo] target(s) in 8m 29s
+     Running tests\body_booleans_stress.rs (target\fast-test\deps\body_booleans_stress-e00797c6ae59ff63.exe)
+
+running 15 tests
+test body_cut_chain_three_levels ... ok
+test body_cut_with_keep_tool_then_reuse_tool_twice ... ok
+test body_intersect_disjoint_warns_and_preserves ... ok
+test body_intersect_contained_keeps_small_body ... ok
+test body_intersect_tangent_face_contact_is_graceful ... ok
+test body_intersect_partial_overlap_is_exact ... ok
+test body_join_duplicate_sources_is_graceful ... ok
+test body_join_with_one_ghost_source_reports_and_keeps_valid_pair ... ok
+test body_split_boundary_tangent_plane_is_graceful ... ok
+test body_intersects_of_three_bodies_pairwise_chain ... ok
+test body_split_tangent_to_face_is_graceful ... ok
+test body_split_midplane_then_join_back_is_identity ... ok
+test characterization_cutting_a_whole_island_fails ... ok
+test clearance_plug_join_conserves_volume ... ok
+test flush_coaxial_plug_join_conserves_material_as_two_bodies ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests\boolean_face_selection.rs (target\fast-test\deps\boolean_face_selection-038aeca00e023de8.exe)
+
+running 1 test
+test drilled_faces_keep_surface_kind_and_producer_after_cold_rebuild ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests\catalog_a_numeric.rs (target\fast-test\deps\catalog_a_numeric-6f24ecea62f32994.exe)
+
+running 13 tests
+test a02_expression_overflowing_the_stored_type_is_attributed ... ok
+test a03_subnormal_box_dimension_terminates_classified ... ok
+test a03_sub_tolerance_magnitudes_are_exact_or_rejected ... ok
+test a04_body_scale_infinite_factor_is_rejected ... ok
+test a04_body_scale_display_range_overflow_known_break ... ok
+test a04_pattern_count_times_spacing_overflow_is_attributed ... ok
+test a05_empty_and_trailing_garbage_expressions_fall_back_with_warning ... ok
+test a05_expression_evaluator_rejects_malformed_input_cleanly ... ok
+test a07_unit_input_paths_agree_within_conversion_contract ... ok
+test a04_thread_starts_times_pitch_overflow_terminates ... ok
+test a08_undo_restores_the_pre_delete_state ... ok
+test a08_variable_rename_is_atomic_on_collision ... ok
+test a08_variable_lifecycle_rename_delete_recreate_reopen ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\catalog_b_constraints.rs (target\fast-test\deps\catalog_b_constraints-4c8ba556173af5c9.exe)
+
+running 9 tests
+test b01_conflicting_variable_bound_model_warns_at_evaluation ... ok
+test b01_incompatible_width_on_fully_constrained_rect_is_attributed ... ok
+test b02_duplicate_constraints_redundant_vs_inconsistent ... ok
+test b03_nearly_collinear_triangle_through_exact_collinearity ... ok
+test b01_conflicting_literal_model_uses_last_valid_geometry_deterministically ... ok
+test b04_mixed_scales_solve_per_entity_accurately ... ok
+test b05_mirrored_start_reaches_mirrored_solution_without_flips ... ok
+test b07_insertion_order_and_repeated_solves_agree ... ok
+test b06_dense_ladder_network_converges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\catalog_c_regions_text.rs (target\fast-test\deps\catalog_c_regions_text-0d766bfb97d0e0ca.exe)
+
+running 8 tests
+test c02_duplicate_and_degenerate_geometry_normalizes ... ok
+test c03_endpoint_gap_closure_tolerance ... ok
+test c04_multiple_intersections_at_one_point ... ok
+test c05_offset_sweep_through_collapse_is_atomic ... ok
+test c06_projected_edge_rebuild_follows_source_and_refuses_kind_change ... ok
+test c07_text_counters_and_overlap_fill_correctly ... ok
+test c01_nested_loops_alternate_material_and_void ... ok
+test c08_baked_text_survives_reopen_without_font ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests\catalog_d_extrude.rs (target\fast-test\deps\catalog_d_extrude-d565043b8f3a9d4f.exe)
+
+running 8 tests
+test d01_profile_on_every_plane_with_both_directions ... ok
+test d03_annulus_holes_survive_geometry_and_mesh ... ok
+test d05_region_selection_survives_region_insertion ... ok
+test d06_join_with_unfuseable_region_rolls_back_whole_feature ... ok
+test d02_depth_drag_through_zero_keeps_mode_semantics ... FAILED
+test d08_draft_past_collapse_boundary_flips_taper_direction ... ok
+test d07_cut_targeting_changes_exactly_the_intended_bodies ... ok
+test d08_draft_sweep_through_collapse ... ok
+
+failures:
+
+---- d02_depth_drag_through_zero_keeps_mode_semantics stdout ----
+
+thread 'd02_depth_drag_through_zero_keeps_mode_semantics' (71576) panicked at break-test\tests\catalog_d_extrude.rs:143:5:
+zero-depth cut must warn
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    d02_depth_drag_through_zero_keeps_mode_semantics
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p break-test --test catalog_d_extrude`
+EXIT 101

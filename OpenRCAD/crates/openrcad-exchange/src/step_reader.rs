@@ -2069,6 +2069,34 @@ fn reconstruct_brep(entities: &HashMap<u32, StepEntity>, shell_id: u32) -> Resul
                                 }
                             }
                         }
+                        if curve.is_closed() && !curve.is_periodic() {
+                            // A closed, non-periodic curve (a crossing-cylinder
+                            // section loop) names its closure point twice, as
+                            // both domain ends. A vertex there projects to
+                            // either; pick the end that agrees with the edge's
+                            // sense, or an edge ending at the closure reads back
+                            // as the whole loop traversed backwards.
+                            let (bound_first, bound_last) = curve.bounds();
+                            let at_closure = |vertex: openrcad_topo::arena::VertexId| {
+                                brep.vertices[vertex]
+                                    .point
+                                    .distance(&curve.point(bound_first))
+                                    <= openrcad_foundation::tolerance::CONFUSION.max(1.0e-7)
+                            };
+                            if curve_same_sense && last < first {
+                                if at_closure(end_v_id) && last <= bound_first {
+                                    last = bound_last;
+                                } else if at_closure(start_v_id) && first >= bound_last {
+                                    first = bound_first;
+                                }
+                            } else if !curve_same_sense && last > first {
+                                if at_closure(end_v_id) && last >= bound_last {
+                                    last = bound_first;
+                                } else if at_closure(start_v_id) && first <= bound_first {
+                                    first = bound_last;
+                                }
+                            }
+                        }
                         if curve.is_closed()
                             && (last - first).abs() <= openrcad_foundation::tolerance::CONFUSION
                             && brep.vertices[start_v_id]
